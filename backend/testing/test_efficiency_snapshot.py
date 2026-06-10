@@ -1589,6 +1589,83 @@ def test_llm_cost_pricing_coverage_unattributed_tasks():
     assert result["unpriced_combos"] == []
 
 
+def test_llm_cost_pricing_coverage_uses_attempt_provider_model():
+    """Banked and current attempts are classified by their own provider/model."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.IN_PROGRESS,
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 200,
+            "llm_call_count": 2,
+        },
+        provider="fakeprovider",
+        model="fake-model-x",
+        vm_provisioned_at=now - timedelta(minutes=8),
+    )
+    bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+
+    task.status = TaskStatus.COMPLETED
+    task.api_call_summary = {
+        "total_input_tokens": 1000,
+        "total_output_tokens": 500,
+        "llm_call_count": 3,
+    }
+    task.provider = "anthropic"
+    task.model = "claude-sonnet-4-6"
+
+    result = _compute_llm_cost_pricing_coverage([task])
+
+    assert result["priced_tasks"] == 1
+    assert result["unpriced_tasks"] == 1
+    assert result["unattributed_tasks"] == 0
+    assert result["coverage_fraction"] == 0.5
+    assert result["unpriced_combos"] == ["fakeprovider:fake-model-x"]
+
+
+def test_llm_cost_pricing_coverage_counts_missing_attempt_attribution():
+    """Token-bearing attempt rows with missing provider or model stay explicit."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    missing_provider = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+    )
+    missing_provider.attempt_history = [
+        {
+            "provider": None,
+            "model": "claude-sonnet-4-6",
+            "llm_input_tokens": 200,
+            "llm_output_tokens": 100,
+            "llm_call_count": 1,
+        }
+    ]
+    missing_model = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 300,
+            "total_output_tokens": 150,
+            "llm_call_count": 1,
+        },
+        provider="anthropic",
+        model=None,
+    )
+
+    result = _compute_llm_cost_pricing_coverage([missing_provider, missing_model])
+
+    assert result["priced_tasks"] == 0
+    assert result["unpriced_tasks"] == 0
+    assert result["unattributed_tasks"] == 2
+    assert result["coverage_fraction"] == 0.0
+    assert result["unpriced_combos"] == []
+
+
 def test_compute_llm_cost_breakdown_priced_and_unpriced():
     """Mixed priced/unpriced tasks across two providers and one unknown model."""
     import uuid
@@ -3048,6 +3125,53 @@ async def test_unpriced_alert_dedups_on_stable_degraded_state(db_session, mocker
     assert first is True
     assert second is None  # deduped on the persisted marker
     assert len(await _unpriced_alerts(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_unpriced_alert_uses_attempt_provider_model(db_session, mocker):
+    """Priced current attempts must not hide unpriced banked retry attempts."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    for i in range(UNPRICED_ALERT_MIN_TASKS):
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            api_call_summary={
+                "total_input_tokens": 500 + i,
+                "total_output_tokens": 200,
+                "llm_call_count": 2,
+            },
+            provider="fakeprovider",
+            model="fake-model-x",
+            vm_provisioned_at=now - timedelta(minutes=10 + i),
+        )
+        db_session.add(task)
+        await db_session.flush()
+        bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+
+        task.status = TaskStatus.COMPLETED
+        task.api_call_summary = {
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 3,
+        }
+        task.provider = "anthropic"
+        task.model = "claude-sonnet-4-6"
+
+    await db_session.commit()
+
+    fired = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+
+    assert fired is True
+    alerts = await _unpriced_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert "fakeprovider:fake-model-x" in alerts[0].message
+    assert "50%" in alerts[0].message
 
 
 @pytest.mark.asyncio

@@ -272,6 +272,13 @@ async def _load_recent_tasks(
                 Task.vm_machine_type,
                 Task.vm_provisioned_at,
                 Task.vm_stopped_at,
+                # Banked retry attribution must stay loaded so pricing and
+                # alerting see the full attempt history after projection.
+                Task.vm_runtime_cost_banked_db,
+                Task.llm_input_tokens_banked_db,
+                Task.llm_output_tokens_banked_db,
+                Task.llm_call_count_banked_db,
+                Task.attempt_history_db,
                 Task.vm_cold_start_ms,
                 Task.vm_warm_start,
                 Task.api_call_summary,
@@ -958,7 +965,13 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> float | None:
     total_cost = 0.0
     merged = 0
     for t in tasks:
-        for provider, model, input_tokens, output_tokens, _call_count in _task_llm_attempts(t):
+        for (
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            _call_count,
+        ) in _task_llm_attempts(t):
             if provider and model:
                 pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
                 if pricing:
@@ -1412,36 +1425,44 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
 def _compute_llm_cost_pricing_coverage(
     tasks: list[Task],
 ) -> Dict[str, Any]:
-    """Coverage diagnostic: how many token-bearing tasks have a pricing entry.
+    """Coverage diagnostic: how many token-bearing attempt rows have pricing.
 
-    A task is "priceable" when it has non-zero total tokens AND a non-null
-    (provider, model). A priceable task is "priced" when (provider, model) is
-    in LLM_TOKEN_PRICING; otherwise it is "unpriced" and silently contributes
-    zero to llm_cost_per_merged_pr.
+    An attempt is "priceable" when it has non-zero tokens AND a non-null
+    (provider, model). A priceable attempt is "priced" when (provider, model)
+    is in LLM_TOKEN_PRICING; otherwise it is "unpriced" and silently
+    contributes zero to llm_cost_per_merged_pr. Token-bearing attempts with
+    missing provider or model are counted explicitly as unattributed.
     """
     priced = 0
     unpriced = 0
     unattributed = 0
     unpriced_combos: list[str] = []
     for t in tasks:
-        input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
-        has_tokens = (input_tokens + output_tokens) > 0
-        if not has_tokens:
-            continue
-        if not t.provider or not t.model:
-            unattributed += 1
-            continue
-        key = (t.provider.lower(), t.model.lower())
-        if key in LLM_TOKEN_PRICING:
-            priced += 1
-        else:
-            unpriced += 1
-            combo = f"{t.provider.lower()}:{t.model.lower()}"
-            if (
-                combo not in unpriced_combos
-                and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
-            ):
-                unpriced_combos.append(combo)
+        for (
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            _call_count,
+        ) in _task_llm_attempts(t):
+            if input_tokens <= 0 and output_tokens <= 0:
+                continue
+            if not provider or not model:
+                unattributed += 1
+                continue
+            provider = provider.lower()
+            model = model.lower()
+            key = (provider, model)
+            if key in LLM_TOKEN_PRICING:
+                priced += 1
+            else:
+                unpriced += 1
+                combo = f"{provider}:{model}"
+                if (
+                    combo not in unpriced_combos
+                    and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
+                ):
+                    unpriced_combos.append(combo)
     priceable = priced + unpriced + unattributed
     coverage_fraction: float | None = (
         round(priced / priceable, 4) if priceable else None
