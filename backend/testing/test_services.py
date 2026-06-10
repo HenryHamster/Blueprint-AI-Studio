@@ -1431,6 +1431,52 @@ async def test_cost_ceiling_disabled_ignores_compute_spend(cost_db, mocker):
     assert len(alerts) == 0
 
 
+@pytest.mark.asyncio
+async def test_cost_ceiling_includes_running_vm_cost(cost_db, mocker):
+    """An in-flight VM (vm_stopped_at=None) on a larger machine type is estimated to
+    now and included in the daily total. Proves both live-VM inclusion and
+    machine-type-correct pricing: e2-standard-8 2-hour on-demand cost (~$0.536) crosses
+    a $0.20 ceiling that e2-standard-2 2-hour pricing (~$0.134) would miss."""
+    project = await _make_project(cost_db)
+
+    # Background in-flight task: e2-standard-8, running for 2+ hours, still running.
+    # e2-standard-8 on-demand = $0.268/hr → ~2h ≈ $0.536 >> $0.20 ceiling.
+    # e2-standard-2 on-demand = $0.067/hr → ~2h ≈ $0.134 < $0.20 (old code would miss it).
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    running_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=None,
+        vm_spot=False,
+        vm_machine_type="e2-standard-8",
+    )
+    cost_db.add(running_task)
+    await cost_db.commit()
+
+    # Current task (the trigger): minimal cost on its own, just finished.
+    current_task = _make_cost_task(project.id, vm_secs=60, is_spot=False)
+    cost_db.add(current_task)
+    await cost_db.commit()
+    await cost_db.refresh(current_task)
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.20}):
+        await _check_daily_cost_ceiling(current_task, cost_db)
+
+    await cost_db.flush()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, (
+        "Expected alert: e2-standard-8 2-hour in-flight cost should exceed $0.20 ceiling"
+    )
+    assert alerts[0].title == "Daily cost ceiling exceeded"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _run_auto_archive_cycle — age cap + per-project count cap
 # ══════════════════════════════════════════════════════════════════════════════

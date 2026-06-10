@@ -10,12 +10,13 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
-from app.models import Alert, AlertSeverity, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Task, TaskStatus, get_task_total_vm_cost_usd
 from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
@@ -32,43 +33,55 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
     Deduplicated: only one undismissed 'Daily cost ceiling exceeded' alert per
     project is created regardless of how many times this is called.
     """
-    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
-
     ceiling = float(_runtime_config.get("daily_cost_ceiling_usd", 0))
     if ceiling <= 0:
         return
 
-    today_start = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-    )
-    # Exclude current task from DB query to avoid double-counting (its vm_stopped_at
-    # was just set in-memory and may be flushed before the query runs).
-    rows = (
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Query tasks with an active VM today: still running (vm_stopped_at IS NULL)
+    # or stopped within today's window. Exclude current task to avoid double-counting
+    # (its vm_stopped_at was just set in-memory and may be flushed before the query runs).
+    db_tasks = (
         await session.execute(
-            select(Task.vm_provisioned_at, Task.vm_stopped_at, Task.vm_spot).where(
+            select(Task)
+            .options(
+                load_only(
+                    Task.vm_provisioned_at,
+                    Task.vm_stopped_at,
+                    Task.vm_spot,
+                    Task.vm_machine_type,
+                    Task.vm_runtime_cost_banked_db,
+                    Task.context,
+                )
+            )
+            .where(
                 Task.project_id == task.project_id,
                 Task.id != task.id,
-                Task.vm_stopped_at >= today_start,
                 Task.vm_provisioned_at.is_not(None),
+                or_(
+                    Task.vm_stopped_at.is_(None),
+                    Task.vm_stopped_at >= today_start,
+                ),
             )
         )
-    ).all()
+    ).scalars().all()
 
     daily_total = 0.0
-    for prov_at, stop_at, is_spot in rows:
-        if prov_at and stop_at:
-            secs = (stop_at - prov_at).total_seconds()
-            rate = SPOT_RATE if is_spot else ON_DEMAND_RATE
-            daily_total += secs * rate
+    for t in db_tasks:
+        if t.vm_stopped_at is None:
+            # In-flight: estimate cost to now using machine-type-aware helper
+            daily_total += get_task_total_vm_cost_usd(t, stopped_at=now)
+        else:
+            daily_total += get_task_total_vm_cost_usd(t)
 
     # Always include the current task's cost explicitly (it is in-memory, not yet committed).
-    if (
-        task.vm_provisioned_at
-        and task.vm_stopped_at
-        and task.vm_stopped_at >= today_start
-    ):
-        secs = (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
-        daily_total += secs * (SPOT_RATE if task.vm_spot else ON_DEMAND_RATE)
+    if task.vm_provisioned_at:
+        if task.vm_stopped_at and task.vm_stopped_at >= today_start:
+            daily_total += get_task_total_vm_cost_usd(task)
+        elif task.vm_stopped_at is None:
+            daily_total += get_task_total_vm_cost_usd(task, stopped_at=now)
 
     vm_total = daily_total
 
@@ -144,6 +157,8 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                             Task.vm_provisioned_at,
                             Task.vm_stopped_at,
                             Task.vm_spot,
+                            Task.vm_machine_type,
+                            Task.vm_runtime_cost_banked_db,
                             Task.status,
                             Task.id,
                             Task.context,
@@ -153,8 +168,11 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                     .where(
                         Task.project_id == task.project_id,
                         Task.id != task.id,
-                        Task.vm_stopped_at >= today_start,
                         Task.vm_provisioned_at.is_not(None),
+                        or_(
+                            Task.vm_stopped_at.is_(None),
+                            Task.vm_stopped_at >= today_start,
+                        ),
                     )
                 )
             )
@@ -163,10 +181,12 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         )
         cost_by_failure_class: dict[str, float] = {}
         for t in [*list(cost_rows), task]:
-            if not (t.vm_provisioned_at and t.vm_stopped_at):
+            if not t.vm_provisioned_at:
                 continue
-            secs = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+            if t.vm_stopped_at is None:
+                t_cost = get_task_total_vm_cost_usd(t, stopped_at=now)
+            else:
+                t_cost = get_task_total_vm_cost_usd(t)
             status_val = getattr(t.status, "value", None) or (
                 t.status if isinstance(t.status, str) else "UNKNOWN"
             )
@@ -176,7 +196,7 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                 else status_val
             )
             cost_by_failure_class[bucket] = round(
-                cost_by_failure_class.get(bucket, 0.0) + secs * rate, 4
+                cost_by_failure_class.get(bucket, 0.0) + t_cost, 4
             )
         _budget_future = asyncio.ensure_future(
             dispatch_external_notification(

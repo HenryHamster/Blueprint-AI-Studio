@@ -451,11 +451,11 @@ async def _check_project_spend_ceiling(
 ) -> None:
     """Raise ComputeLaunchPreconditionFailed when launching would breach the project ceiling.
 
-    Computes rolling spend as settled terminal-job costs in the last 24 h plus
-    in-flight accrued costs across all active jobs for this project. If that
-    total plus the requested cap would exceed the configured
-    ``daily_spend_ceiling_usd``, the launch is rejected before any row is
-    written. The check is skipped when no ceiling is configured.
+    Computes total 24h spend as: settled terminal-job costs + in-flight accrued
+    compute costs + agent-VM/LLM task spend (via compute_project_window_spend_usd).
+    If that total plus the requested cap would exceed the configured
+    ``daily_spend_ceiling_usd``, the launch is rejected before any row is written.
+    The check is skipped when no ceiling is configured.
     """
     project = await session.get(Project, project_id)
     ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd") if project else None
@@ -473,17 +473,27 @@ async def _check_project_spend_ceiling(
         )
     )
     inflight = float(inflight_result.scalar_one() or 0.0)
-    rolling = settled + inflight
+    compute_rolling = settled + inflight
+    # Add agent-VM + LLM spend to get total cross-lane project spend. This helper
+    # covers Task-based costs only and does NOT include ComputeJob spend, so there
+    # is no double-counting with compute_rolling above.
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    task_spend = await compute_project_window_spend_usd(session, project_id)
+    rolling = compute_rolling + task_spend
     if rolling + requested_cap_usd > ceiling_usd:
         raise ComputeLaunchPreconditionFailed(
             {
                 "error": "project_spend_ceiling_exceeded",
                 "message": (
-                    f"project rolling 24h compute spend ${rolling:.4f} plus requested "
-                    f"cap ${requested_cap_usd:.4f} would exceed configured ceiling "
-                    f"${ceiling_usd:.4f}"
+                    f"project rolling 24h total spend ${rolling:.4f} (compute: "
+                    f"${compute_rolling:.4f}, agent VM+LLM: ${task_spend:.4f}) plus "
+                    f"requested cap ${requested_cap_usd:.4f} would exceed configured "
+                    f"ceiling ${ceiling_usd:.4f}"
                 ),
                 "rolling_spend_usd": rolling,
+                "compute_spend_usd": compute_rolling,
+                "task_spend_usd": task_spend,
                 "requested_cap_usd": requested_cap_usd,
                 "ceiling_usd": ceiling_usd,
             }

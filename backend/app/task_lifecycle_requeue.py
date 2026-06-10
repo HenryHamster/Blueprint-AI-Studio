@@ -558,10 +558,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # Accumulate VM cost of prior failed attempts so the digest can compute
         # total compute burned on retries that eventually succeeded.
         try:
-            from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+            from app.vm_cost_rates import get_vm_rate_per_second
 
             if child.vm_provisioned_at and child.vm_stopped_at:
-                _rate = SPOT_RATE if child.vm_spot else ON_DEMAND_RATE
+                _rate = get_vm_rate_per_second(
+                    machine_type=child.vm_machine_type, spot=child.vm_spot
+                )
                 _attempt_cost = (
                     _rate
                     * (child.vm_stopped_at - child.vm_provisioned_at).total_seconds()

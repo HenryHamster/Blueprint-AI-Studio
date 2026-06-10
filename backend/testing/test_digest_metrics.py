@@ -1441,6 +1441,32 @@ def test_compute_digest_cost_economics_includes_compute_job_spend():
     assert result["daily_cost_usd"] == round(expected_vm + 2.5, 2)
 
 
+def test_compute_digest_cost_economics_includes_running_vm():
+    """An in-flight task (vm_stopped_at=None, vm_provisioned_at today) contributes
+    to daily_vm_cost_usd estimated to now rather than being treated as zero."""
+    now = _utcnow()
+    # Task provisioned 1 hour ago, still running (no vm_stopped_at)
+    running_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+        vm_spot=False,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=None,
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[running_task],
+        direction_progress_list=[],
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # 1 hour on-demand e2-standard-2 estimated to now ≈ $0.067
+    assert result["daily_vm_cost_usd"] > 0.0, (
+        "In-flight VM with vm_stopped_at=None should contribute to daily_vm_cost_usd"
+    )
+    assert result["daily_vm_cost_usd"] == pytest.approx(0.067, abs=0.005)
+
+
 def test_compute_digest_cost_economics_spot_on_demand_split():
     """Spot and on-demand task costs are split and totaled with known VM timing."""
     from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE

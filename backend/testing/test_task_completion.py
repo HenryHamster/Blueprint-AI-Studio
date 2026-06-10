@@ -3610,3 +3610,214 @@ def test_reconcile_revised_falls_back_to_challenge_issues_when_no_overlap():
     rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
     assert rec["state"] == "challenged_revised"
     assert rec["surviving_issues"] == chal_issues
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Security audit completion handler — idempotency under replay
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+_SECURITY_AUDIT_FINDINGS_JSON = json.dumps([
+    {
+        "severity": "critical",
+        "title": "SQL Injection in login endpoint",
+        "description": "User input is interpolated directly into SQL queries.",
+        "fix_prompt": "Parameterize all SQL queries in backend/app/routers/auth.py.",
+        "file_path": "backend/app/routers/auth.py",
+        "line_number": 42,
+    },
+    {
+        "severity": "high",
+        "title": "Missing auth check on admin endpoint",
+        "description": "The /admin/reset endpoint has no @require_role decorator.",
+        "fix_prompt": "Add @require_role decorator to the reset endpoint.",
+        "file_path": "backend/app/routers/admin.py",
+        "line_number": 87,
+    },
+])
+
+
+class TestHandleSecurityAuditCompletion:
+    """Tests for _handle_security_audit_completion focusing on idempotency."""
+
+    async def _run(self, db_session, mocker, task, logs=None):
+        from app.task_completion import _handle_security_audit_completion
+
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_open_pull_requests",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        mocker.patch("app.task_completion._runtime_config", {})
+        mocker.patch(
+            "app.task_completion._maybe_release_safeguard_gate",
+            new_callable=AsyncMock,
+        )
+        if logs is None:
+            logs = _SECURITY_AUDIT_FINDINGS_JSON
+        await _handle_security_audit_completion(task, logs, db_session)
+
+    @pytest.mark.asyncio
+    async def test_security_audit_completion_replay_spawns_no_duplicate_children(
+        self, db_session, mocker
+    ):
+        """Replaying _handle_security_audit_completion when children already exist
+        must not spawn duplicates — the already-spawned guard must fire."""
+        from sqlmodel import select as sqlmodel_select
+        from app.models import Task as TaskModel
+
+        project = make_project(name="SecurityAuditIdempotencyProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        audit_task = make_task(
+            project_id=project.id,
+            title="security_audit: main",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "security_audit", "prompt": "audit", "base_branch": "main"}],
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        # Simulate prior attempt: pre-commit children with the security_audit_task_id
+        # context key (as if the first attempt committed children but crashed before
+        # flipping the parent to EVALUATING).
+        prior_child = make_task(
+            project_id=project.id,
+            title="[CRITICAL] SQL Injection fix",
+            status=TaskStatus.QUEUED,
+            parent_task_id=audit_task.id,
+            context={"security_audit_task_id": str(audit_task.id), "finding_index": 0},
+            payloads=[{"type": "create", "prompt": "fix sql injection", "base_branch": "main"}],
+        )
+        db_session.add(prior_child)
+        await db_session.commit()
+        await db_session.refresh(prior_child)
+
+        # Invoke the handler a second time (replay)
+        await self._run(db_session, mocker, audit_task)
+
+        # Exactly one child should exist — the pre-existing one; no new ones spawned
+        children = (
+            await db_session.execute(
+                sqlmodel_select(TaskModel).where(TaskModel.parent_task_id == audit_task.id)
+            )
+        ).scalars().all()
+        assert len(children) == 1, (
+            f"Expected 1 child (pre-existing), got {len(children)} — duplicate children spawned on replay"
+        )
+
+        # Parent must be EVALUATING after the replay completes remaining effects
+        await db_session.refresh(audit_task)
+        assert audit_task.status == TaskStatus.EVALUATING, (
+            f"Expected parent EVALUATING after replay, got {audit_task.status}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_security_audit_children_and_evaluating_committed_atomically(
+        self, db_session, mocker
+    ):
+        """Children and parent EVALUATING flip must land in a single commit so a crash
+        between commits cannot leave COMPLETED parent with committed children."""
+        from sqlmodel import select as sqlmodel_select
+        from app.models import Task as TaskModel
+
+        project = make_project(name="SecurityAuditAtomicCommitProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        audit_task = make_task(
+            project_id=project.id,
+            title="security_audit: atomic",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "security_audit", "prompt": "audit", "base_branch": "main"}],
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        commit_count = 0
+        original_commit = db_session.commit
+
+        async def counting_commit():
+            nonlocal commit_count
+            commit_count += 1
+            await original_commit()
+
+        mocker.patch.object(db_session, "commit", side_effect=counting_commit)
+
+        await self._run(db_session, mocker, audit_task)
+
+        await db_session.refresh(audit_task)
+        children = (
+            await db_session.execute(
+                sqlmodel_select(TaskModel).where(TaskModel.parent_task_id == audit_task.id)
+            )
+        ).scalars().all()
+
+        # When children exist, parent must be EVALUATING — proved by one commit only
+        # in the spawn+flip path (the plan_output save at top + one final commit)
+        assert audit_task.status == TaskStatus.EVALUATING
+        assert len(children) == 2  # 2 actionable findings (critical + high)
+        # The critical constraint: at most 2 commits total (plan_output save + spawn+flip)
+        # NOT 3 separate commits (children, history, parent flip separately)
+        assert commit_count <= 2, (
+            f"Expected ≤2 commits (plan_output + atomic spawn+flip), got {commit_count}. "
+            "A COMPLETED parent with committed children is a race window for duplicate spawns."
+        )
+
+    @pytest.mark.asyncio
+    async def test_security_audit_no_children_when_no_actionable_findings(
+        self, db_session, mocker
+    ):
+        """When findings contain no critical/high items, no children are spawned and
+        the parent is marked COMPLETED directly (not EVALUATING)."""
+        from sqlmodel import select as sqlmodel_select
+        from app.models import Task as TaskModel
+
+        project = make_project(name="SecurityAuditNoActionableProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        audit_task = make_task(
+            project_id=project.id,
+            title="security_audit: low only",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "security_audit", "prompt": "audit", "base_branch": "main"}],
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        low_only_logs = json.dumps([
+            {
+                "severity": "low",
+                "title": "Minor logging issue",
+                "description": "Log level inconsistency.",
+                "fix_prompt": "Fix logging levels.",
+                "file_path": "backend/app/main.py",
+                "line_number": 10,
+            }
+        ])
+
+        await self._run(db_session, mocker, audit_task, logs=low_only_logs)
+
+        await db_session.refresh(audit_task)
+        children = (
+            await db_session.execute(
+                sqlmodel_select(TaskModel).where(TaskModel.parent_task_id == audit_task.id)
+            )
+        ).scalars().all()
+
+        assert len(children) == 0
+        assert audit_task.status == TaskStatus.COMPLETED

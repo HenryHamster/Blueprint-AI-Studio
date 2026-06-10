@@ -30,6 +30,7 @@ from app.models import (
     TaskWakeRegistration,
     WakeDeliveryState,
     ReleaseVersion,
+    get_task_total_vm_cost_usd,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
 # Remediation funnel + recurring-failure-pattern helpers relocated to their own
@@ -3297,18 +3298,22 @@ def compute_digest_cost_economics(
     )
 
     # Compute today's cost for cost ceiling warning. The VM figure comes from
-    # task VM-runtime; off-VM compute-job spend is passed in pre-aggregated by
+    # task VM-runtime (using the machine-type-aware helper so larger instances are
+    # costed correctly); off-VM compute-job spend is passed in pre-aggregated by
     # the caller (admin_digest) from the ComputeJob ledger so daily_cost_usd
     # means total spend, not just VM runtime.
+    # In-flight tasks (vm_stopped_at IS NULL) are estimated to now so the figure
+    # is current rather than lagging until the task eventually stops.
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     daily_vm_cost_usd = round(
         sum(
-            ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
-            * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            get_task_total_vm_cost_usd(
+                t,
+                stopped_at=now if t.vm_stopped_at is None else None,
+            )
             for t in all_tasks
-            if t.vm_provisioned_at
-            and t.vm_stopped_at
-            and t.vm_stopped_at >= today_start
+            if t.vm_provisioned_at is not None
+            and (t.vm_stopped_at is None or t.vm_stopped_at >= today_start)
         ),
         2,
     )

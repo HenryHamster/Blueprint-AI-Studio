@@ -3446,6 +3446,35 @@ async def _find_last_strategic_cycle_time(
     return task.updated_at or task.created_at
 
 
+async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
+    """Return True if a repo_bootstrap task is still in-flight for this project.
+
+    False for self-repo projects and for projects whose bootstrap has already
+    completed (``bootstrap_completed_at`` is set).  A terminal bootstrap
+    (FAILED / COMPLETED / …) also returns False so a permanently degraded
+    bootstrap never deadlocks autonomous spawning.
+    """
+    _build_cfg = project.build_config or {}
+    if _build_cfg.get("bootstrap_completed_at") or project.is_self_repo:
+        return False
+    pending = (
+        await session.execute(
+            select(Task.id)
+            .where(
+                Task.project_id == project.id,
+                Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                Task.status.in_([
+                    TaskStatus.QUEUED,
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                ]),
+            )
+            .limit(1)
+        )
+    ).first()
+    return pending is not None
+
+
 async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
@@ -3459,6 +3488,15 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     if await _has_active_strategic_task(project.id, session):
         logger.warning(
             f"[STRATEGIC] Skipping design doc update — strategic task already active for {project.id}"
+        )
+        return False
+
+    # Guard: defer architecture cycles until repo_bootstrap completes.
+    if await _bootstrap_pending(project, session):
+        logger.info(
+            "[STRATEGIC] Deferring design doc update for project %s — "
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+            project.id,
         )
         return False
 
@@ -3715,30 +3753,13 @@ async def _spawn_strategic_review(
     # If bootstrap_completed_at is unset AND there is a pending bootstrap task,
     # this project is still being onboarded — skip this cycle. If bootstrap has
     # FAILED or is otherwise terminal, proceed gracefully (degraded path).
-    _build_cfg = project.build_config or {}
-    if not _build_cfg.get("bootstrap_completed_at") and not project.is_self_repo:
-        _pending_bootstrap = (
-            await session.execute(
-                select(Task.id)
-                .where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
-                    Task.status.in_([
-                        TaskStatus.QUEUED,
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                    ]),
-                )
-                .limit(1)
-            )
-        ).first()
-        if _pending_bootstrap is not None:
-            logger.info(
-                "[STRATEGIC] Deferring strategic review for project %s — "
-                "repo_bootstrap task is pending (bootstrap_completed_at not set)",
-                project.id,
-            )
-            return False
+    if await _bootstrap_pending(project, session):
+        logger.info(
+            "[STRATEGIC] Deferring strategic review for project %s — "
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+            project.id,
+        )
+        return False
 
     # Build direction stats with rich data. Include `active` + `paused` +
     # `proposed`: paused entries are a strong user signal the strategic agent

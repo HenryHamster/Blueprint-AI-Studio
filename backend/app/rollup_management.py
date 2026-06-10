@@ -642,9 +642,12 @@ def _build_rollup_pr_body(
             prov_at = getattr(c, "vm_provisioned_at", None)
             stop_at = getattr(c, "vm_stopped_at", None)
             if prov_at and stop_at:
-                from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+                from app.vm_cost_rates import get_vm_rate_per_second
 
-                rate = SPOT_RATE if getattr(c, "vm_spot", False) else ON_DEMAND_RATE
+                rate = get_vm_rate_per_second(
+                    machine_type=getattr(c, "vm_machine_type", None),
+                    spot=getattr(c, "vm_spot", False),
+                )
                 total_cost += (stop_at - prov_at).total_seconds() * rate
                 has_cost = True
         if type_counts:

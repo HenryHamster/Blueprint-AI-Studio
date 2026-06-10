@@ -1905,3 +1905,148 @@ async def test_existing_pr_merged_persists_stranded_marker_through_reset(
     assert STRANDED_LANDING_REASON_KEY in ctx
     assert ctx.get("pr_merged") is None
     assert parent.status == TaskStatus.EVALUATING
+
+
+def test_rollup_summary_cost_uses_machine_type_rate():
+    """_build_rollup_pr_body scales cost by machine-type rate, not the global default.
+
+    A child with vm_machine_type='e2-standard-4' (2× the e2-standard-2 rate) must
+    produce exactly 2× the cost of an identical child on the default machine type.
+    This proves that machine-type-aware helper is used rather than the old
+    hardcoded e2-standard-2 constants.
+    """
+    from types import SimpleNamespace
+    from datetime import datetime, timedelta
+    from app.rollup_management import _build_rollup_pr_body
+    from app.vm_cost_rates import get_vm_rate_per_second
+
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    runtime_secs = 100_000  # long enough that 2-decimal rounding preserves 2:1 ratio
+    t1 = t0 + timedelta(seconds=runtime_secs)
+
+    def _child(machine_type):
+        return SimpleNamespace(
+            payloads=[{"type": "create"}],
+            vm_provisioned_at=t0,
+            vm_stopped_at=t1,
+            vm_spot=False,
+            vm_machine_type=machine_type,
+        )
+
+    body_default = _build_rollup_pr_body(1, "test/branch", children=[_child("e2-standard-2")])
+    body_large = _build_rollup_pr_body(1, "test/branch", children=[_child("e2-standard-4")])
+
+    assert "Estimated cost" in body_default
+    assert "Estimated cost" in body_large
+
+    expected_default = runtime_secs * get_vm_rate_per_second("e2-standard-2", spot=False)
+    expected_large = runtime_secs * get_vm_rate_per_second("e2-standard-4", spot=False)
+
+    # e2-standard-4 is priced at exactly 2× e2-standard-2
+    assert expected_large == pytest.approx(expected_default * 2, rel=1e-9)
+
+    assert f"~${expected_default:.2f}" in body_default, (
+        f"Expected cost ~${expected_default:.2f} not found in body: {body_default!r}"
+    )
+    assert f"~${expected_large:.2f}" in body_large, (
+        f"Expected cost ~${expected_large:.2f} not found in body: {body_large!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requeue_banked_cost_uses_machine_type_rate(cleanup_db, mocker):
+    """_requeue_parent_task accumulates _prior_attempts_cost using the child's
+    actual machine-type rate, not the legacy e2-standard-2 constant.
+
+    A child with vm_machine_type='e2-standard-4' (2× the e2-standard-2 rate) must
+    produce exactly 2× the banked cost of an identical child on the default machine
+    type. This proves the machine-type-aware get_vm_rate_per_second path is used in
+    the requeue cost accumulation, not a hardcoded constant.
+    """
+    from datetime import datetime, timedelta
+    from sqlalchemy import select
+
+    from app.models import Task
+    from app.task_lifecycle_requeue import _requeue_parent_task
+    from app.vm_cost_rates import get_vm_rate_per_second
+
+    # Patch side-effecting deps so tests observe only DB state.
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    session = cleanup_db
+    project = await _make_project(session)
+
+    runtime_secs = 100_000  # large enough that 2:1 ratio survives rounding
+
+    async def _run_requeue(machine_type):
+        """Build a fresh parent+child, call _requeue_parent_task, return the
+        cloned child's _prior_attempts_cost."""
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        t1 = t0 + timedelta(seconds=runtime_secs)
+
+        parent = await _make_task(
+            session,
+            project.id,
+            task_type="research",
+            status=TaskStatus.EVALUATING,
+            context={"_requeue_count": 0, "direction_id": "d-banked-cost-test"},
+            plan_output="some plan",
+        )
+
+        child = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "do work"}],
+            status=TaskStatus.FAILED,
+            parent_task_id=parent.id,
+            latest_status_message="Process exited with code 1",
+            vm_provisioned_at=t0,
+            vm_stopped_at=t1,
+            vm_spot=False,
+            vm_machine_type=machine_type,
+            context={"failure_category": "claude_code_failed"},
+        )
+        session.add(child)
+        await session.commit()
+        await session.refresh(child)
+
+        await _requeue_parent_task(parent, session)
+        await session.commit()
+
+        # Find the cloned (QUEUED) child created by the requeue.
+        clones = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.parent_task_id == parent.id,
+                        Task.status == TaskStatus.QUEUED,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(clones) == 1, (
+            f"Expected exactly 1 QUEUED clone after requeue, got {len(clones)}"
+        )
+        return float((clones[0].context or {}).get("_prior_attempts_cost", 0.0))
+
+    cost_default = await _run_requeue("e2-standard-2")
+    cost_large = await _run_requeue("e2-standard-4")
+
+    # Sanity-check the expected values derived from the shared rate table.
+    rate_default = get_vm_rate_per_second("e2-standard-2", spot=False)
+    rate_large = get_vm_rate_per_second("e2-standard-4", spot=False)
+    expected_default = round(runtime_secs * rate_default, 6)
+    expected_large = round(runtime_secs * rate_large, 6)
+
+    assert expected_large == pytest.approx(expected_default * 2, rel=1e-9), (
+        "e2-standard-4 rate must be exactly 2× e2-standard-2 rate"
+    )
+    assert cost_default == pytest.approx(expected_default, rel=1e-6), (
+        f"Banked cost for e2-standard-2 child: expected {expected_default}, got {cost_default}"
+    )
+    assert cost_large == pytest.approx(expected_large, rel=1e-6), (
+        f"Banked cost for e2-standard-4 child: expected {expected_large}, got {cost_large}; "
+        "machine-type rate may not be applied correctly in _requeue_parent_task"
+    )

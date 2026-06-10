@@ -7782,6 +7782,129 @@ async def test_create_compute_job_ceiling_counts_active_inflight_spend(db_sessio
     assert detail["rolling_spend_usd"] == pytest.approx(4.50)
 
 
+@pytest.mark.asyncio
+async def test_create_compute_job_ceiling_counts_agent_vm_spend(db_session):
+    """Cross-lane: agent-VM/LLM spend alone (zero compute) blocks a compute launch.
+
+    A project with no compute jobs but $4.50 of agent-VM/LLM spend should block
+    a new compute launch when 4.50 + 1.00 cap = 5.50 > 5.00 ceiling.
+    """
+    project = _make_project_with_ceiling(5.0)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # No compute jobs at all — mock agent-VM/LLM window spend at $4.50.
+    # 0.0 compute + 4.50 task + 1.00 cap = 5.50 > 5.00 → blocked.
+    with patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=AsyncMock(return_value=4.50),
+    ):
+        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task,
+                command="echo cross-lane ceiling",
+                machine_type="e2-standard-2",
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+            )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_spend_ceiling_exceeded"
+    assert detail["ceiling_usd"] == pytest.approx(5.0)
+    # rolling = compute(0.0) + task(4.50) = 4.50; rolling + cap = 5.50 > ceiling
+    assert detail["rolling_spend_usd"] == pytest.approx(4.50)
+    assert detail["task_spend_usd"] == pytest.approx(4.50)
+    assert detail["compute_spend_usd"] == pytest.approx(0.0)
+    assert detail["requested_cap_usd"] == pytest.approx(1.0)
+
+    # No active compute job row should exist.
+    jobs = (
+        await db_session.execute(
+            select(ComputeJob).where(
+                ComputeJob.project_id == project.id,
+                ComputeJob.status.in_([
+                    ComputeJobStatus.QUEUED, ComputeJobStatus.STARTING,
+                    ComputeJobStatus.RUNNING, ComputeJobStatus.POLLING,
+                ]),
+            )
+        )
+    ).scalars().all()
+    assert jobs == [], "no compute job should be created when agent-VM spend exceeds ceiling"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_ceiling_no_double_count(db_session):
+    """Compute spend and agent-VM spend are summed without overlap.
+
+    A project with $3.00 settled compute spend + $1.50 agent-VM/LLM spend =
+    $4.50 total.  Adding a $1.00 cap → 5.50 > 5.00 → blocked.  Reducing the
+    task spend to $0.00 (5.00 + 0.00 + 1.00 = 6.00 > 5.00... wait, still
+    blocked).  Use $0.50 task spend: 3.00 + 0.50 + 1.00 = 4.50 < 5.00 → allowed.
+    """
+    project = _make_project_with_ceiling(5.0)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # $3.00 settled compute spend.
+    await _make_terminal_job(db_session, project_id=project.id, final_cost_usd=3.00)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # With $0.50 agent-VM spend: 3.00 + 0.50 + 1.00 = 4.50 < 5.00 → allowed.
+    with patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=AsyncMock(return_value=0.50),
+    ):
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo no double count under",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+    assert job.status == ComputeJobStatus.QUEUED
+
+    # Now block new task: 3.00 settled + 1.50 agent-VM + 1.00 cap = 5.50 > 5.00.
+    task2 = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    with patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=AsyncMock(return_value=1.50),
+    ):
+        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task2,
+                command="echo no double count over",
+                machine_type="e2-standard-2",
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+            )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_spend_ceiling_exceeded"
+    # Total = 3.00 compute (settled) + QUEUED job's accrued 0 + 1.50 agent = 4.50
+    # But the QUEUED job from above adds to inflight accrued_cost_usd (0.0).
+    assert detail["compute_spend_usd"] == pytest.approx(3.0)
+    assert detail["task_spend_usd"] == pytest.approx(1.50)
+    assert detail["rolling_spend_usd"] == pytest.approx(4.50)
+
+
 # ---------------------------------------------------------------------------
 # Per-project compute-job concurrency cap tests
 # ---------------------------------------------------------------------------

@@ -533,6 +533,133 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
     assert len(result.scalars().all()) == 0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. _spawn_research_task — Bootstrap-Pending Guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _active_direction_with_cooldown_elapsed(direction_id: str, text: str = "Research direction") -> dict:
+    """Return an active direction whose last_researched_at is well past cooldown."""
+    return {
+        **_active_direction(direction_id, text),
+        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_research_spawn_defers_while_external_repo_bootstrap_pending(db_session):
+    """_spawn_research_task defers (no task created) while a repo_bootstrap is in-flight.
+
+    This is the acceptance test for the bootstrap-pending guard added to
+    _spawn_research_task_inner.  An external-repo project whose
+    build_config.bootstrap_completed_at is unset and has an active
+    repo_bootstrap task must not spawn research work.
+    """
+    direction = _active_direction_with_cooldown_elapsed("d-bootstrap-defer", "Ungrounded research")
+    project = Project(
+        name="Bootstrap Pending Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_strategic_failures": 3},
+        build_config={},  # bootstrap_completed_at not set
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Simulate an in-flight repo_bootstrap task
+    bootstrap_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "repo_bootstrap"}],
+    )
+    db_session.add(bootstrap_task)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    assert result.scalars().first() is None, (
+        "No research task should be created while repo_bootstrap is in-flight"
+    )
+
+
+@pytest.mark.asyncio
+async def test_research_spawn_proceeds_when_external_repo_bootstrap_completed(db_session):
+    """_spawn_research_task proceeds normally once bootstrap_completed_at is set."""
+    direction = _active_direction_with_cooldown_elapsed("d-bootstrap-ok", "Grounded research")
+    project = Project(
+        name="Bootstrap Complete Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_strategic_failures": 3},
+        build_config={"bootstrap_completed_at": "2026-01-01T00:00:00"},
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    assert result.scalars().first() is not None, (
+        "A research task should be created once bootstrap is complete"
+    )
+
+
+@pytest.mark.asyncio
+async def test_research_spawn_proceeds_for_self_repo_regardless_of_bootstrap(db_session):
+    """_spawn_research_task is not gated on bootstrap for self-repo projects."""
+    direction = _active_direction_with_cooldown_elapsed("d-self-repo", "Self-repo research")
+    project = Project(
+        name="Self Repo Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_strategic_failures": 3},
+        build_config={},  # bootstrap_completed_at not set
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Even with an active repo_bootstrap task, self-repo projects are unaffected
+    bootstrap_task = Task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "repo_bootstrap"}],
+    )
+    db_session.add(bootstrap_task)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    assert result.scalars().first() is not None, (
+        "Self-repo projects should not be gated on bootstrap completion"
+    )
+
+
 @pytest.mark.asyncio
 async def test_blocked_research_lane_keeps_direction_out_of_respawn(db_session):
     """A direction whose prior research task is BLOCKED on an upstream

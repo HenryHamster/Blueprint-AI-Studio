@@ -586,6 +586,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     "paused while the research circuit breaker is open",
                 )
                 return  # Back to cooldown
+    # Guard: defer autonomous research until repo_bootstrap completes for external-repo
+    # projects. Strategic cycles already defer this way; keeping research consistent
+    # prevents ungrounded findings against a half-onboarded repo. Terminal bootstraps
+    # (FAILED/COMPLETED) proceed gracefully so a degraded bootstrap never deadlocks.
+    from app.strategic_spawning import _bootstrap_pending
+    if await _bootstrap_pending(project, session):
+        logger.info(
+            "[AUTONOMOUS] Deferring research spawn for project %s — "
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+            project.id,
+        )
+        return
+
     # Guard: must have active directions that aren't in cooldown or mid-cycle
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     now = _utcnow()

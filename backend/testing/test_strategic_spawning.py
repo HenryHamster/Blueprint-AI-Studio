@@ -1599,6 +1599,62 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
     assert tasks[0].status == TaskStatus.QUEUED
 
 
+# ── Bootstrap-pending guard in _spawn_design_doc_update ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_defers_while_bootstrap_pending(db_session):
+    """_spawn_design_doc_update returns False while a repo_bootstrap task is in-flight."""
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        build_config={},  # bootstrap_completed_at not set
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a pending repo_bootstrap task for this project
+    bootstrap_task = Task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "repo_bootstrap"}],
+    )
+    db_session.add(bootstrap_task)
+    await db_session.commit()
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+
+    assert spawned is False
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "design_doc_update",
+        )
+    )
+    assert result.scalars().first() is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_proceeds_when_bootstrap_completed(db_session):
+    """_spawn_design_doc_update proceeds normally when bootstrap_completed_at is set."""
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        build_config={"bootstrap_completed_at": "2026-01-01T00:00:00"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    assert tasks[0].payloads[0]["type"] == "design_doc_update"
+    assert tasks[0].status == TaskStatus.QUEUED
+
+
 @pytest.mark.asyncio
 async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_self_repo(
     db_session,

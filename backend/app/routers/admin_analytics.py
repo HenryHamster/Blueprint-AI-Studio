@@ -238,7 +238,7 @@ def _task_estimated_cost_usd(task: Task) -> float | None:
     """Return the VM cost for a task, or None when timing data is incomplete."""
     if not task.vm_provisioned_at or not task.vm_stopped_at:
         return None
-    rate = get_vm_rate_per_second(spot=task.vm_spot)
+    rate = get_vm_rate_per_second(machine_type=task.vm_machine_type, spot=task.vm_spot)
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
 

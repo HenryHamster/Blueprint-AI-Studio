@@ -156,7 +156,7 @@ def _estimated_task_cost_usd(task: Task) -> Optional[float]:
     """Return the VM cost for a task, or None when timing data is incomplete."""
     if not task.vm_provisioned_at or not task.vm_stopped_at:
         return None
-    rate = get_vm_rate_per_second(spot=task.vm_spot)
+    rate = get_vm_rate_per_second(machine_type=task.vm_machine_type, spot=task.vm_spot)
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
 
@@ -1885,63 +1885,86 @@ async def _handle_security_audit_completion(
             )
             return
 
+    # Already-spawned guard: if a prior attempt committed children but died before
+    # flipping the parent to EVALUATING, a replay would re-parse the same findings
+    # and spawn duplicates. Detect that case and skip spawning.
+    existing_children = (
+        await session.execute(
+            select(Task).where(Task.parent_task_id == task.id)
+        )
+    ).scalars().all()
+    already_spawned = [
+        ct for ct in existing_children
+        if (ct.context or {}).get("security_audit_task_id") == str(task.id)
+    ]
+
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
     child_tasks = []
-    for i, finding in enumerate(actionable):
-        fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
-        if not fix_prompt:
-            continue
-        title = finding.get("title", f"Security fix #{i + 1}")
-        severity = finding.get("severity", "high")
-
-        new_task = Task(
-            project_id=task.project_id,
-            title=f"[{severity.upper()}] {title}",
-            description=finding.get("description", fix_prompt[:200]),
-            parent_task_id=task.id,
-            payloads=[
-                validate_internal_payload(
-                    {
-                        "type": "create",
-                        "prompt": fix_prompt,
-                        "base_branch": base_branch,
-                        **({"prompt_suffix": create_suffix} if create_suffix else {}),
-                    },
-                    "task_completion:security_finding",
-                )
-            ],
-            context={
-                "security_audit_task_id": str(task.id),
-                "finding_index": i,
-                "severity": severity,
-                "file_path": finding.get("file_path", ""),
-                "line_number": finding.get("line_number", 0),
-            },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-            status=TaskStatus.QUEUED,
-            created_by="ORCHESTRATOR",
-            requires_approval=False,  # review pipeline handles quality; only merge to main gates
-            depends_on=[],
+    if already_spawned:
+        # Replay path: children already committed in a prior attempt.
+        # Skip spawning; use existing children to complete remaining effects.
+        child_tasks = already_spawned
+        logger.info(
+            "[SECURITY AUDIT] Task %s replay: found %d already-spawned children, skipping re-spawn",
+            task.id,
+            len(child_tasks),
         )
-        session.add(new_task)
-        child_tasks.append(new_task)
+    else:
+        for i, finding in enumerate(actionable):
+            fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
+            if not fix_prompt:
+                continue
+            title = finding.get("title", f"Security fix #{i + 1}")
+            severity = finding.get("severity", "high")
 
-    await session.commit()
+            new_task = Task(
+                project_id=task.project_id,
+                title=f"[{severity.upper()}] {title}",
+                description=finding.get("description", fix_prompt[:200]),
+                parent_task_id=task.id,
+                payloads=[
+                    validate_internal_payload(
+                        {
+                            "type": "create",
+                            "prompt": fix_prompt,
+                            "base_branch": base_branch,
+                            **({"prompt_suffix": create_suffix} if create_suffix else {}),
+                        },
+                        "task_completion:security_finding",
+                    )
+                ],
+                context={
+                    "security_audit_task_id": str(task.id),
+                    "finding_index": i,
+                    "severity": severity,
+                    "file_path": finding.get("file_path", ""),
+                    "line_number": finding.get("line_number", 0),
+                },
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+                requires_approval=False,  # review pipeline handles quality; only merge to main gates
+                depends_on=[],
+            )
+            session.add(new_task)
+            child_tasks.append(new_task)
+
+        await session.flush()
+        for ct in child_tasks:
+            history = TaskHistory(
+                task_id=ct.id,
+                action="SPAWNED",
+                details={"spawned_by": "SECURITY_AUDIT", "parent_audit_id": str(task.id)},
+            )
+            session.add(history)
+
+    pending_broadcasts: list[tuple[str, str, dict]] = []
     for ct in child_tasks:
-        await session.refresh(ct)
-        history = TaskHistory(
-            task_id=ct.id,
-            action="SPAWNED",
-            details={"spawned_by": "SECURITY_AUDIT", "parent_audit_id": str(task.id)},
-        )
-        session.add(history)
-        await broadcast_to_project(
+        pending_broadcasts.append((
             str(task.project_id),
             "task_updated",
             {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
-        )
-
-    await session.commit()
+        ))
 
     # Post PR comment for medium/low findings that don't get auto-fixed
     informational = [f for f in findings if f.get("severity") in ("medium", "low")]
@@ -1993,7 +2016,19 @@ async def _handle_security_audit_completion(
         task.status = TaskStatus.COMPLETED
         task.latest_status_message = f"Security audit complete: no critical/high findings; {len(informational)} medium/low surfaced as PR comment"
     session.add(task)
+    # Single atomic commit: children INSERTs + parent status flip land together.
+    # A crash before this point leaves no children (nothing was committed), so
+    # the replay guard above fires only when children truly exist from a prior
+    # committed attempt — making replay safe either way.
     await session.commit()
+
+    for project_id, event_name, payload in pending_broadcasts:
+        try:
+            await broadcast_to_project(project_id, event_name, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[SECURITY AUDIT] Failed to broadcast {event_name} for {payload.get('task_id')}: {exc}"
+            )
 
     await broadcast_to_project(
         str(task.project_id),
