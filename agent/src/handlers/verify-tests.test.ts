@@ -63,24 +63,28 @@ import { persistAndPostStatus, execFileAsync } from '../index.js';
 import { detectTestRunners, detectAutoTestRunners, detectAcceptanceProbes, discoverDocumentedCommands } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
 
+// Must match process.env.AGENT_WORKSPACE so describeRunnerDirectory (which reads
+// that env var at module load time in test-runners.ts) strips the right prefix.
+const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+
 const PY_PROBE = {
-  cmd: 'python3', args: ['-m', 'compileall', '-q', '/tmp/workspace'],
-  cwd: '/tmp/workspace', ecosystem: 'python' as const, label: 'python3 -m compileall (root)',
+  cmd: 'python3', args: ['-m', 'compileall', '-q', WORKSPACE],
+  cwd: WORKSPACE, ecosystem: 'python' as const, label: 'python3 -m compileall (root)',
 };
 // An operator-declared build command probe (build_cmd).
 const DECLARED_PROBE = {
   cmd: 'npm', args: ['run', 'build'],
-  cwd: '/tmp/workspace/admin-ui', ecosystem: 'node' as const,
+  cwd: `${WORKSPACE}/admin-ui`, ecosystem: 'node' as const,
   label: 'npm run build (admin-ui)', declared: true,
 };
 
-const RUNNER = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
+const RUNNER = { cmd: 'npm', args: ['test'], cwd: WORKSPACE, label: 'npm test (root)' };
 // A stored runner pointing at a now-stale command (e.g. a dropped Makefile target).
-const STALE_RUNNER = { cmd: 'make', args: ['test'], cwd: '/tmp/workspace', label: 'make test (Makefile)' };
+const STALE_RUNNER = { cmd: 'make', args: ['test'], cwd: WORKSPACE, label: 'make test (Makefile)' };
 // A real replacement suite auto-detected at a different path/command.
 const REPLACEMENT_RUNNER = {
   cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'],
-  cwd: '/tmp/workspace/services/api', label: 'pytest (services/api)',
+  cwd: `${WORKSPACE}/services/api`, label: 'pytest (services/api)',
 };
 
 function lastPostedPayload(): Record<string, unknown> {

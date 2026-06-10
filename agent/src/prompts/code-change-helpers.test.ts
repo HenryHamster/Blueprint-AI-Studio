@@ -2,16 +2,12 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
-vi.mock('../index.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../index.js')>();
-  return {
-    ...actual,
-    WORKSPACE: '/tmp/workspace',
-    sendLog: vi.fn(),
-    getAgentToken: vi.fn().mockReturnValue(''),
-    git: vi.fn().mockReturnValue(''),
-  };
-});
+vi.mock('../index.js', () => ({
+  WORKSPACE: '/tmp/workspace',
+  sendLog: vi.fn(),
+  getAgentToken: vi.fn().mockReturnValue(''),
+  git: vi.fn().mockReturnValue(''),
+}));
 
 vi.mock('fs', () => ({
   default: {
