@@ -6,6 +6,32 @@ import type { Task } from '../types/task';
 
 const { apiFetch } = vi.hoisted(() => ({
   apiFetch: vi.fn(async (url: string) => {
+    if (url.includes('/lane-diag')) {
+      return new Response(JSON.stringify({
+        pr_count: 5,
+        task_count: 20,
+        truncated: false,
+        pr_breakdown_limit: 100,
+        pr_breakdown_truncated: false,
+        window_days: 7,
+        window_start: '2026-04-17T12:00:00Z',
+        project_id: 'project-1',
+        max_tasks: 5000,
+        relay_counts_by_lane: { LANE_CI: 3, LANE_CONFLICT: 1, LANE_REVIEW_CONVERGENCE: 2, LANE_ARBITRATION: 0 },
+        lane_iteration_distribution: {},
+        per_pr_phase_breakdown: [],
+        lane_waste: {
+          waste_taxonomy: { infra: 2, merge_conflict: 1, ci_churn: 3, review_ambiguity: 0, lost_reasoning: 1, unknown: 0 },
+          waste_task_count: 7,
+          cap_counted_task_count: 7,
+          cap_excluded_task_count: 0,
+          chain_count: 4,
+          cap_exhausted_chain_count: 0,
+          chain_limit: 50,
+          chains_truncated: false,
+        },
+      }), { status: 200 });
+    }
     if (url.includes('/task-cost-breakdown')) {
       return new Response(JSON.stringify({
         project_id: 'project-1',

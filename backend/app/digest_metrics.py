@@ -1404,6 +1404,7 @@ def classify_lane_waste_category(t: "Task") -> str:
         LANE_ARBITRATION,
         LANE_CI,
         LANE_CONFLICT,
+        LANE_REVIEW_CONVERGENCE,
         classify_iteration_lane,
     )
 
@@ -1424,6 +1425,13 @@ def classify_lane_waste_category(t: "Task") -> str:
         return "ci_churn"
     if lane == LANE_ARBITRATION:
         return "review_ambiguity"
+    if lane == LANE_REVIEW_CONVERGENCE:
+        iteration = rl.get("iteration")
+        if isinstance(iteration, (int, float)):
+            if iteration <= 2:
+                return "review_ambiguity"
+            else:
+                return "lost_reasoning"
     return "unknown"
 
 

@@ -1,0 +1,192 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { act } from 'react';
+import { LaneDiagPanel } from './LaneDiagPanel';
+
+const mockLaneDiagResponse = {
+  pr_count: 5,
+  task_count: 20,
+  truncated: false,
+  pr_breakdown_limit: 100,
+  pr_breakdown_truncated: false,
+  window_days: 7,
+  window_start: '2026-04-17T12:00:00Z',
+  project_id: 'project-1',
+  max_tasks: 5000,
+  relay_counts_by_lane: {
+    LANE_CI: 3,
+    LANE_CONFLICT: 1,
+    LANE_REVIEW_CONVERGENCE: 2,
+    LANE_ARBITRATION: 0,
+  },
+  lane_iteration_distribution: {},
+  per_pr_phase_breakdown: [
+    {
+      pr_number: '42',
+      task_count: 5,
+      review_seconds: 3600,
+      fix_seconds: 7200,
+      gap_seconds: 600,
+      total_seconds: 11400,
+      queue_seconds: 120,
+      provision_seconds: 80,
+      cold_start_seconds: 50,
+      execution_seconds: 7150,
+    },
+    {
+      pr_number: '41',
+      task_count: 2,
+      review_seconds: 1800,
+      fix_seconds: 3600,
+      gap_seconds: 300,
+      total_seconds: 5700,
+      queue_seconds: 60,
+      provision_seconds: 40,
+      cold_start_seconds: 30,
+      execution_seconds: 3570,
+    },
+  ],
+  lane_waste: {
+    waste_taxonomy: {
+      infra: 2,
+      merge_conflict: 1,
+      ci_churn: 3,
+      review_ambiguity: 0,
+      lost_reasoning: 1,
+      unknown: 0,
+    },
+    waste_task_count: 7,
+    cap_counted_task_count: 7,
+    cap_excluded_task_count: 0,
+    chain_count: 4,
+    cap_exhausted_chain_count: 0,
+    chain_limit: 50,
+    chains_truncated: false,
+  },
+};
+
+const { apiFetch } = vi.hoisted(() => ({
+  apiFetch: vi.fn(async () => {
+    return new Response(JSON.stringify(mockLaneDiagResponse), { status: 200 });
+  }),
+}));
+
+vi.mock('../api', () => ({
+  apiFetch,
+}));
+
+describe('LaneDiagPanel', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    apiFetch.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('shows loading state initially', () => {
+    render(<LaneDiagPanel />);
+    expect(screen.getByText('Loading lane diagnostics…')).toBeInTheDocument();
+  });
+
+  it('renders waste taxonomy section after load', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Waste Taxonomy')).toBeInTheDocument();
+    expect(screen.getByText('CI Churn')).toBeInTheDocument();
+    expect(screen.getByText('Infra')).toBeInTheDocument();
+    expect(screen.getByText('Lost Reasoning')).toBeInTheDocument();
+    // total waste tasks footer
+    expect(screen.getByText(/Total waste tasks: 7/)).toBeInTheDocument();
+  });
+
+  it('renders relay counts by lane', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Relay Counts by Lane')).toBeInTheDocument();
+    expect(screen.getByText('LANE_CI')).toBeInTheDocument();
+    expect(screen.getByText('LANE_CONFLICT')).toBeInTheDocument();
+    expect(screen.getByText('LANE_REVIEW_CONVERGENCE')).toBeInTheDocument();
+    // LANE_ARBITRATION has count 0 so it should not be shown
+    expect(screen.queryByText('LANE_ARBITRATION')).not.toBeInTheDocument();
+  });
+
+  it('renders per-PR phase breakdown sorted by total_seconds desc', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Per-PR Phase Breakdown')).toBeInTheDocument();
+    // PR #42 has higher total_seconds and should appear first
+    const pr42 = screen.getByText('#42');
+    const pr41 = screen.getByText('#41');
+    expect(pr42).toBeInTheDocument();
+    expect(pr41).toBeInTheDocument();
+    // PR #42 appears before PR #41 in document order
+    expect(pr42.compareDocumentPosition(pr41) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('passes projectId as query param to apiFetch', async () => {
+    render(<LaneDiagPanel projectId="proj-abc" />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(apiFetch).toHaveBeenCalledWith(
+      expect.stringContaining('project_id=proj-abc'),
+      undefined,
+      2,
+      30000,
+    );
+  });
+
+  it('renders without projectId (no query param)', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(apiFetch).toHaveBeenCalledWith(
+      '/api/admin/lane-diag',
+      undefined,
+      2,
+      30000,
+    );
+  });
+
+  it('renders window label from window_days', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText(/7d window/)).toBeInTheDocument();
+  });
+
+  it('shows error state when fetch fails', async () => {
+    apiFetch.mockResolvedValueOnce(new Response('{}', { status: 500 }));
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText(/Error: HTTP 500/)).toBeInTheDocument();
+  });
+
+  it('shows empty relay table when all counts are zero', async () => {
+    apiFetch.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...mockLaneDiagResponse,
+      relay_counts_by_lane: { LANE_CI: 0, LANE_CONFLICT: 0 },
+    }), { status: 200 }));
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('No relay data available.')).toBeInTheDocument();
+  });
+
+  it('shows version label when version is present', async () => {
+    apiFetch.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...mockLaneDiagResponse,
+      window_days: undefined,
+      version: { version_number: 9, phase: 'BUILD', status: 'open', opened_at: '2026-06-01T00:00:00Z', promoted_at: null },
+    }), { status: 200 }));
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText(/v9/)).toBeInTheDocument();
+  });
+});

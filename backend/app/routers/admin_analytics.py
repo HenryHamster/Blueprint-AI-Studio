@@ -21,6 +21,7 @@ from app.models import (
     Artifact,
     ArtifactType,
     ProjectMessage,
+    ReleaseVersion,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
 )
@@ -288,6 +289,10 @@ def _compute_lane_diag(tasks: List[Task], pr_breakdown_limit: int) -> Dict[str, 
             "task_count": 0,
             "review_seconds": 0.0,
             "fix_seconds": 0.0,
+            "queue_seconds": 0.0,
+            "provision_seconds": 0.0,
+            "cold_start_seconds": 0.0,
+            "execution_seconds": 0.0,
             "first_created_at": None,
             "last_completed_at": None,
         }
@@ -328,6 +333,23 @@ def _compute_lane_diag(tasks: List[Task], pr_breakdown_limit: int) -> Dict[str, 
             elif payload_type in _LANE_DIAG_FIX_TYPES:
                 phase["fix_seconds"] += active_seconds
 
+        if task.created_at and task.vm_dispatched_at:
+            phase["queue_seconds"] += max(
+                (task.vm_dispatched_at - task.created_at).total_seconds(), 0.0
+            )
+        if task.vm_dispatched_at and task.vm_provisioned_at:
+            phase["provision_seconds"] += max(
+                (task.vm_provisioned_at - task.vm_dispatched_at).total_seconds(), 0.0
+            )
+        if task.vm_provisioned_at and task.vm_started_at:
+            phase["cold_start_seconds"] += max(
+                (task.vm_started_at - task.vm_provisioned_at).total_seconds(), 0.0
+            )
+        if task.vm_started_at and task.vm_stopped_at:
+            phase["execution_seconds"] += max(
+                (task.vm_stopped_at - task.vm_started_at).total_seconds(), 0.0
+            )
+
     lane_distribution: Dict[str, Dict[str, Any]] = {}
     for lane in _LANE_DIAG_LANES:
         per_pr_counts = [counts[lane] for counts in lane_counts_by_pr.values()]
@@ -361,6 +383,10 @@ def _compute_lane_diag(tasks: List[Task], pr_breakdown_limit: int) -> Dict[str, 
                 "fix_seconds": fix_seconds,
                 "gap_seconds": gap_seconds,
                 "total_seconds": total_seconds,
+                "queue_seconds": phase["queue_seconds"],
+                "provision_seconds": phase["provision_seconds"],
+                "cold_start_seconds": phase["cold_start_seconds"],
+                "execution_seconds": phase["execution_seconds"],
             }
         )
 
@@ -539,6 +565,7 @@ async def get_lane_diag(
     project_id: uuid.UUID | None = Query(None),
     max_tasks: int = Query(5000, ge=1, le=20000),
     pr_breakdown_limit: int = Query(100, ge=1, le=250),
+    version_number: int | None = Query(None, ge=1),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
@@ -551,8 +578,45 @@ async def get_lane_diag(
     ``lane_waste`` reports chain-complete review/fix waste — including terminal
     FAILED/CANCELLED iterations belonging to an in-window PR chain — using the
     same PR-chain semantics as the outer-loop convergence surfaces.
+
+    When ``version_number`` is supplied, tasks are scoped to the time window of
+    that release version (``opened_at`` to ``promoted_at``, or now for open
+    versions). Version metadata is included in the response.
     """
-    cutoff = _utcnow() - timedelta(days=7)
+    now = _utcnow()
+    version_meta: dict | None = None
+    if version_number is not None:
+        version_filters = [ReleaseVersion.version_number == version_number]
+        if project_id is not None:
+            version_filters.append(ReleaseVersion.project_id == project_id)
+        rv = (
+            (
+                await session.execute(
+                    select(ReleaseVersion).where(*version_filters).limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if rv is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"ReleaseVersion {version_number} not found",
+            )
+        window_start = rv.opened_at
+        window_end = rv.promoted_at or now
+        version_meta = {
+            "version_number": rv.version_number,
+            "phase": rv.phase,
+            "status": rv.status,
+            "opened_at": rv.opened_at.isoformat(),
+            "promoted_at": rv.promoted_at.isoformat() if rv.promoted_at else None,
+        }
+        cutoff = window_start
+    else:
+        cutoff = now - timedelta(days=7)
+        window_end = None
+
     project_filter = [Task.project_id == project_id] if project_id else []
 
     _task_columns = load_only(
@@ -567,6 +631,10 @@ async def get_lane_diag(
         Task.context,
         Task.fix_loop_history,
         Task.archived,
+        Task.vm_dispatched_at,
+        Task.vm_provisioned_at,
+        Task.vm_started_at,
+        Task.vm_stopped_at,
     )
 
     # Legacy surface query: COMPLETED-only, original form — the legacy aggregates
@@ -574,12 +642,25 @@ async def get_lane_diag(
     # relay_counts_by_lane) must always use THIS pool so that FAILED/CANCELLED
     # rows can never displace COMPLETED rows from the top-N and erode existing
     # response keys.
+    # When version-scoped, push the created_at lower bound into SQL to keep
+    # per-version pools tight.  Upper bound is applied in Python (window_end).
+    completed_filters = [Task.status == TaskStatus.COMPLETED, *project_filter]
+    terminal_filters = [
+        Task.status.in_(
+            [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+        ),
+        *project_filter,
+    ]
+    if version_number is not None:
+        completed_filters.append(Task.created_at >= cutoff)
+        terminal_filters.append(Task.created_at >= cutoff)
+
     completed_tasks = (
         (
             await session.execute(
                 select(Task)
                 .options(_task_columns)
-                .where(Task.status == TaskStatus.COMPLETED, *project_filter)
+                .where(*completed_filters)
                 .order_by(Task.created_at.desc())
                 .limit(max_tasks)
             )
@@ -587,10 +668,23 @@ async def get_lane_diag(
         .scalars()
         .all()
     )
+
+    def _in_window(task: Task) -> bool:
+        completed_at = _derive_completed_at(task)
+        if completed_at < cutoff:
+            return False
+        if window_end is not None and task.created_at is not None:
+            created = task.created_at
+            if created.tzinfo is not None:
+                created = created.replace(tzinfo=None)
+            if created >= window_end:
+                return False
+        return True
+
     scoped_tasks = [
         task
         for task in completed_tasks
-        if _review_loop_pr_number(task) and _derive_completed_at(task) >= cutoff
+        if _review_loop_pr_number(task) and _in_window(task)
     ]
     diag = _compute_lane_diag(scoped_tasks, pr_breakdown_limit)
 
@@ -602,12 +696,7 @@ async def get_lane_diag(
             await session.execute(
                 select(Task)
                 .options(_task_columns)
-                .where(
-                    Task.status.in_(
-                        [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
-                    ),
-                    *project_filter,
-                )
+                .where(*terminal_filters)
                 .order_by(Task.created_at.desc())
                 .limit(max_tasks)
             )
@@ -615,6 +704,14 @@ async def get_lane_diag(
         .scalars()
         .all()
     )
+    if window_end is not None:
+        all_terminal_tasks = [
+            t
+            for t in all_terminal_tasks
+            if t.created_at is None
+            or (t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at)
+            < window_end
+        ]
     original_tasks = await _load_outer_loop_original_tasks(
         session, all_terminal_tasks, project_id=project_id
     )
@@ -634,16 +731,18 @@ async def get_lane_diag(
         chain_limit=pr_breakdown_limit,
         escalation_alerts=alerts,
     )
-    diag.update(
-        {
-            "project_id": str(project_id) if project_id else None,
-            "window_days": 7,
-            "window_start": cutoff.isoformat(),
-            "max_tasks": max_tasks,
-            "truncated": len(completed_tasks) >= max_tasks
-            or len(all_terminal_tasks) >= max_tasks,
-        }
-    )
+    extra: dict = {
+        "project_id": str(project_id) if project_id else None,
+        "window_start": cutoff.isoformat(),
+        "max_tasks": max_tasks,
+        "truncated": len(completed_tasks) >= max_tasks
+        or len(all_terminal_tasks) >= max_tasks,
+    }
+    if version_number is None:
+        extra["window_days"] = 7
+    if version_meta is not None:
+        extra["version"] = version_meta
+    diag.update(extra)
     return diag
 
 

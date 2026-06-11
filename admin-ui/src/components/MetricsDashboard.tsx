@@ -3,6 +3,7 @@ import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
 import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint } from '../api';
+import { LaneDiagPanel } from './LaneDiagPanel';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
 import type { WarmStartOriginBreakdown } from '../hooks/useEfficiencySnapshot';
 import {
@@ -832,6 +833,14 @@ export default function MetricsDashboard({
           <div className={`${cardClass} sm:col-span-2`}>
             <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-3">Efficiency Axes</div>
             <EfficiencyWidget projectId={projectId} />
+          </div>
+        )}
+
+        {/* Lane diagnostics panel — full width */}
+        {projectId && (
+          <div className={`${cardClass} sm:col-span-2`}>
+            <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-3">Lane Diagnostics</div>
+            <LaneDiagPanel projectId={projectId} />
           </div>
         )}
       </div>

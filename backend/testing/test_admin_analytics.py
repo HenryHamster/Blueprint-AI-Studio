@@ -341,10 +341,18 @@ class TestLaneDiag:
         assert by_pr["101"]["fix_seconds"] == 3000.0
         assert by_pr["101"]["gap_seconds"] == 2700.0
         assert by_pr["101"]["total_seconds"] == 7200.0
+        assert by_pr["101"]["queue_seconds"] == 0.0
+        assert by_pr["101"]["provision_seconds"] == 0.0
+        assert by_pr["101"]["cold_start_seconds"] == 0.0
+        assert by_pr["101"]["execution_seconds"] == 0.0
         assert by_pr["202"]["review_seconds"] == 120.0
         assert by_pr["202"]["fix_seconds"] == 240.0
         assert by_pr["202"]["gap_seconds"] == 180.0
         assert by_pr["202"]["total_seconds"] == 540.0
+        assert by_pr["202"]["queue_seconds"] == 0.0
+        assert by_pr["202"]["provision_seconds"] == 0.0
+        assert by_pr["202"]["cold_start_seconds"] == 0.0
+        assert by_pr["202"]["execution_seconds"] == 0.0
 
     @pytest.mark.asyncio
     async def test_lane_diag_counts_panel_review_runtime_as_active_time(
@@ -378,6 +386,211 @@ class TestLaneDiag:
         assert pr_breakdown["fix_seconds"] == 0.0
         assert pr_breakdown["gap_seconds"] == 300.0
         assert pr_breakdown["total_seconds"] == 1200.0
+        assert pr_breakdown["queue_seconds"] == 0.0
+        assert pr_breakdown["provision_seconds"] == 0.0
+        assert pr_breakdown["cold_start_seconds"] == 0.0
+        assert pr_breakdown["execution_seconds"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_vm_phase_timing_breakdown_per_pr(
+        self, client: AsyncClient, db_session
+    ):
+        """Tasks with VM timestamps contribute queue/provision/cold_start/execution seconds."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        base = _utcnow() - timedelta(hours=2)
+
+        # PR 101: two tasks, both with full VM timestamps
+        # Task 1: queue=30s, provision=60s, cold_start=10s, execution=300s
+        t1_created = base
+        t1_dispatched = t1_created + timedelta(seconds=30)
+        t1_provisioned = t1_dispatched + timedelta(seconds=60)
+        t1_started = t1_provisioned + timedelta(seconds=10)
+        t1_stopped = t1_started + timedelta(seconds=300)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "review", "prompt": "x"}],
+                context={"review_loop": {"pr_number": 101}},
+                created_at=t1_created,
+                started_at=t1_started,
+                status_log=[{"s": "COMPLETED", "t": t1_stopped.isoformat()}],
+                vm_dispatched_at=t1_dispatched,
+                vm_provisioned_at=t1_provisioned,
+                vm_started_at=t1_started,
+                vm_stopped_at=t1_stopped,
+            )
+        )
+
+        # Task 2: queue=20s, provision=40s, cold_start=5s, execution=600s
+        t2_created = base + timedelta(minutes=10)
+        t2_dispatched = t2_created + timedelta(seconds=20)
+        t2_provisioned = t2_dispatched + timedelta(seconds=40)
+        t2_started = t2_provisioned + timedelta(seconds=5)
+        t2_stopped = t2_started + timedelta(seconds=600)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={"review_loop": {"pr_number": 101, "fix_reason": "ci_failure"}},
+                created_at=t2_created,
+                started_at=t2_started,
+                status_log=[{"s": "COMPLETED", "t": t2_stopped.isoformat()}],
+                vm_dispatched_at=t2_dispatched,
+                vm_provisioned_at=t2_provisioned,
+                vm_started_at=t2_started,
+                vm_stopped_at=t2_stopped,
+            )
+        )
+
+        # PR 202: one task with no VM timestamps — should contribute 0 for all VM phases
+        t3_created = base + timedelta(minutes=5)
+        t3_stopped = t3_created + timedelta(seconds=120)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "review", "prompt": "x"}],
+                context={"review_loop": {"pr_number": 202}},
+                created_at=t3_created,
+                started_at=t3_created,
+                status_log=[{"s": "COMPLETED", "t": t3_stopped.isoformat()}],
+            )
+        )
+
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+
+        by_pr = {row["pr_number"]: row for row in body["per_pr_phase_breakdown"]}
+
+        # PR 101: sums of both tasks
+        assert by_pr["101"]["queue_seconds"] == 50.0  # 30 + 20
+        assert by_pr["101"]["provision_seconds"] == 100.0  # 60 + 40
+        assert by_pr["101"]["cold_start_seconds"] == 15.0  # 10 + 5
+        assert by_pr["101"]["execution_seconds"] == 900.0  # 300 + 600
+
+        # PR 202: no VM timestamps → all zero
+        assert by_pr["202"]["queue_seconds"] == 0.0
+        assert by_pr["202"]["provision_seconds"] == 0.0
+        assert by_pr["202"]["cold_start_seconds"] == 0.0
+        assert by_pr["202"]["execution_seconds"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_version_number_scopes_to_version_window(
+        self, client: AsyncClient, db_session
+    ):
+        """Tasks outside the version window are excluded; version metadata is returned."""
+        from app.models import ReleaseVersion
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        v9_opened = _utcnow() - timedelta(days=10)
+        v9_promoted = _utcnow() - timedelta(days=3)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=9,
+            phase="build",
+            status="promoted",
+            opened_at=v9_opened,
+            promoted_at=v9_promoted,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        # In-window task (created during v9)
+        self._add_review_loop_task(
+            db_session, project.id, 901, "review",
+            v9_opened + timedelta(days=1), 600,
+        )
+        self._add_review_loop_task(
+            db_session, project.id, 901, "fix",
+            v9_opened + timedelta(days=2), 1200, "ci_failure",
+        )
+        # Out-of-window task (created before v9 opened)
+        self._add_review_loop_task(
+            db_session, project.id, 800, "review",
+            v9_opened - timedelta(days=2), 300,
+        )
+        # Out-of-window task (created after v9 promoted)
+        self._add_review_loop_task(
+            db_session, project.id, 950, "review",
+            v9_promoted + timedelta(days=1), 300,
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/lane-diag?project_id={project.id}&version_number=9"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Only in-window tasks should be counted
+        assert body["pr_count"] == 1
+        assert body["task_count"] == 2
+
+        # Version metadata must be present
+        v = body["version"]
+        assert v["version_number"] == 9
+        assert v["phase"] == "build"
+        assert v["status"] == "promoted"
+        assert v["opened_at"] is not None
+        assert v["promoted_at"] is not None
+
+        # Standard metrics are present
+        assert "lane_iteration_distribution" in body
+        assert "relay_counts_by_lane" in body
+        assert "lane_waste" in body
+
+    @pytest.mark.asyncio
+    async def test_version_number_not_found_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Requesting a non-existent version_number returns 404."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/lane-diag?project_id={project.id}&version_number=99"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_no_version_param_returns_flat_response_unchanged(
+        self, client: AsyncClient, db_session
+    ):
+        """Without version_number, the flat rolling-window response is unchanged."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # All legacy keys still present
+        assert "lane_iteration_distribution" in body
+        assert "per_pr_phase_breakdown" in body
+        assert "relay_counts_by_lane" in body
+        assert "pr_count" in body
+        assert "task_count" in body
+        assert "window_days" in body
+        assert "window_start" in body
+        assert "lane_waste" in body
+        # No version key injected
+        assert "version" not in body
 
 
 class TestLaneWasteDiag:
@@ -476,7 +689,7 @@ class TestLaneWasteDiag:
         self._add_chain_task(
             db_session, project.id, pr_number=501, original_task_id=oid_a,
             iteration=1, task_type="review", created_at=base,
-        )  # unknown / review_convergence, cap-counted
+        )  # review_ambiguity (LANE_REVIEW_CONVERGENCE, iter≤2), cap-counted
         self._add_chain_task(
             db_session, project.id, pr_number=501, original_task_id=oid_a,
             iteration=2, task_type="fix", fix_reason="ci_failure",
@@ -497,7 +710,7 @@ class TestLaneWasteDiag:
             db_session, project.id, pr_number=501, original_task_id=oid_a,
             iteration=5, task_type="review", stale_head=True,
             created_at=base + timedelta(minutes=40),
-        )  # unknown, NOT cap-counted (stale-head discard)
+        )  # lost_reasoning (LANE_REVIEW_CONVERGENCE, iter≥3), NOT cap-counted (stale-head discard)
         self._add_original(db_session, project.id, oid_a, base - timedelta(minutes=5))
 
         # Chain B (PR 502) — merged via original hydration; lost-state lanes.
@@ -537,10 +750,10 @@ class TestLaneWasteDiag:
             "infra": 1,
             "merge_conflict": 1,
             "ci_churn": 1,
-            "review_ambiguity": 1,
-            "lost_reasoning": 1,
+            "review_ambiguity": 2,
+            "lost_reasoning": 2,
             "lost_repo_state": 1,
-            "unknown": 2,
+            "unknown": 0,
         }
         assert waste["waste_task_count"] == 8
         # Cap parity: infra FAILED + stale-head discard excluded from cap totals.

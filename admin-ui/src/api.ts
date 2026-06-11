@@ -2719,3 +2719,80 @@ export interface StrategicRefreshMarker {
    *  attribute receipts correctly — only operator-origin consumes show 'Steer picked up'. */
   last_fired_origin?: string;
 }
+
+// ── Lane Diagnostics ─────────────────────────────────────────────────────────
+
+export interface LaneWasteTaxonomy {
+  infra: number;
+  merge_conflict: number;
+  ci_churn: number;
+  review_ambiguity: number;
+  lost_reasoning: number;
+  unknown: number;
+  [key: string]: number;
+}
+
+export interface LaneWasteDiagnostics {
+  waste_taxonomy: LaneWasteTaxonomy;
+  waste_task_count: number;
+  cap_counted_task_count: number;
+  cap_excluded_task_count: number;
+  chain_count: number;
+  cap_exhausted_chain_count: number;
+  chain_limit: number;
+  chains_truncated: boolean;
+}
+
+export interface PerPrPhaseRow {
+  pr_number: string;
+  task_count: number;
+  review_seconds: number;
+  fix_seconds: number;
+  gap_seconds: number;
+  total_seconds: number;
+  queue_seconds: number;
+  provision_seconds: number;
+  cold_start_seconds: number;
+  execution_seconds: number;
+}
+
+export interface LaneDiagResponse {
+  lane_iteration_distribution: Record<string, {
+    p50_iterations: number;
+    p90_iterations: number;
+    max_iterations: number;
+    task_count: number;
+    pr_count: number;
+  }>;
+  per_pr_phase_breakdown: PerPrPhaseRow[];
+  relay_counts_by_lane: Record<string, number>;
+  pr_count: number;
+  task_count: number;
+  pr_breakdown_limit: number;
+  pr_breakdown_truncated: boolean;
+  lane_waste: LaneWasteDiagnostics;
+  project_id: string | null;
+  window_start: string;
+  max_tasks: number;
+  truncated: boolean;
+  window_days?: number;
+  version?: {
+    version_number: number;
+    phase: string;
+    status: string;
+    opened_at: string;
+    promoted_at: string | null;
+  };
+}
+
+export async function fetchLaneDiag(
+  projectId?: string,
+  signal?: AbortSignal,
+): Promise<LaneDiagResponse> {
+  const params = new URLSearchParams();
+  if (projectId) params.set('project_id', projectId);
+  const query = params.toString() ? `?${params.toString()}` : '';
+  const res = await apiFetch(`/api/admin/lane-diag${query}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch lane diagnostics: ${res.status}`);
+  return res.json();
+}

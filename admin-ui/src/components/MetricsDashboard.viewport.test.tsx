@@ -102,6 +102,20 @@ vi.mock('../api', () => ({
         ],
       }), { status: 200 });
     }
+    if (url.includes('/lane-diag')) {
+      return new Response(JSON.stringify({
+        pr_count: 3,
+        task_count: 12,
+        window_days: 7,
+        truncated: false,
+        pr_breakdown_truncated: false,
+        relay_counts_by_lane: { 'ci-repair': 2, 'review-rework': 1 },
+        lane_waste: {
+          waste_taxonomy: { infra: 2, merge_conflict: 1, ci_churn: 3, review_ambiguity: 0, lost_reasoning: 1, unknown: 0 },
+        },
+        per_pr_phase_breakdown: [],
+      }), { status: 200 });
+    }
     return new Response(JSON.stringify({
       axes: {
         cost_per_merged_pr: {
