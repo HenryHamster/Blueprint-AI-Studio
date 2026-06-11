@@ -53,6 +53,7 @@ from app.routers.agent import router as agent_router
 from app.routers.agent_github import router as agent_github_router
 from app.routers.agent_strategic_fetch import router as agent_strategic_fetch_router
 from app.routers.agent_warm_continuity import router as agent_warm_continuity_router
+from app.efficiency_snapshot import agent_router as efficiency_snapshot_agent_router
 from app.routers.agent_credentials import router as agent_credentials_router
 from app.routers.agent_compute_jobs import router as agent_compute_jobs_router
 from app.routers.admin_compute_jobs import router as admin_compute_jobs_router
@@ -774,6 +775,7 @@ app.include_router(admin_pool_accounts_router)
 app.include_router(admin_project_config_router)
 app.include_router(admin_warm_pool_router)
 app.include_router(agent_router)
+app.include_router(efficiency_snapshot_agent_router)
 app.include_router(agent_github_router)
 app.include_router(agent_strategic_fetch_router)
 app.include_router(agent_warm_continuity_router)

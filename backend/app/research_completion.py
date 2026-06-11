@@ -110,6 +110,7 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
     direction_saturation_refractory_minutes,
 )
 from app.direction_refractory import stamp_direction_refractory
+from app.direction_mode import normalized_recommended_mode as _normalized_recommended_mode
 from app.source_ref_validation import (
     validate_source_refs,
     resolve_branch_verification_context,
@@ -3097,6 +3098,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _adversarial_gate_deferred: list[dict] = []
     _low_conf_skipped_findings: list[dict] = []
     _scope_skip_counts: dict[str, int] = {}
+
+    # Persist research-audit knowledge document when the direction is in audit/measurement
+    # mode. This runs before the spawn loop so the document is durable even if all findings
+    # are deduped away. Best-effort: a failure never blocks the spawn loop.
+    _audit_direction_id = (task.context or {}).get("direction_id")
+    _audit_direction: dict | None = None
+    if _audit_direction_id and project_obj is not None:
+        _audit_direction = next(
+            (d for d in (project_obj.directions or []) if d.get("id") == _audit_direction_id),
+            None,
+        )
+    if _normalized_recommended_mode(_audit_direction) == "audit" and (findings or insights):
+        try:
+            from app.knowledge_completion import persist_research_audit_document
+
+            await persist_research_audit_document(
+                task, findings, insights, _audit_direction, session
+            )
+        except Exception:  # noqa: BLE001 — best-effort; must not block spawn loop
+            logger.warning(
+                "[RESEARCH] Failed to persist research-audit knowledge doc for task %s",
+                task.id,
+                exc_info=True,
+            )
 
     # Create all child tasks — no wave dependencies, priority ordering handles dispatch order
     child_tasks = []

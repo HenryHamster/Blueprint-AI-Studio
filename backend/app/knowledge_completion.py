@@ -93,6 +93,10 @@ _KIND_META: dict[str, dict[str, str]] = {
         "tag": "DESIGN",
         "citation_hint": "at least one file reference (or web URL) is required",
     },
+    "research_audit": {
+        "tag": "RESEARCH_AUDIT",
+        "citation_hint": "at least one file reference or task reference is required",
+    },
 }
 
 
@@ -2377,3 +2381,164 @@ async def _handle_design_completion(
 ) -> None:
     """Completion handler for the ``design`` task type (codebase-grounded doc)."""
     await _handle_knowledge_document_completion(task, logs, session, kind="design")
+
+
+# ---------------------------------------------------------------------------
+# Research-audit knowledge: when a research task completes in report/audit mode
+# its numeric findings are durably persisted as a queryable KnowledgeDocument
+# so future cycles can retrieve prior measurements without operator help.
+# ---------------------------------------------------------------------------
+
+
+def _build_research_audit_document(
+    task: Task,
+    findings: list[dict[str, Any]],
+    insights: list[dict[str, Any]],
+    direction: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Build a research_audit KnowledgeDocument dict from completed research output.
+
+    Returns None when there is no substantive content (empty findings and insights).
+    The body synthesizes the findings list and any insights into a structured report
+    that is human-readable and keyword-searchable in the knowledge index.
+    """
+    if not findings and not insights:
+        return None
+
+    payload = task.first_payload or {}
+    direction_id = str((task.context or {}).get("direction_id") or "")
+    topic = payload.get("topic") or (direction or {}).get("title") or "Research audit"
+    raw_tags = payload.get("tags")
+    base_tags = [str(t) for t in raw_tags[:28]] if isinstance(raw_tags, list) else []
+    tags = list(dict.fromkeys([*base_tags, "research_audit"]))[:30]
+
+    title_parts = [f"Research audit: {str(topic)[:200]}"]
+    title = title_parts[0][:500]
+
+    summary_parts: list[str] = []
+    if findings:
+        summary_parts.append(f"{len(findings)} finding(s) recorded.")
+    if insights:
+        summary_parts.append(f"{len(insights)} insight(s) recorded.")
+    summary = " ".join(summary_parts) or "Research audit report."
+
+    body_lines = [f"# Research audit: {topic}", ""]
+    if findings:
+        body_lines.append(f"## Findings ({len(findings)})")
+        body_lines.append("")
+        for i, f in enumerate(findings[:50], 1):
+            f_title = str(f.get("title") or f"Finding {i}").strip()[:200]
+            f_desc = str(f.get("description") or f.get("prompt") or "").strip()[:800]
+            f_type = str(f.get("type") or "").strip()
+            f_scope = str(f.get("scope") or "").strip()
+            f_grade = str(f.get("actionability_grade") or "").strip()
+            meta_parts = [p for p in [f_type, f_scope, f_grade] if p]
+            meta_str = f" ({', '.join(meta_parts)})" if meta_parts else ""
+            body_lines.append(f"### {i}. {f_title}{meta_str}")
+            if f_desc:
+                body_lines.append("")
+                body_lines.append(f_desc)
+            body_lines.append("")
+    if insights:
+        body_lines.append(f"## Insights ({len(insights)})")
+        body_lines.append("")
+        for j, ins in enumerate(insights[:20], 1):
+            ins_summary = str(ins.get("summary") or "").strip()[:500]
+            if ins_summary:
+                body_lines.append(f"- {ins_summary}")
+        body_lines.append("")
+    body = "\n".join(body_lines)
+
+    citations = [f"task:{task.id}"]
+
+    return {
+        "title": title,
+        "summary": summary,
+        "body": body,
+        "topic": str(topic)[:200],
+        "tags": tags,
+        "citations": citations,
+        "direction_id": direction_id or None,
+    }
+
+
+async def persist_research_audit_document(
+    task: Task,
+    findings: list[dict[str, Any]],
+    insights: list[dict[str, Any]],
+    direction: dict[str, Any] | None,
+    session: AsyncSession,
+) -> None:
+    """Persist a research_audit KnowledgeDocument for a completed audit-mode research task.
+
+    Idempotent: a second call for the same source task is a no-op (existing row
+    returned unchanged). Best-effort: callers must wrap in try/except so a persist
+    failure never blocks the research completion spawn loop.
+    """
+    document = _build_research_audit_document(task, findings, insights, direction)
+    if document is None:
+        logger.info(
+            "[RESEARCH_AUDIT] Skipping knowledge doc for task %s: no substantive content",
+            task.id,
+        )
+        return
+
+    direction_id = document.get("direction_id")
+    citations = [c for c in (document.get("citations") or []) if isinstance(c, str)]
+
+    existing = (
+        (
+            await session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.project_id == task.project_id,
+                    KnowledgeDocument.source_task_id == task.id,
+                    KnowledgeDocument.source_kind == SourceKind.RESEARCH_AUDIT.value,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        logger.info(
+            "[RESEARCH_AUDIT] Knowledge doc already exists (%s) for task %s — skipping",
+            existing.id,
+            task.id,
+        )
+        return
+
+    verdict_record: dict[str, Any] = {
+        "passed": True,
+        "strategy": "research_audit",
+        "finding_count": len(findings),
+        "insight_count": len(insights),
+    }
+
+    doc = KnowledgeDocument(
+        project_id=task.project_id,
+        source_task_id=task.id,
+        direction_id=direction_id,
+        source_kind=SourceKind.RESEARCH_AUDIT.value,
+        title=document["title"],
+        summary=document["summary"],
+        body=document["body"],
+        topic=document["topic"],
+        tags=document["tags"],
+        source_citations=citations[:100],
+        forward_quality_verdict=verdict_record,
+    )
+    session.add(doc)
+    await session.commit()
+    await session.refresh(doc)
+
+    logger.info(
+        "[RESEARCH_AUDIT] Persisted knowledge document %s for task %s "
+        "(%d finding(s), %d insight(s))",
+        doc.id,
+        task.id,
+        len(findings),
+        len(insights),
+    )
+
+    normalized = {"title": document["title"], "summary": document["summary"]}
+    await _deliver_knowledge_to_dependents(task, doc, normalized, session)

@@ -5274,3 +5274,195 @@ async def test_schema_version_v5_migrates_lane_axes(db_session):
     assert baseline.get(AXIS_LANE_COST_PER_MERGED_PR) is None
     assert baseline.get(AXIS_LANE_WARM_RESUME_RATE) is None
     assert baseline.get(AXIS_CHECKPOINT_LOSS_RATE) is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_carries_serving_sha(db_session, monkeypatch):
+    """write_snapshot stamps serving_sha matching DEPLOY_SHA when the env var is set."""
+    monkeypatch.setenv("DEPLOY_SHA", "abc1234def5678")
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    assert snap.get("serving_sha") == "abc1234def5678", (
+        f"write_snapshot must stamp serving_sha from DEPLOY_SHA; got {snap.get('serving_sha')!r}"
+    )
+    # Verify it is persisted in the stored snapshot too.
+    await db_session.refresh(project)
+    stored_snaps = project.design_doc[DESIGN_DOC_KEY]["snapshots"]
+    assert stored_snaps[-1].get("serving_sha") == "abc1234def5678"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_sha_none_when_unset(db_session, monkeypatch):
+    """write_snapshot stamps serving_sha=None when DEPLOY_SHA is not set."""
+    monkeypatch.delenv("DEPLOY_SHA", raising=False)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    assert snap.get("serving_sha") is None, (
+        f"serving_sha must be None when DEPLOY_SHA is absent; got {snap.get('serving_sha')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# format_compliance_by_type persistence and agent endpoint tests
+# ---------------------------------------------------------------------------
+
+
+def _make_format_compliance_typed_task(project_id, *, task_type: str, errors: int):
+    """Create a task with format_compliance_summary and a specific payload type."""
+    t = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        format_compliance_summary={
+            "format_error_total": errors,
+            "format_repair_attempts": 0,
+            "format_repair_successes": 0,
+        },
+    )
+    t.payloads = [{"type": task_type}]
+    return t
+
+
+@pytest.mark.asyncio
+async def test_format_compliance_by_type_persisted_in_snapshot(db_session):
+    """write_snapshot stores format_compliance_by_type in the snapshot dict."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two "create" tasks (well-formed + error) and one "research" task (well-formed).
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=0))
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=1))
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="research", errors=0))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The snapshot dict returned by write_snapshot must carry the by_type block.
+    assert "format_compliance_by_type" in snap
+    by_type = snap["format_compliance_by_type"]
+    assert "create" in by_type
+    assert "research" in by_type
+    assert by_type["create"]["tasks_measured"] == 2
+    assert by_type["create"]["format_compliance_rate"] == 0.5
+    assert by_type["research"]["tasks_measured"] == 1
+    assert by_type["research"]["format_compliance_rate"] == 1.0
+
+    # The persisted snapshot in design_doc must also carry the by_type block.
+    container = project.design_doc[DESIGN_DOC_KEY]
+    persisted_snap = container["snapshots"][-1]
+    assert "format_compliance_by_type" in persisted_snap
+    assert persisted_snap["format_compliance_by_type"]["create"]["tasks_measured"] == 2
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_surfaces_format_compliance_by_type(db_session):
+    """read_baseline_with_drift includes format_compliance_by_type from the latest snapshot."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=0))
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="fix", errors=1))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    by_type = drift.get("format_compliance_by_type")
+    assert by_type is not None
+    assert "create" in by_type
+    assert "fix" in by_type
+    assert by_type["create"]["format_compliance_rate"] == 1.0
+    assert by_type["fix"]["format_compliance_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_format_compliance_by_type_none_for_old_snapshots(db_session):
+    """Snapshots that predate format_compliance_by_type return None gracefully."""
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {"captured_at": "2026-01-01T00:00:00"},
+                "snapshots": [
+                    # Old snapshot without format_compliance_by_type key.
+                    {"captured_at": "2026-01-01T00:00:00", FORMAT_COMPLIANCE_KEY: {}},
+                ],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    # format_compliance_by_type absent in the snapshot => surfaced as None.
+    assert drift.get("format_compliance_by_type") is None
+
+
+@pytest.mark.asyncio
+async def test_agent_format_compliance_snapshot_endpoint(client: AsyncClient, db_session):
+    """GET /api/agent/efficiency-snapshot/format-compliance returns by_type block."""
+    from app.auth import create_agent_token
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a task in this project so we have a valid agent token to use.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Add format-compliance tasks and write a snapshot.
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=0))
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="research", errors=1))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "vm-fc-test-1")
+    resp = await client.get(
+        "/api/agent/efficiency-snapshot/format-compliance",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert "captured_at" in data
+    assert FORMAT_COMPLIANCE_KEY in data
+    assert "format_compliance_by_type" in data
+    by_type = data["format_compliance_by_type"]
+    assert "create" in by_type
+    assert "research" in by_type
+    assert by_type["create"]["format_compliance_rate"] == 1.0
+    assert by_type["research"]["format_compliance_rate"] == 0.0

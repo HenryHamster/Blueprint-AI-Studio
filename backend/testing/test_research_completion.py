@@ -9873,3 +9873,191 @@ async def test_adversarial_gate_uses_poolvm_provenance_after_cache_loss(
     assert verdict["grader_agent_image_build_ts"] == 1749417600
     assert verdict["grader_agent_runtime_fingerprint"] == "b" * 64
     assert verdict["grader_agent_source_sha"] == "fedcba9876543210"
+
+
+# ---------------------------------------------------------------------------
+# Research-audit knowledge document persistence
+# ---------------------------------------------------------------------------
+
+
+async def _make_audit_project_and_task(db_session, direction_id="d-audit01", mode="audit"):
+    """A minimal project with audit-mode direction + a research task."""
+    from test_autonomous_research import _make_research_task
+
+    direction = {
+        "id": direction_id,
+        "text": "Audit direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "recommended_mode": mode,
+    }
+    project = _Project(
+        name=f"Audit project {direction_id}",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = await _make_research_task(project, direction, db_session)
+    # Stamp the direction_id on context so the handler can look it up.
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+    return project, direction, task
+
+
+@_pytest.mark.asyncio
+async def test_audit_mode_persists_knowledge_document(db_session, mocker):
+    """An audit-mode research task creates a KnowledgeDocument when findings are present."""
+    from app.models import KnowledgeDocument, SourceKind
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _make_audit_project_and_task(
+        db_session, "d-audit-persist"
+    )
+    _patch_research_externals(mocker)
+    finding = _make_finding(direction_id=direction["id"])
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        return_value=[],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                _select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id,
+                    KnowledgeDocument.source_kind == SourceKind.RESEARCH_AUDIT.value,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 1, "audit-mode research must persist a KnowledgeDocument"
+    doc = docs[0]
+    assert doc.direction_id == direction["id"]
+    assert doc.topic is not None
+    assert "research_audit" in (doc.tags or [])
+
+
+@_pytest.mark.asyncio
+async def test_non_audit_mode_no_knowledge_document(db_session, mocker):
+    """A standard (non-audit) research task does NOT persist a research_audit doc."""
+    from app.models import KnowledgeDocument, SourceKind
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _make_audit_project_and_task(
+        db_session, "d-non-audit", mode="ship"
+    )
+    _patch_research_externals(mocker)
+    finding = _make_finding(direction_id=direction["id"])
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        return_value=[],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                _select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id,
+                    KnowledgeDocument.source_kind == SourceKind.RESEARCH_AUDIT.value,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert docs == [], "non-audit mode must NOT create a research_audit KnowledgeDocument"
+
+
+@_pytest.mark.asyncio
+async def test_audit_mode_no_document_when_no_findings(db_session, mocker):
+    """An audit-mode research task with no findings/insights does NOT persist a doc."""
+    from app.models import KnowledgeDocument, SourceKind
+    from test_autonomous_research import _patch_research_externals
+
+    _project, _direction, task = await _make_audit_project_and_task(
+        db_session, "d-audit-empty"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        return_value=[],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                _select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id,
+                    KnowledgeDocument.source_kind == SourceKind.RESEARCH_AUDIT.value,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert docs == [], "empty-findings audit must NOT create a research_audit KnowledgeDocument"
+
+
+@_pytest.mark.asyncio
+async def test_audit_mode_persist_error_does_not_block_spawn(db_session, mocker):
+    """A persist failure in the audit knowledge path must not block child task spawn."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _make_audit_project_and_task(
+        db_session, "d-audit-error"
+    )
+    _patch_research_externals(mocker)
+    finding = _make_finding(direction_id=direction["id"])
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        return_value=[],
+    )
+    mocker.patch(
+        "app.knowledge_completion.persist_research_audit_document",
+        side_effect=RuntimeError("simulated persist failure"),
+    )
+
+    # Must not raise despite the persist error.
+    await _handle_research_completion(task, "", db_session)
+
+    # Children were still spawned (the persist error did not abort the spawn loop).
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) >= 1, "spawn loop must proceed even when audit persist fails"

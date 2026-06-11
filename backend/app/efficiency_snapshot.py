@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, Mapping
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -57,6 +57,7 @@ from app.task_locking import project_lock
 from app.vm_cost_rates import idle_cost_usd
 
 router = APIRouter()
+agent_router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 # ---------------------------------------------------------------------------
 # Cold-start stage breakdown (per-stage p50 decomposition)
@@ -2221,10 +2222,13 @@ async def compute_current_axes(
         # volume. See app.digest_metrics.compute_timeout_rate.
         "agent_timeout_rate": compute_timeout_rate(tasks),
         # Durable structured-output format-compliance measure (v7 shared
-        # self-repair adoption): overall block only, read from persisted
-        # Task.format_compliance_summary. Per-task-type detail remains a live
-        # digest concern; the snapshot needs the durable baseline/trend.
-        FORMAT_COMPLIANCE_KEY: compute_format_compliance_metrics(tasks)["overall"],
+        # self-repair adoption): overall block from persisted
+        # Task.format_compliance_summary, plus a per-task-type breakdown keyed
+        # by task type. The by_type block lets read-only research agents
+        # (authenticated with the agent token) obtain the durable per-type
+        # breakdown for a snapshot day without hitting admin-auth endpoints.
+        FORMAT_COMPLIANCE_KEY: (_fc := compute_format_compliance_metrics(tasks))["overall"],
+        "format_compliance_by_type": _fc["by_type"],
     }
 
 
@@ -2240,9 +2244,16 @@ async def write_snapshot(
     # Compute axes before acquiring lock — reads only Task rows, not the project.
     axes = await compute_current_axes(session, project_id)
     captured_at = _utcnow().isoformat()
+    from app.deployed_sha import get_serving_sha
+
     snapshot: Dict[str, Any] = {
         "captured_at": captured_at,
+        # metric_def_version versions the metric DEFINITIONS; serving_sha records
+        # which deployed backend code was running when this snapshot was written.
+        # Both allow consumers to partition history across definition changes and
+        # deployment boundaries. serving_sha is None on pre-stamp snapshots.
         "metric_def_version": METRIC_DEF_VERSION,
+        "serving_sha": get_serving_sha(),
         **axes,
     }
 
@@ -2762,6 +2773,10 @@ async def read_baseline_with_drift(
             cost_incl_pool_idle_axis,
             latest.get("pool_dispatch_funnel"),
         ),
+        # Per-task-type format-compliance breakdown from the latest snapshot,
+        # keyed by task type.  None for snapshots that predate this field (no
+        # baseline/drift semantics — snapshot-only observability field).
+        "format_compliance_by_type": latest.get("format_compliance_by_type"),
     }
 
 
@@ -3264,3 +3279,73 @@ async def compute_project_window_spend_usd(
                 in_rate, out_rate = pricing
                 total += input_tokens * in_rate + output_tokens * out_rate
     return round(total, 6)
+
+
+# ---------------------------------------------------------------------------
+# Agent-authenticated efficiency-snapshot read endpoint
+# ---------------------------------------------------------------------------
+# Research tasks that authenticate with an agent token (not admin credentials)
+# can read the latest snapshot's per-task-type format-compliance breakdown here
+# without needing access to the admin digest path.
+#
+# Auth: the same X-Agent-Token JWT used by all other agent endpoints; JWT is
+# verified via verify_agent_jwt (the low-level validator), which avoids a
+# circular import through app.routers.agent. For a read-only telemetry endpoint
+# the task-state liveness checks in verify_agent_token are unnecessary.
+
+
+@agent_router.get("/efficiency-snapshot/format-compliance")
+async def agent_get_efficiency_snapshot_format_compliance(
+    session: AsyncSession = Depends(get_session),
+    x_agent_token: str = Header(..., description="Agent JWT", alias="X-Agent-Token"),
+):
+    """Return the latest snapshot's per-task-type format-compliance breakdown.
+
+    Read-only endpoint for agent-authenticated tasks (research/measure task
+    types directed at format-compliance reads) that cannot reach the admin
+    digest path. Authenticates with the same X-Agent-Token JWT used by all
+    other agent endpoints; extracts the project_id from the task identified
+    by the token's ``sub`` claim.
+
+    Returns ``{captured_at, format_compliance, format_compliance_by_type}``
+    from the latest persisted snapshot, or 404 when no snapshot exists yet.
+    """
+    from app.auth import verify_agent_jwt
+
+    payload = verify_agent_jwt(x_agent_token)
+    task_id_str = payload.get("sub")
+    project_id_str = payload.get("project_id")
+
+    if not task_id_str and not project_id_str:
+        raise HTTPException(status_code=401, detail="token_missing_subject")
+
+    if task_id_str:
+        try:
+            task_uuid = uuid.UUID(task_id_str)
+        except ValueError:
+            raise HTTPException(status_code=401, detail="token_invalid_subject") from None
+        task = await session.get(Task, task_uuid)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task_not_found")
+        project_id = task.project_id
+    else:
+        try:
+            project_id = uuid.UUID(project_id_str)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=401, detail="token_invalid_project_id") from None
+
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project_not_found")
+
+    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    snapshots = container.get("snapshots") or []
+    if not snapshots:
+        raise HTTPException(status_code=404, detail="no_snapshot_available")
+
+    latest = snapshots[-1]
+    return {
+        "captured_at": latest.get("captured_at"),
+        FORMAT_COMPLIANCE_KEY: latest.get(FORMAT_COMPLIANCE_KEY),
+        "format_compliance_by_type": latest.get("format_compliance_by_type"),
+    }

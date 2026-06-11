@@ -118,6 +118,16 @@ async def _fetch_service_image(
     return containers[0].image
 
 
+def get_serving_sha() -> str | None:
+    """Return the serving git SHA synchronously from the DEPLOY_SHA env var.
+
+    Fast and side-effect-free — reads the env var the deploy pipeline stamps on
+    every revision. Returns None when DEPLOY_SHA is absent or not a valid SHA.
+    """
+    env_sha = os.getenv("DEPLOY_SHA")
+    return env_sha if _looks_like_git_sha(env_sha) else None
+
+
 async def resolve_deployed_sha() -> str | None:
     """Resolve the git SHA the orchestrator is actually serving.
 
