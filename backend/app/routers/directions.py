@@ -1049,24 +1049,48 @@ async def create_direction_research_task(
     # cooldown, not concurrency. Match by current_direction_id, falling back to
     # the legacy single-direction payload shape for any in-flight task spawned
     # before this endpoint started stamping current_direction_id.
+    active_statuses = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+        TaskStatus.BLOCKED,
+    ]
+
+    # Fast path: modern research tasks all carry the direction claim key, so a
+    # direct lookup avoids scanning unrelated active tasks in the common case.
+    claim_key = research_direction_claim_key(project.id, direction_id)
+    existing_claim = (
+        await session.execute(
+            select(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.idempotency_key == claim_key,
+                Task.status.in_(active_statuses),
+            )
+            .options(load_only(Task.id, Task.status))
+        )
+    ).scalar_one_or_none()
+    if existing_claim is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Research is already in progress on this direction "
+                f"(task {str(existing_claim.id)[:8]}, status {existing_claim.status}). "
+                f"Cancel it before starting another."
+            ),
+        )
+
     active_research = (
         (
             await session.execute(
                 select(Task)
                 .where(
                     Task.project_id == project.id,
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                            TaskStatus.BLOCKED,
-                        ]
-                    ),
+                    Task.status.in_(active_statuses),
+                    Task.payloads[0]["type"].as_string() == "research",
                 )
                 .options(load_only(Task.id, Task.payloads, Task.status))
-                .limit(500)
             )
         )
         .scalars()

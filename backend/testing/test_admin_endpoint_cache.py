@@ -553,7 +553,6 @@ async def test_version_lifecycle_serves_stale_on_failure(
     assert r2.status_code == 200
     assert r2.json()["precomputed"] is True  # served from stale fallback
 
-
 @pytest.mark.asyncio
 async def test_version_lifecycle_access_check_runs_on_cache_hit(
     client: AsyncClient, db_session, mocker
@@ -606,7 +605,6 @@ async def test_version_lifecycle_access_check_runs_on_cache_hit(
     assert r2.status_code in (403, 404), (
         f"Expected 403/404 for unauthorized user on cached endpoint, got {r2.status_code}"
     )
-
 
 # ---------------------------------------------------------------------------
 # /api/admin/projects/{id}/agent-serving-shas cache
