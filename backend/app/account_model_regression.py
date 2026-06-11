@@ -91,27 +91,32 @@ async def compute_provider_model_breakdown(
     account_ids: list[str],
     *,
     expand_accounts: bool = False,
+    project_id: _uuid.UUID | None = None,
 ) -> list[dict[str, Any]]:
     """Compute rolling 7-day per-(provider, model) success-rate breakdown.
 
     Infra failures are excluded from both numerator and denominator.
     When expand_accounts=True, each row includes per-account drill-in with
     below_median flags and quarantine_status (read from MaxPlanAccount.rate_limit_state).
+    When project_id is supplied, only tasks belonging to that project are included.
     """
     if not account_ids:
         return []
 
     cutoff = _utcnow() - timedelta(days=7)
     terminal = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
-    stmt = select(
-        Task.provider, Task.model, Task.account_id, Task.status, Task.context
-    ).where(
+    where_clauses = [
         Task.created_at >= cutoff,
         Task.status.in_(terminal),
         Task.provider.isnot(None),
         Task.model.isnot(None),
         Task.account_id.in_(account_ids),
-    )
+    ]
+    if project_id is not None:
+        where_clauses.append(Task.project_id == project_id)
+    stmt = select(
+        Task.provider, Task.model, Task.account_id, Task.status, Task.context
+    ).where(*where_clauses)
     task_rows = (await session.execute(stmt)).all()
 
     # Aggregate per (provider, model, account_id), skipping infra failures.

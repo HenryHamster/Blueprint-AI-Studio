@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
+from app.admin_helpers import _get_user_project
 from app.auth import get_current_user
 from app.database import get_session, resolve_dialect_name
 from app.digest_cache import DigestCache, get_digest_cache
@@ -403,17 +404,25 @@ async def _compute_account_health_summary(
 async def get_provider_model_breakdown(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    cache: DigestCache = Depends(get_digest_cache),
     expand_accounts: bool = Query(False),
+    project_id: uuid.UUID | None = Query(None),
 ):
-    """Rolling 7-day per-(provider, model) success-rate breakdown with optional per-account drill-in."""
-    from app.account_model_regression import compute_provider_model_breakdown
+    """Rolling 7-day per-(provider, model) success-rate breakdown with optional per-account drill-in.
+
+    When project_id is supplied the caller must be a member of that project and only
+    tasks belonging to that project are counted. When omitted, all tasks for the
+    user's accounts are included.
+    """
+    user_id = current_user["user_id"]
+
+    if project_id is not None:
+        await _get_user_project(project_id, user_id, session)
 
     user_acct_ids = (
         (
             await session.execute(
-                select(MaxPlanAccount.id).where(
-                    MaxPlanAccount.user_id == current_user["user_id"]
-                )
+                select(MaxPlanAccount.id).where(MaxPlanAccount.user_id == user_id)
             )
         )
         .scalars()
@@ -423,8 +432,34 @@ async def get_provider_model_breakdown(
     if not user_acct_id_strs:
         return {"rows": []}
 
+    cache_key = (
+        "provider-model-breakdown",
+        user_id,
+        str(project_id) if project_id is not None else None,
+        expand_accounts,
+    )
+    return await cache.get_or_compute(
+        cache_key,
+        lambda: _compute_provider_model_breakdown(
+            session=session,
+            account_ids=user_acct_id_strs,
+            expand_accounts=expand_accounts,
+            project_id=project_id,
+        ),
+    )
+
+
+async def _compute_provider_model_breakdown(
+    *,
+    session: AsyncSession,
+    account_ids: list[str],
+    expand_accounts: bool,
+    project_id: uuid.UUID | None,
+) -> dict:
+    from app.account_model_regression import compute_provider_model_breakdown
+
     rows = await compute_provider_model_breakdown(
-        session, user_acct_id_strs, expand_accounts=expand_accounts
+        session, account_ids, expand_accounts=expand_accounts, project_id=project_id
     )
     return {"rows": rows}
 

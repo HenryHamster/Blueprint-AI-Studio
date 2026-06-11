@@ -3198,17 +3198,37 @@ async def repair_state(
     from app.alert_dispatch import _maybe_create_circuit_breaker_alert
     from app.time_utils import _utcnow as _main_utcnow
 
-    for proj_id, breaker in list(_circuit_breakers.items()):
-        if breaker.get("state") != "HALF_OPEN":
-            continue
+    # Batch-load all test tasks for HALF_OPEN breakers in one query
+    half_open_items = [
+        (proj_id, breaker)
+        for proj_id, breaker in list(_circuit_breakers.items())
+        if breaker.get("state") == "HALF_OPEN" and breaker.get("half_open_task_id")
+    ]
+    if half_open_items:
+        test_ids = []
+        for _, breaker in half_open_items:
+            try:
+                test_ids.append(uuid.UUID(breaker["half_open_task_id"]))
+            except Exception:
+                pass
+        found_ids: set = set()
+        if test_ids:
+            try:
+                rows = (
+                    await session.execute(select(Task).where(Task.id.in_(test_ids)))
+                ).scalars().all()
+                found_ids = {r.id for r in rows}
+            except Exception:
+                pass
+
+    for proj_id, breaker in half_open_items:
         test_id = breaker.get("half_open_task_id")
-        if not test_id:
-            continue
         try:
-            test_task = await session.get(Task, uuid.UUID(test_id))
+            task_uuid = uuid.UUID(test_id)
         except Exception:
-            test_task = None
-        if test_task is None:
+            continue
+        test_task_exists = task_uuid in found_ids
+        if not test_task_exists:
             breaker["state"] = "OPEN"
             breaker["opened_at"] = _main_utcnow()
             breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)

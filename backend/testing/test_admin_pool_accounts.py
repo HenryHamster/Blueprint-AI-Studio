@@ -11,6 +11,7 @@ from app.models import (
     LLMProviderName,
     MaxPlanAccount,
     Project,
+    ProjectMember,
     Task,
     TaskStatus,
 )
@@ -1656,3 +1657,87 @@ async def test_patch_max_plan_account_secret_manager_failure_returns_503(
     assert acct.secret_blob_ref == "projects/test/secrets/existing/versions/1", (
         f"secret_blob_ref must not be overwritten with plaintext on SM failure: {acct.secret_blob_ref!r}"
     )
+
+
+# ── project_id scoping on provider-model breakdown ───────────────────────────
+
+
+async def test_provider_model_breakdown_honors_project_id(client, db_session):
+    """When project_id is supplied, only tasks from that project contribute to the breakdown."""
+    project_a = Project(name="pmb-proj-a", user_id="test-user-123")
+    project_b = Project(name="pmb-proj-b", user_id="test-user-123")
+    db_session.add_all([project_a, project_b])
+    await db_session.flush()
+
+    # The test user must be a ProjectMember of project_a to pass the auth check.
+    db_session.add(ProjectMember(project_id=project_a.id, user_id="test-user-123", role="owner"))
+    await db_session.flush()
+
+    acct_id = uuid.uuid4()
+    acct_str = str(acct_id)
+    db_session.add(
+        MaxPlanAccount(
+            id=acct_id,
+            user_id="test-user-123",
+            name="PMB-Acct",
+            provider=LLMProviderName.ANTHROPIC,
+            auth_mode=LLMAuthMode.OAUTH,
+        )
+    )
+    await db_session.flush()
+
+    # 7 completed tasks in project_a with provider/model "anthropic/claude-scope"
+    tasks_a = [
+        Task(
+            project_id=project_a.id,
+            provider="anthropic",
+            model="claude-scope",
+            account_id=acct_str,
+            status=TaskStatus.COMPLETED,
+        )
+        for _ in range(7)
+    ]
+    # 8 completed tasks in project_b with the SAME provider/model
+    tasks_b = [
+        Task(
+            project_id=project_b.id,
+            provider="anthropic",
+            model="claude-scope",
+            account_id=acct_str,
+            status=TaskStatus.COMPLETED,
+        )
+        for _ in range(8)
+    ]
+    db_session.add_all(tasks_a + tasks_b)
+    await db_session.commit()
+
+    # Without project_id: all 15 tasks are included.
+    res_all = await client.get("/api/admin/max-plan-accounts/provider-model-breakdown")
+    assert res_all.status_code == 200
+    rows_all = res_all.json()["rows"]
+    assert len(rows_all) == 1
+    assert rows_all[0]["total_tasks"] == 15
+
+    # With project_a: only the 7 tasks from project_a are counted.
+    res_scoped = await client.get(
+        f"/api/admin/max-plan-accounts/provider-model-breakdown?project_id={project_a.id}"
+    )
+    assert res_scoped.status_code == 200
+    rows_scoped = res_scoped.json()["rows"]
+    assert len(rows_scoped) == 1
+    assert rows_scoped[0]["total_tasks"] == 7, (
+        "project_id filter must restrict breakdown to tasks in the specified project"
+    )
+
+
+async def test_provider_model_breakdown_project_id_rejects_non_member(client, db_session):
+    """A project the caller is NOT a member of must return 404."""
+    # Create a project owned by a different user; test-user-123 has no membership.
+    other_project = Project(name="pmb-other", user_id="other-user-999")
+    db_session.add(other_project)
+    await db_session.commit()
+
+    res = await client.get(
+        f"/api/admin/max-plan-accounts/provider-model-breakdown?project_id={other_project.id}"
+    )
+    assert res.status_code == 404

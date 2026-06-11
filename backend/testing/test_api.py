@@ -1171,3 +1171,88 @@ async def test_patch_post_commit_pending_false_is_noop_when_already_false(
         "abandoned breadcrumb should NOT be added when column was already False"
     )
     assert ctx.get("some_key") == "some_val"
+
+
+@pytest.mark.asyncio
+async def test_admin_tasks_project_id_filter_returns_scoped_counts(
+    client: AsyncClient, db_session
+):
+    """GET /api/admin/tasks?project_id=<id> returns scoped_active_count,
+    scoped_evaluating_count, and scoped_queued_count reflecting only that
+    project, while active_count remains the global fleet total."""
+    # Project A — the scoped project
+    project_a = Project(name="Project A", user_id="test-user-123", status=ProjectStatus.DEPLOYING, payloads=[{"type": "create"}])
+    db_session.add(project_a)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    db_session.add(ProjectMember(project_id=project_a.id, user_id="test-user-123", role="owner"))
+
+    # Project B — a second project owned by the same user
+    project_b = Project(name="Project B", user_id="test-user-123", status=ProjectStatus.DEPLOYING, payloads=[{"type": "create"}])
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_b)
+    db_session.add(ProjectMember(project_id=project_b.id, user_id="test-user-123", role="owner"))
+
+    # Tasks in project A
+    task_a_active = Task(
+        project_id=project_a.id,
+        title="A active",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+    )
+    task_a_evaluating = Task(
+        project_id=project_a.id,
+        title="A evaluating",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create"}],
+    )
+    # Task in project B (must NOT appear in scoped counts for project A)
+    task_b_active = Task(
+        project_id=project_b.id,
+        title="B active",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add_all([task_a_active, task_a_evaluating, task_b_active])
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/tasks", params={"project_id": str(project_a.id), "archived": "false"})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Global fleet counts include tasks from both projects
+    assert data["active_count"] >= 2, "global active_count should include both projects"
+
+    # Scoped counts are present and only reflect project A
+    assert "scoped_active_count" in data
+    assert "scoped_evaluating_count" in data
+    assert "scoped_queued_count" in data
+    assert data["scoped_active_count"] == 1
+    assert data["scoped_evaluating_count"] == 1
+    assert data["scoped_queued_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_tasks_no_project_id_omits_scoped_counts(
+    client: AsyncClient, db_session
+):
+    """GET /api/admin/tasks without project_id must NOT include
+    scoped_*_count fields — they are only present when a project is scoped."""
+    project = await _make_project_with_member(db_session)
+    db_session.add(Task(
+        project_id=project.id,
+        title="task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+    ))
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/tasks", params={"archived": "false"})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "active_count" in data
+    assert "scoped_active_count" not in data
+    assert "scoped_evaluating_count" not in data
+    assert "scoped_queued_count" not in data

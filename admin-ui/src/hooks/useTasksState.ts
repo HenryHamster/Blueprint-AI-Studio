@@ -54,6 +54,8 @@ interface UseTasksStateDeps {
   // Shared ref the facade keeps pointed at the latest fetchTasks.
   fetchTasksRef: React.MutableRefObject<() => Promise<void>>;
   prevTasksRef: React.MutableRefObject<Task[]>;
+  // Project scope — when set, task list and counts are scoped to this project.
+  selectedProjectId: string | null;
 }
 
 export function useTasksState(deps: UseTasksStateDeps) {
@@ -63,6 +65,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
     fetchArchiveTasks,
     selectedTaskIds, setSelectedTaskIds, setSelectionMode, setConfirmDialog,
     fetchTasksRef, prevTasksRef,
+    selectedProjectId,
   } = deps;
 
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -70,6 +73,9 @@ export function useTasksState(deps: UseTasksStateDeps) {
   const [globalActiveCount, setGlobalActiveCount] = useState(0);
   const [globalEvaluatingCount, setGlobalEvaluatingCount] = useState(0);
   const [globalQueuedCount, setGlobalQueuedCount] = useState(0);
+  const [scopedActiveCount, setScopedActiveCount] = useState<number | null>(null);
+  const [scopedEvaluatingCount, setScopedEvaluatingCount] = useState<number | null>(null);
+  const [scopedQueuedCount, setScopedQueuedCount] = useState<number | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(1);
@@ -90,6 +96,17 @@ export function useTasksState(deps: UseTasksStateDeps) {
   // Reset page when status filter changes
   useEffect(() => { setPage(1); }, [statusFilter]);
 
+  // Reset page and selection when project scope changes
+  useEffect(() => {
+    setPage(1);
+    setSelectedTaskIds(new Set());
+    setSelectionMode(false);
+    setScopedActiveCount(null);
+    setScopedEvaluatingCount(null);
+    setScopedQueuedCount(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProjectId]);
+
   const fetchTasks = async () => {
     if (tasks.length === 0) {
       setInitialLoading(true);
@@ -101,6 +118,9 @@ export function useTasksState(deps: UseTasksStateDeps) {
       let url = `${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}&archived=false`;
       if (statusFilter.length < STATUS_OPTIONS.length) {
         statusFilter.forEach(s => { url += `&status=${s}`; });
+      }
+      if (selectedProjectId) {
+        url += `&project_id=${encodeURIComponent(selectedProjectId)}`;
       }
       const res = await authGet(url);
       if (res.ok) {
@@ -115,6 +135,12 @@ export function useTasksState(deps: UseTasksStateDeps) {
           if (data.active_count !== undefined) setGlobalActiveCount(data.active_count);
           if (data.evaluating_count !== undefined) setGlobalEvaluatingCount(data.evaluating_count);
           if (data.queued_count !== undefined) setGlobalQueuedCount(data.queued_count);
+          if (data.scoped_active_count !== undefined) setScopedActiveCount(data.scoped_active_count);
+          else setScopedActiveCount(null);
+          if (data.scoped_evaluating_count !== undefined) setScopedEvaluatingCount(data.scoped_evaluating_count);
+          else setScopedEvaluatingCount(null);
+          if (data.scoped_queued_count !== undefined) setScopedQueuedCount(data.scoped_queued_count);
+          else setScopedQueuedCount(null);
         }
 
         // Browser notifications for completed/failed tasks
@@ -484,6 +510,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   return {
     tasks, setTasks, totalTasks,
     globalActiveCount, globalEvaluatingCount, globalQueuedCount,
+    scopedActiveCount, scopedEvaluatingCount, scopedQueuedCount,
     initialLoading, refreshing,
     page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,

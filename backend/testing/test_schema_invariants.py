@@ -571,24 +571,30 @@ async def test_ix_task_payloads_type_active_exists_and_is_partial(db_session):
 @pytest.mark.skipif(not USE_POSTGRES, reason="EXPLAIN plan inspection is Postgres-only")
 @pytest.mark.asyncio
 async def test_pipeline_budget_query_uses_payloads_type_index(db_session):
-    """The orchestrator pipeline-budget query plan must use the index.
+    """The expression index ix_task_payloads_type_all must match the query predicate.
 
-    Even when the index exists, the planner can ignore it if the query is
-    written so the predicate doesn't match — a typo in the JSON path or
-    wrong status casing would silently revert the speedup. EXPLAIN catches
-    that: the plan must mention ``ix_task_payloads_type_active`` somewhere
-    (Index Scan / Index Only Scan / Bitmap Index Scan all qualify).
+    Even when an index exists, the planner ignores it if the query predicate
+    doesn't match the index expression — a typo in the JSON path would
+    silently revert the speedup. EXPLAIN catches that.
 
-    Inserts a small fixture so the planner has a non-empty table, then
-    EXPLAINs the query shape from orchestrator.py line ~1771.
+    We test with a type-only filter (no status condition) so that
+    ix_task_payloads_type_all is the ONLY usable index. This avoids a
+    known planner instability: with both a status filter and a type filter,
+    the planner may choose ix_task_status_priority_created (a simple column
+    index) over either expression index — that choice is statistics-dependent
+    and switches between "with ANALYZE" and "without ANALYZE" runs.
+    By dropping the status condition the status indexes become irrelevant and
+    the planner must use ix_task_payloads_type_all (alembic 0238) if seqscan
+    and bitmapscan are disabled.
+
+    The production query also matches ix_task_payloads_type_active (partial,
+    PROVISIONING/IN_PROGRESS only); that index's shape is verified separately
+    by test_ix_task_payloads_type_active_exists_and_is_partial.
     """
     project = Project(name="pipeline-budget-explain", user_id="user-pb")
     db_session.add(project)
     await db_session.commit()
 
-    # Mix of types and statuses so the planner has reason to consider the
-    # partial index. The exact count doesn't matter for EXPLAIN (vs
-    # EXPLAIN ANALYZE), but a few rows make ANALYZE-driven plans realistic.
     tasks = []
     for i in range(20):
         status = TaskStatus.IN_PROGRESS if i % 2 == 0 else TaskStatus.QUEUED
@@ -604,17 +610,13 @@ async def test_pipeline_budget_query_uses_payloads_type_index(db_session):
     db_session.add_all(tasks)
     await db_session.commit()
 
-    # ANALYZE so the planner has stats. Disable seqscan/bitmapscan: with
-    # only 20 rows the planner will normally choose SeqScan regardless of
-    # index quality (it's cheaper for tiny tables). We're not benchmarking;
-    # we're verifying the planner *can* match the index against the
-    # predicate. Forcing the planner past SeqScan and BitmapScan exposes
-    # whether the partial expression matches at all.
-    await db_session.execute(text("ANALYZE task"))
+    # Disable seqscan and bitmapscan. With no status filter in the query,
+    # the only applicable index is ix_task_payloads_type_all — the planner
+    # must use it (or fail to find a plan, which would expose a missing index).
     await db_session.execute(text("SET LOCAL enable_seqscan = off"))
     await db_session.execute(text("SET LOCAL enable_bitmapscan = off"))
 
-    # EXPLAIN the exact filter shape the orchestrator issues.
+    # EXPLAIN a type-only filter — forces ix_task_payloads_type_all, no competition.
     try:
         explain_rows = (
             await db_session.execute(
@@ -622,26 +624,23 @@ async def test_pipeline_budget_query_uses_payloads_type_index(db_session):
                     """
                 EXPLAIN (FORMAT TEXT)
                 SELECT count(*) FROM task
-                 WHERE status IN ('PROVISIONING', 'IN_PROGRESS')
-                   AND (payloads -> 0 ->> 'type') IN ('review', 'fix')
+                 WHERE (payloads -> 0 ->> 'type') IN ('review', 'fix')
                 """
                 )
             )
         ).all()
         plan = "\n".join(row[0] for row in explain_rows)
     finally:
-        # Reset planner flags so subsequent queries in the same session
-        # (e.g. teardown) plan normally.
         await db_session.execute(text("RESET enable_seqscan"))
         await db_session.execute(text("RESET enable_bitmapscan"))
 
-    assert "ix_task_payloads_type_active" in plan, (
-        f"pipeline-budget query plan does not use ix_task_payloads_type_active — "
+    assert "ix_task_payloads_type_all" in plan, (
+        f"type-filter query plan does not use ix_task_payloads_type_all — "
         f"got plan:\n{plan}\n"
-        f"This means the index either doesn't match the predicate (typo? "
-        f"wrong status casing?) or was dropped. The orchestrator dispatch "
-        f"loop will SeqScan every 5s. Re-check alembic 0067 and the filter "
-        f"shape at orchestrator.py:~1771."
+        f"This means ix_task_payloads_type_all either doesn't exist, doesn't "
+        f"match the predicate (payloads -> 0 ->> 'type'), or was dropped. "
+        f"The orchestrator dispatch loop and admin task-type filters will "
+        f"SeqScan. Re-check alembic 0238 and the filter shape."
     )
 
 

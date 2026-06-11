@@ -199,6 +199,7 @@ export function useAppState() {
   // ── Tasks domain ─────────────────────────────────────────────────────────
   const {
     tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount,
+    scopedActiveCount, scopedEvaluatingCount, scopedQueuedCount,
     initialLoading, refreshing,
     page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
@@ -215,6 +216,7 @@ export function useAppState() {
     fetchArchiveTasks,
     selectedTaskIds, setSelectedTaskIds, setSelectionMode, setConfirmDialog,
     fetchTasksRef, prevTasksRef,
+    selectedProjectId,
   });
 
   // ── Project-scoped config domain ─────────────────────────────────────────
@@ -548,7 +550,9 @@ export function useAppState() {
     // Auth
     user, authLoading, userRole, accessDenied, error, setError,
     // Tasks
-    tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, initialLoading, refreshing, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
+    tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount,
+    scopedActiveCount, scopedEvaluatingCount, scopedQueuedCount,
+    initialLoading, refreshing, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     needsAttentionCount,
     actionLoadingMap,
     fetchTasks, handleApprove, handleClearWaveDeps, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,

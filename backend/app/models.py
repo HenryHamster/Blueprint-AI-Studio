@@ -1355,6 +1355,10 @@ class Task(SQLModel, table=True):
             "payloads",
             postgresql_where=text("status IN ('PROVISIONING', 'IN_PROGRESS')"),
         ),
+        # Expression index on payloads[0]->>'type' covering all statuses so
+        # get_project_tasks task-type filters avoid a full table scan.
+        # Added via alembic 0238 CONCURRENTLY DDL.
+        Index("ix_task_payloads_type_all", "payloads"),
         # Partial index on retry_after_until so the reaper's stale
         # retry_after sweep (reaper.py: status=QUEUED AND
         # retry_after_until IS NOT NULL) doesn't degrade to linear scan

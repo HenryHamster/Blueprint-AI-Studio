@@ -97,7 +97,7 @@ async def test_bulk_retry_uses_scoped_session_per_task(
 
     invoked_with: list[uuid.UUID] = []
 
-    async def _fake_retry(task_id: uuid.UUID, request_session):
+    async def _fake_retry(task_id: uuid.UUID, request_session, preloaded_has_children=None):
         invoked_with.append(task_id)
         return None  # no old VM to delete
 
@@ -143,7 +143,7 @@ async def test_bulk_retry_does_not_block_concurrent_session_during_requeue(
     sleep_started = asyncio.Event()
     second_op_done = asyncio.Event()
 
-    async def _slow_retry(task_id: uuid.UUID, request_session):
+    async def _slow_retry(task_id: uuid.UUID, request_session, preloaded_has_children=None):
         sleep_started.set()
         # Wait for the concurrent fresh-session read to complete.
         # If the request session holds a blocking transaction, the
