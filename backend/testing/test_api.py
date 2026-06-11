@@ -1234,6 +1234,56 @@ async def test_admin_tasks_project_id_filter_returns_scoped_counts(
 
 
 @pytest.mark.asyncio
+async def test_admin_tasks_project_id_filter_hides_non_member_counts(
+    client: AsyncClient, db_session
+):
+    """Non-members must not learn per-project counts through scoped fields."""
+    project = Project(
+        name="Private Project",
+        user_id="other-user",
+        status=ProjectStatus.DEPLOYING,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            Task(
+                project_id=project.id,
+                title="private active",
+                status=TaskStatus.IN_PROGRESS,
+                payloads=[{"type": "create"}],
+            ),
+            Task(
+                project_id=project.id,
+                title="private evaluating",
+                status=TaskStatus.EVALUATING,
+                payloads=[{"type": "create"}],
+            ),
+            Task(
+                project_id=project.id,
+                title="private queued",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create"}],
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/tasks", params={"project_id": str(project.id)})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["tasks"] == []
+    assert data["total"] == 0
+    assert data["scoped_active_count"] == 0
+    assert data["scoped_evaluating_count"] == 0
+    assert data["scoped_queued_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_admin_tasks_no_project_id_omits_scoped_counts(
     client: AsyncClient, db_session
 ):

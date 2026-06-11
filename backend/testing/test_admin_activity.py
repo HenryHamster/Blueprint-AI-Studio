@@ -115,3 +115,48 @@ async def test_failed_task_includes_failure_class_and_taxonomy(
     assert ev["failure_class"] is not None
     assert ev["taxonomy"] is not None
     assert ev["error_summary"] is not None
+
+
+@pytest.mark.asyncio
+async def test_activity_includes_pr_artifact_when_multiple_artifacts_present(
+    client: AsyncClient, db_session
+):
+    """Artifact query returns data correctly when a task has multiple artifacts."""
+    project = await _make_project(db_session, name="Activity Multi-Artifact Project")
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        title="Multi-artifact task",
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Add both an ERROR_LOG and a PULL_REQUEST artifact for the same task
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.ERROR_LOG,
+            logs="some earlier error",
+        )
+    )
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/example/repo/pull/42",
+            repo_url="https://github.com/example/repo",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/activity")
+    assert resp.status_code == 200
+    events = resp.json()["events"]
+    completed = [e for e in events if e["type"] == "TASK_COMPLETED"]
+    assert len(completed) == 1
+    ev = completed[0]
+    # PR artifact should be picked up despite the presence of other artifact types
+    assert ev["pr_url"] == "https://github.com/example/repo/pull/42"

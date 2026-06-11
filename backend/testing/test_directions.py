@@ -9923,3 +9923,118 @@ async def test_strategic_api_update_direction_conflicts_with_unknown_id_returns_
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_reject_direction_cancels_queued_tasks(
+    db_session, mocker
+):
+    """reject_direction cancels QUEUED tasks tied to the rejected direction."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    dir_id = "d-rej-cancel-01"
+    existing_dirs = [
+        {
+            "id": dir_id,
+            "text": "Direction to reject",
+            "status": "proposed",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        }
+    ]
+    project = Project(
+        name="P-reject-cancel",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=existing_dirs,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create enough QUEUED tasks to force the 5000-row batch loop to iterate twice.
+    queued_tasks = []
+    for i in range(5001):
+        t = Task(
+            project_id=project.id,
+            user_id="u1",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create", "prompt": f"task {i}"}],
+            context={"direction_id": dir_id},
+        )
+        db_session.add(t)
+        queued_tasks.append(t)
+    # One QUEUED task for a different direction — should NOT be cancelled
+    other_task = Task(
+        project_id=project.id,
+        user_id="u1",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "other"}],
+        context={"direction_id": "d-other"},
+    )
+    db_session.add(other_task)
+    await db_session.commit()
+
+    sr_task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    task_id = str(sr_task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "reject_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": dir_id,
+                        "rationale": "not aligned with focus",
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["op"] == "reject_direction"
+        assert body["cancelled_tasks"] == len(queued_tasks)
+
+        # All QUEUED tasks for the rejected direction are now CANCELLED
+        for t in queued_tasks:
+            await db_session.refresh(t)
+            assert t.status == TaskStatus.CANCELLED, (
+                f"Expected CANCELLED, got {t.status}"
+            )
+
+        # Task for a different direction is untouched
+        await db_session.refresh(other_task)
+        assert other_task.status == TaskStatus.QUEUED
+
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)

@@ -517,7 +517,10 @@ async def get_all_tasks(
                     func.count(case((Task.status == TaskStatus.QUEUED, 1))),
                 )
                 .select_from(Task)
-                .where(Task.project_id == project_id)
+                .where(
+                    Task.project_id == project_id,
+                    Task.project_id.in_(_user_project_ids(current_user["user_id"])),
+                )
             )
         ).one()
         scoped_active, scoped_evaluating, scoped_queued = _scoped_row
