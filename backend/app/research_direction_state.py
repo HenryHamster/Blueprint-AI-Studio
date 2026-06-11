@@ -196,6 +196,32 @@ def _detect_dedup_deadlock(history: list, window: int = 3) -> tuple[bool, int]:
     return True, consecutive
 
 
+def direction_refractory_minutes() -> float:
+    """Refractory window stamped on a direction when its research cycle completes.
+
+    Defaults to the operator-tuned ``autonomous_direction_cooldown_minutes`` so
+    the post-cycle hold and the spawn-side recency cooldown are one knob — a
+    refractory longer than the operator's cooldown silently overrides operator
+    throttling intent. An explicit ``direction_refractory_minutes`` runtime
+    value decouples them if a longer hold is ever wanted.
+    """
+    value = _runtime_config.get("direction_refractory_minutes")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    fallback = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
+    if isinstance(fallback, (int, float)) and not isinstance(fallback, bool):
+        return float(fallback)
+    return 240.0
+
+
+def direction_saturation_refractory_minutes() -> float:
+    """Longer hold for saturated / no-findings directions: 2x the standard window."""
+    value = _runtime_config.get("direction_saturation_refractory_minutes")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return 2.0 * direction_refractory_minutes()
+
+
 async def apply_post_spawn_state(
     session: AsyncSession,
     task: Task,
@@ -278,7 +304,7 @@ async def apply_post_spawn_state(
             directions = list(project.directions or [])
             _pending_archived_diagnoses: list[tuple] = []
             now_iso = _utcnow().isoformat()
-            _refractory_min = _runtime_config.get("direction_refractory_minutes", 360)
+            _refractory_min = direction_refractory_minutes()
             for d in directions:
                 if d.get("id") in direction_ids_with_findings:
                     d["last_researched_at"] = now_iso
@@ -469,9 +495,7 @@ async def apply_post_spawn_state(
                     # Saturated directions get a longer refractory so the portfolio
                     # is not immediately re-queued on a direction that has no work left.
                     if d.get("possibly_saturated"):
-                        _sat_refractory_min = _runtime_config.get(
-                            "direction_saturation_refractory_minutes", 720
-                        )
+                        _sat_refractory_min = direction_saturation_refractory_minutes()
                         if isinstance(_sat_refractory_min, (int, float)) and _sat_refractory_min > 0:
                             d["refractory_until"] = (
                                 _utcnow() + timedelta(minutes=float(_sat_refractory_min))
