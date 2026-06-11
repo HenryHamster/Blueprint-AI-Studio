@@ -208,8 +208,12 @@ function formatPrimaryFindingsSection(findings: PrimaryFinding[]): string {
   return (
     'The primary release audit reported these higher-severity findings. ' +
     'Independently re-investigate EACH against the real diff and the full repo, ' +
-    'and emit one verdict per finding (match it back by severity + summary + ' +
-    'file):\n' + lines.join('\n') + '\n\n'
+    'and emit one verdict per finding:\n' + lines.join('\n') + '\n\n' +
+    'IMPORTANT — verbatim summary requirement: the `summary` field in each ' +
+    'verdict MUST be copied character-for-character from the numbered list above ' +
+    '(e.g. finding 1 → copy its text exactly as your verdict summary). The ' +
+    'backend matches verdicts back to findings by exact string comparison; ' +
+    'paraphrasing breaks the binding and causes the qualification to be held.\n\n'
   );
 }
 
@@ -370,7 +374,7 @@ export async function handleReleaseAuditChallenge(
 
 Field semantics:
 - \`challenged_candidate_sha\`: the pinned candidate SHA — use exactly \`${candidateSha}\`.
-- \`verdicts\`: one entry per higher-severity finding you judged. Each entry has \`severity\` (critical|blocker|high|medium|moderate|warning), \`summary\` (one sentence, matching the primary finding by content so it can be matched back), \`file\` (file path or empty string if cross-cutting), \`verdict\` (one of: confirmed | refuted_false_positive | uncertain), and \`reason\`.
+- \`verdicts\`: one entry per higher-severity finding you judged. Each entry has \`severity\` (critical|blocker|high|medium|moderate|warning), \`summary\` (when primary findings were listed above, copy the exact text from the numbered list character-for-character — the backend uses exact string matching to bind verdicts to findings, so paraphrasing breaks the binding; when deriving findings independently, one descriptive sentence), \`file\` (file path or empty string if cross-cutting), \`verdict\` (one of: confirmed | refuted_false_positive | uncertain), and \`reason\`.
 - \`reason\`: an auditable justification (≥ 20 non-whitespace characters) citing the specific files/lines you read. It is REQUIRED for \`confirmed\` and \`refuted_false_positive\`; a verdict of those types WITHOUT a substantive reason will be downgraded to \`uncertain\`.
 
 Rules:
