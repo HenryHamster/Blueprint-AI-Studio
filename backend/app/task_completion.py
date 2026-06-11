@@ -102,6 +102,18 @@ _COMPUTE_WAKE_POST_COMMIT_META_KEY = "_compute_wake_post_commit_meta"
 _COMPUTE_WAKE_NEXT_RETRY_KEY = "_compute_wake_next_retry_after"
 _COMPUTE_WAKE_MAX_ATTEMPTS = 12
 
+# VM-substrate analysis routing. When the backend-side cited-LLM attempt reports
+# the missing-backend-key ``precondition-not-met`` cause (operator policy
+# p-13f153e9 permanently forbids a backend ANTHROPIC_API_KEY), the analysis is
+# routed onto the agent-VM centralized-accounts substrate instead of grading
+# measured_only forever: the compute_experiment task is re-queued with an optional
+# request bundle stamped into ``task.context`` so the resumed handler runs the
+# ``claude`` CLI and submits the produced analysis back. Bounded by a per-task
+# attempt counter so a structurally-stuck job can never loop forever.
+_COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY = "compute_vm_analysis_request"
+_COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY = "compute_vm_analysis_attempts"
+_COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS = 12
+
 # Auto-delivery of the cited LLM analysis classifies the
 # ``analyze_compute_experiment_knowledge`` unavailable-cause tokens by whether a
 # retry could ever change the outcome.
@@ -2312,8 +2324,132 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 # ---------------------------------------------------------------------------
 
 
-async def _auto_analyze_compute_experiment_best_effort(
+async def _route_compute_analysis_to_vm(
     task: Task, logs: str, criterion: Optional[dict], session: AsyncSession
+) -> bool:
+    """Re-queue a compute_experiment onto the agent-VM substrate for cited analysis.
+
+    Invoked ONLY for the missing-backend-key ``precondition-not-met`` cause. Builds
+    the authoritative analysis prompt + evidence bundle backend-side, stamps it onto
+    ``task.context`` under an OPTIONAL key, and returns the task to the dispatch
+    queue (``QUEUED``) so a fresh agent VM resumes it, runs the centralized
+    ``claude`` CLI, and submits the produced analysis back through the agent
+    endpoint (where citation grounding is re-enforced). The deterministic
+    measured_only document has already persisted and stays the durable base record.
+
+    Bounded and best-effort:
+
+    * a per-task attempt counter (``task.context``) caps re-queues at
+      ``_COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS`` so a structurally-stuck job can never
+      loop forever;
+    * a no-op when the durable doc is already an ``llm`` upgrade (a prior VM
+      submission already succeeded) or there is no durable evidence to cite;
+    * any failure rolls back and leaves the terminal measured_only outcome intact.
+
+    Returns ``True`` iff it re-queued the task.
+    """
+    from app.models import KnowledgeDocument, SourceKind
+
+    try:
+        existing = (
+            (
+                await session.execute(
+                    select(KnowledgeDocument).where(
+                        KnowledgeDocument.project_id == task.project_id,
+                        KnowledgeDocument.source_task_id == task.id,
+                        KnowledgeDocument.source_kind
+                        == SourceKind.COMPUTE_EXPERIMENT.value,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            mode = str((existing.forward_quality_verdict or {}).get("analysis_mode") or "")
+            if mode == "llm":
+                # Already upgraded by a prior VM submission — nothing to route.
+                return False
+
+        ctx = dict(task.context or {})
+        attempts = int(ctx.get(_COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY, 0) or 0)
+        if attempts >= _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS:
+            logger.warning(
+                "[COMPUTE] VM analysis attempt ceiling (%d) reached for task %s; "
+                "leaving deterministic measured_only doc intact",
+                _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS,
+                task.id,
+            )
+            return False
+
+        measurement = _extract_compute_measurement(logs)
+        if measurement is None:
+            return False
+        outcome, cost = measurement
+
+        from app.knowledge_completion import build_compute_vm_analysis_request
+
+        bundle = await build_compute_vm_analysis_request(
+            task,
+            outcome=outcome,
+            cost=cost,
+            criterion=criterion,
+            result_reference=_extract_compute_result_reference(logs),
+            session=session,
+            logs=logs,
+        )
+        if bundle is None:
+            # No durable evidence to cite — genuinely terminal, do not dispatch.
+            return False
+
+        # Carry the authoritative COMPUTE_RESULT artifact so the resumed handler
+        # can post its honest terminal completion (re-gated, upgrade-only) after
+        # submitting the analysis — the backend never has to trust the VM for it.
+        bundle["result_logs"] = logs
+
+        ctx[_COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY] = bundle
+        ctx[_COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY] = attempts + 1
+        # Clear the slot-released marker so re-dispatch acquires a fresh slot,
+        # mirroring the RESUME wake-delivery path in task_lifecycle.deliver_wake.
+        ctx.pop("_slot_released", None)
+        task.context = ctx
+        flag_modified(task, "context")
+        task.status = TaskStatus.QUEUED
+        task.parked_at = None
+        task.park_reason = None
+        task.vm_instance_id = None
+        task.latest_status_message = (
+            "Compute analysis routed to VM substrate (centralized accounts): "
+            "backend has no Anthropic key"
+        )[:500]
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[COMPUTE] routed compute analysis for task %s to VM substrate "
+            "(attempt %d/%d)",
+            task.id,
+            attempts + 1,
+            _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — routing must never break completion
+        logger.warning(
+            "[COMPUTE] failed to route compute analysis to VM for task %s",
+            task.id,
+            exc_info=True,
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        return False
+
+
+async def _auto_analyze_compute_experiment_best_effort(
+    task: Task,
+    logs: str,
+    criterion: Optional[dict],
+    session: AsyncSession,
+    *,
+    route_precondition_to_vm: bool = False,
 ) -> str:
     """Auto-attempt the cited LLM analysis once the deterministic doc exists.
 
@@ -2356,14 +2492,34 @@ async def _auto_analyze_compute_experiment_best_effort(
     reason = str((envelope or {}).get("reason") or "").strip()
     if reason in _ANALYSIS_RECOVERABLE_CAUSES:
         return "recoverable"
-    # Terminal causes — and any unrecognised reason — fail closed: the
+    if reason == "precondition-not-met":
+        # The backend has no Anthropic key (operator policy p-13f153e9 permanently
+        # forbids one). Instead of grading measured_only forever, route the cited
+        # analysis onto the agent-VM centralized-accounts substrate. Only the
+        # production autonomous wake post-commit path routes (``route_precondition_to_vm``):
+        # the direct owns_commit=True completion is also the path the RESUMED VM
+        # task completes through, and re-routing there would loop. The routing is
+        # bounded internally (per-task attempt counter) and a no-op once the doc is
+        # already an llm upgrade or there is no durable evidence; either way the
+        # deterministic measured_only doc stays intact. The LLM is NOT re-attempted
+        # in-process, so this is a terminal disposition for the wake retry sweep.
+        if route_precondition_to_vm:
+            await _route_compute_analysis_to_vm(task, logs, criterion, session)
+        return "terminal"
+    # Genuinely terminal causes (no-evidence, citations-ungrounded,
+    # analysis-disabled) — and any unrecognised reason — fail closed: the
     # measured-only outcome with its unavailable_cause is durably persisted and
     # must not be retried so a structurally-stuck job cannot loop the LLM forever.
     return "terminal"
 
 
 async def _persist_compute_experiment_knowledge_best_effort(
-    task: Task, logs: str, criterion: Optional[dict], session: AsyncSession
+    task: Task,
+    logs: str,
+    criterion: Optional[dict],
+    session: AsyncSession,
+    *,
+    route_precondition_to_vm: bool = False,
 ) -> _ComputeKnowledgeOutcome:
     """Persist a compute_experiment's measured verdict as durable knowledge, then
     auto-attempt the cited LLM analysis.
@@ -2428,7 +2584,11 @@ async def _persist_compute_experiment_knowledge_best_effort(
     # manually hitting the analyze endpoint — best-effort, decoupled from the
     # already-committed completion.
     analysis = await _auto_analyze_compute_experiment_best_effort(
-        task, logs, criterion, session
+        task,
+        logs,
+        criterion,
+        session,
+        route_precondition_to_vm=route_precondition_to_vm,
     )
     return _ComputeKnowledgeOutcome(
         deterministic_ok=True,
@@ -2578,7 +2738,7 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
         logs = build_compute_result_logs(job)
         criterion = (task.context or {}).get("compute_success_criterion")
         knowledge = await _persist_compute_experiment_knowledge_best_effort(
-            task, logs, criterion, session
+            task, logs, criterion, session, route_precondition_to_vm=True
         )
         if not knowledge.deterministic_ok or knowledge.analysis_retry_pending:
             # Either durable knowledge did not persist, OR it persisted but the

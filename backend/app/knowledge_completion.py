@@ -1163,6 +1163,7 @@ def _build_compute_experiment_document(
     cost: float | None,
     criterion: dict[str, Any] | None,
     result_reference: str | None,
+    terminal_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the DETERMINISTIC compute-experiment knowledge document.
 
@@ -1171,6 +1172,11 @@ def _build_compute_experiment_document(
     pass as the structured facts to ground its prose in. Returns a dict of
     ``title``/``summary``/``body``/``topic``/``tags``/``citations`` plus the
     metric ``verdict_record`` so the persisted shape is identical to before.
+
+    ``terminal_diagnostics`` is an optional dict extracted from the ComputeJob row
+    (``terminal_reason``, ``vm_phase``, ``accelerator_type``, ``machine_type``).
+    When present it is appended to the human-readable summary and body and stored
+    in ``verdict_record`` so a failed run is attributable at a glance.
     """
     payload = task.first_payload or {}
     experiment = str(payload.get("experiment") or "").strip()
@@ -1209,6 +1215,12 @@ def _build_compute_experiment_document(
             )
     if cost is not None:
         summary_parts.append(f"Cost: ${cost}.")
+    if terminal_diagnostics:
+        td_reason = terminal_diagnostics.get("terminal_reason")
+        td_phase = terminal_diagnostics.get("vm_phase")
+        if td_reason:
+            phase_clause = f"; VM phase: {td_phase}" if td_phase else ""
+            summary_parts.append(f"Terminal diagnostics: {td_reason}{phase_clause}.")
     summary = " ".join(summary_parts)
 
     body_lines = [
@@ -1230,6 +1242,19 @@ def _build_compute_experiment_document(
         body_lines.append(f"- **Cost (USD):** {cost}")
     if result_reference:
         body_lines.append(f"- **Result reference:** {result_reference}")
+    if terminal_diagnostics:
+        td_reason = terminal_diagnostics.get("terminal_reason")
+        td_phase = terminal_diagnostics.get("vm_phase")
+        td_accel = terminal_diagnostics.get("accelerator_type")
+        td_machine = terminal_diagnostics.get("machine_type")
+        if td_reason:
+            body_lines.append(f"- **Terminal reason:** {td_reason}")
+        if td_phase:
+            body_lines.append(f"- **VM phase:** {td_phase}")
+        if td_accel:
+            body_lines.append(f"- **Accelerator type:** {td_accel}")
+        if td_machine:
+            body_lines.append(f"- **Machine type:** {td_machine}")
     body = "\n".join(body_lines)
 
     raw_tags = payload.get("tags")
@@ -1245,13 +1270,15 @@ def _build_compute_experiment_document(
         else []
     )
 
-    verdict_record = {
+    verdict_record: dict[str, Any] = {
         "strategy": "metric",
         "outcome": outcome,
         "cost_usd": cost,
         "criterion": criterion,
         "criterion_met": crit_met,
     }
+    if terminal_diagnostics:
+        verdict_record["terminal_diagnostics"] = terminal_diagnostics
 
     return {
         "title": title,
@@ -1646,10 +1673,35 @@ async def _analyze_compute_experiment_with_llm(
     document = await _call_compute_analysis_llm(api_key, prompt)
     if document is None:
         return None, "llm-error"
+    return _ground_and_assemble_compute_analysis(
+        document, evidence, fallback, execution="backend"
+    )
 
+
+def _ground_and_assemble_compute_analysis(
+    document: dict[str, Any],
+    evidence: dict[str, Any],
+    fallback: dict[str, Any],
+    *,
+    analysis_model: str = _COMPUTE_LLM_ANALYSIS_MODEL,
+    execution: str = "backend",
+) -> tuple[dict[str, Any] | None, str]:
+    """Ground a produced analysis document and assemble the upgrade payload.
+
+    Backend-authoritative grounding shared by BOTH the backend-key LLM path and
+    the VM-substrate submission path (:func:`submit_compute_vm_analysis`). The
+    producer's citations — whether they came from the backend Anthropic call or
+    from the agent VM running the centralized-accounts ``claude`` CLI — are kept
+    only if they are members of the durable candidate set, and at least one must
+    resolve to real artifact/metric evidence. The VM is NEVER trusted to
+    self-certify grounding; this same gate runs on submission.
+
+    Returns ``(document, "")`` on success or ``(None, reason)`` with a compact
+    machine-readable cause (``"llm-error"``, ``"citations-ungrounded"``).
+    """
     # Citation grounding: keep only citations that are members of the durable
-    # candidate set (the LLM cannot fabricate evidence), then run them through the
-    # SAME shape gate the other knowledge lanes use.
+    # candidate set (the producer cannot fabricate evidence), then run them
+    # through the SAME shape gate the other knowledge lanes use.
     allowed = set(evidence["citations"])
     real_evidence = set(evidence["real_evidence"])
     raw_citations = document.get("source_citations")
@@ -1663,9 +1715,9 @@ async def _analyze_compute_experiment_with_llm(
     # resolves to real artifact/metric evidence — not only the result_reference.
     if not usable or not any(c in real_evidence for c in usable):
         logger.info(
-            "[COMPUTE] analysis for task %s lacked grounded artifact citations; "
+            "[COMPUTE] %s analysis lacked grounded artifact citations; "
             "analysis unavailable",
-            task.id,
+            execution,
         )
         return None, "citations-ungrounded"
 
@@ -1679,13 +1731,16 @@ async def _analyze_compute_experiment_with_llm(
 
     verdict_record = dict(fallback["verdict_record"])
     verdict_record["analysis_mode"] = "llm"
-    verdict_record["analysis_model"] = _COMPUTE_LLM_ANALYSIS_MODEL
+    verdict_record["analysis_model"] = analysis_model
+    # Auditable provenance: whether the model ran in the backend process or on the
+    # agent-VM centralized-accounts substrate (operator policy p-13f153e9).
+    verdict_record["analysis_execution"] = execution
 
     # Stamp citation-grounding counts so _persist_compute_knowledge_document can
     # attach them to the verdict, mirroring the design/web_research grounding stamp.
     # At this point we already know: at least one usable citation is in real_evidence
     # (the gate above enforced it), so grounded >= 1 and citation_grounding_miss
-    # will not fire for LLM-produced documents.
+    # will not fire for produced documents.
     grounding_stamp = {
         "checked": True,
         "file_citations": len(usable),
@@ -1888,6 +1943,11 @@ async def _persist_compute_knowledge_document(
     # touching the compute_result the compute handler already wrote there.
     # Always reflect the stored doc's actual (post-upgrade) values so the
     # mirror is consistent with what was written to the database.
+    # When the stored document is at a STRONGER mode than the incoming
+    # verdict (e.g. llm doc receiving a deterministic re-run), pull
+    # acceptance fields from the stored verdict so the mirror stays
+    # consistent with the graded llm document instead of regressing to
+    # the deterministic acceptance.
     plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
     plan_output = dict(plan_output)
     stored_verdict = doc.forward_quality_verdict or verdict_record
@@ -1901,9 +1961,18 @@ async def _persist_compute_knowledge_document(
         "citation_count": len(doc.source_citations or citations),
         "source_kind": SourceKind.COMPUTE_EXPERIMENT.value,
         "analysis_mode": stored_verdict.get("analysis_mode", mode),
-        "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
-        "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
-        "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
+        "knowledge_acceptance_evidence": stored_verdict.get(
+            "knowledge_acceptance_evidence",
+            acceptance["knowledge_acceptance_evidence"],
+        ),
+        "compute_acceptance_grade": stored_verdict.get(
+            "compute_acceptance_grade",
+            acceptance["compute_acceptance_grade"],
+        ),
+        "compute_acceptance_reason": stored_verdict.get(
+            "compute_acceptance_reason",
+            acceptance["compute_acceptance_reason"],
+        ),
         "release_evidence": stored_verdict.get("release_evidence"),
         "analysis_fallback_reason": stored_verdict.get("fallback_reason"),
     }
@@ -1929,6 +1998,34 @@ async def _persist_compute_knowledge_document(
     return doc
 
 
+def _extract_job_terminal_diagnostics(job: Any) -> dict[str, Any] | None:
+    """Extract attributable terminal diagnostics from a ComputeJob row.
+
+    Returns a dict with ``terminal_reason``, ``vm_phase`` (``provisioning`` when
+    the VM never started, ``runtime`` otherwise), plus ``accelerator_type`` and
+    ``machine_type`` when known.  Returns ``None`` when the job has no
+    terminal_reason (i.e. no diagnostic information to add).
+    """
+    if job is None:
+        return None
+    reason = getattr(job, "terminal_reason", None)
+    if not reason:
+        return None
+    started_at = getattr(job, "started_at", None)
+    vm_phase = "provisioning" if started_at is None else "runtime"
+    diag: dict[str, Any] = {
+        "terminal_reason": reason,
+        "vm_phase": vm_phase,
+    }
+    accel = getattr(job, "accelerator_type", None)
+    if accel:
+        diag["accelerator_type"] = accel
+    machine = getattr(job, "machine_type", None)
+    if machine:
+        diag["machine_type"] = machine
+    return diag
+
+
 async def _prepare_deterministic_compute_document(
     task: Task,
     *,
@@ -1940,12 +2037,15 @@ async def _prepare_deterministic_compute_document(
     logs: str | None = None,
 ) -> tuple[dict[str, Any], uuid.UUID | None]:
     """Build the primary deterministic artifact-grounded compute document."""
+    job = await _load_compute_job_from_logs(logs, session)
+    terminal_diagnostics = _extract_job_terminal_diagnostics(job)
     document = _build_compute_experiment_document(
         task,
         outcome=outcome,
         cost=cost,
         criterion=criterion,
         result_reference=result_reference,
+        terminal_diagnostics=terminal_diagnostics,
     )
     try:
         grounding_stamp = await _compute_citation_grounding_stamp(
@@ -1962,7 +2062,6 @@ async def _prepare_deterministic_compute_document(
             task.id,
             exc_info=True,
         )
-    job = await _load_compute_job_from_logs(logs, session)
     return document, job.id if job is not None else None
 
 
@@ -2068,46 +2167,187 @@ async def analyze_compute_experiment_knowledge(
         analysis = None
         reason = "llm-error"
     if analysis is None:
-        _stamped_doc_id: str | None = None
-        try:
-            _existing = (
-                (
-                    await session.execute(
-                        select(KnowledgeDocument).where(
-                            KnowledgeDocument.project_id == task.project_id,
-                            KnowledgeDocument.source_task_id == task.id,
-                            KnowledgeDocument.source_kind
-                            == SourceKind.COMPUTE_EXPERIMENT.value,
-                        )
+        return await _stamp_compute_analysis_unavailable(task, reason, session)
+
+    doc = await _persist_compute_knowledge_document(
+        task,
+        analysis,
+        "llm",
+        session,
+        compute_job_id=compute_job_id,
+    )
+    return {
+        "status": "upgraded",
+        "reason": None,
+        "analysis_mode": "llm",
+        "knowledge_document_id": str(doc.id),
+    }
+
+
+async def _stamp_compute_analysis_unavailable(
+    task: Task, reason: str | None, session: AsyncSession
+) -> dict[str, Any]:
+    """Stamp an unavailable cause on the deterministic doc and return the envelope.
+
+    Shared by the backend-key path and the VM-substrate submission path. Never
+    downgrades: an already-``llm`` document keeps its acceptance grade and is NOT
+    annotated with an unavailable cause (a successful upgrade is authoritative).
+    """
+    stamped_doc_id: str | None = None
+    try:
+        existing = (
+            (
+                await session.execute(
+                    select(KnowledgeDocument).where(
+                        KnowledgeDocument.project_id == task.project_id,
+                        KnowledgeDocument.source_task_id == task.id,
+                        KnowledgeDocument.source_kind
+                        == SourceKind.COMPUTE_EXPERIMENT.value,
                     )
                 )
-                .scalars()
-                .first()
             )
-            if _existing is not None:
-                _stamped_doc_id = str(_existing.id)
-                _verdict = dict(_existing.forward_quality_verdict or {})
-                _verdict["unavailable_cause"] = reason or "unknown"
-                _verdict["analysis_attempted_at"] = datetime.now(timezone.utc).isoformat()
-                _existing.forward_quality_verdict = _verdict
-                flag_modified(_existing, "forward_quality_verdict")
-                session.add(_existing)
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            stamped_doc_id = str(existing.id)
+            verdict = dict(existing.forward_quality_verdict or {})
+            # Do not annotate an already-upgraded llm doc as unavailable.
+            if str(verdict.get("analysis_mode") or "") != "llm":
+                verdict["unavailable_cause"] = reason or "unknown"
+                verdict["analysis_attempted_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                existing.forward_quality_verdict = verdict
+                flag_modified(existing, "forward_quality_verdict")
+                session.add(existing)
                 await session.commit()
-        except Exception:  # noqa: BLE001 — stamp must never block the caller
-            logger.warning(
-                "[COMPUTE] failed to stamp unavailable_cause for task %s",
-                task.id,
-                exc_info=True,
-            )
-        envelope: dict[str, Any] = {
-            "status": "analysis_unavailable",
-            "reason": reason or "unknown",
-            "analysis_mode": "unavailable",
-        }
-        if _stamped_doc_id is not None:
-            envelope["knowledge_document_id"] = _stamped_doc_id
-        return envelope
+    except Exception:  # noqa: BLE001 — stamp must never block the caller
+        logger.warning(
+            "[COMPUTE] failed to stamp unavailable_cause for task %s",
+            task.id,
+            exc_info=True,
+        )
+    envelope: dict[str, Any] = {
+        "status": "analysis_unavailable",
+        "reason": reason or "unknown",
+        "analysis_mode": "unavailable",
+    }
+    if stamped_doc_id is not None:
+        envelope["knowledge_document_id"] = stamped_doc_id
+    return envelope
 
+
+async def build_compute_vm_analysis_request(
+    task: Task,
+    *,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    result_reference: str | None,
+    session: AsyncSession,
+    logs: str | None = None,
+) -> dict[str, Any] | None:
+    """Build the prompt + evidence bundle the agent VM runs the model on.
+
+    The backend constructs the authoritative analysis prompt (constrained to the
+    durable candidate citations) so the VM only has to run the centralized
+    ``claude`` CLI and return the produced JSON — citation grounding stays
+    backend-side at submission. Returns ``None`` when there is no durable evidence
+    to analyze (the genuinely terminal ``no-evidence`` case), so callers leave the
+    measured_only document intact rather than dispatching a VM with nothing to
+    cite.
+    """
+    evidence = await _gather_compute_evidence(
+        task,
+        logs=logs,
+        result_reference=result_reference,
+        criterion=criterion,
+        session=session,
+    )
+    if evidence is None:
+        return None
+    fallback, _compute_job_id = await _prepare_deterministic_compute_document(
+        task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        result_reference=result_reference,
+        session=session,
+        logs=logs,
+    )
+    prompt = _build_compute_analysis_prompt(
+        task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        evidence=evidence,
+        fallback=fallback,
+    )
+    return {
+        "prompt": prompt,
+        # Informational allowlist mirrored from the prompt; grounding is still
+        # re-enforced backend-side on submission and never trusts the VM.
+        "allowed_citations": list(evidence["citations"]),
+    }
+
+
+async def submit_compute_vm_analysis(
+    task: Task,
+    *,
+    vm_document: dict[str, Any],
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    result_reference: str | None,
+    session: AsyncSession,
+    logs: str | None = None,
+) -> dict[str, Any]:
+    """Ground a VM-produced compute analysis backend-side and upgrade the doc.
+
+    The agent VM ran the model on the centralized-accounts substrate (operator
+    policy p-13f153e9 permanently forbids a backend ANTHROPIC_API_KEY) and POSTed
+    the produced analysis JSON. This re-grounds its citations against the REAL
+    durable artifact via the SAME gate the backend-key path uses (never trusting
+    VM-supplied grounding) and, when grounded, UPGRADES the deterministic
+    KnowledgeDocument to ``analysis_mode='llm'`` through the existing upgrade-only
+    persistence machinery. An ungrounded or empty submission never downgrades —
+    it stamps a machine-readable cause and leaves the measured_only doc intact.
+    """
+    fallback, compute_job_id = await _prepare_deterministic_compute_document(
+        task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        result_reference=result_reference,
+        session=session,
+        logs=logs,
+    )
+    if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
+        return await _stamp_compute_analysis_unavailable(
+            task, "analysis-disabled", session
+        )
+    evidence = await _gather_compute_evidence(
+        task,
+        logs=logs,
+        result_reference=result_reference,
+        criterion=criterion,
+        session=session,
+    )
+    if evidence is None:
+        return await _stamp_compute_analysis_unavailable(task, "no-evidence", session)
+    if not isinstance(vm_document, dict):
+        return await _stamp_compute_analysis_unavailable(task, "llm-error", session)
+    analysis, reason = _ground_and_assemble_compute_analysis(
+        vm_document,
+        evidence,
+        fallback,
+        execution="vm_substrate",
+    )
+    if analysis is None:
+        return await _stamp_compute_analysis_unavailable(
+            task, reason or "llm-error", session
+        )
     doc = await _persist_compute_knowledge_document(
         task,
         analysis,

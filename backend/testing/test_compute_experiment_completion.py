@@ -3635,6 +3635,202 @@ async def test_recoverable_analysis_retries_via_wake_sweep_until_upgraded(
 
 
 @pytest.mark.asyncio
+async def test_no_backend_key_compute_analysis_upgrades_via_vm_substrate(
+    db_session, mocker, _quiet_compute_io
+):
+    """Production-shaped (no backend ANTHROPIC_API_KEY): an autonomous compute
+    completion routes the cited analysis onto the agent-VM centralized-accounts
+    substrate instead of grading measured_only forever, and a grounded VM
+    submission UPGRADES the doc to analysis_mode='llm' with an acceptance-grade
+    reason — zero operator action and NEVER via a backend key (operator policy
+    p-13f153e9).
+    """
+    from app.knowledge_completion import submit_compute_vm_analysis
+    from app.models import TaskWakeRegistration, WakeAction, WakeDeliveryState
+    from app.task_completion import (
+        _COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY,
+        _COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY,
+        _COMPUTE_WAKE_POST_COMMIT_META_KEY,
+        run_compute_wake_post_commit,
+    )
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+
+    # A DELIVERED compute-wake registration — the production autonomous path that
+    # persists durable knowledge AFTER the finalize commit.
+    reg = TaskWakeRegistration(
+        task_id=task.id,
+        project_id=task.project_id,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        delivery_state=WakeDeliveryState.DELIVERED,
+        delivered_at=datetime.utcnow(),
+        source_metadata={_COMPUTE_WAKE_POST_COMMIT_META_KEY: {"attempts": 0}},
+    )
+    db_session.add(reg)
+    await db_session.commit()
+    await db_session.refresh(reg)
+
+    # ── Autonomous completion with NO backend key → route to the VM substrate ──
+    with patch.dict(
+        os.environ, {"ANTHROPIC_API_KEY": "", "DISABLE_LLM_COMPUTE_ANALYSIS": ""}
+    ):
+        ok = await run_compute_wake_post_commit(db_session, reg)
+    assert ok is True
+
+    await db_session.refresh(task)
+    # The deterministic measured_only doc persisted as the durable base record.
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    assert verdict["analysis_mode"] == "deterministic"
+    assert verdict["compute_acceptance_grade"] == "measured_only"
+    assert verdict["knowledge_acceptance_evidence"] is False
+    # NOT a dead-end terminal grade: the task is re-queued onto the VM substrate
+    # carrying the backend-built analysis request bundle, bounded by an attempt
+    # counter so a structurally-stuck job can never loop forever.
+    assert task.status == TaskStatus.QUEUED
+    bundle = (task.context or {}).get(_COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY)
+    assert isinstance(bundle, dict)
+    assert bundle.get("prompt")
+    assert bundle.get("result_logs")
+    # The backend built the authoritative prompt grounded in the durable artifact.
+    assert artifact_uri in bundle["prompt"]
+    assert task.context[_COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY] == 1
+
+    # ── Simulate the VM submitting a grounded analysis (the agent endpoint runs
+    #    this same backend core; citation grounding stays backend-authoritative
+    #    and never trusts the VM). Still NO backend ANTHROPIC_API_KEY. ──
+    vm_document = {
+        "title": "VM analysis: durable artifacts cleared the bar",
+        "summary": "Grounded analysis citing the durable artifact bundle + metric.",
+        "body": "# Analysis\n\nThe run cleared the bar; see the cited evidence.",
+        "source_citations": [artifact_uri, metric_ref],
+    }
+    with patch.dict(
+        os.environ, {"ANTHROPIC_API_KEY": "", "DISABLE_LLM_COMPUTE_ANALYSIS": ""}
+    ):
+        envelope = await submit_compute_vm_analysis(
+            task,
+            vm_document=vm_document,
+            outcome="SUCCESS",
+            cost=0.37,
+            criterion={
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+                "value": 0.93,
+                "met": True,
+                "measurable": True,
+            },
+            result_reference=job.result_reference,
+            session=db_session,
+            logs=compute_jobs.build_compute_result_logs(job),
+        )
+    assert envelope["status"] == "upgraded"
+    assert envelope["analysis_mode"] == "llm"
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1  # in-place upgrade, not a new row
+    doc = docs[0]
+    assert artifact_uri in doc.source_citations
+    assert metric_ref in doc.source_citations
+    upgraded = doc.forward_quality_verdict
+    assert upgraded["analysis_mode"] == "llm"
+    # Provenance: the model ran on the VM centralized-accounts substrate, NOT the
+    # backend process — the whole point of operator policy p-13f153e9.
+    assert upgraded["analysis_execution"] == "vm_substrate"
+    assert upgraded["knowledge_acceptance_evidence"] is True
+    assert upgraded["compute_acceptance_grade"] == "acceptance"
+    assert upgraded["compute_acceptance_reason"] == "llm_artifact_cited"
+    assert "analysis" in doc.body.lower()
+
+
+@pytest.mark.asyncio
+async def test_compute_vm_analysis_routing_is_bounded(
+    db_session, mocker, _quiet_compute_io
+):
+    """The VM-substrate routing is bounded: once the per-task attempt ceiling is
+    reached it stops re-queueing and leaves the deterministic measured_only doc
+    intact rather than looping forever (and never downgrades it)."""
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+    from app.task_completion import (
+        _COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY,
+        _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS,
+        _route_compute_analysis_to_vm,
+    )
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    logs = compute_jobs.build_compute_result_logs(job)
+    criterion = {
+        "metric": "accuracy",
+        "operator": ">=",
+        "threshold": 0.9,
+        "value": 0.93,
+        "met": True,
+        "measurable": True,
+    }
+    # The deterministic measured_only doc is the durable base record.
+    await persist_compute_experiment_knowledge(
+        task,
+        outcome="SUCCESS",
+        cost=0.37,
+        criterion=criterion,
+        result_reference=job.result_reference,
+        session=db_session,
+        logs=logs,
+    )
+
+    # One below the ceiling: routing re-queues and bumps the counter to the cap.
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        _COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY: _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS - 1,
+    }
+    db_session.add(task)
+    await db_session.commit()
+    routed = await _route_compute_analysis_to_vm(task, logs, criterion, db_session)
+    assert routed is True
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert (
+        task.context[_COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY]
+        == _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS
+    )
+
+    # At the ceiling: routing is a no-op — the structurally-stuck job does NOT
+    # loop, and the deterministic measured_only doc is left intact.
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+    routed_again = await _route_compute_analysis_to_vm(task, logs, criterion, db_session)
+    assert routed_again is False
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    assert docs[0].forward_quality_verdict["analysis_mode"] == "deterministic"
+    assert docs[0].forward_quality_verdict["compute_acceptance_grade"] == "measured_only"
+
+
+@pytest.mark.asyncio
 async def test_absent_or_measured_only_knowledge_never_earns_acceptance(
     db_session, _quiet_compute_io
 ):
@@ -3866,3 +4062,252 @@ async def test_non_live_proof_acceptance_unaffected_by_release_binding(
     assert "release_binding" not in verdict
     assert verdict["compute_acceptance_grade"] == "acceptance"
     assert verdict["knowledge_acceptance_evidence"] is True
+
+
+@pytest.mark.asyncio
+async def test_deterministic_doc_records_job_terminal_diagnostics(
+    db_session, _quiet_compute_io
+):
+    """A provisioning-timeout ComputeJob's terminal diagnostics surface in the
+    persisted knowledge document: summary contains the terminal_reason, body
+    carries vm_phase/accelerator_type, and forward_quality_verdict has a
+    terminal_diagnostics sub-dict.
+    """
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = Project(name="DiagTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+
+    # Simulate a provisioning timeout: VM never started (started_at=None),
+    # has an accelerator request, and carries the canonical timeout reason.
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.FAILED,
+        outcome=ComputeJobOutcome.TIMED_OUT,
+        terminal_reason="compute job timed out while provisioning",
+        started_at=None,  # VM never started → provisioning phase
+        accelerator_type="T4",
+        machine_type="n1-standard-4-t4",
+        accrued_cost_usd=0.0,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs_json = json.dumps({"job_id": str(job.id), "outcome": "TIMED_OUT"})
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        doc = await persist_compute_experiment_knowledge(
+            task,
+            outcome="TIMED_OUT",
+            cost=0.0,
+            criterion=None,
+            result_reference=None,
+            session=db_session,
+            logs=logs_json,
+        )
+
+    assert doc is not None
+    # Human-readable summary carries the cause.
+    assert "compute job timed out while provisioning" in doc.summary
+    assert "provisioning" in doc.summary
+    # Body carries the structured diagnostics.
+    assert "compute job timed out while provisioning" in doc.body
+    assert "provisioning" in doc.body
+    assert "T4" in doc.body
+    # verdict_record carries the structured sub-dict.
+    td = doc.forward_quality_verdict.get("terminal_diagnostics")
+    assert td is not None
+    assert td["terminal_reason"] == "compute job timed out while provisioning"
+    assert td["vm_phase"] == "provisioning"
+    assert td["accelerator_type"] == "T4"
+
+
+# ── Integration: POST /api/agent/compute-analysis endpoint ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_analysis_endpoint_upgrades_doc_to_llm(
+    client, db_session, mocker, _quiet_compute_io
+):
+    """POSTing to /api/agent/compute-analysis with a valid agent JWT and a grounded
+    VM-produced analysis (a) upgrades the KnowledgeDocument to analysis_mode='llm'
+    with compute_acceptance_reason='llm_artifact_cited', (b) clears the one-shot
+    request bundle from task.context afterward, and (c) rejects a foreign job_id
+    with 404.
+
+    Exercises the router function's full logic:
+      1. Token 'sub' → task_id resolution and 403 paths.
+      2. job-ownership scoping via get_compute_job_for_task (security boundary).
+      3. outcome/cost/criterion resolution from task.plan_output / task.context.
+      4. One-shot bundle cleanup.
+
+    Uses run_compute_wake_post_commit with no backend API key to drive the task to
+    the VM-re-queued state (status=QUEUED, vm_instance_id=None), which is the only
+    state from which the endpoint can be called (verify_agent_token rejects tokens
+    for terminal tasks on non-idempotent paths).
+    """
+    from app.auth import create_agent_token
+    from app.models import TaskWakeRegistration, WakeAction, WakeDeliveryState
+    from app.task_completion import (
+        _COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY,
+        _COMPUTE_WAKE_POST_COMMIT_META_KEY,
+        run_compute_wake_post_commit,
+    )
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+
+    # Add the compute success criterion to task context so the endpoint can
+    # resolve it via the fallback path (task.context["compute_success_criterion"]).
+    task.context = {
+        **(task.context or {}),
+        "compute_success_criterion": {
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.9,
+            "value": 0.93,
+            "met": True,
+            "measurable": True,
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    # A DELIVERED compute-wake registration — the production autonomous path that
+    # persists durable knowledge AFTER the finalize commit.
+    reg = TaskWakeRegistration(
+        task_id=task.id,
+        project_id=task.project_id,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        delivery_state=WakeDeliveryState.DELIVERED,
+        delivered_at=datetime.utcnow(),
+        source_metadata={_COMPUTE_WAKE_POST_COMMIT_META_KEY: {"attempts": 0}},
+    )
+    db_session.add(reg)
+    await db_session.commit()
+    await db_session.refresh(reg)
+
+    # With no backend key, run_compute_wake_post_commit persists the deterministic
+    # doc and routes the analysis onto the VM substrate (task → QUEUED, vm_instance_id=None).
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "", "DISABLE_LLM_COMPUTE_ANALYSIS": ""}):
+        ok = await run_compute_wake_post_commit(db_session, reg)
+    assert ok is True
+
+    await db_session.refresh(task)
+    # Task is QUEUED for VM analysis with vm_instance_id cleared for re-dispatch.
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id is None
+    assert _COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY in (task.context or {})
+
+    # Deterministic base record persisted.
+    docs_before = await _knowledge_docs_for(db_session, task)
+    assert len(docs_before) == 1
+    assert docs_before[0].forward_quality_verdict["analysis_mode"] == "deterministic"
+
+    # Token: since task.vm_instance_id is None, any vm_instance_id in the token
+    # passes the vm_instance_mismatch guard in verify_agent_token.
+    token = create_agent_token(str(task.id), "agent-vm-analysis-test")
+    headers = {"x-agent-token": token}
+
+    # ── (c) Foreign job_id → 404 ──────────────────────────────────────────────
+    bad_resp = await client.post(
+        "/api/agent/compute-analysis",
+        headers=headers,
+        json={
+            "job_id": str(uuid.uuid4()),  # not this task's job
+            "analysis": {
+                "summary": "grounded summary",
+                "body": "grounded body",
+                "source_citations": [artifact_uri],
+            },
+        },
+    )
+    assert bad_resp.status_code == 404, (
+        f"foreign job_id must be rejected with 404 (got {bad_resp.status_code}): {bad_resp.text}"
+    )
+
+    # ── (a) Grounded submission → upgrades doc to analysis_mode='llm' ─────────
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "", "DISABLE_LLM_COMPUTE_ANALYSIS": ""}):
+        resp = await client.post(
+            "/api/agent/compute-analysis",
+            headers=headers,
+            json={
+                "job_id": str(job.id),
+                "analysis": {
+                    "title": "VM analysis: durable artifacts cleared the bar",
+                    "summary": "Grounded analysis citing the durable artifact bundle + metric.",
+                    "body": "# Analysis\n\nThe run cleared the bar; see the cited evidence.",
+                    "source_citations": [artifact_uri, metric_ref],
+                },
+            },
+        )
+    assert resp.status_code == 200, f"expected 200 OK, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["data"]["status"] == "upgraded"
+    assert data["data"]["analysis_mode"] == "llm"
+
+    # (a) Verify the KnowledgeDocument was upgraded in the DB. The endpoint's
+    # session commits on the same StaticPool connection; use refresh() on the
+    # known object (loaded in docs_before) to bypass the identity-map cache and
+    # force a fresh DB read — the same pattern test_agent.py uses for task state.
+    det_doc = docs_before[0]
+    await db_session.refresh(det_doc)
+    upgraded_verdict = det_doc.forward_quality_verdict
+    assert upgraded_verdict["analysis_mode"] == "llm", (
+        f"expected analysis_mode=llm after upgrade, got: {upgraded_verdict['analysis_mode']}"
+    )
+    assert upgraded_verdict["compute_acceptance_grade"] == "acceptance"
+    assert upgraded_verdict["compute_acceptance_reason"] == "llm_artifact_cited"
+    assert upgraded_verdict["knowledge_acceptance_evidence"] is True
+    assert artifact_uri in det_doc.source_citations
+    assert metric_ref in det_doc.source_citations
+
+    # ── (b) One-shot bundle is cleared from task.context ─────────────────────
+    await db_session.refresh(task)
+    assert _COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY not in (task.context or {}), (
+        "the one-shot request bundle must be cleared from task.context after submission"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_analysis_endpoint_rejects_bad_jwt(
+    client, db_session, _quiet_compute_io
+):
+    """An invalid agent JWT is rejected (401) — the security boundary holds.
+
+    Note: a missing x-agent-token header yields 422 (FastAPI required-header
+    validation) rather than 401; the security boundary is enforced by token
+    verification, not by the absence of the field.
+    """
+    resp_bad_token = await client.post(
+        "/api/agent/compute-analysis",
+        headers={"x-agent-token": "not-a-valid-jwt"},
+        json={
+            "job_id": str(uuid.uuid4()),
+            "analysis": {
+                "summary": "grounded summary",
+                "body": "grounded body",
+            },
+        },
+    )
+    assert resp_bad_token.status_code in (401, 403)
