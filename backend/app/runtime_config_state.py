@@ -838,6 +838,24 @@ runtime_config: Dict = {
     # gets a durable verdict. Operators can still dial it to 0.0 to disable the
     # trial or override it per deployment via runtime_config_json.
     "repo_map_holdback_fraction": 0.1,
+    # Deterministic holdback fractions for the three newly-assignment-based
+    # capability trials (module_interfaces, related_tests, affected_consumers).
+    # Conservative 0.1 default keeps a small holdback arm alive so trials can
+    # accumulate intent-to-treat evidence. Operators can dial up/down via
+    # runtime_config_json or PATCH /api/admin/settings once adoption signals
+    # are visible in the digest.
+    "module_interfaces_holdback_fraction": 0.1,
+    "related_tests_holdback_fraction": 0.1,
+    "affected_consumers_holdback_fraction": 0.1,
+    # Deterministic holdback fraction for the diagnostics-after-edit trial.
+    # Mirrors repo_map_holdback_fraction semantics: tasks hashed below this
+    # threshold run WITHOUT the post-edit diagnostics hook, populating the
+    # without-arm for intent-to-treat analysis. Default 10% holdback.
+    "diagnostics_after_edit_holdback_fraction": 0.1,
+    # Kill switch for the diagnostics-after-edit capability trial. When False,
+    # the agent must not arm the post-edit diagnostics hook regardless of arm
+    # assignment. Default True (trial active).
+    "diagnostics_after_edit_enabled": True,
 }
 
 # Promotion-policy key set — the rubric controls that live in runtime_config.
@@ -1396,6 +1414,10 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "direction_churn_min_merge_rate",
                     "direction_lifetime_min_merge_rate",
                     "repo_map_holdback_fraction",
+                    "module_interfaces_holdback_fraction",
+                    "related_tests_holdback_fraction",
+                    "affected_consumers_holdback_fraction",
+                    "diagnostics_after_edit_holdback_fraction",
                 ):
                     if float_key in config_json:
                         _set(float_key, float(config_json[float_key]))
@@ -1413,6 +1435,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "smoketest_enabled",
                         bool(config_json["smoketest_enabled"]),
+                    )
+                if "diagnostics_after_edit_enabled" in config_json:
+                    _set(
+                        "diagnostics_after_edit_enabled",
+                        bool(config_json["diagnostics_after_edit_enabled"]),
                     )
                 if "promotion_enabled_by_project" in config_json:
                     # Persisted per-project live-promotion overrides. Normalize to

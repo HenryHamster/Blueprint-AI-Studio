@@ -154,6 +154,7 @@ function renderThresholds(thresholds: NonNullable<Project['capability_adoption_v
     thresholds.min_n_per_arm != null ? `min n/arm ${thresholds.min_n_per_arm}` : null,
     thresholds.adopt_lift != null ? `adopt ${thresholds.adopt_lift}` : null,
     thresholds.reject_lift != null ? `reject ${thresholds.reject_lift}` : null,
+    thresholds.futility_n != null ? `futility ${thresholds.futility_n}` : null,
   ].filter(Boolean);
   return parts.length > 0 ? `Thresholds: ${parts.join(' · ')}` : 'Thresholds —';
 }
@@ -192,12 +193,14 @@ function CapabilityEvidencePanel({ project }: { project: Project }) {
                   <span className={`inline-flex rounded border px-2 py-1 text-[10px] font-semibold ${getVerdictClasses(verdict?.verdict)}`}>
                     {verdict?.verdict ?? 'no active/adjudicated trial'}
                   </span>
+                  {verdict?.verdict_reason && <div className="mt-0.5 text-[10px] text-neutral-500">{verdict.verdict_reason}</div>}
                   {verdict ? (
                     <div className="mt-1 text-[10px] text-neutral-400">
                       <span className="tabular-nums text-neutral-300">{formatLift(verdict.lift)}</span>
                       <span className="mx-1.5 text-neutral-700">·</span><span className="tabular-nums text-neutral-300">Samples {verdict.n_with ?? 0} with / {verdict.n_without ?? 0} without</span>
                       <span className="mx-1.5 text-neutral-700">·</span><span className="text-neutral-300">{renderThresholds(verdict.thresholds)}</span>
                       {verdict.evaluated_at && <><span className="mx-1.5 text-neutral-700">·</span>Evaluated <span className="text-neutral-300">{formatEvidenceDate(verdict.evaluated_at)}</span></>}
+                      {verdict.arm_composition && <><span className="mx-1.5 text-neutral-700">·</span><span className="text-neutral-300">{verdict.arm_composition.with_assigned ?? 0}+{verdict.arm_composition.with_receipt ?? 0}w / {verdict.arm_composition.without_assigned ?? 0}+{verdict.arm_composition.without_receipt ?? 0}wo</span></>}
                     </div>
                   ) : (
                     <div className="mt-1 text-[10px] text-neutral-500">no active/adjudicated trial</div>

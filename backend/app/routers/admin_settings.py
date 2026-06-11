@@ -122,6 +122,9 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "max_total_research_per_project",
         "next_role_poll_timeout_secs",
         "notification_config",
+        "module_interfaces_holdback_fraction",
+        "related_tests_holdback_fraction",
+        "affected_consumers_holdback_fraction",
         "productive_direction_cooldown_minutes",
         "promotion_enabled",
         "promotion_enabled_by_project",
@@ -169,6 +172,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "warm_pool_idle_ttl_secs",
         "warm_pool_account_retarget_enabled",
         "warm_pool_cross_provider_retarget_enabled",
+        "diagnostics_after_edit_holdback_fraction",
+        "diagnostics_after_edit_enabled",
     }
 )
 
@@ -478,6 +483,15 @@ async def get_settings(
         ),
         "drift_over_claim_consistency_threshold": float(
             _runtime_config.get("drift_over_claim_consistency_threshold", 0.4)
+        ),
+        "module_interfaces_holdback_fraction": float(
+            _runtime_config.get("module_interfaces_holdback_fraction", 0.1)
+        ),
+        "related_tests_holdback_fraction": float(
+            _runtime_config.get("related_tests_holdback_fraction", 0.1)
+        ),
+        "affected_consumers_holdback_fraction": float(
+            _runtime_config.get("affected_consumers_holdback_fraction", 0.1)
         ),
         "drift_stall_min_claims": int(_runtime_config.get("drift_stall_min_claims", 5)),
         "reserved_slots_for_types": _runtime_config.get(
@@ -1364,6 +1378,47 @@ async def _apply_settings(
                 detail="drift_over_claim_consistency_threshold must be between 0.0 and 1.0",
             )
         _runtime_config["drift_over_claim_consistency_threshold"] = round(val, 3)
+    for float_key in (
+        "module_interfaces_holdback_fraction",
+        "related_tests_holdback_fraction",
+        "affected_consumers_holdback_fraction",
+    ):
+        if float_key in payload:
+            try:
+                val = float(payload[float_key])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{float_key} must be a number",
+                )
+            if not (0.0 <= val <= 1.0):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{float_key} must be between 0.0 and 1.0",
+                )
+            _runtime_config[float_key] = round(val, 4)
+    if "diagnostics_after_edit_holdback_fraction" in payload:
+        try:
+            val = float(payload["diagnostics_after_edit_holdback_fraction"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="diagnostics_after_edit_holdback_fraction must be a number",
+            )
+        if not (0.0 <= val <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="diagnostics_after_edit_holdback_fraction must be between 0.0 and 1.0",
+            )
+        _runtime_config["diagnostics_after_edit_holdback_fraction"] = round(val, 3)
+    if "diagnostics_after_edit_enabled" in payload:
+        val = payload["diagnostics_after_edit_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="diagnostics_after_edit_enabled must be a boolean",
+            )
+        _runtime_config["diagnostics_after_edit_enabled"] = val
     if "drift_stall_min_claims" in payload:
         try:
             val = int(payload["drift_stall_min_claims"])
@@ -2308,6 +2363,15 @@ async def _apply_settings(
                     "task_type_provider_overrides": _runtime_config.get(
                         "task_type_provider_overrides", {}
                     ),
+                    "module_interfaces_holdback_fraction": _runtime_config.get(
+                        "module_interfaces_holdback_fraction", 0.1
+                    ),
+                    "related_tests_holdback_fraction": _runtime_config.get(
+                        "related_tests_holdback_fraction", 0.1
+                    ),
+                    "affected_consumers_holdback_fraction": _runtime_config.get(
+                        "affected_consumers_holdback_fraction", 0.1
+                    ),
                     "agent_prompt_suffixes": _runtime_config.get(
                         "agent_prompt_suffixes", {}
                     ),
@@ -2553,6 +2617,12 @@ async def _apply_settings(
                     ),
                     "promotion_threshold": _runtime_config.get("promotion_threshold"),
                     "promotion_weights": _runtime_config.get("promotion_weights"),
+                    "diagnostics_after_edit_holdback_fraction": float(
+                        _runtime_config.get("diagnostics_after_edit_holdback_fraction", 0.1)
+                    ),
+                    "diagnostics_after_edit_enabled": bool(
+                        _runtime_config.get("diagnostics_after_edit_enabled", True)
+                    ),
                 }
             except AttributeError:
                 pass  # Column not yet added (rolling deploy, old schema)

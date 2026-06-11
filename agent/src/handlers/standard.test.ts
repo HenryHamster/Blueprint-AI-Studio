@@ -32,7 +32,7 @@ vi.mock('../index.js', async (importOriginal) => {
     setupWorkspace: vi.fn().mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' }),
     runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
     sendHeartbeatSync: vi.fn(),
-    getProviderRunner: vi.fn().mockReturnValue({ displayName: 'Claude Code' }),
+    getProviderRunner: vi.fn().mockReturnValue({ displayName: 'Claude Code', provider: 'anthropic' }),
   };
 });
 
@@ -103,6 +103,10 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../prompts/diagnostics-after-edit-hook.js', () => ({
+  writeDiagnosticsAfterEditHook: vi.fn().mockReturnValue(true),
+}));
+
 // Spy on the read-only ./fetch writer while keeping buildFetchGuidance and the
 // PLAN_FETCH_VERBS constant real, so prompt-guidance assertions exercise the
 // genuine text and the writer-invocation assertions can inspect the call args.
@@ -150,13 +154,14 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata } from './standard.js';
-import { setupWorkspace, runClaudeCode, sendHeartbeatSync } from '../index.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm } from './standard.js';
+import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
-import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
+import { extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
 import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { expectCalledWith, expectNotCalledWith } from '../utils/typed-mock-call.js';
+import { writeDiagnosticsAfterEditHook } from '../prompts/diagnostics-after-edit-hook.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -4123,9 +4128,142 @@ function capturedRepoMapHeartbeatOpts(): Record<string, unknown> | undefined {
   return call ? (call[2] as Record<string, unknown>) : undefined;
 }
 
+describe('receipt-only capability trial arm assignment', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(buildRepoMap).mockReturnValue('');
+    vi.mocked(extractModuleInterfaces).mockReturnValue('MODULE_INTERFACE_CONTEXT');
+    vi.mocked(discoverRelatedTests).mockReturnValue('RELATED_TEST_CONTEXT');
+    vi.mocked(discoverAffectedConsumers).mockReturnValue('AFFECTED_CONSUMERS_CONTEXT');
+  });
+
+  it('assigns independent salted arms for each capability', () => {
+    expect(assignCapabilityHoldbackArm(TASK_ID, 'module_interfaces', 0.5)).toBe(false);
+    expect(assignCapabilityHoldbackArm(TASK_ID, 'related_tests', 0.5)).toBe(true);
+    expect(assignCapabilityHoldbackArm(TASK_ID, 'affected_consumers', 0.5)).toBe(true);
+  });
+
+  it('suppresses only held-back capability sections and emits independent create-task arms', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+      project_metadata: {
+        module_interfaces_holdback_fraction: 0.5,
+        related_tests_holdback_fraction: 0.5,
+        affected_consumers_holdback_fraction: 0.5,
+      },
+    };
+
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const prompt = capturedPrompt();
+    expect(prompt).not.toContain('MODULE_INTERFACE_CONTEXT');
+    expect(prompt).toContain('RELATED_TEST_CONTEXT');
+    expect(prompt).toContain('AFFECTED_CONSUMERS_CONTEXT');
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts).toMatchObject({
+      module_interfaces_arm: false,
+      related_tests_arm: true,
+      affected_consumers_arm: true,
+      had_module_interfaces: false,
+      had_related_tests: true,
+      had_affected_consumers: true,
+    });
+  });
+
+  it('suppresses held-back refactor sections before prompt assembly', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+      project_metadata: { related_tests_holdback_fraction: 1.0 },
+    };
+
+    await handleRefactor(TASK_ID, { prompt: 'Refactor this' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('MODULE_INTERFACE_CONTEXT');
+    expect(prompt).not.toContain('RELATED_TEST_CONTEXT');
+    expect(prompt).toContain('AFFECTED_CONSUMERS_CONTEXT');
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts?.related_tests_arm).toBe(false);
+    expect(opts?.had_related_tests).toBe(false);
+  });
+
+  it('omits capability arm flags when the trial fraction is not running', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+      project_metadata: {
+        module_interfaces_holdback_fraction: 0.0,
+        related_tests_holdback_fraction: 0.0,
+        affected_consumers_holdback_fraction: 0.0,
+      },
+    };
+
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts).toMatchObject({
+      had_module_interfaces: true,
+      had_related_tests: true,
+      had_affected_consumers: true,
+    });
+    expect(opts?.module_interfaces_arm).toBeUndefined();
+    expect(opts?.related_tests_arm).toBeUndefined();
+    expect(opts?.affected_consumers_arm).toBeUndefined();
+  });
+
+  it('excludes small-scope module and consumer flags while keeping related-tests trial signals', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'small' },
+      project_context: {},
+      project_metadata: {
+        module_interfaces_holdback_fraction: 1.0,
+        related_tests_holdback_fraction: 0.5,
+        affected_consumers_holdback_fraction: 1.0,
+      },
+    };
+
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts?.had_module_interfaces).toBeUndefined();
+    expect(opts?.module_interfaces_arm).toBeUndefined();
+    expect(opts?.had_affected_consumers).toBeUndefined();
+    expect(opts?.affected_consumers_arm).toBeUndefined();
+    expect(opts?.had_related_tests).toBe(true);
+    expect(opts?.related_tests_arm).toBe(true);
+
+    vi.clearAllMocks();
+    vi.mocked(buildRepoMap).mockReturnValue('');
+    vi.mocked(extractModuleInterfaces).mockReturnValue('MODULE_INTERFACE_CONTEXT');
+    vi.mocked(discoverRelatedTests).mockReturnValue('RELATED_TEST_CONTEXT');
+    vi.mocked(discoverAffectedConsumers).mockReturnValue('AFFECTED_CONSUMERS_CONTEXT');
+
+    await handleRefactor(TASK_ID, { prompt: 'Refactor this' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const refactorOpts = capturedRepoMapHeartbeatOpts();
+    expect(refactorOpts?.had_module_interfaces).toBeUndefined();
+    expect(refactorOpts?.module_interfaces_arm).toBeUndefined();
+    expect(refactorOpts?.had_affected_consumers).toBeUndefined();
+    expect(refactorOpts?.affected_consumers_arm).toBeUndefined();
+    expect(refactorOpts?.had_related_tests).toBe(true);
+    expect(refactorOpts?.related_tests_arm).toBe(true);
+  });
+});
+
 describe('repo-map arm assignment in sendHeartbeatSync', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'Claude Code', provider: 'anthropic' } as ReturnType<typeof getProviderRunner>);
   });
 
   it('sends repo_map_arm=false and had_repo_map=false when holdback arm assigned with empty buildRepoMap', async () => {
@@ -4191,5 +4329,118 @@ describe('repo-map arm assignment in sendHeartbeatSync', () => {
     expect(opts).toBeDefined();
     expect(opts?.had_repo_map).toBe(false);
     expect(opts?.repo_map_arm).toBeUndefined();
+  });
+});
+
+// ── Diagnostics-after-edit arm assignment heartbeat ─────────────────────────
+function capturedDiagnosticsHeartbeatOpts(): Record<string, unknown> | undefined {
+  const calls = vi.mocked(sendHeartbeatSync).mock.calls;
+  const call = calls.find(([, , opts]) => opts != null && typeof opts === 'object' && (
+    'diagnostics_after_edit_arm' in opts || 'had_diagnostics_after_edit' in opts
+  ));
+  return call ? (call[2] as Record<string, unknown>) : undefined;
+}
+
+describe('diagnostics-after-edit arm assignment in sendHeartbeatSync', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'Claude Code', provider: 'anthropic' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(writeDiagnosticsAfterEditHook).mockReturnValue(true);
+  });
+
+  it('materializes the hook and sends assignment plus receipt for an eligible treatment-arm Claude self-repo task', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: {
+        diagnostics_after_edit_holdback_fraction: 0.5,
+        diagnostics_after_edit_enabled: true,
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, 'HenryHamster', 'BlueprintAIStudio', WS, STATUS_REF());
+
+    expect(writeDiagnosticsAfterEditHook).toHaveBeenCalledTimes(1);
+    const opts = capturedDiagnosticsHeartbeatOpts();
+    expect(opts?.diagnostics_after_edit_arm).toBe(true);
+    expect(opts?.had_diagnostics_after_edit).toBe(true);
+  });
+
+  it('sends assignment only and writes no hook for a held-back Claude self-repo task', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: {
+        diagnostics_after_edit_holdback_fraction: 1.0,
+        diagnostics_after_edit_enabled: true,
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, 'HenryHamster', 'BlueprintAIStudio', WS, STATUS_REF());
+
+    expect(writeDiagnosticsAfterEditHook).not.toHaveBeenCalled();
+    const opts = capturedDiagnosticsHeartbeatOpts();
+    expect(opts?.diagnostics_after_edit_arm).toBe(false);
+    expect(opts?.had_diagnostics_after_edit).toBeUndefined();
+  });
+
+  it('sends assignment with a false receipt when the kill switch disables a treatment-arm task', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: {
+        diagnostics_after_edit_holdback_fraction: 0.5,
+        diagnostics_after_edit_enabled: false,
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, 'HenryHamster', 'BlueprintAIStudio', WS, STATUS_REF());
+
+    expect(writeDiagnosticsAfterEditHook).not.toHaveBeenCalled();
+    const opts = capturedDiagnosticsHeartbeatOpts();
+    expect(opts?.diagnostics_after_edit_arm).toBe(true);
+    expect(opts?.had_diagnostics_after_edit).toBe(false);
+  });
+
+  it('omits diagnostics keys and writes no hook for Codex tasks', async () => {
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'OpenAI Codex', provider: 'openai' } as ReturnType<typeof getProviderRunner>);
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: {
+        diagnostics_after_edit_holdback_fraction: 0.5,
+        diagnostics_after_edit_enabled: true,
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, 'HenryHamster', 'BlueprintAIStudio', WS, STATUS_REF());
+
+    expect(writeDiagnosticsAfterEditHook).not.toHaveBeenCalled();
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts?.diagnostics_after_edit_arm).toBeUndefined();
+    expect(opts?.had_diagnostics_after_edit).toBeUndefined();
+  });
+
+  it('omits diagnostics keys and writes no hook for foreign repos', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: {
+        diagnostics_after_edit_holdback_fraction: 0.5,
+        diagnostics_after_edit_enabled: true,
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, 'other-owner', 'other-repo', WS, STATUS_REF());
+
+    expect(writeDiagnosticsAfterEditHook).not.toHaveBeenCalled();
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts?.diagnostics_after_edit_arm).toBeUndefined();
+    expect(opts?.had_diagnostics_after_edit).toBeUndefined();
   });
 });

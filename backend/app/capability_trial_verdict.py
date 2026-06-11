@@ -67,6 +67,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
     {
         "cap_name": "module_interfaces",
         "context_key": "_had_module_interfaces",
+        "assignment_key": "_module_interfaces_arm",
         "thresholds": {
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
@@ -77,6 +78,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
     {
         "cap_name": "related_tests",
         "context_key": "_had_related_tests",
+        "assignment_key": "_related_tests_arm",
         "thresholds": {
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
@@ -87,6 +89,18 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
     {
         "cap_name": "affected_consumers",
         "context_key": "_had_affected_consumers",
+        "assignment_key": "_affected_consumers_arm",
+        "thresholds": {
+            "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
+            "adopt_lift": _DEFAULT_ADOPT_LIFT,
+            "reject_lift": _DEFAULT_REJECT_LIFT,
+            "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
+        },
+    },
+    {
+        "cap_name": "diagnostics_after_edit",
+        "context_key": "_had_diagnostics_after_edit",
+        "assignment_key": "_diagnostics_after_edit_arm",
         "thresholds": {
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
@@ -112,6 +126,7 @@ def evaluate_trial_verdict(
     evaluated_at: str | None = None,
     accumulation_basis: str | None = None,
     arm_composition: dict | None = None,
+    receipt_only_trial: bool = False,
 ) -> dict[str, Any]:
     """Return a verdict dict for a capability trial based on measured lift and sample sizes.
 
@@ -139,6 +154,11 @@ def evaluate_trial_verdict(
                     requires the assignment-based subpopulation alone to satisfy
                     ``min_n_per_arm`` — fallback-receipt tasks cannot tip a decision.
                     When None the entry omits the key and the purity gate is skipped.
+    receipt_only_trial: When True, a decided verdict (adopt/reject) is blocked and
+                    replaced with ``continue-trial`` / ``receipt_only_trial``. Use for
+                    trials that have no ``assignment_key`` and therefore accumulate only
+                    receipt-context evidence — structurally confounded evidence must
+                    never produce a durable adoption decision.
 
     Returns
     -------
@@ -193,6 +213,13 @@ def evaluate_trial_verdict(
             verdict = "continue-trial"
             verdict_reason = "ambiguous_lift"
 
+    # Receipt-only guard: trials with no assignment key accumulate only receipt
+    # context — the arms are structurally confounded and must never produce a
+    # decided verdict regardless of sample size.
+    if verdict in ("adopt", "reject") and receipt_only_trial:
+        verdict = "continue-trial"
+        verdict_reason = "receipt_only_trial"
+
     # Purity gate: a decided verdict requires the assignment-based subpopulation
     # alone to satisfy min_n per arm. Receipt-fallback tasks (legacy tasks that
     # pre-date intent-to-treat assignment) are confounded and must not tip the
@@ -243,7 +270,7 @@ def record_trial_verdict(
         new_verdict == "continue-trial"
         and entry.get("evidence_source") != "strategic_review"
         and (prior_verdict in ("adopt", "reject") or prior_source == "strategic_review")
-        and new_reason != "ambiguous_lift"
+        and new_reason not in ("ambiguous_lift", "receipt_only_trial")
     ):
         logger.info(
             "[CAPABILITY_TRIAL] skipping continue-trial write for %s — "

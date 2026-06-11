@@ -5011,6 +5011,42 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_capability_holdback_fractions_round_trip_and_persist(
+        self, client: AsyncClient, db_session
+    ):
+        """The three capability holdback fractions must PATCH, surface in GET,
+        and persist into DeploymentState.runtime_config_json.
+
+        Regression: PATCH previously rejected the keys via _KNOWN_SETTINGS_KEYS,
+        so operators could not tune the rollout holdback for the three assigned
+        capability trials from the admin settings API.
+        """
+        from app.models import DeploymentState
+
+        payload = {
+            "module_interfaces_holdback_fraction": 0.125,
+            "related_tests_holdback_fraction": 0.25,
+            "affected_consumers_holdback_fraction": 0.375,
+        }
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch("/api/admin/settings", json=payload)
+        assert resp.status_code == 200, resp.text
+
+        get_resp = await client.get("/api/admin/settings")
+        body = get_resp.json()
+        for key, expected in payload.items():
+            assert body[key] == expected
+
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        for key, expected in payload.items():
+            assert row.runtime_config_json[key] == expected
+
+    @pytest.mark.asyncio
     async def test_patch_review_second_opinion_gate_enabled(self, client: AsyncClient):
         """review_second_opinion_gate_enabled accepts booleans, rejects
         non-booleans, and round-trips on GET (operator rollback for the

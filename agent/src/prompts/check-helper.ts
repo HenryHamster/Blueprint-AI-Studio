@@ -11,6 +11,12 @@ import {
   type CodeChangeHelperConfig,
 } from './code-change-helpers.js';
 
+export const BLUEPRINT_ADMIN_UI_ESLINT_CMD = 'npx eslint 2>&1';
+export const BLUEPRINT_AGENT_ESLINT_CMD = 'npx eslint 2>&1';
+export const BLUEPRINT_AGENT_TSC_CMD = 'npx tsc --noEmit 2>&1';
+export const BLUEPRINT_BACKEND_RUFF_CHECK_CMD = 'python3 -m ruff check --select E,F,W --ignore E501 2>&1';
+export const BLUEPRINT_BACKEND_RUFF_FORMAT_CMD = 'python3 -m ruff format --check 2>&1';
+
 /** Emit the ci_failure closed-loop verify block for the generated ./check.
  *
  *  For a ci_failure fix task we know the EXACT pytest node-ids CI reported
@@ -260,7 +266,7 @@ if admin_ui_runtime_touched; then
       [ -f "$f" ] && printf '%s\\0' "\${f#admin-ui/}" >> /tmp/check_admin_ui_lint.txt
     done
     if [ -s /tmp/check_admin_ui_lint.txt ]; then
-      run "admin-ui eslint (changed)" bash -c 'cd admin-ui && xargs -0 -a /tmp/check_admin_ui_lint.txt npx eslint 2>&1'
+      run "admin-ui eslint (changed)" bash -c 'cd admin-ui && xargs -0 -a /tmp/check_admin_ui_lint.txt ${BLUEPRINT_ADMIN_UI_ESLINT_CMD}'
     else
       echo "[check] no admin-ui JS/TS files changed, skipping eslint"
     fi
@@ -430,7 +436,7 @@ if touches agent/; then
     tail -30 /tmp/check_agent_npm_ci.log
     FAILED+=("agent npm ci")
   }
-  run "agent tsc"        bash -c 'cd agent && npx tsc --noEmit 2>&1'
+  run "agent tsc"        bash -c 'cd agent && ${BLUEPRINT_AGENT_TSC_CMD}'
 
   # Scope agent eslint to changed files. Errors in files the agent
   # edited are the agent's responsibility ("don't leave preexisting
@@ -443,7 +449,7 @@ if touches agent/; then
       [ -f "$f" ] && printf '%s\\0' "\${f#agent/}" >> /tmp/check_agent_lint.txt
     done
     if [ -s /tmp/check_agent_lint.txt ]; then
-      run "agent eslint (changed)" bash -c 'cd agent && xargs -0 -a /tmp/check_agent_lint.txt npx eslint 2>&1'
+      run "agent eslint (changed)" bash -c 'cd agent && xargs -0 -a /tmp/check_agent_lint.txt ${BLUEPRINT_AGENT_ESLINT_CMD}'
     else
       echo "[check] no agent JS/TS files changed, skipping eslint"
     fi
@@ -472,8 +478,8 @@ if touches backend/; then
       [ -f "$f" ] && printf '%s\\0' "$f" >> /tmp/check_backend_py.txt
     done
     if [ -s /tmp/check_backend_py.txt ]; then
-      run "backend ruff (changed)"     bash -c 'xargs -0 -a /tmp/check_backend_py.txt python3 -m ruff check --select E,F,W --ignore E501 2>&1'
-      run "backend ruff fmt (changed)" bash -c 'xargs -0 -a /tmp/check_backend_py.txt python3 -m ruff format --check 2>&1'
+      run "backend ruff (changed)"     bash -c 'xargs -0 -a /tmp/check_backend_py.txt ${BLUEPRINT_BACKEND_RUFF_CHECK_CMD}'
+      run "backend ruff fmt (changed)" bash -c 'xargs -0 -a /tmp/check_backend_py.txt ${BLUEPRINT_BACKEND_RUFF_FORMAT_CMD}'
     else
       echo "[check] no backend/*.py files changed, skipping ruff"
     fi

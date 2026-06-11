@@ -490,6 +490,63 @@ async def compute_trial_arm_accumulation(
     return result
 
 
+async def compute_trial_arm_accrual(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID | None",
+    assignment_key: str,
+    window_days: int = 7,
+) -> Dict[str, Any]:
+    """Recent per-arm assignment volume over the last ``window_days`` days.
+
+    Unlike :func:`compute_trial_arm_accumulation` — which counts cumulatively over
+    the whole life of the trial to DECIDE — this measures the RECENT accrual RATE so
+    the operator can project how long until the holdback (without-)arm reaches its
+    decision threshold and what adjusting the holdback fraction would buy.
+
+    Only assignment-based trials have a meaningful accrual rate, so this takes the
+    ``assignment_key`` directly (no receipt fallback): a task counts toward the WITH
+    arm when the assignment flag is truthy and the WITHOUT arm when it is falsy.
+    Tasks that pre-date the assignment field (NULL flag) are excluded — they carry no
+    randomized arm and so contribute nothing to the forward-looking rate.
+
+    Runs a dialect-aware aggregate ``func.count()`` GROUP BY the arm-flag value over
+    terminal COMPLETED/FAILED tasks created within the window, project-filtered. An
+    aggregate count never materializes JSONB-heavy rows, so it does not widen the
+    digest's own capped terminal-task scan.
+
+    Returns ``{"with_7d": int, "without_7d": int, "window_days": window_days}`` (the
+    ``with_7d``/``without_7d`` keys keep the default-7-day naming for callers/UI even
+    when ``window_days`` differs).
+    """
+    if resolve_dialect_name(session) == "sqlite":
+        arm_expr = func.json_extract(Task.context, f"$.{assignment_key}")
+    else:
+        arm_expr = Task.context[assignment_key].astext
+
+    window_start = _utcnow() - timedelta(days=window_days)
+    filters = [
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        arm_expr.is_not(None),
+        Task.created_at >= window_start,
+    ]
+    if project_id is not None:
+        filters.append(Task.project_id == project_id)
+
+    stmt = select(arm_expr, func.count()).where(*filters).group_by(arm_expr)
+    rows = (await session.execute(stmt)).all()
+
+    with_7d = without_7d = 0
+    for arm_val, cnt in rows:
+        cnt = int(cnt)
+        if _json_truthy(arm_val):
+            with_7d += cnt
+        else:
+            without_7d += cnt
+
+    return {"with_7d": with_7d, "without_7d": without_7d, "window_days": window_days}
+
+
 def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     """Roll a list of tasks' ``format_compliance_summary`` into one count+rate block.
 

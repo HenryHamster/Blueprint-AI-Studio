@@ -148,6 +148,11 @@ export interface CapabilityTrialVerdict {
   n_without: number;
   evaluated_at?: string;
   window_hours?: number | null;
+  verdict_reason?: string;
+  thresholds?: { min_n_per_arm?: number; adopt_lift?: number; reject_lift?: number; futility_n?: number };
+  accumulation_basis?: string;
+  arm_composition?: { with_assigned?: number; with_receipt?: number; without_assigned?: number; without_receipt?: number };
+  accrual_projection?: { with_7d?: number; without_7d?: number; window_days?: number; holdback_fraction?: number; days_to_min_n?: number | null };
 }
 
 type ScopeConversionRates = Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }>;

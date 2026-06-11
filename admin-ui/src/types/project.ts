@@ -171,7 +171,11 @@ export interface CapabilityAdoptionVerdict {
     min_n_per_arm?: number;
     adopt_lift?: number;
     reject_lift?: number;
+    futility_n?: number;
   };
+  verdict_reason?: string;
+  accumulation_basis?: string;
+  arm_composition?: { with_assigned?: number; with_receipt?: number; without_assigned?: number; without_receipt?: number };
 }
 
 export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig {

@@ -60,6 +60,7 @@ from app.digest_metrics import (
     compute_effort_model_efficiency,
     compute_dependency_health_signals,
     compute_trial_arm_accumulation,
+    compute_trial_arm_accrual,
     compute_wake_post_commit_health_signals,
     compute_park_wake_health,
     compute_merge_gate_fleet_health,
@@ -1423,6 +1424,7 @@ async def _compute_digest(
     # scan).  The WINDOWED per-arm rates/counts in ``_first_attempt_success_rate``
     # (``trial_breakdowns``, ``with_{cap}_n``, …) are left untouched for dashboard
     # display — only the decision basis changes.
+    _augmented_verdicts: dict = {}
     if _digest_project is not None:
         from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
         _verdict_evaluated_at = _tv_utcnow().isoformat()
@@ -1443,12 +1445,85 @@ async def _compute_digest(
                 config=_td["thresholds"],
                 accumulation_basis="cumulative_terminal_arm_tasks",
                 arm_composition=_accum.get("arm_composition"),
+                receipt_only_trial=(_td.get("assignment_key") is None),
             )
             record_trial_verdict(_digest_project, _cap, _verdict_entry)
         try:
             await session.flush()
         except Exception:
             logger.warning("[CAPABILITY_TRIAL] failed to flush verdicts", exc_info=True)
+
+        # --- Per-trial accrual projection (ephemeral, NOT persisted) ---
+        # Augment the verdict entries returned in the response with a recent
+        # assigned-arm accrual rate and a projection of how many days remain until
+        # BOTH arms' assigned subpopulation reaches the min-N decision threshold at
+        # the current rate. Only assignment-based trials (an ``assignment_key``) have
+        # a randomized holdback arm to project; receipt-only trials get no projection.
+        #
+        # This is read-only display compute. We deliberately do NOT mutate the live
+        # ``project.capability_adoption_verdicts`` entries (which ``get_trial_verdicts``
+        # returns by reference) — mutating them would risk a later autoflush
+        # persisting ``accrual_projection`` to the JSONB column. Instead we build a
+        # response-only copy with the projection grafted on.
+        _accrual_window_days = 7
+        _stored_verdicts = get_trial_verdicts(_digest_project)
+        _augmented_verdicts = {
+            _k: (dict(_v) if isinstance(_v, dict) else _v)
+            for _k, _v in _stored_verdicts.items()
+        }
+        for _td in get_trial_definitions():
+            _assignment_key = _td.get("assignment_key")
+            if not _assignment_key:
+                continue
+            _cap = _td["cap_name"]
+            _verdict_entry = _augmented_verdicts.get(_cap)
+            if not isinstance(_verdict_entry, dict):
+                continue
+            _accrual = await compute_trial_arm_accrual(
+                session,
+                project_id=project_id,
+                assignment_key=_assignment_key,
+                window_days=_accrual_window_days,
+            )
+            _holdback_fraction = float(
+                _runtime_config.get(f"{_cap}_holdback_fraction", 0.0)
+            )
+            _with_daily = _accrual["with_7d"] / _accrual_window_days
+            _without_daily = _accrual["without_7d"] / _accrual_window_days
+            _thresholds = _verdict_entry.get("thresholds") or {}
+            _min_n = int(_thresholds.get("min_n_per_arm", 0))
+            _arm_comp = _verdict_entry.get("arm_composition") or {}
+            _with_assigned = int(_arm_comp.get("with_assigned") or 0)
+            _without_assigned = int(_arm_comp.get("without_assigned") or 0)
+            # Days for the slower-filling assigned arm to reach min_n at its recent rate.
+            _with_days = (
+                (_min_n - _with_assigned) / _with_daily if _with_daily > 0 else None
+            )
+            _without_days = (
+                (_min_n - _without_assigned) / _without_daily
+                if _without_daily > 0
+                else None
+            )
+            _with_remaining = max(_with_days, 0.0) if _with_days is not None else None
+            _without_remaining = (
+                max(_without_days, 0.0) if _without_days is not None else None
+            )
+            _days_to_min_n: "float | None"
+            if _with_assigned >= _min_n and _without_assigned >= _min_n:
+                _days_to_min_n = 0.0
+            elif _with_remaining is None or _without_remaining is None:
+                # At least one arm has a zero recent rate and is still under min_n —
+                # it can never reach threshold at the current accrual, so no estimate.
+                _days_to_min_n = None
+            else:
+                _days_to_min_n = round(max(_with_remaining, _without_remaining), 1)
+            _verdict_entry["accrual_projection"] = {
+                "with_7d": _accrual["with_7d"],
+                "without_7d": _accrual["without_7d"],
+                "window_days": _accrual_window_days,
+                "holdback_fraction": _holdback_fraction,
+                "days_to_min_n": _days_to_min_n,
+            }
 
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(
         completed_tasks + failed_tasks
@@ -1605,7 +1680,7 @@ async def _compute_digest(
         if prediction_calibration
         else None,
         "release_qualifier_infra_metrics": release_qualifier_infra_metrics,
-        "capability_adoption_verdicts": get_trial_verdicts(_digest_project)
+        "capability_adoption_verdicts": _augmented_verdicts
         if _digest_project is not None
         else {},
         "research_output_quality": _research_output_quality,

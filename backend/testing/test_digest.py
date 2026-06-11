@@ -21,6 +21,7 @@ from app.digest_metrics import (
     compute_remediation_and_patterns,
     compute_remediation_funnel,
     compute_trial_arm_accumulation,
+    compute_trial_arm_accrual,
 )
 from app.sr_review_quality_metrics import (
     _stash_projected_task_fields,
@@ -9076,6 +9077,159 @@ async def test_compute_trial_arm_accumulation_intent_to_treat(db_session):
     assert accum["with_rate"] == round(2 / 3, 2)
     assert accum["without_rate"] == 0.5
     assert accum["lift"] == round(round(2 / 3, 2) - 0.5, 2)
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accrual_windows_by_created_at(db_session):
+    """Accrual counts assigned-arm tasks created within the window and excludes
+    older ones, partitioning WITH/WITHOUT by the assignment flag's truthiness."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    tasks = []
+    # In-window WITH arm: 4 tasks created 1–4 days ago.
+    for i in range(4):
+        tasks.append(
+            _arm_task(
+                project.id, had_repo_map=True, first_attempt_succeeded=True,
+                days_ago=i + 1, idx=i,
+            )
+        )
+    # In-window WITHOUT arm: 2 tasks created 1–2 days ago.
+    for i in range(2):
+        tasks.append(
+            _arm_task(
+                project.id, had_repo_map=False, first_attempt_succeeded=False,
+                days_ago=i + 1, idx=50 + i,
+            )
+        )
+    # Out-of-window (older than 7 days) — must be excluded.
+    tasks.append(
+        _arm_task(
+            project.id, had_repo_map=True, first_attempt_succeeded=True,
+            days_ago=10, idx=99,
+        )
+    )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accrual = await compute_trial_arm_accrual(
+        db_session, project_id=project.id, assignment_key="_repo_map_arm"
+    )
+    assert accrual["with_7d"] == 4
+    assert accrual["without_7d"] == 2
+    assert accrual["window_days"] == 7
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accrual_project_scoped_and_ignores_null_arm(db_session):
+    """Accrual is project-scoped and excludes tasks missing the assignment flag."""
+    project = make_project()
+    other = make_project()
+    db_session.add_all([project, other])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other)
+
+    tasks = [
+        _arm_task(project.id, had_repo_map=True, first_attempt_succeeded=True,
+                  days_ago=1, idx=0),
+        # Different project — must not count.
+        _arm_task(other.id, had_repo_map=True, first_attempt_succeeded=True,
+                  days_ago=1, idx=1),
+        # No assignment key at all — must not count.
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=_utcnow() - timedelta(days=1),
+            context={"_had_repo_map": True, "_first_attempt_succeeded": True},
+        ),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accrual = await compute_trial_arm_accrual(
+        db_session, project_id=project.id, assignment_key="_repo_map_arm"
+    )
+    assert accrual["with_7d"] == 1
+    assert accrual["without_7d"] == 0
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accrual_window_days_param_respected(db_session):
+    """A custom window_days widens the lookback and is echoed in the result."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all([
+        _arm_task(project.id, had_repo_map=True, first_attempt_succeeded=True,
+                  days_ago=1, idx=0),
+        # 10 days old: outside default 7d, inside a 14d window.
+        _arm_task(project.id, had_repo_map=True, first_attempt_succeeded=True,
+                  days_ago=10, idx=1),
+    ])
+    await db_session.commit()
+
+    default = await compute_trial_arm_accrual(
+        db_session, project_id=project.id, assignment_key="_repo_map_arm"
+    )
+    assert default["with_7d"] == 1
+
+    widened = await compute_trial_arm_accrual(
+        db_session, project_id=project.id, assignment_key="_repo_map_arm",
+        window_days=14,
+    )
+    assert widened["with_7d"] == 2
+    assert widened["window_days"] == 14
+
+
+@pytest.mark.asyncio
+async def test_digest_exposes_accrual_projection_for_assignment_trial(db_session):
+    """The digest attaches accrual_projection to every assignment-based trial.
+    All five current trials have holdback arms, so all five verdicts get a projection
+    in the response. The projection is ephemeral and must NOT be persisted."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Enough recent assigned-arm tasks for both arms to have a non-zero accrual rate.
+    tasks = []
+    for i in range(7):
+        tasks.append(
+            _arm_task(project.id, had_repo_map=True, first_attempt_succeeded=True,
+                      days_ago=1, idx=i)
+        )
+    for i in range(7):
+        tasks.append(
+            _arm_task(project.id, had_repo_map=False, first_attempt_succeeded=False,
+                      days_ago=1, idx=50 + i)
+        )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+    verdicts = result["capability_adoption_verdicts"]
+
+    repo_map = verdicts["repo_map"]
+    proj = repo_map["accrual_projection"]
+    assert proj["with_7d"] == 7
+    assert proj["without_7d"] == 7
+    assert proj["window_days"] == 7
+    assert "holdback_fraction" in proj
+    assert "days_to_min_n" in proj
+
+    # All five trials now have holdback arms — each gets an accrual projection.
+    assert "accrual_projection" in verdicts["module_interfaces"]
+
+    # The ephemeral projection is NOT persisted back to the DB entry.
+    await db_session.refresh(project)
+    stored = project.capability_adoption_verdicts["repo_map"]
+    assert "accrual_projection" not in stored
 
 
 @pytest.mark.asyncio

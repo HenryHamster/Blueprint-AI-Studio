@@ -375,6 +375,25 @@ class HeartbeatRequest(BaseModel):
     had_module_interfaces: bool | None = None
     had_related_tests: bool | None = None
     had_affected_consumers: bool | None = None
+    # Deterministic arm-assignment flags for the three newly-assigned capability
+    # trials (module_interfaces, related_tests, affected_consumers). True =
+    # treatment arm, False = holdback arm. Separate from the had_* receipt
+    # flags so intent-to-treat analysis uses assignment, not receipt. Older
+    # agents simply omit these fields; the context key stays absent.
+    module_interfaces_arm: bool | None = None
+    related_tests_arm: bool | None = None
+    affected_consumers_arm: bool | None = None
+    # Whether the post-edit diagnostics hook was armed and ran for this task.
+    # Set once on the first heartbeat that carries this field; used as the
+    # receipt/compliance signal for the diagnostics-after-edit capability trial.
+    had_diagnostics_after_edit: bool | None = None
+    # Deterministic arm-assignment flag for the diagnostics-after-edit trial.
+    # True = treatment arm (task was assigned to run the hook),
+    # False = holdback arm. Separate from had_diagnostics_after_edit so
+    # intent-to-treat analysis uses assignment, not receipt. Only present when
+    # the trial is actively running (holdback_fraction > 0 and enabled=True);
+    # older agents omit this field.
+    diagnostics_after_edit_arm: bool | None = None
 
 
 class ComputeJobResponse(BaseModel):

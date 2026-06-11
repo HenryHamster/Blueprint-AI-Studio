@@ -119,6 +119,58 @@ def _effective_repo_map_holdback(project: object) -> float:
     return get_effective_holdback_fraction(get_trial_verdicts(project), "repo_map", default)
 
 
+def _effective_module_interfaces_holdback(project: object) -> float:
+    """Return the module_interfaces holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("module_interfaces_holdback_fraction", 0.0))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "module_interfaces", default)
+
+
+def _effective_related_tests_holdback(project: object) -> float:
+    """Return the related_tests holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("related_tests_holdback_fraction", 0.0))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "related_tests", default)
+
+
+def _effective_affected_consumers_holdback(project: object) -> float:
+    """Return the affected_consumers holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("affected_consumers_holdback_fraction", 0.0))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "affected_consumers", default)
+
+
+def _effective_diagnostics_after_edit_holdback(project: object) -> float:
+    """Return the diagnostics_after_edit holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("diagnostics_after_edit_holdback_fraction", 0.1))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "diagnostics_after_edit", default)
+
+
 def _log_agent_auth_reject(
     reason: str,
     *,
@@ -897,6 +949,13 @@ async def claim_task(
             "promotion_target": project_promotion_target,
             "integration_branch": project_integration_branch,
             "repo_map_holdback_fraction": _effective_repo_map_holdback(project),
+            "module_interfaces_holdback_fraction": _effective_module_interfaces_holdback(project),
+            "related_tests_holdback_fraction": _effective_related_tests_holdback(project),
+            "affected_consumers_holdback_fraction": _effective_affected_consumers_holdback(project),
+            "diagnostics_after_edit_holdback_fraction": _effective_diagnostics_after_edit_holdback(project),
+            "diagnostics_after_edit_enabled": bool(
+                _shared_state.runtime_config.get("diagnostics_after_edit_enabled", True)
+            ),
         }
 
     task_type = _claimed_first_payload.get("type", "")
@@ -4180,6 +4239,31 @@ async def agent_heartbeat(
     if req.repo_map_arm is not None and (task.context or {}).get("_repo_map_arm") is None:
         ctx = dict(task.context or {})
         ctx["_repo_map_arm"] = req.repo_map_arm
+        task.context = ctx
+    if req.module_interfaces_arm is not None and (task.context or {}).get("_module_interfaces_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_module_interfaces_arm"] = req.module_interfaces_arm
+        task.context = ctx
+    if req.related_tests_arm is not None and (task.context or {}).get("_related_tests_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_related_tests_arm"] = req.related_tests_arm
+        task.context = ctx
+    if req.affected_consumers_arm is not None and (task.context or {}).get("_affected_consumers_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_affected_consumers_arm"] = req.affected_consumers_arm
+        task.context = ctx
+
+    # Write-once diagnostics-after-edit capability flag. Set on the first
+    # heartbeat that carries had_diagnostics_after_edit; mirrors had_repo_map pattern.
+    if req.had_diagnostics_after_edit is not None and (task.context or {}).get("_had_diagnostics_after_edit") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_diagnostics_after_edit"] = req.had_diagnostics_after_edit
+        task.context = ctx
+    # Write-once diagnostics-after-edit arm-assignment flag. Records the
+    # deterministic holdback vs treatment assignment for intent-to-treat analysis.
+    if req.diagnostics_after_edit_arm is not None and (task.context or {}).get("_diagnostics_after_edit_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_diagnostics_after_edit_arm"] = req.diagnostics_after_edit_arm
         task.context = ctx
 
     # Per-task LLM telemetry (efficiency direction d-91d8dede). Cumulative
