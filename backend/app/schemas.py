@@ -444,21 +444,87 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
 
 _POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset({"env", "command", "cwd"})
 
+# Regex patterns for scrubbing secrets/credentials from RPC error messages.
+_URL_QUERY_RE = re.compile(r"\?[^\s'\"<>]*")
+_BEARER_LIKE_RE = re.compile(
+    r"(?i)(bearer|token|secret|password|authorization|sig|x-goog-signature)"
+    r"\s*[=:]\s*\S+",
+)
+_RPC_MSG_SAFE_LIMIT = 400
+
+
+def sanitize_rpc_diagnostic(raw: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """Sanitize a ``compute_rpc_diagnostic`` dict for safe public exposure.
+
+    Bounds string fields, strips URL query strings, and redacts bearer-like
+    tokens so neither operator-facing API responses nor knowledge documents ever
+    expose secrets or signed URLs from raw provider exceptions.  Safe to call on
+    ``None`` (returns ``None``).
+
+    This helper is the shared sanitization path used by BOTH
+    ``serialize_compute_job_response_safe`` (admin API) and
+    ``_extract_job_terminal_diagnostics`` (knowledge documents) so the two
+    surfaces produce identical sanitized output.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: Dict[str, Any] = {}
+    for key, limit in (("operation", 64), ("error_type", 200), ("reason", 200)):
+        val = raw.get(key)
+        if isinstance(val, str) and val:
+            out[key] = val[:limit]
+    msg = raw.get("error_message")
+    if isinstance(msg, str) and msg:
+        msg = _URL_QUERY_RE.sub("?[redacted]", msg)
+        msg = _BEARER_LIKE_RE.sub(r"\1=[redacted]", msg)
+        out["error_message"] = msg[:_RPC_MSG_SAFE_LIMIT]
+    return out if out else None
+
 
 def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
     """Return a JSON-ready compute-job response with launch-spec fields redacted.
 
     Strips ``env``, ``command``, and ``cwd`` from ``polling_metadata`` before
     returning so operator-facing endpoints never expose internal launch material
-    that may contain secrets or internal paths. The agent-facing endpoints use
-    ``serialize_compute_job_response`` directly — agents own their job and need
-    the full metadata.
+    that may contain secrets or internal paths.  Also sanitizes the promoted
+    ``compute_rpc_diagnostic`` to strip URL query strings and credential-bearing
+    tokens from raw provider exception text, and promotes ``vm_phase``,
+    and ``launch_contract`` for operator diagnostics.  The agent-facing endpoints
+    use ``serialize_compute_job_response`` directly — agents own their job and
+    need the full metadata.
     """
     data = serialize_compute_job_response(job)
     metadata = data.get("polling_metadata")
     if isinstance(metadata, dict):
         for key in _POLLING_METADATA_LAUNCH_SPEC_KEYS:
             metadata.pop(key, None)
+
+    # Sanitize the promoted diagnostic — may carry raw provider exception text
+    # with signed URLs or credential values.  Overwrite both the top-level
+    # promoted field AND the copy inside polling_metadata so neither path leaks
+    # secrets to operator-facing callers.
+    sanitized_diag = sanitize_rpc_diagnostic(data.get("compute_rpc_diagnostic"))
+    data["compute_rpc_diagnostic"] = sanitized_diag
+    if isinstance(metadata, dict) and "compute_rpc_diagnostic" in metadata:
+        metadata["compute_rpc_diagnostic"] = sanitized_diag
+
+    # Promote vm_phase so operators can see whether a failure occurred before
+    # the VM started (provisioning) or during execution (runtime).
+    started_at = data.get("started_at")
+    data["vm_phase"] = "provisioning" if started_at is None else "runtime"
+
+    # Promote launch_contract fields for provisioning-context diagnostics.
+    if isinstance(metadata, dict):
+        deadline = metadata.get("requested_deadline_seconds")
+        prov_model = metadata.get("provisioning_model")
+        contract: Dict[str, Any] = {}
+        if deadline is not None:
+            contract["requested_deadline_seconds"] = deadline
+        if prov_model is not None:
+            contract["provisioning_model"] = prov_model
+        if contract:
+            data["launch_contract"] = contract
+
     return data
 
 

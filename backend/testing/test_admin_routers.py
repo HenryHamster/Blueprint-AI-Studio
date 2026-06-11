@@ -2719,6 +2719,113 @@ class TestTaskTypeCostAdherence:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# admin_compute_jobs.py — Compute-job listing & kill
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestComputeJobsPanel:
+    @pytest.mark.asyncio
+    async def test_compute_jobs_response_includes_vm_phase_and_sanitized_cause(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /api/admin/projects/{id}/compute-jobs must expose vm_phase and a
+        sanitized provisioning_cause for a provisioning-phase terminal job, and
+        a planted secret/signed-URL in the raw diagnostic must NOT leak into the
+        response.
+        """
+        from datetime import timezone
+        from app.models import ComputeJobStatus, ComputeJobOutcome
+
+        project = await _make_project(db_session)
+        job = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.TIMED_OUT,
+            outcome=ComputeJobOutcome.TIMED_OUT,
+            terminal_reason="compute job timed out while provisioning",
+            # started_at is intentionally omitted (None) → provisioning phase
+            completed_at=datetime.now(timezone.utc),
+            polling_metadata={
+                "requested_deadline_seconds": 1800,
+                "provisioning_model": "SPOT",
+                "compute_rpc_diagnostic": {
+                    "operation": "create_instance",
+                    "error_type": "QuotaExceededError",
+                    "error_message": (
+                        "RESOURCE_EXHAUSTED: quota exceeded "
+                        "https://gcp.example.com/instances?token=LEAKED_TOKEN&key=LEAKED_KEY"
+                    ),
+                    "reason": "QUOTA_EXCEEDED",
+                },
+            },
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+        assert resp.status_code == 200, resp.text
+        jobs = resp.json()["compute_jobs"]
+        assert len(jobs) == 1
+        data = jobs[0]
+
+        # vm_phase must be exposed and correct for a job with no started_at
+        assert data.get("vm_phase") == "provisioning", (
+            f"vm_phase must be 'provisioning' for a job that never started; got {data.get('vm_phase')!r}"
+        )
+
+        # launch_contract must be promoted from polling_metadata
+        contract = data.get("launch_contract")
+        assert contract is not None, "launch_contract must be present in response"
+        assert contract["requested_deadline_seconds"] == 1800
+        assert contract["provisioning_model"] == "SPOT"
+
+        # compute_rpc_diagnostic must be sanitized — no raw secrets
+        diag = data.get("compute_rpc_diagnostic")
+        assert diag is not None, "compute_rpc_diagnostic must be present"
+        assert diag["error_type"] == "QuotaExceededError"
+        assert diag["reason"] == "QUOTA_EXCEEDED"
+        msg = diag.get("error_message", "")
+        assert "LEAKED_TOKEN" not in msg, "secret token must be redacted from error_message"
+        assert "LEAKED_KEY" not in msg, "secret key must be redacted from error_message"
+        assert "[redacted]" in msg, "query string must be replaced with [redacted]"
+
+    @pytest.mark.asyncio
+    async def test_compute_jobs_response_runtime_phase_has_no_launch_contract(
+        self, client: AsyncClient, db_session
+    ):
+        """A job that started (runtime phase) has vm_phase=runtime and no
+        launch_contract promoted (runtime failures keep the original shape).
+        """
+        from datetime import timezone
+        from app.models import ComputeJobStatus, ComputeJobOutcome
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+        job = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.TIMED_OUT,
+            outcome=ComputeJobOutcome.TIMED_OUT,
+            terminal_reason="compute job deadline exceeded",
+            started_at=now,
+            completed_at=now,
+            polling_metadata={
+                "requested_deadline_seconds": 3600,
+                "provisioning_model": "STANDARD",
+            },
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["compute_jobs"][0]
+        assert data.get("vm_phase") == "runtime"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # admin_notifications.py — Alerts, Messages, Playbook
 # ═══════════════════════════════════════════════════════════════════════════════
 

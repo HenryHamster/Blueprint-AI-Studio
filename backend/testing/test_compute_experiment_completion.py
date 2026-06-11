@@ -61,7 +61,11 @@ from app.task_capabilities import (
     COMPLETION_HANDLER_BY_TASK_TYPE,
     get_task_capability,
 )
-from app.knowledge_completion import KNOWLEDGE_PREREQUISITES_KEY
+from app.knowledge_completion import (
+    KNOWLEDGE_PREREQUISITES_KEY,
+    _build_compute_experiment_document,
+    _extract_job_terminal_diagnostics,
+)
 from app.task_completion import _handle_compute_experiment_completion
 
 
@@ -4945,4 +4949,149 @@ async def test_command_cannot_spoof_durable_metrics_via_result_metrics(
     criterion = task.plan_output["compute_result"]["criterion"]
     assert criterion["met"] is False, (
         "spoofed durable_payload_bytes via result_metrics must not satisfy the criterion"
+    )
+
+
+# ── Provisioning-phase terminal diagnostics ──────────────────────────────────
+
+
+def test_provisioning_death_terminal_diagnostics_includes_cause_and_contract():
+    """A provisioning-phase job (started_at=None) must surface sanitized
+    provisioning_cause and launch_contract in _extract_job_terminal_diagnostics,
+    and a planted secret/signed-URL in the raw diagnostic must NOT appear.
+    """
+    job = MagicMock()
+    job.terminal_reason = "compute job timed out while provisioning"
+    job.started_at = None
+    job.accelerator_type = "nvidia-tesla-t4"
+    job.machine_type = "n1-standard-4"
+    job.polling_metadata = {
+        "compute_rpc_diagnostic": {
+            "operation": "create_instance",
+            "error_type": "GoogleAPIError",
+            "error_message": (
+                "RESOURCE_EXHAUSTED: quota exceeded "
+                "https://gcp.googleapis.com/v1/instances?"
+                "token=SECRET123&x-goog-signature=ABCDEF"
+            ),
+            "reason": "QUOTA_EXCEEDED",
+        },
+        "requested_deadline_seconds": 3600,
+        "provisioning_model": "SPOT",
+    }
+
+    diag = _extract_job_terminal_diagnostics(job)
+
+    assert diag is not None
+    assert diag["vm_phase"] == "provisioning"
+    assert diag["terminal_reason"] == "compute job timed out while provisioning"
+    assert diag["accelerator_type"] == "nvidia-tesla-t4"
+    assert diag["machine_type"] == "n1-standard-4"
+
+    cause = diag.get("provisioning_cause")
+    assert cause is not None, "provisioning_cause must be populated from compute_rpc_diagnostic"
+    assert cause["error_type"] == "GoogleAPIError"
+    assert cause["reason"] == "QUOTA_EXCEEDED"
+    msg = cause.get("error_message", "")
+    assert "SECRET123" not in msg, "planted secret token must be redacted"
+    assert "ABCDEF" not in msg, "planted signature value must be redacted"
+    assert "[redacted]" in msg, "query string must be replaced with [redacted]"
+
+    contract = diag.get("launch_contract")
+    assert contract is not None, "launch_contract must be populated from polling_metadata"
+    assert contract["requested_deadline_seconds"] == 3600
+    assert contract["provisioning_model"] == "SPOT"
+
+
+def test_provisioning_death_knowledge_document_renders_cause_and_contract():
+    """A provisioning-phase terminal job must produce a knowledge document whose
+    summary, body, AND verdict_record carry the sanitized provisioning_cause and
+    launch_contract, and no raw secrets appear.
+    """
+    job = MagicMock()
+    job.terminal_reason = "compute job timed out while provisioning"
+    job.started_at = None
+    job.accelerator_type = None
+    job.machine_type = None
+    job.polling_metadata = {
+        "compute_rpc_diagnostic": {
+            "operation": "create_instance",
+            "error_type": "ZoneCapacityError",
+            "error_message": (
+                "No capacity in zone us-central1-a "
+                "https://provider.example.com/api?X-Amz-Signature=MYSECRET&key=MYKEY"
+            ),
+            "reason": "ZONE_CAPACITY",
+        },
+        "requested_deadline_seconds": 7200,
+        "provisioning_model": "STANDARD",
+    }
+
+    diag = _extract_job_terminal_diagnostics(job)
+    assert diag is not None
+
+    task = MagicMock()
+    task.first_payload = {"experiment": "GPU throughput test", "tags": []}
+
+    doc = _build_compute_experiment_document(
+        task,
+        outcome="TIMED_OUT",
+        cost=0.0,
+        criterion=None,
+        result_reference=None,
+        terminal_diagnostics=diag,
+    )
+
+    summary = doc["summary"]
+    body = doc["body"]
+    vr = doc["verdict_record"]
+
+    # Secret values must not appear anywhere in the document
+    for secret in ("MYSECRET", "MYKEY"):
+        assert secret not in summary, f"secret {secret!r} must not appear in summary"
+        assert secret not in body, f"secret {secret!r} must not appear in body"
+
+    # Sanitized diagnostic fields must be visible
+    assert "ZoneCapacityError" in summary or "ZoneCapacityError" in body
+    assert "ZONE_CAPACITY" in summary or "ZONE_CAPACITY" in body
+    assert "7200" in body
+    assert "STANDARD" in body
+
+    # verdict_record must carry both new fields
+    td = vr.get("terminal_diagnostics", {})
+    assert "provisioning_cause" in td, "verdict_record terminal_diagnostics must have provisioning_cause"
+    assert "launch_contract" in td, "verdict_record terminal_diagnostics must have launch_contract"
+    assert td["launch_contract"]["requested_deadline_seconds"] == 7200
+    assert td["launch_contract"]["provisioning_model"] == "STANDARD"
+
+
+def test_runtime_phase_terminal_diagnostics_no_provisioning_fields():
+    """A runtime-phase job (started_at set) must NOT carry provisioning_cause or
+    launch_contract in its terminal diagnostics (runtime failures keep today's
+    behavior byte-for-byte unchanged).
+    """
+    job = MagicMock()
+    job.terminal_reason = "compute job spend cap exceeded"
+    job.started_at = datetime.utcnow()
+    job.accelerator_type = "nvidia-tesla-t4"
+    job.machine_type = "n1-standard-4"
+    job.polling_metadata = {
+        "compute_rpc_diagnostic": {
+            "operation": "get_status",
+            "error_type": "BudgetError",
+            "error_message": "spend cap exceeded",
+        },
+        "requested_deadline_seconds": 3600,
+        "provisioning_model": "SPOT",
+    }
+
+    diag = _extract_job_terminal_diagnostics(job)
+
+    assert diag is not None
+    assert diag["vm_phase"] == "runtime"
+    assert "provisioning_cause" not in diag, (
+        "runtime-phase terminal diagnostics must not include provisioning_cause"
+    )
+    assert "launch_contract" not in diag, (
+        "runtime-phase terminal diagnostics must not include launch_contract"
     )

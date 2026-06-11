@@ -2444,6 +2444,17 @@ export interface ComputeJob {
   } | null;
   accelerator_type: string | null;
   accelerator_count: number | null;
+  // Phase the VM reached before going terminal, promoted by the admin endpoint:
+  // 'provisioning' (never started — $0 cost, VM never reached RUNNING) vs
+  // 'runtime' (failed during execution). Absent on agent-facing / legacy rows.
+  vm_phase?: 'provisioning' | 'runtime' | null;
+  // Echo of the requested launch contract, surfaced for provisioning-context
+  // diagnostics (machine_type / accelerator_type are already top-level fields).
+  // Present only on the admin endpoint; absent on legacy rows.
+  launch_contract?: {
+    requested_deadline_seconds?: number | null;
+    provisioning_model?: string | null;
+  } | null;
   polling_metadata?: Record<string, unknown>;
   // Bounded RPC failure diagnostic; null/absent when no backend RPC has failed
   // (or once it resolves). Older responses may carry it under polling_metadata.
