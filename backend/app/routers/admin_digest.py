@@ -1471,11 +1471,14 @@ async def _compute_digest(
             _lane_aggs = await compute_lane_pilot_aggregates(session, project_id)
             _lane_verdict = evaluate_lane_pilot_verdict(_lane_aggs)
             _lane_verdict["evaluated_at"] = _verdict_evaluated_at
-            # Annotate with the most recent closed version's relay baseline so the
-            # lane-vs-relay comparison is recorded alongside the verdict for auditing.
+            # Materialize a compact lane-vs-relay comparison: relay medians from
+            # the most recent closed version's persisted baseline plus lane-arm
+            # medians computed live, plus deltas.  Only bounded scalars are
+            # stored — no per-PR row arrays or per-task chains.
             try:
                 from app.lane_baseline_snapshot import read_version_lane_baseline  # noqa: PLC0415
                 from app.models import ReleaseVersion as _ReleaseVersion  # noqa: PLC0415
+                from app.review_fix_lane_pilot import compute_lane_arm_time_medians  # noqa: PLC0415
                 _latest_rv = (
                     await session.execute(
                         select(_ReleaseVersion)
@@ -1490,9 +1493,31 @@ async def _compute_digest(
                 if _latest_rv is not None and _digest_project is not None:
                     _rb = read_version_lane_baseline(_digest_project, _latest_rv.version_number)
                     if _rb is not None:
-                        _lane_verdict["relay_baseline"] = _rb
+                        _relay_m = _rb.get("relay_medians") or {}
+                        _relay_fields = {
+                            "wall_clock_seconds": _relay_m.get("wall_clock_seconds"),
+                            "active_seconds": _relay_m.get("active_seconds"),
+                            "gap_seconds": _relay_m.get("gap_seconds"),
+                            "task_count": _relay_m.get("task_count"),
+                            "pr_count": _relay_m.get("pr_count", 0),
+                        }
+                        _lane_m = await compute_lane_arm_time_medians(session, project_id)
+                        _deltas: dict[str, Any] = {}
+                        for _mf in ("wall_clock_seconds", "active_seconds", "gap_seconds", "task_count"):
+                            _rv, _lv = _relay_fields.get(_mf), _lane_m.get(_mf)
+                            _deltas[_mf] = (_lv - _rv) if (_rv is not None and _lv is not None) else None
+                        _lane_verdict["lane_relay_comparison"] = {
+                            "source_version": {
+                                "version_number": _latest_rv.version_number,
+                                "captured_at": _rb.get("captured_at"),
+                                "terminal_status": _rb.get("terminal_status"),
+                            },
+                            "relay": _relay_fields,
+                            "lane": _lane_m,
+                            "deltas": _deltas,
+                        }
             except Exception:
-                logger.warning("[LANE_PILOT] failed to annotate relay_baseline", exc_info=True)
+                logger.warning("[LANE_PILOT] failed to compute lane_relay_comparison", exc_info=True)
             record_trial_verdict(_digest_project, LANE_PILOT_CAP_NAME, _lane_verdict)
             if _lane_verdict.get("verdict") == "KILL":
                 await apply_lane_pilot_kill(

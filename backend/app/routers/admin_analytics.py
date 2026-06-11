@@ -599,13 +599,39 @@ async def get_lane_diag(
                 detail=f"ReleaseVersion {version_number} not found",
             )
         window_start = rv.opened_at
-        window_end = rv.promoted_at or now
+        # For closed (non-open) versions, derive the actual close time.
+        # Promoted versions use promoted_at; abandoned versions recover the
+        # abandonment timestamp from last_qualification provenance (written by
+        # abandon_current_version as record["abandoned_at"] = now.isoformat()).
+        # Falling back to `now` for a genuinely open version keeps the live
+        # rolling window behavior unchanged.
+        abandoned_at_str: str | None = None
+        abandoned_at_dt: datetime | None = None
+        if rv.status != "open":
+            abandoned_at_str = (rv.last_qualification or {}).get("abandoned_at")
+            if abandoned_at_str:
+                try:
+                    _parsed = datetime.fromisoformat(abandoned_at_str)
+                    abandoned_at_dt = (
+                        _parsed.replace(tzinfo=None) if _parsed.tzinfo else _parsed
+                    )
+                except (ValueError, TypeError):
+                    pass
+        if rv.status == "open":
+            window_end: datetime = now
+        elif rv.promoted_at is not None:
+            window_end = rv.promoted_at
+        elif abandoned_at_dt is not None:
+            window_end = abandoned_at_dt
+        else:
+            window_end = now
         version_meta = {
             "version_number": rv.version_number,
             "phase": rv.phase,
             "status": rv.status,
             "opened_at": rv.opened_at.isoformat(),
             "promoted_at": rv.promoted_at.isoformat() if rv.promoted_at else None,
+            "abandoned_at": abandoned_at_dt.isoformat() if abandoned_at_dt else None,
         }
         cutoff = window_start
     else:
@@ -650,9 +676,9 @@ async def get_lane_diag(
         completed_filters.append(Task.created_at >= cutoff)
         terminal_filters.append(Task.created_at >= cutoff)
         # For closed versions push the upper bound into SQL so that out-of-window
-        # rows created after promoted_at cannot consume the max_tasks cap before
-        # any in-window row is fetched.
-        if window_end is not None and window_end != now:
+        # rows created after the close time (promoted_at or abandoned_at) cannot
+        # consume the max_tasks cap before any in-window row is fetched.
+        if rv.status != "open":
             completed_filters.append(Task.created_at < window_end)
             terminal_filters.append(Task.created_at < window_end)
 

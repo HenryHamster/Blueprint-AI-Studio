@@ -867,6 +867,113 @@ def is_review_fix_lane_pilot_active_for_project(project: Any) -> bool:
     )
 
 
+# ── Lane-arm time medians (feeds lane_relay_comparison in digest) ──────────────
+async def compute_lane_arm_time_medians(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Compute per-PR wall-clock, active, and gap medians for lane-arm tasks.
+
+    Queries terminal lane-arm tasks (COMPLETED/FAILED/CANCELLED), groups them
+    by PR number from context["review_loop"]["pr_number"], and returns per-PR
+    time medians using the same field names and definitions as
+    ``_compute_relay_medians`` in lane_baseline_snapshot so the two sides can
+    be compared directly.
+
+    Returns a dict with keys: wall_clock_seconds, active_seconds, gap_seconds,
+    task_count, pr_count — matching the relay_medians schema.
+    """
+    from sqlalchemy import func
+
+    from app.database import resolve_dialect_name
+    from app.models import Task, TaskStatus
+
+    is_sqlite = resolve_dialect_name(session) == "sqlite"
+    if is_sqlite:
+        _arm_expr = func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}")
+    else:
+        _arm_expr = Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext
+
+    rows = (
+        await session.execute(
+            select(Task.created_at, Task.started_at, Task.updated_at, Task.context)
+            .where(
+                Task.project_id == project_id,
+                Task.status.in_(
+                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                ),
+                _arm_expr == "lane",
+            )
+        )
+    ).all()
+
+    def _strip_tz(dt: Any) -> Any:
+        if dt is None:
+            return None
+        return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) is not None else dt
+
+    pr_buckets: dict[str, list[tuple]] = {}
+    for created_at, started_at, updated_at, ctx in rows:
+        if not isinstance(ctx, dict):
+            continue
+        review_loop = ctx.get("review_loop")
+        if not isinstance(review_loop, dict):
+            continue
+        pr_number = review_loop.get("pr_number")
+        if pr_number is None:
+            continue
+        key = str(pr_number)
+        if key not in pr_buckets:
+            pr_buckets[key] = []
+        pr_buckets[key].append((_strip_tz(created_at), _strip_tz(started_at), _strip_tz(updated_at)))
+
+    if not pr_buckets:
+        return {
+            "wall_clock_seconds": None,
+            "active_seconds": None,
+            "gap_seconds": None,
+            "task_count": None,
+            "pr_count": 0,
+        }
+
+    def _median(vals: list) -> float | None:
+        if not vals:
+            return None
+        s = sorted(vals)
+        n = len(s)
+        mid = n // 2
+        return s[mid] if n % 2 == 1 else (s[mid - 1] + s[mid]) / 2.0
+
+    wc_vals: list[float] = []
+    active_vals: list[float] = []
+    gap_vals: list[float] = []
+    count_vals: list[float] = []
+
+    for _, tasks in pr_buckets.items():
+        created_times = [t[0] for t in tasks if t[0] is not None]
+        updated_times = [t[2] for t in tasks if t[2] is not None]
+        if not created_times or not updated_times:
+            continue
+        wall_clock = (max(updated_times) - min(created_times)).total_seconds()
+        active = sum(
+            max((t[2] - t[1]).total_seconds(), 0.0)
+            for t in tasks
+            if t[1] is not None and t[2] is not None
+        )
+        wc_vals.append(wall_clock)
+        active_vals.append(active)
+        gap_vals.append(max(wall_clock - active, 0.0))
+        count_vals.append(float(len(tasks)))
+
+    return {
+        "wall_clock_seconds": _median(wc_vals),
+        "active_seconds": _median(active_vals),
+        "gap_seconds": _median(gap_vals),
+        "task_count": _median(count_vals),
+        "pr_count": len(pr_buckets),
+    }
+
+
 # ── TrialDefinition aggregate wiring (feeds evaluate_lane_pilot_verdict) ───────
 async def compute_lane_pilot_aggregates(
     session: AsyncSession, project_id: uuid.UUID

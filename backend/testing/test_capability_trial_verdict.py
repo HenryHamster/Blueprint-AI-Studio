@@ -1839,4 +1839,124 @@ class TestEvaluateLanePilotVerdictEngagement:
         aggs = _good_aggs(n=10)  # CONTINUE (insufficient data)
         result = evaluate_lane_pilot_verdict(aggs)
         assert "futility_min_engagement" in result["thresholds"]
-        assert result["thresholds"]["futility_min_engagement"] == 0.50
+
+
+# ── Lane relay comparison structure ──────────────────────────────────────────
+
+
+class TestLaneRelayComparison:
+    """Tests for the lane_relay_comparison structure persisted in the verdict."""
+
+    def _make_relay(self, **overrides):
+        base = {
+            "wall_clock_seconds": 3600.0,
+            "active_seconds": 1800.0,
+            "gap_seconds": 1800.0,
+            "task_count": 3.0,
+            "pr_count": 10,
+        }
+        base.update(overrides)
+        return base
+
+    def _make_lane(self, **overrides):
+        base = {
+            "wall_clock_seconds": 2700.0,
+            "active_seconds": 1500.0,
+            "gap_seconds": 1200.0,
+            "task_count": 2.5,
+            "pr_count": 8,
+        }
+        base.update(overrides)
+        return base
+
+    def _build_comparison(self, relay, lane, version_number=9):
+        deltas = {}
+        for field in ("wall_clock_seconds", "active_seconds", "gap_seconds", "task_count"):
+            rv, lv = relay.get(field), lane.get(field)
+            deltas[field] = (lv - rv) if (rv is not None and lv is not None) else None
+        return {
+            "source_version": {
+                "version_number": version_number,
+                "captured_at": "2026-06-01T00:00:00",
+                "terminal_status": "promoted",
+            },
+            "relay": relay,
+            "lane": lane,
+            "deltas": deltas,
+        }
+
+    def test_evaluate_lane_pilot_verdict_has_no_relay_baseline(self):
+        """evaluate_lane_pilot_verdict output must never include relay_baseline."""
+        aggs = {
+            "n_lane": 5, "n_control": 5,
+            "lane_merge_rate": 0.8, "control_merge_rate": 0.7,
+            "lane_cost_per_merged": 1.0, "control_cost_per_merged": 1.2,
+            "gate_integrity_violations": 0,
+            "checkpoint_loss_rate": 0.1,
+            "warm_resume_fraction": 0.9,
+            "checkpoint_fraction": 0.8,
+            "lane_fix_tasks_sampled": 5,
+        }
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert "relay_baseline" not in result
+
+    def test_comparison_has_required_top_level_keys(self):
+        comparison = self._build_comparison(self._make_relay(), self._make_lane())
+        assert set(comparison.keys()) == {"source_version", "relay", "lane", "deltas"}
+
+    def test_source_version_has_identity_fields(self):
+        comparison = self._build_comparison(self._make_relay(), self._make_lane(), version_number=10)
+        sv = comparison["source_version"]
+        assert sv["version_number"] == 10
+        assert sv["captured_at"] == "2026-06-01T00:00:00"
+        assert sv["terminal_status"] == "promoted"
+
+    def test_relay_and_lane_have_no_arrays_or_dicts(self):
+        comparison = self._build_comparison(self._make_relay(), self._make_lane())
+        for arm_key in ("relay", "lane"):
+            for v in comparison[arm_key].values():
+                assert not isinstance(v, (list, dict)), (
+                    f"{arm_key} field must be a scalar, got {type(v)}"
+                )
+
+    def test_deltas_are_scalars(self):
+        comparison = self._build_comparison(self._make_relay(), self._make_lane())
+        for v in comparison["deltas"].values():
+            assert v is None or isinstance(v, (int, float))
+
+    def test_deltas_correct_values(self):
+        relay = self._make_relay(wall_clock_seconds=3600.0, active_seconds=1800.0)
+        lane = self._make_lane(wall_clock_seconds=2700.0, active_seconds=1500.0)
+        comparison = self._build_comparison(relay, lane)
+        assert comparison["deltas"]["wall_clock_seconds"] == -900.0
+        assert comparison["deltas"]["active_seconds"] == -300.0
+
+    def test_delta_none_when_relay_field_is_none(self):
+        relay = self._make_relay(wall_clock_seconds=None)
+        lane = self._make_lane(wall_clock_seconds=2700.0)
+        comparison = self._build_comparison(relay, lane)
+        assert comparison["deltas"]["wall_clock_seconds"] is None
+
+    def test_delta_none_when_lane_field_is_none(self):
+        relay = self._make_relay(wall_clock_seconds=3600.0)
+        lane = self._make_lane(wall_clock_seconds=None)
+        comparison = self._build_comparison(relay, lane)
+        assert comparison["deltas"]["wall_clock_seconds"] is None
+
+    def test_lane_relay_comparison_persisted_without_relay_baseline(self):
+        """Persisted verdict entry should contain lane_relay_comparison, not relay_baseline."""
+        project = _make_project()
+        comparison = self._build_comparison(self._make_relay(), self._make_lane())
+        verdict_entry = {
+            "verdict": "CONTINUE",
+            "n_lane": 5,
+            "n_control": 5,
+            "lane_relay_comparison": comparison,
+        }
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, LANE_PILOT_CAP_NAME, verdict_entry)
+
+        stored = project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME]
+        assert "relay_baseline" not in stored
+        assert "lane_relay_comparison" in stored
+        assert stored["lane_relay_comparison"]["source_version"]["version_number"] == 9

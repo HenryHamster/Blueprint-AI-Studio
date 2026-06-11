@@ -647,6 +647,132 @@ class TestLaneDiag:
         assert body["pr_count"] == 1
         assert body["task_count"] == 1
 
+    @pytest.mark.asyncio
+    async def test_abandoned_version_window_ends_at_abandoned_at(
+        self, client: AsyncClient, db_session
+    ):
+        """Abandoned versions scope the window to abandoned_at, not now.
+
+        Without the fix, window_end falls back to now and the response includes
+        tasks created after the version was abandoned (the successor version's
+        work). The fix recovers abandoned_at from last_qualification provenance
+        and uses it as the window upper bound.
+        """
+        from app.models import ReleaseVersion
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        v10_opened = _utcnow() - timedelta(days=5)
+        v10_abandoned = _utcnow() - timedelta(days=2)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=10,
+            phase="build",
+            status="abandoned",
+            opened_at=v10_opened,
+            promoted_at=None,
+            last_qualification={
+                "status": "abandoned",
+                "reason": "operator_override",
+                "abandoned_at": v10_abandoned.isoformat(),
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        # In-window task (created during v10, before abandonment)
+        self._add_review_loop_task(
+            db_session, project.id, 1001, "review",
+            v10_opened + timedelta(days=1), 600,
+        )
+        # Out-of-window task (created after v10 was abandoned — successor work)
+        self._add_review_loop_task(
+            db_session, project.id, 1002, "fix",
+            v10_abandoned + timedelta(hours=1), 300, "ci_failure",
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/lane-diag?project_id={project.id}&version_number=10"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Only the in-window task should be counted
+        assert body["pr_count"] == 1
+        assert body["task_count"] == 1
+
+        # Version metadata must include abandoned_at and have promoted_at=None
+        v = body["version"]
+        assert v["version_number"] == 10
+        assert v["status"] == "abandoned"
+        assert v["promoted_at"] is None
+        assert v["abandoned_at"] is not None
+        assert v["abandoned_at"].startswith(v10_abandoned.isoformat()[:19])
+
+    @pytest.mark.asyncio
+    async def test_abandoned_version_displacement_prevented(
+        self, client: AsyncClient, db_session
+    ):
+        """Abandoned-version in-window tasks survive successor task displacement.
+
+        With max_tasks smaller than the number of out-of-window (successor)
+        tasks, a lower-bound-only SQL query fills the cap with successor rows
+        and returns empty aggregates. The upper-bound SQL fix must push
+        created_at < abandoned_at into SQL for all closed versions, including
+        abandoned ones.
+        """
+        from app.models import ReleaseVersion
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        v10_opened = _utcnow() - timedelta(days=5)
+        v10_abandoned = _utcnow() - timedelta(days=2)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=10,
+            phase="build",
+            status="abandoned",
+            opened_at=v10_opened,
+            promoted_at=None,
+            last_qualification={
+                "status": "abandoned",
+                "abandoned_at": v10_abandoned.isoformat(),
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        # One in-window task for the abandoned version
+        self._add_review_loop_task(
+            db_session, project.id, 2001, "fix",
+            v10_opened + timedelta(days=1), 600, "ci_failure",
+        )
+
+        # Successor tasks created after abandonment that would fill a small cap
+        for i in range(5):
+            self._add_review_loop_task(
+                db_session, project.id, 3000 + i, "fix",
+                v10_abandoned + timedelta(hours=i + 1), 300, "ci_failure",
+            )
+        await db_session.commit()
+
+        # max_tasks=3: without the SQL upper bound, out-of-window rows displace
+        # the in-window one and the response returns empty aggregates.
+        resp = await client.get(
+            f"/api/admin/lane-diag?project_id={project.id}&version_number=10&max_tasks=3"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # The in-window task must still be counted despite the smaller cap
+        assert body["pr_count"] == 1
+        assert body["task_count"] == 1
+
 
 class TestLaneWasteDiag:
     """Chain-complete review/fix waste diagnostics (the additive ``lane_waste``)."""
