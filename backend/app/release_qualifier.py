@@ -162,6 +162,8 @@ from app.release_scoring import (
     _MIN_TELEMETRY_SAMPLE,  # noqa: F401 — re-exported for callers/tests
     _SEVERITY_RANK,  # noqa: F401
     _SEVERITIES_REQUIRING_VERIFICATION,
+    _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
+    _audit_findings_carry_meta,
     _audit_missing_reason,
     _clamp01,  # noqa: F401
     _classify_check_runs,
@@ -2765,6 +2767,13 @@ async def _finalize_qualification(
     # strategic agent can target them.  Use reconciled report when available so
     # refuted findings are not surfaced as actionable blockers.
     audit_findings = _extract_audit_findings(_audit_report_scored)
+    # Pre-cap totals + truncation flags for both carried lists. Verified meta is
+    # computed on the reconciled report (matches audit_findings just above);
+    # excluded meta on the original report (matches excluded_audit_findings,
+    # which is derived from audit_report — the unverified-primary gap is
+    # independent of challenge reconciliation).
+    _verified_findings_meta = _audit_findings_carry_meta(_audit_report_scored)
+    _excluded_findings_meta = _audit_findings_carry_meta(audit_report)
     # Build the reconciliation record on the RECONCILED report so
     # findings_derived_score agrees with the applied audit_score.  The challenge
     # synthesis is derived from the binding verdict artifact (new gate) — kept
@@ -2926,6 +2935,18 @@ async def _finalize_qualification(
         "smoketest_task_id": smoketest_task_id,
         "audit_findings": audit_findings,
         "excluded_audit_findings": excluded_audit_findings,
+        # Pre-cap totals + truncation flags so consumers can tell whether the
+        # carried lists above are complete or were clipped at _MAX_CARRIED_FINDINGS.
+        # Verified-list meta tracks the reconciled report (matches audit_findings);
+        # excluded-list meta tracks the original report (matches excluded_audit_findings).
+        "audit_findings_total": _verified_findings_meta["audit_findings_total"],
+        "audit_findings_truncated": _verified_findings_meta["audit_findings_truncated"],
+        "excluded_audit_findings_total": _excluded_findings_meta[
+            "excluded_audit_findings_total"
+        ],
+        "excluded_audit_findings_truncated": _excluded_findings_meta[
+            "excluded_audit_findings_truncated"
+        ],
         # Challenger-confirmed false positives: findings the challenge marked
         # refuted_false_positive with an auditable reason — DISTINCT from
         # excluded_audit_findings (which tracks the unverified-primary gap).

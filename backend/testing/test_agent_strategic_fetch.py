@@ -7,11 +7,14 @@ Relocated from test_agent.py when the strategic fetch surface was extracted
 into its own router seam; behavior and contracts are unchanged.
 """
 
+import uuid
+from datetime import datetime
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
+from app.models import MessageType, Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, TaskStatus
 from app.auth import create_agent_token
 
 
@@ -1130,3 +1133,179 @@ async def test_strategic_create_message_note_type_not_grounded(
     ).scalar_one()
     assert "_provenance_warnings" not in (msg.context or {})
     spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Qualification verdict fetch endpoint
+# ---------------------------------------------------------------------------
+
+
+async def _make_project_with_version(db_session, *, vm="agent-vm-qual"):
+    project = Project(name="Qual Test", user_id="test-user-qual")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id=vm)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=10,
+        status="open",
+        opened_at=datetime(2026, 1, 1),
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    return project, task, version
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_returns_latest_verdict_findings(
+    client: AsyncClient, db_session
+):
+    """Happy path: returns verdict row fields including full audit findings list."""
+    project, task, version = await _make_project_with_version(db_session)
+
+    findings = [
+        {"severity": "HIGH", "summary": "Missing auth check", "file": "backend/app/auth.py"},
+        {"severity": "MEDIUM", "summary": "N+1 query in loop", "file": "backend/app/admin.py"},
+    ]
+    excluded = [{"severity": "LOW", "summary": "Cosmetic warning"}]
+    challenger_refuted = [{"severity": "MEDIUM", "summary": "False positive", "challenger_reason": "not applicable"}]
+
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abc12345def6789012345678901234567890abcd",
+        confidence=0.72,
+        sub_scores={"audit": 0.5, "test_erosion": 1.0},
+        terminal_status="dry_run",
+        finalized_at=datetime(2026, 6, 1, 12, 0, 0),
+        audit_findings=findings,
+        excluded_audit_findings=excluded,
+        challenger_refuted_audit_findings=challenger_refuted,
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(verdict)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "qualification_verdict"
+    assert body["candidate_sha"] == "abc12345def6789012345678901234567890abcd"
+    assert body["confidence"] == pytest.approx(0.72)
+    assert body["status"] == "dry_run"
+    assert body["finalized_at"] == "2026-06-01T12:00:00"
+    assert body["sub_scores"] == {"audit": 0.5, "test_erosion": 1.0}
+    # Full findings list returned
+    assert len(body["findings"]) == 2
+    assert body["findings"][0]["severity"] == "HIGH"
+    assert body["findings"][0]["file"] == "backend/app/auth.py"
+    assert body["findings"][1]["severity"] == "MEDIUM"
+    assert len(body["excluded_findings"]) == 1
+    assert body["excluded_findings"][0]["summary"] == "Cosmetic warning"
+    assert len(body["challenger_refuted_findings"]) == 1
+    assert body["challenger_refuted_findings"][0]["challenger_reason"] == "not applicable"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_falls_back_to_last_qualification(
+    client: AsyncClient, db_session
+):
+    """No verdict row with audit_findings → falls back to last_qualification blob."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-fb"
+    )
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    fallback_findings = [{"severity": "HIGH", "summary": "Legacy finding"}]
+    version.last_qualification = {
+        "status": "not_promoted",
+        "confidence": 0.45,
+        "candidate_sha": "deadbeef" * 5,
+        "finalized_at": "2026-05-01T10:00:00",
+        "sub_scores": {"audit": 0.3},
+        "audit_findings": fallback_findings,
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "last_qualification"
+    assert body["confidence"] == pytest.approx(0.45)
+    assert body["status"] == "not_promoted"
+    assert len(body["findings"]) == 1
+    assert body["findings"][0]["severity"] == "HIGH"
+    # Empty lists when not present in blob
+    assert body["excluded_findings"] == []
+    assert body["challenger_refuted_findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_no_open_version(
+    client: AsyncClient, db_session
+):
+    """No open ReleaseVersion → returns source=no_open_version."""
+    project = Project(name="No Version", user_id="test-user-nov")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-nov")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["source"] == "no_open_version"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Token from project A cannot fetch qualification data for project B (404)."""
+    project_a = Project(name="QA", user_id="test-user-qa")
+    project_b = Project(name="QB", user_id="test-user-qb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-qa")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), task_a.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404

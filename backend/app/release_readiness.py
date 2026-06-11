@@ -298,6 +298,12 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "migration_apply_safety_detail": qual.get("migration_apply_safety_detail"),
         "audit_findings": qual.get("audit_findings"),
         "excluded_audit_findings": qual.get("excluded_audit_findings"),
+        # Completeness signal: pre-cap totals + truncation flags so the API/UI can
+        # tell whether the carried findings lists were clipped at the cap.
+        "audit_findings_total": qual.get("audit_findings_total"),
+        "audit_findings_truncated": qual.get("audit_findings_truncated"),
+        "excluded_audit_findings_total": qual.get("excluded_audit_findings_total"),
+        "excluded_audit_findings_truncated": qual.get("excluded_audit_findings_truncated"),
         "challenger_refuted_audit_findings": qual.get("challenger_refuted_audit_findings"),
         "test_erosion_detail": qual.get("test_erosion_detail"),
         "smoketest_detail": qual.get("smoketest_detail"),

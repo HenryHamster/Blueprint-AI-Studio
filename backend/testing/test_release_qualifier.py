@@ -1508,7 +1508,11 @@ class TestExtractAuditFindings:
         }
         out = rq._extract_audit_findings(report)
         assert out == [
-            {"severity": "low", "summary": "Private import."},
+            {
+                "severity": "low",
+                "summary": "Private import.",
+                "key": rq._audit_finding_key("Private import.", None),
+            },
         ]
 
     def test_sorted_most_severe_first(self):
@@ -1563,7 +1567,13 @@ class TestExtractAuditFindings:
             ]
         }
         out = rq._extract_audit_findings(report)
-        assert out == [{"severity": "high", "summary": "Token baked into image."}]
+        assert out == [
+            {
+                "severity": "high",
+                "summary": "Token baked into image.",
+                "key": rq._audit_finding_key("Token baked into image.", None),
+            }
+        ]
 
     def test_gate_agrees_with_score_audit_for_unverified(self):
         """When _score_audit treats a finding as undeducted (unverified),
@@ -1604,7 +1614,13 @@ class TestExtractAuditFindings:
         report = {"findings": ["a plain string", {"severity": "high", "summary": ""}]}
         out = rq._extract_audit_findings(report)
         # The blank-summary finding is dropped; the string one is kept.
-        assert out == [{"severity": "unknown", "summary": "a plain string"}]
+        assert out == [
+            {
+                "severity": "unknown",
+                "summary": "a plain string",
+                "key": rq._audit_finding_key("a plain string", None),
+            }
+        ]
 
     def test_blocker_warning_severities_sort_correctly_and_survive_cap(self):
         """Blocker and warning severities must sort before lower-severity findings.
@@ -1653,6 +1669,136 @@ class TestExtractAuditFindings:
             "warning must sort before all low findings"
         )
 
+    def test_extract_audit_findings_carries_file_and_stable_key(self):
+        """Carried findings include file attribution and a deterministic,
+        content-derived key that is stable across re-extractions.
+
+        Acceptance guard for the stable-identity feature: a fix-first
+        resolution ledger needs each carried finding to (a) name the file it
+        targets and (b) carry a stable key so the same finding maps to the same
+        ledger entry across re-extractions.
+        """
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "SQL injection in claim handler.",
+                    "file": "backend/app/claim_task_helpers.py",
+                    "verification_note": (
+                        "Read backend/app/claim_task_helpers.py lines 40-60: "
+                        "raw f-string interpolated into the WHERE clause."
+                    ),
+                },
+                {"severity": "low", "summary": "Unused import."},
+            ]
+        }
+        out = rq._extract_audit_findings(report)
+        by_summary = {f["summary"]: f for f in out}
+
+        injected = by_summary["SQL injection in claim handler."]
+        # (a) file attribution carried from the raw finding.
+        assert injected["file"] == "backend/app/claim_task_helpers.py"
+        # (b) every carried finding has a key.
+        assert all("key" in f for f in out)
+        # The keyed value is the deterministic content hash of file|summary.
+        assert injected["key"] == rq._audit_finding_key(
+            "SQL injection in claim handler.",
+            "backend/app/claim_task_helpers.py",
+        )
+        # Findings without a raw file carry no file but still get a key.
+        unused = by_summary["Unused import."]
+        assert "file" not in unused
+        assert unused["key"] == rq._audit_finding_key("Unused import.", None)
+
+        # Key is STABLE across re-extractions of the same report.
+        out2 = rq._extract_audit_findings(report)
+        assert [f["key"] for f in out] == [f["key"] for f in out2]
+
+        # Same summary, DIFFERENT file → different key (file participates).
+        assert rq._audit_finding_key("dup summary", "a.py") != rq._audit_finding_key(
+            "dup summary", "b.py"
+        )
+        # Same content → same key.
+        assert rq._audit_finding_key("dup summary", "a.py") == rq._audit_finding_key(
+            "dup summary", "a.py"
+        )
+
+    def test_path_field_used_as_file_fallback(self):
+        """When the raw finding keys the location as 'path' (not 'file'), the
+        carried finding still gets file attribution."""
+        report = {"findings": [{"severity": "low", "summary": "nit", "path": "x/y.py"}]}
+        out = rq._extract_audit_findings(report)
+        assert out[0]["file"] == "x/y.py"
+        assert out[0]["key"] == rq._audit_finding_key("nit", "x/y.py")
+
+
+class TestAuditFindingsCarryMeta:
+    """_audit_findings_carry_meta exposes pre-cap totals + truncation flags so
+    consumers can tell whether the carried (capped) lists are complete."""
+
+    def test_none_report_zeroed(self):
+        meta = rq._audit_findings_carry_meta(None)
+        assert meta == {
+            "audit_findings_total": 0,
+            "audit_findings_truncated": False,
+            "excluded_audit_findings_total": 0,
+            "excluded_audit_findings_truncated": False,
+        }
+
+    def test_totals_agree_with_capped_lists_below_cap(self):
+        report = {
+            "findings": [
+                {"severity": "low", "summary": "low a"},
+                {"severity": "low", "summary": "low b"},
+                # Unverified high → excluded list only.
+                {"severity": "high", "summary": "speculative high"},
+            ]
+        }
+        meta = rq._audit_findings_carry_meta(report)
+        verified = rq._extract_audit_findings(report)
+        excluded = rq._extract_excluded_audit_findings(report)
+        assert meta["audit_findings_total"] == len(verified) == 2
+        assert meta["audit_findings_truncated"] is False
+        assert meta["excluded_audit_findings_total"] == len(excluded) == 1
+        assert meta["excluded_audit_findings_truncated"] is False
+
+    def test_truncated_flag_at_and_above_cap(self):
+        # Exactly at the cap → not truncated.
+        at_cap = {
+            "findings": [
+                {"severity": "low", "summary": f"low {i}"}
+                for i in range(rq._MAX_CARRIED_FINDINGS)
+            ]
+        }
+        meta_at = rq._audit_findings_carry_meta(at_cap)
+        assert meta_at["audit_findings_total"] == rq._MAX_CARRIED_FINDINGS
+        assert meta_at["audit_findings_truncated"] is False
+        assert len(rq._extract_audit_findings(at_cap)) == rq._MAX_CARRIED_FINDINGS
+
+        # Above the cap → truncated, total reflects the PRE-cap count.
+        over_cap = {
+            "findings": [
+                {"severity": "low", "summary": f"low {i}"}
+                for i in range(rq._MAX_CARRIED_FINDINGS + 3)
+            ]
+        }
+        meta_over = rq._audit_findings_carry_meta(over_cap)
+        assert meta_over["audit_findings_total"] == rq._MAX_CARRIED_FINDINGS + 3
+        assert meta_over["audit_findings_truncated"] is True
+        # Capped list is still bounded.
+        assert len(rq._extract_audit_findings(over_cap)) == rq._MAX_CARRIED_FINDINGS
+
+    def test_excluded_truncated_flag_above_cap(self):
+        over_cap = {
+            "findings": [
+                {"severity": "high", "summary": f"unverified high {i}"}
+                for i in range(rq._MAX_CARRIED_FINDINGS + 2)
+            ]
+        }
+        meta = rq._audit_findings_carry_meta(over_cap)
+        assert meta["excluded_audit_findings_total"] == rq._MAX_CARRIED_FINDINGS + 2
+        assert meta["excluded_audit_findings_truncated"] is True
+
 
 class TestExtractExcludedAuditFindings:
     """_extract_excluded_audit_findings is the inverse of _extract_audit_findings:
@@ -1681,6 +1827,7 @@ class TestExtractExcludedAuditFindings:
                 "severity": "high",
                 "summary": "Speculative SQL injection.",
                 "unverified": "true",
+                "key": rq._audit_finding_key("Speculative SQL injection.", None),
             }
         ]
         # And it must NOT appear in the verified-findings list.
@@ -1730,6 +1877,7 @@ class TestExtractExcludedAuditFindings:
                 "severity": "medium",
                 "summary": "an unverified issue",
                 "unverified": "true",
+                "key": rq._audit_finding_key("an unverified issue", None),
             }
         ]
 
@@ -6631,7 +6779,15 @@ async def test_finalize_dry_run_when_promotion_disabled(db_session, mocker):
 
     await db_session.refresh(version)
     assert version.status == "open"
-    assert version.last_qualification["status"] == "dry_run"
+    lq = version.last_qualification
+    assert lq["status"] == "dry_run"
+    # Pre-cap completeness meta is persisted on last_qualification so consumers
+    # can tell whether the carried findings lists were clipped at the cap. This
+    # clean audit carries no findings → totals zero, neither list truncated.
+    assert lq["audit_findings_total"] == len(lq["audit_findings"]) == 0
+    assert lq["audit_findings_truncated"] is False
+    assert lq["excluded_audit_findings_total"] == len(lq["excluded_audit_findings"]) == 0
+    assert lq["excluded_audit_findings_truncated"] is False
 
 
 def test_audit_leg_proof_state_matrix():
@@ -7136,12 +7292,17 @@ async def test_finalize_records_excluded_audit_findings(db_session, mocker):
             "severity": "high",
             "summary": "Unverified injection risk.",
             "unverified": "true",
+            "key": rq._audit_finding_key("Unverified injection risk.", None),
         }
     ]
     # ...but it must NOT appear in the scored/actionable findings list.
     assert lq["audit_findings"] == []
     # ...and the reconciliation count agrees.
     assert lq["audit_reconciliation"]["excluded_findings_count"] == 1
+    # Pre-cap completeness meta agrees with the capped lists.
+    assert lq["excluded_audit_findings_total"] == 1
+    assert lq["excluded_audit_findings_truncated"] is False
+    assert lq["audit_findings_total"] == 0
 
 
 @pytest.mark.asyncio
@@ -8305,12 +8466,28 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
 
     await db_session.refresh(version)
     findings = version.last_qualification["audit_findings"]
-    # Most-severe first, all three findings carried with severity + summary.
+    # Most-severe first, all three findings carried with severity + summary +
+    # a deterministic content key (no raw file on these → file omitted).
     assert findings == [
-        {"severity": "high", "summary": "Token baked into VM image."},
-        {"severity": "high", "summary": "Unsafe dependency pinning."},
-        {"severity": "low", "summary": "Private cross-module import."},
+        {
+            "severity": "high",
+            "summary": "Token baked into VM image.",
+            "key": rq._audit_finding_key("Token baked into VM image.", None),
+        },
+        {
+            "severity": "high",
+            "summary": "Unsafe dependency pinning.",
+            "key": rq._audit_finding_key("Unsafe dependency pinning.", None),
+        },
+        {
+            "severity": "low",
+            "summary": "Private cross-module import.",
+            "key": rq._audit_finding_key("Private cross-module import.", None),
+        },
     ]
+    # Pre-cap completeness meta agrees with the carried (capped) list.
+    assert version.last_qualification["audit_findings_total"] == len(findings)
+    assert version.last_qualification["audit_findings_truncated"] is False
     # Test-erosion detail is carried too: this fixture has positive deltas and
     # no deleted files, so the clean dimension carries None (nothing to fix).
     assert "test_erosion_detail" in version.last_qualification

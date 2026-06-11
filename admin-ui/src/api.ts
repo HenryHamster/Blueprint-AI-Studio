@@ -1375,6 +1375,12 @@ export interface AuditReconciliation {
 export interface AuditFinding {
   severity: string;
   summary: string;
+  // File attribution carried when the raw finding named one (additive; older
+  // records predating stable-identity carry no file).
+  file?: string;
+  // Deterministic content-derived key (sha256→16-hex of normalized file|summary)
+  // stable across re-extractions, so findings can be keyed in a resolution ledger.
+  key?: string;
 }
 
 export interface ChallengerRefutedFinding {
@@ -1417,6 +1423,12 @@ export interface VersionQualification {
   // Audit findings carried from the qualification run (severity + summary per finding).
   audit_findings?: AuditFinding[] | null;
   excluded_audit_findings?: AuditFinding[] | null;
+  // Pre-cap totals + truncation flags so the UI can tell whether the carried
+  // findings lists were clipped at the carry cap (additive; absent on older records).
+  audit_findings_total?: number | null;
+  audit_findings_truncated?: boolean | null;
+  excluded_audit_findings_total?: number | null;
+  excluded_audit_findings_truncated?: boolean | null;
   // Challenger-confirmed false positives: findings refuted by an independent challenger (with reason).
   challenger_refuted_audit_findings?: ChallengerRefutedFinding[] | null;
   migration_safety?: string | null;
