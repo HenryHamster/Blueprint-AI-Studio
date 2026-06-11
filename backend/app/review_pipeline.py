@@ -1344,6 +1344,13 @@ async def _spawn_pipeline_task(
                     f"already-merged review skip"
                 )
                 session.add(orig_task)
+            # Retire the chain's lane row now that the PR has merged.
+            try:
+                from app.review_fix_lane_pilot import retire_chain_lane as _retire_lane
+
+                await _retire_lane(session, source_task.context or {})
+            except Exception:  # noqa: BLE001
+                logger.debug("[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True)
             return (None, False)
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -1355,6 +1362,13 @@ async def _spawn_pipeline_task(
         )
         _set_spawn_reason(source_task, SPAWN_REASON_ALREADY_MERGED)
         session.add(source_task)
+        # Retire the chain's lane row now that the PR has merged.
+        try:
+            from app.review_fix_lane_pilot import retire_chain_lane as _retire_lane
+
+            await _retire_lane(session, source_task.context or {})
+        except Exception:  # noqa: BLE001
+            logger.debug("[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True)
         return (None, False)
 
     # ── verify_tests fast-path ──────────────────────────────────────────────

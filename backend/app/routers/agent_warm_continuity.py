@@ -626,6 +626,15 @@ async def _finalize_warm_claim(
         existing_timing["warm_claim_origin"] = origin
         existing_timing["prior_role_vm_id"] = vm_instance_id
         ctx["_timing"] = existing_timing
+        # Ground warm-resume receipts in actual outcome: stamp only here, at the
+        # warm-claim site, so a cold-fallback fix (reserved member reaped, lease
+        # expired, or pool fallback) leaves the receipt absent.
+        if ctx.get("is_lane_phase"):
+            from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+            confirm_lane_warm_resume(
+                ctx, has_checkpoint=bool(ctx.get("lane_checkpoint_sha"))
+            )
         task.context = ctx
         flag_modified(task, "context")
         agent_token = create_agent_token(

@@ -275,6 +275,65 @@ async def checkpoint_and_reserve_on_phase_complete(
             await mark_checkpoint_missing(session, lane.id, reason="no_phase_sha")
         return False
 
+    # Verify the SHA is actually reachable on the lane branch before recording
+    # it as the durable checkpoint. An unverified SHA causes the agent's warm-
+    # resume hard-reset to fail and silently degrades to a cold clone —
+    # defeating the measurement. Policy: verification failure (both False and
+    # None) degrades to mark_checkpoint_missing so the sweep can requeue;
+    # verification unavailability (credentials missing, transient API failure)
+    # is treated identically to not-reachable to avoid recording a
+    # potentially-stale SHA. Neither case blocks the review spawn path.
+    try:
+        from app.github_refs import is_ancestor_of
+        from app.github_token_resolver import get_github_token_for_task
+
+        gh_token, gh_owner, gh_repo = await get_github_token_for_task(
+            source_task.id, session
+        )
+        reachable = await is_ancestor_of(
+            gh_token, gh_owner, gh_repo, str(sha), lane.branch_name,
+            project_id=str(source_task.project_id),
+        )
+    except Exception as exc:  # noqa: BLE001 - verification is best-effort
+        logger.warning(
+            "[LANE-PILOT] SHA verification unavailable for lane %s sha=%s: %s",
+            lane.id,
+            str(sha)[:8],
+            exc,
+        )
+        with contextlib.suppress(LaneCheckpointError):
+            await mark_checkpoint_missing(
+                session, lane.id, reason="sha_verification_unavailable"
+            )
+        return False
+
+    if reachable is False:
+        logger.warning(
+            "[LANE-PILOT] SHA %s not reachable on branch %s for lane %s — "
+            "skipping checkpoint",
+            str(sha)[:8],
+            lane.branch_name,
+            lane.id,
+        )
+        with contextlib.suppress(LaneCheckpointError):
+            await mark_checkpoint_missing(
+                session, lane.id, reason="sha_not_reachable"
+            )
+        return False
+
+    if reachable is None:
+        logger.warning(
+            "[LANE-PILOT] SHA reachability indeterminate for lane %s sha=%s — "
+            "skipping checkpoint",
+            lane.id,
+            str(sha)[:8],
+        )
+        with contextlib.suppress(LaneCheckpointError):
+            await mark_checkpoint_missing(
+                session, lane.id, reason="sha_verification_unavailable"
+            )
+        return False
+
     payload = LaneCheckpointPayload(
         sha=str(sha),
         summary=summary[:1024],
@@ -351,14 +410,13 @@ async def activate_lane_for_fix(
 
 
 def wire_fix_lane_context(ctx: dict, lane: Any) -> None:
-    """Attach lane warm-resume directives + use receipts to a FIX spawn context.
+    """Attach lane warm-resume directives to a FIX spawn context.
 
     Sets ``improvement_lane_id`` (so the warm-pool dispatch hook leases the
     lane-reserved member), ``is_lane_phase`` + ``lane_checkpoint_sha`` (so the
-    agent fetch+resets to the checkpoint, skipping clone/install), and the
-    warm-resume + checkpoint USE receipts. Receipts mark that lane mechanics
-    actually engaged on this task — they feed the purity gate ONLY and never
-    determine arm membership (the assignment key does that).
+    agent fetch+resets to the checkpoint, skipping clone/install). Receipts are
+    intentionally NOT stamped here — they record actual warm engagement and are
+    written only by ``confirm_lane_warm_resume`` at the warm-claim site.
     """
     if lane is None:
         return
@@ -366,8 +424,21 @@ def wire_fix_lane_context(ctx: dict, lane: Any) -> None:
     ctx["is_lane_phase"] = True
     if lane.last_checkpoint_sha:
         ctx["lane_checkpoint_sha"] = str(lane.last_checkpoint_sha)
+
+
+def confirm_lane_warm_resume(ctx: dict, *, has_checkpoint: bool) -> None:
+    """Stamp warm-resume and checkpoint USE receipts on a task context.
+
+    Called ONLY at the warm-claim site (``_finalize_warm_claim``) when a
+    lane-phase task is actually claimed warm — never at spawn time. Receipts
+    feed the purity gate and the lane checkpoint ``warm_resume`` field; they
+    must reflect what actually happened, not what was intended at spawn.
+    ``has_checkpoint`` should be True when the task's context had a
+    ``lane_checkpoint_sha`` (i.e. the checkpoint was available for the agent
+    to reset to).
+    """
     ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] = True
-    ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] = True
+    ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] = has_checkpoint
 
 
 # ── KILL mechanics ────────────────────────────────────────────────────────────
@@ -419,6 +490,94 @@ async def force_expire_lane_reservations(
     return cleared
 
 
+async def retire_chain_lane(
+    session: AsyncSession,
+    ctx: dict | None,
+) -> bool:
+    """CAS the chain's lane to RETIRED if it is not already terminal.
+
+    Transitions ACTIVE or PARKED lanes to RETIRED.  If the lane happens to be
+    PROPOSED (non-terminal but PROPOSED->RETIRED is not a valid transition),
+    the CAS raises LaneCASError and is silently swallowed — PROPOSED is
+    transient and is advanced to ACTIVE immediately on creation.
+
+    Called when a chain's PR merges or closes so the lane row reaches a
+    terminal state promptly.  Best-effort: LaneCASError (concurrent retirement
+    by another worker) is suppressed.  Returns True when a transition was made.
+    """
+    from app.improvement_lane_ops import LaneCASError, _TERMINAL_STATUSES, cas_transition
+    from app.models import ImprovementLaneStatus, PoolVm
+
+    lane = await get_chain_lane(session, ctx)
+    if lane is None:
+        return False
+    if lane.status in _TERMINAL_STATUSES:
+        return False
+    try:
+        current = ImprovementLaneStatus(lane.status)
+        await cas_transition(session, lane.id, current, ImprovementLaneStatus.RETIRED)
+        logger.info("[LANE-PILOT] lane %s -> RETIRED (chain terminal)", lane.id)
+        # Release any warm-pool member still reserved for this lane so it
+        # rejoins the general pool immediately rather than waiting for TTL.
+        reserved_members = (
+            await session.execute(
+                select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+            )
+        ).scalars().all()
+        for member in reserved_members:
+            member.reserved_lane_id = None
+            member.reservation_expires_at = None
+            session.add(member)
+        return True
+    except LaneCASError as exc:
+        logger.debug("[LANE-PILOT] retire_chain_lane CAS miss lane=%s: %s", lane.id, exc)
+        return False
+
+
+async def kill_project_lanes(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """CAS non-terminal ImprovementLane rows for *project_id* to KILLED.
+
+    Transitions ACTIVE and PARKED lanes to KILLED.  PROPOSED lanes are
+    technically non-terminal but PROPOSED->KILLED is not a valid transition;
+    any PROPOSED row encountered raises LaneCASError and is silently skipped
+    (PROPOSED is transient and is advanced to ACTIVE immediately on creation).
+
+    Returns the count of lanes successfully transitioned.  Called from
+    apply_lane_pilot_kill so the KILL operation closes all lane rows rather
+    than leaving them ACTIVE/PARKED after the pilot flag is disabled.
+    """
+    from app.improvement_lane_ops import LaneCASError, _TERMINAL_STATUSES, cas_transition
+    from app.models import ImprovementLane, ImprovementLaneStatus
+
+    rows = (
+        await session.execute(
+            select(ImprovementLane).where(
+                ImprovementLane.project_id == project_id,
+                ImprovementLane.status.not_in(list(_TERMINAL_STATUSES)),
+            )
+        )
+    ).scalars().all()
+
+    killed = 0
+    for lane in rows:
+        try:
+            current = ImprovementLaneStatus(lane.status)
+            await cas_transition(session, lane.id, current, ImprovementLaneStatus.KILLED)
+            killed += 1
+        except LaneCASError as exc:  # noqa: PERF203 — CAS miss per iteration is intentional
+            logger.debug(
+                "[LANE-PILOT] kill_project_lanes CAS miss lane=%s: %s", lane.id, exc
+            )
+    if killed:
+        logger.info(
+            "[LANE-PILOT] KILL closed %d lane(s) for project %s", killed, project_id
+        )
+    return killed
+
+
 async def apply_lane_pilot_kill(
     session: AsyncSession, project_id: uuid.UUID, *, reason: str
 ) -> dict:
@@ -426,19 +585,28 @@ async def apply_lane_pilot_kill(
 
     The flag flip makes ``is_review_fix_lane_pilot_enabled`` return False so all
     subsequent spawns run classic; force-expiring reservations releases members
-    held for in-flight lanes. Idempotent.
+    held for in-flight lanes; kill_project_lanes closes the lane rows so they
+    reach KILLED rather than leaking as ACTIVE/PARKED. Idempotent.
     """
     from app.shared_state import runtime_config
 
     runtime_config["review_fix_lane_pilot_enabled"] = False
     cleared = await force_expire_lane_reservations(session, project_id)
+    lanes_killed = await kill_project_lanes(session, project_id)
     logger.warning(
-        "[LANE-PILOT] KILL applied for project %s reason=%s reservations_cleared=%d",
+        "[LANE-PILOT] KILL applied for project %s reason=%s "
+        "reservations_cleared=%d lanes_killed=%d",
         project_id,
         reason,
         cleared,
+        lanes_killed,
     )
-    return {"flag_disabled": True, "reservations_cleared": cleared, "reason": reason}
+    return {
+        "flag_disabled": True,
+        "reservations_cleared": cleared,
+        "lanes_killed": lanes_killed,
+        "reason": reason,
+    }
 
 
 async def raise_gate_integrity_alert(

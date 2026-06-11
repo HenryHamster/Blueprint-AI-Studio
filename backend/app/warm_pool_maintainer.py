@@ -1192,11 +1192,64 @@ async def pool_maintainer_service():
             logger.error("[WARM-POOL] maintainer tick error: %s", exc, exc_info=True)
 
 
+async def sweep_exhausted_lane_budgets(session) -> int:
+    """Kill ACTIVE ImprovementLane rows whose phase_requeues budget is exhausted.
+
+    mark_checkpoint_missing leaves over-budget lanes ACTIVE "so the sweep can
+    surface them to the strategist" — this is that sweep.  CAS each matching
+    lane to KILLED so the rows reach a terminal state and stop polluting the
+    warm-resume and checkpoint-loss denominators.
+
+    Returns the count of lanes killed.  Inert when improvement_lanes_enabled
+    is False.
+    """
+    from app.improvement_lane_ops import LaneCASError, cas_transition
+    from app.models import ImprovementLaneStatus, _LANE_MAX_PHASE_REQUEUES
+    from app.runtime_config_state import is_improvement_lanes_enabled
+
+    if not is_improvement_lanes_enabled():
+        return 0
+
+    exhausted = (
+        await session.execute(
+            select(ImprovementLane).where(
+                ImprovementLane.status == ImprovementLaneStatus.ACTIVE.value,
+                ImprovementLane.phase_requeues > _LANE_MAX_PHASE_REQUEUES,
+            )
+        )
+    ).scalars().all()
+
+    killed = 0
+    for lane in exhausted:
+        try:
+            await cas_transition(
+                session,
+                lane.id,
+                ImprovementLaneStatus.ACTIVE,
+                ImprovementLaneStatus.KILLED,
+            )
+            killed += 1
+            logger.info(
+                "[WARM-POOL] killed exhausted-budget lane %s (phase_requeues=%d)",
+                lane.id,
+                lane.phase_requeues,
+            )
+        except LaneCASError as exc:  # noqa: PERF203 — CAS miss per iteration is intentional
+            logger.debug(
+                "[WARM-POOL] exhausted-budget CAS miss lane=%s: %s", lane.id, exc
+            )
+    if killed:
+        await session.commit()
+    return killed
+
+
 async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     """Reaper pass: retire over-TTL / zombie / stale-image / stuck-RETIRING pool VMs.
 
-    Returns the number of members retired. Inert when ``warm_pool_enabled`` is
-    False.
+    Always runs the lane-budget sweep (independent of ``warm_pool_enabled``) so
+    shadow-lane mode closes over-budget lanes promptly.  Returns the number of
+    pool VM members retired; the VM-reaper body is inert when ``warm_pool_enabled``
+    is False.
 
     Concurrency: the candidate scan below is LOCK-FREE (mirrors the orphan
     reaper's Step-1 status scan). Single-action safety against a concurrent
@@ -1208,6 +1261,11 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     sweep or the maintainer) wins the claim is the only one that tears the member
     down; the loser no-ops.
     """
+    # Lane-budget sweep runs independently of warm_pool_enabled so that
+    # shadow-lane mode (improvement_lanes_enabled=True, warm_pool_enabled=False)
+    # still closes over-budget lanes instead of leaving them ACTIVE forever.
+    await sweep_exhausted_lane_budgets(session)
+
     if not is_warm_pool_enabled():
         return 0
 

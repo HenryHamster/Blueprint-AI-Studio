@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -22,9 +23,16 @@ from app.improvement_lane_ops import (
 from app.models import (
     ImprovementLane,
     ImprovementLaneStatus,
+    PoolVm,
+    PoolVmState,
     _LANE_MAX_PHASE_REQUEUES,
 )
 from app.payload_schemas import LaneCheckpointPayload, LaneCheckpointValidated
+from app.review_fix_lane_pilot import (
+    LANE_CHAIN_ID_KEY,
+    kill_project_lanes,
+    retire_chain_lane,
+)
 
 
 @pytest_asyncio.fixture()
@@ -539,3 +547,275 @@ def test_lane_checkpoint_payload_manifest_patch_too_large():
     big_data = {"key": "x" * 9000}
     with pytest.raises(Exception, match="8KB"):
         LaneCheckpointPayload(sha="abc1234", summary="overflow", manifest_patch=big_data)
+
+
+# ---------------------------------------------------------------------------
+# retire_chain_lane — terminal lifecycle on PR merge
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chain_terminal_retires_lane_and_releases_reservation(db: AsyncSession):
+    """retire_chain_lane CASes ACTIVE -> RETIRED and clears any PoolVm reserved for
+    the lane, so the member rejoins the general pool immediately rather than waiting
+    for the TTL expiry sweep."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id="d-retire1",
+        title="Retire on merge",
+        goal="PR merged goal",
+        branch_name="lane/retire1",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    # A warm-pool member reserved for this lane.
+    member = PoolVm(
+        vm_instance_id="pool-vm-retire-test-1",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+    )
+    db.add(member)
+    await db.commit()
+
+    ctx = {LANE_CHAIN_ID_KEY: str(lane.id)}
+    did_retire = await retire_chain_lane(db, ctx)
+    await db.commit()
+
+    assert did_retire is True
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value
+    assert refreshed.retired_at is not None
+    assert refreshed.current_task_id is None
+    # Reservation must be released so the member is immediately available.
+    await db.refresh(member)
+    assert member.reserved_lane_id is None
+    assert member.reservation_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_retire_chain_lane_parked_becomes_retired(db: AsyncSession):
+    """retire_chain_lane CASes PARKED -> RETIRED as well."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/retire2",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    await db.commit()
+
+    ctx = {LANE_CHAIN_ID_KEY: str(lane.id)}
+    did_retire = await retire_chain_lane(db, ctx)
+    await db.commit()
+
+    assert did_retire is True
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value
+
+
+@pytest.mark.asyncio
+async def test_retire_chain_lane_noop_if_terminal(db: AsyncSession):
+    """retire_chain_lane is a no-op when the lane is already in a terminal state."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/retire3",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.KILLED.value
+    await db.commit()
+
+    ctx = {LANE_CHAIN_ID_KEY: str(lane.id)}
+    did_retire = await retire_chain_lane(db, ctx)
+    await db.commit()
+
+    assert did_retire is False
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.KILLED.value
+
+
+@pytest.mark.asyncio
+async def test_retire_chain_lane_noop_without_chain_id(db: AsyncSession):
+    """retire_chain_lane returns False and is a no-op when ctx lacks LANE_CHAIN_ID_KEY."""
+    did_retire = await retire_chain_lane(db, {})
+    assert did_retire is False
+
+
+# ---------------------------------------------------------------------------
+# kill_project_lanes — bulk KILL on pilot termination
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_kill_project_lanes_transitions_active_and_parked(db: AsyncSession):
+    """kill_project_lanes CASes both ACTIVE and PARKED lanes to KILLED."""
+    project_id = await _make_project(db)
+
+    lane_active = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="Active lane",
+        goal="G",
+        branch_name="lane/kill1a",
+        base_branch="main",
+    )
+    lane_active.status = ImprovementLaneStatus.ACTIVE.value
+
+    lane_parked = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="Parked lane",
+        goal="G",
+        branch_name="lane/kill1p",
+        base_branch="main",
+    )
+    lane_parked.status = ImprovementLaneStatus.PARKED.value
+    await db.commit()
+
+    count = await kill_project_lanes(db, project_id)
+    await db.commit()
+
+    assert count == 2
+    for lane_id in (lane_active.id, lane_parked.id):
+        refreshed = await db.get(ImprovementLane, lane_id)
+        assert refreshed.status == ImprovementLaneStatus.KILLED.value
+        assert refreshed.retired_at is not None
+
+
+@pytest.mark.asyncio
+async def test_kill_project_lanes_skips_already_terminal(db: AsyncSession):
+    """kill_project_lanes does not re-transition lanes already in RETIRED or KILLED."""
+    project_id = await _make_project(db)
+
+    lane_retired = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="Already retired",
+        goal="G",
+        branch_name="lane/kill2r",
+        base_branch="main",
+    )
+    lane_retired.status = ImprovementLaneStatus.RETIRED.value
+
+    lane_killed = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="Already killed",
+        goal="G",
+        branch_name="lane/kill2k",
+        base_branch="main",
+    )
+    lane_killed.status = ImprovementLaneStatus.KILLED.value
+    await db.commit()
+
+    count = await kill_project_lanes(db, project_id)
+    await db.commit()
+
+    assert count == 0
+    # Statuses unchanged.
+    assert (await db.get(ImprovementLane, lane_retired.id)).status == ImprovementLaneStatus.RETIRED.value
+    assert (await db.get(ImprovementLane, lane_killed.id)).status == ImprovementLaneStatus.KILLED.value
+
+
+# ---------------------------------------------------------------------------
+# sweep_exhausted_lane_budgets — reaper kills over-budget ACTIVE lanes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_exhausted_lane_budgets_kills_over_budget(db: AsyncSession):
+    """Over-budget ACTIVE lane is killed; at-budget and under-budget lanes are preserved."""
+    from app.warm_pool_maintainer import sweep_exhausted_lane_budgets
+
+    project_id = await _make_project(db)
+
+    lane_over = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="Over-budget lane",
+        goal="G",
+        branch_name="lane/sweep1o",
+        base_branch="main",
+    )
+    lane_over.status = ImprovementLaneStatus.ACTIVE.value
+    lane_over.phase_requeues = _LANE_MAX_PHASE_REQUEUES + 1  # strictly over budget
+
+    lane_at = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="At-budget lane",
+        goal="G",
+        branch_name="lane/sweep1a",
+        base_branch="main",
+    )
+    lane_at.status = ImprovementLaneStatus.ACTIVE.value
+    lane_at.phase_requeues = _LANE_MAX_PHASE_REQUEUES  # exactly at limit, not over
+
+    lane_under = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="Under-budget lane",
+        goal="G",
+        branch_name="lane/sweep1u",
+        base_branch="main",
+    )
+    lane_under.status = ImprovementLaneStatus.ACTIVE.value
+    lane_under.phase_requeues = 0
+
+    await db.commit()
+
+    with patch("app.runtime_config_state.is_improvement_lanes_enabled", return_value=True):
+        count = await sweep_exhausted_lane_budgets(db)
+    await db.commit()
+
+    assert count == 1
+    assert (await db.get(ImprovementLane, lane_over.id)).status == ImprovementLaneStatus.KILLED.value
+    # at-budget and under-budget lanes must not be touched
+    assert (await db.get(ImprovementLane, lane_at.id)).status == ImprovementLaneStatus.ACTIVE.value
+    assert (await db.get(ImprovementLane, lane_under.id)).status == ImprovementLaneStatus.ACTIVE.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_exhausted_lane_budgets_inert_when_disabled(db: AsyncSession):
+    """sweep_exhausted_lane_budgets returns 0 and changes nothing when the flag is off."""
+    from app.warm_pool_maintainer import sweep_exhausted_lane_budgets
+
+    project_id = await _make_project(db)
+
+    lane_over = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="Over-budget but flag off",
+        goal="G",
+        branch_name="lane/sweep2o",
+        base_branch="main",
+    )
+    lane_over.status = ImprovementLaneStatus.ACTIVE.value
+    lane_over.phase_requeues = _LANE_MAX_PHASE_REQUEUES + 1
+    await db.commit()
+
+    with patch("app.runtime_config_state.is_improvement_lanes_enabled", return_value=False):
+        count = await sweep_exhausted_lane_budgets(db)
+
+    assert count == 0
+    # Lane must remain ACTIVE — the sweep was entirely inert.
+    assert (await db.get(ImprovementLane, lane_over.id)).status == ImprovementLaneStatus.ACTIVE.value

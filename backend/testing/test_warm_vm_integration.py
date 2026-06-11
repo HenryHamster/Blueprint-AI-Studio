@@ -1742,3 +1742,133 @@ async def test_next_role_lane_fields_absent_when_flag_off(
             _runtime_config["improvement_lanes_enabled"] = prior_lanes
         _shared_state.vm_last_heartbeat.clear()
         _shared_state.vm_last_heartbeat.update(prior_heartbeat)
+
+
+# ---------------------------------------------------------------------------
+# Lane warm-resume receipts: grounded in actual outcome, not spawn intent.
+# A task with is_lane_phase=True receives receipts ONLY at warm claim; a
+# task that never goes through _finalize_warm_claim (cold fallback) leaves
+# them absent so the lane checkpoint's warm_resume field reflects truth.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lane_warm_resume_receipt_set_at_claim_not_spawn(
+    client: AsyncClient, db_session, mocker
+):
+    """Receipts are absent at spawn time and stamped only when the task is
+    actually claimed warm via /next-role (i.e. _finalize_warm_claim).
+
+    Simulates the reaped-reservation fallback: a task is spawned with lane
+    dispatch context (is_lane_phase=True, lane_checkpoint_sha set) but only
+    the actual warm /next-role claim stamps LANE_PILOT_WARM_RESUME_RECEIPT_KEY
+    and LANE_PILOT_CHECKPOINT_RECEIPT_KEY onto the task context.
+    """
+    import app.shared_state as _shared_state
+    from app.shared_state import runtime_config as _runtime_config
+    from app.capability_trial_verdict import (
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+    )
+
+    mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_warm_continuity.broadcast_to_project",
+        new_callable=mocker.AsyncMock,
+    )
+
+    prior_warm = _runtime_config.get("warm_continuity_enabled")
+    prior_lanes = _runtime_config.get("improvement_lanes_enabled")
+    prior_heartbeat = dict(_shared_state.vm_last_heartbeat)
+    try:
+        _runtime_config["warm_continuity_enabled"] = True
+        _runtime_config["improvement_lanes_enabled"] = True
+
+        project = Project(name="Lane Receipt Test", user_id="test-user-lane-receipt")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        vm_id = "agent-vm-lane-receipt-001"
+        checkpoint_sha = "aabbccdd11223344aabbccdd11223344aabbccdd"
+
+        source_task = Task(
+            project_id=project.id,
+            title="Source task for lane receipt",
+            payloads=[{"type": "create", "pr_number": 8001, "branch": "feat/lane-receipt"}],
+            vm_instance_id=vm_id,
+            status=TaskStatus.IN_PROGRESS,
+            context={"scope": "small"},
+        )
+        db_session.add(source_task)
+        await db_session.commit()
+        await db_session.refresh(source_task)
+
+        # Spawn a fix task with lane dispatch context (is_lane_phase, checkpoint sha)
+        # but NO receipts — this is the state at spawn time before any warm claim.
+        lane_fix_task = Task(
+            project_id=project.id,
+            title="Lane fix task",
+            payloads=[{"type": "fix", "pr_number": 8001, "branch": "feat/lane-receipt"}],
+            status=TaskStatus.QUEUED,
+            context={
+                "warm_target_vm_id": vm_id,
+                "warm_target_pr": "8001",
+                "is_lane_phase": True,
+                "lane_checkpoint_sha": checkpoint_sha,
+                # No LANE_PILOT_WARM_RESUME_RECEIPT_KEY — not yet claimed warm.
+            },
+        )
+        db_session.add(lane_fix_task)
+        await db_session.commit()
+        await db_session.refresh(lane_fix_task)
+
+        # Pre-claim: no receipts in context.
+        pre_ctx = lane_fix_task.context or {}
+        assert LANE_PILOT_WARM_RESUME_RECEIPT_KEY not in pre_ctx, (
+            "Receipt must NOT be stamped at spawn time — only at actual warm claim"
+        )
+        assert LANE_PILOT_CHECKPOINT_RECEIPT_KEY not in pre_ctx, (
+            "Checkpoint receipt must NOT be stamped at spawn time"
+        )
+
+        # Warm claim via /next-role: _finalize_warm_claim stamps the receipts.
+        _shared_state.record_vm_heartbeat(vm_id)
+        source_token = create_agent_token(str(source_task.id), vm_id)
+        nr_resp = await client.post(
+            "/api/agent/next-role",
+            json={
+                "vm_instance_id": vm_id,
+                "prior_task_id": str(source_task.id),
+                "prior_pr_number": 8001,
+            },
+            headers={"x-agent-token": source_token},
+        )
+        assert nr_resp.status_code == 200, nr_resp.text
+        body = nr_resp.json()
+        assert body["action"] == "claim"
+        assert body["task_id"] == str(lane_fix_task.id)
+
+        # Post-claim: receipts must be present in the persisted task context.
+        await db_session.refresh(lane_fix_task)
+        post_ctx = lane_fix_task.context or {}
+        assert post_ctx.get(LANE_PILOT_WARM_RESUME_RECEIPT_KEY) is True, (
+            "Warm-resume receipt must be True after actual warm claim"
+        )
+        assert post_ctx.get(LANE_PILOT_CHECKPOINT_RECEIPT_KEY) is True, (
+            "Checkpoint receipt must be True after warm claim with checkpoint SHA"
+        )
+
+    finally:
+        if prior_warm is None:
+            _runtime_config.pop("warm_continuity_enabled", None)
+        else:
+            _runtime_config["warm_continuity_enabled"] = prior_warm
+        if prior_lanes is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes
+        _shared_state.vm_last_heartbeat.clear()
+        _shared_state.vm_last_heartbeat.update(prior_heartbeat)

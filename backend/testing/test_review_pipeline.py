@@ -11242,6 +11242,84 @@ async def test_already_merged_skip_leaves_rollup_parent_evaluating(db_session, m
     )
 
 
+@pytest.mark.asyncio
+async def test_already_merged_skip_retires_active_lane(db_session, mocker):
+    """When the already-merged guard fires, _spawn_pipeline_task must retire the
+    chain's ImprovementLane so it reaches a terminal state immediately rather than
+    staying ACTIVE and polluting lane metrics until the next TTL sweep.
+
+    Regression: retire_chain_lane is called with source_task.context, so omitting
+    LANE_CHAIN_ID_KEY from that context, passing the wrong context, or removing
+    the call entirely would all leave the lane ACTIVE after this call — none of
+    which would be caught by the unit tests on retire_chain_lane alone."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+
+    from app.improvement_lane_ops import create_lane
+    from app.models import ImprovementLaneStatus
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/already-merged-retire",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    await db_session.flush()
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small", "pr_merged": True},
+    )
+    db_session.add(original_task)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9999,
+                "branch": "lane/already-merged-retire",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+            LANE_CHAIN_ID_KEY: str(lane.id),
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=9999,
+        branch="lane/already-merged-retire",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None and created is False, (
+        "Review spawn must be skipped for an already-merged PR"
+    )
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.RETIRED.value, (
+        f"Lane must be RETIRED after already-merged skip, got {lane.status}"
+    )
+
+
 # ── clear_review_escalation_approval_gate (stale stuck-hold release) ──────────
 
 
@@ -12839,6 +12917,18 @@ async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
     warm-resume + checkpoint USE receipts. The reviewer is never lane-ized."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     _lane_pilot_on(mocker)
+    # SHA reachability is verified before every checkpoint; return True so the
+    # happy path proceeds without a real GitHub API call.
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
 
     from app.models import (
         ImprovementLane,
@@ -12955,9 +13045,11 @@ async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
     assert fctx.get("improvement_lane_id") == str(lane_id)
     assert fctx.get("is_lane_phase") is True
     assert fctx.get("lane_checkpoint_sha") == "abc1234def5678"
-    # USE receipts recorded for the purity gate — separate from arm membership.
-    assert fctx.get(LANE_PILOT_WARM_RESUME_RECEIPT_KEY) is True
-    assert fctx.get(LANE_PILOT_CHECKPOINT_RECEIPT_KEY) is True
+    # USE receipts are NOT set at spawn time — they are stamped only at the
+    # warm-claim site (_finalize_warm_claim) so cold-fallback tasks carry no
+    # false receipt.
+    assert LANE_PILOT_WARM_RESUME_RECEIPT_KEY not in fctx
+    assert LANE_PILOT_CHECKPOINT_RECEIPT_KEY not in fctx
     assert fctx.get(LANE_PILOT_ASSIGNMENT_KEY) == "lane"
     # The lane resumed ACTIVE for the fix phase.
     await db_session.refresh(lane)
@@ -12966,10 +13058,15 @@ async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
 
     # ── Warm-resumed fix completion -> COLD re-review ──
     review.status = TaskStatus.COMPLETED
+    # Simulate what _finalize_warm_claim writes: warm-resume receipts are set
+    # only at actual warm claim, not at spawn time.  The fix ran warm (the lane
+    # reservation was intact), so both receipts are now True.
     fix.context = {
         **fctx,
         "head_sha": "def5678abc1234",
         "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
     }
     fix.status = TaskStatus.EVALUATING
     db_session.add(review)
@@ -13553,6 +13650,16 @@ async def test_lane_pilot_adopt_gate_integrity_preserved(db_session, mocker):
     context (gate integrity invariant)."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     _lane_pilot_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
 
     from app.review_fix_lane_pilot import (
         LANE_PILOT_ASSIGNMENT_KEY,
@@ -13621,6 +13728,202 @@ async def test_lane_pilot_adopt_gate_integrity_preserved(db_session, mocker):
     assert "lane_checkpoint_sha" not in rctx
     # The arm assignment is still propagated forward (for measurement).
     assert rctx.get(LANE_PILOT_ASSIGNMENT_KEY) == "lane"
+
+
+# ── Lane checkpoint SHA verification ──────────────────────────────────────────
+#
+# These directly exercise checkpoint_and_reserve_on_phase_complete to confirm
+# that unverified SHAs degrade to mark_checkpoint_missing rather than being
+# recorded as durable checkpoints.
+
+
+class TestLaneCheckpointShaVerification:
+    """SHA reachability is verified before recording a lane checkpoint.
+
+    A False (not reachable) or None (API unavailable) result must degrade to
+    mark_checkpoint_missing with a distinct reason string instead of recording
+    a stale or unverified SHA.  A True result must proceed through the normal
+    checkpoint_lane path.
+    """
+
+    async def _setup_lane_and_task(self, db_session):
+        """Create a project, an ACTIVE lane, and a source task for checkpoint tests."""
+        from app.improvement_lane_ops import cas_transition, create_lane
+        from app.models import ImprovementLaneStatus
+
+        project = await _make_db_project(db_session, is_self_repo=True)
+        lane = await create_lane(
+            db_session,
+            project_id=project.id,
+            direction_id=None,
+            title="checkpoint-sha-test",
+            goal="verify sha before checkpoint",
+            branch_name="feat/sha-verify",
+            base_branch="main",
+            pilot_arm="lane",
+        )
+        await db_session.flush()
+        await cas_transition(
+            db_session,
+            lane.id,
+            ImprovementLaneStatus.PROPOSED,
+            ImprovementLaneStatus.ACTIVE,
+            current_task_id=None,
+        )
+
+        source_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+            context={"head_sha": "abc1234def5678"},
+        )
+        db_session.add(source_task)
+        await db_session.commit()
+        await db_session.refresh(source_task)
+        await db_session.refresh(lane)
+        return lane, source_task
+
+    @pytest.mark.asyncio
+    async def test_lane_checkpoint_unverified_sha_degrades_to_checkpoint_missing(
+        self, db_session, mocker
+    ):
+        """SHA not reachable on branch → mark_checkpoint_missing(reason='sha_not_reachable')
+        and return False; checkpoint_lane must NOT be called."""
+        mocker.patch(
+            "app.github_token_resolver.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("gh-token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github_refs.is_ancestor_of",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        mock_checkpoint_lane = mocker.patch(
+            "app.improvement_lane_ops.checkpoint_lane", new_callable=AsyncMock
+        )
+
+        from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+        lane, source_task = await self._setup_lane_and_task(db_session)
+        initial_requeues = lane.phase_requeues or 0
+
+        result = await checkpoint_and_reserve_on_phase_complete(
+            db_session,
+            source_task,
+            lane,
+            sha="abc1234def5678",
+            summary="phase complete",
+        )
+
+        assert result is False
+        mock_checkpoint_lane.assert_not_called()
+        # phase_requeues incremented via mark_checkpoint_missing.
+        await db_session.refresh(lane)
+        assert (lane.phase_requeues or 0) == initial_requeues + 1
+
+    @pytest.mark.asyncio
+    async def test_lane_checkpoint_sha_verification_unavailable_degrades(
+        self, db_session, mocker
+    ):
+        """API returns None (unavailable) → mark_checkpoint_missing with
+        reason='sha_verification_unavailable' and return False."""
+        mocker.patch(
+            "app.github_token_resolver.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("gh-token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github_refs.is_ancestor_of",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mock_checkpoint_lane = mocker.patch(
+            "app.improvement_lane_ops.checkpoint_lane", new_callable=AsyncMock
+        )
+
+        from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+        lane, source_task = await self._setup_lane_and_task(db_session)
+        initial_requeues = lane.phase_requeues or 0
+
+        result = await checkpoint_and_reserve_on_phase_complete(
+            db_session,
+            source_task,
+            lane,
+            sha="abc1234def5678",
+            summary="phase complete",
+        )
+
+        assert result is False
+        mock_checkpoint_lane.assert_not_called()
+        await db_session.refresh(lane)
+        assert (lane.phase_requeues or 0) == initial_requeues + 1
+
+    @pytest.mark.asyncio
+    async def test_lane_checkpoint_sha_token_error_degrades(
+        self, db_session, mocker
+    ):
+        """Token fetch failure (credentials missing, etc.) → degrade to
+        mark_checkpoint_missing(reason='sha_verification_unavailable'), return False."""
+        mocker.patch(
+            "app.github_token_resolver.get_github_token_for_task",
+            new_callable=AsyncMock,
+            side_effect=Exception("no github credentials"),
+        )
+        mock_checkpoint_lane = mocker.patch(
+            "app.improvement_lane_ops.checkpoint_lane", new_callable=AsyncMock
+        )
+
+        from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+        lane, source_task = await self._setup_lane_and_task(db_session)
+        initial_requeues = lane.phase_requeues or 0
+
+        result = await checkpoint_and_reserve_on_phase_complete(
+            db_session,
+            source_task,
+            lane,
+            sha="abc1234def5678",
+            summary="phase complete",
+        )
+
+        assert result is False
+        mock_checkpoint_lane.assert_not_called()
+        await db_session.refresh(lane)
+        assert (lane.phase_requeues or 0) == initial_requeues + 1
+
+    @pytest.mark.asyncio
+    async def test_lane_checkpoint_sha_reachable_proceeds(
+        self, db_session, mocker
+    ):
+        """SHA verified as reachable → checkpoint_lane is called and True is returned."""
+        mocker.patch(
+            "app.github_token_resolver.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("gh-token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github_refs.is_ancestor_of",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+
+        from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+        lane, source_task = await self._setup_lane_and_task(db_session)
+
+        result = await checkpoint_and_reserve_on_phase_complete(
+            db_session,
+            source_task,
+            lane,
+            sha="abc1234def5678",
+            summary="phase complete",
+        )
+
+        assert result is True
+        await db_session.refresh(lane)
+        assert lane.last_checkpoint_sha == "abc1234def5678"
 
 
 @pytest.mark.asyncio
