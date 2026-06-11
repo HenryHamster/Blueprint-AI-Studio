@@ -5438,10 +5438,11 @@ async def _process_post_commit(
                 return {"status": "accepted"}
 
         # Release-qualifier finalization — fires from EVERY terminal path
-        # (COMPLETED / FAILED / CANCELLED) for BOTH a release_audit task and a
-        # qualifier-smoketest task. This deliberately lives in the terminal
-        # section (not the COMPLETED-only review-pipeline block above): a
-        # qualifier child that fails/cancels must still advance qualification,
+        # (COMPLETED / FAILED / CANCELLED / BLOCKED) for BOTH a release_audit
+        # task and a qualifier-smoketest task. This deliberately lives in the
+        # terminal section (not the COMPLETED-only review-pipeline block above):
+        # a qualifier child that fails/cancels/blocks must still advance
+        # qualification,
         # or the ReleaseVersion stays {status:"pending"} forever and the
         # version is wedged.
         #
@@ -5473,6 +5474,7 @@ async def _process_post_commit(
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
+            TaskStatus.BLOCKED,
         ):
             _qual_ctx = task.context or {}
             _qual_first_payload = task.first_payload or {}

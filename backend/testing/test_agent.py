@@ -17181,6 +17181,46 @@ async def test_cancelled_release_audit_last_child_triggers_finalization(
 
 
 @pytest.mark.asyncio
+async def test_blocked_release_audit_last_child_triggers_finalization(
+    db_session, mocker
+):
+    """CRITICAL: a BLOCKED release_audit child must also hit the lifecycle
+    finalization hook when it is the last qualifier child to go terminal.
+
+    This covers the task_lifecycle.py status gate directly. If BLOCKED were
+    removed from the terminal-status guard, this test would stop awaiting the
+    finalize hook even though the release_qualifier helper itself still accepts
+    BLOCKED.
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    finalize_spy = mocker.patch(
+        "app.release_qualifier.maybe_finalize_qualification",
+        new=AsyncMock(return_value={"status": "infra_failure"}),
+    )
+
+    project, version = await _make_qualifier_project_and_version(db_session)
+    audit_task, _smoke = await _seed_qualifier_children(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.BLOCKED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    payload = AgentStatusPayload(task_id=audit_task.id, status=TaskStatus.BLOCKED)
+    factory = _process_post_commit_factory(db_session)
+    await _process_post_commit(audit_task.id, payload, _session_factory=factory)
+
+    finalize_spy.assert_awaited_once()
+    call = finalize_spy.await_args
+    assert call.args[0].id == audit_task.id
+    assert call.kwargs["session_factory"] is factory
+
+
+@pytest.mark.asyncio
 async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
     db_session, mocker
 ):

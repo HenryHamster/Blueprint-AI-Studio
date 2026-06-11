@@ -387,6 +387,13 @@ _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
         TaskStatus.BLOCKED,
     }
 )
+_INFRA_FAILURE_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    }
+)
 
 
 async def _qualification_in_flight(
@@ -1909,8 +1916,9 @@ async def _finalize_qualification(
     policy = _load_policy()
 
     # --- Infra-failure detection: check required child terminal statuses ------
-    # A FAILED or CANCELLED required child means the qualifier pipeline itself
-    # broke (agent VM crash, timeout, clone failure) — NOT a quality finding.
+    # A FAILED, CANCELLED, or BLOCKED required child means the qualifier pipeline
+    # itself broke (agent VM crash, timeout, clone failure, blocked precondition)
+    # — NOT a quality finding.
     # Route these to _handle_infra_failure BEFORE reading artifacts so the
     # quality-verdict path only sees COMPLETED children.  A COMPLETED child
     # whose artifact is absent or unparseable is also an infrastructure failure
@@ -1920,9 +1928,9 @@ async def _finalize_qualification(
     if audit_task_id:
         try:
             _audit_task_obj = await session.get(Task, uuid.UUID(str(audit_task_id)))
-            if _audit_task_obj is not None and _audit_task_obj.status in (
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
+            if (
+                _audit_task_obj is not None
+                and _audit_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
             ):
                 # A RATE_LIMIT-classified FAILED audit is a transient account-credit
                 # failure, not a pipeline infrastructure failure.  Re-spawn the audit
@@ -2065,9 +2073,9 @@ async def _finalize_qualification(
     if smoketest_enabled and smoketest_task_id:
         try:
             _smoke_task_obj = await session.get(Task, uuid.UUID(str(smoketest_task_id)))
-            if _smoke_task_obj is not None and _smoke_task_obj.status in (
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
+            if (
+                _smoke_task_obj is not None
+                and _smoke_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
             ):
                 return await _handle_infra_failure(
                     session,
@@ -2204,17 +2212,17 @@ async def _finalize_qualification(
     # If neither task id is present, this is the new binding flow with a missing
     # challenge artifact, which MUST hold the version.
     if challenge_task_id or not audit_challenge_task_id:
-        # Load the challenge task object early so FAILED/CANCELLED terminal
-        # states are caught before artifact reads (consistent with audit/smoketest).
+        # Load the challenge task object early so non-completed terminal states
+        # are caught before artifact reads (consistent with audit/smoketest).
         _challenge_task_obj: Task | None = None
         if challenge_task_id:
             try:
                 _challenge_task_obj = await session.get(
                     Task, uuid.UUID(str(challenge_task_id))
                 )
-                if _challenge_task_obj is not None and _challenge_task_obj.status in (
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
+                if (
+                    _challenge_task_obj is not None
+                    and _challenge_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
                 ):
                     challenge_infra_respawn_count = qual.get(
                         "challenge_infra_respawn_count", 0

@@ -8660,6 +8660,39 @@ class TestFinalizeInfraFailure:
         assert count == 0
 
     @pytest.mark.asyncio
+    async def test_audit_task_blocked_records_infra_failure_not_verdict(
+        self, db_session
+    ):
+        """Audit BLOCKED routes to infra_failure before artifact scoring."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.BLOCKED,
+            smoke_status=TaskStatus.COMPLETED,
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_task_blocked"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert version.last_qualification["error"] == "audit_task_blocked"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
     async def test_smoketest_task_failed_records_infra_failure_when_enabled(
         self, db_session
     ):
@@ -8686,6 +8719,40 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
 
         # No verdict row even though audit completed.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_smoketest_task_blocked_records_infra_failure_when_enabled(
+        self, db_session
+    ):
+        """Smoketest BLOCKED routes to infra_failure before artifact scoring."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.BLOCKED,
+            smoketest_enabled=True,
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_task_blocked"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert version.last_qualification["error"] == "smoketest_task_blocked"
+
         count = (
             await db_session.execute(
                 select(sa_func.count()).where(
@@ -10807,6 +10874,45 @@ async def test_maybe_finalize_already_finalized_version_returns_none(db_session)
     # Status must not have changed — still dry_run.
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_maybe_finalize_qualification_blocked_child_triggers(db_session):
+    """When a qualifier child transitions to BLOCKED and the other child is
+    already terminal, maybe_finalize_qualification must run (not skip) and
+    finalize the qualification.  BLOCKED is a terminal status in
+    _TERMINAL_STATUSES — the task_lifecycle guard must include it so the
+    reaper sweep is not the only path to finalization.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Audit child is COMPLETED; smoketest child transitions to BLOCKED.
+    audit_task, smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.BLOCKED,
+    )
+
+    # Trigger finalization using the BLOCKED smoke child as the "just updated"
+    # task — this mirrors the task_lifecycle.py code path that now includes
+    # BLOCKED in its status guard.
+    result = await rq.maybe_finalize_qualification(
+        smoke_task, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # maybe_finalize_qualification must have run finalization (not returned None).
+    assert result is not None
+
+    # Version must no longer be pending — BLOCKED child triggered finalization.
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] != "pending"
 
 
 async def _seed_pending_qualification_with_challenge(
