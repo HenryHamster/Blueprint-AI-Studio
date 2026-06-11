@@ -1269,10 +1269,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # ticks racing — can both pass the unlocked has_active_strategic check below
     # before either's spawn commits, double-spawning a strategic cycle. That burns
     # a redundant agent run and races the two cycles through the phase state
-    # machine into false failures. Hold the per-project research-spawn advisory
-    # lock across the whole check-and-spawn: on the strategic path there is no
-    # intermediate commit before the spawn commit, so the lock spans the entire
-    # critical section. If a peer instance holds it, skip strategic this tick — the
+    # machine into false failures. Take the per-project research-spawn advisory
+    # lock for the check-and-spawn HEAD: the lock is transaction-scoped and the
+    # spawn path DOES commit mid-build (``_build_recent_interventions`` releases
+    # its read transaction before GitHub ancestry I/O, #8842), so this
+    # acquisition only covers the checks below, not the full build→INSERT.
+    # ``_spawn_strategic_review`` re-takes the lock and re-runs the active-task
+    # check immediately before its INSERT to close the tail of the window
+    # (2026-06-11 double-spawn). If a peer instance holds it, skip strategic this tick — the
     # peer is already spawning, and the operator-refresh marker survives an
     # un-spawned tick (consumed on the follow-up tick). Best-effort but no-op in
     # tests (the advisory lock reports no contention on non-Postgres dialects).

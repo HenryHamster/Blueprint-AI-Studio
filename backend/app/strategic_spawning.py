@@ -5690,6 +5690,40 @@ async def _spawn_strategic_review(
         _STRATEGIC_REVIEW_SCHEMA,
     )
     payload = validate_internal_payload(payload, "autonomous_research:strategic_review")
+
+    # Re-arm the duplicate-spawn guards before the INSERT. The payload build
+    # above takes ~30s in prod, and ``_build_recent_interventions`` COMMITS
+    # mid-way (#8842 — releases the read transaction before its GitHub
+    # ancestry fan-out). That commit also releases the research-spawn advisory
+    # xact-lock taken by the autonomous tick (#8927) and the project-row
+    # FOR UPDATE taken by ``_has_active_strategic_task`` at the top of this
+    # function, so everything after it was an unguarded check-then-act window:
+    # two orchestrator instances both passed the top guard before either's
+    # spawn committed and double-spawned a cycle (2026-06-11, d8f82aa8 /
+    # 39eea7b8, 29s apart). Re-take the lock and re-run the active check on
+    # the current transaction so check→INSERT→commit shrinks back to
+    # milliseconds. Bail rolls back so the session is clean for the caller —
+    # the discarded build-state (drift snapshot, version bootstrap) is
+    # recomputed by the surviving spawner's cycle.
+    from app.autonomous_research import _try_research_spawn_advisory_lock
+
+    if not await _try_research_spawn_advisory_lock(session, project.id):
+        await session.rollback()
+        logger.warning(
+            "[STRATEGIC] Aborting strategic review spawn for project %s — a peer "
+            "instance took the research-spawn lock during the payload build",
+            project.id,
+        )
+        return False
+    if await _has_active_strategic_task(project.id, session):
+        await session.rollback()
+        logger.warning(
+            "[STRATEGIC] Aborting strategic review spawn for project %s — a "
+            "strategic task appeared during the payload build",
+            project.id,
+        )
+        return False
+
     new_task = Task(
         project_id=project.id,
         title=f"Strategic review: {project.name}",

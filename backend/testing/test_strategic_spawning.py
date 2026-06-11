@@ -1599,6 +1599,58 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
     assert tasks[0].status == TaskStatus.QUEUED
 
 
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_aborts_when_strategic_task_appears_mid_build(
+    db_session, mocker
+):
+    """The pre-INSERT recheck catches a peer's spawn that landed mid-build.
+
+    ``_build_recent_interventions`` commits mid-build (#8842), releasing the
+    advisory lock and the project-row FOR UPDATE taken by the top-of-function
+    guard — so a peer instance can commit its own strategic spawn during the
+    ~30s payload build (2026-06-11 double-spawn). The guard is therefore run
+    a second time immediately before the INSERT: first call (top) sees no
+    active task, second call (recheck) sees the peer's task → no row inserted.
+    """
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(side_effect=[False, True]),
+    )
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is False
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert result.scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_aborts_when_peer_holds_spawn_lock_at_insert(
+    db_session, mocker
+):
+    """The pre-INSERT advisory-lock re-acquire bails when a peer holds the lock."""
+    mocker.patch(
+        "app.autonomous_research._try_research_spawn_advisory_lock",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is False
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert result.scalars().all() == []
+
+
 # ── Bootstrap-pending guard in _spawn_design_doc_update ───────────────────────
 
 
