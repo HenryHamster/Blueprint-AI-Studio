@@ -154,7 +154,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance } from './standard.js';
 import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
@@ -4442,5 +4442,153 @@ describe('diagnostics-after-edit arm assignment in sendHeartbeatSync', () => {
     const opts = capturedRepoMapHeartbeatOpts();
     expect(opts?.diagnostics_after_edit_arm).toBeUndefined();
     expect(opts?.had_diagnostics_after_edit).toBeUndefined();
+  });
+});
+
+// ── resolveVisualAcceptance unit tests ────────────────────────────────────────
+// This is the linchpin mapping planner output into the success-path capture
+// config. A bug here silently makes visual evidence unsatisfiable — the exact
+// failure mode this feature exists to fix.
+describe('resolveVisualAcceptance', () => {
+  // ── payload channel ─────────────────────────────────────────────────────
+
+  it('resolves from payload acceptance_evidence (component + viewport_width)', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'Button', viewport_width: 1280 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toEqual({ component: 'Button', width: 1280 });
+  });
+
+  it('resolves from payload with numeric viewport_width as string', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'Card', viewport_width: '768' },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toEqual({ component: 'Card', width: 768 });
+  });
+
+  // ── context channel ──────────────────────────────────────────────────────
+
+  it('resolves from context acceptance_evidence (descriptor + selector)', () => {
+    const ctx = {
+      acceptance_evidence: { kind: 'visual', descriptor: 'Modal', selector: '1024' },
+    };
+    expect(resolveVisualAcceptance({}, ctx)).toEqual({ component: 'Modal', width: 1024 });
+  });
+
+  it('prefers payload channel over context channel', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'Button', viewport_width: 800 },
+    };
+    const ctx = {
+      acceptance_evidence: { kind: 'visual', descriptor: 'OtherComponent', selector: '400' },
+    };
+    expect(resolveVisualAcceptance(payload, ctx)).toEqual({ component: 'Button', width: 800 });
+  });
+
+  // ── SAFE_COMPONENT rejections ────────────────────────────────────────────
+
+  it('returns undefined when component contains a space (not shell-safe)', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'My Button', viewport_width: 800 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+
+  it('returns undefined when component contains a slash', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'a/b', viewport_width: 800 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+
+  it('returns undefined when component is empty string', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: '', viewport_width: 800 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+
+  it('returns undefined when component exceeds 100 chars', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'A'.repeat(101), viewport_width: 800 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+
+  it('accepts component at exactly 100 chars', () => {
+    const component = 'A'.repeat(100);
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component, viewport_width: 800 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toEqual({ component, width: 800 });
+  });
+
+  // ── width 1–4096 boundary ────────────────────────────────────────────────
+
+  it('returns undefined for width 0 (below minimum)', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'Btn', viewport_width: 0 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+
+  it('returns undefined for width 4097 (above maximum)', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'Btn', viewport_width: 4097 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+
+  it('accepts width 1 (minimum)', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'Btn', viewport_width: 1 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toEqual({ component: 'Btn', width: 1 });
+  });
+
+  it('accepts width 4096 (maximum)', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'Btn', viewport_width: 4096 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toEqual({ component: 'Btn', width: 4096 });
+  });
+
+  it('returns undefined for non-integer width (float)', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'visual', component: 'Btn', viewport_width: 800.5 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+
+  // ── non-visual kind ──────────────────────────────────────────────────────
+
+  it('returns undefined when payload kind is not visual', () => {
+    const payload = {
+      acceptance_evidence: { kind: 'functional', component: 'Btn', viewport_width: 800 },
+    };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+
+  it('returns undefined when context kind is not visual', () => {
+    const ctx = {
+      acceptance_evidence: { kind: 'named_test', descriptor: 'Btn', selector: '800' },
+    };
+    expect(resolveVisualAcceptance({}, ctx)).toBeUndefined();
+  });
+
+  // ── missing / malformed ──────────────────────────────────────────────────
+
+  it('returns undefined when no acceptance_evidence present', () => {
+    expect(resolveVisualAcceptance({}, {})).toBeUndefined();
+  });
+
+  it('returns undefined when acceptance_evidence is null in payload', () => {
+    const payload = { acceptance_evidence: null };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+
+  it('returns undefined when acceptance_evidence is a string (not an object)', () => {
+    const payload = { acceptance_evidence: 'visual' };
+    expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
   });
 });

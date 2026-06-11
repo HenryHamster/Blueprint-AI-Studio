@@ -894,11 +894,29 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         test: 'test (a named test or selector exercising the seam end-to-end)',
         behavior: 'behavior (an observable runtime behavior)',
         artifact: 'artifact (an artifact a downstream task consumes)',
+        visual: 'visual (a viewport screenshot of an admin-ui component proving it renders correctly at a given width)',
       };
       if (kind) aeLines.push(`- Kind: ${kindLabels[kind] ?? kind}`);
-      if (descriptor) aeLines.push(`- Proof: ${descriptor}`);
-      const selector = strVal(acceptanceEvidence.selector);
-      if (selector) aeLines.push(`- Selector: ${selector}`);
+      if (kind === 'visual') {
+        // Visual evidence travels as PlanAcceptanceEvidence on the context
+        // channel: descriptor = the component to capture, selector = the
+        // viewport width (px). Read those fields (with a defensive fallback to
+        // the payload-shape field names) and render an explicit, actionable
+        // capture instruction plus how the proof is verified.
+        const component = descriptor || strVal(acceptanceEvidence.component);
+        const widthStr = strVal(acceptanceEvidence.selector) || strVal(acceptanceEvidence.viewport_width);
+        const assertionType = strVal(acceptanceEvidence.assertion_type);
+        if (component) aeLines.push(`- Component to capture: ${component}`);
+        if (widthStr) aeLines.push(`- Viewport width: ${widthStr}px`);
+        if (assertionType) aeLines.push(`- Assertion focus: ${assertionType}`);
+        aeLines.push(
+          `- How it is verified: on a successful run a viewport screenshot of ${component || 'the component'}${widthStr ? ` at ${widthStr}px` : ''} is captured and uploaded, and the acceptance gate matches that screenshot against this declaration. Ensure ${component || 'the component'} has a \`*.viewport.test.tsx\` that renders it at that width so the screenshot can be captured.`,
+        );
+      } else {
+        if (descriptor) aeLines.push(`- Proof: ${descriptor}`);
+        const selector = strVal(acceptanceEvidence.selector);
+        if (selector) aeLines.push(`- Selector: ${selector}`);
+      }
       aeLines.push('');
       prefix += aeLines.join('\n') + '\n';
     }

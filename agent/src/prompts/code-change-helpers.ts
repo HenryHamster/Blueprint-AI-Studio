@@ -108,7 +108,27 @@ export interface CodeChangeHelperConfig {
    *  review-fix budget is spent (incident: rollup PR #8920). See
    *  buildMergeVerifyBlock. Unset for non-conflict fixes (unchanged behavior). */
   mergeVerify?: boolean;
+  /** A declared `visual` acceptance-evidence requirement (component + viewport
+   *  width) carried onto this task. When set, the generated ./check adds a
+   *  best-effort SUCCESS-PATH block that captures the component's viewport
+   *  screenshot at the declared width and uploads it through the signed-URL
+   *  endpoint — stamping `task.context['viewport_failure_screenshot_uri']` to
+   *  the canonical (component, width) object so the acceptance gate can resolve
+   *  the declaration as satisfied. Every failure mode is non-fatal (WARN +
+   *  continue); this is NOT a new blocking gate. Unset for tasks with no visual
+   *  declaration — the generated ./check is then byte-identical to today.
+   *  `component` is validated shell-safe (it is bash- and JSON-interpolated). */
+  visualAcceptance?: { component: string; width: number };
 }
+
+// A declared visual-acceptance component name we are willing to interpolate
+// into the generated ./check bash — both as a single-quoted literal AND inside
+// a JSON `-d` body. The backend sanitizes component to a GCS object key with
+// `[^A-Za-z0-9._-]` and caps it at 100 chars (viewport_evidence.viewport_object_name),
+// so this allowlist mirrors that safe set and rejects every shell metacharacter
+// (single quotes, $, backticks, etc.). A component outside this set is rejected
+// rather than interpolated (see CLAUDE.md on generating one language from another).
+const VISUAL_COMPONENT_RE = /^[A-Za-z0-9._-]{1,100}$/;
 
 // A pytest node-id we are willing to interpolate into the generated ./check
 // bash as a single-quoted literal AND pass to `scripts/test-backend.sh`. We
@@ -229,6 +249,19 @@ export function validateCfgShellSafety(cfg: CodeChangeHelperConfig): void {
   }
   if (!OWNER_REPO_RE.test(cfg.repo)) {
     throw new Error(`repo contains unsafe characters for shell interpolation: ${cfg.repo}`);
+  }
+  if (cfg.visualAcceptance) {
+    const { component, width } = cfg.visualAcceptance;
+    if (typeof component !== 'string' || !VISUAL_COMPONENT_RE.test(component)) {
+      throw new Error(
+        `visualAcceptance.component contains unsafe characters for shell interpolation: ${component}`,
+      );
+    }
+    if (!Number.isInteger(width) || width < 1 || width > 4096) {
+      throw new Error(
+        `visualAcceptance.width must be an integer in 1–4096; got ${width}`,
+      );
+    }
   }
   validateBuildConfigShellSafety(cfg.buildConfig);
 }

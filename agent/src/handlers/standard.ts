@@ -255,6 +255,39 @@ export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
   return lines.join('\n');
 }
 
+/** Extract a `visual` acceptance-evidence declaration (component + viewport
+ *  width) from a task's payload or context, for threading into the generated
+ *  ./check success-path capture+upload (see writeCheckHelper / buildVisualCaptureBlock).
+ *  Returns undefined when no well-formed visual declaration is present. Two
+ *  channels carry it, and a single planned declaration lands on exactly one of
+ *  them depending on which vocabulary the planner used:
+ *    - payload AcceptanceEvidence: {kind:"visual", component, viewport_width}
+ *    - context PlanAcceptanceEvidence: {kind:"visual", descriptor=component, selector=width}
+ *  The component is restricted to the backend's safe object-key character class
+ *  (also the shell-safe set) and width to 1–4096, so it can be interpolated into
+ *  the generated bash; anything else is skipped (best-effort — this never blocks). */
+export function resolveVisualAcceptance(
+  payload: Record<string, unknown>,
+  ctx: Record<string, unknown>,
+): { component: string; width: number } | undefined {
+  const SAFE_COMPONENT = /^[A-Za-z0-9._-]{1,100}$/;
+  const fromPayload = payload.acceptance_evidence as Record<string, unknown> | undefined;
+  const fromCtx = ctx.acceptance_evidence as Record<string, unknown> | undefined;
+  let component: string | undefined;
+  let width = NaN;
+  if (fromPayload && typeof fromPayload === 'object' && strVal(fromPayload.kind) === 'visual') {
+    component = strVal(fromPayload.component);
+    width = Number(fromPayload.viewport_width);
+  } else if (fromCtx && typeof fromCtx === 'object' && strVal(fromCtx.kind) === 'visual') {
+    // Context channel (PlanAcceptanceEvidence): descriptor=component, selector=width-string.
+    component = strVal(fromCtx.descriptor);
+    width = Number(strVal(fromCtx.selector));
+  }
+  if (!component || !SAFE_COMPONENT.test(component)) return undefined;
+  if (!Number.isInteger(width) || width < 1 || width > 4096) return undefined;
+  return { component, width };
+}
+
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const {
     taskId, payload, task, ghToken, owner, repo, ws, statusRef,
@@ -748,6 +781,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     analysisContext,
     regressingCategories: reasoningGateCats.length > 0 ? reasoningGateCats : undefined,
     buildConfig,
+    visualAcceptance: resolveVisualAcceptance(payload, ctx),
   });
 
   // Fresh reviewer pass: read-only second session to catch what the implementing

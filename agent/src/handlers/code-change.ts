@@ -87,6 +87,13 @@ export interface CodeChangeTaskOpts {
    *  Postgres before ./pr open can push (closes the conflict-resolution verify
    *  loop). Unset for non-conflict fixes. See buildMergeVerifyBlock. */
   mergeVerify?: boolean;
+  /** A declared `visual` acceptance-evidence requirement (component + viewport
+   *  width) for this task. Forwarded to writeCodeChangeHelpers so the generated
+   *  ./check captures the component's viewport screenshot at the declared width
+   *  on a passing run and uploads it through the signed-URL endpoint — making a
+   *  declared visual evidence satisfiable. Best-effort / non-fatal; unset for
+   *  tasks with no visual declaration (generated ./check is byte-identical). */
+  visualAcceptance?: { component: string; width: number };
   /** When true, this task was auto-decomposed from a larger finding into a
    *  cluster sibling. Combined with relatedFiles + siblingTasks, enables the
    *  SCOPE_EMPTY pre-flight guard (see runCodeChangeTask). */
@@ -385,6 +392,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     buildConfig: opts.buildConfig,
     ciFailureSelectors: opts.ciFailureSelectors,
     mergeVerify: opts.mergeVerify,
+    visualAcceptance: opts.visualAcceptance,
   });
 
   // 2. Run Claude with the full task prompt. Claude is responsible for

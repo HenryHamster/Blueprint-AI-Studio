@@ -225,6 +225,46 @@ describe('buildContextPrefix', () => {
     });
     expect(prefix).not.toContain('## Acceptance Evidence');
   });
+
+  it('renders a visual acceptance declaration explicitly (component, width, assertion, how-verified)', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      context: {
+        // PlanAcceptanceEvidence shape: descriptor = component, selector = width.
+        acceptance_evidence: {
+          kind: 'visual',
+          descriptor: 'MetricsDashboard',
+          selector: '375',
+          assertion_type: 'overflow',
+        },
+      },
+    });
+
+    expect(prefix).toContain('## Acceptance Evidence');
+    expect(prefix).toContain('Kind: visual');
+    expect(prefix).toContain('- Component to capture: MetricsDashboard');
+    expect(prefix).toContain('- Viewport width: 375px');
+    expect(prefix).toContain('- Assertion focus: overflow');
+    // It explains how the proof is verified (captured + uploaded + gate-matched).
+    expect(prefix).toContain('How it is verified:');
+    expect(prefix).toContain('viewport screenshot of MetricsDashboard at 375px');
+    expect(prefix).toContain('*.viewport.test.tsx');
+    // Visual must NOT fall through to the generic descriptor/selector rendering.
+    expect(prefix).not.toContain('- Proof: MetricsDashboard');
+    expect(prefix).not.toContain('- Selector: 375');
+  });
+
+  it('omits the assertion-focus line for a visual declaration without assertion_type', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      context: {
+        acceptance_evidence: { kind: 'visual', descriptor: 'TaskCard', selector: '768' },
+      },
+    });
+    expect(prefix).toContain('- Component to capture: TaskCard');
+    expect(prefix).toContain('- Viewport width: 768px');
+    expect(prefix).not.toContain('- Assertion focus:');
+  });
 });
 
 // ── formatRejectionPatternsSection ───────────────────────────────────────────

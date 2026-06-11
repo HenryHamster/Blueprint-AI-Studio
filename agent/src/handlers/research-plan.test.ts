@@ -2466,6 +2466,36 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('depends_on_indices');
   });
 
+  // ── visual acceptance-evidence kind documented in BOTH prompt surfaces ───────
+  // GAP 1 of the visual-acceptance loop: the plan-subtask and research-finding
+  // acceptance_evidence vocabularies must document the fourth `visual` kind so a
+  // declaration can ever be produced. The payload vocab carries component +
+  // viewport_width + optional assertion_type; the research-finding context vocab
+  // carries it as descriptor=component, selector=width.
+  it('handlePlan prompt documents the visual acceptance_evidence kind (payload vocab)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('"kind": "visual"');
+    expect(p).toContain('"viewport_width"');
+    expect(p).toContain('"assertion_type"');
+    // It is scoped to frontend/admin-ui work, proven by an uploaded screenshot.
+    expect(p).toMatch(/FRONTEND-TOUCHING/);
+    expect(p).toContain('admin-ui');
+  });
+
+  it('handleResearch prompt documents the visual acceptance_evidence kind in BOTH the payload and context vocabularies', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // Payload vocab (named_test/observable_behavior/downstream_artifact/visual).
+    expect(p).toContain('"kind": "visual"');
+    expect(p).toContain('"viewport_width"');
+    // Context vocab (test|behavior|artifact|visual with descriptor/selector).
+    expect(p).toContain('"test"|"behavior"|"artifact"|"visual"');
+    // Documents the descriptor=component / selector=width mapping for visual.
+    expect(p).toMatch(/descriptor = the component name/);
+    expect(p).toMatch(/FRONTEND-TOUCHING/);
+  });
+
   // ── handlePlan atomic schema-change rule (no split model/migrate subtasks) ────
   // Regression: the plan prompt previously told the agent that any subtask
   // touching backend/app/models.py (or adding tables/columns) must spawn a
