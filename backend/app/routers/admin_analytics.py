@@ -37,6 +37,11 @@ from app.review_heuristics import (
     LANE_REVIEW_CONVERGENCE,
     classify_iteration_lane,
 )
+from app.digest_metrics import compute_lane_waste_diagnostics
+from app.routers.admin_pipeline_observability import (
+    _load_escalation_alerts,
+    _load_outer_loop_original_tasks,
+)
 
 # Re-export for test and internal use (single source of truth is vm_cost_rates)
 ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # $/sec
@@ -318,7 +323,7 @@ def _compute_lane_diag(tasks: List[Task], pr_breakdown_limit: int) -> Dict[str, 
 
         if task.started_at:
             active_seconds = max((completed_at - task.started_at).total_seconds(), 0.0)
-            if payload_type == "review":
+            if payload_type in {"review", "panel_review"}:
                 phase["review_seconds"] += active_seconds
             elif payload_type in _LANE_DIAG_FIX_TYPES:
                 phase["fix_seconds"] += active_seconds
@@ -537,30 +542,44 @@ async def get_lane_diag(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    """Return lane diagnostics for recent completed review/fix pipeline tasks."""
-    cutoff = _utcnow() - timedelta(days=7)
-    filters = [
-        Task.status == TaskStatus.COMPLETED,
-    ]
-    if project_id:
-        filters.append(Task.project_id == project_id)
+    """Return lane diagnostics for recent review/fix pipeline tasks.
 
-    tasks = (
+    Backward-compatible: the original keys (``lane_iteration_distribution``,
+    ``per_pr_phase_breakdown``, ``relay_counts_by_lane``, ``pr_count``,
+    ``task_count`` …) still aggregate only COMPLETED tasks whose
+    ``review_loop.pr_number`` is set and which completed in-window. Additively,
+    ``lane_waste`` reports chain-complete review/fix waste — including terminal
+    FAILED/CANCELLED iterations belonging to an in-window PR chain — using the
+    same PR-chain semantics as the outer-loop convergence surfaces.
+    """
+    cutoff = _utcnow() - timedelta(days=7)
+    project_filter = [Task.project_id == project_id] if project_id else []
+
+    _task_columns = load_only(
+        Task.id,
+        Task.project_id,
+        Task.status,
+        Task.created_at,
+        Task.started_at,
+        Task.updated_at,
+        Task.status_log,
+        Task.payloads,
+        Task.context,
+        Task.fix_loop_history,
+        Task.archived,
+    )
+
+    # Legacy surface query: COMPLETED-only, original form — the legacy aggregates
+    # (lane_iteration_distribution, per_pr_phase_breakdown, task_count, pr_count,
+    # relay_counts_by_lane) must always use THIS pool so that FAILED/CANCELLED
+    # rows can never displace COMPLETED rows from the top-N and erode existing
+    # response keys.
+    completed_tasks = (
         (
             await session.execute(
                 select(Task)
-                .options(
-                    load_only(
-                        Task.id,
-                        Task.project_id,
-                        Task.created_at,
-                        Task.started_at,
-                        Task.status_log,
-                        Task.payloads,
-                        Task.context,
-                    )
-                )
-                .where(*filters)
+                .options(_task_columns)
+                .where(Task.status == TaskStatus.COMPLETED, *project_filter)
                 .order_by(Task.created_at.desc())
                 .limit(max_tasks)
             )
@@ -570,17 +589,59 @@ async def get_lane_diag(
     )
     scoped_tasks = [
         task
-        for task in tasks
+        for task in completed_tasks
         if _review_loop_pr_number(task) and _derive_completed_at(task) >= cutoff
     ]
     diag = _compute_lane_diag(scoped_tasks, pr_breakdown_limit)
+
+    # Waste surface query: broadened to include terminal FAILED/CANCELLED rows so
+    # chain-complete waste diagnostics are accurate.  Issued separately so it
+    # cannot truncate the legacy COMPLETED pool above.
+    all_terminal_tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(_task_columns)
+                .where(
+                    Task.status.in_(
+                        [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                    ),
+                    *project_filter,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(max_tasks)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    original_tasks = await _load_outer_loop_original_tasks(
+        session, all_terminal_tasks, project_id=project_id
+    )
+    alerts = await _load_escalation_alerts(
+        session, cutoff=cutoff, project_id=project_id
+    )
+    diag["lane_waste"] = compute_lane_waste_diagnostics(
+        [
+            *all_terminal_tasks,
+            *[
+                task
+                for oid, task in original_tasks.items()
+                if oid not in {str(t.id) for t in all_terminal_tasks}
+            ],
+        ],
+        cutoff,
+        chain_limit=pr_breakdown_limit,
+        escalation_alerts=alerts,
+    )
     diag.update(
         {
             "project_id": str(project_id) if project_id else None,
             "window_days": 7,
             "window_start": cutoff.isoformat(),
             "max_tasks": max_tasks,
-            "truncated": len(tasks) >= max_tasks,
+            "truncated": len(completed_tasks) >= max_tasks
+            or len(all_terminal_tasks) >= max_tasks,
         }
     )
     return diag

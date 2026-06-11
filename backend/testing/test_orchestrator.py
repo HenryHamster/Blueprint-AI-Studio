@@ -3767,6 +3767,25 @@ class TestWarmVMSkipProvision:
                 "app.orchestrator._persist_zone_health", new_callable=AsyncMock
             )
             mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+            # The provision wrapper reaches Secret Manager and GCS via
+            # asyncio.gather BEFORE the (separately mocked) provision_agent_vm
+            # call. Both need real Google credentials: present on GCE agent
+            # VMs (ambient metadata creds) but absent in the CI container,
+            # where DefaultCredentialsError crashes the wrapper into its
+            # requeue/error path, which then runs uncoordinated DB work on
+            # this fixture's shared StaticPool connection. Patch both so
+            # every test in this class is hermetic and behaves identically
+            # in CI and on VMs (mirrors the orch_cap_db harness).
+            mocker.patch(
+                "app.orchestrator.prepare_and_store_agent_secret",
+                new_callable=AsyncMock,
+                return_value="projects/test/secrets/agent/versions/1",
+            )
+            mocker.patch(
+                "app.orchestrator.upload_json_payload",
+                new_callable=AsyncMock,
+                return_value="gs://test-bucket/payloads/test.json",
+            )
 
             now = self._naive_utcnow()
             _orch_module._last_pool_refresh = now
@@ -3826,7 +3845,9 @@ class TestWarmVMSkipProvision:
         with contextlib.suppress(asyncio.CancelledError):
             await _orch_module.orchestrator_worker()
 
-        # Cancel any background provisioning coroutines the cycle spawned.
+        # Drain background provisioning coroutines the cycle spawned so
+        # dangling tasks don't race the post-cycle verify reads on the shared
+        # StaticPool connection.
         #
         # The dispatch path commits status=PROVISIONING INLINE, then fires the
         # real VM provision via `asyncio.create_task(_provision_and_handle(...))`
@@ -3835,42 +3856,26 @@ class TestWarmVMSkipProvision:
         # `orchestrator_worker`. The worker's cycle-ending CancelledError never
         # reaches it. Left dangling, that task keeps running
         # `_provision_and_handle` against this test's shared in-memory StaticPool
-        # SINGLE connection (`orch_warm_db`): after the mocked
-        # `provision_agent_vm` returns it opens a fresh `AsyncSessionLocal()`
-        # session and issues `_lock_provisioning_task_for_vm` (SELECT ... FOR
-        # UPDATE) + commit/rollback. Concurrent DB work on that one shared
-        # connection races the post-cycle verify read + event-loop teardown,
-        # corrupting the read — the shard-5 CI flake where a dispatch-positive
-        # assertion samples QUEUED (or a torn/cancelled read) instead of the
-        # committed PROVISIONING.
+        # SINGLE connection (`orch_warm_db`), racing the post-cycle verify read.
         #
-        # We CANCEL rather than await-to-completion: the PROVISIONING status is
-        # already committed inline before this task is created, so the dispatch
-        # result is settled. At this point (no await since the worker yielded)
-        # the coroutine is still parked at its first real suspension (the
-        # payload-upload `to_thread` inside `asyncio.gather`), i.e. BEFORE it
-        # ever touches the shared connection. Cancelling there unwinds it without
-        # running any DB op (CancelledError is BaseException, so the coroutine's
-        # `except Exception` requeue paths never fire — only its
-        # `except CancelledError`/`finally` cleanup, whose side effects are
-        # mocked) and frees the shared connection before the verify.
-        #
-        # Awaiting to completion was tried and made the CI flake WORSE: it RUNS
-        # the post-provision DB work on the shared connection, which is exactly
-        # the conflict we are eliminating.
+        # AWAIT them to completion rather than cancel: with provisioning fully
+        # mocked in the fixture (provision_agent_vm, Secret Manager, GCS) the
+        # wrapper finishes promptly, while a cancel can land mid DB-query and
+        # poison the StaticPool connection — a reconnect to sqlite :memory:
+        # yields an empty database ("no such table: task"), the shard-5 CI
+        # flake. Mirrors the orch_cap_db harness's _run_one_cycle.
         _orphan_keys_before = set(_pipeline_state.background_tasks)
         for _coro in list(_orch_module._provision_coroutines.values()):
             _loop = _coro.get_loop()
             if _loop.is_closed():
                 continue
-            _coro.cancel()
             with contextlib.suppress(BaseException):
                 await _coro
         _orch_module._provision_coroutines.clear()
-        # The `except CancelledError` arm of `_provision_and_handle` schedules a
+        # `_provision_and_handle`'s failure arms can schedule a
         # `_delayed_orphan_cleanup` background task (sleeps 120s then calls the
-        # mocked `_ensure_vm_deleted`). Cancel + drop any such task this cleanup
-        # provoked so the cycle leaves no dangling work for later tests.
+        # mocked `_ensure_vm_deleted`). Cancel + drop any such task the cycle
+        # provoked so it leaves no dangling work for later tests.
         for _key in set(_pipeline_state.background_tasks) - _orphan_keys_before:
             _orphan = _pipeline_state.background_tasks.pop(_key, None)
             if _orphan is not None:
@@ -5571,10 +5576,11 @@ class TestWarmVMSkipProvision:
         shared in-memory StaticPool SINGLE connection, racing the post-cycle
         verify read; a concurrent transaction reset on that shared connection
         can discard the inline PROVISIONING commit, so the verify intermittently
-        observes QUEUED. ``_run_one_cycle`` must cancel + clear those coroutines
-        (and any ``_delayed_orphan_cleanup`` they spawn) before returning, so no
-        background DB work survives into the verify window. This guards that
-        invariant directly — deterministically, without depending on CI timing.
+        observes QUEUED. ``_run_one_cycle`` must drain (await) + clear those
+        coroutines (and any ``_delayed_orphan_cleanup`` they spawn) before
+        returning, so no background DB work survives into the verify window.
+        This guards that invariant directly — deterministically, without
+        depending on CI timing.
 
         See ``backend/testing/test_orch_db_isolation.py`` for the standalone
         demonstration that an uncoordinated background session on the shared

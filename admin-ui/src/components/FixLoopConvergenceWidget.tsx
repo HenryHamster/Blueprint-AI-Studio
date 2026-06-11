@@ -377,9 +377,15 @@ export function FixLoopConvergenceWidget({ trendDays = 7, projectId, onViewTask 
 
   const fetchData = useCallback(async () => {
     try {
+      const convergenceParams = new URLSearchParams({ hours: '24' });
+      const trendParams = new URLSearchParams({ days: String(trendDays) });
+      if (projectId) {
+        convergenceParams.set('project_id', projectId);
+        trendParams.set('project_id', projectId);
+      }
       const [res, trendRes] = await Promise.all([
-        apiFetch('/api/admin/fix-loop-convergence?hours=24'),
-        apiFetch(`/api/admin/fix-loop-convergence-trend?days=${trendDays}`),
+        apiFetch(`/api/admin/fix-loop-convergence?${convergenceParams}`),
+        apiFetch(`/api/admin/fix-loop-convergence-trend?${trendParams}`),
       ]);
       if (!mountedRef.current) return;
       if (!res.ok) {
@@ -401,7 +407,7 @@ export function FixLoopConvergenceWidget({ trendDays = 7, projectId, onViewTask 
       setFetchError(e instanceof Error ? e.message : 'network error');
       setLoading(false);
     }
-  }, [trendDays]);
+  }, [projectId, trendDays]);
 
   useEffect(() => {
     mountedRef.current = true;

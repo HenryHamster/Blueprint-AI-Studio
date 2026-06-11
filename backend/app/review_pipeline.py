@@ -1183,6 +1183,49 @@ async def _check_fix_mid_retry_defer(
     return False
 
 
+def task_counts_toward_review_cap(task: Task) -> bool:
+    """Whether ``task`` counts toward the per-PR / per-lane review-fix iteration cap.
+
+    Single source of truth for cap-counting eligibility, shared by the pipeline
+    spawn gate (``_spawn_pipeline_task``) and read-only diagnostics
+    (admin lane-diag) so the diagnostic's iteration totals match operator
+    control logic exactly. A task is EXCLUDED from the cap when any of the
+    following apply:
+
+      * it is archived — the pipeline cap query always filters ``archived=False``,
+        mirroring the manual iteration-cap reset path;
+      * it is FAILED/CANCELLED with an infra-class ``failure_category`` — it
+        never actually ran a review (provisioning / rate limit / agent timeout
+        / external API / supersede-cancel), so counting it would trip the cap
+        with zero real reviews on the PR; or
+      * it is a stale-head discard (``_review_stale_head``) — a review that ran
+        against an older head than the live PR head, discarded and respawned;
+        counting it would penalise the chain for a verdict it couldn't act on.
+
+    Note: the live pipeline cap query selects status in (COMPLETED, FAILED) only
+    — it never counts CANCELLED tasks, even non-infra ones.  This function
+    applies the same infra-class exclusion to CANCELLED tasks for consistency,
+    so non-infra CANCELLED tasks *are* counted here.  This is an intentional
+    diagnostic-only deviation: CANCELLED tasks in live chains are rare outside
+    infra/supersede paths and the slight over-count is acceptable for a pilot
+    diagnostic.
+
+    Excluded tasks remain VISIBLE as waste/drilldown rows in diagnostics; they
+    are only omitted from the cap-counted iteration total.
+    """
+    from app.failure_classification import INFRA_CLASSES
+
+    if getattr(task, "archived", False):
+        return False
+    if task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+        fc = (task.context or {}).get("failure_category")
+        if fc in INFRA_CLASSES:
+            return False
+    if (task.context or {}).get("_review_stale_head"):
+        return False
+    return True
+
+
 async def _spawn_pipeline_task(
     source_task: Task,
     task_type: str,
@@ -1481,11 +1524,11 @@ async def _spawn_pipeline_task(
     #
     # Push pr_number + type filters into SQL via the partial expression index
     # ``ix_task_payloads_pr_number`` (alembic 0057). The infra-class failure
-    # filter remains Python-side because INFRA_CLASSES is composed dynamically.
-    # ``load_only`` keeps the row narrow — we only need status/context/payloads
-    # for the post-filter; status_log and other JSONB columns stay deferred.
-    from app.failure_classification import INFRA_CLASSES
-
+    # filter remains Python-side (in ``task_counts_toward_review_cap``) because
+    # INFRA_CLASSES is composed dynamically. ``load_only`` keeps the row narrow —
+    # we only need status/context/payloads for the post-filter; status_log and
+    # other JSONB columns stay deferred.
+    #
     # Dialect-conditional WHERE for the per-PR cap query (audit 2026-04-29
     # round 2 / finding C2). Postgres requires byte-exact expression match
     # for ``ix_task_payloads_pr_number`` (built on
@@ -1710,25 +1753,12 @@ async def _spawn_pipeline_task(
                     session.add(source_task)
                     return (None, False)
 
-    def _counts_toward_cap(t: Task) -> bool:
-        # Exempt both FAILED and CANCELLED tasks with infra failure categories.
-        # Without CANCELLED here, supersede-cancels (review_pipeline.py:1170,
-        # 1204) — which stamp failure_category=AGENT_TIMEOUT — burn cap slots
-        # without doing useful work. Incident 2026-05-07 task 78de0fdb hit
-        # the global cap at PR #4091 because ~13 of 25 tasks on the chain
-        # were supersede-cancels (review-snapshot-stale, no-heartbeat-for-15min)
-        # that each consumed an iteration slot.
-        if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-            fc = (t.context or {}).get("failure_category")
-            if fc in INFRA_CLASSES:
-                return False
-        # Stale-head discards: a review that ran against an older head than the
-        # live PR head is discarded and a fresh review respawned. Counting it
-        # toward the cap would penalise the chain for a verdict it couldn't
-        # act on.
-        if (t.context or {}).get("_review_stale_head"):
-            return False
-        return True
+    # Cap-counting eligibility lives in the module-level
+    # ``task_counts_toward_review_cap`` so read-only diagnostics share the exact
+    # same exclusion of infra-class FAILED/CANCELLED tasks and stale-head
+    # discards. See that function for the rationale (incident 2026-05-07 task
+    # 78de0fdb: supersede-cancels burning cap slots at PR #4091).
+    _counts_toward_cap = task_counts_toward_review_cap
 
     pr_iterations = sum(1 for t in pr_pipeline_tasks if _counts_toward_cap(t))
 

@@ -13,7 +13,7 @@ from app.models import Artifact, ArtifactType
 from app.routers import admin_analytics
 from app.time_utils import _utcnow
 from app.models import TaskStatus
-from testing.factories import make_project, make_task
+from testing.factories import make_alert, make_project, make_task
 
 
 @pytest.fixture
@@ -337,14 +337,473 @@ class TestLaneDiag:
 
         by_pr = {row["pr_number"]: row for row in body["per_pr_phase_breakdown"]}
         assert list(by_pr.keys()) == ["101", "202"]
-        assert by_pr["101"]["review_seconds"] == 900.0
+        assert by_pr["101"]["review_seconds"] == 1500.0
         assert by_pr["101"]["fix_seconds"] == 3000.0
-        assert by_pr["101"]["gap_seconds"] == 3300.0
+        assert by_pr["101"]["gap_seconds"] == 2700.0
         assert by_pr["101"]["total_seconds"] == 7200.0
         assert by_pr["202"]["review_seconds"] == 120.0
         assert by_pr["202"]["fix_seconds"] == 240.0
         assert by_pr["202"]["gap_seconds"] == 180.0
         assert by_pr["202"]["total_seconds"] == 540.0
+
+    @pytest.mark.asyncio
+    async def test_lane_diag_counts_panel_review_runtime_as_active_time(
+        self, client: AsyncClient, db_session
+    ):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        base = _utcnow() - timedelta(hours=1)
+        self._add_review_loop_task(
+            db_session, project.id, 101, "review", base, 300
+        )
+        self._add_review_loop_task(
+            db_session,
+            project.id,
+            101,
+            "panel_review",
+            base + timedelta(minutes=10),
+            600,
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["lane_iteration_distribution"]["arbitration"]["task_count"] == 1
+        [pr_breakdown] = body["per_pr_phase_breakdown"]
+        assert pr_breakdown["review_seconds"] == 900.0
+        assert pr_breakdown["fix_seconds"] == 0.0
+        assert pr_breakdown["gap_seconds"] == 300.0
+        assert pr_breakdown["total_seconds"] == 1200.0
+
+
+class TestLaneWasteDiag:
+    """Chain-complete review/fix waste diagnostics (the additive ``lane_waste``)."""
+
+    @staticmethod
+    def _add_chain_task(
+        db_session,
+        project_id,
+        *,
+        pr_number,
+        original_task_id,
+        iteration,
+        task_type,
+        created_at,
+        status=TaskStatus.COMPLETED,
+        fix_reason=None,
+        failure_category=None,
+        failure_detail=None,
+        drift=None,
+        fix_loop_history=None,
+        stale_head=False,
+        active_seconds=60,
+    ) -> uuid.UUID:
+        review_loop = {"pr_number": pr_number, "iteration": iteration}
+        if original_task_id is not None:
+            review_loop["original_task_id"] = str(original_task_id)
+        if fix_reason:
+            review_loop["fix_reason"] = fix_reason
+        if drift:
+            review_loop["drift_signal"] = drift
+        context: dict = {"review_loop": review_loop}
+        if failure_category:
+            context["failure_category"] = failure_category
+        if failure_detail:
+            context["failure_detail"] = failure_detail
+        if stale_head:
+            context["_review_stale_head"] = True
+        completed_at = created_at + timedelta(seconds=active_seconds)
+        task = make_task(
+            project_id=project_id,
+            status=status,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": task_type, "prompt": "x"}],
+            context=context,
+            fix_loop_history=fix_loop_history or {},
+            started_at=created_at,
+            created_at=created_at,
+            status_log=[{"s": status.value, "t": completed_at.isoformat()}],
+        )
+        db_session.add(task)
+        return task.id
+
+    @staticmethod
+    def _add_original(
+        db_session,
+        project_id,
+        original_task_id,
+        created_at,
+        *,
+        merged=False,
+        failure_detail=None,
+    ):
+        context: dict = {}
+        if merged:
+            context["pr_merged"] = True
+        if failure_detail:
+            context["failure_detail"] = failure_detail
+        db_session.add(
+            make_task(
+                id=original_task_id,
+                project_id=project_id,
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                context=context,
+                started_at=created_at,
+                created_at=created_at,
+                status_log=[{"s": "COMPLETED", "t": created_at.isoformat()}],
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_reports_chain_complete_waste_taxonomy_and_drilldowns(
+        self, client: AsyncClient, db_session
+    ):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        base = _utcnow() - timedelta(hours=2)
+        oid_a = uuid.UUID("11111111-1111-1111-1111-111111111111")
+        oid_b = uuid.UUID("22222222-2222-2222-2222-222222222222")
+
+        # Chain A (PR 501) — cap-exhausted, mixed waste, infra + stale-head excluded.
+        self._add_chain_task(
+            db_session, project.id, pr_number=501, original_task_id=oid_a,
+            iteration=1, task_type="review", created_at=base,
+        )  # unknown / review_convergence, cap-counted
+        self._add_chain_task(
+            db_session, project.id, pr_number=501, original_task_id=oid_a,
+            iteration=2, task_type="fix", fix_reason="ci_failure",
+            created_at=base + timedelta(minutes=10),
+        )  # ci_churn, cap-counted
+        self._add_chain_task(
+            db_session, project.id, pr_number=501, original_task_id=oid_a,
+            iteration=3, task_type="fix", status=TaskStatus.FAILED,
+            failure_category="AGENT_TIMEOUT", created_at=base + timedelta(minutes=20),
+        )  # infra, NOT cap-counted, terminal FAILED included
+        self._add_chain_task(
+            db_session, project.id, pr_number=501, original_task_id=oid_a,
+            iteration=4, task_type="fix", fix_reason="merge_conflict",
+            failure_detail="review_cap_exhausted",
+            created_at=base + timedelta(minutes=30),
+        )  # merge_conflict, cap-counted, marks the chain cap-exhausted
+        self._add_chain_task(
+            db_session, project.id, pr_number=501, original_task_id=oid_a,
+            iteration=5, task_type="review", stale_head=True,
+            created_at=base + timedelta(minutes=40),
+        )  # unknown, NOT cap-counted (stale-head discard)
+        self._add_original(db_session, project.id, oid_a, base - timedelta(minutes=5))
+
+        # Chain B (PR 502) — merged via original hydration; lost-state lanes.
+        self._add_chain_task(
+            db_session, project.id, pr_number=502, original_task_id=oid_b,
+            iteration=1, task_type="review", drift={"drift_in": ["a.py"]},
+            created_at=base + timedelta(minutes=5),
+        )  # lost_repo_state
+        self._add_chain_task(
+            db_session, project.id, pr_number=502, original_task_id=oid_b,
+            iteration=2, task_type="fix",
+            fix_loop_history={
+                "test": [
+                    {"loop": "test", "iteration": 1,
+                     "exit_reason": "divergence_oscillation",
+                     "ended_at": "2026-06-01T00:00:00"}
+                ]
+            },
+            created_at=base + timedelta(minutes=15),
+        )  # lost_reasoning
+        self._add_chain_task(
+            db_session, project.id, pr_number=502, original_task_id=oid_b,
+            iteration=3, task_type="panel_review",
+            created_at=base + timedelta(minutes=25),
+        )  # review_ambiguity
+        self._add_original(
+            db_session, project.id, oid_b, base - timedelta(minutes=5), merged=True
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}")
+        assert resp.status_code == 200
+        waste = resp.json()["lane_waste"]
+
+        # Aggregate waste taxonomy spans every pilot category.
+        assert waste["waste_taxonomy"] == {
+            "infra": 1,
+            "merge_conflict": 1,
+            "ci_churn": 1,
+            "review_ambiguity": 1,
+            "lost_reasoning": 1,
+            "lost_repo_state": 1,
+            "unknown": 2,
+        }
+        assert waste["waste_task_count"] == 8
+        # Cap parity: infra FAILED + stale-head discard excluded from cap totals.
+        assert waste["cap_counted_task_count"] == 6
+        assert waste["cap_excluded_task_count"] == 2
+        assert waste["chain_count"] == 2
+        assert waste["cap_exhausted_chain_count"] == 1
+
+        chains = {c["pr_number"]: c for c in waste["chains"]}
+        assert set(chains) == {501, 502}
+
+        chain_a = chains[501]
+        assert chain_a["original_task_id"] == str(oid_a)
+        assert chain_a["project_id"] == str(project.id)
+        assert chain_a["terminal_outcome"] == "cap_exhausted"
+        assert chain_a["cap_exhausted"] is True
+        assert chain_a["task_count"] == 5
+        assert chain_a["cap_counted_iterations"] == 3
+        assert chain_a["cap_excluded_iterations"] == 2
+        assert chain_a["waste_totals"]["infra"] == 1
+        assert chain_a["max_iteration"] == 5
+
+        # Drilldown handles carry the per-task terminal/lane/cap markers.
+        a_by_iter = {t["iteration"]: t for t in chain_a["tasks"]}
+        assert a_by_iter[3]["status"] == "FAILED"
+        assert a_by_iter[3]["waste_category"] == "infra"
+        assert a_by_iter[3]["failure_category"] == "AGENT_TIMEOUT"
+        assert a_by_iter[3]["counts_toward_cap"] is False
+        assert a_by_iter[5]["stale_head_discard"] is True
+        assert a_by_iter[5]["counts_toward_cap"] is False
+        assert a_by_iter[2]["lane"] == "ci"
+        assert a_by_iter[2]["counts_toward_cap"] is True
+        assert {"task_id", "type", "created_at", "completed_at", "started_at"} <= set(
+            a_by_iter[1]
+        )
+
+        # Chain B's terminal outcome is hydrated from the (review_loop-less) original.
+        chain_b = chains[502]
+        assert chain_b["terminal_outcome"] == "merged"
+        assert chain_b["cap_exhausted"] is False
+        b_cats = {t["iteration"]: t["waste_category"] for t in chain_b["tasks"]}
+        assert b_cats == {1: "lost_repo_state", 2: "lost_reasoning", 3: "review_ambiguity"}
+
+    @pytest.mark.asyncio
+    async def test_additive_contract_preserves_legacy_keys_and_includes_terminal_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        base = _utcnow() - timedelta(hours=1)
+        oid = uuid.UUID("33333333-3333-3333-3333-333333333333")
+        # Two COMPLETED iterations + one terminal FAILED (non-infra) on the same PR.
+        self._add_chain_task(
+            db_session, project.id, pr_number=601, original_task_id=oid,
+            iteration=1, task_type="review", created_at=base,
+        )
+        self._add_chain_task(
+            db_session, project.id, pr_number=601, original_task_id=oid,
+            iteration=2, task_type="fix", fix_reason="code_review",
+            created_at=base + timedelta(minutes=10),
+        )
+        self._add_chain_task(
+            db_session, project.id, pr_number=601, original_task_id=oid,
+            iteration=3, task_type="fix", status=TaskStatus.FAILED,
+            failure_category="CODE_ERROR", created_at=base + timedelta(minutes=20),
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Legacy contract: every original key present and unchanged in meaning —
+        # only the two COMPLETED, PR-bearing tasks count toward the legacy surface.
+        for key in (
+            "lane_iteration_distribution",
+            "per_pr_phase_breakdown",
+            "relay_counts_by_lane",
+            "pr_count",
+            "task_count",
+            "pr_breakdown_limit",
+            "pr_breakdown_truncated",
+            "window_days",
+            "window_start",
+        ):
+            assert key in body
+        assert body["task_count"] == 2
+        assert body["pr_count"] == 1
+
+        # Additive surface: the terminal FAILED task IS included as chain waste.
+        waste = body["lane_waste"]
+        assert waste["waste_task_count"] == 3
+        assert waste["chain_count"] == 1
+        [chain] = waste["chains"]
+        assert chain["task_count"] == 3
+        # CODE_ERROR is NOT infra-class, so the FAILED task still counts toward cap.
+        assert chain["cap_counted_iterations"] == 3
+        statuses = {t["status"] for t in chain["tasks"]}
+        assert statuses == {"COMPLETED", "FAILED"}
+
+    @pytest.mark.asyncio
+    async def test_legacy_surface_not_eroded_by_failed_tasks_under_truncation(
+        self, client: AsyncClient, db_session
+    ):
+        """FAILED/CANCELLED tasks must not displace COMPLETED rows from the legacy surface.
+
+        With max_tasks=2 and 2 recent FAILED + 2 older COMPLETED tasks, the
+        legacy aggregates (task_count, pr_count) must still count both COMPLETED
+        tasks — the separate completed-only query ensures FAILED rows never evict
+        them from the top-N pool.
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        base = _utcnow() - timedelta(hours=3)
+        oid = uuid.UUID("44444444-4444-4444-4444-444444444444")
+
+        # Two COMPLETED tasks (older) — must always appear in legacy surface.
+        self._add_chain_task(
+            db_session, project.id, pr_number=701, original_task_id=oid,
+            iteration=1, task_type="review", created_at=base,
+        )
+        self._add_chain_task(
+            db_session, project.id, pr_number=702, original_task_id=oid,
+            iteration=1, task_type="review", created_at=base + timedelta(minutes=5),
+        )
+        # Two FAILED tasks (more recent) — with a shared max_tasks=2 query these
+        # would evict the COMPLETED tasks, eroding the legacy surface.
+        self._add_chain_task(
+            db_session, project.id, pr_number=703, original_task_id=oid,
+            iteration=1, task_type="review", status=TaskStatus.FAILED,
+            failure_category="CODE_ERROR",
+            created_at=base + timedelta(minutes=20),
+        )
+        self._add_chain_task(
+            db_session, project.id, pr_number=704, original_task_id=oid,
+            iteration=1, task_type="review", status=TaskStatus.FAILED,
+            failure_category="CODE_ERROR",
+            created_at=base + timedelta(minutes=25),
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/lane-diag?project_id={project.id}&max_tasks=2"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Legacy surface counts both COMPLETED tasks regardless of the 2 FAILED
+        # tasks that are more recent and would have displaced them in a shared query.
+        assert body["task_count"] == 2
+        assert body["pr_count"] == 2
+
+        # Waste surface uses its own (broadened) query and captures the 2 FAILED
+        # tasks (the 2 most-recent within max_tasks=2).
+        waste = body["lane_waste"]
+        assert waste["waste_task_count"] == 2
+        statuses = {t["status"] for c in waste["chains"] for t in c["tasks"]}
+        assert statuses == {"FAILED"}
+
+    @pytest.mark.asyncio
+    async def test_hydrates_original_tasks_outside_window_for_canonical_outcomes(
+        self, client: AsyncClient, db_session
+    ):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        merged_oid = uuid.UUID("55555555-5555-5555-5555-555555555555")
+        cap_oid = uuid.UUID("66666666-6666-6666-6666-666666666666")
+
+        self._add_chain_task(
+            db_session,
+            project.id,
+            pr_number=801,
+            original_task_id=merged_oid,
+            iteration=1,
+            task_type="review",
+            created_at=now - timedelta(minutes=20),
+        )
+        self._add_chain_task(
+            db_session,
+            project.id,
+            pr_number=802,
+            original_task_id=cap_oid,
+            iteration=1,
+            task_type="fix",
+            created_at=now - timedelta(minutes=10),
+        )
+        self._add_original(
+            db_session,
+            project.id,
+            merged_oid,
+            now - timedelta(days=8),
+            merged=True,
+        )
+        self._add_original(
+            db_session,
+            project.id,
+            cap_oid,
+            now - timedelta(days=9),
+            failure_detail="review_cap_exhausted",
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}&max_tasks=2")
+        assert resp.status_code == 200
+        waste = resp.json()["lane_waste"]
+        chains = {c["pr_number"]: c for c in waste["chains"]}
+        assert chains[801]["terminal_outcome"] == "merged"
+        assert chains[801]["cap_exhausted"] is False
+        assert chains[802]["terminal_outcome"] == "cap_exhausted"
+        assert chains[802]["cap_exhausted"] is True
+        assert waste["cap_exhausted_chain_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_uses_escalation_alerts_for_canonical_chain_outcome(
+        self, client: AsyncClient, db_session
+    ):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        oid = uuid.UUID("77777777-7777-7777-7777-777777777777")
+        task_id = self._add_chain_task(
+            db_session,
+            project.id,
+            pr_number=803,
+            original_task_id=oid,
+            iteration=1,
+            task_type="review",
+            created_at=now - timedelta(minutes=5),
+        )
+        self._add_original(
+            db_session,
+            project.id,
+            oid,
+            now - timedelta(days=8),
+        )
+        await db_session.commit()
+
+        db_session.add(
+            make_alert(
+                project.id,
+                task_id=task_id,
+                title="Review-fix escalation: stuck cycle on PR #803",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}")
+        assert resp.status_code == 200
+        waste = resp.json()["lane_waste"]
+        [chain] = waste["chains"]
+        assert chain["pr_number"] == 803
+        assert chain["terminal_outcome"] == "stuck"
+        assert chain["cap_exhausted"] is False
+        assert waste["cap_exhausted_chain_count"] == 0
 
 
 class TestTaskCostBreakdown:
