@@ -2547,6 +2547,93 @@ async def test_accelerator_only_resolves_canonical_machine_type(
 
 
 @pytest.mark.asyncio
+async def test_create_compute_job_gpu_extends_wall_clock_deadline(
+    db_session, monkeypatch
+):
+    """GPU jobs add GPU_PROVISIONING_ALLOWANCE_SECONDS to wall_clock_deadline; CPU jobs do not."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task_gpu = await _make_compute_task(db_session)
+    before = datetime.utcnow()
+    job_gpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_gpu,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator="T4",
+    )
+    after = datetime.utcnow()
+
+    # GPU wall_clock_deadline includes the provisioning allowance.
+    expected_allowance = compute_jobs.GPU_PROVISIONING_ALLOWANCE_SECONDS
+    lower = before + timedelta(seconds=600 + expected_allowance)
+    upper = after + timedelta(seconds=600 + expected_allowance)
+    assert lower <= job_gpu.wall_clock_deadline <= upper, (
+        f"GPU wall_clock_deadline {job_gpu.wall_clock_deadline} not in "
+        f"[{lower}, {upper}]"
+    )
+
+    # CPU job wall_clock_deadline does NOT include the allowance.
+    task_cpu = await _make_compute_task(db_session)
+    before_cpu = datetime.utcnow()
+    job_cpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_cpu,
+        command="echo cpu",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=600,
+    )
+    after_cpu = datetime.utcnow()
+    lower_cpu = before_cpu + timedelta(seconds=600)
+    upper_cpu = after_cpu + timedelta(seconds=600)
+    assert lower_cpu <= job_cpu.wall_clock_deadline <= upper_cpu, (
+        f"CPU wall_clock_deadline {job_cpu.wall_clock_deadline} not in "
+        f"[{lower_cpu}, {upper_cpu}]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_stores_park_deadline_seconds(
+    db_session, monkeypatch
+):
+    """park_deadline_seconds in polling_metadata equals deadline + allowance + grace."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task_gpu = await _make_compute_task(db_session)
+    job_gpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_gpu,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator="T4",
+    )
+    expected_gpu_park = (
+        600
+        + compute_jobs.GPU_PROVISIONING_ALLOWANCE_SECONDS
+        + compute_jobs._COMPUTE_PARK_GRACE_SECONDS
+    )
+    assert job_gpu.polling_metadata["park_deadline_seconds"] == expected_gpu_park
+
+    # CPU: no provisioning allowance, only grace.
+    task_cpu = await _make_compute_task(db_session)
+    job_cpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_cpu,
+        command="echo cpu",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=600,
+    )
+    expected_cpu_park = 600 + compute_jobs._COMPUTE_PARK_GRACE_SECONDS
+    assert job_cpu.polling_metadata["park_deadline_seconds"] == expected_cpu_park
+
+
+@pytest.mark.asyncio
 async def test_create_compute_job_rejects_a100(db_session, monkeypatch):
     """An A100 (over-quota, count=0) request is rejected loudly at create time."""
     monkeypatch.setattr(compute, "LOCAL_MODE", False)

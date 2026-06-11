@@ -77,6 +77,21 @@ MAX_COMPUTE_JOB_DEADLINE_SECONDS = int(
 COMPUTE_JOB_MONITOR_INTERVAL_SECONDS = float(
     os.getenv("COMPUTE_JOB_MONITOR_INTERVAL_SECONDS", "15")
 )
+# Extra wall-clock window added to the declared deadline for GPU (accelerator)
+# jobs to cover the Deep Learning VM cold-start. The provisioning phase can
+# consume the entire declared deadline before the command even begins on a
+# short job; this additive floor is independent of and stacked on top of the
+# declared runtime budget so provisioning-phase deaths are distinguishable from
+# runtime-overrun kills.
+GPU_PROVISIONING_ALLOWANCE_SECONDS = int(
+    os.getenv("COMPUTE_GPU_PROVISIONING_ALLOWANCE_SECONDS", "900")
+)
+# Grace added on top of the job's full worst-case window (declared deadline +
+# provisioning allowance) before the backend reaper ages a parked
+# compute_experiment task out (park_wake_timeout). The monitor fires the
+# compute_job_terminal wake well before this, so the deadline is only a
+# backstop against a wedged monitor — generous so a healthy run never trips it.
+_COMPUTE_PARK_GRACE_SECONDS = 600
 _COMPUTE_RPC_DIAGNOSTIC_KEY = "compute_rpc_diagnostic"
 _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING = 1000
 
@@ -265,7 +280,13 @@ async def create_compute_job(
         project_id=locked_task.project_id,
         requested_cap_usd=capped_spend,
     )
-    deadline_at = _utcnow() + timedelta(seconds=capped_deadline)
+    # GPU jobs add a provisioning allowance to the wall-clock deadline so a
+    # Deep Learning VM cold-start cannot exhaust the declared runtime budget
+    # before the command begins. The runtime budget itself is unchanged.
+    provisioning_allowance = (
+        GPU_PROVISIONING_ALLOWANCE_SECONDS if persisted_accelerator is not None else 0
+    )
+    deadline_at = _utcnow() + timedelta(seconds=capped_deadline + provisioning_allowance)
     # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
     # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
     rate = get_compute_rate_per_second(
@@ -274,6 +295,10 @@ async def create_compute_job(
         count=accelerator_count,
         spot=normalized_provisioning == "SPOT",
     )
+    # Park deadline: worst-case window (declared runtime + provisioning allowance)
+    # plus grace. Stored in polling_metadata so the agent can read it from the
+    # job response instead of recomputing from the declared deadline alone.
+    park_deadline_seconds = capped_deadline + provisioning_allowance + _COMPUTE_PARK_GRACE_SECONDS
     polling_metadata = {
         "command": command,
         "cwd": cwd,
@@ -283,6 +308,7 @@ async def create_compute_job(
         "requested_deadline_seconds": capped_deadline,
         "launch_request_fingerprint": launch_request_fingerprint,
         "status_message": "queued for compute-job launch",
+        "park_deadline_seconds": park_deadline_seconds,
     }
     if live_release_evidence is not None:
         polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence

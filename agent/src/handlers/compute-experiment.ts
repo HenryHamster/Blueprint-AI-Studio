@@ -405,11 +405,22 @@ export async function handleComputeExperiment(
   // Release this VM/fleet slot now instead of polling the job to terminal. The
   // park registration is FINALIZE-action and keyed to the job id; the backend
   // wake worker runs the compute_experiment completion path when the monitor fires
-  // the wake. The park deadline outlasts the job's own deadline (+grace) so the
-  // reaper only ages the task out if the monitor never reports terminal. A duplicate
-  // launch returns the same job (backend idempotency), so re-parking targets the
-  // same job id and the backend's park guard prevents duplicate registrations.
-  const parkDeadlineSeconds = (deadlineSeconds as number) + COMPUTE_PARK_GRACE_SECONDS;
+  // the wake. The park deadline outlasts the job's full worst-case window
+  // (declared deadline + any provisioning allowance for GPU jobs) plus grace, so
+  // the reaper only ages the task out if the monitor never reports terminal. A
+  // duplicate launch returns the same job (backend idempotency), so re-parking
+  // targets the same job id and the backend's park guard prevents duplicate
+  // registrations.
+  //
+  // Prefer the backend-computed park_deadline_seconds from polling_metadata (which
+  // accounts for the GPU provisioning allowance) over the local fallback so GPU
+  // jobs never have their park expire during the substrate's legal provisioning
+  // window.
+  const pollingMeta = job && typeof job.polling_metadata === 'object' && job.polling_metadata !== null
+    ? job.polling_metadata as Record<string, unknown>
+    : null;
+  const parkDeadlineSeconds = numOrNull(pollingMeta?.park_deadline_seconds)
+    ?? (deadlineSeconds as number) + COMPUTE_PARK_GRACE_SECONDS;
   statusRef.value = `Parked on compute job ${jobId} until terminal`;
   sendLog(ws, `Parking task on compute job ${jobId} (releasing VM/slot); backend will finalize on terminal.\n`);
   await persistAndPostStatus(taskId, {

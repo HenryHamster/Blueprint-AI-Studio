@@ -184,6 +184,36 @@ describe('handleComputeExperiment', () => {
     expect(completion.status).toBe('FAILED');
     expect(completion.failure_category).toBe('compute_launch_failed');
   });
+
+  it('uses backend-supplied park_deadline_seconds from polling_metadata when present', async () => {
+    // Simulate a GPU job response where the backend computed a larger park deadline
+    // (deadline + provisioning allowance + grace).
+    const gpuParkDeadline = 600 + 900 + 600; // 2100s for a T4 job
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({
+      status: 'QUEUED',
+      polling_metadata: { park_deadline_seconds: gpuParkDeadline },
+    }));
+
+    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
+
+    const park = lastCompletionPayload();
+    expect(park.status).toBe('PARKED');
+    const req = park.park_request as Record<string, unknown>;
+    // Must use the backend-supplied value, not deadline + local grace (1200).
+    expect(req.deadline_seconds).toBe(gpuParkDeadline);
+  });
+
+  it('falls back to deadline + local grace when polling_metadata.park_deadline_seconds is absent', async () => {
+    // No polling_metadata in the response — should fall back to the old calculation.
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'QUEUED' }));
+
+    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
+
+    const park = lastCompletionPayload();
+    expect(park.status).toBe('PARKED');
+    const req = park.park_request as Record<string, unknown>;
+    expect(req.deadline_seconds).toBe(600 + 600); // fallback: deadline + COMPUTE_PARK_GRACE_SECONDS
+  });
 });
 
 // ── handleComputeExperiment: VM-substrate analysis mode ──────────────────────
