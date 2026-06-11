@@ -78,7 +78,7 @@ vi.mock('../telemetry.js', async (importOriginal) => {
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import fs from 'fs';
-import { handleDesign, groundDesignCitations } from './design.js';
+import { handleDesign, groundDesignCitations, buildCitationRepairPrompt } from './design.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
 import { configureAgentPermissions, writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -111,6 +111,9 @@ describe('handleDesign', () => {
       exitCode: 0, allOutput: '', lastResultText: '',
     } as Awaited<ReturnType<typeof runClaudeCode>>);
     vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // Citations ground by default so tests not targeting the grounding-repair
+    // reopen never trigger it incidentally.
+    vi.mocked(fs.existsSync).mockReturnValue(true);
   });
 
   it('clones the repo and builds a codebase-grounded prompt with file-citation cues', async () => {
@@ -128,6 +131,9 @@ describe('handleDesign', () => {
     // Codebase-grounded, file-citation-first guidance.
     expect(prompt).toContain('GROUNDING your design in the ACTUAL code');
     expect(prompt).toContain('FILE references are the default');
+    // The grounding contract is explicit: citations are machine-checked, so the
+    // agent is told to emit clean repo-relative paths and verify them first.
+    expect(prompt).toContain('MACHINE-CHECKED');
     // Document schema cues the backend completion handler parses.
     for (const key of ['title', 'summary', 'body', 'source_citations', 'topic']) {
       expect(prompt).toContain(`"${key}"`);
@@ -365,7 +371,10 @@ describe('handleDesign', () => {
   });
 
   it('stamps _citation_grounding on the emitted document for the backend gate', async () => {
-    // existsSync false (module default) → file citation resolves to nothing.
+    // existsSync false → the file citation resolves to nothing (this also
+    // exercises the repair reopen, whose retry re-reads the same document and
+    // keeps the truthful zero-grounded stamp).
+    vi.mocked(fs.existsSync).mockReturnValue(false);
     vi.mocked(readHandlerOutput).mockReturnValue({ ...VALID_DOCUMENT });
 
     await handleDesign(
@@ -387,6 +396,9 @@ describe('handleDesign — bounded self-repair on format miss', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // Recovered documents ground cleanly — these tests target the FORMAT
+    // repair, not the citation-grounding repair.
+    vi.mocked(fs.existsSync).mockReturnValue(true);
   });
 
   it('makes exactly one focused re-ask when exitCode=0 but no document extracts, and COMPLETES with the recovered document', async () => {
@@ -452,6 +464,163 @@ describe('handleDesign — bounded self-repair on format miss', () => {
     expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
     expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
     expect(lastPostedPayload().status).toBe('FAILED');
+  });
+});
+
+// ── Citation-grounding repair: warn the agent and let it fix its citations ────
+describe('handleDesign — citation-grounding repair reopen', () => {
+  // Decorated/malformed citations (the real-world failure mode: backticks,
+  // appended descriptions) never resolve; clean repo-relative paths do.
+  const UNGROUNDED_DOCUMENT = {
+    ...VALID_DOCUMENT,
+    source_citations: ['`backend/app/reaper_sweeps.py` (sweep loop)'],
+  };
+  const CORRECTED_DOCUMENT = {
+    ...VALID_DOCUMENT,
+    source_citations: ['backend/app/reaper_sweeps.py'],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // Only clean (undecorated) paths exist in the mocked working tree.
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p) => !String(p).includes('`') && !String(p).includes('('),
+    );
+  });
+
+  it('reopens once with the unresolved citations verbatim and adopts the corrected document', async () => {
+    vi.mocked(readHandlerOutput)
+      .mockReturnValueOnce({ ...UNGROUNDED_DOCUMENT })
+      .mockReturnValueOnce({ ...CORRECTED_DOCUMENT });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Exactly one reopen (two runClaudeCode invocations total — strictly bounded).
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    // The reopen prompt echoes the offending citation exactly as written, so
+    // the agent can see WHICH format/path it got wrong.
+    const reopenPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(reopenPrompt).toContain('NONE of its file citations resolve');
+    expect(reopenPrompt).toContain('`backend/app/reaper_sweeps.py` (sweep loop)');
+    expect(reopenPrompt).toContain(`/tmp/design_document_${TASK_ID}.json`);
+
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    const parsed = JSON.parse(payload.logs as string) as Record<string, unknown>;
+    expect(parsed.source_citations).toEqual(['backend/app/reaper_sweeps.py']);
+    expect(parsed._citation_grounding).toEqual({
+      file_citations: 1, grounded: 1, checked: true, unresolved: [],
+    });
+  });
+
+  it('adopts a corrected document from the retry output when the /tmp file was not rewritten', async () => {
+    // The /tmp file keeps yielding the original ungrounded document; the
+    // corrected JSON arrives only in the retry response text.
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...UNGROUNDED_DOCUMENT });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: '',
+      } as Awaited<ReturnType<typeof runClaudeCode>>)
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(CORRECTED_DOCUMENT),
+      } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const parsed = JSON.parse(lastPostedPayload().logs as string) as Record<string, unknown>;
+    expect(parsed.source_citations).toEqual(['backend/app/reaper_sweeps.py']);
+    expect(parsed._citation_grounding).toEqual({
+      file_citations: 1, grounded: 1, checked: true, unresolved: [],
+    });
+  });
+
+  it('keeps the original document (truthful zero-grounded stamp) when the reopen fixes nothing', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...UNGROUNDED_DOCUMENT });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Still strictly bounded: one reopen, no retry loop.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    const parsed = JSON.parse(payload.logs as string) as Record<string, unknown>;
+    expect(parsed._citation_grounding).toEqual({
+      file_citations: 1, grounded: 0, checked: true,
+      unresolved: ['`backend/app/reaper_sweeps.py` (sweep loop)'],
+    });
+  });
+
+  it('does not reopen when at least one file citation grounds', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...CORRECTED_DOCUMENT });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reopen for a web-URL-only document (no file citations to ground)', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      ...VALID_DOCUMENT, source_citations: ['https://example.com/spec'],
+    });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips the reopen when the first run exited non-zero', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...UNGROUNDED_DOCUMENT });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 1, allOutput: 'boom', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    expect(lastPostedPayload().status).toBe('FAILED');
+  });
+});
+
+describe('buildCitationRepairPrompt', () => {
+  it('lists each unresolved citation verbatim and targets the document path', () => {
+    const prompt = buildCitationRepairPrompt(
+      ['`a/b.py` (loop)', '/tmp/workspace/c/d.py'], '/tmp/design_document_t1.json',
+    );
+    expect(prompt).toContain('- `a/b.py` (loop)');
+    expect(prompt).toContain('- /tmp/workspace/c/d.py');
+    expect(prompt).toContain('/tmp/design_document_t1.json');
+    // The fix is constrained to the citations array.
+    expect(prompt).toContain('Fix ONLY the source_citations array');
+  });
+
+  it('caps the echoed list and reports the overflow count', () => {
+    const unresolved = Array.from({ length: 25 }, (_, i) => `made/up/path${i}.py`);
+    const prompt = buildCitationRepairPrompt(unresolved, '/tmp/doc.json');
+    expect(prompt).toContain('- made/up/path19.py');
+    expect(prompt).not.toContain('- made/up/path20.py');
+    expect(prompt).toContain('(+5 more)');
   });
 });
 
