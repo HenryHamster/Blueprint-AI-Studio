@@ -2643,6 +2643,20 @@ async def _finalize_qualification(
                         session, version, qual, _challenge_hold
                     )
                 new_respawn_count = challenge_respawn_count + 1
+                # When the hold was a SHA mismatch, record the SHA the challenge
+                # reported so operators can see what candidate it actually ran on
+                # vs what this qualification expected.
+                _sha_mismatch_observed = (
+                    str(
+                        (challenge_verdicts or {}).get(
+                            "challenged_candidate_sha"
+                        )
+                        or ""
+                    )
+                    or None
+                    if _challenge_hold == "audit_challenge_sha_mismatch"
+                    else None
+                )
                 version.last_qualification = {
                     **qual,
                     "status": "pending",
@@ -2653,6 +2667,13 @@ async def _finalize_qualification(
                     "audit_challenge_previous_task_id": challenge_task_id,
                     "audit_challenge_retry_primary_findings_count": len(
                         primary_findings
+                    ),
+                    **(
+                        {
+                            "audit_challenge_sha_mismatch_observed_sha": _sha_mismatch_observed
+                        }
+                        if _sha_mismatch_observed
+                        else {}
                     ),
                 }
                 flag_modified(version, "last_qualification")

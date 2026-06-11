@@ -6008,6 +6008,365 @@ async def test_initial_challenge_receives_primary_findings_before_reconciliation
 
 
 @pytest.mark.asyncio
+async def test_deferred_challenge_spawn_produces_primary_findings_binding(
+    db_session, mocker
+):
+    """End-to-end: deferred challenge spawn → binding verdicts → quality verdict.
+
+    Acceptance proof for the audit-leg primary-findings binding flow:
+
+    Pass 1 (deferred spawn):
+      - version.last_qualification has audit_challenge_spawn_pending=True and no
+        challenge_task_id — the audit completed with deductible findings but the
+        challenge was intentionally deferred.
+      - _finalize_qualification spawns the initial challenge with primary_findings
+        in its payload (verbatim summaries and severities from the audit report).
+
+    Pass 2 (reconciliation → quality verdict):
+      - The challenge task completes with binding verdicts that use
+        primary_finding_index to map back to the exact primary findings.
+      - _finalize_qualification reconciles successfully, produces a real quality
+        verdict (not_promoted), and records a QualificationVerdict row.
+
+    This is the acceptance criterion for test_deferred_challenge_spawn_produces_
+    primary_findings_binding: the test must run green under a real merge-test
+    verdict (not_promoted), exercising _finalize_qualification's deferred-spawn
+    block and _reconcile_audit_with_challenge's primary_finding_index binding.
+    """
+    from app import shared_state
+    from app.models import QualificationVerdict
+
+    shared_state.runtime_config["promotion_enabled"] = False  # dry-run / not_promoted path
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Seed audit with two deductible (high-severity, verified) findings.
+    audit_task, smoke_task = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.75,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Unbounded read from untrusted input in parser.",
+                    "file": "backend/app/parser.py",
+                    "verification_note": "Read backend/app/parser.py:120 and confirmed the buffer is not bounded.",
+                },
+                {
+                    "severity": "high",
+                    "summary": "Missing CSRF token validation on state-changing endpoint.",
+                    "file": "backend/app/routers/admin.py",
+                    "verification_note": "Read backend/app/routers/admin.py:45 and confirmed no CSRF check.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=None,  # No challenge yet — will be spawned in pass 1
+    )
+
+    # Mark the qualification as having a deferred challenge spawn.
+    candidate_sha = version.last_qualification["candidate_sha"]
+    version.last_qualification = {
+        **version.last_qualification,
+        "challenge_task_id": None,
+        "audit_challenge_task_id": None,
+        "audit_challenge_spawn_pending": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Pass 1: deferred spawn ---
+    result1 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result1["status"] == "audit_challenge_respawned"
+    assert result1["reason"] in (
+        "challenge_initial_primary_findings",
+        "challenge_initial_no_primary_findings",
+    )
+    assert result1["reason"] == "challenge_initial_primary_findings", (
+        "deferred spawn must carry primary findings when the audit has deductible findings"
+    )
+    new_challenge_id = uuid.UUID(version.last_qualification["challenge_task_id"])
+    assert version.last_qualification["audit_challenge_spawn_pending"] is False
+
+    # Verify the spawned challenge payload carries the primary findings verbatim.
+    new_challenge = await db_session.get(Task, new_challenge_id)
+    assert new_challenge is not None
+    pf = new_challenge.first_payload.get("primary_findings") or []
+    assert len(pf) == 2
+    # Findings are sorted by severity rank (critical first, then high, etc.).
+    pf_summaries = [f["summary"] for f in pf]
+    assert "Unbounded read from untrusted input in parser." in pf_summaries
+    assert "Missing CSRF token validation on state-changing endpoint." in pf_summaries
+
+    # --- Seed the challenge with indexed binding verdicts ---
+    # Use primary_finding_index (1-based) to bind verdicts to findings.
+    pf_index_by_summary = {f["summary"]: i + 1 for i, f in enumerate(pf)}
+    challenge_artifact = {
+        "challenged_candidate_sha": candidate_sha,
+        "verdicts": [
+            {
+                "primary_finding_index": pf_index_by_summary[pf[0]["summary"]],
+                "severity": pf[0]["severity"],
+                "summary": pf[0]["summary"],
+                "file": pf[0]["file"],
+                "verdict": "confirmed",
+                "reason": "Independent review confirms the parser does not bound the input buffer.",
+            },
+            {
+                "primary_finding_index": pf_index_by_summary[pf[1]["summary"]],
+                "severity": pf[1]["severity"],
+                "summary": pf[1]["summary"],
+                "file": pf[1]["file"],
+                "verdict": "confirmed",
+                "reason": "Independent review confirms no CSRF token is validated on the endpoint.",
+            },
+        ],
+    }
+    new_challenge.status = TaskStatus.COMPLETED
+    db_session.add(new_challenge)
+    db_session.add(
+        Artifact(
+            task_id=new_challenge_id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            logs=json.dumps(challenge_artifact),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Pass 2: reconciliation → quality verdict ---
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result2 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Both confirmed findings still deduct → not_promoted (below promotion threshold).
+    assert result2["status"] in ("not_promoted", "dry_run"), (
+        f"expected a final quality verdict but got {result2['status']!r}"
+    )
+    lq = version.last_qualification
+    assert lq["status"] in ("not_promoted", "dry_run")
+    assert lq.get("audit_findings") is not None
+
+    # A durable QualificationVerdict row must be written (this is what
+    # distinguishes a quality verdict from an infra_failure hold).
+    verdict_count = (
+        await db_session.execute(
+            select(sa_func.count()).where(
+                QualificationVerdict.release_version_id == version.id
+            )
+        )
+    ).scalar()
+    assert verdict_count == 1, (
+        f"expected 1 QualificationVerdict row but found {verdict_count} — "
+        "the deferred-spawn + binding flow must produce a durable quality verdict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sha_mismatch_respawn_roundtrip(
+    db_session, mocker
+):
+    """End-to-end: SHA-mismatch hold → respawn with correct SHA → quality verdict.
+
+    Validates the full audit_challenge_sha_mismatch roundtrip:
+
+    Pass 1 (SHA mismatch):
+      - The initial challenge artifact carries challenged_candidate_sha that does
+        not match the qualification's candidate_sha.
+      - _finalize_qualification detects the mismatch via _reconcile_audit_with_
+        challenge, re-spawns the challenge with the correct candidate_sha, and
+        records audit_challenge_sha_mismatch_observed_sha in last_qualification
+        so operators can see what SHA the challenge actually ran on.
+
+    Pass 2 (correct SHA → quality verdict):
+      - The respawned challenge completes with challenged_candidate_sha == the
+        qualification's candidate_sha and indexed binding verdicts.
+      - _finalize_qualification reconciles successfully, produces a real quality
+        verdict, and records a QualificationVerdict row.
+    """
+    from app import shared_state
+    from app.models import QualificationVerdict
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    WRONG_SHA = "dead" * 10  # 40-char hex, intentionally different from candidate
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.80,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Credential logged in plaintext on authentication failure.",
+                    "file": "backend/app/auth.py",
+                    "verification_note": "Read backend/app/auth.py:88 and confirmed the password is written to the log.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=None,
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+
+    # Seed an initial challenge artifact with a WRONG candidate SHA.
+    mismatched_challenge = Task(
+        project_id=project.id,
+        title="audit-challenge-mismatched",
+        payloads=[{
+            "type": "release_audit_challenge",
+            "base_branch": "main",
+            "candidate_sha": WRONG_SHA,
+        }],
+        vm_instance_id="vm-challenge-mismatch",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": WRONG_SHA},
+    )
+    db_session.add(mismatched_challenge)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=mismatched_challenge.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            logs=json.dumps({
+                "challenged_candidate_sha": WRONG_SHA,  # WRONG — does not match candidate_sha
+                "verdicts": [
+                    {
+                        "severity": "high",
+                        "summary": "Credential logged in plaintext on authentication failure.",
+                        "file": "backend/app/auth.py",
+                        "verdict": "confirmed",
+                        "reason": "Reviewed auth.py and confirmed the credential appears in the log line.",
+                    }
+                ],
+            }),
+        )
+    )
+    version.last_qualification = {
+        **version.last_qualification,
+        "challenge_task_id": str(mismatched_challenge.id),
+        "audit_challenge_task_id": str(mismatched_challenge.id),
+        "audit_challenge_respawn_count": 0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Pass 1: SHA mismatch → respawn ---
+    result1 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result1["status"] == "audit_challenge_respawned", (
+        f"expected respawn for SHA mismatch but got {result1['status']!r}"
+    )
+    assert result1["reason"] == "audit_challenge_sha_mismatch"
+
+    lq1 = version.last_qualification
+    assert lq1["audit_challenge_retry_reason"] == "audit_challenge_sha_mismatch"
+    assert lq1["audit_challenge_respawn_count"] == 1
+
+    # The production change: observed SHA must be recorded so operators know
+    # what SHA the mismatched challenge actually ran on.
+    assert lq1.get("audit_challenge_sha_mismatch_observed_sha") == WRONG_SHA, (
+        "audit_challenge_sha_mismatch_observed_sha must record the wrong SHA "
+        "so operators can debug identity drift"
+    )
+
+    # The new challenge payload must carry the CORRECT candidate_sha.
+    new_challenge_id = uuid.UUID(lq1["challenge_task_id"])
+    new_challenge = await db_session.get(Task, new_challenge_id)
+    assert new_challenge is not None
+    assert new_challenge.first_payload.get("candidate_sha") == candidate_sha, (
+        "the respawned challenge must be pinned to the qualification's candidate_sha"
+    )
+    # Primary findings must also be carried so reconciliation can succeed.
+    assert new_challenge.first_payload.get("primary_findings"), (
+        "respawned challenge must include primary_findings for indexed binding"
+    )
+
+    # --- Seed the respawned challenge with matching SHA + binding verdicts ---
+    pf = new_challenge.first_payload["primary_findings"]
+    new_challenge.status = TaskStatus.COMPLETED
+    db_session.add(new_challenge)
+    db_session.add(
+        Artifact(
+            task_id=new_challenge_id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            logs=json.dumps({
+                "challenged_candidate_sha": candidate_sha,  # CORRECT SHA
+                "verdicts": [
+                    {
+                        "primary_finding_index": 1,
+                        "severity": pf[0]["severity"],
+                        "summary": pf[0]["summary"],
+                        "file": pf[0]["file"],
+                        "verdict": "confirmed",
+                        "reason": "Confirmed on the correct candidate commit — credential appears in log.",
+                    },
+                ],
+            }),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Pass 2: correct SHA → quality verdict ---
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result2 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result2["status"] in ("not_promoted", "dry_run"), (
+        f"expected a final quality verdict after SHA-matched challenge but got "
+        f"{result2['status']!r}"
+    )
+    lq2 = version.last_qualification
+    assert lq2["status"] in ("not_promoted", "dry_run")
+
+    verdict_count = (
+        await db_session.execute(
+            select(sa_func.count()).where(
+                QualificationVerdict.release_version_id == version.id
+            )
+        )
+    ).scalar()
+    assert verdict_count == 1, (
+        f"expected 1 QualificationVerdict row but found {verdict_count} — "
+        "the SHA-mismatch respawn roundtrip must produce a durable quality verdict"
+    )
+
+
+@pytest.mark.asyncio
 async def test_empty_challenge_verdicts_respawn_with_distinct_reason(
     db_session,
 ):
