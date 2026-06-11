@@ -4,11 +4,12 @@ import { fetchPipelineRegressions, type PipelineRegression } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 
+const STORAGE_KEY = 'blueprint-admin:pipelineRegressionsPanelCollapsed';
+const LEGACY_STORAGE_KEY = 'blueprint-admin:pipelineRegressionsCollapsed';
+
 interface PipelineRegressionsPanelProps {
   projectId: string | null;
 }
-
-const PANEL_COLLAPSE_KEY = 'blueprint-admin:pipelineRegressionsCollapsed';
 
 const SEVERITY_RANK: Record<string, number> = { critical: 3, warning: 2, info: 1 };
 
@@ -69,7 +70,7 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
   const [fetchError, setFetchError] = useState<string | null>(null);
   // null = no explicit operator preference yet; fall back to a health-derived default.
   const [collapsedPref, setCollapsedPref] = useState<boolean | null>(() => {
-    const stored = localStorage.getItem(PANEL_COLLAPSE_KEY);
+    const stored = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY);
     return stored === null ? null : stored === 'true';
   });
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
@@ -124,7 +125,7 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
     setCollapsedPref((prev) => {
       const next = !(prev ?? healthy);
       try {
-        localStorage.setItem(PANEL_COLLAPSE_KEY, String(next));
+        localStorage.setItem(STORAGE_KEY, String(next));
       } catch { /* localStorage unavailable — keep in-memory state */ }
       return next;
     });
@@ -135,6 +136,7 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
       <button
         type="button"
         onClick={togglePanel}
+        data-testid="pipeline-regressions-toggle"
         aria-expanded={!collapsed}
         className="flex min-h-[44px] w-full items-center gap-2 px-1 py-1 text-[11px] font-bold uppercase tracking-widest text-neutral-400 transition-colors hover:text-neutral-300"
       >
@@ -157,6 +159,11 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
         {healthy && (
           <span className="ml-1 rounded-full border border-emerald-500/30 bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-emerald-300">
             Healthy
+          </span>
+        )}
+        {collapsed && fetchError && (
+          <span className="ml-1 rounded-full border border-red-500/30 bg-red-500/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-red-300">
+            Error
           </span>
         )}
       </button>
