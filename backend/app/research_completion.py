@@ -63,6 +63,7 @@ from app.finding_deduplication import (
     extract_archived_diagnoses,
     finding_hash as _finding_hash,
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
+    need_matches_task_lineage,
     normalize_prerequisite,
     resolve_prerequisite_task,
 )
@@ -4269,6 +4270,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _acceptance_evidence = parse_acceptance_evidence(
             finding.get("acceptance_evidence")
         )
+        _finding_lineage = {
+            str(v).strip().lower()
+            for v in (
+                fhash,
+                finding.get("finding_hash"),
+                _finding_hash(
+                    str(finding.get("title", title) or ""),
+                    str(
+                        finding.get("description", finding.get("prompt", "")) or ""
+                    ),
+                ),
+            )
+            if isinstance(v, str) and v.strip()
+        }
         new_task = Task(
             project_id=task.project_id,
             title=title,
@@ -4287,6 +4302,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_depth": research_depth + 1,
                 "related_files": related_files,
                 "finding_hash": fhash,
+                "finding_lineage": sorted(_finding_lineage),
                 **(
                     {"acceptance_evidence": _acceptance_evidence}
                     if _acceptance_evidence
@@ -4893,6 +4909,42 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if isinstance(_dcap, str) and _dcap.strip():
             _deferred_identities.add(("capability", _dcap.strip()))
     _codeferred_findings: list[dict] = []
+
+    def _wire_prerequisite_edge(
+        dependent: Task,
+        foundation: Task,
+        *,
+        finding_title: str,
+        prereq_label: str,
+    ) -> bool:
+        if foundation.id == dependent.id:
+            return False
+        if _would_create_cycle(dependent, foundation, _prereq_candidates):
+            logger.warning(
+                "[RESEARCH] Finding '%s' prerequisite %s resolved to foundation %s "
+                "but the edge would close a depends_on cycle — refused at spawn "
+                "(no edge)",
+                finding_title,
+                prereq_label,
+                foundation.id,
+            )
+            return False
+        foundation_id = str(foundation.id)
+        existing_dep = list(dependent.depends_on or [])
+        if foundation_id not in existing_dep:
+            existing_dep.append(foundation_id)
+            dependent.depends_on = existing_dep
+            remember_structural_depends_on(dependent, foundation_id)
+            session.add(dependent)
+            logger.info(
+                "[RESEARCH] Wired finding '%s' depends_on foundation %s "
+                "(prerequisite %s)",
+                finding_title,
+                foundation_id,
+                prereq_label,
+            )
+        return True
+
     for ci, ct in enumerate(child_tasks):
         fi = finding_indices[ci]
         finding_title = findings[fi].get("title", f"#{fi}")
@@ -4912,6 +4964,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # below (that path is correct); only the unresolved remainder becomes needs.
         needs: list = []
         unresolved_entries: list = []
+        structurally_dead_entries: list = []
 
         dep_indices = findings[fi].get("depends_on_indices", [])
         missing_dep_indices = [j for j in dep_indices if j not in finding_to_child]
@@ -4927,6 +4980,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 continue
             missing_finding = findings[missing_fi]
             missing_title = missing_finding.get("title", f"#{missing_fi}")
+            missing_type = str(missing_finding.get("type") or "")
+            missing_label = str(missing_title or "")
+            if (
+                missing_type in _NON_SPAWNING_FINDING_TYPES
+                or missing_label.lower().startswith("obs:")
+            ):
+                structurally_dead_entries.append(
+                    {
+                        "finding_index": missing_fi,
+                        "title": missing_title,
+                        "type": missing_type or None,
+                        "reason": "non_spawning_finding",
+                    }
+                )
+                continue
             missing_hash = _finding_hash(
                 str(missing_title),
                 str(
@@ -4936,6 +5004,39 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     or ""
                 ),
             )
+            lineage_need = {"kind": "task", "ref": missing_hash}
+            same_batch_foundation = next(
+                (
+                    candidate
+                    for candidate in child_tasks
+                    if need_matches_task_lineage(lineage_need, candidate)
+                ),
+                None,
+            )
+            if same_batch_foundation is not None and same_batch_foundation.id != ct.id:
+                _wire_prerequisite_edge(
+                    ct,
+                    same_batch_foundation,
+                    finding_title=finding_title,
+                    prereq_label=f"task:{missing_hash}",
+                )
+                continue
+            # Not in same-batch spawns — check existing in-flight / recently-completed
+            # foundations the same way the explicit-prerequisite path does. A sibling
+            # dropped by deduplicate_findings (deduped against an existing task) leaves
+            # its dependents with a missing_dep_indices entry whose hash matches that
+            # existing task exactly. Wire an edge rather than creating a dead need.
+            existing_foundation = resolve_prerequisite_task(
+                lineage_need, _prereq_candidates
+            )
+            if existing_foundation is not None and existing_foundation.id != ct.id:
+                _wire_prerequisite_edge(
+                    ct,
+                    existing_foundation,
+                    finding_title=finding_title,
+                    prereq_label=f"task:{missing_hash}",
+                )
+                continue
             unresolved_entries.append(
                 {
                     "finding_index": missing_fi,
@@ -4955,32 +5056,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if prereq:
             foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
             if foundation is not None and foundation.id != ct.id:
-                if _would_create_cycle(ct, foundation, _prereq_candidates):
-                    logger.warning(
-                        "[RESEARCH] Finding '%s' prerequisite %s:%s resolved to "
-                        "foundation %s but the edge would close a depends_on cycle "
-                        "— refused at spawn (no edge)",
-                        finding_title,
-                        prereq.get("kind"),
-                        prereq.get("ref"),
-                        foundation.id,
-                    )
-                else:
-                    foundation_id = str(foundation.id)
-                    existing_dep = list(ct.depends_on or [])
-                    if foundation_id not in existing_dep:
-                        existing_dep.append(foundation_id)
-                        ct.depends_on = existing_dep
-                        remember_structural_depends_on(ct, foundation_id)
-                        session.add(ct)
-                        logger.info(
-                            "[RESEARCH] Wired finding '%s' depends_on foundation %s "
-                            "(prerequisite %s:%s)",
-                            finding_title,
-                            foundation_id,
-                            prereq.get("kind"),
-                            prereq.get("ref"),
-                        )
+                _wire_prerequisite_edge(
+                    ct,
+                    foundation,
+                    finding_title=finding_title,
+                    prereq_label=f"{prereq.get('kind')}:{prereq.get('ref')}",
+                )
             elif foundation is None:
                 # Unresolved explicit prerequisite: a finding declared an explicit
                 # {kind, ref} foundation it must build on, but no in-flight or
@@ -5023,6 +5104,70 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             needs = deduped_needs
 
         if not needs:
+            if structurally_dead_entries:
+                ctx = dict(ct.context or {})
+                ctx["unresolved_prerequisite"] = (
+                    list(ctx.get("unresolved_prerequisite") or [])
+                    + structurally_dead_entries
+                )
+                ctx["prerequisite_escalated_to_parent"] = True
+                ctx["prerequisite_escalation_reason"] = "structurally_unresolvable"
+                ct.context = ctx
+                flag_modified(ct, "context")
+                ct.status = TaskStatus.CANCELLED
+                ct.latest_status_message = (
+                    f"Escalated to parent: finding '{finding_title}' declared only "
+                    "structurally unresolvable prerequisite(s)."
+                )[:500]
+                session.add(ct)
+                logger.warning(
+                    "[RESEARCH] Finding '%s' escalated to parent instead of BLOCKED "
+                    "on structurally unresolvable prerequisite(s): %s",
+                    finding_title,
+                    structurally_dead_entries,
+                )
+            continue
+
+        live_need_keys = {
+            (n.get("kind"), n.get("ref"))
+            for n in needs
+            if isinstance(n, dict)
+            and not (
+                n.get("kind") == "task"
+                and (n.get("kind"), n.get("ref")) not in _deferred_identities
+            )
+        }
+        dead_task_needs = [
+            n
+            for n in needs
+            if isinstance(n, dict)
+            and n.get("kind") == "task"
+            and (n.get("kind"), n.get("ref")) not in _deferred_identities
+        ]
+        if dead_task_needs and not live_need_keys:
+            ctx = dict(ct.context or {})
+            existing_unresolved = ctx.get("unresolved_prerequisite") or []
+            if not isinstance(existing_unresolved, list):
+                existing_unresolved = [existing_unresolved]
+            existing_unresolved.extend(unresolved_entries)
+            existing_unresolved.extend(structurally_dead_entries)
+            ctx["unresolved_prerequisite"] = existing_unresolved
+            ctx["prerequisite_escalated_to_parent"] = True
+            ctx["prerequisite_escalation_reason"] = "no_live_or_deferred_provider"
+            ct.context = ctx
+            flag_modified(ct, "context")
+            ct.status = TaskStatus.CANCELLED
+            ct.latest_status_message = (
+                f"Escalated to parent: finding '{finding_title}' declared task "
+                "prerequisite(s) with no spawned, deferred, or in-flight provider."
+            )[:500]
+            session.add(ct)
+            logger.warning(
+                "[RESEARCH] Finding '%s' escalated to parent instead of BLOCKED "
+                "on dead task prerequisite(s): %s",
+                finding_title,
+                ", ".join(f"{n['kind']}:{n['ref']}" for n in dead_task_needs),
+            )
             continue
 
         # Co-defer a dependent whose foundation was deferred THIS cycle. Leaving it

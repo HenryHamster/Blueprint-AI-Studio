@@ -4681,19 +4681,17 @@ async def test_finding_without_prerequisite_spawns_with_no_extra_deps(
 
 
 @_pytest.mark.asyncio
-async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
-    """When a finding declares a prerequisite that does not resolve to any
-    candidate, the dependent is transitioned into the BLOCKED state carrying the
-    unresolved prerequisite as its machine-resolvable need (no depends_on edge),
-    so the blocked-resume sweep gates it instead of letting it duplicate the
-    foundation."""
+async def test_unmatched_task_hash_prerequisite_escalates_to_parent(
+    db_session, mocker
+):
+    """When a task-hash prerequisite resolves to no spawned, deferred, or
+    in-flight provider, the dependent escalates immediately instead of parking
+    BLOCKED on an unmatchable hash."""
     from test_autonomous_research import _make_finding, _patch_research_externals
-    from app.task_blocked import get_blocker_metadata
+    from app.task_blocked import get_blocker_needs
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-prq04")
     finding = _make_finding(title="Add login endpoint", direction_id=direction["id"])
-    # Declare an EXACT (finding-hash) prerequisite that does not resolve to any
-    # candidate this cycle — a valid-but-unresolved forward reference.
     missing_ref = "00000000deadbeef"
     finding["prerequisite"] = {"kind": "task", "ref": missing_ref}
 
@@ -4715,24 +4713,215 @@ async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
     )
     assert len(children) == 1
     child = children[0]
-    assert child.status == TaskStatus.BLOCKED, (
-        "an unresolved prerequisite must transition the dependent into BLOCKED"
+    assert child.status == TaskStatus.CANCELLED, (
+        "an unresolvable prerequisite must escalate instead of entering BLOCKED"
     )
     assert not (child.depends_on or []), (
         "unresolved prerequisite must not create a depends_on edge"
     )
-    # The unresolved prerequisite is persisted as the canonical machine-resolvable
-    # need under context['blocker']['need'] for the blocked-resume sweep.
-    need = get_blocker_metadata(child).get("need")
-    assert need == {"kind": "task", "ref": missing_ref}, (
-        "unresolved prerequisite must be carried as the blocked need"
+    assert get_blocker_needs(child) == []
+    assert (child.context or {}).get("prerequisite_escalated_to_parent") is True
+    assert (child.context or {}).get("prerequisite_escalation_reason") == (
+        "no_live_or_deferred_provider"
     )
-    # Still stamped on context for operator visibility, in addition to BLOCKED.
     unresolved = (child.context or {}).get("unresolved_prerequisite", [])
     assert any(
         u.get("kind") == "task" and u.get("ref") == missing_ref
         for u in (unresolved if isinstance(unresolved, list) else [unresolved])
     ), "unresolved prerequisite details must remain in context for visibility"
+
+
+@_pytest.mark.asyncio
+async def test_depends_on_indices_missing_sibling_wires_to_existing_inflight(
+    db_session, mocker
+):
+    """When a depends_on_indices sibling was deduped against an EXISTING in-flight
+    task (not spawned this cycle), the dependent must wire a depends_on edge to
+    that existing task rather than be CANCELLED as 'no provider'.
+
+    Failure shape: deduplicate_findings drops the sibling finding (it matches the
+    existing task by hash), so it's absent from finding_to_child; the missing-sibling
+    loop builds a (kind=task, ref=hash) need. Before the fix, this need wasn't
+    checked against _prereq_candidates (existing_tasks + child_tasks), so it landed
+    in dead_task_needs and the dependent was CANCELLED. After the fix, the missing-
+    sibling loop also calls resolve_prerequisite_task(_prereq_candidates) and wires
+    the edge instead."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq-inflight")
+
+    # Pre-existing in-flight foundation whose finding_hash matches sibling finding A.
+    sibling_title = "Build shared event bus"
+    sibling_desc = "Core pub/sub infrastructure all other findings depend on"
+    sibling_hash = _finding_hash(sibling_title, sibling_desc)
+    existing_foundation = _Task(
+        project_id=_project.id,
+        title=sibling_title,
+        description=sibling_desc,
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={"finding_hash": sibling_hash},
+    )
+    db_session.add(existing_foundation)
+    await db_session.commit()
+    await db_session.refresh(existing_foundation)
+
+    # Research cycle produces sibling finding A (matches existing task by hash) and
+    # dependent finding B. Deduplicate_findings will drop A; B's depends_on_indices
+    # points at A (index 0). The missing-sibling loop must resolve A's hash against
+    # the existing foundation and wire the edge — not cancel B.
+    finding_a = _make_finding(
+        title=sibling_title,
+        direction_id=direction["id"],
+    )
+    finding_a["description"] = sibling_desc
+    finding_a["finding_hash"] = sibling_hash
+
+    finding_b = _make_finding(
+        title="Wire domain event handlers",
+        direction_id=direction["id"],
+    )
+    finding_b["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    # Only dependent B should spawn (A was deduped).
+    dep_children = [c for c in children if "event handler" in c.title.lower()]
+    assert len(dep_children) == 1, (
+        "dependent finding B must spawn as a child task"
+    )
+    dep = dep_children[0]
+    assert dep.status != TaskStatus.CANCELLED, (
+        "dependent with deduped sibling must not be CANCELLED as 'no provider'"
+    )
+    assert str(existing_foundation.id) in (dep.depends_on or []), (
+        "dependent must wire a depends_on edge to the existing in-flight foundation"
+    )
+    assert get_blocker_needs(dep) == [], (
+        "no unresolved need must be persisted when the edge was wired"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_task_prerequisite_rebinds_to_same_batch_design_lineage(
+    db_session, mocker
+):
+    """A dependent whose declared hash names a retitled same-batch design sibling
+    wires to that sibling via recorded finding lineage instead of blocking."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq08")
+    original_hash = _finding_hash(
+        "design: original serving contract",
+        "Original design finding before planner retitle",
+    )
+    provider = _make_finding(
+        title="design: supersession-aware serving confirmation",
+        direction_id=direction["id"],
+        finding_type="design",
+    )
+    provider["finding_hash"] = original_hash
+    dependent = _make_finding(
+        title="Implement serving confirmation guard",
+        direction_id=direction["id"],
+    )
+    dependent["prerequisite"] = {"kind": "task", "ref": original_hash}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[provider, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_title = {c.title: c for c in children}
+    design_child = by_title[provider["title"]]
+    dependent_child = by_title[dependent["title"]]
+
+    assert dependent_child.status != TaskStatus.BLOCKED
+    assert str(design_child.id) in (dependent_child.depends_on or [])
+    assert get_blocker_needs(dependent_child) == []
+    assert original_hash in (design_child.context or {}).get("finding_lineage", [])
+
+
+@_pytest.mark.asyncio
+async def test_observation_dependency_escalates_instead_of_blocking(
+    db_session, mocker
+):
+    """Observation/non-spawning findings cannot provide a task, so a dependent
+    whose only need is that finding escalates instead of entering BLOCKED."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq09")
+    observation = _make_finding(
+        title="obs: lane substrate layers a new system over pool/park-wake",
+        direction_id=direction["id"],
+        finding_type="design_doc_observation",
+    )
+    dependent = _make_finding(
+        title="Use lane substrate observation",
+        direction_id=direction["id"],
+    )
+    dependent["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[observation, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.title == dependent["title"]
+    assert child.status == TaskStatus.CANCELLED
+    assert get_blocker_needs(child) == []
+    assert (child.context or {}).get("prerequisite_escalated_to_parent") is True
+    assert (child.context or {}).get("prerequisite_escalation_reason") == (
+        "structurally_unresolvable"
+    )
 
 
 @_pytest.mark.asyncio

@@ -225,6 +225,31 @@ def get_blocker_needs(task: Task) -> list:
     return []
 
 
+def _raw_need_is_structurally_dead(raw: object) -> bool:
+    """Return True for needs that are structurally unresolvable at construction time.
+
+    Two derivations are supported — no caller needs to set an explicit flag:
+
+    1. Explicit flag: ``structurally_dead: True`` in the raw dict.
+    2. Observation-class label: when ``label`` (or ``ref``) starts with ``"obs:"``
+       (case-insensitive), the need points at an observation finding that never
+       spawns a task — no provider can ever exist.
+
+    This is the final construction guard in ``enter_blocked_state``: a caller
+    passing a structurally dead need gets CANCELLED+escalated, not BLOCKED.
+    """
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("structurally_dead") is True:
+        return True
+    # Observation-class: "obs: ..." labels can never spawn a provider task.
+    for field in ("label", "ref"):
+        val = raw.get(field)
+        if isinstance(val, str) and val.strip().lower().startswith("obs:"):
+            return True
+    return False
+
+
 def is_blocked(task: Task) -> bool:
     """True if the task is in the first-class BLOCKED state."""
     return task.status == TaskStatus.BLOCKED
@@ -304,6 +329,22 @@ def enter_blocked_state(
             continue
         seen_need_keys.add(key)
         normalized_needs.append(normalized)
+    if normalized_needs and all(
+        _raw_need_is_structurally_dead(raw) for raw in raw_needs
+    ):
+        meta["needs"] = normalized_needs
+        meta["need"] = normalized_needs[0]
+        meta["escalated"] = True
+        meta["escalation_detail"] = (
+            "structurally unresolvable prerequisite(s) refused at BLOCKED creation"
+        )
+        ctx = dict(task.context or {})
+        ctx[BLOCKER_CONTEXT_KEY] = meta
+        ctx["precondition_escalated_to_parent"] = True
+        task.context = ctx
+        task.status = TaskStatus.CANCELLED
+        task.latest_status_message = meta["escalation_detail"]
+        return meta
     if normalized_needs:
         meta["needs"] = normalized_needs
         meta["need"] = normalized_needs[0]

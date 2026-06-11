@@ -76,16 +76,23 @@ def _candidate_pr_number(candidate: Task) -> Optional[int]:
 
 
 def _match_task(ref: str, candidates: List[Task]) -> Optional[Task]:
-    """kind='task': the single candidate whose id OR finding-hash equals ``ref``.
+    """kind='task': the single candidate whose id, finding-hash, OR lineage matches ``ref``.
 
     Reuses the spawn-time resolver's explicit task-signal predicate
     (:func:`finding_deduplication.prerequisite_matches_task`) so a need that
     names its foundation by a non-UUID ``finding_hash`` — exactly how the
     producer records sibling/prerequisite needs — resolves here too, not only a
-    raw task id. When more than one candidate shares the signal, the CANONICAL
-    provider (earliest by ``created_at``, id-tiebroken) is returned so the
-    resume-time matcher attaches the dependent to the SAME foundation the
-    spawn-time resolver would pick.
+    raw task id. That predicate is LINEAGE-AWARE: it matches the provider's
+    canonical ``finding_hash`` OR any hash in its recorded
+    ``finding_lineage`` (:func:`finding_deduplication.task_finding_lineage`), so
+    a need keyed by an ORIGINAL finding hash still resolves onto a retitled /
+    split provider whose recomputed ``finding_hash`` has drifted (identity-drift;
+    audit case 2). Matching stays EXPLICIT — recorded lineage hashes only, never
+    fuzzy title overlap — and degrades gracefully to the bare exact-hash match on
+    older providers that carry no ``finding_lineage`` entry. When more than one
+    candidate shares the signal, the CANONICAL provider (earliest by
+    ``created_at``, id-tiebroken) is returned so the resume-time matcher attaches
+    the dependent to the SAME foundation the spawn-time resolver would pick.
 
     A non-exact ``ref`` (a title-like string rather than a task UUID / finding
     hash, per :func:`app.task_blocked.is_exact_task_ref`) can never identify a
@@ -187,6 +194,40 @@ def _match_need(need: Dict[str, Any], candidates: List[Task]) -> Optional[Task]:
     if kind == "capability":
         return _match_capability(ref, need, candidates)
     return None
+
+
+def need_is_structurally_unobservable(need: Dict[str, Any]) -> bool:
+    """True iff NO provider class can EVER satisfy ``need``.
+
+    A need is structurally unobservable when no future foundation, knowledge
+    document, or registry capability could ever bind it — so the resume sweep
+    re-arming the recheck on it would loop forever. This is the BOUNDED-OUTCOME
+    liveness guard: a residual need matching nothing live/completed/lineage/
+    knowledge/registry/dead AND proven unobservable here must reach a terminal
+    disposition immediately rather than re-arm indefinitely. Two provable cases:
+
+      * a malformed (non-dict) need — nothing can resolve it; and
+      * an observation-class / explicitly structurally-dead need — an ``obs:``
+        ref/label, or a ``structurally_dead`` flag (shared construction-time
+        detector :func:`app.task_blocked._raw_need_is_structurally_dead`):
+        observation findings never spawn a provider task, so no foundation can
+        ever exist.
+
+    Deliberately CONSERVATIVE: ANY other well-formed need is NEVER unobservable
+    here. A ``capability`` need may be advertised by a future provider or the
+    registry; an exact ``task`` / ``pr`` need may resolve to a foundation that
+    has not appeared yet; and even a NON-exact ``kind=task`` ref can be satisfied
+    by a durable KnowledgeDocument whose ``topic`` equals the ref (see
+    :func:`knowledge_substance_satisfies_need`). Only the construction-time
+    structurally-dead signal — never mere ref shape — proves unobservability, so
+    independent work and knowledge-satisfiable waiters are never falsely
+    terminated.
+    """
+    if not isinstance(need, dict):
+        return True
+    from app.task_blocked import _raw_need_is_structurally_dead
+
+    return _raw_need_is_structurally_dead(need)
 
 
 def _foundation_shipped(

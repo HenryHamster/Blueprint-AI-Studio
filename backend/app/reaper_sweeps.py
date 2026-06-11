@@ -892,15 +892,21 @@ async def _classify_blocker_needs(
     if working_caps is None:
         working_caps = set()
 
-    # Stranded-parent set so a ghost-merge / unshipped foundation does NOT satisfy
-    # a completed need — mirrors the respawn-dedup layer's "shipped" notion
-    # (finding_deduplication.build_dedup_state): a foundation whose rollup parent
-    # FAILED/CANCELLED, or COMPLETED without a merge-unblock signal, never reached
-    # the integration branch and must not silently unblock its dependents.
-    from app.landed_signal import has_merge_unblock_signal
-
+    # Stranded-parent set so a GENUINE ghost merge does NOT satisfy a completed
+    # need. LANDED-IN-BASE-LINEAGE semantics: the ghost-merge exclusion fires ONLY
+    # for a rollup parent that has terminally FAILED/CANCELLED — its staging branch
+    # is abandoned, so a child PR that merged into it never reached the dependent's
+    # base lineage. A parent that has merely NOT-YET-ROLLED-UP — still in flight,
+    # or COMPLETED while its rollup PR to integration is pending — is NOT stranded:
+    # the child's PR has already merged into the plan/staging branch that IS in the
+    # dependent's base lineage, so the dependent cuts from it and sees the code
+    # regardless of when the parent rollup integrates (audit case 3: a completed,
+    # exact-title provider whose PR merged into the plan branch must resume its
+    # dependent even before the rollup lands). Keying the strand on definitively
+    # FAILED/CANCELLED parents only preserves the genuine ghost-merge exclusion
+    # while no longer parking a dependent on a provider that genuinely landed in
+    # its base lineage.
     failed_parents = {c.id for c in dead}
-    failed_parents |= {c.id for c in completed if not has_merge_unblock_signal(c)}
 
     existing_edges = {str(d) for d in (task.depends_on or [])}
     for need in needs:
@@ -1271,6 +1277,7 @@ async def _apply_needs_disposition(
     """
     from sqlalchemy.orm.attributes import flag_modified
     from app.alert_dispatch import _resolve_blocked_escalation_alert
+    from app.blocked_need_resolution import need_is_structurally_unobservable
 
     # 1) ANY need names a terminally-dead foundation → cancel (both paths). A
     #    single provably-dead foundation makes the dependent impossible regardless
@@ -1288,6 +1295,39 @@ async def _apply_needs_disposition(
             pending_broadcasts=pending_broadcasts,
             give_up_class=GIVE_UP_FOUNDATION_DIED,
             need=disp.get("dead_need"),
+        )
+        return "cancelled"
+
+    # 1b) BOUNDED-OUTCOME LIVENESS INVARIANT. A residual need the sweep can prove
+    #     is STRUCTURALLY UNOBSERVABLE — an observation-class ("obs:") ref/label,
+    #     an explicit ``structurally_dead`` flag, or a malformed (non-dict) need —
+    #     matched NOTHING live/completed/lineage/knowledge/registry (it is in
+    #     ``residual``) and can never be matched by any future foundation. Re-arming
+    #     the recheck on it
+    #     would loop forever, so the dependent must reach a terminal disposition
+    #     NOW. Mirroring the dead-foundation cascade above, a SINGLE such residual
+    #     makes the task impossible (every recorded need must resolve to resume),
+    #     so escalate-and-cancel immediately regardless of how the other needs
+    #     resolved. This makes an indefinite recheck loop on an unobservable need
+    #     impossible by construction (the parked re-eval cap is the bound for
+    #     observable-but-unprovided needs; this is the bound for unobservable ones).
+    unobservable = [
+        n for n in disp["residual"] if need_is_structurally_unobservable(n)
+    ]
+    if unobservable:
+        await _cancel_blocker_as_dead(
+            task,
+            session,
+            detail=(
+                "A recorded prerequisite can never be satisfied by any foundation "
+                "— it names an observation-class or structurally-dead reference no "
+                "task will ever provide. Auto-cancelled (re-scope or re-point the "
+                "need to retry)."
+            ),
+            message="Cancelled — prerequisite is structurally unobservable",
+            pending_broadcasts=pending_broadcasts,
+            give_up_class=GIVE_UP_NEVER_SATISFIABLE,
+            need=unobservable[0],
         )
         return "cancelled"
 

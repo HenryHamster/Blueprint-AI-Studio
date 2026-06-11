@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 
 from app.blocked_need_resolution import (
     completed_foundation_for_need,
+    need_is_structurally_unobservable,
     need_matched_dead_foundation,
     need_satisfied_by_completed,
     resolve_blocked_need,
@@ -97,6 +98,53 @@ def test_task_need_title_like_ref_never_matches_titled_candidate():
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "task", "ref": "Build the auth subsystem"}
     assert resolve_blocked_need(blocked, need, [candidate]) is None
+
+
+# ── lineage-aware resume matching (identity drift / retitled-split provider) ──
+
+def test_task_need_resolves_to_retitled_provider_via_lineage():
+    """Audit case 2: a need keyed by the ORIGINAL finding hash resolves onto a
+    retitled / split provider whose recomputed ``finding_hash`` has drifted,
+    because the provider records the original hash in its ``finding_lineage``.
+    Hash-only matching could never bind the renamed provider — lineage does."""
+    original = "aaaabbbbccccdddd"
+    provider = _task(
+        title="feat: agent before/after viewport screenshot pilot (Phase 0)",
+        context={"finding_hash": "1111222233334444", "finding_lineage": [original]},
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": original}
+    # Sanity: the provider's recomputed hash is NOT the need ref (genuine drift).
+    assert provider.context["finding_hash"] != original
+    assert resolve_blocked_need(blocked, need, [provider]) is provider
+
+
+def test_completed_retitled_provider_satisfies_need_via_lineage():
+    """The completed / landed resume path is lineage-aware too: a shipped,
+    retitled provider satisfies a need keyed by the ORIGINAL finding hash."""
+    original = "feeddeadbeef0001"
+    provider = _shipped(
+        title="feat: agent before/after viewport screenshot capture loop",
+        context={"finding_hash": "0000111122223333", "finding_lineage": [original]},
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": original}
+    assert need_satisfied_by_completed(blocked, need, [provider]) is True
+    assert completed_foundation_for_need(blocked, need, [provider]) is provider
+
+
+def test_task_need_lineage_degrades_to_exact_hash_when_absent():
+    """Graceful degradation: a provider carrying NO ``finding_lineage`` (older
+    task) still resolves by its exact ``finding_hash``, and a need by a hash it
+    neither stamps nor lists in lineage still misses."""
+    provider = _task(context={"finding_hash": "abcabcabcabc0001"})
+    blocked = _task(status=TaskStatus.BLOCKED)
+    assert resolve_blocked_need(
+        blocked, {"kind": "task", "ref": "abcabcabcabc0001"}, [provider]
+    ) is provider
+    assert resolve_blocked_need(
+        blocked, {"kind": "task", "ref": "abcabcabcabc9999"}, [provider]
+    ) is None
 
 
 # ── shared exact-task-ref policy ─────────────────────────────────────────────
@@ -415,6 +463,134 @@ def test_malformed_need_returns_none():
     assert resolve_blocked_need(blocked, {"kind": "task"}, [_task()]) is None
     assert resolve_blocked_need(blocked, {"ref": "x"}, [_task()]) is None
     assert resolve_blocked_need(blocked, {"kind": "bogus", "ref": "x"}, [_task()]) is None
+
+
+# ── enter_blocked_state construction guard ────────────────────────────────────
+
+def _make_blocked_task(**kwargs) -> "Task":
+    return _task(status=TaskStatus.IN_PROGRESS, **kwargs)
+
+
+def test_enter_blocked_state_construction_guard_fires_on_explicit_flag():
+    """A need carrying structurally_dead=True is refused at BLOCKED creation;
+    the task is CANCELLED+escalated rather than persisted as BLOCKED."""
+    from app.task_blocked import enter_blocked_state
+
+    task = _make_blocked_task()
+    raw_dead_need = {"kind": "task", "ref": "deadbeefcafe0001", "structurally_dead": True}
+    enter_blocked_state(
+        task,
+        waiting_on="some_prerequisite",
+        reason="test",
+        need=raw_dead_need,
+    )
+    assert task.status == TaskStatus.CANCELLED, (
+        "structurally_dead need must escalate to CANCELLED, not persist BLOCKED"
+    )
+    assert (task.context or {}).get("precondition_escalated_to_parent") is True
+
+
+def test_enter_blocked_state_construction_guard_fires_on_obs_label():
+    """A need whose label starts with 'obs:' is observation-class and structurally
+    dead — enter_blocked_state must CANCEL+escalate instead of persisting BLOCKED."""
+    from app.task_blocked import enter_blocked_state
+
+    task = _make_blocked_task()
+    obs_need = {
+        "kind": "task",
+        "ref": "deadbeefcafe0002",
+        "label": "obs: lane substrate layers a new system over pool/park-wake",
+    }
+    enter_blocked_state(
+        task,
+        waiting_on="obs_finding",
+        reason="test",
+        need=obs_need,
+    )
+    assert task.status == TaskStatus.CANCELLED, (
+        "obs:-labelled need is observation-class and must escalate, not persist BLOCKED"
+    )
+    assert (task.context or {}).get("precondition_escalated_to_parent") is True
+
+
+
+def test_enter_blocked_state_construction_guard_is_non_vacuous_for_valid_hash_with_obs_label():
+    """The critical guard path: a valid finding-hash ref (passes build_need) paired
+    with an obs-class label must STILL be refused — the guard fires before persisting."""
+    from app.task_blocked import _raw_need_is_structurally_dead
+
+    # Verify the detector fires correctly.
+    assert _raw_need_is_structurally_dead(
+        {"kind": "task", "ref": "deadbeefcafe0003", "label": "obs: some observation"}
+    ) is True
+    assert _raw_need_is_structurally_dead(
+        {"kind": "task", "ref": "deadbeefcafe0003", "label": "OBS: case-insensitive"}
+    ) is True
+    assert _raw_need_is_structurally_dead(
+        {"kind": "task", "ref": "deadbeefcafe0004", "structurally_dead": True}
+    ) is True
+    # A normal task need must NOT be detected as dead.
+    assert _raw_need_is_structurally_dead(
+        {"kind": "task", "ref": "deadbeefcafe0005", "label": "Implement serving guard"}
+    ) is False
+    assert _raw_need_is_structurally_dead(
+        {"kind": "task", "ref": "deadbeefcafe0006"}
+    ) is False
+
+
+# ── need_is_structurally_unobservable (bounded-outcome liveness guard) ────────
+
+def test_unobservable_need_detects_obs_class_and_structurally_dead():
+    """A need no provider class can EVER satisfy — observation-class ("obs:")
+    ref/label or an explicit structurally_dead flag — is unobservable, so the
+    sweep must terminate it rather than re-arm the recheck forever."""
+    # Observation-class by label (ref is a valid hash, but obs label dooms it).
+    assert need_is_structurally_unobservable(
+        {"kind": "task", "ref": "deadbeefcafe0001",
+         "label": "obs: lane substrate layers a new system over pool/park-wake"}
+    ) is True
+    # Observation-class by ref prefix, case-insensitive.
+    assert need_is_structurally_unobservable(
+        {"kind": "task", "ref": "OBS: some observation"}
+    ) is True
+    # Explicit structurally_dead flag.
+    assert need_is_structurally_unobservable(
+        {"kind": "task", "ref": "deadbeefcafe0002", "structurally_dead": True}
+    ) is True
+
+
+def test_unobservable_need_detects_malformed_non_dict():
+    """A malformed (non-dict) need can never bind to any resolver path."""
+    assert need_is_structurally_unobservable(None) is True
+    assert need_is_structurally_unobservable("obs: not a dict") is True
+
+
+def test_observable_needs_are_never_structurally_unobservable():
+    """Conservative: ONLY the construction-time structurally-dead signal proves
+    unobservability — never mere ref shape. A capability may be advertised later,
+    an exact task / PR may yet resolve, an empty dict carries no dead signal, and
+    even a NON-exact kind=task ref can be satisfied by a KnowledgeDocument whose
+    topic equals it — so none of these is falsely terminated."""
+    assert need_is_structurally_unobservable({}) is False
+    assert need_is_structurally_unobservable(
+        {"kind": "capability", "ref": "payment-core"}
+    ) is False
+    assert need_is_structurally_unobservable(
+        {"kind": "task", "ref": "deadbeefcafe0003"}
+    ) is False
+    assert need_is_structurally_unobservable(
+        {"kind": "task", "ref": str(uuid.uuid4())}
+    ) is False
+    assert need_is_structurally_unobservable({"kind": "pr", "ref": "8123"}) is False
+    # A non-exact task ref is knowledge-topic-satisfiable, so NOT unobservable
+    # (this is the hollow-compute waiter shape that must stay observable).
+    assert need_is_structurally_unobservable(
+        {"kind": "task", "ref": "compute-hollow-need"}
+    ) is False
+    # A title-like task ref is likewise NOT proven unobservable by shape alone.
+    assert need_is_structurally_unobservable(
+        {"kind": "task", "ref": "Build the auth subsystem"}
+    ) is False
 
 
 def test_unknown_kind_returns_none():

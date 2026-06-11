@@ -96,6 +96,39 @@ def _task_finding_hash(task: Task) -> str | None:
     return str(value) if value else None
 
 
+def task_finding_lineage(task: Task) -> set[str]:
+    """Return the explicit finding hashes this task descends from.
+
+    The lineage is intentionally hash-only. It includes the task's canonical
+    ``finding_hash`` plus any spawn-time ``finding_lineage`` entries recorded on
+    the task context, so retitled/split findings can still satisfy a prerequisite
+    keyed by their original hash without adding fuzzy title matching.
+    """
+    ctx = _task_context(task)
+    lineage: set[str] = set()
+    primary = ctx.get("finding_hash")
+    if primary:
+        lineage.add(str(primary))
+    raw = ctx.get("finding_lineage")
+    if isinstance(raw, (list, set, tuple)):
+        lineage.update(str(v) for v in raw if v)
+    elif isinstance(raw, str) and raw:
+        lineage.add(raw)
+    return lineage
+
+
+def need_matches_task_lineage(need: dict, task: Task | None) -> bool:
+    """True when a task-kind need ref is in the task's explicit lineage set."""
+    if task is None or not isinstance(need, dict):
+        return False
+    if need.get("kind") != "task":
+        return False
+    canonical_ref = canonicalize_exact_task_ref(need.get("ref"))
+    if canonical_ref is None:
+        return False
+    return canonical_ref in task_finding_lineage(task)
+
+
 def _coerce_datetime_for_compare(value: datetime, reference: datetime) -> datetime:
     if value.tzinfo is None and reference.tzinfo is not None:
         return value.replace(tzinfo=timezone.utc)
@@ -219,7 +252,11 @@ def prerequisite_matches_task(normalized: dict, task: Optional[Task]) -> bool:
         canonical_ref = canonicalize_exact_task_ref(ref)
         if canonical_ref is None:
             return False
-        return canonical_ref == str(task.id) or canonical_ref == _task_finding_hash(task)
+        return (
+            canonical_ref == str(task.id)
+            or canonical_ref == _task_finding_hash(task)
+            or need_matches_task_lineage({"kind": "task", "ref": canonical_ref}, task)
+        )
     if kind == "capability":
         return ref.lower() in _task_capability_markers(task)
     return False

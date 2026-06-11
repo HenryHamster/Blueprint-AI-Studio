@@ -26,6 +26,7 @@ from app.finding_deduplication import (
     prerequisite_matches_task,
     resolve_prerequisite_task,
     select_canonical_provider,
+    task_finding_lineage,
 )
 from app.models import Task, TaskStatus
 
@@ -1286,6 +1287,23 @@ def test_resolve_prerequisite_task_matches_by_finding_hash():
     assert resolve_prerequisite_task(prereq, [other, foundation]) is foundation
 
 
+def test_resolve_prerequisite_task_matches_by_recorded_finding_lineage():
+    foundation = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "finding_hash": "1111222233334444",
+            "finding_lineage": ["aaaabbbbccccdddd"],
+        },
+    )
+    prereq = {"kind": "task", "ref": "aaaabbbbccccdddd"}
+
+    assert task_finding_lineage(foundation) == {
+        "1111222233334444",
+        "aaaabbbbccccdddd",
+    }
+    assert resolve_prerequisite_task(prereq, [foundation]) is foundation
+
+
 def test_resolve_prerequisite_task_capability_exact_marker_match():
     foundation = _make_task(
         status=TaskStatus.IN_PROGRESS, context={"provides_capability": "Auth-Service"}
@@ -1440,6 +1458,16 @@ def test_prerequisite_matches_task_matches_by_id():
 def test_prerequisite_matches_task_matches_by_finding_hash():
     task = _make_task(context={"finding_hash": "abc123def4560000"})
     assert prerequisite_matches_task({"kind": "task", "ref": "abc123def4560000"}, task) is True
+
+
+def test_prerequisite_matches_task_matches_by_finding_lineage():
+    task = _make_task(
+        context={
+            "finding_hash": "abc123def4560000",
+            "finding_lineage": ["feedfacecafebeef"],
+        }
+    )
+    assert prerequisite_matches_task({"kind": "task", "ref": "feedfacecafebeef"}, task) is True
 
 
 def test_prerequisite_matches_task_matches_capability_marker_case_insensitive():
