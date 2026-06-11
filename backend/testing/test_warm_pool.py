@@ -274,13 +274,20 @@ async def test_register_list_and_state_transitions(db_session):
     assert idle.idle_since is not None
 
     # Lease it, then release back to IDLE.
+    owner_task_id = uuid.uuid4()
     leased = await lease_idle_pool_vm(
-        db_session, project_id=project.id, account_id="acct-1"
+        db_session,
+        project_id=project.id,
+        account_id="acct-1",
+        leased_task_id=owner_task_id,
     )
     await db_session.commit()
     assert leased.state == PoolVmState.LEASED
+    assert leased.leased_task_id == owner_task_id
 
-    released = await release_pool_vm(db_session, "vm-crud")
+    released = await release_pool_vm(
+        db_session, "vm-crud", owning_task_id=owner_task_id
+    )
     await db_session.commit()
     assert released.state == PoolVmState.IDLE
     assert released.leased_task_id is None
@@ -319,19 +326,42 @@ async def test_release_pool_vm_is_guarded_to_leased_only(db_session):
     await db_session.commit()
 
     # PROVISIONING is NOT a lease return — guard refuses (no-op).
-    assert await release_pool_vm(db_session, "vm-guard") is None
+    owner_task_id = uuid.uuid4()
+
+    assert (
+        await release_pool_vm(
+            db_session, "vm-guard", owning_task_id=owner_task_id
+        )
+        is None
+    )
     assert (await get_pool_vm(db_session, "vm-guard")).state == PoolVmState.PROVISIONING
 
     # Promote -> lease, then release: LEASED -> IDLE, lease binding cleared.
     await mark_pool_vm_idle(db_session, "vm-guard")
     await db_session.commit()
     leased = await lease_idle_pool_vm(
-        db_session, project_id=project.id, account_id="acct-1"
+        db_session,
+        project_id=project.id,
+        account_id="acct-1",
+        leased_task_id=owner_task_id,
     )
     await db_session.commit()
     assert leased.state == PoolVmState.LEASED
+    assert leased.leased_task_id == owner_task_id
 
-    released = await release_pool_vm(db_session, "vm-guard")
+    assert (
+        await release_pool_vm(
+            db_session, "vm-guard", owning_task_id=uuid.uuid4()
+        )
+        is None
+    )
+    await db_session.refresh(leased)
+    assert leased.state == PoolVmState.LEASED
+    assert leased.leased_task_id == owner_task_id
+
+    released = await release_pool_vm(
+        db_session, "vm-guard", owning_task_id=owner_task_id
+    )
     await db_session.commit()
     assert released.state == PoolVmState.IDLE
     assert released.leased_task_id is None
@@ -341,8 +371,51 @@ async def test_release_pool_vm_is_guarded_to_leased_only(db_session):
     # A RETIRING member is NEVER pulled back to IDLE by a late/duplicate release.
     await mark_pool_vm_retiring(db_session, "vm-guard")
     await db_session.commit()
-    assert await release_pool_vm(db_session, "vm-guard") is None
+    assert (
+        await release_pool_vm(
+            db_session, "vm-guard", owning_task_id=owner_task_id
+        )
+        is None
+    )
     assert (await get_pool_vm(db_session, "vm-guard")).state == PoolVmState.RETIRING
+
+
+@pytest.mark.asyncio
+async def test_release_pool_vm_owner_can_stamp_lane_reservation(db_session):
+    project = await _make_project(db_session, name="Release Lane Owner")
+    lane_id = uuid.uuid4()
+    owner_task_id = uuid.uuid4()
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-lane-owner",
+        project_id=project.id,
+        account_id="acct-1",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    leased = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        account_id="acct-1",
+        leased_task_id=owner_task_id,
+    )
+    await db_session.commit()
+    assert leased.state == PoolVmState.LEASED
+
+    released = await release_pool_vm(
+        db_session,
+        "vm-lane-owner",
+        owning_task_id=owner_task_id,
+        lane_id=str(lane_id),
+    )
+    await db_session.commit()
+
+    assert released is not None
+    assert released.state == PoolVmState.IDLE
+    assert released.leased_task_id is None
+    assert released.reserved_lane_id == lane_id
+    assert released.reservation_expires_at is not None
 
 
 # ---------------------------------------------------------------------------

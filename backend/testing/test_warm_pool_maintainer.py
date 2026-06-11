@@ -52,6 +52,7 @@ from app.warm_pool_maintainer import (
     run_pool_maintainer_cycle,
     sweep_idle_pool_vms,
 )
+from testing.conftest import TestingSessionLocal
 
 
 class _NoCloseSession:
@@ -2244,6 +2245,104 @@ async def test_maintainer_clears_expired_reservation_banks_lane_cost(
         assert abs(lane.reserved_idle_cost_usd_total - span_cost) < 1e-9, (
             "Lane attribution must equal the fleet-ledger settled cost"
         )
+    finally:
+        if prior_lanes is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes
+
+
+@pytest.mark.asyncio
+async def test_expired_reservation_sweep_skips_concurrently_leased_member(
+    db_session, warm_pool_on, mocker
+):
+    """If a member is leased after the unlocked expiry scan, the sweep must not
+    clear fields or settle cost unless it can lock/revalidate the same IDLE
+    reservation."""
+    prior_lanes = _runtime_config.get("improvement_lanes_enabled")
+    _runtime_config["improvement_lanes_enabled"] = True
+    try:
+        project = await _make_project(db_session, name="Reserve Expire Race")
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="race lane",
+            goal="race goal",
+            branch_name="race-branch",
+            base_branch="main",
+            workspace_state="WARM_RESERVED",
+            reserved_idle_cost_usd_total=0.0,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        member = await _register(
+            db_session, project, "agent-vm-lane-race", PoolVmState.IDLE
+        )
+        member.idle_since = _utcnow() - timedelta(seconds=120)
+        member.reserved_lane_id = lane.id
+        member.reservation_expires_at = _utcnow() - timedelta(seconds=30)
+        db_session.add(member)
+        await db_session.commit()
+        await db_session.refresh(member)
+
+        racing_task_id = uuid.uuid4()
+        original_execute = db_session.execute
+        race_committed = False
+
+        async def _execute_with_concurrent_lease(*args, **kwargs):
+            nonlocal race_committed
+            statement = args[0] if args else kwargs.get("statement")
+            result = await original_execute(*args, **kwargs)
+            statement_text = str(statement).lower()
+            if (
+                not race_committed
+                and "poolvm" in statement_text
+                and "reservation_expires_at" in statement_text
+                and "reserved_lane_id" in statement_text
+                and "for update" not in statement_text
+            ):
+                race_committed = True
+                async with TestingSessionLocal() as fresh_session:
+                    leased = await lease_idle_pool_vm(
+                        fresh_session,
+                        project_id=project.id,
+                        leased_task_id=racing_task_id,
+                    )
+                    assert leased is not None
+                    assert leased.vm_instance_id == "agent-vm-lane-race"
+                    await fresh_session.commit()
+            return result
+
+        mocker.patch.object(
+            db_session, "execute", side_effect=_execute_with_concurrent_lease
+        )
+
+        await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+
+        assert race_committed is True
+        await db_session.refresh(member)
+        assert member.state == PoolVmState.LEASED
+        assert member.leased_task_id == racing_task_id
+        assert member.idle_since is None
+        assert member.reserved_lane_id is None
+        assert member.reservation_expires_at is None
+
+        spans = list(
+            (
+                await original_execute(
+                    select(PoolIdleSpan).where(
+                        PoolIdleSpan.vm_instance_id == "agent-vm-lane-race"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(spans) == 1, "sweep must not double-bank a racing lease span"
+
+        await db_session.refresh(lane)
+        assert lane.reserved_idle_cost_usd_total == 0.0
     finally:
         if prior_lanes is None:
             _runtime_config.pop("improvement_lanes_enabled", None)

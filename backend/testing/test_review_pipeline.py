@@ -12956,10 +12956,6 @@ async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
 
     # The implement (create) phase just completed on a warm pool member.
     vm_id = "pool-vm-lane-1"
-    member = PoolVm(
-        vm_instance_id=vm_id, project_id=project.id, state=PoolVmState.LEASED
-    )
-    db_session.add(member)
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.EVALUATING,
@@ -12987,6 +12983,14 @@ async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
     db_session.add(source_task)
     await db_session.commit()
     await db_session.refresh(source_task)
+    member = PoolVm(
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        leased_task_id=source_task.id,
+    )
+    db_session.add(member)
+    await db_session.commit()
 
     # ── Implement completion → COLD review ──
     review, created = await _spawn_pipeline_task(

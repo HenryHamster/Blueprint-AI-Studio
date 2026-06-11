@@ -1304,10 +1304,14 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     from app.efficiency_snapshot import settle_pool_vm_idle_cost
     from app.runtime_config_state import is_improvement_lanes_enabled
 
-    expired_reserved = list(
+    expired_reserved_candidates = list(
         (
             await session.execute(
-                select(PoolVm).where(
+                select(
+                    PoolVm.id,
+                    PoolVm.reserved_lane_id,
+                    PoolVm.reservation_expires_at,
+                ).where(
                     PoolVm.state == PoolVmState.IDLE,
                     PoolVm.reserved_lane_id.isnot(None),
                     PoolVm.reservation_expires_at.isnot(None),
@@ -1315,17 +1319,37 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                 )
             )
         )
-        .scalars()
         .all()
     )
-    for member in expired_reserved:
-        lane_id = member.reserved_lane_id
+    cleared_expired_reservations = 0
+    for member_id, lane_id, expires_at in expired_reserved_candidates:
+        locked_member = (
+            (
+                await session.execute(
+                    select(PoolVm)
+                    .where(
+                        PoolVm.id == member_id,
+                        PoolVm.state == PoolVmState.IDLE,
+                        PoolVm.reserved_lane_id == lane_id,
+                        PoolVm.reservation_expires_at == expires_at,
+                        PoolVm.reservation_expires_at <= now,
+                    )
+                    .with_for_update(skip_locked=True)
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked_member is None:
+            continue
         # Settle idle cost for the fleet ledger; this also advances idle_since
         # to `now` so the same span is never billed twice.
-        accrued = settle_pool_vm_idle_cost(member, now=now, session=session)
-        member.reserved_lane_id = None
-        member.reservation_expires_at = None
-        session.add(member)
+        accrued = settle_pool_vm_idle_cost(locked_member, now=now, session=session)
+        locked_member.reserved_lane_id = None
+        locked_member.reservation_expires_at = None
+        session.add(locked_member)
+        cleared_expired_reservations += 1
         # Attribute the reserved-idle cost to the lane (additional write).
         if accrued > 0 and lane_id is not None and is_improvement_lanes_enabled():
             lane = await session.get(ImprovementLane, lane_id)
@@ -1336,11 +1360,11 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                 session.add(lane)
         logger.debug(
             "[WARM-POOL] cleared expired lane reservation vm=%s lane=%s accrued=$%.4f",
-            member.vm_instance_id,
+            locked_member.vm_instance_id,
             lane_id,
             accrued,
         )
-    if expired_reserved:
+    if cleared_expired_reservations:
         await session.commit()
 
     # --- Pass 2: main reaper loop ---

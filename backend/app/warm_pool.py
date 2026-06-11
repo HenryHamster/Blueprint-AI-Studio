@@ -594,6 +594,7 @@ async def release_pool_vm(
     session,
     vm_instance_id: str,
     *,
+    owning_task_id: uuid.UUID | str,
     lane_id: Optional[str] = None,
 ) -> Optional[PoolVm]:
     """Atomically return a LEASED member to the IDLE pool so it can be re-leased.
@@ -608,28 +609,32 @@ async def release_pool_vm(
 
     Unlike :func:`mark_pool_vm_idle` (which flips ANY state to IDLE — the
     booted-ready PROVISIONING->IDLE signal), this return is GUARDED to a
-    ``state == LEASED`` row locked ``FOR UPDATE SKIP LOCKED`` before it is
-    flipped to IDLE, so a member a concurrent reaper/maintainer already moved to
-    RETIRING (mid-teardown) is NEVER resurrected onto the leasable set, and a
-    duplicate completion signal is a race-safe no-op. Returns the now-IDLE
-    member, or None when no LEASED row matches (unknown / already reconciled /
-    retiring). The caller owns the transaction (commit).
+    ``state == LEASED`` row owned by ``owning_task_id`` and locked
+    ``FOR UPDATE SKIP LOCKED`` before it is flipped to IDLE, so a member a
+    concurrent reaper/maintainer already moved to RETIRING (mid-teardown) is
+    NEVER resurrected onto the leasable set, a duplicate completion signal is a
+    race-safe no-op, and a stale/non-owner task cannot return or reserve another
+    task's lease. Returns the now-IDLE member, or None when no owned LEASED row
+    matches (unknown / already reconciled / retiring / leased to another task).
+    The caller owns the transaction (commit).
 
     Idle-cost banking is preserved trivially: a LEASED member's ``idle_since`` is
     already None (cleared at lease time, with its accrued span banked then), so
     the fresh IDLE window simply restarts from now with nothing to erase.
 
     ``lane_id``: when supplied (improvement lanes enabled, caller passes the lane's
-    id), the member is returned IDLE stamped with ``reserved_lane_id`` /
+    id), the owned member is returned IDLE stamped with ``reserved_lane_id`` /
     ``reservation_expires_at`` so the lane's next phase can reclaim its warm
     workspace. A normal (no-lane) release stamps no reservation and clears any
     prior reservation fields.
     """
+    owner_id = uuid.UUID(str(owning_task_id))
     stmt = (
         select(PoolVm)
         .where(
             PoolVm.vm_instance_id == vm_instance_id,
             PoolVm.state == PoolVmState.LEASED,
+            PoolVm.leased_task_id == owner_id,
         )
         .with_for_update(skip_locked=True)
         .limit(1)
@@ -653,8 +658,10 @@ async def release_pool_vm(
         member.reservation_expires_at = None
     session.add(member)
     logger.info(
-        "[WARM-POOL] released pool VM vm_instance_id=%s -> IDLE (re-leasable) lane=%s",
+        "[WARM-POOL] released pool VM vm_instance_id=%s task=%s -> IDLE "
+        "(re-leasable) lane=%s",
         vm_instance_id,
+        owner_id,
         lane_id,
     )
     return member

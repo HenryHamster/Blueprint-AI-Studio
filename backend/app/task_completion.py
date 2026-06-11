@@ -1057,10 +1057,10 @@ async def _release_pool_member_if_terminal(
     # Only reclaim the member actually bound to THIS task: a vm_instance_id
     # reused across tasks must not let one task's terminal state pull back a
     # member leased to a different task.
-    if member.leased_task_id is not None and member.leased_task_id != task.id:
+    if member.leased_task_id != task.id:
         return None
     if status == TaskStatus.COMPLETED:
-        await release_pool_vm(session, vm_id)
+        await release_pool_vm(session, vm_id, owning_task_id=task.id)
         outcome = "idle"
     else:
         await mark_pool_vm_retiring(session, vm_id)

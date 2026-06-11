@@ -1430,6 +1430,7 @@ async def _compute_digest(
     if _digest_project is not None:
         from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
         _verdict_evaluated_at = _tv_utcnow().isoformat()
+        _pending_trial_verdicts: list[tuple[str, dict[str, Any]]] = []
         for _td in get_trial_definitions():
             _cap = _td["cap_name"]
             # Lane pilot uses its own multi-axis evaluator (KILL/ADOPT thresholds
@@ -1454,7 +1455,7 @@ async def _compute_digest(
                 arm_composition=_accum.get("arm_composition"),
                 receipt_only_trial=(_td.get("assignment_key") is None),
             )
-            record_trial_verdict(_digest_project, _cap, _verdict_entry)
+            _pending_trial_verdicts.append((_cap, _verdict_entry))
 
         # ── Lane pilot: dedicated multi-axis verdict path ─────────────────────
         # Uses compute_lane_pilot_aggregates -> evaluate_lane_pilot_verdict which
@@ -1463,9 +1464,10 @@ async def _compute_digest(
         # A KILL verdict degrades spawning + force-expires reservations; an
         # immediate_alert verdict posts a BLOCKER ProjectMessage.
         from app.review_fix_lane_pilot import (  # noqa: PLC0415
-            apply_lane_pilot_kill,
+            apply_lane_pilot_kill_in_transaction,
             compute_lane_pilot_aggregates,
             raise_gate_integrity_alert,
+            compute_lane_arm_time_medians,
         )
         if project_id is not None:
             _lane_aggs = await compute_lane_pilot_aggregates(session, project_id)
@@ -1478,7 +1480,6 @@ async def _compute_digest(
             try:
                 from app.lane_baseline_snapshot import read_version_lane_baseline  # noqa: PLC0415
                 from app.models import ReleaseVersion as _ReleaseVersion  # noqa: PLC0415
-                from app.review_fix_lane_pilot import compute_lane_arm_time_medians  # noqa: PLC0415
                 _latest_rv = (
                     await session.execute(
                         select(_ReleaseVersion)
@@ -1518,19 +1519,29 @@ async def _compute_digest(
                         }
             except Exception:
                 logger.warning("[LANE_PILOT] failed to compute lane_relay_comparison", exc_info=True)
-            record_trial_verdict(_digest_project, LANE_PILOT_CAP_NAME, _lane_verdict)
             if _lane_verdict.get("verdict") == "KILL":
-                await apply_lane_pilot_kill(
+                await apply_lane_pilot_kill_in_transaction(
                     session,
                     project_id,
+                    verdict_entry=_lane_verdict,
                     reason=_lane_verdict.get("verdict_reason", "digest_eval"),
+                    alert_detail=(
+                        str(_lane_verdict.get("verdict_reason", ""))
+                        if _lane_verdict.get("immediate_alert")
+                        else None
+                    ),
                 )
-            if _lane_verdict.get("immediate_alert"):
+            elif _lane_verdict.get("immediate_alert"):
                 await raise_gate_integrity_alert(
                     session,
                     project_id,
                     detail=str(_lane_verdict.get("verdict_reason", "")),
                 )
+            record_trial_verdict(_digest_project, LANE_PILOT_CAP_NAME, _lane_verdict)
+            _pending_trial_verdicts.append((LANE_PILOT_CAP_NAME, _lane_verdict))
+
+        for _cap, _verdict_entry in _pending_trial_verdicts:
+            record_trial_verdict(_digest_project, _cap, _verdict_entry)
 
         try:
             await session.flush()

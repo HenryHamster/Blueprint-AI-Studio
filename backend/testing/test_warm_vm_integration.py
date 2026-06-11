@@ -30,7 +30,17 @@ from datetime import datetime, timedelta
 import pytest
 from httpx import AsyncClient
 
-from app.models import PoolIdleCostLedger, PoolIdleSpan, Project, PoolVmState, Task, TaskStatus
+from app.models import (
+    ImprovementLane,
+    ImprovementLaneStatus,
+    PoolIdleCostLedger,
+    PoolIdleSpan,
+    PoolVm,
+    Project,
+    PoolVmState,
+    Task,
+    TaskStatus,
+)
 from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.review_pipeline import _spawn_pipeline_task
 from testing.conftest import TestingSessionLocal
@@ -897,6 +907,114 @@ async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
         assert funnel["pool_lease_hits"] == 1
         assert funnel["cold_dispatches"] == 0
         assert funnel["pool_hit_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_warm_pool_non_owner_terminal_and_checkpoint_do_not_release_or_reserve(
+    db_session, mocker
+):
+    """A stale task with the same VM id cannot return or lane-reserve another
+    task's pool lease from either terminal completion or checkpoint flow."""
+    from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+    from app.task_completion import _release_pool_member_if_terminal
+
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=mocker.AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=mocker.AsyncMock,
+        return_value=True,
+    )
+
+    with _warm_pool_enabled():
+        project = Project(name="Warm Pool Ownership Guard", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        vm_id = f"agent-vm-owner-{uuid.uuid4().hex}"
+        owner_task = Task(
+            project_id=project.id,
+            title="Owner task",
+            payloads=[{"type": "create", "prompt": "owner", "base_branch": "main"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=vm_id,
+            context={"scope": "small"},
+        )
+        stale_task = Task(
+            project_id=project.id,
+            title="Stale task",
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "stale",
+                    "base_branch": "main",
+                    "branch": "feat/stale",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            context={"scope": "small"},
+        )
+        db_session.add_all([owner_task, stale_task])
+        await db_session.commit()
+        await db_session.refresh(owner_task)
+        await db_session.refresh(stale_task)
+
+        member = PoolVm(
+            vm_instance_id=vm_id,
+            project_id=project.id,
+            state=PoolVmState.LEASED,
+            leased_task_id=owner_task.id,
+            idle_since=None,
+        )
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="ownership lane",
+            goal="ownership goal",
+            status=ImprovementLaneStatus.ACTIVE.value,
+            branch_name="feat/stale",
+            base_branch="main",
+            current_task_id=stale_task.id,
+            workspace_state="LEASED",
+            workspace_vm_instance_id=vm_id,
+        )
+        db_session.add_all([member, lane])
+        await db_session.commit()
+        await db_session.refresh(member)
+        await db_session.refresh(lane)
+
+        released = await _release_pool_member_if_terminal(
+            stale_task,
+            TaskStatus.COMPLETED,
+            db_session,
+        )
+        assert released is None
+        await db_session.refresh(member)
+        assert member.state == PoolVmState.LEASED
+        assert member.leased_task_id == owner_task.id
+
+        checkpointed = await checkpoint_and_reserve_on_phase_complete(
+            db_session,
+            stale_task,
+            lane,
+            sha="abc1234def5678",
+            summary="stale checkpoint",
+        )
+        assert checkpointed is True
+        await db_session.refresh(member)
+        await db_session.refresh(lane)
+        assert member.state == PoolVmState.LEASED
+        assert member.leased_task_id == owner_task.id
+        assert member.reserved_lane_id is None
+        assert member.reservation_expires_at is None
+        assert lane.status == ImprovementLaneStatus.PARKED.value
+        assert lane.last_checkpoint_sha == "abc1234def5678"
+        assert lane.workspace_state == "LEASED"
+        assert lane.workspace_vm_instance_id == vm_id
 
 
 @pytest.mark.asyncio

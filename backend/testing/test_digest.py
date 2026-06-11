@@ -1,20 +1,29 @@
 """Integration tests for /api/admin/digest and /api/admin/activity endpoints."""
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 
 from app.main import app
 from app.models import (
+    ImprovementLane,
+    ImprovementLaneStatus,
+    PoolVm,
+    PoolVmState,
+    Project,
+    ProjectMessage,
     Task,
     TaskStatus,
     ResidualRemediationCase,
     ResidualCaseStatus,
     ReleaseVersion,
 )
+from app.capability_trial_verdict import LANE_PILOT_ASSIGNMENT_KEY, LANE_PILOT_CAP_NAME
 from app.routers.admin_analytics import _derive_completed_at
 from app.routers.admin_digest import _compute_digest
 from app.digest_metrics import (
@@ -89,6 +98,159 @@ async def test_compute_digest_counts_active_tasks_without_display_row_cap(db_ses
     assert data["queued_count"] == 525
     assert data["running_count"] == 0
     assert len(data["active_tasks"]) == 5
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_kill_survives_digest_session_rollback(db_session):
+    """A digest-computed lane-pilot KILL is committed outside the digest session."""
+    from app.shared_state import runtime_config
+
+    previous_flag = runtime_config.get("review_fix_lane_pilot_enabled")
+    runtime_config["review_fix_lane_pilot_enabled"] = True
+    try:
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="Digest KILL lane",
+            goal="prove durable kill",
+            branch_name="lane/digest-kill",
+            base_branch="main",
+            status=ImprovementLaneStatus.ACTIVE.value,
+            pilot_arm="lane",
+        )
+        db_session.add(lane)
+        await db_session.flush()
+        db_session.add(
+            PoolVm(
+                vm_instance_id="digest-kill-reserved-vm",
+                project_id=project.id,
+                state=PoolVmState.IDLE,
+                reserved_lane_id=lane.id,
+                reservation_expires_at=_utcnow() + timedelta(hours=1),
+            )
+        )
+        for idx in range(3):
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    title=f"Lane review leaked context {idx}",
+                    status=TaskStatus.COMPLETED,
+                    payloads=[{"type": "review"}],
+                    context={
+                        LANE_PILOT_ASSIGNMENT_KEY: "lane",
+                        "improvement_lane_id": str(lane.id),
+                    },
+                )
+            )
+        await db_session.commit()
+
+        Session = async_sessionmaker(
+            db_session.bind,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+
+        async with Session() as digest_session:
+            result = await _compute_digest(
+                hours=24, project_id=project.id, session=digest_session
+            )
+            assert result["capability_adoption_verdicts"][LANE_PILOT_CAP_NAME][
+                "verdict"
+            ] == "KILL"
+            await digest_session.rollback()
+
+        async with Session() as fresh:
+            stored_project = await fresh.get(Project, project.id)
+            stored_verdict = stored_project.capability_adoption_verdicts[
+                LANE_PILOT_CAP_NAME
+            ]
+            assert stored_verdict["verdict"] == "KILL"
+            assert stored_verdict["verdict_reason"] == (
+                "gate_integrity_violations_exceeded"
+            )
+            stored_lane = await fresh.get(ImprovementLane, lane.id)
+            assert stored_lane.status == ImprovementLaneStatus.KILLED.value
+            stored_vm = (
+                await fresh.execute(
+                    select(PoolVm).where(
+                        PoolVm.vm_instance_id == "digest-kill-reserved-vm"
+                    )
+                )
+            ).scalars().one()
+            assert stored_vm.reserved_lane_id is None
+            assert stored_vm.reservation_expires_at is None
+            messages = (
+                await fresh.execute(
+                    select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+                )
+            ).scalars().all()
+            assert len(messages) == 1
+            assert messages[0].context["dedupe_key"] == (
+                "review_fix_lane_gate_integrity_violation"
+            )
+
+        assert runtime_config["review_fix_lane_pilot_enabled"] is False
+
+        async with Session() as digest_session:
+            await _compute_digest(hours=24, project_id=project.id, session=digest_session)
+            await digest_session.rollback()
+
+        async with Session() as fresh:
+            stored_lane = await fresh.get(ImprovementLane, lane.id)
+            assert stored_lane.status == ImprovementLaneStatus.KILLED.value
+            messages = (
+                await fresh.execute(
+                    select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+                )
+            ).scalars().all()
+            assert len(messages) == 1
+    finally:
+        if previous_flag is None:
+            runtime_config.pop("review_fix_lane_pilot_enabled", None)
+        else:
+            runtime_config["review_fix_lane_pilot_enabled"] = previous_flag
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_immediate_alert_on_continue_is_not_dropped(db_session, mocker):
+    """A CONTINUE verdict with immediate_alert still raises the operator alert."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.review_fix_lane_pilot.compute_lane_pilot_aggregates",
+        new_callable=AsyncMock,
+        return_value={},
+    )
+    mocker.patch(
+        "app.routers.admin_digest.evaluate_lane_pilot_verdict",
+        return_value={
+            "verdict": "CONTINUE",
+            "verdict_reason": "treatment_not_engaging",
+            "immediate_alert": True,
+        },
+    )
+    raise_alert = mocker.patch(
+        "app.review_fix_lane_pilot.raise_gate_integrity_alert",
+        new_callable=AsyncMock,
+    )
+    kill_lane = mocker.patch(
+        "app.review_fix_lane_pilot.apply_lane_pilot_kill_in_transaction",
+        new_callable=AsyncMock,
+    )
+
+    await _compute_digest(hours=24, project_id=project.id, session=db_session)
+
+    raise_alert.assert_awaited_once_with(
+        db_session, project.id, detail="treatment_not_engaging"
+    )
+    kill_lane.assert_not_awaited()
 
 
 @pytest.mark.asyncio

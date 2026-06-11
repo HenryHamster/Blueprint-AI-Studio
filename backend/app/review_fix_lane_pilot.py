@@ -42,7 +42,7 @@ import uuid
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # Canonical keys/constants are OWNED by the measurement subtask — import them
 # verbatim, never re-type the literals (a drifted key silently de-populates the
@@ -540,7 +540,12 @@ async def checkpoint_and_reserve_on_phase_complete(
         try:
             from app.warm_pool import release_pool_vm
 
-            member = await release_pool_vm(session, vm_id, lane_id=str(lane.id))
+            member = await release_pool_vm(
+                session,
+                vm_id,
+                owning_task_id=source_task.id,
+                lane_id=str(lane.id),
+            )
             if member is not None:
                 lane.workspace_state = WORKSPACE_WARM_RESERVED
                 lane.workspace_vm_instance_id = vm_id
@@ -794,6 +799,53 @@ async def apply_lane_pilot_kill(
         "lanes_killed": lanes_killed,
         "reason": reason,
     }
+
+
+async def apply_lane_pilot_kill_in_transaction(
+    source_session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    verdict_entry: dict[str, Any],
+    reason: str,
+    alert_detail: str | None = None,
+) -> dict:
+    """Persist a lane-pilot KILL in an explicit write-owned transaction.
+
+    Digest computation runs on read/request sessions that may be rolled back by
+    callers after the response is computed.  KILL is a safety control, so it
+    must not depend on that outer session committing.
+    """
+    from app.capability_trial_verdict import record_trial_verdict
+    from app.database import resolve_async_engine
+    from app.models import Project
+
+    factory = async_sessionmaker(
+        resolve_async_engine(source_session),
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with factory() as session:
+        try:
+            project = await session.get(Project, project_id)
+            if project is None:
+                raise ValueError(f"Project {project_id} not found for lane-pilot KILL")
+
+            prior = (
+                project.capability_adoption_verdicts.get(LANE_PILOT_CAP_NAME)
+                if isinstance(project.capability_adoption_verdicts, dict)
+                else None
+            )
+            if not (isinstance(prior, dict) and prior.get("verdict") == "KILL"):
+                record_trial_verdict(project, LANE_PILOT_CAP_NAME, verdict_entry)
+
+            result = await apply_lane_pilot_kill(session, project_id, reason=reason)
+            if alert_detail is not None:
+                await raise_gate_integrity_alert(session, project_id, detail=alert_detail)
+            await session.commit()
+            return result
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def raise_gate_integrity_alert(
