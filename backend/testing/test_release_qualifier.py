@@ -2158,6 +2158,39 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         assert len(refuted) == 1
         assert refuted[0]["summary"] == "SQL injection in query builder module"
 
+    def test_indexed_refuted_paraphrased_summary_binds_by_index(self):
+        """Indexed refutation binds by index regardless of summary text mismatch.
+
+        The backend binds via primary_finding_index; the verbatim requirement
+        applies only to the agent side.  _indexed_verdict_can_bind only checks
+        the severity ceiling, so a paraphrased summary must still remove the
+        finding from scoring.
+        """
+        finding = _make_verified_finding("Memory corruption in packet parser")
+        finding["severity"] = "high"
+        report = {"findings": [finding]}
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",
+                    "summary": "Heap overflow during network packet parsing",  # paraphrase
+                    "reason": "bounds-checked buffer slices prevent out-of-bounds writes",
+                },
+            ],
+        )
+
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # Index-based binding bypasses summary matching; finding is removed.
+        assert hold is None
+        assert len(refuted) == 1
+
     def test_refuted_verdict_consumed_second_finding_held(self):
         """One refuted verdict + one confirmed verdict match one finding each."""
         finding_a = _make_verified_finding("Path traversal vulnerability in file server")

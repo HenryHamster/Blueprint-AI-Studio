@@ -464,6 +464,24 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
     expect(call.failure_category).toBe('release_audit_challenge_unparseable');
   });
 
+  it('includes the primary findings list in the repair prompt when reopening', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'no json here', lastResultText: 'still none' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] }) });
+
+    await handleReleaseAuditChallenge(TASK_ID, {
+      ...RELEASE_PAYLOAD,
+      primary_findings: [
+        { severity: 'high', summary: 'Unsafe deserialization in upload handler.', file: 'app/upload.py' },
+      ],
+    }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const repairPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).toContain('1. [high] Unsafe deserialization in upload handler. (file: app/upload.py)');
+    expect(repairPrompt).toContain('copy the listed primary finding summary exactly into "summary"');
+  });
+
   it('self-repair records audit_challenge schema telemetry and pins output basename', async () => {
     // Force the repair path: readHandlerOutput returns null, first run has no JSON,
     // repair run returns valid JSON → exercises all three schema-dimensioned telemetry calls.

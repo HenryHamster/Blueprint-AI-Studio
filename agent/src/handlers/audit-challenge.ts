@@ -417,12 +417,15 @@ Rules:
   if (handlerOutput !== null && validateChallengeArtifactShape(handlerOutput).ok) {
     logs = sanitize(JSON.stringify(normalizeChallengeOutput(handlerOutput, candidateSha)));
   } else {
+    const reopenPrompt = primaryFindings.length > 0
+      ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nReturn ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index" and copy the listed primary finding summary exactly into "summary". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`
+      : `Your prior release audit challenge response did not end with a parseable JSON verdict object.
+Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index" and copy the listed primary finding summary exactly into "summary". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`;
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['challenged_candidate_sha', 'verdicts'],
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `Your prior release audit challenge response did not end with a parseable JSON verdict object.
-Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index" and copy the listed primary finding summary exactly into "summary". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`,
+      reopenPrompt,
       ws,
       statusRef,
       model,
