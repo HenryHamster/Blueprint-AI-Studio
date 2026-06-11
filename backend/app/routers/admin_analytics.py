@@ -22,6 +22,8 @@ from app.models import (
     ArtifactType,
     ProjectMessage,
     ReleaseVersion,
+    ImprovementLane,
+    PoolVm,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
 )
@@ -1171,3 +1173,143 @@ async def get_open_prs(
     }
     _open_prs_cache[project_id] = (time.time(), payload)
     return payload
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/improvement-lanes
+# ---------------------------------------------------------------------------
+
+
+@router.get("/improvement-lanes")
+async def get_improvement_lanes(
+    project_id: uuid.UUID = Query(...),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """List improvement lanes for a project with status, checkpoint, workspace, and cost fields.
+
+    Returns control-plane state for operators to monitor active and parked lanes:
+    which lanes are ACTIVE/PARKED, how far each got (checkpoint seq/phase/sha),
+    whether a workspace reservation is held and its reserved-idle cost, which
+    pilot arm a lane is in, and whether checkpoints are being lost.
+
+    ``shadow`` is True when the checkpoint contract is running but neither a warm
+    workspace reservation nor a pilot arm has been assigned — indicates shadow mode.
+
+    ``checkpoint_loss_count`` = lane.checkpoint_seq - len(lane.checkpoints).
+    checkpoint_seq is the count of checkpoints successfully written; checkpoints[]
+    is a rolling window capped at 50.  Any positive difference means older
+    checkpoints were evicted from the window.  Note: phase_requeues (phases that
+    failed to write any checkpoint) is a separate signal also included in the row.
+    """
+    lanes = (
+        (
+            await session.execute(
+                select(ImprovementLane)
+                .where(ImprovementLane.project_id == project_id)
+                .order_by(ImprovementLane.updated_at.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Resolve active warm-pool reservations for all returned lanes in one query.
+    lane_ids = [lane.id for lane in lanes]
+    reservations: Dict[uuid.UUID, PoolVm] = {}
+    if lane_ids:
+        pool_vms = (
+            (
+                await session.execute(
+                    select(PoolVm).where(PoolVm.reserved_lane_id.in_(lane_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for pvm in pool_vms:
+            if pvm.reserved_lane_id is not None:
+                reservations[pvm.reserved_lane_id] = pvm
+
+    now = _utcnow()
+    rows: List[Dict[str, Any]] = []
+    for lane in lanes:
+        # Derive age of the most recent checkpoint from its created_at field.
+        last_checkpoint_age_seconds: float | None = None
+        if lane.checkpoints:
+            last_cp = lane.checkpoints[-1]
+            try:
+                cp_created_at = datetime.fromisoformat(last_cp["created_at"])
+                # Strip tz if present (checkpoints write naive UTC via _utcnow).
+                if cp_created_at.tzinfo is not None:
+                    cp_created_at = cp_created_at.replace(tzinfo=None)
+                last_checkpoint_age_seconds = max(
+                    (now - cp_created_at).total_seconds(), 0.0
+                )
+            except (KeyError, ValueError, TypeError):
+                pass
+
+        # checkpoint_loss_count: checkpoints written but evicted from the rolling window.
+        checkpoint_loss_count = max(
+            0, (lane.checkpoint_seq or 0) - len(lane.checkpoints or [])
+        )
+
+        # shadow: checkpoint contract running but no reservation and no pilot arm yet.
+        shadow = (
+            (lane.checkpoint_seq or 0) > 0
+            and lane.workspace_state == "COLD"
+            and lane.pilot_arm is None
+        )
+
+        # Reservation fields from PoolVm if a reservation is active for this lane.
+        pvm = reservations.get(lane.id)
+        reservation_expires_at: str | None = None
+        reserved_vm_instance_id: str | None = None
+        if pvm is not None:
+            reservation_expires_at = (
+                pvm.reservation_expires_at.isoformat()
+                if pvm.reservation_expires_at
+                else None
+            )
+            reserved_vm_instance_id = pvm.vm_instance_id
+
+        rows.append(
+            {
+                "id": str(lane.id),
+                "status": lane.status,
+                "direction_id": lane.direction_id,
+                "branch": lane.branch_name,
+                "last_checkpoint_phase": lane.last_checkpoint_phase,
+                "last_checkpoint_seq": lane.checkpoint_seq,
+                "last_checkpoint_sha": lane.last_checkpoint_sha,
+                "last_checkpoint_age_seconds": last_checkpoint_age_seconds,
+                "checkpoint_loss_count": checkpoint_loss_count,
+                "workspace_state": lane.workspace_state,
+                "workspace_vm_instance_id": lane.workspace_vm_instance_id,
+                "reservation_expires_at": reservation_expires_at,
+                "reserved_vm_instance_id": reserved_vm_instance_id,
+                "pilot_arm": lane.pilot_arm,
+                "phase_requeues": lane.phase_requeues,
+                "llm_input_tokens_total": lane.llm_input_tokens_total,
+                "llm_output_tokens_total": lane.llm_output_tokens_total,
+                "vm_cost_usd_total": round(lane.vm_cost_usd_total or 0.0, 6),
+                "reserved_idle_cost_usd_total": round(
+                    lane.reserved_idle_cost_usd_total or 0.0, 6
+                ),
+                "shadow": shadow,
+                "created_at": lane.created_at.isoformat() if lane.created_at else None,
+                "updated_at": lane.updated_at.isoformat() if lane.updated_at else None,
+            }
+        )
+
+    return {
+        "lanes": rows,
+        "total_returned": len(rows),
+        "offset": offset,
+        "limit": limit,
+        "project_id": str(project_id),
+    }

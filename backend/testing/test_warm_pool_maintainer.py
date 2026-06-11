@@ -23,6 +23,7 @@ from sqlmodel import select
 import app.shared_state as _shared_state
 import app.warm_pool_maintainer as _wpm
 from app.models import (
+    ImprovementLane,
     PoolIdleCostLedger,
     PoolIdleSpan,
     PoolVm,
@@ -38,6 +39,7 @@ from app.warm_pool import (
     count_live_pool_vms,
     get_live_pool_vm_ids,
     is_pool_vm_image_stale,
+    lease_idle_pool_vm,
     register_pool_vm,
     resolve_project_warm_pool_target,
     warm_pool_project_target_map,
@@ -189,7 +191,9 @@ async def test_idle_reaper_retires_over_ttl_member(db_session, warm_pool_on, moc
     # Recent heartbeat so the ONLY reason it dies is the idle-TTL.
     _shared_state.record_vm_heartbeat("agent-vm-ttl")
 
-    retired = await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
     assert retired == 1
     mock_del.assert_awaited()
     assert await db_session.get(PoolVm, member.id) is None
@@ -197,9 +201,7 @@ async def test_idle_reaper_retires_over_ttl_member(db_session, warm_pool_on, moc
 
 @pytest.mark.asyncio
 async def test_idle_reaper_retires_stale_image_member(db_session, warm_pool_on, mocker):
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     project = await _make_project(db_session)
     member = await _register(db_session, project, "agent-vm-stale", PoolVmState.IDLE)
     member.idle_since = _utcnow()  # fresh idle — not over TTL
@@ -212,7 +214,9 @@ async def test_idle_reaper_retires_stale_image_member(db_session, warm_pool_on, 
         return_value=[{"vm_id": "agent-vm-stale"}],
     )
 
-    retired = await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
     assert retired == 1
     assert await db_session.get(PoolVm, member.id) is None
 
@@ -226,9 +230,7 @@ async def test_idle_reaper_continues_after_retire_failure(
     instance the rollback expired (regression for the 2026-06-04 incident triage:
     the except handler read member.vm_instance_id after session.rollback(),
     masking the real error and aborting the whole sweep)."""
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.compute.get_stale_image_vms", return_value=[])
     _runtime_config["warm_pool_idle_ttl_seconds"] = 1800
 
@@ -251,9 +253,7 @@ async def test_idle_reaper_continues_after_retire_failure(
             raise SQLAlchemyError("simulated lock timeout")
         return await real_retire(session, member, **kw)
 
-    mocker.patch(
-        "app.warm_pool_maintainer.retire_and_delete_pool_vm", new=flaky_retire
-    )
+    mocker.patch("app.warm_pool_maintainer.retire_and_delete_pool_vm", new=flaky_retire)
 
     # Must not raise (no MissingGreenlet), and the healthy member is still reaped.
     retired = await sweep_idle_pool_vms(
@@ -268,9 +268,7 @@ async def test_idle_reaper_continues_after_retire_failure(
 
 @pytest.mark.asyncio
 async def test_idle_reaper_retires_zombie_member(db_session, warm_pool_on, mocker):
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.compute.get_stale_image_vms", return_value=[])
     _runtime_config["warm_pool_heartbeat_stale_seconds"] = 300
     # Simulate a long-lived process so the zombie-teardown warmup gate is armed
@@ -281,18 +279,24 @@ async def test_idle_reaper_retires_zombie_member(db_session, warm_pool_on, mocke
     project = await _make_project(db_session)
     # PROVISIONING member that never heartbeated and has aged past the liveness
     # window → zombie.
-    member = await _register(db_session, project, "agent-vm-zombie", PoolVmState.PROVISIONING)
+    member = await _register(
+        db_session, project, "agent-vm-zombie", PoolVmState.PROVISIONING
+    )
     member.created_at = _utcnow() - timedelta(seconds=900)
     db_session.add(member)
     await db_session.commit()
 
-    retired = await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
     assert retired == 1
     assert await db_session.get(PoolVm, member.id) is None
 
 
 @pytest.mark.asyncio
-async def test_idle_reaper_spares_zombie_during_warmup(db_session, warm_pool_on, mocker):
+async def test_idle_reaper_spares_zombie_during_warmup(
+    db_session, warm_pool_on, mocker
+):
     """A fresh leader (process just started) must NOT tear down an established
     pool member solely because its in-memory heartbeat map is empty. This is the
     deploy/crash/failover false-positive: the heartbeat map is process-local and
@@ -310,7 +314,9 @@ async def test_idle_reaper_spares_zombie_during_warmup(db_session, warm_pool_on,
     # Established IDLE member, aged well past the staleness window, with NO
     # heartbeat in the (empty) in-memory map — exactly what a member looks like
     # to a fresh leader right after a changeover. It must survive.
-    member = await _register(db_session, project, "agent-vm-established", PoolVmState.IDLE)
+    member = await _register(
+        db_session, project, "agent-vm-established", PoolVmState.IDLE
+    )
     member.idle_since = _utcnow() - timedelta(seconds=900)
     db_session.add(member)
     await db_session.commit()
@@ -324,16 +330,16 @@ async def test_idle_reaper_spares_zombie_during_warmup(db_session, warm_pool_on,
 
 
 @pytest.mark.asyncio
-async def test_retire_carries_banked_idle_cost_to_ledger(db_session, warm_pool_on, mocker):
+async def test_retire_carries_banked_idle_cost_to_ledger(
+    db_session, warm_pool_on, mocker
+):
     """Tearing down a pool member must NOT erase its banked idle spend: the
     banked cost is carried into the durable PoolIdleCostLedger in the same
     transaction that deletes the registry row, so compute_pool_idle_cost still
     sees it after the row is gone."""
     from app.efficiency_snapshot import compute_pool_idle_cost
 
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
 
     project = await _make_project(db_session)
     member = await _register(db_session, project, "agent-vm-banked", PoolVmState.IDLE)
@@ -349,9 +355,7 @@ async def test_retire_carries_banked_idle_cost_to_ledger(db_session, warm_pool_o
     # Registry row is gone...
     assert await db_session.get(PoolVm, member.id) is None
     # ...but the banked spend survived in the ledger and is still counted.
-    ledger = (
-        (await db_session.execute(select(PoolIdleCostLedger))).scalars().all()
-    )
+    ledger = (await db_session.execute(select(PoolIdleCostLedger))).scalars().all()
     assert len(ledger) == 1
     assert ledger[0].vm_instance_id == "agent-vm-banked"
     assert ledger[0].idle_cost_usd == pytest.approx(1.25)
@@ -369,9 +373,7 @@ async def test_retire_writes_pool_idle_span_for_final_accrual(
     the exact span end time rather than the member's retirement timestamp."""
     from app.efficiency_snapshot import _compute_windowed_idle_cost
 
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
 
     project = await _make_project(db_session)
     member = await _register(db_session, project, "agent-vm-span", PoolVmState.IDLE)
@@ -420,7 +422,9 @@ async def test_idle_reaper_spares_fresh_alive_member(db_session, warm_pool_on, m
     await db_session.commit()
     _shared_state.record_vm_heartbeat("agent-vm-fresh")
 
-    retired = await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
     assert retired == 0
     mock_del.assert_not_awaited()
     assert await db_session.get(PoolVm, member.id) is not None
@@ -456,9 +460,7 @@ async def test_idle_reaper_inert_when_disabled(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_reconcile_drains_excess_idle(db_session, warm_pool_on, mocker):
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     _runtime_config["warm_pool_target_size"] = 1
 
     project = await _make_project(db_session)
@@ -565,7 +567,9 @@ async def test_reconcile_skips_provision_when_suppressed(db_session, warm_pool_o
 
 
 @pytest.mark.asyncio
-async def test_cost_guard_drains_idle_and_skips_provision(db_session, warm_pool_on, mocker):
+async def test_cost_guard_drains_idle_and_skips_provision(
+    db_session, warm_pool_on, mocker
+):
     """When the cost guard is engaged, reconcile forces target 0 — every IDLE
     member is drained and no provisioning happens, regardless of the configured
     target."""
@@ -651,7 +655,9 @@ async def test_unscoped_demand_active_project_provisions_zero(db_session, warm_p
 
 
 @pytest.mark.asyncio
-async def test_scoped_project_seeded_members_not_drained(db_session, warm_pool_on, mocker):
+async def test_scoped_project_seeded_members_not_drained(
+    db_session, warm_pool_on, mocker
+):
     """A scoped project's manually-seeded members are held at target, NOT drained
     — the whole point of scoping (vs. the global-target-0 workaround that drains
     seeded members on the next tick)."""
@@ -683,7 +689,9 @@ async def test_scoped_project_seeded_members_not_drained(db_session, warm_pool_o
 
 
 @pytest.mark.asyncio
-async def test_unscoped_project_idle_members_are_drained(db_session, warm_pool_on, mocker):
+async def test_unscoped_project_idle_members_are_drained(
+    db_session, warm_pool_on, mocker
+):
     """The contrast to the scoped case: an UNSCOPED project's idle members are
     drained (effective target forced to 0) so narrowing the scope winds down
     out-of-scope pools instead of leaking idle cost."""
@@ -715,7 +723,9 @@ async def test_unscoped_project_idle_members_are_drained(db_session, warm_pool_o
 
 
 @pytest.mark.asyncio
-async def test_evaluate_cost_guard_engages_on_low_hit_rate(db_session, warm_pool_on, mocker):
+async def test_evaluate_cost_guard_engages_on_low_hit_rate(
+    db_session, warm_pool_on, mocker
+):
     """Guard engages when there is real idle spend, enough ELIGIBLE dispatches,
     and an eligible hit rate below the floor — and disengages once it recovers.
     The guard gates on the eligible rate (hits + pool-serviceable misses), NOT
@@ -753,12 +763,16 @@ async def test_evaluate_cost_guard_engages_on_low_hit_rate(db_session, warm_pool
         "pool_hit_rate": 0.40,
         "total_dispatches": 50,
     }
-    recovered = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
+    recovered = await evaluate_pool_cost_guard(
+        db_session, runtime_config=_runtime_config
+    )
     assert recovered["engaged"] is False
 
 
 @pytest.mark.asyncio
-async def test_evaluate_cost_guard_holds_below_min_dispatches(db_session, warm_pool_on, mocker):
+async def test_evaluate_cost_guard_holds_below_min_dispatches(
+    db_session, warm_pool_on, mocker
+):
     """Guard stays disengaged on a thin sample even at a 0% eligible hit rate — it
     must not drain on noise before enough ELIGIBLE dispatches accumulate. A large
     raw fleet-wide volume must NOT substitute for eligible volume here."""
@@ -838,7 +852,9 @@ async def test_evaluate_cost_guard_ignores_out_of_scope_noise(db_session, warm_p
     assert guard["raw_hit_rate"] is not None and guard["raw_hit_rate"] < 0.10
     assert guard["hit_rate"] == 0.9
     assert guard["engaged"] is False
-    assert guard["idle_cost_usd"] == pytest.approx(0.5 + _idle_cost_usd(24 * 3600), rel=0.05)
+    assert guard["idle_cost_usd"] == pytest.approx(
+        0.5 + _idle_cost_usd(24 * 3600), rel=0.05
+    )
 
 
 @pytest.mark.asyncio
@@ -873,12 +889,12 @@ async def test_reconcile_provisions_despite_leased_members(db_session, warm_pool
 
 
 @pytest.mark.asyncio
-async def test_reconcile_keeps_last_idle_when_leased_coexists(db_session, warm_pool_on, mocker):
+async def test_reconcile_keeps_last_idle_when_leased_coexists(
+    db_session, warm_pool_on, mocker
+):
     """A LEASED member coexisting with the last IDLE member must not push live
     over target and drain that IDLE member (pre-fix bug)."""
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     _runtime_config["warm_pool_target_size"] = 1
     project = await _make_project(db_session)
     idle = await _register(db_session, project, "agent-vm-keep-idle", PoolVmState.IDLE)
@@ -906,7 +922,9 @@ async def test_reconcile_keeps_last_idle_when_leased_coexists(db_session, warm_p
 
 
 @pytest.mark.asyncio
-async def test_run_pool_maintainer_cycle_provisions_within_budgets(db_session, warm_pool_on):
+async def test_run_pool_maintainer_cycle_provisions_within_budgets(
+    db_session, warm_pool_on
+):
     """run_pool_maintainer_cycle reconciles every project with members, capping
     provisioning by the fleet dispatch-slot + pool budget arithmetic it owns."""
     _runtime_config["warm_pool_target_size"] = 3
@@ -937,6 +955,7 @@ async def test_run_pool_maintainer_cycle_inert_when_disabled(db_session):
     """The cycle early-returns zero totals when warm_pool_enabled is off."""
     _runtime_config["warm_pool_enabled"] = False
     try:
+
         async def _no_provision(session, project_id):
             raise AssertionError("must not provision when disabled")
 
@@ -1174,9 +1193,7 @@ async def test_demand_and_member_projects_both_reconcile_in_one_cycle(
 
 
 @pytest.mark.asyncio
-async def test_bootstrapped_member_idle_cost_is_observable(
-    db_session, warm_pool_on
-):
+async def test_bootstrapped_member_idle_cost_is_observable(db_session, warm_pool_on):
     """A bootstrapped member flows through the normal register→idle lifecycle, so
     its idle cost is observable through the standard compute_pool_idle_cost path
     (no special bootstrap cost path)."""
@@ -1336,9 +1353,7 @@ async def test_retire_skips_member_leased_after_scan(db_session, warm_pool_on, m
     db_session.add(member)
     await db_session.commit()
 
-    won = await retire_and_delete_pool_vm(
-        db_session, member, reason="pool_idle_ttl"
-    )
+    won = await retire_and_delete_pool_vm(db_session, member, reason="pool_idle_ttl")
     assert won is False
     mock_del.assert_not_awaited()
     surviving = await db_session.get(PoolVm, member.id)
@@ -1384,14 +1399,18 @@ async def test_idle_reaper_reclaims_orphaned_lease(db_session, warm_pool_on, moc
     await db_session.commit()
     # No heartbeat recorded → VM is not alive (torn down on completion).
 
-    retired = await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
     assert retired == 1
     mock_del.assert_awaited()
     assert await db_session.get(PoolVm, member.id) is None
 
 
 @pytest.mark.asyncio
-async def test_idle_reaper_spares_lease_with_running_task(db_session, warm_pool_on, mocker):
+async def test_idle_reaper_spares_lease_with_running_task(
+    db_session, warm_pool_on, mocker
+):
     """A LEASED member whose task is still IN_PROGRESS (lease expired but the agent
     claimed it and is running) must NOT be torn down mid-task."""
     mock_del = mocker.patch(
@@ -1407,7 +1426,9 @@ async def test_idle_reaper_spares_lease_with_running_task(db_session, warm_pool_
     db_session.add(member)
     await db_session.commit()
 
-    retired = await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
     assert retired == 0
     mock_del.assert_not_awaited()
     survivor = await db_session.get(PoolVm, member.id)
@@ -1433,7 +1454,9 @@ async def test_idle_reaper_spares_lease_with_live_vm(db_session, warm_pool_on, m
     await db_session.commit()
     _shared_state.record_vm_heartbeat("agent-vm-reused")  # VM is alive → spared
 
-    retired = await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
     assert retired == 0
     mock_del.assert_not_awaited()
     assert await db_session.get(PoolVm, member.id) is not None
@@ -1447,7 +1470,9 @@ async def test_retire_defers_to_peer_fresh_retiring(db_session, warm_pool_on, mo
         "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
     )
     project = await _make_project(db_session)
-    member = await _register(db_session, project, "agent-vm-peerretire", PoolVmState.IDLE)
+    member = await _register(
+        db_session, project, "agent-vm-peerretire", PoolVmState.IDLE
+    )
     # Peer just flipped it to RETIRING (fresh updated_at).
     member.state = PoolVmState.RETIRING
     member.updated_at = _utcnow()
@@ -1544,7 +1569,9 @@ class _PoolAccounts:
         return False
 
 
-async def _make_task_for_account(db_session, project, account_id, status=TaskStatus.QUEUED):
+async def _make_task_for_account(
+    db_session, project, account_id, status=TaskStatus.QUEUED
+):
     """A demand-signal task whose context attributes it to ``account_id``."""
     task = Task(
         project_id=project.id,
@@ -1577,9 +1604,7 @@ async def test_reconcile_spreads_provision_across_demand_accounts(
         booted[account_id] = booted.get(account_id, 0) + 1
         return True
 
-    async with _PoolAccounts(
-        [{"id": "acct-a"}, {"id": "acct-b"}, {"id": "acct-c"}]
-    ):
+    async with _PoolAccounts([{"id": "acct-a"}, {"id": "acct-b"}, {"id": "acct-c"}]):
         summary = await reconcile_project_pool(
             db_session,
             project.id,
@@ -1628,7 +1653,9 @@ async def test_reconcile_never_boots_account_without_demand(db_session, warm_poo
 
 
 @pytest.mark.asyncio
-async def test_reconcile_deprioritizes_over_represented_account(db_session, warm_pool_on):
+async def test_reconcile_deprioritizes_over_represented_account(
+    db_session, warm_pool_on
+):
     """An account already over-represented among current idle members is
     deprioritized so the next boot broadens coverage to the under-served account."""
     _runtime_config["warm_pool_target_size"] = 3
@@ -1639,8 +1666,12 @@ async def test_reconcile_deprioritizes_over_represented_account(db_session, warm
     await _make_task_for_account(db_session, project, "acct-b")
     # ...but acct-a already has 2 idle members → only 1 deficit slot, and it must
     # go to the under-served acct-b.
-    await _register(db_session, project, "agent-vm-a1", PoolVmState.IDLE, account_id="acct-a")
-    await _register(db_session, project, "agent-vm-a2", PoolVmState.IDLE, account_id="acct-a")
+    await _register(
+        db_session, project, "agent-vm-a1", PoolVmState.IDLE, account_id="acct-a"
+    )
+    await _register(
+        db_session, project, "agent-vm-a2", PoolVmState.IDLE, account_id="acct-a"
+    )
 
     booted: dict = {}
 
@@ -1779,7 +1810,9 @@ async def test_demand_weighting_never_exceeds_global_target(db_session, warm_poo
 
 
 @pytest.mark.asyncio
-async def test_default_provision_fn_honors_requested_account(db_session, warm_pool_on, mocker):
+async def test_default_provision_fn_honors_requested_account(
+    db_session, warm_pool_on, mocker
+):
     """_default_pool_provision_fn boots the REQUESTED account when account_id is
     given, and skips when that account is not eligible."""
     boot_calls = []
@@ -1835,9 +1868,7 @@ async def test_idle_reaper_recycles_pre_promotion_member(
 ):
     """A warm member booted from a pre-promotion image is recycled once a newer
     valid image exists — even when it is NOT temporally stale and is alive."""
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     # Not temporally stale, but a newer family-target image exists → outdated.
     mocker.patch("app.compute.get_stale_image_vms", return_value=[])
     mocker.patch(
@@ -1921,14 +1952,18 @@ async def test_per_project_guard_drains_only_failing_project(
     # Project A: 10 warm-pool hits → 100% hit rate → guard stays off.
     for _ in range(10):
         await _make_dispatched_task(db_session, project_a, warm_pool_hit=True)
-    idle_a = await _register(db_session, project_a, "agent-vm-guard-a", PoolVmState.IDLE)
+    idle_a = await _register(
+        db_session, project_a, "agent-vm-guard-a", PoolVmState.IDLE
+    )
     idle_a.idle_since = _utcnow() - timedelta(seconds=300)
     db_session.add(idle_a)
 
     # Project B: 10 cold dispatches, no hits → 0% hit rate + $5 idle → guard engages.
     for _ in range(10):
         await _make_dispatched_task(db_session, project_b, warm_pool_hit=False)
-    idle_b = await _register(db_session, project_b, "agent-vm-guard-b", PoolVmState.IDLE)
+    idle_b = await _register(
+        db_session, project_b, "agent-vm-guard-b", PoolVmState.IDLE
+    )
     idle_b.idle_since = _utcnow() - timedelta(seconds=300)
     db_session.add(idle_b)
     await db_session.commit()
@@ -2003,9 +2038,13 @@ async def test_fleet_guard_still_drains_all_as_safety_valve(
 
     project_a = await _make_project(db_session, name="Fleet A")
     project_b = await _make_project(db_session, name="Fleet B")
-    idle_a = await _register(db_session, project_a, "agent-vm-fleet-a", PoolVmState.IDLE)
+    idle_a = await _register(
+        db_session, project_a, "agent-vm-fleet-a", PoolVmState.IDLE
+    )
     idle_a.idle_since = _utcnow() - timedelta(seconds=300)
-    idle_b = await _register(db_session, project_b, "agent-vm-fleet-b", PoolVmState.IDLE)
+    idle_b = await _register(
+        db_session, project_b, "agent-vm-fleet-b", PoolVmState.IDLE
+    )
     idle_b.idle_since = _utcnow() - timedelta(seconds=300)
     db_session.add_all([idle_a, idle_b])
     await db_session.commit()
@@ -2046,3 +2085,167 @@ async def test_fleet_guard_still_drains_all_as_safety_valve(
         "project B must be drained when fleet guard engages"
     )
     assert totals["drained"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Lane-scoped workspace reservation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lane_reserved_member_skipped_by_non_lane_request(
+    db_session, warm_pool_on
+):
+    """A non-lane (or different-lane) lease request skips a member with an active
+    lane reservation; the matching lane request claims it."""
+    project = await _make_project(db_session, name="Reserve Skip")
+    lane_a = uuid.uuid4()
+    lane_b = uuid.uuid4()
+
+    member = await _register(db_session, project, "agent-vm-res-skip", PoolVmState.IDLE)
+    member.reserved_lane_id = lane_a
+    member.reservation_expires_at = _utcnow() + timedelta(seconds=900)
+    member.idle_since = _utcnow() - timedelta(seconds=60)
+    db_session.add(member)
+    await db_session.commit()
+
+    # No lane_id: must skip the reserved member.
+    result = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        leased_task_id=uuid.uuid4(),
+    )
+    assert result is None, "Non-lane request must skip a reserved member"
+
+    # Different lane_id: must also skip.
+    result = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        leased_task_id=uuid.uuid4(),
+        lane_id=str(lane_b),
+    )
+    assert result is None, "Different-lane request must skip a reserved member"
+
+    # Member is still IDLE.
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.IDLE
+
+    # Matching lane_id: must claim it.
+    leased = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        leased_task_id=uuid.uuid4(),
+        lane_id=str(lane_a),
+    )
+    assert leased is not None, "Matching-lane request must claim the reserved member"
+    assert leased.vm_instance_id == "agent-vm-res-skip"
+    assert leased.state == PoolVmState.LEASED
+    # Reservation cleared on lease.
+    assert leased.reserved_lane_id is None
+    assert leased.reservation_expires_at is None
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_expired_reservation_claimable_by_any_request(db_session, warm_pool_on):
+    """After the reservation TTL expires, the member is claimable by any request
+    (no lane_id required)."""
+    project = await _make_project(db_session, name="Reserve Expiry")
+    lane_id = uuid.uuid4()
+
+    member = await _register(
+        db_session, project, "agent-vm-res-expired", PoolVmState.IDLE
+    )
+    member.reserved_lane_id = lane_id
+    member.reservation_expires_at = _utcnow() - timedelta(seconds=10)  # past
+    member.idle_since = _utcnow() - timedelta(seconds=100)
+    db_session.add(member)
+    await db_session.commit()
+
+    # Non-lane request should now succeed (expired reservation is not a blocker).
+    leased = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        leased_task_id=uuid.uuid4(),
+    )
+    assert leased is not None, "Expired reservation must not block a general lease"
+    assert leased.vm_instance_id == "agent-vm-res-expired"
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_maintainer_clears_expired_reservation_banks_lane_cost(
+    db_session, warm_pool_on
+):
+    """The maintainer sweep clears an expired lane reservation on an IDLE member,
+    settles the reserved-idle cost to the fleet ledger (PoolIdleSpan), and
+    attributes it to the lane (ImprovementLane.reserved_idle_cost_usd_total)."""
+    prior_lanes = _runtime_config.get("improvement_lanes_enabled")
+    _runtime_config["improvement_lanes_enabled"] = True
+    try:
+        project = await _make_project(db_session, name="Reserve Expire Lane")
+
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="test lane",
+            goal="test goal",
+            branch_name="test-branch",
+            base_branch="main",
+            workspace_state="WARM_RESERVED",
+            reserved_idle_cost_usd_total=0.0,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        member = await _register(
+            db_session, project, "agent-vm-lane-expire", PoolVmState.IDLE
+        )
+        idle_start = _utcnow() - timedelta(seconds=120)
+        member.idle_since = idle_start
+        member.reserved_lane_id = lane.id
+        member.reservation_expires_at = _utcnow() - timedelta(seconds=30)
+        db_session.add(member)
+        await db_session.commit()
+
+        await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+
+        # Member still exists and is IDLE — reservation clear, not reaped.
+        await db_session.refresh(member)
+        assert member.state == PoolVmState.IDLE, (
+            "Member must not be reaped, only cleared"
+        )
+        assert member.reserved_lane_id is None, "reserved_lane_id must be cleared"
+        assert member.reservation_expires_at is None, (
+            "reservation_expires_at must be cleared"
+        )
+
+        # Fleet ledger: PoolIdleSpan row written.
+        spans = list(
+            (
+                await db_session.execute(
+                    select(PoolIdleSpan).where(
+                        PoolIdleSpan.vm_instance_id == "agent-vm-lane-expire"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(spans) >= 1, "settle_pool_vm_idle_cost must write a PoolIdleSpan"
+        span_cost = sum(s.cost_usd for s in spans)
+        assert span_cost > 0, "Settled idle cost must be positive"
+
+        # Lane attribution: reserved_idle_cost_usd_total must match the settled cost.
+        await db_session.refresh(lane)
+        assert lane.reserved_idle_cost_usd_total > 0, (
+            "Lane reserved_idle_cost_usd_total must be incremented"
+        )
+        assert abs(lane.reserved_idle_cost_usd_total - span_cost) < 1e-9, (
+            "Lane attribution must equal the fleet-ledger settled cost"
+        )
+    finally:
+        if prior_lanes is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes

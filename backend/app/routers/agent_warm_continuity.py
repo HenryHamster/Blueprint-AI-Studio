@@ -679,6 +679,19 @@ async def _finalize_warm_claim(
     }
     if secret_manifest is not None:
         response["secret_manifest"] = secret_manifest
+    # Lane workspace-mode: pass the checkpoint SHA + lane marker to the agent
+    # when a lane phase is dispatched warm. The agent uses these to hard-reset
+    # the warm workspace to the last verified checkpoint (treating it as truth)
+    # instead of resetting to origin/<branch>. Gated on improvement_lanes_enabled
+    # so the path is completely inert when the feature flag is off.
+    from app.runtime_config_state import is_improvement_lanes_enabled
+
+    if is_improvement_lanes_enabled():
+        task_ctx = task.context or {}
+        _lane_checkpoint_sha = task_ctx.get("lane_checkpoint_sha")
+        if task_ctx.get("is_lane_phase") and _lane_checkpoint_sha:
+            response["lane_checkpoint_sha"] = str(_lane_checkpoint_sha)
+            response["is_lane_phase"] = True
     return response
 
 

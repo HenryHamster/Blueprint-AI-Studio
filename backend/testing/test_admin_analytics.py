@@ -9,7 +9,7 @@ import pytest
 from httpx import AsyncClient
 
 from app import shared_state
-from app.models import Artifact, ArtifactType
+from app.models import Artifact, ArtifactType, ImprovementLane, ImprovementLaneStatus, PoolVm, PoolVmState
 from app.routers import admin_analytics
 from app.time_utils import _utcnow
 from app.models import TaskStatus
@@ -1772,3 +1772,297 @@ class TestAdminRecordFailureResult:
         assert len(results) == 1
         assert results[0][2] == "AGENT_TIMEOUT"
         shared_state.direction_failure_streaks.pop(direction_id, None)
+
+# ---------------------------------------------------------------------------
+# TestImprovementLanes
+# ---------------------------------------------------------------------------
+
+
+def _make_lane(project_id, **kwargs):
+    """Minimal ImprovementLane factory for tests."""
+    defaults = dict(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        direction_id="d-test123",
+        title="Test lane",
+        goal="Improve something",
+        branch_name="lane/test-branch",
+        base_branch="main",
+        status=ImprovementLaneStatus.PARKED.value,
+        checkpoint_seq=0,
+        checkpoints=[],
+        workspace_state="COLD",
+        phase_requeues=0,
+        llm_input_tokens_total=0,
+        llm_output_tokens_total=0,
+        vm_cost_usd_total=0.0,
+        reserved_idle_cost_usd_total=0.0,
+    )
+    defaults.update(kwargs)
+    return ImprovementLane(**defaults)
+
+
+class TestImprovementLanes:
+    @pytest.mark.asyncio
+    async def test_lists_lanes_for_project_with_reservation(
+        self, client: AsyncClient, db_session
+    ):
+        """Admin gets lane status/checkpoint/workspace/reservation/arm/cost fields."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        lane = _make_lane(
+            project.id,
+            status=ImprovementLaneStatus.ACTIVE.value,
+            direction_id="d-abc",
+            branch_name="lane/active-branch",
+            checkpoint_seq=3,
+            checkpoints=[
+                {
+                    "seq": 1,
+                    "phase": "review",
+                    "created_at": (now - timedelta(seconds=120)).isoformat(),
+                    "sha": "aaa111",
+                },
+                {
+                    "seq": 2,
+                    "phase": "fix",
+                    "created_at": (now - timedelta(seconds=60)).isoformat(),
+                    "sha": "bbb222",
+                },
+                {
+                    "seq": 3,
+                    "phase": "review",
+                    "created_at": (now - timedelta(seconds=30)).isoformat(),
+                    "sha": "ccc333",
+                },
+            ],
+            last_checkpoint_phase="review",
+            last_checkpoint_sha="ccc333",
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="agent-vm-res1",
+            pilot_arm="lane",
+            llm_input_tokens_total=500,
+            llm_output_tokens_total=250,
+            vm_cost_usd_total=0.12,
+            reserved_idle_cost_usd_total=0.03,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        expires_at = now + timedelta(hours=1)
+        pool_vm = PoolVm(
+            vm_instance_id="agent-vm-res1",
+            project_id=project.id,
+            state=PoolVmState.IDLE,
+            reserved_lane_id=lane.id,
+            reservation_expires_at=expires_at,
+        )
+        db_session.add(pool_vm)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_returned"] == 1
+        row = body["lanes"][0]
+
+        assert row["id"] == str(lane.id)
+        assert row["status"] == ImprovementLaneStatus.ACTIVE.value
+        assert row["direction_id"] == "d-abc"
+        assert row["branch"] == "lane/active-branch"
+        assert row["last_checkpoint_phase"] == "review"
+        assert row["last_checkpoint_seq"] == 3
+        assert row["last_checkpoint_sha"] == "ccc333"
+        assert row["last_checkpoint_age_seconds"] is not None
+        assert row["last_checkpoint_age_seconds"] >= 28  # ~30s ago
+        assert row["checkpoint_loss_count"] == 0  # 3 written, 3 kept
+        assert row["workspace_state"] == "WARM_RESERVED"
+        assert row["workspace_vm_instance_id"] == "agent-vm-res1"
+        assert row["reservation_expires_at"] is not None
+        assert row["reserved_vm_instance_id"] == "agent-vm-res1"
+        assert row["pilot_arm"] == "lane"
+        assert row["phase_requeues"] == 0
+        assert row["llm_input_tokens_total"] == 500
+        assert row["llm_output_tokens_total"] == 250
+        assert abs(row["vm_cost_usd_total"] - 0.12) < 1e-5
+        assert abs(row["reserved_idle_cost_usd_total"] - 0.03) < 1e-5
+        assert row["shadow"] is False
+
+    @pytest.mark.asyncio
+    async def test_pagination_limit_offset(self, client: AsyncClient, db_session):
+        """Pagination via limit/offset returns correct subset and ordering."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        for i in range(3):
+            lane = _make_lane(
+                project.id,
+                branch_name=f"lane/branch-{i}",
+                status=ImprovementLaneStatus.PARKED.value,
+            )
+            # Stagger updated_at so ordering is deterministic.
+            lane.updated_at = now - timedelta(minutes=i)
+            db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes?project_id={project.id}&limit=2&offset=1"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_returned"] == 2
+        assert body["offset"] == 1
+        assert body["limit"] == 2
+
+    @pytest.mark.asyncio
+    async def test_project_isolation(self, client: AsyncClient, db_session):
+        """Only lanes belonging to the requested project are returned."""
+        project_a = make_project()
+        project_b = make_project()
+        db_session.add(project_a)
+        db_session.add(project_b)
+        await db_session.commit()
+
+        lane_a = _make_lane(project_a.id, branch_name="lane/for-a")
+        lane_b = _make_lane(project_b.id, branch_name="lane/for-b")
+        db_session.add(lane_a)
+        db_session.add(lane_b)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes?project_id={project_a.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_returned"] == 1
+        assert body["lanes"][0]["branch"] == "lane/for-a"
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_age_derived_from_last_checkpoint(
+        self, client: AsyncClient, db_session
+    ):
+        """last_checkpoint_age_seconds is derived from the last checkpoint's created_at."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        age_seconds = 300
+        lane = _make_lane(
+            project.id,
+            checkpoint_seq=1,
+            checkpoints=[
+                {
+                    "seq": 1,
+                    "phase": "fix",
+                    "created_at": (now - timedelta(seconds=age_seconds)).isoformat(),
+                    "sha": "abc123",
+                }
+            ],
+            last_checkpoint_phase="fix",
+            last_checkpoint_sha="abc123",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        row = body["lanes"][0]
+        assert row["last_checkpoint_age_seconds"] is not None
+        # Allow ±5s for test execution time.
+        assert abs(row["last_checkpoint_age_seconds"] - age_seconds) < 5
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_loss_count_derived(self, client: AsyncClient, db_session):
+        """checkpoint_loss_count = checkpoint_seq - len(checkpoints) when window is full."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        # Simulate 55 written but only 3 kept (window would cap at 50 in prod).
+        lane = _make_lane(
+            project.id,
+            checkpoint_seq=55,
+            checkpoints=[
+                {"seq": 53, "phase": "fix", "created_at": (now - timedelta(seconds=300)).isoformat(), "sha": "a1"},
+                {"seq": 54, "phase": "review", "created_at": (now - timedelta(seconds=200)).isoformat(), "sha": "b2"},
+                {"seq": 55, "phase": "fix", "created_at": (now - timedelta(seconds=100)).isoformat(), "sha": "c3"},
+            ],
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        # 55 written, 3 in window → 52 lost.
+        assert row["checkpoint_loss_count"] == 52
+
+    @pytest.mark.asyncio
+    async def test_shadow_mode_flag(self, client: AsyncClient, db_session):
+        """shadow=True when checkpoints exist but workspace is COLD and no pilot_arm."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        lane = _make_lane(
+            project.id,
+            checkpoint_seq=2,
+            checkpoints=[
+                {"seq": 1, "phase": "fix", "created_at": (now - timedelta(seconds=200)).isoformat(), "sha": "x1"},
+                {"seq": 2, "phase": "review", "created_at": (now - timedelta(seconds=100)).isoformat(), "sha": "x2"},
+            ],
+            workspace_state="COLD",
+            pilot_arm=None,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["shadow"] is True
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_caller_gets_403(self, override_get_session, db_session):
+        """A caller without admin privileges receives 403."""
+        from fastapi import HTTPException
+        from app.auth import get_current_user, require_admin
+        from app.main import app as _app
+        from httpx import AsyncClient, ASGITransport
+
+        async def non_admin():
+            return {"user_id": "other", "role": "user"}
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        _app.dependency_overrides[get_current_user] = non_admin
+        _app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=_app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    f"/api/admin/improvement-lanes?project_id={uuid.uuid4()}"
+                )
+            assert resp.status_code == 403
+        finally:
+            _app.dependency_overrides.pop(get_current_user, None)
+            _app.dependency_overrides.pop(require_admin, None)

@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
-from app.admin import _get_user_project_with_role
+from app.admin_helpers import _get_user_project_with_role
 from app.auth import get_current_user, require_admin
 from app.database import get_session, resolve_dialect_name
 from app.failure_layer_classifier import parse_viewport_regression_class

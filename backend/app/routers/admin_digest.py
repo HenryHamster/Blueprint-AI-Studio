@@ -42,6 +42,8 @@ from app import strategic_cycle as _strategic_cycle
 from app.strategic_analysis import _compute_prediction_calibration
 from app.strategic_completion import strategic_challenge_summary
 from app.capability_trial_verdict import (
+    LANE_PILOT_CAP_NAME,
+    evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
     get_trial_definitions,
     get_trial_verdicts,
@@ -1430,6 +1432,11 @@ async def _compute_digest(
         _verdict_evaluated_at = _tv_utcnow().isoformat()
         for _td in get_trial_definitions():
             _cap = _td["cap_name"]
+            # Lane pilot uses its own multi-axis evaluator (KILL/ADOPT thresholds
+            # differ from the generic lift/min_n model) — skip it here and handle
+            # it in the dedicated block below.
+            if _cap == LANE_PILOT_CAP_NAME:
+                continue
             _accum = await compute_trial_arm_accumulation(
                 session,
                 project_id=project_id,
@@ -1448,6 +1455,36 @@ async def _compute_digest(
                 receipt_only_trial=(_td.get("assignment_key") is None),
             )
             record_trial_verdict(_digest_project, _cap, _verdict_entry)
+
+        # ── Lane pilot: dedicated multi-axis verdict path ─────────────────────
+        # Uses compute_lane_pilot_aggregates -> evaluate_lane_pilot_verdict which
+        # checks lane-specific KILL/ADOPT thresholds (merge-rate floor, cost
+        # ceiling, gate-integrity violations, checkpoint-loss rate, futility-N).
+        # A KILL verdict degrades spawning + force-expires reservations; an
+        # immediate_alert verdict posts a BLOCKER ProjectMessage.
+        from app.review_fix_lane_pilot import (  # noqa: PLC0415
+            apply_lane_pilot_kill,
+            compute_lane_pilot_aggregates,
+            raise_gate_integrity_alert,
+        )
+        if project_id is not None:
+            _lane_aggs = await compute_lane_pilot_aggregates(session, project_id)
+            _lane_verdict = evaluate_lane_pilot_verdict(_lane_aggs)
+            _lane_verdict["evaluated_at"] = _verdict_evaluated_at
+            record_trial_verdict(_digest_project, LANE_PILOT_CAP_NAME, _lane_verdict)
+            if _lane_verdict.get("verdict") == "KILL":
+                await apply_lane_pilot_kill(
+                    session,
+                    project_id,
+                    reason=_lane_verdict.get("verdict_reason", "digest_eval"),
+                )
+            if _lane_verdict.get("immediate_alert"):
+                await raise_gate_integrity_alert(
+                    session,
+                    project_id,
+                    detail=str(_lane_verdict.get("verdict_reason", "")),
+                )
+
         try:
             await session.flush()
         except Exception:

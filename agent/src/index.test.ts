@@ -3004,6 +3004,72 @@ describe('park directives and warm continuation', () => {
     );
     expect(process.env.TASK_ID).toBe('task-next');
   });
+
+  it('sets lane workspace env for a lane-phase warm claim', async () => {
+    process.env.TASK_ID = 'task-prior';
+    process.env.VM_INSTANCE_ID = 'vm-lane-claim';
+    delete process.env.BLUEPRINT_LANE_MODE;
+    delete process.env.BLUEPRINT_LANE_CHECKPOINT_SHA;
+
+    const result = await continueWarmContinuation({
+      priorTaskId: 'task-prior',
+      priorPrNumber: 23,
+      baseBranch: 'main',
+    }, {
+      pollForNextRole: () => Promise.resolve({
+        action: 'claim',
+        taskId: 'task-lane-next',
+        agentToken: 'rotated-lane-jwt',
+        isLanePhase: true,
+        laneCheckpointSha: 'abc1234def5678901234567890123456789012ab',
+      }),
+      resetForNextRole: vi.fn(),
+      activateClaimedRole: vi.fn((claim: { taskId?: string; agentToken?: string }) => {
+        if (claim.agentToken) _setAgentTokenForTesting(claim.agentToken);
+        if (claim.taskId) process.env.TASK_ID = claim.taskId;
+      }),
+      materializeClaimCredentialState: vi.fn(),
+      performWarmRetarget: vi.fn(),
+      resolveVmInstanceId: () => 'vm-lane-claim',
+    });
+
+    expect(result).toEqual({ action: 'continue' });
+    expect(process.env.BLUEPRINT_LANE_MODE).toBe('1');
+    expect(process.env.BLUEPRINT_LANE_CHECKPOINT_SHA).toBe('abc1234def5678901234567890123456789012ab');
+    expect(process.env.BLUEPRINT_WARM_HANDOFF).toBe('1');
+  });
+
+  it('clears stale lane workspace env for a non-lane warm claim', async () => {
+    process.env.TASK_ID = 'task-prior';
+    process.env.VM_INSTANCE_ID = 'vm-normal-claim';
+    process.env.BLUEPRINT_LANE_MODE = '1';
+    process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'stale-checkpoint';
+
+    const result = await continueWarmContinuation({
+      priorTaskId: 'task-prior',
+      priorPrNumber: 24,
+      baseBranch: 'main',
+    }, {
+      pollForNextRole: () => Promise.resolve({
+        action: 'claim',
+        taskId: 'task-normal-next',
+        agentToken: 'rotated-normal-jwt',
+      }),
+      resetForNextRole: vi.fn(),
+      activateClaimedRole: vi.fn((claim: { taskId?: string; agentToken?: string }) => {
+        if (claim.agentToken) _setAgentTokenForTesting(claim.agentToken);
+        if (claim.taskId) process.env.TASK_ID = claim.taskId;
+      }),
+      materializeClaimCredentialState: vi.fn(),
+      performWarmRetarget: vi.fn(),
+      resolveVmInstanceId: () => 'vm-normal-claim',
+    });
+
+    expect(result).toEqual({ action: 'continue' });
+    expect(process.env.BLUEPRINT_LANE_MODE).toBeUndefined();
+    expect(process.env.BLUEPRINT_LANE_CHECKPOINT_SHA).toBeUndefined();
+    expect(process.env.BLUEPRINT_WARM_HANDOFF).toBe('1');
+  });
 });
 
 // ── pollForNextRole ──────────────────────────────────────────────────────────
@@ -3088,6 +3154,44 @@ describe('pollForNextRole', () => {
       agentToken: 'rotated-jwt-for-next-X',
     });
     expect(clearIntervalSpy).toHaveBeenCalled();
+  });
+
+  it('returns lane workspace fields on a lane-phase claim', async () => {
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({
+          action: 'claim',
+          task_id: 'next-lane',
+          agent_token: 'rotated-jwt-lane',
+          is_lane_phase: true,
+          lane_checkpoint_sha: 'abc1234def5678901234567890123456789012ab',
+        }),
+      });
+    });
+
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-lane',
+      priorTaskId: 't-lane',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt-lane',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      heartbeatIntervalMs: 200,
+    });
+
+    expect(result).toEqual({
+      action: 'claim',
+      taskId: 'next-lane',
+      agentToken: 'rotated-jwt-lane',
+      isLanePhase: true,
+      laneCheckpointSha: 'abc1234def5678901234567890123456789012ab',
+    });
   });
 
   it('surfaces secret_manifest on an account-divergent warm claim', async () => {

@@ -55,6 +55,7 @@ import { RecentMergesTimeline } from './RecentMergesTimeline';
 import { MergeGateFleetHealthCard } from './MergeGateFleetHealthCard';
 import { ParkWakeHealthCard } from './ParkWakeHealthCard';
 import { DependencyHealthCard } from './DependencyHealthCard';
+import { ImprovementLanesPanel } from './ImprovementLanesPanel';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
 import { assertDigestContract, type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
@@ -830,6 +831,11 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           {/* Direction auto-pause/recovery observability */}
           <div className="mt-4">
             <DirectionAutoPauseWidget selectedProjectId={selectedProjectId} />
+          </div>
+
+          {/* Improvement lane control-plane observability */}
+          <div className="mt-4">
+            <ImprovementLanesPanel projectId={selectedProjectId} />
           </div>
 
           {/* Section 5: PR Monitor */}

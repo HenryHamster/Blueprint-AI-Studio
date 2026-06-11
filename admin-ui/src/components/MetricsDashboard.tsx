@@ -349,6 +349,9 @@ const EFFICIENCY_AXES: EfficiencyAxisDef[] = [
   { key: 'median_api_calls_per_task', label: 'Median API calls per task', unit: '', favorableDirection: 'lower' },
   { key: 'median_review_iterations', label: 'Median review iterations', unit: '', favorableDirection: 'lower' },
   { key: 'llm_cost_per_merged_pr', label: 'LLM token cost per merged PR', unit: '$', favorableDirection: 'lower' },
+  { key: 'lane_cost_per_merged_pr', label: 'Lane cost per merged PR', unit: '$', favorableDirection: 'lower' },
+  { key: 'lane_warm_resume_rate', label: 'Lane warm resume rate', unit: '', favorableDirection: 'higher' },
+  { key: 'checkpoint_loss_rate', label: 'Checkpoint loss rate', unit: '', favorableDirection: 'lower' },
 ];
 
 function getDriftColor(driftPct: number | null, favorableDirection: 'lower' | 'higher'): string {

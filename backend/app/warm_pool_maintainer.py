@@ -32,6 +32,7 @@ from sqlalchemy import func, or_, select, update
 
 from app.database import AsyncSessionLocal
 from app.models import (
+    ImprovementLane,
     PoolIdleCostLedger,
     PoolIdleSpan,
     PoolVm,
@@ -258,7 +259,9 @@ async def evaluate_pool_cost_guard(session, *, runtime_config) -> dict:
     # all-time monotonically-growing accumulator does not permanently latch the
     # materiality floor True after the pool crosses $1 in lifetime spend.
     _guard_cutoff = _utcnow() - timedelta(hours=cfg["window_hours"])
-    idle_cost = (await _compute_windowed_idle_cost(session, None, _guard_cutoff))["total"]
+    idle_cost = (await _compute_windowed_idle_cost(session, None, _guard_cutoff))[
+        "total"
+    ]
 
     engaged = (
         cfg["enabled"]
@@ -319,7 +322,9 @@ async def evaluate_project_pool_cost_guard(
 
     cfg = _cost_guard_config(runtime_config)
     _guard_cutoff = _utcnow() - timedelta(hours=cfg["window_hours"])
-    idle_cost = (await _compute_windowed_idle_cost(session, project_id, _guard_cutoff))["total"]
+    idle_cost = (await _compute_windowed_idle_cost(session, project_id, _guard_cutoff))[
+        "total"
+    ]
     funnel = await _compute_project_pool_hit_rate(session, project_id, _guard_cutoff)
     hit_rate = funnel["hit_rate"]
     total = funnel["total_dispatches"]
@@ -352,7 +357,9 @@ async def evaluate_project_pool_cost_guard(
     }
 
 
-async def _maybe_emit_cost_guard_alert(session, project_id: uuid.UUID, reason: str) -> None:
+async def _maybe_emit_cost_guard_alert(
+    session, project_id: uuid.UUID, reason: str
+) -> None:
     """Emit a deduplicated WARNING alert when the cost guard engages for a project.
 
     Mirrors the circuit-breaker alert pattern (alert_dispatch): skip if an
@@ -362,15 +369,19 @@ async def _maybe_emit_cost_guard_alert(session, project_id: uuid.UUID, reason: s
     from app.models import Alert, AlertSeverity
 
     existing = (
-        await session.execute(
-            select(Alert).where(
-                Alert.project_id == project_id,
-                Alert.task_id.is_(None),
-                Alert.dismissed_at.is_(None),
-                Alert.title == _COST_GUARD_ALERT_TITLE,
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _COST_GUARD_ALERT_TITLE,
+                )
             )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if existing is not None:
         return
     session.add(
@@ -457,9 +468,7 @@ async def retire_and_delete_pool_vm(
         # excluded so a dispatcher that leased it between the scan and now is
         # never torn down mid-task; an already-RETIRING member is excluded so a
         # peer's teardown is never duplicated.
-        claim_where = (
-            PoolVm.state.in_((PoolVmState.PROVISIONING, PoolVmState.IDLE)),
-        )
+        claim_where = (PoolVm.state.in_((PoolVmState.PROVISIONING, PoolVmState.IDLE)),)
 
     # Bank any idle cost accrued since idle_since BEFORE the claim nulls it,
     # folded into the atomic UPDATE so only the claim winner persists it. We must
@@ -893,7 +902,7 @@ async def reconcile_project_pool(
     if live > target:
         idle_members = [m for m in warm_capacity if m.state == PoolVmState.IDLE]
         # Oldest-idle first so the freshest warm capacity survives.
-        idle_members.sort(key=lambda m: (m.idle_since or m.created_at))
+        idle_members.sort(key=lambda m: m.idle_since or m.created_at)
         to_drain = min(live - target, len(idle_members))
         for member in idle_members[:to_drain]:
             if await retire_and_delete_pool_vm(
@@ -912,7 +921,9 @@ async def reconcile_project_pool(
     if suppressed or drain_only:
         return summary
     deficit = target - live
-    allowed = min(deficit, max(0, dispatch_slots_remaining), max(0, pool_budget_remaining))
+    allowed = min(
+        deficit, max(0, dispatch_slots_remaining), max(0, pool_budget_remaining)
+    )
     if allowed <= 0:
         return summary
 
@@ -959,12 +970,16 @@ async def _projects_with_pool_members(session) -> list[uuid.UUID]:
     then on the maintainer keeps it at target.
     """
     rows = (
-        await session.execute(
-            select(PoolVm.project_id)
-            .where(PoolVm.state.in_(LIVE_POOL_STATES))
-            .distinct()
+        (
+            await session.execute(
+                select(PoolVm.project_id)
+                .where(PoolVm.state.in_(LIVE_POOL_STATES))
+                .distinct()
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return list(rows)
 
 
@@ -992,17 +1007,21 @@ async def _demand_active_projects(session, *, runtime_config) -> set[uuid.UUID]:
     """
     cutoff = _utcnow() - timedelta(minutes=_demand_window_minutes(runtime_config))
     rows = (
-        await session.execute(
-            select(Task.project_id)
-            .where(
-                or_(
-                    Task.status == TaskStatus.QUEUED,
-                    Task.vm_dispatched_at >= cutoff,
+        (
+            await session.execute(
+                select(Task.project_id)
+                .where(
+                    or_(
+                        Task.status == TaskStatus.QUEUED,
+                        Task.vm_dispatched_at >= cutoff,
+                    )
                 )
+                .distinct()
             )
-            .distinct()
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return set(rows)
 
 
@@ -1040,10 +1059,14 @@ async def run_pool_maintainer_cycle(
         # performance. In the normal case (fleet guard disengaged) each project
         # is evaluated independently by evaluate_project_pool_cost_guard so a
         # single poorly-performing project does not drain productive neighbors.
-        fleet_guard = await evaluate_pool_cost_guard(session, runtime_config=runtime_config)
+        fleet_guard = await evaluate_pool_cost_guard(
+            session, runtime_config=runtime_config
+        )
         fleet_guard_engaged = fleet_guard["engaged"]
         if fleet_guard_engaged:
-            logger.warning("[WARM-POOL] fleet cost guard engaged: %s", fleet_guard["reason"])
+            logger.warning(
+                "[WARM-POOL] fleet cost guard engaged: %s", fleet_guard["reason"]
+            )
         # Reconcile the UNION of (a) projects that already have live pool members
         # and (b) demand-active projects with no members yet. (b) is what lets a
         # pool actually FORM: a demand-active zero-member project flows through
@@ -1209,12 +1232,60 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     warmup = int(
         runtime_config.get("warm_pool_reaper_warmup_seconds", hb_stale) or hb_stale
     )
-    zombie_teardown_armed = (
-        now - _PROCESS_START_TS
-    ).total_seconds() >= warmup
+    zombie_teardown_armed = (now - _PROCESS_START_TS).total_seconds() >= warmup
 
     stale_vm_ids = await _stale_pool_image_ids()
     idle_cutoff = now - timedelta(seconds=idle_ttl)
+
+    # --- Pass 1: clear EXPIRED lane reservations on IDLE members ---
+    # A reservation that has outlived its TTL is cleared so the member rejoins
+    # the general pool. The reserved idle cost is settled to the fleet ledger
+    # (PoolIdleSpan via settle_pool_vm_idle_cost) AND attributed to the lane's
+    # reserved_idle_cost_usd_total so warm-park overhead is visible in lane
+    # rollups. This is a soft mutation (no reaping, member stays IDLE).
+    from app.efficiency_snapshot import settle_pool_vm_idle_cost
+    from app.runtime_config_state import is_improvement_lanes_enabled
+
+    expired_reserved = list(
+        (
+            await session.execute(
+                select(PoolVm).where(
+                    PoolVm.state == PoolVmState.IDLE,
+                    PoolVm.reserved_lane_id.isnot(None),
+                    PoolVm.reservation_expires_at.isnot(None),
+                    PoolVm.reservation_expires_at <= now,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for member in expired_reserved:
+        lane_id = member.reserved_lane_id
+        # Settle idle cost for the fleet ledger; this also advances idle_since
+        # to `now` so the same span is never billed twice.
+        accrued = settle_pool_vm_idle_cost(member, now=now, session=session)
+        member.reserved_lane_id = None
+        member.reservation_expires_at = None
+        session.add(member)
+        # Attribute the reserved-idle cost to the lane (additional write).
+        if accrued > 0 and lane_id is not None and is_improvement_lanes_enabled():
+            lane = await session.get(ImprovementLane, lane_id)
+            if lane is not None:
+                lane.reserved_idle_cost_usd_total = (
+                    lane.reserved_idle_cost_usd_total or 0.0
+                ) + accrued
+                session.add(lane)
+        logger.debug(
+            "[WARM-POOL] cleared expired lane reservation vm=%s lane=%s accrued=$%.4f",
+            member.vm_instance_id,
+            lane_id,
+            accrued,
+        )
+    if expired_reserved:
+        await session.commit()
+
+    # --- Pass 2: main reaper loop ---
 
     # Candidate scan WITHOUT locks (mirrors the reaper's lock-free Step 1). We
     # consider every non-terminal member; the per-member predicate below decides
@@ -1329,11 +1400,36 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
         # Snapshot before the teardown so the failure log never reads an
         # attribute off an instance the except's rollback just expired.
         vm_id = member.vm_instance_id
+        reserved_lane_id = member.reserved_lane_id  # capture before teardown
         try:
             if await retire_and_delete_pool_vm(
                 session, member, reason=reason, claim_grace_seconds=claim_grace
             ):
                 retired += 1
+                # Affinity degradation: reaping a reserved member breaks the
+                # lane's workspace continuity. Silently degrade so the lane's
+                # next resume cold-preps rather than waiting on a VM that is
+                # gone. Affinity is an OPTIMIZATION, never a correctness dep.
+                if reserved_lane_id is not None and is_improvement_lanes_enabled():
+                    try:
+                        lane = await session.get(ImprovementLane, reserved_lane_id)
+                        if lane is not None and lane.workspace_state != "COLD":
+                            lane.workspace_state = "COLD"
+                            session.add(lane)
+                            await session.commit()
+                            logger.info(
+                                "[WARM-POOL] reserved member %s reaped (reason=%s) — "
+                                "degraded lane %s to COLD",
+                                vm_id,
+                                reason,
+                                reserved_lane_id,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[WARM-POOL] lane-degradation write failed for lane %s",
+                            reserved_lane_id,
+                            exc_info=True,
+                        )
         except Exception:
             await session.rollback()
             logger.warning(

@@ -14,11 +14,17 @@ Covers:
 from unittest.mock import MagicMock, patch
 
 from app.capability_trial_verdict import (
+    LANE_PILOT_ASSIGNMENT_KEY,
+    LANE_PILOT_CAP_NAME,
+    LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+    LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
     carry_adoption_verdicts_for_consolidation,
+    evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
     get_effective_holdback_fraction,
     get_trial_definitions,
     get_trial_verdicts,
+    is_lane_pilot_arm_member,
     record_trial_verdict,
 )
 
@@ -1426,3 +1432,284 @@ class TestDiagnosticsAfterEditTrialDefinition:
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
+
+
+# ── review_fix_lane TrialDefinition registration ──────────────────────────────
+
+
+class TestTrialDefinitionsLanePilot:
+    def _lane_def(self):
+        defs = get_trial_definitions()
+        matches = [td for td in defs if td["cap_name"] == LANE_PILOT_CAP_NAME]
+        assert matches, f"{LANE_PILOT_CAP_NAME} not found in TRIAL_DEFINITIONS"
+        return matches[0]
+
+    def test_lane_pilot_registered(self):
+        caps = [td["cap_name"] for td in get_trial_definitions()]
+        assert LANE_PILOT_CAP_NAME in caps
+
+    def test_lane_pilot_required_fields_present(self):
+        td = self._lane_def()
+        assert "cap_name" in td
+        assert "context_key" in td
+        assert "thresholds" in td
+
+    def test_lane_pilot_has_assignment_key(self):
+        td = self._lane_def()
+        assert td.get("assignment_key") == LANE_PILOT_ASSIGNMENT_KEY
+
+    def test_lane_pilot_thresholds_contain_all_keys(self):
+        td = self._lane_def()
+        required_threshold_keys = [
+            "min_n",
+            "kill_merge_rate_floor",
+            "kill_cost_ceiling",
+            "kill_gate_violations_max",
+            "kill_checkpoint_loss_ceiling",
+            "futility_n",
+            "adopt_merge_lift_floor",
+            "adopt_cost_improvement",
+        ]
+        for key in required_threshold_keys:
+            assert key in td["thresholds"], f"threshold key missing: {key}"
+
+    def test_lane_pilot_threshold_values_are_numeric_and_nonzero(self):
+        td = self._lane_def()
+        for k, v in td["thresholds"].items():
+            assert isinstance(v, (int, float)), f"{k} is not numeric"
+            assert v != 0, f"{k} is zero"
+
+    def test_canonical_key_constants_exported(self):
+        assert isinstance(LANE_PILOT_CAP_NAME, str) and LANE_PILOT_CAP_NAME
+        assert isinstance(LANE_PILOT_ASSIGNMENT_KEY, str) and LANE_PILOT_ASSIGNMENT_KEY
+        assert isinstance(LANE_PILOT_WARM_RESUME_RECEIPT_KEY, str) and LANE_PILOT_WARM_RESUME_RECEIPT_KEY
+        assert isinstance(LANE_PILOT_CHECKPOINT_RECEIPT_KEY, str) and LANE_PILOT_CHECKPOINT_RECEIPT_KEY
+
+
+# ── is_lane_pilot_arm_member (partitioning helper) ────────────────────────────
+
+
+class TestIsLanePilotArmMember:
+    def test_lane_assignment_key_returns_lane(self):
+        ctx = {LANE_PILOT_ASSIGNMENT_KEY: "lane"}
+        assert is_lane_pilot_arm_member(ctx) == "lane"
+
+    def test_control_assignment_key_returns_control(self):
+        ctx = {LANE_PILOT_ASSIGNMENT_KEY: "control"}
+        assert is_lane_pilot_arm_member(ctx) == "control"
+
+    def test_receipt_key_only_not_a_member(self):
+        # A task with ONLY warm-resume or checkpoint receipt keys but NO assignment key
+        # must NOT be counted into any arm — receipts are not arm membership.
+        ctx = {
+            LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+            LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
+        }
+        assert is_lane_pilot_arm_member(ctx) is None
+
+    def test_empty_context_not_a_member(self):
+        assert is_lane_pilot_arm_member({}) is None
+
+    def test_none_context_not_a_member(self):
+        assert is_lane_pilot_arm_member(None) is None  # type: ignore[arg-type]
+
+    def test_unknown_arm_value_not_a_member(self):
+        ctx = {LANE_PILOT_ASSIGNMENT_KEY: "unknown_arm"}
+        assert is_lane_pilot_arm_member(ctx) is None
+
+
+# ── evaluate_lane_pilot_verdict ───────────────────────────────────────────────
+
+
+def _good_aggs(*, n=40, merge_lift=0.10, cost_improvement=0.10, gate_violations=0, checkpoint_loss=0.01) -> dict:
+    """Build a healthy aggregate dict (ADOPT territory by default)."""
+    control_rate = 0.70
+    lane_rate = control_rate + merge_lift
+    control_cost = 1000.0
+    lane_cost = control_cost * (1.0 - cost_improvement)
+    return {
+        "n_lane": n,
+        "n_control": n,
+        "lane_merge_rate": lane_rate,
+        "control_merge_rate": control_rate,
+        "lane_cost_per_merged": lane_cost,
+        "control_cost_per_merged": control_cost,
+        "gate_integrity_violations": gate_violations,
+        "checkpoint_loss_rate": checkpoint_loss,
+    }
+
+
+class TestEvaluateLanePilotVerdict:
+    # ── acceptance test (named in the plan) ──────────────────────────────────
+
+    def test_lane_pilot_thresholds_kill_and_adopt(self):
+        """Acceptance: pre-registered thresholds produce KILL on synthetic regressing
+        data and ADOPT on synthetic improving data."""
+        # Synthetic regressing: merge rate tanks well below the kill floor.
+        bad = _good_aggs(merge_lift=-0.10)
+        kill_verdict = evaluate_lane_pilot_verdict(bad)
+        assert kill_verdict["verdict"] == "KILL"
+
+        # Synthetic improving: cost down ≥5%, merge rate non-inferior, no violations.
+        good = _good_aggs(merge_lift=0.05, cost_improvement=0.05)
+        adopt_verdict = evaluate_lane_pilot_verdict(good)
+        assert adopt_verdict["verdict"] == "ADOPT"
+
+    # ── KILL conditions ───────────────────────────────────────────────────────
+
+    def test_kill_on_lane_merge_rate_below_floor(self):
+        aggs = _good_aggs(merge_lift=-0.05)  # lift = -0.05 <= -0.03
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "lane_merge_rate_below_floor"
+        assert result["immediate_alert"] is False
+
+    def test_kill_on_lane_merge_rate_exactly_at_floor(self):
+        # lift = -0.03 (exactly at floor) → KILL
+        aggs = _good_aggs(merge_lift=-0.03)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "lane_merge_rate_below_floor"
+
+    def test_kill_on_cost_per_merged_above_ceiling(self):
+        # Lane costs 15% more than control — exceeds +10% ceiling.
+        aggs = _good_aggs(cost_improvement=-0.15)  # lane_cost = control * 1.15
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "lane_cost_ceiling_exceeded"
+        assert result["immediate_alert"] is False
+
+    def test_kill_on_gate_integrity_violations(self):
+        # 3 gate violations → KILL + immediate_alert.
+        aggs = _good_aggs(gate_violations=3)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "gate_integrity_violations_exceeded"
+        assert result["immediate_alert"] is True
+
+    def test_kill_on_gate_integrity_violations_above_min(self):
+        aggs = _good_aggs(gate_violations=10)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["immediate_alert"] is True
+
+    def test_kill_on_checkpoint_loss_rate_above_ceiling(self):
+        # 8% checkpoint loss > 5% ceiling.
+        aggs = _good_aggs(checkpoint_loss=0.08)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "checkpoint_loss_rate_exceeded"
+        assert result["immediate_alert"] is False
+
+    def test_kill_on_futility_at_max_n(self):
+        # n >= 90 per arm, adopt criteria NOT met → futility KILL.
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "futility_at_max_n"
+
+    # ── CONTINUE conditions ───────────────────────────────────────────────────
+
+    def test_continue_insufficient_n(self):
+        aggs = _good_aggs(n=10)  # below min_n=30
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+        assert result["verdict_reason"] == "insufficient_data"
+        assert result["immediate_alert"] is False
+
+    def test_continue_none_merge_rate(self):
+        aggs = _good_aggs()
+        aggs["lane_merge_rate"] = None
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+
+    def test_continue_none_cost(self):
+        aggs = _good_aggs()
+        aggs["lane_cost_per_merged"] = None
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+
+    def test_continue_ambiguous_metrics_sufficient_n(self):
+        # n ≥ min_n but metrics don't meet adopt OR kill.
+        aggs = _good_aggs(merge_lift=0.005, cost_improvement=0.02)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+        assert result["verdict_reason"] == "accumulating_data"
+
+    # ── ADOPT condition ───────────────────────────────────────────────────────
+
+    def test_adopt_all_criteria_met(self):
+        aggs = _good_aggs(merge_lift=0.05, cost_improvement=0.05, gate_violations=0)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "ADOPT"
+        assert result["verdict_reason"] == "adopt_criteria_met"
+        assert result["immediate_alert"] is False
+
+    def test_adopt_requires_zero_gate_violations(self):
+        # Exactly adopt metrics but 1 gate violation → not ADOPT.
+        aggs = _good_aggs(merge_lift=0.05, cost_improvement=0.05, gate_violations=1)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] != "ADOPT"
+
+    def test_adopt_requires_cost_improvement_at_threshold(self):
+        # Exactly 5% cost improvement meets the adopt criterion.
+        aggs = _good_aggs(merge_lift=0.05, cost_improvement=0.05)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "ADOPT"
+
+    def test_adopt_requires_merge_non_inferiority(self):
+        # Lift = -0.005 (> -0.01 floor) — still non-inferior.
+        aggs = _good_aggs(merge_lift=-0.005, cost_improvement=0.05)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "ADOPT"
+
+    # ── gate-integrity violations raise immediate_alert below min_n ───────────
+
+    def test_gate_violations_alert_below_min_n(self):
+        aggs = _good_aggs(n=5, gate_violations=3)  # n << min_n
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["immediate_alert"] is True
+
+    # ── KILL takes priority over ADOPT ───────────────────────────────────────
+
+    def test_kill_takes_priority_over_adopt(self):
+        # Meets adopt criteria but also has gate violations → KILL wins.
+        aggs = _good_aggs(merge_lift=0.05, cost_improvement=0.10, gate_violations=3)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["immediate_alert"] is True
+
+    def test_kill_merge_rate_takes_priority_over_cost_improvement(self):
+        aggs = _good_aggs(merge_lift=-0.05, cost_improvement=0.10)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "lane_merge_rate_below_floor"
+
+    # ── snapshot fields present ───────────────────────────────────────────────
+
+    def test_snapshot_fields_present_on_kill(self):
+        aggs = _good_aggs(merge_lift=-0.05)
+        result = evaluate_lane_pilot_verdict(aggs)
+        for field in ("n_lane", "n_control", "lane_merge_rate", "control_merge_rate",
+                      "lane_cost_per_merged", "control_cost_per_merged",
+                      "gate_integrity_violations", "checkpoint_loss_rate", "thresholds"):
+            assert field in result, f"missing field: {field}"
+
+    def test_snapshot_fields_present_on_adopt(self):
+        aggs = _good_aggs()
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "ADOPT"
+        assert "thresholds" in result
+        assert isinstance(result["thresholds"], dict)
+        for key in ("min_n", "kill_merge_rate_floor", "kill_cost_ceiling",
+                    "kill_gate_violations_max", "kill_checkpoint_loss_ceiling",
+                    "futility_n", "adopt_merge_lift_floor", "adopt_cost_improvement"):
+            assert key in result["thresholds"]
+
+    def test_snapshot_fields_present_on_continue(self):
+        aggs = _good_aggs(n=10)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+        assert "thresholds" in result
+        assert "immediate_alert" in result

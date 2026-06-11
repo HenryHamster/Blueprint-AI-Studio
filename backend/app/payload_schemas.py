@@ -785,6 +785,47 @@ class RepoBootstrapPayload(BasePayload):
     is_first_bootstrap: bool = True
 
 
+class LaneCheckpointValidated(BaseModel):
+    """Validated test/lint state carried by a lane checkpoint."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    lint: bool = True
+    tests: str = Field(default="green", pattern=r"^(green|red|skipped)$")
+
+
+class LaneCheckpointPayload(BaseModel):
+    """Lane checkpoint submitted by a completing lane-phase task.
+
+    Validated at task completion; the backend verifies the sha against the
+    lane branch via the GitHub client before appending the checkpoint record.
+    A missing or unverifiable checkpoint degrades completion to
+    ``failure_category='checkpoint_missing'``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    sha: str = Field(min_length=7, max_length=64)
+    summary: str = Field(max_length=1024)
+    validated: LaneCheckpointValidated = Field(default_factory=LaneCheckpointValidated)
+    wip_failing: list[str] = Field(default_factory=list, max_length=50)
+    manifest_patch: dict[str, Any] = Field(default_factory=dict)
+    tokens_in: int = Field(default=0, ge=0)
+    tokens_out: int = Field(default=0, ge=0)
+    vm_cost_usd: float = Field(default=0.0, ge=0.0)
+    warm_resume: bool = False
+
+    @field_validator("manifest_patch")
+    @classmethod
+    def _check_manifest_patch_size(cls, v: dict) -> dict:
+        import json as _json
+
+        size = len(_json.dumps(v, default=str).encode())
+        if size > 8192:
+            raise ValueError(f"manifest_patch exceeds 8KB limit ({size} bytes)")
+        return v
+
+
 class RepoBootstrapOverview(BaseModel):
     """Structured repo-overview payload returned by repo_bootstrap completions."""
 

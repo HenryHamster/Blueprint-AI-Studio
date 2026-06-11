@@ -637,6 +637,63 @@ export async function fetchPipelineRegressions(
   return res.json();
 }
 
+export interface ImprovementLaneRow {
+  id: string;
+  status: string;
+  direction_id: string | null;
+  branch: string | null;
+  last_checkpoint_phase: string | null;
+  last_checkpoint_seq: number | null;
+  last_checkpoint_sha: string | null;
+  last_checkpoint_age_seconds: number | null;
+  checkpoint_loss_count: number;
+  workspace_state: string | null;
+  workspace_vm_instance_id: string | null;
+  reservation_expires_at: string | null;
+  reserved_vm_instance_id: string | null;
+  pilot_arm: string | null;
+  phase_requeues: number;
+  llm_input_tokens_total: number | null;
+  llm_output_tokens_total: number | null;
+  vm_cost_usd_total: number;
+  reserved_idle_cost_usd_total: number;
+  shadow: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  [key: string]: unknown;
+}
+
+export interface ImprovementLanesResponse {
+  lanes: ImprovementLaneRow[];
+  total_returned: number;
+  offset: number;
+  limit: number;
+  project_id: string;
+  [key: string]: unknown;
+}
+
+export async function fetchImprovementLanes(
+  projectId: string,
+  limit = 50,
+  offset = 0,
+  signal?: AbortSignal,
+): Promise<ImprovementLanesResponse> {
+  const params = new URLSearchParams({
+    project_id: projectId,
+    limit: String(limit),
+    offset: String(offset),
+  });
+  const res = await apiFetch(
+    `/api/admin/improvement-lanes?${params.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch improvement lanes: ${res.status}`);
+  return res.json();
+}
+
 export interface SrMissedRetrospectivesResponse {
   items: SrMissedTask[];
   total: number;

@@ -1545,3 +1545,200 @@ async def test_cost_guard_ignores_pre_window_idle_spend(db_session, mocker):
         f"Windowed idle_cost_usd={guard['idle_cost_usd']} should be < $0.10; "
         "the pre-window $100 ledger row must not be counted"
     )
+
+
+# ---------------------------------------------------------------------------
+# Lane workspace-mode: /next-role response carries lane_checkpoint_sha +
+# is_lane_phase when improvement_lanes_enabled is on and task context has
+# the lane phase marker.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_next_role_lane_fields_present_when_flag_on(
+    client: AsyncClient, db_session, mocker
+):
+    """When improvement_lanes_enabled is on and the QUEUED task's context has
+    is_lane_phase=True + lane_checkpoint_sha, /next-role includes both fields
+    in the claim response body.
+    """
+    import app.shared_state as _shared_state
+    from app.shared_state import runtime_config as _runtime_config
+
+    mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_warm_continuity.broadcast_to_project",
+        new_callable=mocker.AsyncMock,
+    )
+
+    prior_warm = _runtime_config.get("warm_continuity_enabled")
+    prior_lanes = _runtime_config.get("improvement_lanes_enabled")
+    prior_heartbeat = dict(_shared_state.vm_last_heartbeat)
+    try:
+        _runtime_config["warm_continuity_enabled"] = True
+        _runtime_config["improvement_lanes_enabled"] = True
+
+        project = Project(name="Lane Fields Test", user_id="test-user-lane")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        vm_id = "agent-vm-lane-test-001"
+        checkpoint_sha = "abcdef1234567890abcdef1234567890abcdef12"
+
+        # Seed a source IN_PROGRESS task so the chain-continuity branch can find it.
+        source_task = Task(
+            project_id=project.id,
+            title="Source task",
+            payloads=[{"type": "create", "pr_number": 7001, "branch": "feat/lane-test"}],
+            vm_instance_id=vm_id,
+            status=TaskStatus.IN_PROGRESS,
+            context={"scope": "small"},
+        )
+        db_session.add(source_task)
+        await db_session.commit()
+        await db_session.refresh(source_task)
+
+        # Seed a QUEUED task pinned to vm_id with lane context.
+        pinned_task = Task(
+            project_id=project.id,
+            title="Lane phase task",
+            payloads=[{"type": "create", "pr_number": 7001, "branch": "feat/lane-test"}],
+            status=TaskStatus.QUEUED,
+            context={
+                "warm_target_vm_id": vm_id,
+                "warm_target_pr": "7001",
+                "is_lane_phase": True,
+                "lane_checkpoint_sha": checkpoint_sha,
+            },
+        )
+        db_session.add(pinned_task)
+        await db_session.commit()
+        await db_session.refresh(pinned_task)
+
+        _shared_state.record_vm_heartbeat(vm_id)
+
+        source_token = create_agent_token(str(source_task.id), vm_id)
+        nr_resp = await client.post(
+            "/api/agent/next-role",
+            json={
+                "vm_instance_id": vm_id,
+                "prior_task_id": str(source_task.id),
+                "prior_pr_number": 7001,
+            },
+            headers={"x-agent-token": source_token},
+        )
+        assert nr_resp.status_code == 200, nr_resp.text
+        body = nr_resp.json()
+        assert body["action"] == "claim"
+        assert body["task_id"] == str(pinned_task.id)
+        # Lane fields must be present when improvement_lanes_enabled is on.
+        assert body.get("is_lane_phase") is True
+        assert body.get("lane_checkpoint_sha") == checkpoint_sha
+
+    finally:
+        if prior_warm is None:
+            _runtime_config.pop("warm_continuity_enabled", None)
+        else:
+            _runtime_config["warm_continuity_enabled"] = prior_warm
+        if prior_lanes is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes
+        _shared_state.vm_last_heartbeat.clear()
+        _shared_state.vm_last_heartbeat.update(prior_heartbeat)
+
+
+@pytest.mark.asyncio
+async def test_next_role_lane_fields_absent_when_flag_off(
+    client: AsyncClient, db_session, mocker
+):
+    """When improvement_lanes_enabled is off, lane fields are NOT included in
+    the /next-role claim response even if the task context has them.
+    """
+    import app.shared_state as _shared_state
+    from app.shared_state import runtime_config as _runtime_config
+
+    mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_warm_continuity.broadcast_to_project",
+        new_callable=mocker.AsyncMock,
+    )
+
+    prior_warm = _runtime_config.get("warm_continuity_enabled")
+    prior_lanes = _runtime_config.get("improvement_lanes_enabled")
+    prior_heartbeat = dict(_shared_state.vm_last_heartbeat)
+    try:
+        _runtime_config["warm_continuity_enabled"] = True
+        _runtime_config["improvement_lanes_enabled"] = False  # flag OFF
+
+        project = Project(name="Lane Fields Flag Off Test", user_id="test-user-lane2")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        vm_id = "agent-vm-lane-off-002"
+        checkpoint_sha = "1111111111111111111111111111111111111111"
+
+        source_task = Task(
+            project_id=project.id,
+            title="Source task 2",
+            payloads=[{"type": "create", "pr_number": 7002, "branch": "feat/lane-off"}],
+            vm_instance_id=vm_id,
+            status=TaskStatus.IN_PROGRESS,
+            context={"scope": "small"},
+        )
+        db_session.add(source_task)
+        await db_session.commit()
+        await db_session.refresh(source_task)
+
+        pinned_task = Task(
+            project_id=project.id,
+            title="Lane phase task (flag off)",
+            payloads=[{"type": "create", "pr_number": 7002, "branch": "feat/lane-off"}],
+            status=TaskStatus.QUEUED,
+            context={
+                "warm_target_vm_id": vm_id,
+                "warm_target_pr": "7002",
+                "is_lane_phase": True,
+                "lane_checkpoint_sha": checkpoint_sha,
+            },
+        )
+        db_session.add(pinned_task)
+        await db_session.commit()
+        await db_session.refresh(pinned_task)
+
+        _shared_state.record_vm_heartbeat(vm_id)
+
+        source_token = create_agent_token(str(source_task.id), vm_id)
+        nr_resp = await client.post(
+            "/api/agent/next-role",
+            json={
+                "vm_instance_id": vm_id,
+                "prior_task_id": str(source_task.id),
+                "prior_pr_number": 7002,
+            },
+            headers={"x-agent-token": source_token},
+        )
+        assert nr_resp.status_code == 200, nr_resp.text
+        body = nr_resp.json()
+        assert body["action"] == "claim"
+        # Flag off → lane fields must NOT appear.
+        assert "is_lane_phase" not in body
+        assert "lane_checkpoint_sha" not in body
+
+    finally:
+        if prior_warm is None:
+            _runtime_config.pop("warm_continuity_enabled", None)
+        else:
+            _runtime_config["warm_continuity_enabled"] = prior_warm
+        if prior_lanes is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes
+        _shared_state.vm_last_heartbeat.clear()
+        _shared_state.vm_last_heartbeat.update(prior_heartbeat)

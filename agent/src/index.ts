@@ -1183,6 +1183,12 @@ export interface PollResult {
   // credentials and re-exec so the frozen provider constants are re-read on
   // the correct account. Absent (same-account claim) → JWT-only rotation.
   secretManifest?: SecretManifest;
+  // Lane workspace-mode fields. Present only when the claimed task is a lane
+  // phase and improvement_lanes_enabled is on. The agent uses laneCheckpointSha
+  // to hard-reset the warm workspace to the last verified checkpoint SHA
+  // (treating it as truth) rather than resetting to origin/<branch>.
+  laneCheckpointSha?: string;
+  isLanePhase?: boolean;
 }
 
 export interface ParkDirective {
@@ -1311,9 +1317,9 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
         }
         // 200 OK with a JSON body that selects claim or exit.
         if (res.status === 200) {
-          let body: { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown } = {};
+          let body: { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown; lane_checkpoint_sha?: unknown; is_lane_phase?: unknown } = {};
           try {
-            body = await res.json() as { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown };
+            body = await res.json() as { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown; lane_checkpoint_sha?: unknown; is_lane_phase?: unknown };
           } catch (e) {
             log(`pollForNextRole: 200 with unparseable body: ${String(e)}`);
             await new Promise(r => setTimeout(r, pollIntervalMs));
@@ -1333,6 +1339,8 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
               taskId: body.task_id,
               agentToken: typeof body.agent_token === 'string' ? body.agent_token : undefined,
               ...(secretManifest ? { secretManifest } : {}),
+              ...(typeof body.lane_checkpoint_sha === 'string' ? { laneCheckpointSha: body.lane_checkpoint_sha } : {}),
+              ...(body.is_lane_phase === true ? { isLanePhase: true } : {}),
             };
           }
           if (body.action === 'exit') {
@@ -1517,6 +1525,15 @@ export async function performWarmRetarget(
   if (opts.taskId) env.TASK_ID = opts.taskId;
   env.BLUEPRINT_WARM_HANDOFF = '1';
   env.BLUEPRINT_REEXEC = '1';
+  // Carry lane workspace-mode vars into the re-exec'd /etc/agent.env so the
+  // restarted process sees the same lane state as this one. Set by
+  // continueWarmContinuation before performWarmRetarget is called.
+  if (process.env.BLUEPRINT_LANE_MODE === '1') {
+    env.BLUEPRINT_LANE_MODE = '1';
+    if (process.env.BLUEPRINT_LANE_CHECKPOINT_SHA) {
+      env.BLUEPRINT_LANE_CHECKPOINT_SHA = process.env.BLUEPRINT_LANE_CHECKPOINT_SHA;
+    }
+  }
   const manifest: SecretManifest = { ...secretManifest, env };
 
   // Materialize FIRST (write-new-then-swap): the helper overwrites
@@ -2955,6 +2972,10 @@ export async function main() {
     // role 1. The flag is set later by the role-loop AFTER resetForNextRole
     // succeeds; on first boot the workspace is empty and we always cold-clone.
     delete process.env.BLUEPRINT_WARM_HANDOFF;
+    // Also clear lane vars so a stale value from a prior process incarnation
+    // cannot leak into the first role of a cold boot.
+    delete process.env.BLUEPRINT_LANE_MODE;
+    delete process.env.BLUEPRINT_LANE_CHECKPOINT_SHA;
   }
 
   // Per-role state reset on cold-start. Mirrors the role-loop's warm handoff
@@ -3249,6 +3270,16 @@ export async function continueWarmContinuation(
     throw err;
   }
   deps.materializeClaimCredentialState(pollResult.secretManifest, 'reset_failed: warm-claim');
+  // Lane workspace-mode: set env vars BEFORE BLUEPRINT_WARM_HANDOFF so
+  // prepareWorkspaceForRole reads a consistent lane state. Clear them on
+  // non-lane claims to prevent leakage across roles on the same warm VM.
+  if (pollResult.isLanePhase && pollResult.laneCheckpointSha) {
+    process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = pollResult.laneCheckpointSha;
+    process.env.BLUEPRINT_LANE_MODE = '1';
+  } else {
+    delete process.env.BLUEPRINT_LANE_CHECKPOINT_SHA;
+    delete process.env.BLUEPRINT_LANE_MODE;
+  }
   process.env.BLUEPRINT_WARM_HANDOFF = '1';
   resetPerRoleModuleState({ warmStart: true });
 

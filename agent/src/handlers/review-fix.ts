@@ -315,6 +315,10 @@ export async function handleReview(
   await prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+    // Gate integrity: a reviewer NEVER warm-resumes onto a lane workspace.
+    // The review-fix lane pilot lane-izes only the fix side; the review path
+    // stays cold and independent. Defense in depth against a leaked lane env.
+    allowLaneResume: false,
   });
   // Fetch the base branch into the shallow clone so `git diff origin/${baseBranch}...HEAD`
   // and `git merge-base --is-ancestor ... origin/${baseBranch}` actually work.  Without
@@ -692,6 +696,12 @@ export async function handleFix(
   await prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+    // Review-fix lane pilot: the FIX side is the lane-ized side. When the
+    // backend dispatched this fix warm onto a lane-reserved member it set the
+    // lane env (BLUEPRINT_LANE_MODE / _CHECKPOINT_SHA); allowLaneResume stays
+    // true (default) so prepareWorkspaceForRole fetch+resets to the checkpoint
+    // and skips the cold clone/install. A classic fix never carries the env.
+    allowLaneResume: true,
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);

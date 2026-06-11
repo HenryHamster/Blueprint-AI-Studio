@@ -358,6 +358,13 @@ MAX_REVIEW_FIX_ITERATIONS = 16
 _PROPAGATE_UNDERSCORE_KEYS = frozenset(
     {
         "_rollup_retries",
+        # Review-fix lane pilot: the intent-to-treat arm assignment and the
+        # chain-private lane id must survive every fix/review iteration so the
+        # chain stays bound to its arm/lane. Both are inert to dispatch (unlike
+        # ``improvement_lane_id``, which is re-derived per fix phase) — see
+        # app.review_fix_lane_pilot.
+        "_review_fix_lane_arm",
+        "_review_fix_lane_id",
     }
 )
 
@@ -2868,6 +2875,91 @@ async def _spawn_pipeline_task(
         ),
     }
 
+    # ── Review-fix lane pilot wiring (flag-gated, self-repo only) ─────────────
+    # Lane-ize ONLY the fix side of the review -> fix -> re-review loop. The
+    # reviewer/auditor ALWAYS runs cold: stripping transient lane directives is
+    # unconditional, so a stale ``improvement_lane_id`` can never ride a review
+    # onto a lane-reserved member (gate integrity, kill-class). On a classic
+    # chain (flag off or not self-repo) every line below is a no-op and the
+    # spawn path is byte-for-byte unchanged.
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.models import Project as _Project
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        LANE_PILOT_ASSIGNMENT_KEY,
+        activate_lane_for_fix,
+        checkpoint_and_reserve_on_phase_complete,
+        ensure_chain_lane,
+        get_chain_lane,
+        is_review_fix_lane_pilot_enabled,
+        lane_arm_of,
+        record_lane_arm_assignment,
+        strip_transient_lane_context,
+        wire_fix_lane_context,
+    )
+
+    strip_transient_lane_context(propagated_ctx)
+    lane_review_force_cold = False
+    lane_fix_task_id: uuid.UUID | None = None
+    lane_fix_to_activate = None
+    if is_review_fix_lane_pilot_enabled():
+        _pilot_project = await session.get(_Project, source_task.project_id)
+        # Record the intent-to-treat arm ONCE for the chain (BOTH arms), keyed on
+        # the immutable original create-task id, so arm membership is decided
+        # before any fix-side treatment. Persisted on the source task (durable,
+        # read by the measurement on terminal rows) AND propagated forward.
+        _seed = resolved_original_id or str(source_task.id)
+        record_lane_arm_assignment(source_ctx, _seed, _pilot_project)
+        _arm = lane_arm_of(source_ctx)
+        if _arm is not None:
+            propagated_ctx[LANE_PILOT_ASSIGNMENT_KEY] = _arm
+            if (source_task.context or {}).get(LANE_PILOT_ASSIGNMENT_KEY) != _arm:
+                source_task.context = source_ctx
+                _flag_modified(source_task, "context")
+        if _arm == "lane":
+            if task_type == "review":
+                # Implement/fix phase just completed -> checkpoint the lane and
+                # move its workspace to WARM_RESERVED, then spawn the review COLD
+                # (lane ctx already stripped, warm handoff suppressed below).
+                lane_review_force_cold = True
+                _lane = await ensure_chain_lane(
+                    session,
+                    project_id=source_task.project_id,
+                    ctx=source_ctx,
+                    title=(propagated_ctx.get("direction_title") or title)[:120],
+                    branch_name=branch,
+                    base_branch=base_branch,
+                    direction_id=propagated_ctx.get("direction_id"),
+                    current_task_id=source_task.id,
+                )
+                _chain_lane_id = source_ctx.get(LANE_CHAIN_ID_KEY)
+                if _chain_lane_id:
+                    propagated_ctx[LANE_CHAIN_ID_KEY] = _chain_lane_id
+                    source_task.context = source_ctx
+                    _flag_modified(source_task, "context")
+                _phase_sha = source_ctx.get("head_sha") or source_ctx.get(
+                    "_pr_head_sha"
+                )
+                if not _phase_sha and orig is not None:
+                    _phase_sha = (orig.context or {}).get("head_sha")
+                await checkpoint_and_reserve_on_phase_complete(
+                    session,
+                    source_task,
+                    _lane,
+                    sha=_phase_sha,
+                    summary=f"lane phase complete PR #{pr_number}",
+                )
+            elif task_type == "fix":
+                # Fix side resumes warm on the lane-reserved member: bind the
+                # lane ACTIVE for this phase and attach warm-resume directives +
+                # use receipts. The reviewer never reaches this branch.
+                _lane = await get_chain_lane(session, source_ctx)
+                if _lane is not None:
+                    lane_fix_task_id = uuid.uuid4()
+                    lane_fix_to_activate = _lane
+                    wire_fix_lane_context(propagated_ctx, _lane)
+
     # Phase 2c: warm-VM continuity pin. When the runtime flag is on AND the
     # source task's VM is still alive (IN_PROGRESS or completed within the
     # warm-handoff window), pin the spawned task to that VM and leave
@@ -2901,6 +2993,10 @@ async def _spawn_pipeline_task(
     record_spawn_attempt()
     if suppress_warm_handoff:
         record_spawn_pin_skipped("caller_suppressed")
+    elif lane_review_force_cold:
+        # Lane-arm review: the reviewer must be independent and cold. Never pin
+        # it to the implementer's (now lane-reserved) VM — gate integrity.
+        record_spawn_pin_skipped("lane_review_cold")
     elif not warm_continuity_enabled:
         record_spawn_pin_skipped("disabled")
     elif is_warm_continuity_suppressed():
@@ -2953,11 +3049,14 @@ async def _spawn_pipeline_task(
         payloads=[payload_data],
         context=propagated_ctx,
         idempotency_key=idempotency_key,
+        **({"id": lane_fix_task_id} if lane_fix_task_id is not None else {}),
         vm_instance_id=spawn_vm_instance_id,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )
     session.add(new_task)
+    if lane_fix_to_activate is not None:
+        await activate_lane_for_fix(session, lane_fix_to_activate, task_id=new_task.id)
     try:
         await session.commit()
     except IntegrityError:

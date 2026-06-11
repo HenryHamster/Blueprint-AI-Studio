@@ -30,7 +30,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.admin import _get_user_project_with_role
+from app.admin_helpers import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
 from app.landed_signal import (
@@ -39,6 +39,8 @@ from app.landed_signal import (
     is_verified_merge,
 )
 from app.models import (
+    ImprovementLane,
+    ImprovementLaneStatus,
     PoolIdleCostLedger,
     PoolIdleSpan,
     PoolVm,
@@ -90,6 +92,9 @@ AXIS_VM_REUSE_RATE = "vm_reuse_rate"
 AXIS_MEDIAN_API_CALLS_PER_TASK = "median_api_calls_per_task"
 AXIS_MEDIAN_REVIEW_ITERATIONS = "median_review_iterations"
 AXIS_LLM_COST_PER_MERGED_PR = "llm_cost_per_merged_pr"
+AXIS_LANE_COST_PER_MERGED_PR = "lane_cost_per_merged_pr"
+AXIS_LANE_WARM_RESUME_RATE = "lane_warm_resume_rate"
+AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 FORMAT_COMPLIANCE_KEY = "format_compliance"
 FORMAT_COMPLIANCE_RATE_KEY = "format_compliance_rate"
 SELF_REPAIR_SUCCESS_RATE_KEY = "self_repair_success_rate"
@@ -101,6 +106,9 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
     AXIS_LLM_COST_PER_MERGED_PR,
+    AXIS_LANE_COST_PER_MERGED_PR,
+    AXIS_LANE_WARM_RESUME_RATE,
+    AXIS_CHECKPOINT_LOSS_RATE,
 )
 
 # ---------------------------------------------------------------------------
@@ -134,6 +142,15 @@ AXIS_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_LLM_COST_PER_MERGED_PR: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_LANE_COST_PER_MERGED_PR: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_LANE_WARM_RESUME_RATE: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_CHECKPOINT_LOSS_RATE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
 }
@@ -243,7 +260,9 @@ _SNAPSHOT_HISTORY_MAX = 365
 #
 # v6: cost_per_merged_pr_incl_pool_idle switched from the all-time pool idle
 #     accumulator to a windowed figure matching the dispatch-funnel window.
-METRIC_DEF_VERSION = "v6"
+# v7: three improvement-lane axes registered (lane_cost_per_merged_pr,
+#     lane_warm_resume_rate, checkpoint_loss_rate).
+METRIC_DEF_VERSION = "v7"
 
 
 async def _load_recent_tasks(
@@ -305,6 +324,88 @@ async def _load_recent_tasks(
         .limit(5000)
     )
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def _load_project_lanes(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[ImprovementLane]:
+    """Load all non-KILLED ImprovementLane rows for the project."""
+    stmt = (
+        select(ImprovementLane)
+        .where(
+            ImprovementLane.project_id == project_id,
+            ImprovementLane.status != ImprovementLaneStatus.KILLED.value,
+        )
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+def _compute_lane_cost_per_merged_pr(
+    lanes: list[ImprovementLane],
+    *,
+    window_days: int = _AXIS_WINDOW_DAYS,
+) -> float | None:
+    """Total lane VM+idle cost / RETIRED lane count in the window. None when no retired lanes.
+
+    Uses ``retired_at`` to scope to lanes that reached their terminal success
+    state within the rolling window, mirroring how task-based axes use
+    ``updated_at`` to bound the denominator. Lanes with no ``retired_at`` are
+    excluded even if their status is RETIRED.
+    """
+    cutoff = _utcnow() - timedelta(days=window_days)
+    total_cost = 0.0
+    retired_count = 0
+    for lane in lanes:
+        if lane.status != ImprovementLaneStatus.RETIRED.value:
+            continue
+        if lane.retired_at is None or lane.retired_at < cutoff:
+            continue
+        total_cost += (lane.vm_cost_usd_total or 0.0) + (
+            lane.reserved_idle_cost_usd_total or 0.0
+        )
+        retired_count += 1
+    if not retired_count:
+        return None
+    return round(total_cost / retired_count, 4)
+
+
+def _compute_lane_warm_resume_rate(lanes: list[ImprovementLane]) -> float | None:
+    """Share of lane phase resumes that reused a warm workspace.
+
+    Reads ``warm_resume`` from each checkpoint record in ``checkpoints[]``.
+    Uses all non-KILLED project lanes so ACTIVE/PARKED lanes contribute
+    real-time signal alongside completed RETIRED ones.
+    Returns None when no checkpoints exist across any lane.
+    """
+    total_checkpoints = 0
+    warm_checkpoints = 0
+    for lane in lanes:
+        for checkpoint in (lane.checkpoints or []):
+            total_checkpoints += 1
+            if checkpoint.get("warm_resume") is True:
+                warm_checkpoints += 1
+    if not total_checkpoints:
+        return None
+    return round(warm_checkpoints / total_checkpoints, 4)
+
+
+def _compute_checkpoint_loss_rate(lanes: list[ImprovementLane]) -> float | None:
+    """Fraction of checkpoint attempts that were lost (phase requeued without a checkpoint).
+
+    Formula: sum(phase_requeues) / (sum(checkpoint_seq) + sum(phase_requeues))
+    across all non-KILLED project lanes. Returns None when the denominator is 0
+    (no lanes have attempted any phases).
+    """
+    total_seq = 0
+    total_requeues = 0
+    for lane in lanes:
+        total_seq += int(lane.checkpoint_seq or 0)
+        total_requeues += int(lane.phase_requeues or 0)
+    denominator = total_seq + total_requeues
+    if not denominator:
+        return None
+    return round(total_requeues / denominator, 4)
 
 
 def _cost_and_merges(tasks: list[Task]) -> tuple[float, int]:
@@ -2049,6 +2150,7 @@ async def compute_current_axes(
     )
 
     tasks = await _load_recent_tasks(session, project_id)
+    lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
 
     # Honest net-cost companion: fold the project's warm-pool idle cost into the
@@ -2082,6 +2184,9 @@ async def compute_current_axes(
         AXIS_MEDIAN_API_CALLS_PER_TASK: _compute_median_api_calls_per_task(tasks),
         AXIS_MEDIAN_REVIEW_ITERATIONS: _compute_median_review_iterations(tasks),
         AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
+        AXIS_LANE_COST_PER_MERGED_PR: _compute_lane_cost_per_merged_pr(lanes),
+        AXIS_LANE_WARM_RESUME_RATE: _compute_lane_warm_resume_rate(lanes),
+        AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
@@ -2234,6 +2339,15 @@ async def write_snapshot(
             if baseline.get("_schema_version") == 4:
                 baseline[AXIS_LLM_COST_PER_MERGED_PR] = None
                 baseline["_schema_version"] = 5
+            # One-time migration: baselines captured before improvement-lane
+            # efficiency axes were registered (schema_version 5) have no lane_*
+            # or checkpoint_* keys. Clear/seed them so current-vs-baseline drift
+            # is apples-to-apples.
+            if baseline.get("_schema_version") == 5:
+                baseline[AXIS_LANE_COST_PER_MERGED_PR] = None
+                baseline[AXIS_LANE_WARM_RESUME_RATE] = None
+                baseline[AXIS_CHECKPOINT_LOSS_RATE] = None
+                baseline["_schema_version"] = 6
             # Re-seed any individual axes that were cleared (e.g. by the migration
             # above) once a valid current value is available.
             for axis in ALL_AXES:

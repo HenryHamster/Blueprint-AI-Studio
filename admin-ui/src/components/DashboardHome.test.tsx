@@ -17,6 +17,7 @@ const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, fetchFleetU
     providerCostPanel: null as Record<string, unknown> | null,
     scopeTrends: null as Record<string, unknown> | null,
     directionAutoPause: null as Record<string, unknown> | null,
+    improvementLanes: null as Record<string, unknown> | null,
     srUnhandledEdges: null as Record<string, unknown> | null,
     srMissed: null as Record<string, unknown> | null,
     srDisagreements: null as Record<string, unknown> | null,
@@ -61,6 +62,13 @@ vi.mock('./DirectionAutoPauseWidget', () => ({
   DirectionAutoPauseWidget: (props: Record<string, unknown>) => {
     capturedProps.directionAutoPause = props;
     return <div data-testid="direction-auto-pause-widget">DirectionAutoPauseWidget</div>;
+  },
+}));
+
+vi.mock('./ImprovementLanesPanel', () => ({
+  ImprovementLanesPanel: (props: Record<string, unknown>) => {
+    capturedProps.improvementLanes = props;
+    return <div data-testid="improvement-lanes-panel">ImprovementLanesPanel</div>;
   },
 }));
 
@@ -342,6 +350,24 @@ describe('DashboardHome', () => {
     await waitFor(() => {
       expect(fetchAgentServingShasMock).toHaveBeenCalledWith('proj1');
     });
+  });
+
+  it('mounts the improvement-lanes panel for a selected project', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    expect(await screen.findByTestId('improvement-lanes-panel')).toBeInTheDocument();
+    expect(capturedProps.improvementLanes).toMatchObject({ projectId: 'proj1' });
   });
 
   it('keeps rendering when agent serving SHA fetch fails', async () => {
