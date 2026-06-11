@@ -36,7 +36,7 @@ from app.research_context import (
     build_recent_findings_evidence,
     extract_diagnosis_from_context,
 )
-from app.shared_state import DEFAULT_TASK_SCOPE, runtime_config as _runtime_config
+from app.shared_state import DEFAULT_TASK_SCOPE
 from app.task_evaluators import (
     CHALLENGE_AGREES,
     CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
@@ -45,6 +45,7 @@ from app.task_evaluators import (
     CHALLENGE_DISAGREES,
     CHALLENGE_INDETERMINATE,
 )
+from app.shared_state import runtime_config as _runtime_config
 from app.task_locking import with_design_doc_locked, with_directions_locked
 from app.time_utils import _utcnow
 
@@ -304,16 +305,9 @@ async def apply_post_spawn_state(
             directions = list(project.directions or [])
             _pending_archived_diagnoses: list[tuple] = []
             now_iso = _utcnow().isoformat()
-            _refractory_min = direction_refractory_minutes()
             for d in directions:
                 if d.get("id") in direction_ids_with_findings:
                     d["last_researched_at"] = now_iso
-                    # Stamp a refractory window so the direction is ineligible for
-                    # immediate re-research after this cycle completes.
-                    if isinstance(_refractory_min, (int, float)) and _refractory_min > 0:
-                        d["refractory_until"] = (
-                            _utcnow() + timedelta(minutes=float(_refractory_min))
-                        ).isoformat()
             # Append to research_history for each direction that produced findings
             finding_titles_by_dir: dict = {}
             finding_descriptions_by_dir: dict = {}

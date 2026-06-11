@@ -108,6 +108,7 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
     apply_post_spawn_state,
     direction_saturation_refractory_minutes,
 )
+from app.direction_refractory import stamp_direction_refractory
 from app.source_ref_validation import (
     validate_source_refs,
     resolve_branch_verification_context,
@@ -145,11 +146,6 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
     predict_spawn_success,
     check_scope_budget_mismatch,
     SPEND_BUDGET_APPROVAL_HOLD_REASON,
-)
-from app.task_completion import (
-    _extract_json_array,
-    _ensure_branch,
-    _apply_synthesized_memo,
 )
 from app.task_locking import (
     with_design_doc_locked,
@@ -590,6 +586,8 @@ def _reconcile_reproduce_provenance_state(
 
 def _parse_research_findings(text: str) -> List[Dict[str, Any]] | None:
     """Extract structured research findings JSON array from agent output text."""
+    from app.task_completion import _extract_json_array
+
     json_str = _extract_json_array(text, "title", "prompt")
     if json_str:
         try:
@@ -1203,8 +1201,6 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     if not direction_id or task.project_id is None:
         return
     now_iso = _utcnow().isoformat()
-    sat_refractory_min = direction_saturation_refractory_minutes()
-
     def _apply_no_findings_refractory(dirs: list) -> None:
         target = next((d for d in dirs if d.get("id") == direction_id), None)
         if not target:
@@ -1217,10 +1213,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
         # "No actionable findings" is direct saturation evidence — mark the direction
         # and apply the longer refractory so the portfolio moves on.
         target["possibly_saturated"] = True
-        if isinstance(sat_refractory_min, (int, float)) and sat_refractory_min > 0:
-            target["refractory_until"] = (
-                _utcnow() + timedelta(minutes=float(sat_refractory_min))
-            ).isoformat()
+        stamp_direction_refractory(target)
 
     await with_directions_locked(session, task.project_id, _apply_no_findings_refractory)
 
@@ -2747,6 +2740,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
     # On success, returns the freshly-locked Task (caller mutates under
     # the new lock). On failure or peer-mutation defer, returns None.
+    from app.task_completion import _ensure_branch
+
     relocked = await _ensure_branch(
         task, research_branch, original_base, "RESEARCH", session
     )
@@ -4649,6 +4644,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         session.add(_memo_task)
         try:
+            from app.task_completion import _apply_synthesized_memo
+
             _synth = _synthesize_deferred_finding_memo(
                 _memo_payload.get("source_finding") or {},
                 _drop_reason,
@@ -5252,6 +5249,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await with_directions_locked(session, task.project_id, _update_productivity)
         await session.commit()
 
+        def _stamp_refractory(dirs: list) -> None:
+            for d in dirs:
+                if d.get("id") in touched_dir_ids:
+                    stamp_direction_refractory(d)
+
+        await with_directions_locked(session, task.project_id, _stamp_refractory)
+        await session.commit()
+
     # Credit playbook entries shown to this research agent when research succeeded.
     # followed_count tracks how many times each entry was seen by a successful research agent,
     # giving a denominator for per-entry success rates used by the archival ranker.
@@ -5330,6 +5335,7 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             target["consecutive_unproductive_cycles"] = (
                 int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
             )
+        stamp_direction_refractory(target)
 
     await with_directions_locked(session, task.project_id, _record_failure)
     if _found:

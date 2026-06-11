@@ -18,6 +18,7 @@ from app.payload_schemas import validate_internal_payload
 from app.shared_state import (
     runtime_config as _runtime_config,
 )
+from app.direction_refractory import get_direction_refractory_info
 from app.strategic_completion import _is_code_failure_pause_reason
 from app.time_utils import _utcnow
 
@@ -632,54 +633,16 @@ async def _process_direction_lifecycle_locked(
         # Refractory check: direction is held ineligible until refractory_until elapses.
         # Set by research completion (standard window) or no-findings saturation (longer
         # window). Strategist/operator can clear refractory_until to re-open the direction.
-        refractory_until = d.get("refractory_until")
-        if refractory_until:
-            try:
-                refractory_dt = datetime.fromisoformat(refractory_until)
-                remaining_m = (refractory_dt - now).total_seconds() / 60
-                if remaining_m > 0:
-                    logger.debug(
-                        "[RESEARCH] Skipping direction %s: refractory for %.1fm more",
-                        did,
-                        remaining_m,
-                    )
-                    continue
-            except (ValueError, TypeError):
-                pass  # malformed timestamp — skip the refractory check
-        last_researched = d.get("last_researched_at")
-        if last_researched:
-            minutes_ago = (
-                now - datetime.fromisoformat(last_researched)
-            ).total_seconds() / 60
-            # Adaptive cooldown: shorter after productive cycles (findings spawned tasks),
-            # standard after unproductive cycles. Saturation still doubles whichever base applies.
-            if d.get("last_cycle_productive"):
-                effective_cooldown = float(
-                    _runtime_config.get("productive_direction_cooldown_minutes", 45)
-                )
-            else:
-                # Tiered unproductive cooldown: 1st consecutive failure waits 0.375x,
-                # 2nd waits 0.75x, 3rd+ waits full. Avoids burning hours on transient
-                # failures while still throttling persistently-broken directions.
-                consecutive = int(d.get("consecutive_unproductive_cycles", 0) or 0)
-                if consecutive <= 1:
-                    multiplier = 0.375
-                elif consecutive == 2:
-                    multiplier = 0.75
-                else:
-                    multiplier = 1.0
-                effective_cooldown = cooldown_minutes * multiplier
-            if d.get("possibly_saturated"):
-                effective_cooldown = effective_cooldown * 2.0
-                logger.debug(
-                    f"[RESEARCH] Direction {did} saturated — applying 2x cooldown ({effective_cooldown}m)"
-                )
-            if minutes_ago < effective_cooldown:
-                logger.debug(
-                    f"[RESEARCH] Skipping direction {did}: last researched "
-                    f"{minutes_ago:.1f}m ago (cooldown: {effective_cooldown}m)"
-                )
-                continue
+        refractory_info = get_direction_refractory_info(d, now=now)
+        remaining_m = refractory_info["refractory_remaining_minutes"]
+        if remaining_m is not None and remaining_m > 0:
+            logger.debug(
+                "[RESEARCH] Skipping direction %s: %s hold for %.1fm more",
+                did,
+                refractory_info["refractory_reason"],
+                remaining_m,
+            )
+            continue
         # Cost efficiency escalation: flag expensive directions for retirement consideration.
         direction_cpm = _cost_per_merge(d)
         threshold = (

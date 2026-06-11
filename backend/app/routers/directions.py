@@ -2,6 +2,7 @@
 
 import uuid
 import logging
+from math import ceil
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
@@ -33,6 +34,7 @@ from app.task_locking import (
 from app.direction_lifecycle import _reset_outcome_detection_state
 from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
 from app.capability_proof import enrich_problem_model_capability_proofs
+from app.direction_refractory import get_direction_refractory_info
 from app.problem_model import compute_model_size_signal, ProblemModel
 
 logger = logging.getLogger(__name__)
@@ -203,6 +205,10 @@ async def get_directions(
         hold_info = _get_direction_hold_info(d.get("id", ""))
         held_at = hold_info["held_at"]
         held_until = hold_info["held_until"]
+        refractory_info = get_direction_refractory_info(d)
+        refractory_until = refractory_info["refractory_until"]
+        refractory_reason = refractory_info["refractory_reason"]
+        refractory_remaining_minutes = refractory_info["refractory_remaining_minutes"]
         generalized_state = _compute_lifetime_generalized_outcome_state(d)
         raw_churn = _compute_churn_metrics(d)
         churn_metrics = (
@@ -244,6 +250,16 @@ async def get_directions(
                 "held_until": held_until.isoformat()
                 if isinstance(held_until, datetime)
                 else None,
+                "refractory_until": refractory_until.isoformat()
+                if isinstance(refractory_until, datetime)
+                else None,
+                "refractory_reason": refractory_reason,
+                "refractory_remaining_minutes": (
+                    max(1, ceil(float(refractory_remaining_minutes)))
+                    if isinstance(refractory_remaining_minutes, (int, float))
+                    and refractory_remaining_minutes is not None
+                    else None
+                ),
                 "churn_metrics": churn_metrics,
                 "lifetime_burn_metrics": lifetime_burn_metrics,
                 "knowledge_document_count": knowledge_counts.get(d.get("id", ""), 0),
@@ -707,6 +723,17 @@ async def update_direction(
             raise HTTPException(
                 status_code=400, detail="cost_budget_usd must be non-negative"
             )
+    if "refractory_until" in payload and payload["refractory_until"] is not None:
+        if not isinstance(payload["refractory_until"], str):
+            raise HTTPException(
+                status_code=400, detail="refractory_until must be an ISO timestamp or null"
+            )
+        try:
+            datetime.fromisoformat(payload["refractory_until"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail="refractory_until must be an ISO timestamp or null"
+            ) from None
     if (
         "success_evidence" in payload
         and payload["success_evidence"] is not None
@@ -911,6 +938,11 @@ async def update_direction(
                         d.pop("cost_budget_usd", None)
                     else:
                         d["cost_budget_usd"] = float(payload["cost_budget_usd"])
+                if "refractory_until" in payload:
+                    if payload["refractory_until"] is None:
+                        d.pop("refractory_until", None)
+                    else:
+                        d["refractory_until"] = payload["refractory_until"]
                 if "success_evidence" in payload or "retirement_condition" in payload:
                     context = d.get("context") or {}
                     _old_se = context.get("success_evidence")
@@ -1001,7 +1033,6 @@ async def create_direction_research_task(
     from app.shared_state import (
         get_project_integration_branch as _get_project_integration_branch,
     )
-    from app.shared_state import runtime_config as _runtime_config
     from app.autonomous_research import research_direction_claim_key
 
     # Serialize same-direction spawns before the in-flight scan so a
@@ -1060,25 +1091,24 @@ async def create_direction_research_task(
             )
 
     if not bypass_cooldown:
-        cooldown_minutes = _runtime_config.get(
-            "autonomous_direction_cooldown_minutes", 240
-        )
-        last_researched_at = direction.get("last_researched_at")
-        if last_researched_at:
-            elapsed = (
-                _utcnow() - datetime.fromisoformat(last_researched_at)
-            ).total_seconds()
-            if elapsed < cooldown_minutes * 60:
-                remaining_minutes = int((cooldown_minutes * 60 - elapsed) / 60)
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Direction is in cooldown for {remaining_minutes} more minutes. Use bypass_cooldown=true to force.",
-                )
+        refractory_info = get_direction_refractory_info(direction)
+        if refractory_info["refractory_remaining_minutes"] is not None:
+            remaining_minutes = max(
+                1, ceil(float(refractory_info["refractory_remaining_minutes"]))
+            )
+            reason = refractory_info["refractory_reason"] or "standard"
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Direction is in {reason} hold for {remaining_minutes} more minutes. "
+                    "Use bypass_cooldown=true to force."
+                ),
+            )
 
     direction_text = direction.get("text", "")
     description = direction_text
     if bypass_cooldown:
-        description = f"[cooldown bypassed manually] {direction_text}"
+        description = f"[hold bypassed manually] {direction_text}"
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
     task_payload = validate_internal_payload(

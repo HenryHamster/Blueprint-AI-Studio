@@ -127,6 +127,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "related_tests_holdback_fraction",
         "affected_consumers_holdback_fraction",
         "productive_direction_cooldown_minutes",
+        "direction_refractory_minutes",
+        "direction_saturation_refractory_minutes",
         "promotion_enabled",
         "promotion_enabled_by_project",
         "promotion_threshold",
@@ -381,6 +383,18 @@ async def get_settings(
         ),
         "productive_direction_cooldown_minutes": _runtime_config.get(
             "productive_direction_cooldown_minutes", 45
+        ),
+        "direction_refractory_minutes": _runtime_config.get(
+            "direction_refractory_minutes",
+            _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
+        ),
+        "direction_saturation_refractory_minutes": _runtime_config.get(
+            "direction_saturation_refractory_minutes",
+            _runtime_config.get(
+                "direction_refractory_minutes",
+                _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
+            )
+            * 2,
         ),
         "max_parallel_research_per_project": _runtime_config.get(
             "max_parallel_research_per_project", 3
@@ -1902,6 +1916,40 @@ async def _apply_settings(
                 detail="autonomous_direction_cooldown_hours must be a number",
             )
         _runtime_config["autonomous_direction_cooldown_minutes"] = val * 60
+    if "direction_refractory_minutes" in payload:
+        if payload["direction_refractory_minutes"] is None:
+            _runtime_config.pop("direction_refractory_minutes", None)
+        else:
+            try:
+                val = int(payload["direction_refractory_minutes"])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="direction_refractory_minutes must be a number",
+                )
+            if not (1 <= val <= 525600):
+                raise HTTPException(
+                    status_code=400,
+                    detail="direction_refractory_minutes must be between 1 and 525600",
+                )
+            _runtime_config["direction_refractory_minutes"] = val
+    if "direction_saturation_refractory_minutes" in payload:
+        if payload["direction_saturation_refractory_minutes"] is None:
+            _runtime_config.pop("direction_saturation_refractory_minutes", None)
+        else:
+            try:
+                val = int(payload["direction_saturation_refractory_minutes"])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="direction_saturation_refractory_minutes must be a number",
+                )
+            if not (1 <= val <= 525600):
+                raise HTTPException(
+                    status_code=400,
+                    detail="direction_saturation_refractory_minutes must be between 1 and 525600",
+                )
+            _runtime_config["direction_saturation_refractory_minutes"] = val
     if "productive_direction_cooldown_minutes" in payload:
         try:
             val = int(payload["productive_direction_cooldown_minutes"])
@@ -2339,7 +2387,7 @@ async def _apply_settings(
             )
             # Persist dict/list config fields to JSONB column
             try:
-                state.runtime_config_json = {
+                runtime_config_json = {
                     "provider_tier_model_map": _runtime_config.get(
                         "provider_tier_model_map", {}
                     ),
@@ -2451,6 +2499,22 @@ async def _apply_settings(
                     ),
                     "productive_direction_cooldown_minutes": _runtime_config.get(
                         "productive_direction_cooldown_minutes", 45
+                    ),
+                    "direction_refractory_minutes": _runtime_config.get(
+                        "direction_refractory_minutes",
+                        _runtime_config.get(
+                            "autonomous_direction_cooldown_minutes", 240
+                        ),
+                    ),
+                    "direction_saturation_refractory_minutes": _runtime_config.get(
+                        "direction_saturation_refractory_minutes",
+                        _runtime_config.get(
+                            "direction_refractory_minutes",
+                            _runtime_config.get(
+                                "autonomous_direction_cooldown_minutes", 240
+                            ),
+                        )
+                        * 2,
                     ),
                     "warm_continuity_enabled": bool(
                         _runtime_config.get("warm_continuity_enabled", False)
@@ -2635,6 +2699,13 @@ async def _apply_settings(
                         _runtime_config.get("diagnostics_after_edit_enabled", True)
                     ),
                 }
+                if "direction_refractory_minutes" not in _runtime_config:
+                    runtime_config_json.pop("direction_refractory_minutes", None)
+                if "direction_saturation_refractory_minutes" not in _runtime_config:
+                    runtime_config_json.pop(
+                        "direction_saturation_refractory_minutes", None
+                    )
+                state.runtime_config_json = runtime_config_json
             except AttributeError:
                 pass  # Column not yet added (rolling deploy, old schema)
             session.add(state)

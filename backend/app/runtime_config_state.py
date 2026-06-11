@@ -1399,6 +1399,26 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                             "max_concurrent_compute_jobs_by_project",
                             normalized_job_caps,
                         )
+                for key in (
+                    "direction_refractory_minutes",
+                    "direction_saturation_refractory_minutes",
+                ):
+                    if key in config_json:
+                        raw_val = config_json[key]
+                        if raw_val is None:
+                            if key in runtime_config:
+                                runtime_config.pop(key, None)
+                                changed.append(key)
+                            continue
+                        try:
+                            _set(key, int(raw_val))
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                f"[CONFIG-SYNC] Ignoring invalid {key} value: {raw_val!r}"
+                            )
+                    elif key in runtime_config:
+                        runtime_config.pop(key, None)
+                        changed.append(key)
                 for int_key in (
                     "max_provision_retries",
                     "max_rollup_retries",

@@ -5072,6 +5072,67 @@ class TestNotificationConfigSettings:
             assert row.runtime_config_json[key] == expected
 
     @pytest.mark.asyncio
+    async def test_patch_direction_refractory_settings_round_trip_and_fallback(
+        self, client: AsyncClient, db_session
+    ):
+        """Direction refractory settings PATCH, surface in GET, persist, and fall back to cooldown when cleared."""
+        from app.models import DeploymentState
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        payload = {
+            "autonomous_direction_cooldown_minutes": 240,
+            "direction_refractory_minutes": 180,
+            "direction_saturation_refractory_minutes": 360,
+        }
+
+        resp = await client.patch("/api/admin/settings", json=payload)
+        assert resp.status_code == 200, resp.text
+
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["direction_refractory_minutes"] == 180
+        assert body["direction_saturation_refractory_minutes"] == 360
+
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["direction_refractory_minutes"] == 180
+        assert row.runtime_config_json["direction_saturation_refractory_minutes"] == 360
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "direction_refractory_minutes": None,
+                "direction_saturation_refractory_minutes": None,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(row)
+        assert "direction_refractory_minutes" not in row.runtime_config_json
+        assert "direction_saturation_refractory_minutes" not in row.runtime_config_json
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        await sync_runtime_config_from_state(row)
+        assert "direction_refractory_minutes" not in _shared_state.runtime_config
+        assert (
+            "direction_saturation_refractory_minutes"
+            not in _shared_state.runtime_config
+        )
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"autonomous_direction_cooldown_minutes": 300},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(row)
+        await sync_runtime_config_from_state(row)
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["direction_refractory_minutes"] == 300
+        assert body["direction_saturation_refractory_minutes"] == 600
+
+    @pytest.mark.asyncio
     async def test_patch_review_second_opinion_gate_enabled(self, client: AsyncClient):
         """review_second_opinion_gate_enabled accepts booleans, rejects
         non-booleans, and round-trips on GET (operator rollback for the

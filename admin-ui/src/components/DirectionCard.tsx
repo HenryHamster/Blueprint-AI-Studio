@@ -4,7 +4,7 @@ import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Loader2, Pe
 import { BarChart, Bar, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
 import type { Direction } from './DirectionsPanel';
 import type { DirectionCategory } from '../hooks/useDirectionForm';
-import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, getStagedWaitingInfo, STAGED_STALE_DAYS, priorityColors, statusColors } from '../utils/directionHelpers';
+import { formatRelativeTime, formatRemainingMinutes, getStagedWaitingInfo, STAGED_STALE_DAYS, priorityColors, statusColors } from '../utils/directionHelpers';
 import { parseTimestamp } from '../utils/time';
 import { healthRateColorClass, summarizeOutcomeKinds } from '../utils/outcomeKinds';
 
@@ -136,7 +136,7 @@ function DirectionCardImpl({
   updateDirection, approveProposal, rejectProposal, reviveProposal,
   reactivateDirection, activateStagedDirection, retargetStagedDirection, cancelStagedDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
   applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections,
-  taskCounts, activeTasks, cooldownMinutes, researchingIds, researchSuccessIds,
+  taskCounts, activeTasks, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
   stageTargetVersion,
   onViewFindings, onNavigateToTask,
@@ -647,8 +647,7 @@ function DirectionCardImpl({
                 </>);
               })()}
               {key === 'active' && (() => {
-                const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
-                const inCooldown = cooldownStatus === 'cooling';
+                const inCooldown = d.refractory_remaining_minutes != null;
                 return (
                   <div className="relative flex items-center gap-1">
                     {/* reason: inline research trigger chip in dense direction row; text-[10px] py-0.5 */}
@@ -731,12 +730,8 @@ function DirectionCardImpl({
           )}
           {/* Last researched / cooldown subtitle */}
           {key === 'active' && (() => {
-            const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
-            if (cooldownStatus === 'never') {
+            if (!d.last_researched_at) {
               return <p className="text-[10px] text-neutral-600 mt-0.5">Never researched</p>;
-            }
-            if (cooldownStatus === 'cooling') {
-              return <p className="text-[10px] text-amber-500/80 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at ?? '')}</p>;
             }
             return <p className="text-[10px] text-neutral-600 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at ?? '')}</p>;
           })()}
@@ -1047,11 +1042,17 @@ function DirectionCardImpl({
             })()}
             {/* Cooldown badge — suppressed when direction is held */}
             {key === 'active' && !d.held && (() => {
-              const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
-              if (cooldownStatus === 'cooling') {
+              if (d.refractory_remaining_minutes != null) {
                 return (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50">
-                    Cooling down · {formatTimeRemaining(d.last_researched_at ?? '', cooldownMinutes)}
+                  <span
+                    title={
+                      d.refractory_reason === 'saturation'
+                        ? 'Saturation hold: the direction was recently unproductive and is waiting longer before it can be researched again.'
+                        : 'Standard hold: the direction is waiting out its research cooldown.'
+                    }
+                    className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50"
+                  >
+                    {d.refractory_reason === 'saturation' ? 'Saturation hold' : 'Cooling down'} · {formatRemainingMinutes(d.refractory_remaining_minutes)}
                   </span>
                 );
               }

@@ -13,7 +13,7 @@ Focuses on gaps not covered by test_directions.py:
 import hashlib
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -113,9 +113,7 @@ def _patch_research_externals(mocker):
     async def _passthrough_ensure_branch(task, *_a, **_kw):
         return task
 
-    mocker.patch(
-        "app.research_completion._ensure_branch", new=_passthrough_ensure_branch
-    )
+    mocker.patch("app.task_completion._ensure_branch", new=_passthrough_ensure_branch)
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch(
         "app.research_completion._validate_plan_dependencies", return_value=True
@@ -1578,68 +1576,6 @@ async def test_operator_refresh_deferred_on_payload_too_large_posts_once(
         if (m.context or {}).get("event_type") == "strategic_steering_deferred"
     ]
     assert len(steering) == 1, "payload-too-large skip must post exactly one deferral notice"
-
-
-@pytest.mark.asyncio
-async def test_all_paused_skip_log_distinguishes_cooling_from_wedge(db_session, mocker):
-    """The all-paused skip log must not read as a starvation wedge when a non-paused
-    direction is merely cooling down. When an eligible-but-cooling direction exists,
-    the log reports the temporarily-filtered count distinctly from a true all-paused
-    state (so an operator / the system's own diagnosis doesn't chase a phantom wedge)."""
-    mocker.patch(
-        "app.strategic_spawning._spawn_design_doc_update",
-        new=AsyncMock(return_value=True),
-    )
-    mocker.patch(
-        "app.strategic_spawning._spawn_strategic_review",
-        new=AsyncMock(return_value=True),
-    )
-    info_spy = mocker.patch("app.autonomous_research.logger.info")
-    project = Project(
-        name="Paused + Cooling",
-        user_id="test-user-123",
-        autonomous_enabled=True,
-        directions=[
-            {
-                **_active_direction("d-paused03", "Paused residual"),
-                "recommended_mode": "pause",
-            },
-            {
-                # Non-paused but freshly researched → filtered out by the cooldown in
-                # _process_direction_lifecycle, so it never reaches active_directions.
-                **_active_direction("d-cooling01", "Recently researched, cooling"),
-                "recommended_mode": "fundamentals",
-                "last_researched_at": (
-                    datetime.utcnow() - timedelta(minutes=2)
-                ).isoformat(),
-            },
-        ],
-        vision={"purpose": "test"},  # no stale strategic task → force_strategic False
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    await _spawn_research_task(project, db_session)
-
-    # Reconstruct every logged message (handles both %-style and pre-formatted calls).
-    rendered = []
-    for c in info_spy.call_args_list:
-        a = c.args
-        try:
-            rendered.append(a[0] % a[1:] if len(a) > 1 else str(a[0]))
-        except Exception:  # defensive: never let log-render break the test
-            rendered.append(str(a[0]))
-    msg = "\n".join(rendered)
-
-    assert "skipping tactical research" in msg
-    assert "NOT a wedge" in msg, (
-        f"a cooling non-paused direction must be reported as not-a-wedge; got:\n{msg}"
-    )
-    assert "d-cooling01" in msg, "the temporarily-filtered direction id should be named"
-    # And nothing was spawned — we genuinely hit the skip path.
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    assert len(result.scalars().all()) == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6396,21 +6332,21 @@ async def test_reorder_non_list_payload_returns_400(client: AsyncClient, mocker)
 async def test_research_endpoint_returns_429_when_direction_in_cooldown(
     client: AsyncClient, mocker
 ):
-    """POST /research without bypass returns 429 when direction was recently researched."""
+    """POST /research without bypass returns 429 when the refractory hold is active."""
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(
         client, project_id, text="Recently researched direction"
     )
     direction_id = direction["id"]
 
-    # Inject a last_researched_at 1 hour ago via PUT (within the 4-hour default cooldown)
-    recent_ts = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    # Inject an active refractory window via PUT.
+    future_ts = (datetime.utcnow() + timedelta(hours=1)).isoformat()
     put_resp = await client.put(
         f"/api/admin/projects/{project_id}/directions",
         json=[
             {
                 **direction,
-                "last_researched_at": recent_ts,
+                "refractory_until": future_ts,
             }
         ],
     )
@@ -6434,11 +6370,11 @@ async def test_research_endpoint_bypass_cooldown_creates_task(
     )
     direction_id = direction["id"]
 
-    # Put it in cooldown
-    recent_ts = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    # Put it in refractory.
+    future_ts = (datetime.utcnow() + timedelta(hours=1)).isoformat()
     await client.put(
         f"/api/admin/projects/{project_id}/directions",
-        json=[{**direction, "last_researched_at": recent_ts}],
+        json=[{**direction, "refractory_until": future_ts}],
     )
 
     resp = await client.post(
@@ -6449,6 +6385,28 @@ async def test_research_endpoint_bypass_cooldown_creates_task(
     data = resp.json()
     assert data["status"] == "QUEUED"
     assert "id" in data
+
+
+@pytest.mark.asyncio
+async def test_research_endpoint_ignores_last_researched_at_without_refractory(
+    client: AsyncClient, mocker
+):
+    """A stale last_researched_at alone no longer blocks research; refractory_until does."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Legacy cooldown direction")
+    direction_id = direction["id"]
+
+    recent_ts = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    await client.put(
+        f"/api/admin/projects/{project_id}/directions",
+        json=[{**direction, "last_researched_at": recent_ts}],
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "QUEUED"
 
 
 @pytest.mark.asyncio
@@ -13830,7 +13788,7 @@ async def test_refractory_blocks_immediate_respawn_after_terminal(db_session):
     cycle fired 20s-5min after the previous parent went terminal because
     last_researched_at was never set for no-findings completions.
     """
-    future = (datetime.utcnow() + timedelta(hours=4)).isoformat()
+    future = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
     direction = {
         **_active_direction("d-refract1", "Direction in refractory"),
         "refractory_until": future,
@@ -13946,7 +13904,7 @@ async def test_no_findings_completion_stamps_saturation_and_refractory(
         new=AsyncMock(return_value=None),
     )
     mocker.patch(
-        "app.research_completion._ensure_branch",
+        "app.task_completion._ensure_branch",
         new=AsyncMock(side_effect=lambda t, *a, **kw: t),
     )
 
@@ -14241,7 +14199,7 @@ async def test_spawn_pending_marker_stamped_before_ensure_branch(db_session, moc
         captured_context.append(dict(task_obj.context or {}))
         return task_obj
 
-    mocker.patch("app.research_completion._ensure_branch", new=_capture_and_passthrough)
+    mocker.patch("app.task_completion._ensure_branch", new=_capture_and_passthrough)
     mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
@@ -14337,7 +14295,7 @@ async def test_mid_spawn_lock_timeout_replay_completes_spawn_exactly_once(db_ses
             raise RuntimeError("lock timeout: simulated LockNotAvailableError mid-spawn")
         return task_obj
 
-    mocker.patch("app.research_completion._ensure_branch", new=_ensure_branch_fail_then_pass)
+    mocker.patch("app.task_completion._ensure_branch", new=_ensure_branch_fail_then_pass)
 
     # Pass 1: handler commits plan_output + _research_spawn_pending, then _ensure_branch fails.
     mocker.patch(
