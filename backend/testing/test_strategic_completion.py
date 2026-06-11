@@ -11599,6 +11599,58 @@ class TestDesignDocCompletionStrategistEvent:
         assert "FAILED to spawn" in emit.await_args.kwargs["completion"]["status_message"]
 
     @pytest.mark.asyncio
+    async def test_phase2_raise_writes_retry_marker_even_when_task_expired(
+        self, strat_fail_db, mocker
+    ):
+        """The except path must rely only on pre-captured identifiers: a failed
+        spawn that expires the Task instance previously raised MissingGreenlet
+        on the task.id lazy-load inside the error handler — masking chain_exc,
+        skipping the retry marker, and failing the whole completion
+        (task a9bf1317, 2026-06-11)."""
+        from unittest.mock import AsyncMock
+        from app.task_completion import _handle_design_doc_completion
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+        task = await _make_failure_task(
+            strat_fail_db, project, task_type="design_doc_update"
+        )
+        expected_id = str(task.id)
+
+        async def _boom(*args, **kwargs):
+            # Simulate the rollback-expiration that accompanies a real spawn
+            # failure: every unloaded attribute access on `task` now requires IO.
+            strat_fail_db.expire(task)
+            raise RuntimeError("spawn boom")
+
+        mocker.patch(
+            "app.strategic_spawning._spawn_strategic_review",
+            new=AsyncMock(side_effect=_boom),
+        )
+        alert = AsyncMock()
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=alert)
+        mocker.patch(
+            "app.strategic_events.emit_strategic_cycle_completed", new=AsyncMock()
+        )
+
+        await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
+
+        await strat_fail_db.refresh(project)
+        marker = (project.vision or {}).get("_pending_strategic_review")
+        assert marker, "retry marker must be written when Phase 2 spawn raises"
+        assert marker["design_doc_task_id"] == expected_id
+        chain_alerts = [
+            call
+            for call in alert.await_args_list
+            if "failed to spawn" in call.args[2] and expected_id[:8] in call.args[2]
+        ]
+        assert chain_alerts, (
+            "the chain-failure alert must carry the pre-captured task id"
+        )
+
+    @pytest.mark.asyncio
     async def test_no_completed_emit_when_phase2_spawns(self, strat_fail_db, mocker):
         from unittest.mock import AsyncMock
         from app.task_completion import _handle_design_doc_completion
