@@ -66,6 +66,7 @@ from app.models import (
 from app.task_evaluators import (
     QUALITY_GRADER_VERDICT_KEY,
     EvaluationVerdict,
+    derive_release_binding_status,
     evaluate_terminal_output,
     record_failed_gate,
 )
@@ -1858,12 +1859,7 @@ async def _persist_compute_knowledge_document(
         release_evidence, echo_sha = live_data
         verdict_record["release_evidence"] = release_evidence
         expected_sha = release_evidence.get("promoted_sha") or None
-        if echo_sha is None:
-            binding_status = "absent"
-        elif echo_sha == expected_sha:
-            binding_status = "verified"
-        else:
-            binding_status = "mismatched"
+        binding_status = derive_release_binding_status(echo_sha, expected_sha)
         verdict_record["release_binding"] = {
             "status": binding_status,
             "echo_sha": echo_sha,

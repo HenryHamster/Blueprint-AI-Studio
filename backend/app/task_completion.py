@@ -35,6 +35,8 @@ from app.github import (
 )
 from app.models import (
     Artifact,
+    ComputeJob,
+    ComputeJobStatus,
     Project,
     Task,
     TaskHistory,
@@ -269,6 +271,46 @@ async def _stamp_compute_result_resource(
     if artifact is not None and artifact.storage_uri:
         resource["storage_uri"] = artifact.storage_uri
     return resource
+
+
+async def _load_release_echo_for_criterion(
+    session: AsyncSession, task: Task, logs: str | None
+) -> tuple[str | None, str | None]:
+    """Return (echo_sha, expected_sha) from the task's compute job for release-echo criteria.
+
+    Tries the job_id from the COMPUTE_RESULT logs first; falls back to a task-level
+    query for terminal jobs when the command emitted no artifact (e.g. TIMED_OUT
+    before writing anything). Returns (None, None) when no job can be found.
+    """
+    job: ComputeJob | None = None
+    job_id = _extract_compute_job_id(logs or "")
+    if job_id is not None:
+        job = await get_compute_job_for_task(session, job_id=job_id, task_id=task.id)
+    if job is None:
+        result = await session.execute(
+            select(ComputeJob)
+            .where(ComputeJob.task_id == task.id)
+            .where(
+                ComputeJob.status.in_(
+                    [
+                        ComputeJobStatus.SUCCEEDED,
+                        ComputeJobStatus.FAILED,
+                        ComputeJobStatus.CANCELLED,
+                        ComputeJobStatus.TIMED_OUT,
+                    ]
+                )
+            )
+            .order_by(ComputeJob.created_at.desc())
+        )
+        job = result.scalars().first()
+    if job is None or not isinstance(job.polling_metadata, dict):
+        return None, None
+    echo_sha: str | None = job.polling_metadata.get("release_echo_sha") or None
+    evidence = job.polling_metadata.get("live_release_evidence")
+    expected_sha: str | None = (
+        evidence.get("promoted_sha") or None if isinstance(evidence, dict) else None
+    )
+    return echo_sha, expected_sha
 
 
 def _derive_artifact_delivery_record(resource: dict) -> dict:
@@ -2818,7 +2860,16 @@ async def _handle_compute_experiment_completion(
     # not-reported cases alike, independent of the gate's pass/fail. Written
     # before record_failed_gate so the FAIL path preserves it alongside the
     # evaluation_gate record.
-    criterion = evaluate_compute_success_criterion(task, logs)
+    #
+    # Pre-load release-echo data from the job row so that release_echo_present /
+    # release_echo_verified criteria are always evaluable (numeric 0.0/1.0) even
+    # when the experiment command timed out before emitting a COMPUTE_RESULT.
+    _echo_sha, _expected_sha = await _load_release_echo_for_criterion(
+        session, task, logs
+    )
+    criterion = evaluate_compute_success_criterion(
+        task, logs, echo_sha=_echo_sha, expected_sha=_expected_sha
+    )
     if criterion is not None:
         crit_context = dict(task.context or {})
         crit_context["compute_success_criterion"] = criterion

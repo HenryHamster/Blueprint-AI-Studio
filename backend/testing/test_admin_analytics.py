@@ -2231,3 +2231,107 @@ class TestImprovementLanes:
         finally:
             _app.dependency_overrides.pop(get_current_user, None)
             _app.dependency_overrides.pop(require_admin, None)
+
+
+class TestLaneBaselines:
+    """Tests for GET /api/admin/lane-baselines."""
+
+    @staticmethod
+    def _make_baseline(version_number: int, pr_count: int = 3) -> dict:
+        """Build a minimal lane baseline blob matching the persist_version_lane_baseline shape."""
+        return {
+            "version_number": version_number,
+            "baseline_def_version": "v1",
+            "terminal_status": "promoted",
+            "captured_at": "2026-01-01T00:00:00",
+            "opened_at": "2025-12-01T00:00:00",
+            "closed_at": "2026-01-01T00:00:00",
+            "pr_count": pr_count,
+            "task_count": pr_count * 2,
+            "relay_medians": {
+                "wall_clock_seconds": 3600.0,
+                "active_seconds": 1800.0,
+                "gap_seconds": 1800.0,
+                "task_count": 2.0,
+                "pr_count": pr_count,
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_lane_baselines_endpoint_returns_persisted_versions(
+        self, client: AsyncClient, db_session
+    ):
+        """Project with two stored baselines returns both sorted descending by version,
+        each including the relay_medians field needed for lane-vs-relay comparison."""
+        from app.lane_baseline_snapshot import DESIGN_DOC_KEY
+
+        project = make_project(
+            design_doc={
+                DESIGN_DOC_KEY: {
+                    "9": self._make_baseline(9, pr_count=5),
+                    "10": self._make_baseline(10, pr_count=8),
+                }
+            }
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-baselines?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["project_id"] == str(project.id)
+        assert body["count"] == 2
+        # Most recent version first.
+        versions = [b["version_number"] for b in body["baselines"]]
+        assert versions == [10, 9]
+        # relay_medians field is present in each baseline.
+        for b in body["baselines"]:
+            assert "relay_medians" in b
+            assert b["relay_medians"]["pr_count"] > 0
+
+    @pytest.mark.asyncio
+    async def test_project_with_no_baselines_returns_empty(
+        self, client: AsyncClient, db_session
+    ):
+        """Project that exists but has no stored baselines returns count=0 and empty list."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-baselines?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["count"] == 0
+        assert body["baselines"] == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_project_id_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """A project_id that does not exist returns HTTP 404."""
+        resp = await client.get(f"/api/admin/lane-baselines?project_id={uuid.uuid4()}")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_baselines_sorted_descending_by_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Baselines are ordered newest-first regardless of insertion order in the dict."""
+        from app.lane_baseline_snapshot import DESIGN_DOC_KEY
+
+        project = make_project(
+            design_doc={
+                DESIGN_DOC_KEY: {
+                    "3": self._make_baseline(3),
+                    "1": self._make_baseline(1),
+                    "2": self._make_baseline(2),
+                }
+            }
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/lane-baselines?project_id={project.id}")
+        assert resp.status_code == 200
+        versions = [b["version_number"] for b in resp.json()["baselines"]]
+        assert versions == [3, 2, 1]

@@ -1315,13 +1315,14 @@ async def _process_single_compute_job(
                 next_retry_at=None,
                 reason="deadline",
             )
+        salvaged = await _salvage_poll_status(backend, job)
         await _apply_polled_compute_job_result(
             session_factory,
             job.id,
             now=now,
             poll_attempt_count=poll_attempt_count,
             next_poll_at=next_poll_at,
-            status=status,
+            status=_merge_salvaged_status(status, salvaged),
             accrued_cost_usd=accrued_cost_usd,
             terminal_status=ComputeJobStatus.TIMED_OUT,
             outcome=ComputeJobOutcome.TIMED_OUT,
@@ -1353,13 +1354,14 @@ async def _process_single_compute_job(
                 next_retry_at=None,
                 reason="budget",
             )
+        salvaged = await _salvage_poll_status(backend, job)
         await _apply_polled_compute_job_result(
             session_factory,
             job.id,
             now=now,
             poll_attempt_count=poll_attempt_count,
             next_poll_at=next_poll_at,
-            status=status,
+            status=_merge_salvaged_status(status, salvaged),
             accrued_cost_usd=accrued_cost_usd,
             terminal_status=ComputeJobStatus.FAILED,
             outcome=ComputeJobOutcome.SPEND_CAP_EXCEEDED,
@@ -1436,6 +1438,54 @@ async def _apply_launch_result(
         _clear_compute_rpc_diagnostic(live)
         await session.commit()
         return True
+
+
+_SALVAGE_POLL_TIMEOUT_SECONDS = float(
+    os.getenv("COMPUTE_SALVAGE_POLL_TIMEOUT_SECONDS", "10")
+)
+
+
+async def _salvage_poll_status(
+    backend, job: ComputeJob, *, timeout_seconds: float = _SALVAGE_POLL_TIMEOUT_SECONDS
+) -> "ComputeStatusResult | None":
+    """Best-effort post-terminate poll — never raises, never hangs the monitor."""
+    try:
+        return await asyncio.wait_for(
+            backend.poll_status(job), timeout=timeout_seconds
+        )
+    except Exception as exc:
+        logger.warning(
+            "[COMPUTE_JOB] salvage poll failed for job=%s (ignored): %s",
+            job.id,
+            exc,
+        )
+        return None
+
+
+def _merge_salvaged_status(
+    base: "ComputeStatusResult", salvaged: "ComputeStatusResult | None"
+) -> "ComputeStatusResult":
+    """Return a new status snapshot with late-arriving fields from salvaged merged in.
+
+    The terminal outcome, status code, and cost semantics all come from ``base``.
+    Only metrics, command_log, and echoed_release_sha are overridden by non-None
+    values from the post-terminate poll so late-emitted evidence is not dropped.
+    """
+    if salvaged is None:
+        return base
+    return ComputeStatusResult(
+        status=base.status,
+        message=base.message,
+        exit_code=base.exit_code,
+        finished_at=base.finished_at,
+        metrics=salvaged.metrics if salvaged.metrics is not None else base.metrics,
+        command_log=salvaged.command_log
+        if salvaged.command_log is not None
+        else base.command_log,
+        echoed_release_sha=salvaged.echoed_release_sha
+        if salvaged.echoed_release_sha is not None
+        else base.echoed_release_sha,
+    )
 
 
 async def _apply_polled_compute_job_result(

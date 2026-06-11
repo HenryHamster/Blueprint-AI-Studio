@@ -1471,6 +1471,28 @@ async def _compute_digest(
             _lane_aggs = await compute_lane_pilot_aggregates(session, project_id)
             _lane_verdict = evaluate_lane_pilot_verdict(_lane_aggs)
             _lane_verdict["evaluated_at"] = _verdict_evaluated_at
+            # Annotate with the most recent closed version's relay baseline so the
+            # lane-vs-relay comparison is recorded alongside the verdict for auditing.
+            try:
+                from app.lane_baseline_snapshot import read_version_lane_baseline  # noqa: PLC0415
+                from app.models import ReleaseVersion as _ReleaseVersion  # noqa: PLC0415
+                _latest_rv = (
+                    await session.execute(
+                        select(_ReleaseVersion)
+                        .where(
+                            _ReleaseVersion.project_id == project_id,
+                            _ReleaseVersion.status.in_(["promoted", "abandoned"]),
+                        )
+                        .order_by(desc(_ReleaseVersion.version_number))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if _latest_rv is not None and _digest_project is not None:
+                    _rb = read_version_lane_baseline(_digest_project, _latest_rv.version_number)
+                    if _rb is not None:
+                        _lane_verdict["relay_baseline"] = _rb
+            except Exception:
+                logger.warning("[LANE_PILOT] failed to annotate relay_baseline", exc_info=True)
             record_trial_verdict(_digest_project, LANE_PILOT_CAP_NAME, _lane_verdict)
             if _lane_verdict.get("verdict") == "KILL":
                 await apply_lane_pilot_kill(

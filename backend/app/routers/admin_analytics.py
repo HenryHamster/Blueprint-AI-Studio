@@ -1362,3 +1362,59 @@ async def get_improvement_lanes(
         "limit": limit,
         "project_id": str(project_id),
     }
+
+
+@router.get("/lane-baselines")
+async def get_lane_baselines(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return all persisted per-version lane baselines for a project.
+
+    Baselines are written by ``persist_version_lane_baseline`` when a
+    ReleaseVersion is promoted or abandoned.  They capture lane-diagnostic
+    aggregates (phase wall-clock, iteration distribution, waste-source
+    classification) plus per-PR relay medians for the v10 lane-pilot comparison.
+
+    Up to the last 20 versions are stored under ``project.design_doc``; reads
+    are cheap because the data lives on the already-loaded project row.
+
+    Returns 404 when the project is not found.  Returns an empty
+    ``baselines`` list when the project exists but has no stored baselines yet.
+    """
+    from app.lane_baseline_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+
+    proj_doc = (
+        await session.execute(
+            select(Project.design_doc).where(Project.id == project_id)
+        )
+    ).scalar_one_or_none()
+
+    if proj_doc is None:
+        # Distinguish "project not found" from "project has null design_doc"
+        exists = (
+            await session.execute(
+                select(Project.id).where(Project.id == project_id)
+            )
+        ).scalar_one_or_none()
+        if exists is None:
+            from fastapi import HTTPException  # noqa: PLC0415
+            raise HTTPException(status_code=404, detail="Project not found")
+
+    raw_baselines: dict = {}
+    if isinstance(proj_doc, dict):
+        raw_baselines = proj_doc.get(DESIGN_DOC_KEY) or {}
+
+    # Sort versions descending so the most recent appears first.
+    sorted_baselines = sorted(
+        raw_baselines.items(),
+        key=lambda kv: int(kv[0]),
+        reverse=True,
+    )
+
+    return {
+        "project_id": str(project_id),
+        "count": len(sorted_baselines),
+        "baselines": [v for _, v in sorted_baselines],
+    }

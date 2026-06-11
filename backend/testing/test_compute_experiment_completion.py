@@ -1102,6 +1102,150 @@ async def test_compute_completion_absent_metric_completes_and_records(
     assert ctx_criterion["value"] is None
 
 
+# ── Release-echo success criteria: backend-derived, always evaluable ─────────
+
+
+async def _make_timed_out_compute_task_with_job(
+    db_session,
+    metric: str,
+    op: str,
+    threshold: float,
+    *,
+    echo_sha: str | None = None,
+    expected_sha: str | None = None,
+) -> tuple["Task", "ComputeJob"]:
+    """Create a task with a declared success criterion and a TIMED_OUT compute job.
+
+    Sets up a realistic TIMED_OUT scenario: the job has terminal status and
+    optionally has a release_echo_sha in its polling_metadata.
+    """
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "success_criterion": {
+                "metric": metric,
+                "operator": op,
+                "threshold": threshold,
+            },
+        }
+    ]
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=task.project_id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.TIMED_OUT,
+        accrued_cost_usd=0.05,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    polling_meta: dict = {}
+    if echo_sha is not None:
+        polling_meta["release_echo_sha"] = echo_sha
+    if expected_sha is not None:
+        polling_meta["live_release_evidence"] = {
+            "promoted_sha": expected_sha,
+            "aggregate_serving_status": "serving_confirmed",
+            "release_version_number": 10,
+        }
+    job.polling_metadata = polling_meta
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    return task, job
+
+
+@pytest.mark.asyncio
+async def test_release_echo_criterion_evaluable_on_timed_out_job(
+    db_session, _quiet_compute_io
+):
+    """A TIMED_OUT job with a captured echo SHA makes release_echo_present
+    evaluable as a numeric 1.0 — even with no COMPUTE_RESULT in the logs."""
+    task, job = await _make_timed_out_compute_task_with_job(
+        db_session,
+        "release_echo_present",
+        "==",
+        1.0,
+        echo_sha="abc123",
+        expected_sha="abc123",
+    )
+
+    # No COMPUTE_RESULT emitted — agent timed out (empty/None logs).
+    logs = json.dumps({"outcome": "TIMED_OUT", "final_cost_usd": 0.05})
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["metric"] == "release_echo_present"
+    assert ctx_criterion["measurable"] is True
+    assert ctx_criterion["value"] == pytest.approx(1.0)
+    assert ctx_criterion["met"] is True
+    assert ctx_criterion["binding_status"] == "verified"
+
+
+@pytest.mark.asyncio
+async def test_release_echo_present_absent_echo_evaluable_as_fail(
+    db_session, _quiet_compute_io
+):
+    """A TIMED_OUT job with NO echo SHA still makes release_echo_present evaluable
+    as a numeric 0.0 and met=False — NOT absent/unmeasurable/unreported."""
+    task, job = await _make_timed_out_compute_task_with_job(
+        db_session,
+        "release_echo_present",
+        "==",
+        1.0,
+        echo_sha=None,
+        expected_sha="expected-sha-abc",
+    )
+
+    logs = json.dumps({"outcome": "TIMED_OUT", "final_cost_usd": 0.05})
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["metric"] == "release_echo_present"
+    assert ctx_criterion["measurable"] is True
+    assert ctx_criterion["value"] == pytest.approx(0.0)
+    assert ctx_criterion["met"] is False
+    assert ctx_criterion["binding_status"] == "absent"
+
+
+@pytest.mark.asyncio
+async def test_release_echo_verified_criterion_mismatched_sha_fails(
+    db_session, _quiet_compute_io
+):
+    """A job with a mismatched echo SHA fails release_echo_verified (value=0.0)
+    but passes release_echo_present (value=1.0), and binding_status='mismatched'
+    is exposed on the criterion record."""
+    task, job = await _make_timed_out_compute_task_with_job(
+        db_session,
+        "release_echo_verified",
+        "==",
+        1.0,
+        echo_sha="actual-sha",
+        expected_sha="expected-sha",
+    )
+
+    logs = json.dumps({"outcome": "TIMED_OUT", "final_cost_usd": 0.05})
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["metric"] == "release_echo_verified"
+    assert ctx_criterion["measurable"] is True
+    assert ctx_criterion["value"] == pytest.approx(0.0)
+    assert ctx_criterion["met"] is False
+    assert ctx_criterion["binding_status"] == "mismatched"
+
+
 # ── Durable knowledge: the verdict survives as a queryable KnowledgeDocument ──
 
 
@@ -4311,3 +4455,168 @@ async def test_agent_compute_analysis_endpoint_rejects_bad_jwt(
         },
     )
     assert resp_bad_token.status_code in (401, 403)
+
+
+# ── Post-terminate salvage poll ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_deadline_kill_salvages_late_echo_sha(db_session, monkeypatch):
+    """Deadline termination does a best-effort poll after terminate; if the
+    post-terminate poll surfaces an echoed_release_sha that was absent in the
+    pre-terminate snapshot, the SHA is merged into the finalized job's
+    polling_metadata."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=60,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "fake-deadline-salvage"
+    job.started_at = datetime.utcnow() - timedelta(seconds=120)
+    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    db_session.add(job)
+    await db_session.commit()
+
+    poll_call_count = 0
+
+    class FakeBackend:
+        async def launch(self, spec):
+            raise AssertionError("launch should not be called")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.01, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            nonlocal poll_call_count
+            poll_call_count += 1
+            if poll_call_count == 1:
+                # Pre-terminate poll: no echo SHA yet
+                return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+            # Post-terminate salvage poll: SHA now available
+            return ComputeStatusResult(
+                status=ComputeJobStatus.RUNNING,
+                echoed_release_sha="late-sha-abc",
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    await _drive_job_to_terminal(db_session, monkeypatch, job, FakeBackend())
+
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert job.polling_metadata.get("release_echo_sha") == "late-sha-abc"
+
+
+@pytest.mark.asyncio
+async def test_spend_cap_kill_salvages_late_metrics(db_session, monkeypatch):
+    """Spend-cap termination does a best-effort poll after terminate; if the
+    post-terminate poll surfaces result_metrics absent in the pre-terminate
+    snapshot, they are merged into the finalized job's polling_metadata."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=0.02,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "fake-budget-salvage"
+    job.started_at = datetime.utcnow() - timedelta(seconds=60)
+    db_session.add(job)
+    await db_session.commit()
+
+    poll_call_count = 0
+
+    class FakeBackend:
+        async def launch(self, spec):
+            raise AssertionError("launch should not be called")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.05, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            nonlocal poll_call_count
+            poll_call_count += 1
+            if poll_call_count == 1:
+                # Pre-terminate poll: no metrics yet
+                return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+            # Post-terminate salvage poll: metrics now available
+            return ComputeStatusResult(
+                status=ComputeJobStatus.RUNNING,
+                metrics={"accuracy": 0.91},
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    await _drive_job_to_terminal(db_session, monkeypatch, job, FakeBackend())
+
+    assert job.outcome == ComputeJobOutcome.SPEND_CAP_EXCEEDED
+    assert job.polling_metadata.get("result_metrics") == {"accuracy": 0.91}
+
+
+@pytest.mark.asyncio
+async def test_salvage_poll_failure_does_not_block_termination(db_session, monkeypatch):
+    """If the post-terminate salvage poll raises an exception, the terminal
+    outcome (TIMED_OUT) is still applied correctly — the exception is swallowed."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=60,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "fake-salvage-fail"
+    job.started_at = datetime.utcnow() - timedelta(seconds=120)
+    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    db_session.add(job)
+    await db_session.commit()
+
+    poll_call_count = 0
+
+    class FakeBackend:
+        async def launch(self, spec):
+            raise AssertionError("launch should not be called")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.01, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            nonlocal poll_call_count
+            poll_call_count += 1
+            if poll_call_count == 1:
+                return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+            # Post-terminate salvage poll raises
+            raise RuntimeError("backend unreachable after terminate")
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    await _drive_job_to_terminal(db_session, monkeypatch, job, FakeBackend())
+
+    # Terminal outcome must still be applied despite the salvage poll failure
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert "runtime deadline" in (job.terminal_reason or "")

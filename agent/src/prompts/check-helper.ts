@@ -317,6 +317,36 @@ fi
 `;
 }
 
+/** Detect whether the given stack can capture visual evidence. Capability-gated
+ *  on admin-ui being available and having the viewport harness infrastructure:
+ *  - Blueprint self-repo: YES (has hardcoded viewport blocks)
+ *  - Config-driven with admin-ui in directories: YES
+ *  - Config-driven without admin-ui or foreign repo: NO */
+function canCaptureVisual(
+  isSelfRepo: boolean,
+  buildConfig: BuildConfig | undefined,
+): boolean {
+  if (isSelfRepo) {
+    return true;
+  }
+  if (buildConfig?.directories?.some(dir => dir.path.replace(/\/$/, '') === 'admin-ui')) {
+    return true;
+  }
+  return false;
+}
+
+/** Emit a loud skip message when visual evidence is declared but cannot be
+ *  captured. This ensures unmet declarations are observable downstream instead
+ *  of silently degraded. Emitted as a best-effort advisory (non-fatal). */
+function buildVisualSkipBlock(reason: string): string {
+  return `
+# ── visual acceptance evidence — cannot capture ────────────────────────────────
+# Visual acceptance evidence was declared but this stack cannot capture it.
+echo "[check] visual acceptance declared but ${reason} — skipping capture"
+# ── end visual acceptance evidence skip ────────────────────────────────────────
+`;
+}
+
 export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   const ciFailureSelectors = sanitizeCiFailureSelectors(cfg.ciFailureSelectors);
@@ -720,21 +750,37 @@ run "size guardrail" bash -c "python3 backend/testing/check_size_limits.py 2>&1"
   //     worse, lint/build the wrong tree. The agent is told to configure
   //     build_config (or rely on CI) instead.
   let stackBlocks: string;
+  const isSelfRepo = isBlueprintSelfRepo(cfg.owner, cfg.repo);
   if (cfg.buildConfig?.directories?.length) {
     stackBlocks = buildConfigDrivenStackBlocks(cfg.buildConfig, cfg.taskId);
-  } else if (isBlueprintSelfRepo(cfg.owner, cfg.repo)) {
+  } else if (isSelfRepo) {
     stackBlocks = blueprintStackBlocks;
   } else {
     stackBlocks = genericNoConfigStackBlock(cfg.owner, cfg.repo);
   }
-  // Success-path visual-acceptance capture+upload. Presence-gated: only emitted
-  // when this task declares a `visual` acceptance requirement (and only for the
-  // Blueprint self-repo stack blocks, whose admin-ui viewport harness it drives).
-  // Absent declaration → empty string → byte-identical ./check.
-  const visualCaptureBlock =
-    cfg.visualAcceptance && stackBlocks === blueprintStackBlocks
-      ? buildVisualCaptureBlock(cfg.taskId, cfg.visualAcceptance.component, cfg.visualAcceptance.width)
-      : '';
+  // Success-path visual-acceptance capture+upload. Keyed to capability signal
+  // rather than generated-string identity: can this stack actually capture
+  // visual evidence? Blueprint self-repo YES (has viewport harness), config-driven
+  // MAYBE (check if admin-ui is configured), foreign repo NO.
+  // - If declared and can capture: emit capture block
+  // - If declared but cannot capture: emit loud skip (observable unmet declaration)
+  // - If not declared: emit nothing (byte-identical ./check)
+  let visualCaptureBlock = '';
+  if (cfg.visualAcceptance) {
+    const canCapture = canCaptureVisual(isSelfRepo, cfg.buildConfig);
+    if (canCapture) {
+      visualCaptureBlock = buildVisualCaptureBlock(
+        cfg.taskId,
+        cfg.visualAcceptance.component,
+        cfg.visualAcceptance.width,
+      );
+    } else {
+      const reason = isSelfRepo
+        ? 'admin-ui stack not available'
+        : 'admin-ui not configured in build_config';
+      visualCaptureBlock = buildVisualSkipBlock(reason);
+    }
+  }
   const footer = `
 if [ \${#FAILED[@]} -eq 0 ]; then
   echo ""

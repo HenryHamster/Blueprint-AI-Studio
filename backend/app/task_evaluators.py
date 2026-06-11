@@ -794,6 +794,39 @@ _RESERVED_COMPUTE_RESULT_KEYS: frozenset[str] = frozenset(
     {"final_cost_usd", "accrued_cost_usd", "spend_cap_usd", "poll_attempts"}
 )
 
+# Metrics whose values are derived backend-side from the job's captured release
+# echo, not from anything the experiment command wrote to its COMPUTE_RESULT.
+_RELEASE_ECHO_METRICS: frozenset[str] = frozenset(
+    {"release_echo_present", "release_echo_verified"}
+)
+
+
+def derive_release_binding_status(
+    echo_sha: str | None, expected_sha: str | None
+) -> str:
+    """Derive release binding status from the VM echo SHA and the expected promoted SHA.
+
+    Returns ``'verified'`` when the echo matches the expected SHA, ``'absent'``
+    when no echo was captured, and ``'mismatched'`` when the echo does not match.
+    Exported so knowledge_completion and task_completion share one implementation.
+    """
+    if echo_sha is None:
+        return "absent"
+    if echo_sha == expected_sha:
+        return "verified"
+    return "mismatched"
+
+
+def _release_echo_numeric(binding_status: str, metric: str) -> float:
+    """Convert a release binding status to a numeric 0.0/1.0 for a release-echo metric.
+
+    ``release_echo_present``: 1.0 when the echo was captured (verified or mismatched).
+    ``release_echo_verified``: 1.0 only when the echo matches the expected promoted SHA.
+    """
+    if metric == "release_echo_present":
+        return 1.0 if binding_status in ("verified", "mismatched") else 0.0
+    return 1.0 if binding_status == "verified" else 0.0
+
 
 def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
     """Read a compute_experiment's declared success criterion from its payload.
@@ -822,7 +855,11 @@ def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
 
 
 def evaluate_compute_success_criterion(
-    task: Task, artifact_text: str | None
+    task: Task,
+    artifact_text: str | None,
+    *,
+    echo_sha: str | None = None,
+    expected_sha: str | None = None,
 ) -> dict | None:
     """Evaluate a compute_experiment's declared success criterion against its result.
 
@@ -837,18 +874,30 @@ def evaluate_compute_success_criterion(
     (``met`` is False), not a free pass. ``value`` is the numeric metric read by
     name out of the terminal result object; ``met`` is False when the metric is
     absent/non-numeric (fail-closed) or when the comparison does not hold.
+
+    For release-echo metrics (``release_echo_present``, ``release_echo_verified``),
+    the value is derived backend-side from ``echo_sha`` and ``expected_sha`` rather
+    than from the artifact JSON. This means the criterion is always EVALUABLE (never
+    absent/unmeasurable) as long as the caller passes the echo data, even when the
+    experiment command emitted no COMPUTE_RESULT before timing out.
     """
     criterion = _declared_success_criterion(task)
     if criterion is None:
         return None
     metric, op, threshold = criterion
-    obj = _extract_json_object(artifact_text) or {}
-    raw_value = obj.get(metric)
-    value = _coerce_number(raw_value)
+    binding_status: str | None = None
+    if metric in _RELEASE_ECHO_METRICS:
+        binding_status = derive_release_binding_status(echo_sha, expected_sha)
+        value: float | None = _release_echo_numeric(binding_status, metric)
+        raw_value: object = value
+    else:
+        obj = _extract_json_object(artifact_text) or {}
+        raw_value = obj.get(metric)
+        value = _coerce_number(raw_value)
     # Shared fail-closed core: a metric absent/non-numeric in the result is never
     # "met" (and ``criterion_met`` enforces that identically for the code gate).
     met = criterion_met(raw_value, op, threshold)
-    return {
+    result: dict = {
         "metric": metric,
         "operator": op,
         "threshold": threshold,
@@ -856,6 +905,9 @@ def evaluate_compute_success_criterion(
         "met": met,
         "measurable": value is not None,
     }
+    if binding_status is not None:
+        result["binding_status"] = binding_status
+    return result
 
 
 def _format_unmet_criterion(criterion: dict) -> str:
