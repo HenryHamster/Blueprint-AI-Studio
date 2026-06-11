@@ -12,8 +12,9 @@ Covers:
     including the deleted-test-file and startup-failure hard-blocker sentinels.
   * run_qualification — phase + in-flight + already-dry-run guards (audit H1);
     the FOR UPDATE row-lock serialization (audit C3); the candidate_sha-pinned
-    child payloads + main...<candidate_sha> audit diff (audit C4); the
-    smoketest-skipped spawn path when smoketest_enabled is False (audit H3).
+    audit payload + main...<candidate_sha> diff (audit C4); the smoketest-skipped
+    spawn path when smoketest_enabled is False (audit H3); the deferred
+    binding-challenge spawn once audit findings exist.
   * _finalize_qualification — promote / dry-run / not-promoted decision paths;
     the smoketest-disabled drop-dimension path.
   * promote — success path (create release branch at candidate_sha, open +
@@ -2047,6 +2048,39 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
             "moderate retry concern",
             "severe retry concern",
         ]
+
+    def test_retry_primary_findings_cover_all_deductible_findings_past_display_cap(self):
+        findings = [
+            _make_verified_finding(f"Verified challenge binding issue {i}", f"app/{i}.py")
+            for i in range(rq._MAX_CARRIED_FINDINGS + 2)
+        ]
+        report = self._report(findings)
+
+        carried = rq._primary_findings_for_challenge_retry(report)
+        assert len(carried) == len(findings)
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": i + 1,
+                    "verdict": "confirmed",
+                    "severity": finding["severity"],
+                    "summary": finding["summary"],
+                    "reason": "confirmed by challenge review with supporting evidence",
+                }
+                for i, finding in enumerate(carried)
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is report
+        assert refuted == []
+        assert binding[0]["finding_summary"] == findings[0]["summary"]
 
     def test_empty_summary_finding_excluded_from_index_domain(self):
         """Findings with empty summaries must be excluded from the indexed list.
@@ -4631,11 +4665,12 @@ def _qualifier_ci_resolves_green(mocker):
 async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     db_session, mocker
 ):
-    """With smoketest_enabled=True, run_qualification snapshots the SHA, spawns
-    release_audit + advisory release_audit_challenge + qualifier-smoketest, and
-    stamps version.last_qualification = {status: 'pending', ...}.  All child
-    payloads carry the exact 40-char candidate_sha (audit C4 contract), and the
-    audit diff_range is pinned to main...<candidate_sha> (NOT main...automain)."""
+    """With smoketest_enabled=True, run_qualification snapshots the SHA,
+    spawns release_audit + qualifier-smoketest, and stamps
+    version.last_qualification = {status: 'pending', ...}.  The binding
+    release_audit_challenge is deferred until the audit report exists, while
+    the audit diff_range remains pinned to main...<candidate_sha> (NOT
+    main...automain)."""
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = True
@@ -4672,7 +4707,8 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     assert version.last_qualification["smoketest_enabled"] is True
     assert version.qualification_attempts == 1
 
-    # Three child tasks exist: release_audit, advisory challenge, and smoketest.
+    # Two child tasks exist: release_audit and smoketest. The binding challenge
+    # is spawned later, once the audit findings are available.
     from sqlmodel import select
 
     tasks = (
@@ -4681,11 +4717,10 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
         .all()
     )
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
-    assert types == ["release_audit", "release_audit_challenge", "smoketest"]
+    assert types == ["release_audit", "smoketest"]
 
     by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
     audit_task = by_type["release_audit"]
-    challenge_task = by_type["release_audit_challenge"]
     smoke_task = by_type["smoketest"]
 
     assert audit_task.first_payload["base_branch"] == "main"
@@ -4694,18 +4729,9 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     assert audit_task.context["release_version_id"] == str(version.id)
     assert audit_task.context["scope"] == "medium"
     assert version.last_qualification["audit_task_id"] == str(audit_task.id)
-
-    assert challenge_task.first_payload["base_branch"] == "main"
-    assert challenge_task.first_payload["diff_range"] == f"main...{candidate}"
-    assert challenge_task.first_payload["candidate_sha"] == candidate
-    assert challenge_task.first_payload["primary_audit_task_id"] == str(audit_task.id)
-    assert challenge_task.context["release_version_id"] == str(version.id)
-    assert challenge_task.context["candidate_sha"] == candidate
-    assert challenge_task.context["primary_audit_task_id"] == str(audit_task.id)
-    assert version.last_qualification["challenge_task_id"] == str(challenge_task.id)
-    assert version.last_qualification["audit_challenge_task_id"] == str(
-        challenge_task.id
-    )
+    assert version.last_qualification["challenge_task_id"] is None
+    assert version.last_qualification["audit_challenge_task_id"] is None
+    assert version.last_qualification["audit_challenge_spawn_pending"] is True
 
     from datetime import datetime, timezone
 
@@ -4728,9 +4754,9 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
 @pytest.mark.asyncio
 async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocker):
     """Audit H3: with smoketest_enabled=False (the shipped default), only the
-    release_audit and advisory challenge children are spawned — NO
-    qualifier-smoketest task — and last_qualification records
-    smoketest_enabled=False with smoketest_task_id None."""
+    release_audit child is spawned — NO qualifier-smoketest task — and
+    last_qualification records smoketest_enabled=False with
+    smoketest_task_id None."""
     from app import shared_state
 
     # Explicit for clarity — this is also the autouse-reset default.
@@ -4763,9 +4789,10 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
     assert version.last_qualification["smoketest_enabled"] is False
     assert version.last_qualification["smoketest_task_id"] is None
     assert version.last_qualification["audit_task_id"] is not None
-    assert version.last_qualification["audit_challenge_task_id"] is not None
+    assert version.last_qualification["audit_challenge_task_id"] is None
+    assert version.last_qualification["audit_challenge_spawn_pending"] is True
 
-    # Exactly two child tasks — release_audit and its advisory challenge — and NO smoketest.
+    # Exactly one child task — release_audit — and NO smoketest or challenge.
     from sqlmodel import select
 
     tasks = (
@@ -4774,15 +4801,10 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
         .all()
     )
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
-    assert types == ["release_audit", "release_audit_challenge"]
+    assert types == ["release_audit"]
     by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
     assert by_type["release_audit"].first_payload["candidate_sha"] == candidate
     assert by_type["release_audit"].first_payload["diff_range"] == f"main...{candidate}"
-    assert by_type["release_audit_challenge"].first_payload["candidate_sha"] == candidate
-    assert (
-        by_type["release_audit_challenge"].first_payload["primary_audit_task_id"]
-        == version.last_qualification["audit_task_id"]
-    )
 
 
 @pytest.mark.asyncio
@@ -5257,7 +5279,7 @@ async def test_run_qualification_second_sequential_call_does_not_double_spawn(
     await db_session.commit()
     assert second["status"] == "already_pending"
 
-    # Exactly one primary/challenge pair total — no duplicate from the second call.
+    # Exactly one release_audit task total — no duplicate from the second call.
     from sqlmodel import select
 
     tasks = (
@@ -5265,10 +5287,7 @@ async def test_run_qualification_second_sequential_call_does_not_double_spawn(
         .scalars()
         .all()
     )
-    assert sorted(t.first_payload.get("type") for t in tasks) == [
-        "release_audit",
-        "release_audit_challenge",
-    ]
+    assert sorted(t.first_payload.get("type") for t in tasks) == ["release_audit"]
     # qualification_attempts bumped exactly once (the second call no-op'd).
     await db_session.refresh(version)
     assert version.qualification_attempts == 1
@@ -5787,7 +5806,7 @@ async def test_challenge_hold_respawns_challenge_only_with_primary_findings(
 
     assert result == {
         "status": "audit_challenge_respawned",
-        "reason": "audit_challenge_missing",
+        "reason": "challenge_initial_no_primary_findings",
         "respawn_count": 1,
         "challenge_task_id": version.last_qualification["challenge_task_id"],
     }
@@ -5800,7 +5819,7 @@ async def test_challenge_hold_respawns_challenge_only_with_primary_findings(
     )
     assert version.last_qualification["audit_challenge_respawn_count"] == 1
     assert version.last_qualification["audit_challenge_retry_reason"] == (
-        "audit_challenge_missing"
+        "challenge_initial_no_primary_findings"
     )
 
     tasks = (
@@ -5838,6 +5857,99 @@ async def test_challenge_hold_respawns_challenge_only_with_primary_findings(
             "severity": "medium",
             "summary": "Challenge matching loses the release scoring file.",
             "file": "backend/app/release_scoring.py",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_initial_challenge_receives_primary_findings_before_reconciliation(
+    db_session,
+):
+    """Pre-reconciliation guard: an initial challenge (no primary_findings in
+    payload) that completed while the audit has deductible findings must be
+    re-spawned with those findings BEFORE reconciliation runs.  The new
+    challenge payload carries the findings so reconciliation can proceed
+    without a binding-failure infra override on the next pass."""
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "SQL query is missing parameterization.",
+                    "file": "backend/app/models.py",
+                    "verification_note": "Read backend/app/models.py:42 and confirmed the query is unparameterized.",
+                },
+                {
+                    "severity": "critical",
+                    "summary": "Secret key written to disk.",
+                    "file": "backend/app/services.py",
+                    "verification_note": "Read backend/app/services.py:100 and confirmed the key is written.",
+                },
+            ],
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=None,
+    )
+    # Defer the challenge spawn entirely. Finalize should create the first
+    # binding challenge only after it can carry the primary findings.
+    version.last_qualification = {
+        **version.last_qualification,
+        "challenge_task_id": None,
+        "audit_challenge_task_id": None,
+        "audit_challenge_spawn_pending": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Guard must fire before reconciliation and spawn the first bound challenge.
+    assert result["status"] == "audit_challenge_respawned"
+    assert result["reason"] == "challenge_initial_primary_findings"
+    assert result["respawn_count"] == 1
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["challenge_task_id"] is not None
+    assert version.last_qualification["audit_challenge_task_id"] == (
+        version.last_qualification["challenge_task_id"]
+    )
+    assert version.last_qualification["audit_challenge_spawn_pending"] is False
+    assert version.last_qualification["audit_challenge_respawn_count"] == 1
+    assert version.last_qualification["audit_challenge_retry_reason"] == (
+        "challenge_initial_primary_findings"
+    )
+
+    # The new challenge payload must carry primary_findings so the next
+    # reconciliation can verify them without a binding-failure hold.
+    from app.models import Task as _Task  # noqa: PLC0415
+
+    new_challenge_id = uuid.UUID(version.last_qualification["challenge_task_id"])
+    new_challenge = await db_session.get(_Task, new_challenge_id)
+    assert new_challenge is not None
+    assert new_challenge.first_payload.get("primary_findings") == [
+        {
+            "severity": "critical",
+            "summary": "Secret key written to disk.",
+            "file": "backend/app/services.py",
+        },
+        {
+            "severity": "high",
+            "summary": "SQL query is missing parameterization.",
+            "file": "backend/app/models.py",
         },
     ]
 

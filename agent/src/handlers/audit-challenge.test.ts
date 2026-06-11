@@ -209,6 +209,107 @@ describe('normalizeChallengeOutput — stable RELEASE_AUDIT_CHALLENGE contract',
     expect(out.verdicts[1]).not.toHaveProperty('primary_finding_index');
   });
 
+  it('copies the bound primary summary even when the model omits summary text', () => {
+    const primaryFindings = [
+      { severity: 'high', summary: 'Unsafe retry binding in audit gate.', file: 'app/x.py' },
+    ];
+    const out = normalizeChallengeOutput(
+      {
+        verdicts: [
+          {
+            primary_finding_index: 1,
+            severity: 'high',
+            summary: '',
+            file: 'app/x.py',
+            verdict: 'confirmed',
+            reason: 'Read app/x.py:42 and confirmed the binding issue is real.',
+          },
+        ],
+      },
+      CANDIDATE_SHA,
+      primaryFindings,
+    );
+    expect(out.verdicts).toHaveLength(1);
+    expect(out.verdicts[0].summary).toBe('Unsafe retry binding in audit gate.');
+  });
+
+  it('normalizes indexed primary summaries verbatim — overwrites model paraphrase with exact finding text', () => {
+    const primaryFindings = [
+      { severity: 'high', summary: 'Unsafe deserialization in upload handler.', file: 'app/upload.py' },
+      { severity: 'medium', summary: 'SQL injection via user_id parameter.', file: 'app/auth.py' },
+    ];
+    const out = normalizeChallengeOutput(
+      {
+        verdicts: [
+          {
+            primary_finding_index: 1,
+            severity: 'high',
+            summary: 'unsafe deserialization exists in upload',  // paraphrased — must be overwritten
+            file: 'app/upload.py',
+            verdict: 'confirmed',
+            reason: 'Read app/upload.py:42 and confirmed the deserialization issue is real.',
+          },
+          {
+            primary_finding_index: 2,
+            severity: 'medium',
+            summary: 'sql injection via user parameter',  // paraphrased — must be overwritten
+            file: 'app/auth.py',
+            verdict: 'refuted_false_positive',
+            reason: 'Read app/auth.py:60 — user_id is not user-controlled here, safely parameterized.',
+          },
+        ],
+      },
+      CANDIDATE_SHA,
+      primaryFindings,
+    );
+    expect(out.verdicts[0].summary).toBe('Unsafe deserialization in upload handler.');
+    expect(out.verdicts[1].summary).toBe('SQL injection via user_id parameter.');
+  });
+
+  it('leaves summary untouched when primary_finding_index is out of bounds', () => {
+    const primaryFindings = [
+      { severity: 'high', summary: 'Exact primary summary text.', file: 'app/x.py' },
+    ];
+    const out = normalizeChallengeOutput(
+      {
+        verdicts: [
+          {
+            primary_finding_index: 5,  // out of bounds (only 1 finding)
+            severity: 'high',
+            summary: 'independently derived summary',
+            file: 'app/x.py',
+            verdict: 'confirmed',
+            reason: 'Read app/x.py:42 and confirmed this issue is genuine and present.',
+          },
+        ],
+      },
+      CANDIDATE_SHA,
+      primaryFindings,
+    );
+    expect(out.verdicts[0].summary).toBe('independently derived summary');
+  });
+
+  it('leaves summary untouched when no primaryFindings array is passed (no regression)', () => {
+    const out = normalizeChallengeOutput(
+      {
+        verdicts: [
+          {
+            primary_finding_index: 2,
+            severity: 'high',
+            summary: 'unsafe retry binding',
+            file: 'app/x.py',
+            verdict: 'confirmed',
+            reason: 'Read app/x.py:42 and confirmed this retry binding issue is real.',
+          },
+        ],
+      },
+      CANDIDATE_SHA,
+      // no primaryFindings argument
+    );
+    expect(out.verdicts[0].summary).toBe('unsafe retry binding');
+    expect(out.verdicts[0].primary_finding_index).toBe(2);
+  });
+
   it('returns an empty contract for non-object / missing-verdicts input', () => {
     expect(normalizeChallengeOutput(null, CANDIDATE_SHA)).toEqual({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] });
     expect(normalizeChallengeOutput({}, CANDIDATE_SHA)).toEqual({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] });

@@ -166,7 +166,7 @@ export function parsePrimaryFindings(payload: Record<string, unknown>): PrimaryF
  * confirmation/refutation without an auditable justification.
  */
 export function normalizeChallengeOutput(
-  raw: unknown, candidateSha: string,
+  raw: unknown, candidateSha: string, primaryFindings?: PrimaryFinding[],
 ): ChallengeArtifact {
   const out: ChallengeArtifact = { challenged_candidate_sha: candidateSha, verdicts: [] };
   if (!raw || typeof raw !== 'object') return out;
@@ -179,16 +179,25 @@ export function normalizeChallengeOutput(
     if (!(CHALLENGE_VERDICTS as readonly string[]).includes(verdictRaw)) continue;
     let verdict = verdictRaw as ChallengeVerdict;
     const severity = strVal(obj.severity).trim().toLowerCase() || 'unknown';
-    const summary = strVal(obj.summary || obj.description || obj.title).trim();
-    if (!summary) continue;
-    const file = strVal(obj.file || obj.file_path).trim();
-    const reason = strVal(obj.reason || obj.verification_note).trim();
     const primaryFindingIndexRaw = obj.primary_finding_index;
     const primaryFindingIndex = (
       typeof primaryFindingIndexRaw === 'number' &&
       Number.isInteger(primaryFindingIndexRaw) &&
       primaryFindingIndexRaw > 0
     ) ? primaryFindingIndexRaw : undefined;
+    // When primary findings are supplied and the index resolves to a valid entry,
+    // overwrite the summary verbatim — model paraphrase must never reach the artifact.
+    let summary = strVal(obj.summary || obj.description || obj.title).trim();
+    if (
+      primaryFindingIndex !== undefined &&
+      primaryFindings !== undefined &&
+      primaryFindingIndex <= primaryFindings.length
+    ) {
+      summary = primaryFindings[primaryFindingIndex - 1].summary;
+    }
+    if (!summary) continue;
+    const file = strVal(obj.file || obj.file_path).trim();
+    const reason = strVal(obj.reason || obj.verification_note).trim();
     if (
       (verdict === 'confirmed' || verdict === 'refuted_false_positive') &&
       nonWhitespaceLen(reason) < MIN_CHALLENGE_REASON_LEN
@@ -415,7 +424,7 @@ Rules:
   let logs = '';
   let challengeUnparseable = false;
   if (handlerOutput !== null && validateChallengeArtifactShape(handlerOutput).ok) {
-    logs = sanitize(JSON.stringify(normalizeChallengeOutput(handlerOutput, candidateSha)));
+    logs = sanitize(JSON.stringify(normalizeChallengeOutput(handlerOutput, candidateSha, primaryFindings)));
   } else {
     const reopenPrompt = primaryFindings.length > 0
       ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nReturn ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index" and copy the listed primary finding summary exactly into "summary". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`
@@ -436,7 +445,7 @@ Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with
       validateParsedValue: validateChallengeArtifactShape,
     });
     if (repaired.value !== null) {
-      logs = sanitize(JSON.stringify(normalizeChallengeOutput(repaired.value, candidateSha)));
+      logs = sanitize(JSON.stringify(normalizeChallengeOutput(repaired.value, candidateSha, primaryFindings)));
     } else {
       challengeUnparseable = exitCode === 0;
       logs = sanitize(lastResultText || allOutput.slice(-50_000));
