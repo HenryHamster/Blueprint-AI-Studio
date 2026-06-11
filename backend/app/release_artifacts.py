@@ -618,11 +618,27 @@ async def _reclassify_sha_mismatch_if_superseded(
         return decision
     if ancestry is not True:
         if ancestry is None:
+            # Ancestry indeterminate (GitHub compare API unavailable).  Within
+            # the confirmation window, defer so the next sweep can retry once
+            # the API recovers.  Past the deadline, resolve as a soft
+            # confirmation_timed_out rather than a hard deploy_failed: we
+            # couldn't verify descendant vs. diverged but never observed an
+            # active failure — mirrors the _defer_or_timeout() pattern in the
+            # promotion_merge provider.
+            _deadline = _to_naive_utc(version.deploy_confirm_deadline)
+            _now_naive = _to_naive_utc(now) or now
+            if _deadline is None or _now_naive < _deadline:
+                return None  # within window — defer, retry on next sweep
             logger.warning(
                 "[RELEASE_ARTIFACTS] sha_mismatch supersession check for v%s: "
-                "ancestry indeterminate (compare API failed) — keeping "
-                "deploy_failed/sha_mismatch",
+                "ancestry indeterminate (compare API failed) past deadline — "
+                "resolving confirmation_timed_out",
                 getattr(version, "version_number", "?"),
+            )
+            return (
+                "confirmation_timed_out",
+                "backend_revision_ancestry_indeterminate",
+                None,
             )
         return decision
 
@@ -686,6 +702,8 @@ register_release_artifact_provider(
 def _previously_deployed_sha(
     ds: DeploymentState | None,
     promoted_sha: str,
+    *,
+    current_contains_promoted: bool = False,
 ) -> str | None:
     """Best-effort: the self-repo SHA serving *before* this promotion.
 
@@ -698,7 +716,7 @@ def _previously_deployed_sha(
     if ds is None:
         return None
     current = ds.current_sha or None
-    if current and current == promoted_sha:
+    if current and (current == promoted_sha or current_contains_promoted):
         return ds.prior_deploy_sha or None
     return current
 
@@ -757,16 +775,42 @@ async def _check_agent_image_serving(
         # ``project.is_self_repo`` (deprecated for deploy-level observability).
         return ("serving_confirmed", promoted_sha, now)
 
-    ds = await session.get(DeploymentState, 1)
-    base_sha = _previously_deployed_sha(ds, promoted_sha)
-    if not base_sha:
-        # Diff base unobservable → indeterminate → not-yet-confirmed.
-        return None
-
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
         return None
     token, owner, repo = resolved
+
+    ds = await session.get(DeploymentState, 1)
+    current_sha = (getattr(ds, "current_sha", None) or "") if ds is not None else ""
+    current_contains_promoted = False
+    if (
+        current_sha
+        and current_sha != promoted_sha
+        and getattr(ds, "prior_deploy_sha", None)
+    ):
+        try:
+            ancestry = await github_refs.is_ancestor_of(
+                token,
+                owner,
+                repo,
+                promoted_sha,
+                current_sha,
+                project_id=str(version.project_id),
+            )
+        except Exception:  # noqa: BLE001 - ancestry lookup is an indeterminate serving signal
+            ancestry = None
+        if ancestry is None:
+            return None
+        current_contains_promoted = ancestry is True
+
+    base_sha = _previously_deployed_sha(
+        ds,
+        promoted_sha,
+        current_contains_promoted=current_contains_promoted,
+    )
+    if not base_sha:
+        # Diff base unobservable → indeterminate → not-yet-confirmed.
+        return None
 
     rebake = await github_refs.agent_image_rebake_expected(
         token,
@@ -786,7 +830,15 @@ async def _check_agent_image_serving(
 
     # Bake expected: confirm only once the fleet is independently observed
     # serving the promoted SHA (the freshly baked image is live and running).
-    if await compute.fleet_serving_source_sha(session, promoted_sha):
+    if await compute.fleet_serving_source_sha(
+        session,
+        promoted_sha,
+        allow_descendant=True,
+        token=token,
+        owner=owner,
+        repo=repo,
+        project_id=str(version.project_id),
+    ):
         return ("serving_confirmed", promoted_sha, now)
     return None
 

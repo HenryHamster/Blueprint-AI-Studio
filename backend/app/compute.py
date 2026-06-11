@@ -994,7 +994,16 @@ def get_vm_source_sha(vm_instance_id: str) -> str | None:
     return _vm_source_shas.get(vm_instance_id)
 
 
-async def fleet_serving_source_sha(session, promoted_sha: str | None) -> bool:
+async def fleet_serving_source_sha(
+    session,
+    promoted_sha: str | None,
+    *,
+    allow_descendant: bool = False,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    project_id: str | None = None,
+) -> bool:
     """True iff the running agent fleet is observed serving ``promoted_sha``.
 
     Default fleet-serving definition for the agent VM image release artifact: at
@@ -1011,26 +1020,49 @@ async def fleet_serving_source_sha(session, promoted_sha: str | None) -> bool:
     """
     if not promoted_sha:
         return False
+    observed_shas: set[str] = set()
     try:
         from sqlalchemy import select
 
         from app.models import PoolVm
         from app.warm_pool import LIVE_POOL_STATES
 
-        match = (
+        rows = (
             await session.execute(
-                select(PoolVm.id).where(
-                    PoolVm.agent_source_sha == promoted_sha,
+                select(PoolVm.agent_source_sha).where(
+                    PoolVm.agent_source_sha.is_not(None),
                     PoolVm.state.in_(LIVE_POOL_STATES),
                 )
             )
-        ).first()
-        if match is not None:
+        ).all()
+        observed_shas.update(str(row[0]) for row in rows if row[0])
+        if promoted_sha in observed_shas:
             return True
     except Exception as e:
         logger.debug(f"[COMPUTE] fleet_serving_source_sha DB read failed: {e}")
     # In-memory heartbeat fallback (warm before a PoolVm row is persisted).
-    return any(sha == promoted_sha for sha in _vm_source_shas.values())
+    observed_shas.update(sha for sha in _vm_source_shas.values() if sha)
+    if promoted_sha in observed_shas:
+        return True
+    if not (allow_descendant and token and owner and repo):
+        return False
+    try:
+        from app import github_refs
+
+        for source_sha in observed_shas:
+            ancestry = await github_refs.is_ancestor_of(
+                token,
+                owner,
+                repo,
+                promoted_sha,
+                source_sha,
+                project_id=project_id,
+            )
+            if ancestry is True:
+                return True
+    except Exception as e:
+        logger.debug(f"[COMPUTE] fleet source ancestry check failed: {e}")
+    return False
 
 
 async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:

@@ -210,6 +210,82 @@ class TestStoreAgentSecretIamRetry:
         assert client.get_iam_policy.call_count == 5
 
 
+class _FleetSourceFakeSession:
+    async def execute(self, _stmt):
+        raise RuntimeError("db unavailable")
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_preserves_exact_match_without_ancestry(
+    monkeypatch, mocker
+):
+    monkeypatch.setattr(compute, "_vm_source_shas", {"vm-1": "b" * 40})
+    ancestry = mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            _FleetSourceFakeSession(),
+            "b" * 40,
+        )
+        is True
+    )
+    ancestry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_accepts_descendant_when_enabled(
+    monkeypatch, mocker
+):
+    promoted_sha = "a" * 40
+    descendant_sha = "b" * 40
+    monkeypatch.setattr(compute, "_vm_source_shas", {"vm-1": descendant_sha})
+    ancestry = mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            _FleetSourceFakeSession(),
+            promoted_sha,
+            allow_descendant=True,
+            token="tok",
+            owner="acme",
+            repo="widget",
+            project_id="proj",
+        )
+        is True
+    )
+    ancestry.assert_awaited_once()
+    assert ancestry.await_args.args[3:5] == (promoted_sha, descendant_sha)
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_indeterminate_descendant_is_not_confirmed(
+    monkeypatch, mocker
+):
+    monkeypatch.setattr(compute, "_vm_source_shas", {"vm-1": "b" * 40})
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new=AsyncMock(return_value=None),
+    )
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            _FleetSourceFakeSession(),
+            "a" * 40,
+            allow_descendant=True,
+            token="tok",
+            owner="acme",
+            repo="widget",
+        )
+        is False
+    )
+
+
 class TestAgentSecretManifest:
     def test_build_agent_secret_manifest_includes_runtime_identity(self):
         task_id = uuid.uuid4()

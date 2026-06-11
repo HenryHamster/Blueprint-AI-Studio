@@ -1518,19 +1518,26 @@ async def _reconcile_if_deploy_failed_recovered(
 ) -> bool:
     """Recover a ``deploy_failed`` version whose promoted SHA is now serving.
 
-    For a ``promoted`` version latched to ``serving_status="deploy_failed"`` still
-    inside the recovery window, re-run the pure ``_classify_serving_outcome``
+    For a ``promoted`` version latched to ``serving_status="deploy_failed"`` (or
+    ``confirmation_timed_out``), re-run the full required-artifact truth recheck
     against the live DeploymentState.  When the promoted SHA is now INDEPENDENTLY
-    observed serving (a STABLE new revision booted after ``promoted_at`` whose
-    live ``current_sha`` matches ``promoted_sha``) flip it back to a truthful
-    ``serving_confirmed`` state via ``_recover_serving_confirmed`` and clear every
-    derived failure surface.  Any other classifier verdict (still failed,
-    rolled-back, sha-mismatch, or no decision) leaves the version deploy_failed.
+    observed serving — the backend_revision provider confirming an observed SHA
+    that equals OR is an ancestry-verified descendant of ``promoted_sha`` AND the
+    full required-artifact aggregate rechecks as ``serving_confirmed`` — flip it
+    back to a truthful ``serving_confirmed`` state via ``_recover_serving_confirmed``
+    and clear every derived failure surface.  Any other verdict (still failed,
+    rolled-back, halted, determinate non-ancestry sha_mismatch, a still-failed
+    required non-backend artifact, or an indeterminate check) leaves the version
+    deploy_failed — only the artifact-row truth actually learned is committed.
 
-    Beyond the recovery window — anchored on when the failure was recorded
-    (``deploy_confirm_alerted_at``, falling back to ``deploy_confirm_deadline`` /
-    ``promoted_at``) — a genuinely dead deploy is no longer re-checked and stays
-    failed forever.
+    Recovery is gated on the deterministic positive, NOT on elapsed time: an
+    ancestry-verified deploy that the descendant-aware provider now confirms
+    serving recovers even when the old recovery window has long since elapsed,
+    because the truth recheck — not a timer — decides.  The
+    ``recovery_window_seconds`` parameter is retained for signature/back-compat
+    with the sweep call site and tests but no longer short-circuits the recheck;
+    every negative or indeterminate result stays latched ``deploy_failed`` by the
+    aggregate gate, so an elapsed window can never force-clear a dead deploy.
 
     Runs in its own dedicated session under a row lock — the same per-version
     isolation pattern as ``_confirm_serving_or_fail`` — so a failure on one
@@ -1563,20 +1570,15 @@ async def _reconcile_if_deploy_failed_recovered(
             if version.serving_status not in ("deploy_failed", "confirmation_timed_out"):
                 return False
 
-            # Bound recovery: beyond the window a genuinely dead deploy stays
-            # loudly failed forever.  Anchor on when the failure was recorded.
-            anchor = _to_naive_utc(
-                version.deploy_confirm_alerted_at
-                or version.deploy_confirm_deadline
-                or version.promoted_at
-            )
-            now_naive = _to_naive_utc(_now) or _now
-            if (
-                anchor is not None
-                and recovery_window_seconds > 0
-                and (now_naive - anchor).total_seconds() > recovery_window_seconds
-            ):
-                return False
+            # Recovery is gated on the deterministic positive below (a full
+            # required-artifact serving_confirmed aggregate, including the
+            # descendant-aware backend_revision provider), NOT on elapsed time.
+            # The ``recovery_window_seconds`` param is retained for back-compat
+            # but intentionally no longer short-circuits this recheck: an
+            # ancestry-verified deploy must be able to recover even beyond the
+            # old window, while every negative/indeterminate result stays latched
+            # deploy_failed via the aggregate gate.
+            _ = recovery_window_seconds
 
             (
                 provider_rows,
