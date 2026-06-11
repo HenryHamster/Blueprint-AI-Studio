@@ -1526,6 +1526,64 @@ def _audit_task_matches_candidate(task: Task | None, candidate_sha: str | None) 
     return bool(payload_sha and payload_sha == candidate_sha)
 
 
+def _build_audit_leg_proof(
+    *,
+    candidate_sha: str | None,
+    audit_task_id: str | None,
+    audit_task_candidate_sha: str | None,
+    challenge_task_id: str | None,
+    challenged_candidate_sha: str | None,
+    binding_expected_count: int,
+    binding_record_count: int,
+    reconciliation_status: str | None,
+    reconciliation_reason: str | None,
+    legacy_advisory_only: bool,
+) -> dict[str, Any]:
+    """Derive the machine-readable audit-leg proof snapshot for a verdict."""
+    required = binding_expected_count > 0 and not legacy_advisory_only
+    binding_complete = (
+        binding_expected_count > 0 and binding_record_count == binding_expected_count
+    )
+    audit_sha_pinned = bool(
+        candidate_sha
+        and audit_task_candidate_sha
+        and audit_task_candidate_sha == candidate_sha
+    )
+    challenge_sha_pinned = bool(
+        candidate_sha
+        and challenged_candidate_sha
+        and challenged_candidate_sha == candidate_sha
+    )
+    reconciliation_success = (
+        reconciliation_status == "available" and reconciliation_reason is None
+    )
+    if not required:
+        state = "not_required"
+    elif (
+        audit_sha_pinned
+        and challenge_sha_pinned
+        and binding_complete
+        and reconciliation_success
+    ):
+        state = "proven"
+    else:
+        state = "unproven"
+    return {
+        "state": state,
+        "required": state == "proven",
+        "candidate_sha": candidate_sha,
+        "audit_task_id": audit_task_id,
+        "audit_task_candidate_sha": audit_task_candidate_sha,
+        "challenge_task_id": challenge_task_id,
+        "challenged_candidate_sha": challenged_candidate_sha,
+        "binding_expected_count": binding_expected_count,
+        "binding_record_count": binding_record_count,
+        "binding_complete": binding_complete,
+        "reconciliation_status": reconciliation_status,
+        "reconciliation_reason": reconciliation_reason,
+    }
+
+
 async def _resolve_migration_identity_at_finalize(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -2723,6 +2781,38 @@ async def _finalize_qualification(
         "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),
         "challenge_binding_record": _challenge_binding_record,
     }
+    audit_challenge = audit_reconciliation.get("audit_challenge")
+    audit_task_candidate_sha = None
+    if _audit_task_obj is not None:
+        audit_task_candidate_sha = str(
+            (_audit_task_obj.context or {}).get("candidate_sha")
+            or (_audit_task_obj.first_payload or {}).get("candidate_sha")
+            or ""
+        ).strip() or None
+    audit_reconciliation["audit_leg_proof"] = _build_audit_leg_proof(
+        candidate_sha=candidate_sha,
+        audit_task_id=str(audit_task_id) if audit_task_id else None,
+        audit_task_candidate_sha=audit_task_candidate_sha,
+        challenge_task_id=str(challenge_task_id) if challenge_task_id else None,
+        challenged_candidate_sha=(
+            str(audit_challenge.get("challenged_candidate_sha") or "").strip() or None
+            if isinstance(audit_challenge, dict)
+            else None
+        ),
+        binding_expected_count=len(primary_findings),
+        binding_record_count=len(_challenge_binding_record),
+        reconciliation_status=(
+            str(audit_challenge.get("status") or "").strip() or None
+            if isinstance(audit_challenge, dict)
+            else None
+        ),
+        reconciliation_reason=(
+            str(audit_challenge.get("reason") or "").strip() or None
+            if isinstance(audit_challenge, dict)
+            else None
+        ),
+        legacy_advisory_only=bool(audit_challenge_task_id) and not bool(challenge_task_id),
+    )
 
     # --- Deterministic Alembic revision-identity safety gate ----------------
     # A revision-identity collision between the candidate and the deployed

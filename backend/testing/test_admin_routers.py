@@ -9343,7 +9343,23 @@ class TestVersionLifecycleQualificationEvidence:
                 "excluded_audit_findings": [{"severity": "low", "summary": "stale noise"}],
                 "test_erosion_detail": {"deleted_test_files": 1},
                 "smoketest_detail": {"passed": False, "suite": "release"},
-                "audit_reconciliation": {"excluded_findings_count": 1},
+                "audit_reconciliation": {
+                    "excluded_findings_count": 1,
+                    "audit_leg_proof": {
+                        "state": "unproven",
+                        "required": True,
+                        "candidate_sha": "open-sha",
+                        "audit_task_id": "audit-1",
+                        "audit_task_candidate_sha": "open-sha",
+                        "challenge_task_id": "challenge-1",
+                        "challenged_candidate_sha": "wrong-sha",
+                        "binding_expected_count": 1,
+                        "binding_record_count": 0,
+                        "binding_complete": False,
+                        "reconciliation_status": "available",
+                        "reconciliation_reason": "audit_challenge_sha_mismatch",
+                    },
+                },
                 "promotion_pr_url": "https://example.com/pr/open",
                 "promotion_conflict": True,
                 "promotion_error_detail": "merge conflict",
@@ -9366,6 +9382,23 @@ class TestVersionLifecycleQualificationEvidence:
                 "migration_safety": "pass",
                 "migration_safety_detail": "migration dry-run matched",
                 "audit_findings": [{"severity": "low", "summary": "reviewed"}],
+                "audit_reconciliation": {
+                    "excluded_findings_count": 0,
+                    "audit_leg_proof": {
+                        "state": "not_required",
+                        "required": False,
+                        "candidate_sha": "recent-sha",
+                        "audit_task_id": "audit-2",
+                        "audit_task_candidate_sha": "recent-sha",
+                        "challenge_task_id": None,
+                        "challenged_candidate_sha": None,
+                        "binding_expected_count": 0,
+                        "binding_record_count": 0,
+                        "binding_complete": False,
+                        "reconciliation_status": "unavailable",
+                        "reconciliation_reason": "challenge_absent",
+                    },
+                },
                 "promotion_pr_url": "https://example.com/pr/recent",
             },
         )
@@ -9404,6 +9437,21 @@ class TestVersionLifecycleQualificationEvidence:
         assert current["last_qualification"]["excluded_audit_findings"] == [
             {"severity": "low", "summary": "stale noise"}
         ]
+        assert current["last_qualification"]["audit_leg_proof"]["state"] == "unproven"
+        assert current["last_qualification"]["audit_reconciliation"]["audit_leg_proof"] == {
+            "state": "unproven",
+            "required": True,
+            "candidate_sha": "open-sha",
+            "audit_task_id": "audit-1",
+            "audit_task_candidate_sha": "open-sha",
+            "challenge_task_id": "challenge-1",
+            "challenged_candidate_sha": "wrong-sha",
+            "binding_expected_count": 1,
+            "binding_record_count": 0,
+            "binding_complete": False,
+            "reconciliation_status": "available",
+            "reconciliation_reason": "audit_challenge_sha_mismatch",
+        }
         assert current["last_qualification"]["test_erosion_detail"] == {"deleted_test_files": 1}
         assert current["last_qualification"]["smoketest_detail"] == {"passed": False, "suite": "release"}
         assert current["last_qualification"]["promotion_conflict"] is True
@@ -9414,6 +9462,7 @@ class TestVersionLifecycleQualificationEvidence:
         assert recent["last_qualification"]["audit_findings"] == [
             {"severity": "low", "summary": "reviewed"}
         ]
+        assert recent["last_qualification"]["audit_leg_proof"]["state"] == "not_required"
         assert recent["last_qualification"]["promotion_pr_url"] == "https://example.com/pr/recent"
 
 
@@ -10145,7 +10194,23 @@ class TestQualificationVerdictsAuditMissingReason:
             excluded_audit_findings=[{"severity": "low", "summary": "y"}],
             test_erosion_detail={"removed": 3},
             smoketest_detail={"passed": False},
-            audit_reconciliation={"reconciled": True},
+            audit_reconciliation={
+                "reconciled": True,
+                "audit_leg_proof": {
+                    "state": "proven",
+                    "required": True,
+                    "candidate_sha": "blockedsha",
+                    "audit_task_id": "audit-1",
+                    "audit_task_candidate_sha": "blockedsha",
+                    "challenge_task_id": "challenge-1",
+                    "challenged_candidate_sha": "blockedsha",
+                    "binding_expected_count": 1,
+                    "binding_record_count": 1,
+                    "binding_complete": True,
+                    "reconciliation_status": "available",
+                    "reconciliation_reason": None,
+                },
+            },
             promotion_pr_url="https://example.com/pr/1",
             promotion_conflict=True,
             promotion_error_detail="merge conflict",
@@ -10169,6 +10234,7 @@ class TestQualificationVerdictsAuditMissingReason:
         assert v["test_erosion_detail"] == {"removed": 3}
         assert v["smoketest_detail"] == {"passed": False}
         assert v["audit_reconciliation"] == {"reconciled": True}
+        assert v["audit_leg_proof"]["state"] == "proven"
         assert v["promotion_pr_url"] == "https://example.com/pr/1"
         assert v["promotion_conflict"] is True
         assert v["promotion_error_detail"] == "merge conflict"
@@ -14593,3 +14659,70 @@ class TestGetBuildConfigCommands:
         assert data["directories"][0]["path"] == "backend"
         assert data["directories"][0]["detected_test_cmd"] == "pytest"
         assert data["directories"][0]["confirmed_test_cmd"] == "pytest -x"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Improvement-lane pilot flag settings
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestImprovementLaneSettings:
+    """PATCH /api/admin/settings round-trip tests for improvement_lanes_enabled
+    and review_fix_lane_pilot_enabled."""
+
+    @pytest.mark.asyncio
+    async def test_settings_patch_improvement_lane_flags(self, client: AsyncClient):
+        """PATCH both flags true/false; GET confirms round-trip; non-bool is rejected."""
+        # Default: both flags default False in GET response.
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.status_code == 200
+        data = get_resp.json()
+        assert "improvement_lanes_enabled" in data
+        assert "review_fix_lane_pilot_enabled" in data
+
+        # Enable improvement_lanes_enabled.
+        resp = await client.patch(
+            "/api/admin/settings", json={"improvement_lanes_enabled": True}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["improvement_lanes_enabled"] is True
+
+        # Enable review_fix_lane_pilot_enabled.
+        resp = await client.patch(
+            "/api/admin/settings", json={"review_fix_lane_pilot_enabled": True}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["review_fix_lane_pilot_enabled"] is True
+
+        # Disable both in a single PATCH.
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"improvement_lanes_enabled": False, "review_fix_lane_pilot_enabled": False},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        body = get_resp.json()
+        assert body["improvement_lanes_enabled"] is False
+        assert body["review_fix_lane_pilot_enabled"] is False
+
+        # Non-boolean values must be rejected (strings, ints).
+        bad1 = await client.patch(
+            "/api/admin/settings", json={"improvement_lanes_enabled": "true"}
+        )
+        assert bad1.status_code == 400
+
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"review_fix_lane_pilot_enabled": 1}
+        )
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_settings_patch_unknown_key_still_rejected(self, client: AsyncClient):
+        """A typo in a flag name must still be rejected (unknown-key gate intact)."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"improvement_lanes_enabld": True}
+        )
+        assert resp.status_code == 400
+        assert "unknown settings key" in resp.text.lower() or "improvement_lanes_enabld" in resp.text

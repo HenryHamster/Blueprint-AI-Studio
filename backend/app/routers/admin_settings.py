@@ -177,6 +177,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "warm_pool_cross_provider_retarget_enabled",
         "diagnostics_after_edit_holdback_fraction",
         "diagnostics_after_edit_enabled",
+        "improvement_lanes_enabled",
+        "review_fix_lane_pilot_enabled",
     }
 )
 
@@ -446,6 +448,12 @@ async def get_settings(
         ),
         "park_and_retarget_budget_seconds": int(
             _runtime_config.get("park_and_retarget_budget_seconds", 600)
+        ),
+        "improvement_lanes_enabled": bool(
+            _runtime_config.get("improvement_lanes_enabled", False)
+        ),
+        "review_fix_lane_pilot_enabled": bool(
+            _runtime_config.get("review_fix_lane_pilot_enabled", False)
         ),
         "warm_pool_enabled": bool(_runtime_config.get("warm_pool_enabled", False)),
         "warm_pool_account_retarget_enabled": bool(
@@ -1444,6 +1452,22 @@ async def _apply_settings(
                 detail="diagnostics_after_edit_enabled must be a boolean",
             )
         _runtime_config["diagnostics_after_edit_enabled"] = val
+    if "improvement_lanes_enabled" in payload:
+        val = payload["improvement_lanes_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="improvement_lanes_enabled must be a boolean",
+            )
+        _runtime_config["improvement_lanes_enabled"] = val
+    if "review_fix_lane_pilot_enabled" in payload:
+        val = payload["review_fix_lane_pilot_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="review_fix_lane_pilot_enabled must be a boolean",
+            )
+        _runtime_config["review_fix_lane_pilot_enabled"] = val
     if "drift_stall_min_claims" in payload:
         try:
             val = int(payload["drift_stall_min_claims"])

@@ -6634,6 +6634,96 @@ async def test_finalize_dry_run_when_promotion_disabled(db_session, mocker):
     assert version.last_qualification["status"] == "dry_run"
 
 
+def test_audit_leg_proof_state_matrix():
+    """The audit-leg proof snapshot distinguishes proven, unproven, and advisory."""
+    cases = [
+        (
+            "proven",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": "challenge-1",
+                "challenged_candidate_sha": "feed" * 10,
+                "binding_expected_count": 2,
+                "binding_record_count": 2,
+                "reconciliation_status": "available",
+                "reconciliation_reason": None,
+                "legacy_advisory_only": False,
+            },
+        ),
+        (
+            "unproven",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": "challenge-1",
+                "challenged_candidate_sha": "beef" * 10,
+                "binding_expected_count": 2,
+                "binding_record_count": 2,
+                "reconciliation_status": "available",
+                "reconciliation_reason": "audit_challenge_sha_mismatch",
+                "legacy_advisory_only": False,
+            },
+        ),
+        (
+            "unproven",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": "challenge-1",
+                "challenged_candidate_sha": "feed" * 10,
+                "binding_expected_count": 2,
+                "binding_record_count": 1,
+                "reconciliation_status": "available",
+                "reconciliation_reason": None,
+                "legacy_advisory_only": False,
+            },
+        ),
+        (
+            "not_required",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": None,
+                "challenged_candidate_sha": None,
+                "binding_expected_count": 0,
+                "binding_record_count": 0,
+                "reconciliation_status": "unavailable",
+                "reconciliation_reason": "challenge_absent",
+                "legacy_advisory_only": False,
+            },
+        ),
+        (
+            "not_required",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": None,
+                "challenged_candidate_sha": None,
+                "binding_expected_count": 1,
+                "binding_record_count": 0,
+                "reconciliation_status": "unavailable",
+                "reconciliation_reason": "challenge_absent",
+                "legacy_advisory_only": True,
+            },
+        ),
+    ]
+
+    for expected_state, kwargs in cases:
+        proof = rq._build_audit_leg_proof(**kwargs)
+        assert proof["state"] == expected_state
+        assert proof["required"] is (expected_state == "proven")
+        assert proof["candidate_sha"] == kwargs["candidate_sha"]
+        assert proof["audit_task_id"] == kwargs["audit_task_id"]
+        assert proof["binding_expected_count"] == kwargs["binding_expected_count"]
+        assert proof["binding_record_count"] == kwargs["binding_record_count"]
+
+
 @pytest.mark.asyncio
 async def test_finalize_persists_advisory_audit_challenge_synthesis(
     db_session, mocker
@@ -6707,6 +6797,11 @@ async def test_finalize_persists_advisory_audit_challenge_synthesis(
     assert synthesis["status"] == "unavailable"
     assert synthesis["reason"] == "challenge_absent"
     assert synthesis["binding"] is True
+    proof = version.last_qualification["audit_reconciliation"]["audit_leg_proof"]
+    assert proof["state"] == "not_required"
+    assert proof["required"] is False
+    assert proof["binding_expected_count"] == 1
+    assert proof["binding_record_count"] == 0
 
     verdict = (
         (
@@ -6721,6 +6816,7 @@ async def test_finalize_persists_advisory_audit_challenge_synthesis(
     )
     assert verdict.terminal_status == "dry_run"
     assert verdict.audit_reconciliation["audit_challenge"] == synthesis
+    assert verdict.audit_reconciliation["audit_leg_proof"] == proof
 
 
 @pytest.mark.asyncio
@@ -6823,7 +6919,14 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
         version,
         audit_logs={
             "audit_score": 1.0,
-            "findings": [],
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Binding proof finding.",
+                    "file": "backend/app/release_qualifier.py",
+                    "verification_note": "confirmed in the binding test path",
+                }
+            ],
             "test_erosion": {
                 "deleted_test_files": [],
                 "assertion_delta": 0,
@@ -6834,6 +6937,8 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
         challenge_verdicts=[
             {
                 "verdict": "confirmed",
+                "summary": "Binding proof finding.",
+                "severity": "high",
             }
         ],
     )
@@ -6851,6 +6956,10 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
     assert synthesis["binding"] is True
     assert synthesis["challenged_candidate_sha"] == _candidate_sha
     assert synthesis["confirmed_count"] >= 1
+    proof = version.last_qualification["audit_reconciliation"]["audit_leg_proof"]
+    assert proof["state"] == "proven"
+    assert proof["required"] is True
+    assert proof["challenged_candidate_sha"] == _candidate_sha
 
     # The verdict row should also land in the 'challenged' telemetry cohort.
     verdict = (
@@ -6865,6 +6974,7 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
         .one()
     )
     assert verdict.audit_reconciliation["audit_challenge"]["status"] == "available"
+    assert verdict.audit_reconciliation["audit_leg_proof"] == proof
 
     verdict_dict = {
         "candidate_sha": verdict.candidate_sha,
@@ -16325,6 +16435,7 @@ class TestFormatQualificationForApi:
         assert out["finalized_at"] is None
         assert out["migration_safety"] is None
         assert out["audit_findings"] is None
+        assert out["audit_leg_proof"] is None
         assert out["promotion_conflict"] is None
 
     def test_all_fields_passed_through(self):
@@ -16344,7 +16455,23 @@ class TestFormatQualificationForApi:
             "excluded_audit_findings": [{"severity": "low", "summary": "ignored"}],
             "test_erosion_detail": {"deleted_test_files": 1},
             "smoketest_detail": {"passed": False},
-            "audit_reconciliation": {"excluded_findings_count": 1},
+            "audit_reconciliation": {
+                "excluded_findings_count": 1,
+                "audit_leg_proof": {
+                    "state": "proven",
+                    "required": True,
+                    "candidate_sha": "feed" * 10,
+                    "audit_task_id": "audit-1",
+                    "audit_task_candidate_sha": "feed" * 10,
+                    "challenge_task_id": "challenge-1",
+                    "challenged_candidate_sha": "feed" * 10,
+                    "binding_expected_count": 1,
+                    "binding_record_count": 1,
+                    "binding_complete": True,
+                    "reconciliation_status": "available",
+                    "reconciliation_reason": None,
+                },
+            },
             "promotion_pr_url": "https://example.com/pr/123",
             "promotion_conflict": True,
             "promotion_error_detail": "merge conflict",
@@ -16365,6 +16492,7 @@ class TestFormatQualificationForApi:
         assert out["test_erosion_detail"] == {"deleted_test_files": 1}
         assert out["smoketest_detail"] == {"passed": False}
         assert out["audit_reconciliation"] == {"excluded_findings_count": 1}
+        assert out["audit_leg_proof"] == qual["audit_reconciliation"]["audit_leg_proof"]
         assert out["promotion_pr_url"] == "https://example.com/pr/123"
         assert out["promotion_conflict"] is True
         assert out["promotion_error_detail"] == "merge conflict"
@@ -20677,7 +20805,23 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         excluded_audit_findings=[{"severity": "low", "summary": "y"}],
         test_erosion_detail={"removed": 2},
         smoketest_detail={"passed": False},
-        audit_reconciliation={"reconciled": True},
+        audit_reconciliation={
+            "reconciled": True,
+            "audit_leg_proof": {
+                "state": "proven",
+                "required": True,
+                "candidate_sha": "abc123",
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "abc123",
+                "challenge_task_id": "challenge-1",
+                "challenged_candidate_sha": "abc123",
+                "binding_expected_count": 1,
+                "binding_record_count": 1,
+                "binding_complete": True,
+                "reconciliation_status": "available",
+                "reconciliation_reason": None,
+            },
+        },
         promotion_pr_url="https://example.com/pr/7",
         promotion_conflict=True,
         promotion_error_detail="merge conflict",
@@ -20699,6 +20843,7 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     assert out["test_erosion_detail"] == {"removed": 2}
     assert out["smoketest_detail"] == {"passed": False}
     assert out["audit_reconciliation"] == {"reconciled": True}
+    assert out["audit_leg_proof"]["state"] == "proven"
     assert out["promotion_pr_url"] == "https://example.com/pr/7"
     assert out["promotion_conflict"] is True
     assert out["promotion_error_detail"] == "merge conflict"

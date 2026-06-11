@@ -273,6 +273,13 @@ def _annotate_regime(out: dict[str, Any], promotion_enabled: bool) -> dict[str, 
 def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
     """Return an operator-facing summary of a ``last_qualification`` record."""
     status = qual.get("status")
+    _recon = qual.get("audit_reconciliation")
+    _audit_leg_proof = _recon.get("audit_leg_proof") if isinstance(_recon, dict) else None
+    _recon_out = (
+        {k: v for k, v in _recon.items() if k != "audit_leg_proof"}
+        if isinstance(_recon, dict)
+        else _recon
+    )
     return {
         "status": status,
         "outcome": _OUTCOME_LABELS.get(status, status),
@@ -294,7 +301,8 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "challenger_refuted_audit_findings": qual.get("challenger_refuted_audit_findings"),
         "test_erosion_detail": qual.get("test_erosion_detail"),
         "smoketest_detail": qual.get("smoketest_detail"),
-        "audit_reconciliation": qual.get("audit_reconciliation"),
+        "audit_reconciliation": _recon_out,
+        "audit_leg_proof": _audit_leg_proof,
         "promotion_pr_url": qual.get("promotion_pr_url"),
         "promotion_conflict": qual.get("promotion_conflict"),
         "promotion_error_detail": qual.get("promotion_error_detail"),
@@ -323,6 +331,15 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         acceptance_aggregate = sub_scores.get("acceptance_aggregate")
     if acceptance_aggregate is None:
         acceptance_aggregate = getattr(verdict, "acceptance_aggregate", None)
+    _vrecon = verdict.audit_reconciliation
+    _v_audit_leg_proof = (
+        _vrecon.get("audit_leg_proof") if isinstance(_vrecon, dict) else None
+    )
+    _vrecon_out = (
+        {k: v for k, v in _vrecon.items() if k != "audit_leg_proof"}
+        if isinstance(_vrecon, dict)
+        else _vrecon
+    )
     return {
         "id": str(verdict.id),
         "release_version_id": str(verdict.release_version_id),
@@ -362,7 +379,8 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "challenger_refuted_audit_findings": verdict.challenger_refuted_audit_findings,
         "test_erosion_detail": verdict.test_erosion_detail,
         "smoketest_detail": verdict.smoketest_detail,
-        "audit_reconciliation": verdict.audit_reconciliation,
+        "audit_reconciliation": _vrecon_out,
+        "audit_leg_proof": _v_audit_leg_proof,
         "promotion_pr_url": verdict.promotion_pr_url,
         "promotion_conflict": verdict.promotion_conflict,
         "promotion_error_detail": verdict.promotion_error_detail,
