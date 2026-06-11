@@ -1423,9 +1423,16 @@ async def get_global_diagnostics(
     # Fetch project remediation state once so the aggregate can surface
     # needs_manual_intervention directions even for projects with no active tasks.
     # Skip projects with no directions — they can never contribute remediation entries.
+    # Narrow the scan to relevant projects before the .limit(500) cap so stale
+    # rows don't crowd out active ones. Project has no updated_at/activity
+    # timestamp, so archived-state is the available relevance signal: archived
+    # projects are inactive and never contribute live remediation entries.
     projects_result = await session.execute(
         select(Project)
-        .where(func.coalesce(func.jsonb_array_length(Project.directions), 0) > 0)
+        .where(
+            func.coalesce(func.jsonb_array_length(Project.directions), 0) > 0,
+            Project.not_archived(),
+        )
         .options(load_only(Project.id, Project.directions))
         .limit(500)
     )

@@ -6187,6 +6187,56 @@ async def test_cycle_halt_alert_posted_exactly_once(
 
 
 @pytest.mark.asyncio
+async def test_post_reaper_halt_alert_bulk_inserts_one_per_project(reaper_db):
+    """_post_reaper_halt_alert bulk-inserts exactly one ERROR alert per project
+    in a single round-trip (no per-project ORM add())."""
+    from app.reaper import _post_reaper_halt_alert
+
+    for i in range(3):
+        reaper_db.add(Project(name=f"halt-proj-{i}", user_id="u"))
+    await reaper_db.commit()
+
+    await _post_reaper_halt_alert(crash_count=4, last_error="boom")
+
+    alerts = (await reaper_db.execute(select(Alert))).scalars().all()
+    assert len(alerts) == 3
+    assert all(a.severity == AlertSeverity.ERROR for a in alerts)
+    assert all(a.title == "Reaper service HALTED after crash-loop" for a in alerts)
+    assert all("crash-looped 4x" in a.message for a in alerts)
+    # One alert per distinct project — no duplicates, none dropped.
+    assert len({a.project_id for a in alerts}) == 3
+
+
+@pytest.mark.asyncio
+async def test_post_reaper_recovery_alert_bulk_inserts_one_per_project(reaper_db):
+    """_post_reaper_recovery_alert bulk-inserts exactly one INFO alert per project."""
+    from app.reaper import _post_reaper_recovery_alert
+
+    for i in range(3):
+        reaper_db.add(Project(name=f"recover-proj-{i}", user_id="u"))
+    await reaper_db.commit()
+
+    await _post_reaper_recovery_alert(probe_failures=2)
+
+    alerts = (await reaper_db.execute(select(Alert))).scalars().all()
+    assert len(alerts) == 3
+    assert all(a.severity == AlertSeverity.INFO for a in alerts)
+    assert all(a.title == "Reaper service recovered autonomously" for a in alerts)
+    assert len({a.project_id for a in alerts}) == 3
+
+
+@pytest.mark.asyncio
+async def test_post_reaper_halt_alert_no_projects_is_noop(reaper_db):
+    """With no projects the early return avoids issuing an empty bulk INSERT."""
+    from app.reaper import _post_reaper_halt_alert
+
+    await _post_reaper_halt_alert(crash_count=1, last_error="x")
+
+    alerts = (await reaper_db.execute(select(Alert))).scalars().all()
+    assert alerts == []
+
+
+@pytest.mark.asyncio
 async def test_per_task_crash_does_not_trigger_cycle_halt(
     reaper_db,
     stop_after_one_cycle,

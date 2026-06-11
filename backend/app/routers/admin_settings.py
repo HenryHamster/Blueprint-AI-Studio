@@ -3099,16 +3099,23 @@ async def repair_state(
         .all()
     )
 
-    for parent in evaluating_tasks:
-        children = (
+    parent_ids = [p.id for p in evaluating_tasks]
+    children_by_parent: dict = {}
+    if parent_ids:
+        all_children = (
             (
                 await session.execute(
-                    select(Task).where(Task.parent_task_id == parent.id)
+                    select(Task).where(Task.parent_task_id.in_(parent_ids))
                 )
             )
             .scalars()
             .all()
         )
+        for child in all_children:
+            children_by_parent.setdefault(child.parent_task_id, []).append(child)
+
+    for parent in evaluating_tasks:
+        children = children_by_parent.get(parent.id, [])
 
         if not children:
             continue
