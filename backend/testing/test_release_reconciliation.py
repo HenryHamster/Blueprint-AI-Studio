@@ -1328,6 +1328,7 @@ from app.release_artifacts import (  # noqa: E402
     BACKEND_REVISION_ARTIFACT_KIND,
     PROMOTION_MERGE_ARTIFACT_KIND,
     ReleaseArtifactProvider,
+    SUPERSEDED_BY_DESCENDANT_REASON,
     _previously_deployed_sha,
     aggregate_required_artifact_status,
     get_or_create_release_deploy_artifact,
@@ -2842,6 +2843,343 @@ async def test_recover_skips_beyond_recovery_window(db_session):
     await db_session.refresh(version)
     assert version.serving_status == "deploy_failed"
     assert version.served_sha is None
+
+
+# ===========================================================================
+# Supersession by a descendant — sha_mismatch vs a legitimately advanced branch.
+#
+# The classifier's exact current_sha == promoted_sha match falsely latches
+# deploy_failed/sha_mismatch when main legitimately advances PAST the promoted
+# commit before confirmation resolves (the real v9 incident: the promoted merge
+# SHA verifiably served, then a DESCENDANT commit containing it deployed before
+# the sweep first checked).  On the sha_mismatch path only, the backend
+# provider asks GitHub (compare API: base = promoted SHA, head = observed live
+# SHA) whether the promoted commit is an ancestor of what is serving:
+# descendant → serving_confirmed with the OBSERVED SHA + the distinct
+# superseded_by_descendant reason; diverged/unrelated or ANY GitHub failure →
+# today's deploy_failed/sha_mismatch exactly.
+# ===========================================================================
+
+
+async def _backend_artifact_for(db_session, version):
+    return (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirm_supersession_by_descendant_resolves_serving_confirmed(
+    db_session, mocker
+):
+    """A STABLE revision serving a DESCENDANT of the promoted SHA is a succeeded,
+    superseded deploy — serving_confirmed with the OBSERVED live SHA (never the
+    promoted SHA echoed) and the distinct superseded_by_descendant reason; no
+    deploy-failed ERROR alert."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # The live revision serves a different SHA that CONTAINS the promoted commit.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    # The served SHA is the OBSERVED live SHA — never the promoted SHA.
+    assert version.served_sha == _SHA_B
+    assert version.served_at is not None
+    assert version.deploy_failure_reason is None
+
+    # Ancestry was asked exactly once: base = promoted SHA, head = observed SHA.
+    is_ancestor.assert_awaited_once_with(
+        "tok",
+        "acme",
+        "widget",
+        _SHA_A,
+        _SHA_B,
+        project_id=str(version.project_id),
+    )
+
+    artifact = await _backend_artifact_for(db_session, version)
+    assert artifact.serving_status == "serving_confirmed"
+    assert artifact.served_identifier == _SHA_B
+    assert artifact.reason_code == SUPERSEDED_BY_DESCENDANT_REASON
+
+    # No loud deploy-failed ERROR alert for a deploy that succeeded.
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [a for a in alerts if "deploy FAILED" in a.title] == []
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_confirm_diverged_sha_stays_deploy_failed_sha_mismatch(
+    db_session, mocker
+):
+    """A live SHA that does NOT contain the promoted commit (diverged / behind /
+    unrelated) keeps today's deploy_failed/sha_mismatch exactly, alert included."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "sha_mismatch"
+    assert version.served_sha is None
+
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == version.project_id,
+                    Alert.severity == AlertSeverity.ERROR,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any("deploy FAILED" in a.title for a in alerts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ancestry_failure", ["raises", "indeterminate", "no_credentials"]
+)
+async def test_confirm_github_failure_falls_back_to_sha_mismatch(
+    db_session, mocker, ancestry_failure
+):
+    """Any GitHub/compare failure on the supersession check fails toward existing
+    semantics: deploy_failed/sha_mismatch, never a silent confirmation."""
+    if ancestry_failure == "raises":
+        mocker.patch(
+            "app.github.is_ancestor_of",
+            new=AsyncMock(side_effect=RuntimeError("github exploded")),
+        )
+    elif ancestry_failure == "indeterminate":
+        mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=None))
+    else:  # no_credentials — the compare API must never even be attempted.
+        mocker.patch(
+            "app.release_promotion._resolve_github_with_session",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.github.is_ancestor_of",
+            new=AsyncMock(side_effect=AssertionError("must not be called")),
+        )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "sha_mismatch"
+    assert version.served_sha is None
+
+
+@pytest.mark.asyncio
+async def test_recover_latched_sha_mismatch_when_live_sha_is_descendant(
+    db_session, mocker
+):
+    """The v9 self-heal: a version already LATCHED deploy_failed/sha_mismatch
+    recovers to serving_confirmed within the recovery window once the live SHA is
+    recognized as a descendant — served SHA = observed SHA, the distinct
+    superseded_by_descendant reason survives recovery, the open ERROR alert is
+    dismissed, and the verdict outcome flips."""
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    deadline = promoted_at + timedelta(hours=1)
+    alerted_at = promoted_at + timedelta(hours=1)  # within the 24h recovery window
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+        deploy_failure_reason="sha_mismatch",
+    )
+    # The live revision serves a DESCENDANT of the promoted SHA.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=now - timedelta(minutes=10),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_B
+    assert version.served_at is not None
+    assert version.deploy_failure_reason is None
+
+    artifact = await _backend_artifact_for(db_session, version)
+    assert artifact.serving_status == "serving_confirmed"
+    assert artifact.served_identifier == _SHA_B
+    assert artifact.reason_code == SUPERSEDED_BY_DESCENDANT_REASON
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is not None
+
+    # The strategist is woken so the crisis directive recomputes.
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is True
+    marker = project.vision["_strategic_refresh"]
+    assert str(marker.get("reason", "")) == "promotion_deploy_recovered"
+
+
+@pytest.mark.asyncio
+async def test_recover_latched_sha_mismatch_stays_failed_when_diverged(
+    db_session, mocker
+):
+    """A latched sha_mismatch whose live SHA does NOT contain the promoted commit
+    stays deploy_failed through the recovery sweep: alert untouched, no refresh."""
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    deadline = promoted_at + timedelta(hours=1)
+    alerted_at = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+        deploy_failure_reason="sha_mismatch",
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=now - timedelta(minutes=10),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is False
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "sha_mismatch"
+    assert version.served_sha is None
+
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is None
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
 
 
 # ===========================================================================

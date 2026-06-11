@@ -1361,6 +1361,8 @@ async def _recover_serving_confirmed(
     served_sha: str,
     served_at: datetime | None,
     now: datetime,
+    *,
+    confirmed_reason_code: str | None = None,
 ) -> None:
     """Flip a deploy_failed version back to serving_confirmed and clear surfaces.
 
@@ -1378,6 +1380,11 @@ async def _recover_serving_confirmed(
       * arms a coalescing strategic refresh so the crisis directive recomputes
         against the now-true serving_confirmed state this cycle.
 
+    ``confirmed_reason_code`` optionally annotates the confirmed backend artifact
+    (e.g. ``superseded_by_descendant`` when the recovery re-check resolved a
+    latched sha_mismatch as supersession); left ``None`` the confirmation clears
+    the artifact reason code, exactly as before.
+
     Runs entirely on the caller's already-locked session; does NOT commit (the
     caller commits under the SAME per-version row lock).
     """
@@ -1389,7 +1396,7 @@ async def _recover_serving_confirmed(
     )
     apply_serving_decision(
         backend_artifact,
-        ("serving_confirmed", served_sha, served_at),
+        ("serving_confirmed", served_sha, served_at, confirmed_reason_code),
         now=now,
     )
     session.add(backend_artifact)
@@ -1531,6 +1538,10 @@ async def _reconcile_if_deploy_failed_recovered(
                 backend_artifact.served_identifier,
                 backend_artifact.served_at,
                 _now,
+                # Preserve a supersession annotation set by the provider
+                # re-check (a latched sha_mismatch resolved as
+                # superseded_by_descendant); None for ordinary recoveries.
+                confirmed_reason_code=backend_artifact.reason_code,
             )
             await session.commit()
             logger.info(

@@ -28,7 +28,20 @@ BACKEND_REVISION_ARTIFACT_KIND = "backend_revision"
 AGENT_IMAGE_ARTIFACT_KIND = "agent_image"
 PROMOTION_MERGE_ARTIFACT_KIND = "promotion_merge"
 
-ServingDecision = tuple[str, str | None, datetime | None]
+# Distinct reason for a serving_confirmed resolution where the OBSERVED live SHA
+# is a strict DESCENDANT of the promoted SHA: the target branch legitimately
+# advanced past the promoted commit before confirmation resolved.  The promoted
+# code IS serving (contained in what is live) — supersession, not a failure.
+SUPERSEDED_BY_DESCENDANT_REASON = "superseded_by_descendant"
+
+# A serving decision is ``(status, identifier_or_reason, served_at)``.  An
+# OPTIONAL trailing fourth element carries a ``reason_code`` annotation for
+# CONFIRMED decisions (e.g. ``superseded_by_descendant``); 3-tuple confirmed
+# decisions keep the historical behavior of clearing the reason code.
+ServingDecision = (
+    tuple[str, str | None, datetime | None]
+    | tuple[str, str | None, datetime | None, str | None]
+)
 ServingCheck = Callable[
     [AsyncSession, ReleaseVersion, ReleaseDeployArtifact, datetime],
     Awaitable[ServingDecision | None],
@@ -157,7 +170,11 @@ def apply_serving_decision(
 ) -> bool:
     """Persist a provider decision onto an artifact row."""
 
-    status, identity_or_reason, served_at = decision
+    status, identity_or_reason, served_at = decision[0], decision[1], decision[2]
+    # Optional trailing reason_code for CONFIRMED decisions (e.g.
+    # ``superseded_by_descendant``).  Absent (the 3-tuple shape every
+    # pre-existing decision uses) a confirmation clears the reason code.
+    confirmed_reason = decision[3] if len(decision) > 3 else None
     changed = False
 
     if artifact.serving_status != status:
@@ -172,8 +189,8 @@ def apply_serving_decision(
         if artifact.served_at != new_served_at:
             artifact.served_at = new_served_at
             changed = True
-        if artifact.reason_code is not None:
-            artifact.reason_code = None
+        if artifact.reason_code != confirmed_reason:
+            artifact.reason_code = confirmed_reason
             changed = True
         return changed
 
@@ -519,6 +536,114 @@ async def get_or_create_release_deploy_artifact(
     return artifact, created
 
 
+async def _reclassify_sha_mismatch_if_superseded(
+    session: AsyncSession,
+    version: ReleaseVersion,
+    ds: DeploymentState | None,
+    decision: ServingDecision | None,
+    now: datetime,
+) -> ServingDecision | None:
+    """Treat supersession-by-descendant as serving-confirmed, not sha_mismatch.
+
+    ``_classify_serving_outcome`` does an exact ``current_sha == promoted_sha``
+    match, so a promotion whose target branch legitimately advanced PAST the
+    promoted commit before the sweep first observed the live SHA classifies as
+    ``deploy_failed``/``sha_mismatch`` — a false deploy failure (the real v9
+    incident: the promoted merge SHA verifiably served, then a DESCENDANT commit
+    containing it deployed before the confirmation sweep first checked).
+
+    On (and only on) the rare ``sha_mismatch`` path, ask GitHub — via the compare
+    API (base = promoted SHA, head = observed live SHA) through the same
+    credential pattern as the ``promotion_merge`` provider — whether the promoted
+    commit is an ancestor of what is serving:
+
+      * descendant (head strictly contains the promoted commit) → the deploy
+        SUCCEEDED and was superseded: resolve ``serving_confirmed`` with the
+        OBSERVED live SHA as the served identifier (never the promoted SHA) and
+        the distinct ``superseded_by_descendant`` reason code;
+      * diverged / behind / unrelated → keep ``deploy_failed``/``sha_mismatch``
+        exactly as today;
+      * any credential/API failure → fall back to the current behavior
+        (``deploy_failed``/``sha_mismatch``) with a warning — fail toward
+        existing semantics, never silently confirm.
+
+    The classifier itself stays PURE (no I/O); this consumer-layer hook owns the
+    one extra GitHub call.  Lazy imports avoid a load-time cycle
+    (``release_reconciliation`` imports this module).
+    """
+    if (
+        decision is None
+        or decision[0] != "deploy_failed"
+        or decision[1] != "sha_mismatch"
+    ):
+        return decision
+
+    from app import github
+    from app.release_promotion import _resolve_github_with_session
+    from app.release_reconciliation import _to_naive_utc
+
+    promoted_sha = version.promoted_sha
+    observed_sha = (ds.current_sha or None) if ds is not None else None
+    if not promoted_sha or not observed_sha:
+        return decision
+    project = await session.get(Project, version.project_id)
+    if project is None:
+        return decision
+
+    try:
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            logger.warning(
+                "[RELEASE_ARTIFACTS] sha_mismatch supersession check for v%s: "
+                "no GitHub credentials — keeping deploy_failed/sha_mismatch",
+                getattr(version, "version_number", "?"),
+            )
+            return decision
+        token, owner, repo = resolved
+        ancestry = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            promoted_sha,
+            observed_sha,
+            project_id=str(version.project_id),
+        )
+    except Exception as exc:  # noqa: BLE001 — fall back to existing semantics
+        logger.warning(
+            "[RELEASE_ARTIFACTS] sha_mismatch supersession check for v%s raised "
+            "(%s) — keeping deploy_failed/sha_mismatch",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+        return decision
+    if ancestry is not True:
+        if ancestry is None:
+            logger.warning(
+                "[RELEASE_ARTIFACTS] sha_mismatch supersession check for v%s: "
+                "ancestry indeterminate (compare API failed) — keeping "
+                "deploy_failed/sha_mismatch",
+                getattr(version, "version_number", "?"),
+            )
+        return decision
+
+    served_at = _to_naive_utc(ds.deployed_at) if ds is not None else None
+    logger.info(
+        "[RELEASE_ARTIFACTS] promoted v%s SHA %s is an ancestor of the observed "
+        "live SHA %s — the deploy succeeded and was superseded by a descendant; "
+        "resolving serving_confirmed (%s), not deploy_failed/sha_mismatch",
+        getattr(version, "version_number", "?"),
+        (promoted_sha or "")[:12],
+        (observed_sha or "")[:12],
+        SUPERSEDED_BY_DESCENDANT_REASON,
+    )
+    return (
+        "serving_confirmed",
+        observed_sha,
+        served_at,
+        SUPERSEDED_BY_DESCENDANT_REASON,
+    )
+
+
 async def _check_backend_revision_serving(
     session: AsyncSession,
     version: ReleaseVersion,
@@ -530,12 +655,21 @@ async def _check_backend_revision_serving(
     from app.release_reconciliation import _classify_serving_outcome
 
     ds = await session.get(DeploymentState, 1)
-    return _classify_serving_outcome(
+    decision = _classify_serving_outcome(
         ds,
         version.promoted_at,
         version.promoted_sha,
         artifact.confirmation_deadline or version.deploy_confirm_deadline,
         now,
+    )
+    # A sha_mismatch may be SUPERSESSION (main advanced past the promoted commit
+    # before confirmation resolved) rather than a failed deploy — distinguish via
+    # one GitHub ancestry call on this rare path only.  Both the initial
+    # confirmation sweep and the deploy-failed recovery re-check consume the
+    # classifier through this provider, so a falsely-latched version self-heals
+    # within its recovery window.
+    return await _reclassify_sha_mismatch_if_superseded(
+        session, version, ds, decision, now
     )
 
 
