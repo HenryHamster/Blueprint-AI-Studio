@@ -20,6 +20,7 @@ from app.models import (
     DeploymentStatus,
     Project,
     QualificationVerdict,
+    ReleaseDeployArtifact,
 )
 from app.deploy_identity import deploy_repo_identity
 from app.release_artifacts import (
@@ -29,6 +30,7 @@ from app.release_artifacts import (
     artifact_is_unconfirmed,
     get_or_create_release_deploy_artifact,
     is_backend_revision_artifact,
+    iter_release_artifact_providers,
     observable_release_artifact_providers,
     project_backend_revision_artifact,
     summarize_release_artifacts,
@@ -115,6 +117,7 @@ async def _refresh_release_artifact_rows(
     project = await session.get(Project, version.project_id)
     deploy_identity = deploy_repo_identity()
 
+    observable_kinds: set[str] = set()
     for provider in observable_release_artifact_providers(project, deploy_identity):
         artifact, created = await get_or_create_release_deploy_artifact(
             session,
@@ -139,8 +142,64 @@ async def _refresh_release_artifact_rows(
                     mutated = True
                 session.add(artifact)
         provider_rows.append((provider, artifact))
+        observable_kinds.add(provider.artifact_kind)
         if is_backend_revision_artifact(provider.artifact_kind):
             backend_artifact = artifact
+
+    # Also resolve any existing REQUIRED artifact rows whose provider is NOT
+    # currently observable for this project.  Such rows were armed when the
+    # deploy identity matched (or by a prior code version) but can never
+    # self-confirm now.  Time them out at their confirmation_deadline with
+    # reason_code="provider_unobservable" so the sweep aggregate and
+    # summarize_release_artifacts converge and no armed row can outlive
+    # resolution.  Within the deadline, count them as unconfirmed so the sweep
+    # re-evaluates on each tick (the identity may be restored before deadline).
+    all_required_provider_map = {
+        p.artifact_kind: p
+        for p in iter_release_artifact_providers()
+        if p.required
+    }
+    unobservable_required_kinds = set(all_required_provider_map) - observable_kinds
+    if unobservable_required_kinds:
+        existing_unobservable_rows = (
+            (
+                await session.execute(
+                    select(ReleaseDeployArtifact).where(
+                        ReleaseDeployArtifact.version_id == version.id,
+                        ReleaseDeployArtifact.artifact_kind.in_(
+                            unobservable_required_kinds
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        _now_naive = _to_naive_utc(now) or now
+        for artifact in existing_unobservable_rows:
+            provider = all_required_provider_map[artifact.artifact_kind]
+            if not artifact_is_unconfirmed(artifact):
+                # Already resolved — include in provider_rows for aggregate.
+                provider_rows.append((provider, artifact))
+                continue
+            # Unconfirmed unobservable required row: record it as having been
+            # unconfirmed so _confirm_serving_or_fail proceeds to compute the
+            # aggregate (rather than bailing at the had_required_unconfirmed
+            # guard), then resolve or leave it depending on the deadline.
+            had_required_unconfirmed = True
+            artifact_deadline = _to_naive_utc(
+                artifact.confirmation_deadline or version.deploy_confirm_deadline
+            )
+            if artifact_deadline is not None and _now_naive >= artifact_deadline:
+                # Past deadline: resolve with provider_unobservable so the row
+                # is no longer pending and the aggregate can converge.
+                decision: tuple = ("confirmation_timed_out", "provider_unobservable", None)
+                if apply_serving_decision(artifact, decision, now=now):
+                    mutated = True
+                session.add(artifact)
+            # Within deadline: count as unconfirmed (identity may be restored
+            # before the window expires); had_required_unconfirmed already set.
+            provider_rows.append((provider, artifact))
 
     return provider_rows, had_required_unconfirmed, mutated, backend_artifact
 
@@ -1035,21 +1094,33 @@ def _classify_serving_outcome(
         ):
             return ("deploy_failed", "rolled_back", None)
 
-        # SERVING CONFIRMED: a new revision booted after the promotion and the
-        # monitoring window passed (STABLE).  Confirm ONLY when the live serving
-        # SHA was INDEPENDENTLY observed AND matches the promoted SHA — never
-        # echo the promoted (merged) SHA as a stand-in.  When the serving SHA is
-        # unobservable, do NOT confirm: keep waiting within the window, and let
-        # the deadline land a distinct ``serving_sha_unobservable`` failure.
-        if status == DeploymentStatus.STABLE and revision_after_promotion:
+        # SERVING CONFIRMED: the deployment is STABLE and the live serving SHA
+        # independently matches the promoted SHA.  A pre-promotion revision
+        # CANNOT serve the promoted merge SHA (that SHA did not exist before
+        # the promotion commit), so an exact SHA match is positive evidence
+        # regardless of deployed_at/promoted_at ordering.  The race case where
+        # the Cloud Run revision booted before the orchestrator finished
+        # recording promoted_at (deployed_at <= promoted_at) is safe to
+        # confirm: the matched SHA proves this is the right revision.
+        #
+        # SHA-mismatch and serving_sha_unobservable still require
+        # revision_after_promotion to guard against a stale pre-promotion
+        # revision that happens to be running a different SHA — in that case
+        # we just wait, we do not fail the deploy.
+        if status == DeploymentStatus.STABLE:
             current_sha = ds.current_sha or None
             if current_sha and promoted_sha:
                 if current_sha == promoted_sha:
                     return ("serving_confirmed", current_sha, deployed_at)
-                return ("deploy_failed", "sha_mismatch", None)
-            # New revision is STABLE but the live serving SHA (or the promoted
-            # SHA to match it against) cannot be observed — not confirmable.
-            serving_sha_unobservable = True
+                # SHA mismatch is a hard failure only for a revision that
+                # booted AFTER the promotion was stamped — a pre-promotion
+                # revision still running a different SHA is just "waiting".
+                if revision_after_promotion:
+                    return ("deploy_failed", "sha_mismatch", None)
+            elif revision_after_promotion:
+                # New revision booted after promotion but serving SHA is
+                # unobservable (Cloud Run lookup degraded) — not confirmable.
+                serving_sha_unobservable = True
 
     # No confirmation yet — once the bounded window elapses this is a TIMEOUT,
     # not an active failure: nothing observed the deploy going bad, the promoted

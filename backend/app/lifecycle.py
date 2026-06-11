@@ -230,6 +230,35 @@ async def _leader_lock_keepalive_tick(leader_session) -> str:
     return "reacquired" if reacquired else "lost"
 
 
+def _log_startup_deploy_identity() -> None:
+    """Emit startup observability for the deploy-level identity.
+
+    Logs INFO when resolved (deploy-level serving confirmation is active) and
+    WARNING when unresolved (only merge-level confirmation is active).  Extracted
+    so tests can exercise both branches without invoking the full startup sequence.
+    """
+    from app.deploy_identity import deploy_repo_identity as _deploy_repo_identity
+
+    identity = _deploy_repo_identity()
+    if identity is None:
+        logger.warning(
+            "[STARTUP] deploy_repo_identity is UNRESOLVED — neither "
+            "DEPLOY_REPO_IDENTITY env var nor runtime_config['deploy_repo_identity'] "
+            "is set.  Deploy-level serving confirmation (backend_revision, "
+            "agent_image) is DISABLED for all projects; only merge-level "
+            "confirmation (promotion_merge) is active.  Set "
+            "runtime_config['deploy_repo_identity'] via PATCH /api/admin/settings "
+            "to enable deploy-level confirmation."
+        )
+    else:
+        logger.info(
+            "[STARTUP] deploy_repo_identity resolved to %s/%s — deploy-level "
+            "serving confirmation active for matching projects.",
+            identity[0],
+            identity[1],
+        )
+
+
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan context manager — startup and shutdown hooks."""
@@ -309,6 +338,14 @@ async def lifespan(app):
 
     # Check deployment state (detect new deploy, rollback, or normal restart)
     await _init_deployment_state()
+
+    # Log the resolved deploy-level identity so operators can confirm that
+    # deploy-level serving confirmation (backend_revision, agent_image) is
+    # active.  When unresolved, all promotions fall back to merge-level
+    # confirmation only (promotion_merge); this WARNING surfaces the gap so
+    # operators know to set runtime_config['deploy_repo_identity'] via
+    # PATCH /api/admin/settings.
+    _log_startup_deploy_identity()
 
     # --- Leader election via pg_try_advisory_lock (session-scoped) ---
     # Only one Cloud Run instance should run the leader-only background services.

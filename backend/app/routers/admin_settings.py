@@ -20,6 +20,7 @@ from datetime import timedelta
 from sqlalchemy.orm import aliased
 
 from app.database import get_session
+from app.deploy_identity import deploy_repo_identity as _deploy_repo_identity
 from app.url_security import _is_safe_external_url
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
 from app.models import (
@@ -336,6 +337,16 @@ async def get_settings(
         )
         in ("balanced", "preferred"),
         "deploy_repo_identity": _runtime_config.get("deploy_repo_identity"),
+        # Resolved identity combines the DEPLOY_REPO_IDENTITY env var (stamped by
+        # the deploy pipeline) with the operator runtime-config override.  Operators
+        # can read this field to confirm whether deploy-level serving confirmation
+        # (backend_revision, agent_image) is active; None means all promotions fall
+        # back to merge-level confirmation only.
+        "deploy_identity_resolved": (
+            "/".join(_resolved_identity)
+            if (_resolved_identity := _deploy_repo_identity()) is not None
+            else None
+        ),
         "providers": _build_provider_catalog(_runtime_config),
         # Published, backend-owned task-capability contract. Operator/agent
         # surfaces consume this map instead of maintaining private task-type

@@ -104,3 +104,48 @@ def test_project_match_does_not_read_is_self_repo(monkeypatch):
     monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
     project = _Proj(github_owner="other", github_repo="proj", is_self_repo=True)
     assert project_matches_deploy_identity(project) is False
+
+
+# ── Startup lifecycle observability tests ────────────────────────────────────
+
+
+def test_log_startup_deploy_identity_warns_when_unresolved(monkeypatch, caplog):
+    """When deploy_repo_identity() is None the startup helper emits a WARNING."""
+    monkeypatch.delenv("DEPLOY_REPO_IDENTITY", raising=False)
+    from app.runtime_config_state import runtime_config
+
+    monkeypatch.setitem(runtime_config, "deploy_repo_identity", None)
+
+    import logging
+
+    from app.lifecycle import _log_startup_deploy_identity
+
+    with caplog.at_level(logging.WARNING, logger="blueprint"):
+        _log_startup_deploy_identity()
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning_records, "Expected a WARNING log but none was emitted"
+    assert "[STARTUP]" in warning_records[0].message
+    assert "UNRESOLVED" in warning_records[0].message
+    assert "deploy_repo_identity" in warning_records[0].message
+
+
+def test_log_startup_deploy_identity_info_when_resolved(monkeypatch, caplog):
+    """When deploy_repo_identity() returns a slug the startup helper emits an INFO."""
+    monkeypatch.delenv("DEPLOY_REPO_IDENTITY", raising=False)
+    from app.runtime_config_state import runtime_config
+
+    monkeypatch.setitem(runtime_config, "deploy_repo_identity", "acme/widget")
+
+    import logging
+
+    from app.lifecycle import _log_startup_deploy_identity
+
+    with caplog.at_level(logging.INFO, logger="blueprint"):
+        _log_startup_deploy_identity()
+
+    info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert info_records, "Expected an INFO log but none was emitted"
+    assert "[STARTUP]" in info_records[0].message
+    assert "acme" in info_records[0].message
+    assert "widget" in info_records[0].message

@@ -4897,6 +4897,31 @@ class TestNotificationConfigSettings:
             assert bad.status_code == 400, f"{bad_val!r} should be rejected"
 
     @pytest.mark.asyncio
+    async def test_deploy_identity_resolved_in_settings(
+        self, client: AsyncClient, monkeypatch
+    ):
+        """GET /api/admin/settings exposes deploy_identity_resolved — the actual
+        resolved identity (env var + runtime_config override), not just the
+        runtime_config value.  Operators use this to confirm that deploy-level
+        serving confirmation is active/inactive."""
+        # Without env var or runtime_config override, identity is unresolved.
+        monkeypatch.delenv("DEPLOY_REPO_IDENTITY", raising=False)
+        resp = await client.get("/api/admin/settings")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "deploy_identity_resolved" in data
+        assert data["deploy_identity_resolved"] is None
+
+        # Setting runtime_config makes it resolvable.
+        await client.patch(
+            "/api/admin/settings", json={"deploy_repo_identity": "acme/widget"}
+        )
+        resp = await client.get("/api/admin/settings")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deploy_identity_resolved"] == "acme/widget"
+
+    @pytest.mark.asyncio
     async def test_patch_warm_continuity_enabled(self, client: AsyncClient):
         """warm_continuity_enabled accepts booleans and rejects non-booleans; round-trips on GET."""
         resp = await client.patch(
