@@ -35,6 +35,7 @@ from app.models import (
     CYCLE_META_MEMOS_CITED,
 )
 from app.auth import get_current_user, require_admin
+from app.digest_latency import record_digest_request
 from app.shared_state import runtime_config as _runtime_config
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
 from app import strategic_cycle as _strategic_cycle
@@ -212,6 +213,7 @@ async def get_digest(
     dedup + serve-stale-on-failure) so at most one on-demand 5000-row scan runs
     per key per TTL — the prior behavior, preserved as a safety net.
     """
+    _t0 = time.monotonic()
     precompute_cache = get_precompute_cache()
     entry = precompute_cache.get_fresh(
         hours,
@@ -220,6 +222,7 @@ async def get_digest(
         worker_only=True,
     )
     if entry is not None:
+        record_digest_request(time.monotonic() - _t0, "l1_precompute")
         return annotate_precompute_metadata(
             entry.result,
             precomputed=True,
@@ -240,6 +243,7 @@ async def get_digest(
         session=session,
     )
     if shared is not None:
+        record_digest_request(time.monotonic() - _t0, "l2_shared_cache")
         return annotate_precompute_metadata(
             shared.payload,
             precomputed=True,
@@ -260,6 +264,7 @@ async def get_digest(
     # non-worker entry would let a non-leader instance serve a never-refreshed
     # payload as fresh-for-PRECOMPUTE_STALE_FALLBACK_SECONDS, regressing
     # non-leader digest freshness from 15s to 5 minutes.
+    record_digest_request(time.monotonic() - _t0, "l3_on_demand")
     return annotate_precompute_metadata(
         result,
         precomputed=False,

@@ -117,6 +117,29 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_list_compute_jobs_paginates_newest_first(client: AsyncClient, db_session):
+    project = await _make_project(db_session, name="Paged")
+    await _add_member(db_session, project.id, "viewer")
+    _task_1, job_1, _artifact_1 = await _make_job(db_session, project, title="job 1")
+    _task_2, job_2, _artifact_2 = await _make_job(db_session, project, title="job 2")
+    _task_3, _job_3, _artifact_3 = await _make_job(
+        db_session, project, title="job 3"
+    )
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs?limit=2&offset=1"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    jobs = body["compute_jobs"]
+    assert body["has_more"] is False
+    assert body["limit"] == 2
+    assert body["offset"] == 1
+    assert [job["id"] for job in jobs] == [str(job_2.id), str(job_1.id)]
+    assert [job["task_title"] for job in jobs] == ["job 2", "job 1"]
+
+
+@pytest.mark.asyncio
 async def test_linked_compute_result_artifact_descriptor_serialized(
     client: AsyncClient, db_session
 ):

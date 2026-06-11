@@ -842,7 +842,9 @@ async def list_compute_jobs(
     *,
     project_id: uuid.UUID,
     include_finished_within: timedelta = timedelta(hours=6),
-) -> list[ComputeJob]:
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[ComputeJob], bool]:
     """Return a project's active compute jobs plus recently-finished ones.
 
     Active jobs are always included; terminal jobs are included only when they
@@ -862,9 +864,13 @@ async def list_compute_jobs(
                 )
             ),
         )
-        .order_by(ComputeJob.created_at.desc())
+        .order_by(ComputeJob.created_at.desc(), ComputeJob.id.desc())
+        .offset(offset)
+        .limit(limit + 1)
     )
-    return list(result.scalars().all())
+    jobs = list(result.scalars().all())
+    has_more = len(jobs) > limit
+    return jobs[:limit], has_more
 
 
 async def get_recent_terminal_compute_spend_usd(

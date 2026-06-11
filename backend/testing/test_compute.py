@@ -2826,14 +2826,54 @@ async def test_list_compute_jobs_returns_active_and_recent_excludes_others(db_se
     db_session.add_all([active, recent_done, stale_done, other_active])
     await db_session.commit()
 
-    jobs = await compute_jobs.list_compute_jobs(
+    jobs, has_more = await compute_jobs.list_compute_jobs(
         db_session, project_id=project.id, include_finished_within=timedelta(hours=6)
     )
+    assert has_more is False
     job_ids = {j.id for j in jobs}
     assert active.id in job_ids
     assert recent_done.id in job_ids
     assert stale_done.id not in job_ids  # finished outside the window
     assert other_active.id not in job_ids  # different project
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_applies_limit_and_offset(db_session):
+    project = Project(name="Paged Compute", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    jobs = []
+    for _ in range(3):
+        job = ComputeJob(
+            task_id=task.id,
+            project_id=project.id,
+            backend="local-subprocess",
+            status=ComputeJobStatus.RUNNING,
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        jobs.append(job)
+
+    page, has_more = await compute_jobs.list_compute_jobs(
+        db_session,
+        project_id=project.id,
+        include_finished_within=timedelta(hours=6),
+        limit=2,
+        offset=1,
+    )
+
+    assert has_more is False
+    assert [job.id for job in page] == [jobs[1].id, jobs[0].id]
 
 
 # ─── Zone success-rate tracking tests ────────────────────────────────────────

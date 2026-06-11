@@ -149,6 +149,15 @@ export function relativeTimeFromIso(iso: string, now: Date = new Date()): string
 }
 
 // ── Task Type Hints (appended to prompts for known task types) ───────────
+// Blueprint-self-repo viewport before/after screenshot pilot (Phase 0). Appended
+// to the create/fix/refactor hints. The instruction is self-limiting: it fires
+// only when the diff touches `admin-ui/src/components/`, which exists only in the
+// Blueprint repo — foreign repos never match the guard, so no separate self-repo
+// signature is needed. `scripts/viewport-snapshot.sh` is informational and never
+// blocks `./pr`. Keep wording identical across every insertion point.
+export const VIEWPORT_SNAPSHOT_HINT =
+  ' VISUAL CHECK (admin-ui only): if your diff touches `admin-ui/src/components/`, after `./check` passes run `bash scripts/viewport-snapshot.sh`, then Read each before/after PNG pair the manifest marks `changed` or `new` and confirm (a) the intended visual change is present, (b) no unintended layout drift in other captured components, (c) no blank or error-boundary render. Fix what looks wrong and re-snapshot. Keep it to ≤6 changed/new pairs at 375px. The script is informational — it never blocks `./pr`.';
+
 export const TASK_TYPE_HINTS: Record<string, string> = {
   'qa': 'Focus on writing tests. Run the existing test suite first to understand patterns. Do not modify production code unless fixing a test setup issue.',
   'migrate': 'This is a database migration task. Check existing Alembic migrations in backend/alembic/versions/ for naming conventions. Use `alembic revision --autogenerate` as a starting point only — always review and clean up generated migrations.',
@@ -156,11 +165,11 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'self_audit': 'Score system maturity on four signals: test_coverage, friction_density, claim_consistency, failure_mix. Each component is 0-100. Pick recommended_mode (audit|fundamentals|ship|pause) from the worst component. Do not modify any files — output is a JSON findings report only.',
   'release_audit': 'You are running on the LTS / promotion branch and reviewing the incoming diff against that branch\'s standards. Run `git diff <diff_range>` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.',
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
-  'create': 'Before finishing: edit the files you need to change, run `./check` to validate lint/build, fix any failures, then `./pr open --title "feat/fix/etc: ..." --body "Summary of changes"` to ship and `./done` to mark complete. The `./pr` helper gates on `./check` so broken code can\'t reach a PR. If admin-ui viewport bootstrapping only fails because Chromium deps are missing, `./check` will retry in the Playwright container when Docker is available and otherwise warn without blocking the task. If a library is unfamiliar, fetch its docs first. If you determine the task can\'t be completed (scope wrong, conflicting requirements, blocker found), call `./fail "<reason>"` instead of leaving silently.',
-  'fix': 'You are fixing issues from a code review or a pipeline failure. Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state. REPRODUCE FIRST: if this task asks you to fix a reported defect/bug from a finding, your FIRST step is to confirm the defect still reproduces on current HEAD — a failing test, an observable symptom, or the cited buggy pattern still present at the cited code/symbol. If it does NOT reproduce (the cited code/symbol is absent, or a reproduction attempt you wrote down demonstrably no longer fails), do NOT fabricate a speculative change: terminate via `./done --already-done "<reason naming the cited location and what you checked>"` — that path now reports the structured `already_resolved` reproduce-on-HEAD verdict so the outcome is scored as a verified no-op rather than a false fix. Distinguish the three canonical outcomes: reproduced → normal fix path and finish with `./done --reproduced "<what reproduced on HEAD and what you fixed>"`; non-reproducing/already-resolved → the `--already-done` off-ramp; indeterminate → keep the bar high and fall through to the normal fix, then if you still cannot prove repro at ship time finish with `./done --indeterminate "<why reproduce-on-HEAD remained ambiguous>"`. Keep the not-reproducible bar high — ambiguity or a still-present cited pattern means proceed with the normal fix. After fixing, run `./check` to verify, then `./pr open --title "fix: ..." --body "..."` to push (it will update the existing PR if there is one), then `./done` with the appropriate reproduce verdict flag when this is a finding-derived fix. Use `./fail "<reason>"` only if you can\'t reasonably resolve the feedback.',
+  'create': 'Before finishing: edit the files you need to change, run `./check` to validate lint/build, fix any failures, then `./pr open --title "feat/fix/etc: ..." --body "Summary of changes"` to ship and `./done` to mark complete. The `./pr` helper gates on `./check` so broken code can\'t reach a PR. If admin-ui viewport bootstrapping only fails because Chromium deps are missing, `./check` will retry in the Playwright container when Docker is available and otherwise warn without blocking the task. If a library is unfamiliar, fetch its docs first. If you determine the task can\'t be completed (scope wrong, conflicting requirements, blocker found), call `./fail "<reason>"` instead of leaving silently.' + VIEWPORT_SNAPSHOT_HINT,
+  'fix': 'You are fixing issues from a code review or a pipeline failure. Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state. REPRODUCE FIRST: if this task asks you to fix a reported defect/bug from a finding, your FIRST step is to confirm the defect still reproduces on current HEAD — a failing test, an observable symptom, or the cited buggy pattern still present at the cited code/symbol. If it does NOT reproduce (the cited code/symbol is absent, or a reproduction attempt you wrote down demonstrably no longer fails), do NOT fabricate a speculative change: terminate via `./done --already-done "<reason naming the cited location and what you checked>"` — that path now reports the structured `already_resolved` reproduce-on-HEAD verdict so the outcome is scored as a verified no-op rather than a false fix. Distinguish the three canonical outcomes: reproduced → normal fix path and finish with `./done --reproduced "<what reproduced on HEAD and what you fixed>"`; non-reproducing/already-resolved → the `--already-done` off-ramp; indeterminate → keep the bar high and fall through to the normal fix, then if you still cannot prove repro at ship time finish with `./done --indeterminate "<why reproduce-on-HEAD remained ambiguous>"`. Keep the not-reproducible bar high — ambiguity or a still-present cited pattern means proceed with the normal fix. After fixing, run `./check` to verify, then `./pr open --title "fix: ..." --body "..."` to push (it will update the existing PR if there is one), then `./done` with the appropriate reproduce verdict flag when this is a finding-derived fix. Use `./fail "<reason>"` only if you can\'t reasonably resolve the feedback.' + VIEWPORT_SNAPSHOT_HINT,
   'docs': 'Read the existing README and documentation files first. Understand the current documentation structure before making changes.',
   'deps': 'Check for breaking changes in major version bumps. Run the full test suite after updating to verify compatibility.',
-  'refactor': 'Run the full test suite BEFORE and AFTER changes via `./check test`. Zero test regressions allowed. Do not change external behavior. After refactoring + verifying via `./check`, run `./pr open --title "refactor: ..." --body "..."` and `./done`. Use `./fail` if the refactor proves not feasible.',
+  'refactor': 'Run the full test suite BEFORE and AFTER changes via `./check test`. Zero test regressions allowed. Do not change external behavior. After refactoring + verifying via `./check`, run `./pr open --title "refactor: ..." --body "..."` and `./done`. Use `./fail` if the refactor proves not feasible.' + VIEWPORT_SNAPSHOT_HINT,
   'investigate': 'This is a read-only investigation. Do NOT modify any files. Search for known issues related to error patterns you discover. Write your findings to the output JSON only. If you are investigating a reported defect from a finding, classify it against the canonical reproduce-on-HEAD verdict — reproduced, non-reproducing/already-resolved, or indeterminate — and state which outcome holds (and the evidence) in your findings, rather than reporting free-text rationale alone.',
   'debug': 'Search for known issues related to error patterns you discover. Use WebSearch to look up specific error messages or stack traces when local context is insufficient.',
 };
@@ -214,8 +223,8 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
   }
   if (testCmds.length > 0) {
     const cmdsText = testCmds.join(', ');
-    hints['create'] = `Before finishing: edit the files you need, run \`./check\` to validate lint/build (which uses ${cmdsText} under the hood), fix any failures, then \`./pr open --title "feat/fix/etc: ..." --body "Summary"\` and \`./done\`. The \`./pr\` helper gates on \`./check\`. If admin-ui viewport bootstrapping only fails because Chromium deps are missing, \`./check\` will retry in the Playwright container when Docker is available and otherwise warn without blocking the task. Use \`./fail "<reason>"\` if the task can't be completed.`;
-    hints['refactor'] = `Use \`./check test\` to run the full test suite BEFORE and AFTER changes (${cmdsText}). Zero test regressions allowed. After refactoring + verifying, \`./pr open --title "refactor: ..." --body "..."\` then \`./done\`. \`./fail\` if not feasible.`;
+    hints['create'] = `Before finishing: edit the files you need, run \`./check\` to validate lint/build (which uses ${cmdsText} under the hood), fix any failures, then \`./pr open --title "feat/fix/etc: ..." --body "Summary"\` and \`./done\`. The \`./pr\` helper gates on \`./check\`. If admin-ui viewport bootstrapping only fails because Chromium deps are missing, \`./check\` will retry in the Playwright container when Docker is available and otherwise warn without blocking the task. Use \`./fail "<reason>"\` if the task can't be completed.` + VIEWPORT_SNAPSHOT_HINT;
+    hints['refactor'] = `Use \`./check test\` to run the full test suite BEFORE and AFTER changes (${cmdsText}). Zero test regressions allowed. After refactoring + verifying, \`./pr open --title "refactor: ..." --body "..."\` then \`./done\`. \`./fail\` if not feasible.` + VIEWPORT_SNAPSHOT_HINT;
   }
 
   // 'deps' hint: list actual package managers detected
@@ -872,7 +881,7 @@ export function formatPlaybook(
 // across the agent → backend (schemas.SelfReviewOutcome) → frontend
 // (SrTrendData.prompt_version) chain is consistent and string-safe
 // for frontend operations like `.slice(...)`.
-export const SELF_REVIEW_PROMPT_VERSION = "6";
+export const SELF_REVIEW_PROMPT_VERSION = "7";
 
 // Human-readable examples of disallowed blind_spot entries — mirrored in
 // backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES for contract-test parity.
@@ -1172,6 +1181,31 @@ Steps:
 
 This check does NOT block \`./done\` — it is informational and feeds the catch-rate dashboard.
 
+**Visual-verification field (optional; admin-ui/src/components diffs only):**
+When your diff touches \`admin-ui/src/components/\` and you ran
+\`bash scripts/viewport-snapshot.sh\` to inspect before/after PNG pairs, record a
+\`visual_verification\` object as a TOP-LEVEL field of the self-review JSON (NOT a
+\`check_results\` category — its shape differs, and \`check_results\` keys are a fixed
+vocabulary). Shape:
+
+\`\`\`json
+"visual_verification": {
+  "passed": true,
+  "pairs_inspected": 3,
+  "pairs_changed": 1,
+  "note": "<what changed visually; what you checked>",
+  "caught_visual_issue": false
+}
+\`\`\`
+
+- \`pairs_inspected\` / \`pairs_changed\`: counts from the snapshot manifest's
+  changed/new pairs you actually Read.
+- \`caught_visual_issue\`: \`true\` only if visual inspection surfaced a defect the
+  \`./check\` assertion gates did not (this is the pilot's kill-criterion signal).
+- \`passed\`: your overall judgement that the rendered output is correct.
+- Omit the field entirely if the diff does not touch \`admin-ui/src/components/\` or
+  you did not run the snapshot — it is never required and never blocks \`./done\`.
+
 Schema:
 
 \`\`\`json
@@ -1183,6 +1217,7 @@ Schema:
     "<category>": { "passed": true | false, "issue": "...", "reasoning": "..." }
   },
   "blind_spots": ["...", "..."],
+  "visual_verification": { "passed": true, "pairs_inspected": 0, "pairs_changed": 0, "note": "...", "caught_visual_issue": false },
   "truncated_files_read": ["path/a.ts", "path/b.ts"],
   "categories": ["incomplete_review"]
 }

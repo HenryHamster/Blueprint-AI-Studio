@@ -1372,6 +1372,22 @@ async def get_warm_reuse_dropout_trend(
     return {"buckets": buckets}
 
 
+@router.get("/digest-latency-stats")
+async def get_digest_latency_stats(
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Return in-process rolling latency aggregate for /api/admin/digest.
+
+    Reports p50/p95 request durations (seconds) and per-tier serve counts
+    since the last process restart. All values are per-instance — replicas
+    maintain independent aggregates and this endpoint only reflects the
+    instance that answered the request.
+    """
+    from app.digest_latency import get_digest_latency_snapshot  # noqa: PLC0415
+
+    return get_digest_latency_snapshot()
+
+
 @router.get("/projects/{project_id}/pool-dispatch-funnel-trend")
 async def get_pool_dispatch_funnel_trend(
     project_id: uuid.UUID,

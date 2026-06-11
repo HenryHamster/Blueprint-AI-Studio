@@ -103,6 +103,8 @@ async def _build_compute_job_payload(session: AsyncSession, jobs) -> list[Dict[s
 async def get_project_compute_jobs(
     project_id: uuid.UUID,
     include_finished_minutes: int = Query(360, ge=0, le=10080),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -110,12 +112,19 @@ async def get_project_compute_jobs(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
-    jobs = await list_compute_jobs(
+    jobs, has_more = await list_compute_jobs(
         session,
         project_id=project_id,
         include_finished_within=timedelta(minutes=include_finished_minutes),
+        limit=limit,
+        offset=offset,
     )
-    return {"compute_jobs": await _build_compute_job_payload(session, jobs)}
+    return {
+        "compute_jobs": await _build_compute_job_payload(session, jobs),
+        "has_more": has_more,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.post("/compute-jobs/{job_id}/kill")
