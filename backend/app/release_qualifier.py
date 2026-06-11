@@ -1454,6 +1454,7 @@ _AUDIT_CHALLENGE_BINDING_HOLDS: frozenset[str] = frozenset(
         "audit_challenge_binding_incomplete",
         "audit_challenge_uncertain",
         "audit_challenge_sha_mismatch",
+        "audit_challenge_empty_verdicts",
     }
 )
 

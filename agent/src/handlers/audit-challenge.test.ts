@@ -181,6 +181,34 @@ describe('normalizeChallengeOutput — stable RELEASE_AUDIT_CHALLENGE contract',
     expect(out.verdicts[0].reason).toBe(reason);
   });
 
+  it('preserves a positive integer primary_finding_index when supplied', () => {
+    const out = normalizeChallengeOutput(
+      {
+        verdicts: [
+          {
+            primary_finding_index: 2,
+            severity: 'high',
+            summary: 'unsafe retry binding',
+            file: 'app/x.py',
+            verdict: 'confirmed',
+            reason: 'Read app/x.py:42 and confirmed this retry binding issue is real.',
+          },
+          {
+            primary_finding_index: '3',
+            severity: 'high',
+            summary: 'string index is ignored',
+            file: 'app/y.py',
+            verdict: 'confirmed',
+            reason: 'Read app/y.py:42 and confirmed this issue is real too.',
+          },
+        ],
+      },
+      CANDIDATE_SHA,
+    );
+    expect(out.verdicts[0]).toMatchObject({ primary_finding_index: 2 });
+    expect(out.verdicts[1]).not.toHaveProperty('primary_finding_index');
+  });
+
   it('returns an empty contract for non-object / missing-verdicts input', () => {
     expect(normalizeChallengeOutput(null, CANDIDATE_SHA)).toEqual({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] });
     expect(normalizeChallengeOutput({}, CANDIDATE_SHA)).toEqual({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] });
@@ -267,6 +295,36 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
     const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('unsafe deserialization');
     expect(prompt).toContain('app/x.py');
+  });
+
+  it('requires exact summary copying and primary_finding_index when primary_findings are supplied', async () => {
+    const payload = {
+      ...RELEASE_PAYLOAD,
+      primary_findings: [
+        {
+          severity: 'high',
+          summary: 'Unsafe deserialization in upload handler.',
+          file: 'app/upload.py',
+        },
+      ],
+    };
+    await handleReleaseAuditChallenge(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('`primary_finding_index` to the 1-based number from this list');
+    expect(prompt).toContain('copy that finding\'s `summary` text EXACTLY');
+    expect(prompt).toContain('verbatim: same words, punctuation, and capitalization; do not paraphrase');
+    expect(prompt).toContain('its `summary` must be copied EXACTLY from that list');
+    expect(prompt).toContain('Do not paraphrase the `summary` on a primary-findings retry');
+    expect(prompt).toContain('1. [high] Unsafe deserialization in upload handler. (file: app/upload.py)');
+  });
+
+  it('allows independently derived summaries when no primary_findings are supplied', async () => {
+    await handleReleaseAuditChallenge(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('No primary audit findings were supplied in your payload');
+    expect(prompt).toContain('Independently identify the higher-severity issues in this diff yourself');
+    expect(prompt).toContain('When no primary findings were supplied, omit `primary_finding_index`');
+    expect(prompt).toContain('the backend can fuzzy-match it by content');
   });
 
   it('FAILS LOUD with diff_range_unresolvable when no valid candidate_sha is supplied', async () => {

@@ -1967,6 +1967,20 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         assert hold == "audit_challenge_binding_incomplete"
         assert modified is None
 
+    def test_empty_verdicts_with_matching_sha_get_distinct_hold_code(self):
+        """Correct challenge SHA with zero verdicts is not a SHA mismatch."""
+        finding = _make_verified_finding("Missing authorization on release promotion")
+        envelope = _make_challenge_envelope(self.SHA, [])
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+
+        assert hold == "audit_challenge_empty_verdicts"
+        assert modified is None
+        assert refuted == []
+        assert binding == []
+
     def test_two_verdicts_two_findings_both_matched(self):
         """One-to-one verdict-to-finding matching still works correctly."""
         finding_a = _make_verified_finding("Race condition in cache invalidation")
@@ -1993,6 +2007,156 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         assert hold is None
         assert modified is report
         assert refuted == []
+
+    def test_primary_finding_index_binds_retry_verdict_with_paraphrased_summary(self):
+        medium = _make_verified_finding("Medium priority challenge binding issue")
+        medium["severity"] = "medium"
+        high = _make_verified_finding("High priority challenge binding issue")
+        report = self._report([medium, high])
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": "severe retry concern",
+                },
+                {
+                    "primary_finding_index": 2,
+                    "verdict": "confirmed",
+                    "severity": "medium",
+                    "summary": "moderate retry concern",
+                },
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is report
+        assert refuted == []
+        assert [b["finding_summary"] for b in binding] == [
+            "Medium priority challenge binding issue",
+            "High priority challenge binding issue",
+        ]
+        assert [b["verdict_summary"] for b in binding] == [
+            "moderate retry concern",
+            "severe retry concern",
+        ]
+
+    def test_empty_summary_finding_excluded_from_index_domain(self):
+        """Findings with empty summaries must be excluded from the indexed list.
+
+        _primary_findings_for_challenge_retry skips findings with no summary
+        before numbering them for the agent.  primary_order_fis must apply the
+        same filter so index 1 maps to the same finding the agent saw as #1.
+        """
+        # a has no summary — excluded from the agent's numbered list
+        a = {
+            "severity": "high",
+            "summary": "",
+            "file": "a.py",
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+        # b has a summary — the agent sees it as index 1
+        b = _make_verified_finding("Security critical authentication bypass")
+        b["file"] = "b.py"
+        report = {"findings": [a, b]}  # a first, so without the fix index 1 → a (wrong)
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",
+                    "summary": "Security critical authentication bypass",
+                    "reason": "thorough code review confirmed no authentication bypass",
+                },
+                {
+                    # No primary_finding_index; exact-match on empty summary for a.
+                    "verdict": "confirmed",
+                    "summary": "",
+                },
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # With the fix: index 1 maps to b (a is excluded); b is refuted.
+        # Without the fix: index 1 maps to a; b has no matchable verdict → hold.
+        assert hold is None
+        assert len(refuted) == 1
+        assert refuted[0]["summary"] == "Security critical authentication bypass"
+        assert refuted[0]["severity"] == "high"
+
+    def test_indexed_refuted_lower_severity_not_allowed(self):
+        """An indexed refuted_false_positive with lower severity than the finding
+        must be rejected by _indexed_verdict_can_bind.
+
+        When rejected the verdict is NOT bound by index and also excluded from
+        the fuzzy adjacency list (it has primary_finding_index set), leaving the
+        finding without any verdict and producing audit_challenge_binding_incomplete.
+        """
+        finding = _make_verified_finding("SQL injection in query builder module")
+        report = {"findings": [finding]}
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "refuted_false_positive",
+                    "severity": "low",  # lower than finding's "high"
+                    "summary": "SQL injection in query builder module",
+                    "reason": "parameterized queries are used throughout",
+                },
+            ],
+        )
+
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # Severity ceiling blocks the refutation; no fuzzy fallback since
+        # primary_finding_index is set → binding is incomplete.
+        assert hold == "audit_challenge_binding_incomplete"
+        assert refuted == []
+
+    def test_indexed_refuted_equal_severity_allowed(self):
+        """An indexed refuted_false_positive with equal severity is accepted and
+        removes the finding from scoring (the allow branch of _indexed_verdict_can_bind).
+        """
+        finding = _make_verified_finding("SQL injection in query builder module")
+        report = {"findings": [finding]}
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",  # equal to finding's "high"
+                    "summary": "SQL injection in query builder module",
+                    "reason": "parameterized queries are used throughout the module",
+                },
+            ],
+        )
+
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # Severity ceiling passes; finding is removed.
+        assert hold is None
+        assert len(refuted) == 1
+        assert refuted[0]["summary"] == "SQL injection in query builder module"
 
     def test_refuted_verdict_consumed_second_finding_held(self):
         """One refuted verdict + one confirmed verdict match one finding each."""
@@ -3312,6 +3476,10 @@ class TestBindingRecordAndUnboundHoldDistinction:
     def test_binding_incomplete_in_binding_holds_frozenset(self):
         """audit_challenge_binding_incomplete must trigger challenge respawn."""
         assert "audit_challenge_binding_incomplete" in rq._AUDIT_CHALLENGE_BINDING_HOLDS
+
+    def test_empty_verdicts_in_binding_holds_frozenset(self):
+        """audit_challenge_empty_verdicts must trigger challenge respawn."""
+        assert "audit_challenge_empty_verdicts" in rq._AUDIT_CHALLENGE_BINDING_HOLDS
 
     def test_binding_record_capped_at_binding_record_cap(self):
         """Binding record must not exceed _BINDING_RECORD_CAP entries."""
@@ -5639,6 +5807,51 @@ async def test_challenge_hold_respawns_challenge_only_with_primary_findings(
             "file": "backend/app/release_scoring.py",
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_empty_challenge_verdicts_respawn_with_distinct_reason(
+    db_session,
+):
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Empty challenge verdicts must retry with a precise reason.",
+                    "file": "backend/app/release_scoring.py",
+                    "verification_note": "Read backend/app/release_scoring.py:1300 and confirmed empty verdicts block reconciliation.",
+                }
+            ],
+            "test_erosion": {"deleted_test_files": []},
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=[],
+    )
+    original_challenge_id = version.last_qualification["challenge_task_id"]
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result == {
+        "status": "audit_challenge_respawned",
+        "reason": "audit_challenge_empty_verdicts",
+        "respawn_count": 1,
+        "challenge_task_id": version.last_qualification["challenge_task_id"],
+    }
+    assert version.last_qualification["challenge_task_id"] != original_challenge_id
+    assert version.last_qualification["audit_challenge_retry_reason"] == (
+        "audit_challenge_empty_verdicts"
+    )
 
 
 @pytest.mark.asyncio

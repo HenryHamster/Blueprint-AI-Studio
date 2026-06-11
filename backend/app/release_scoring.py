@@ -1285,6 +1285,30 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
     return None
 
 
+def _primary_finding_index_for_verdict(verdict_entry: dict) -> int | None:
+    """Return a valid 1-based primary finding index from a challenge verdict."""
+    if not isinstance(verdict_entry, dict):
+        return None
+    raw = verdict_entry.get("primary_finding_index")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw if raw > 0 else None
+
+
+def _indexed_verdict_can_bind(finding: dict, verdict_entry: dict) -> bool:
+    """Validate non-text safety checks for an index-bound challenge verdict."""
+    if not isinstance(verdict_entry, dict):
+        return False
+    if str(verdict_entry.get("verdict") or "").lower().strip() != "refuted_false_positive":
+        return True
+
+    f_severity = str(finding.get("severity") or finding.get("level") or "").lower()
+    cv_severity = str(verdict_entry.get("severity") or "").lower()
+    finding_rank = _SEVERITY_RANK.get(f_severity, 99)
+    verdict_rank = _SEVERITY_RANK.get(cv_severity, 99)
+    return verdict_rank <= finding_rank
+
+
 def _reconcile_audit_with_challenge(
     report: dict[str, Any] | None,
     challenge_envelope: dict[str, Any] | None,
@@ -1364,19 +1388,64 @@ def _reconcile_audit_with_challenge(
                 challenge_verdicts_list = raw
 
     if not sha_matched or not challenge_verdicts_list:
-        hold_code = (
-            "audit_challenge_sha_mismatch"
-            if (
-                isinstance(challenge_envelope, dict)
-                and challenge_envelope.get("challenged_candidate_sha")
+        if sha_matched and isinstance(challenge_envelope.get("verdicts"), list):
+            hold_code = "audit_challenge_empty_verdicts"
+        else:
+            hold_code = (
+                "audit_challenge_sha_mismatch"
+                if (
+                    isinstance(challenge_envelope, dict)
+                    and challenge_envelope.get("challenged_candidate_sha")
+                )
+                else "audit_challenge_missing"
             )
-            else "audit_challenge_missing"
-        )
         return hold_code, None, [], []
 
     challenger_refuted: list[dict[str, Any]] = []
     remove_idxs: set[int] = set()
     available_verdicts = list(challenge_verdicts_list)
+    # Only include findings whose summary is non-empty in the indexed list.
+    # _primary_findings_for_challenge_retry (release_qualifier.py) skips
+    # findings with an empty summary before numbering them for the agent, so the
+    # index domain here must match that filtered subset exactly.
+    primary_order_fis = sorted(
+        [
+            fi
+            for fi, (_, f) in enumerate(deductible)
+            if str(
+                f.get("summary")
+                or f.get("description")
+                or f.get("title")
+                or f.get("text")
+                or ""
+            ).strip()
+        ],
+        key=lambda fi: _SEVERITY_RANK.get(
+            str(
+                deductible[fi][1].get("severity")
+                or deductible[fi][1].get("level")
+                or ""
+            ).lower(),
+            99,
+        ),
+    )
+
+    # Retry challenges receive the primary audit's carried findings as a
+    # numbered list.  When a verdict carries a valid primary_finding_index, bind
+    # by that stable identity first and bypass fuzzy summary matching entirely.
+    # Refutations still keep the severity ceiling because they remove audit
+    # deductions.
+    match_vi: dict[int, int] = {}  # vi -> fi currently matched
+    for vi, cv in enumerate(available_verdicts):
+        index = _primary_finding_index_for_verdict(cv)
+        if index is None or index > len(primary_order_fis):
+            continue
+        fi = primary_order_fis[index - 1]
+        if fi in match_vi.values() or vi in match_vi:
+            continue
+        _, f = deductible[fi]
+        if _indexed_verdict_can_bind(f, cv):
+            match_vi[vi] = fi
 
     # Build per-finding adjacency lists sorted by score descending.
     # Add a small severity-agreement bonus so a verdict prefers the finding
@@ -1384,9 +1453,13 @@ def _reconcile_audit_with_challenge(
     # via text overlap alone.
     adj: list[list[int]] = [[] for _ in range(len(deductible))]
     for fi, (_, f) in enumerate(deductible):
+        if fi in match_vi.values():
+            continue
         f_sev = str(f.get("severity") or f.get("level") or "").lower()
         pairs: list[tuple[float, int]] = []
         for vi, cv in enumerate(available_verdicts):
+            if vi in match_vi or _primary_finding_index_for_verdict(cv) is not None:
+                continue
             s = _score_finding_to_challenge(f, cv)
             if s is not None:
                 cv_sev = str(cv.get("severity") or "").lower()
@@ -1399,8 +1472,6 @@ def _reconcile_audit_with_challenge(
     # This finds a complete assignment whenever one exists, unlike greedy
     # sort-and-assign which can strand a finding when a high-scoring verdict
     # is shared between two findings.
-    match_vi: dict[int, int] = {}  # vi -> fi currently matched
-
     def _try_augment(fi: int, visited: set[int]) -> bool:
         for vi in adj[fi]:
             if vi in visited:
@@ -1433,6 +1504,8 @@ def _reconcile_audit_with_challenge(
     for vi, fi in match_vi.items():
         cv = available_verdicts[vi]
         if str(cv.get("verdict") or "").lower().strip() != "refuted_false_positive":
+            continue
+        if _primary_finding_index_for_verdict(cv) is not None:
             continue
         _, f = deductible[fi]
         bound_score = _score_finding_to_challenge(f, cv) or 0.0
