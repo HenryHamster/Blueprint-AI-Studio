@@ -5494,6 +5494,7 @@ async def _process_post_commit(
                         "ssl",
                         "name resolution",
                         "connection refused",
+                        "greenlet",  # post-rollback expired-attr lazy-load; retryable
                     ]
                 )
                 # Research task interrupted mid-spawn: findings are already committed

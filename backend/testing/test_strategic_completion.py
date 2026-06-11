@@ -11674,6 +11674,62 @@ class TestDesignDocCompletionStrategistEvent:
 
         emit.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_deferred_path_survives_task_and_project_expiry(
+        self, strat_fail_db, mocker
+    ):
+        """Deferred Phase 2 on an expired session must stay whole.
+
+        A bare drift-rollback inside _spawn_strategic_review expires BOTH project
+        and task, so the deferred branch's logger + retry-marker write
+        (project.vision) AND the post-commit emit (task.project_id / task.id /
+        task.latest_status_message) previously lazy-loaded and raised
+        MissingGreenlet — the site that failed task 94594516 (2026-06-11) past
+        the a9bf1317 partial fix. Pre-captured ids + a captured vision snapshot
+        must keep the handler whole on the deferred path too."""
+        from unittest.mock import AsyncMock
+        from app.task_completion import _handle_design_doc_completion
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+        task = await _make_failure_task(
+            strat_fail_db, project, task_type="design_doc_update"
+        )
+        expected_id = str(task.id)
+        expected_pid = project.id
+
+        async def _defer_and_expire(*args, **kwargs):
+            # Mirror the rollback-expiration accompanying a real drift failure:
+            # every unloaded attribute on BOTH instances now requires IO.
+            strat_fail_db.expire(task)
+            strat_fail_db.expire(project)
+            return False
+
+        mocker.patch(
+            "app.strategic_spawning._spawn_strategic_review",
+            new=AsyncMock(side_effect=_defer_and_expire),
+        )
+        emit = AsyncMock()
+        mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+        # Must complete without raising MissingGreenlet.
+        await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
+
+        # Emitted with pre-captured identifiers (never lazy-loaded off the
+        # expired task).
+        emit.assert_awaited_once()
+        args = emit.await_args.args
+        assert args[0] == expected_pid
+        assert str(args[1]) == expected_id
+        assert args[2] == 1
+        assert emit.await_args.kwargs["completion"]["status"] == "deferred"
+        # Retry marker written from the captured base_vision snapshot.
+        await strat_fail_db.refresh(project)
+        marker = (project.vision or {}).get("_pending_strategic_review")
+        assert marker and marker["design_doc_task_id"] == expected_id
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # running_update operator-wins reconciliation (shared helper + fallback path)
