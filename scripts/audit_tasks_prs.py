@@ -2,6 +2,7 @@
 
 Usage:
     python scripts/audit_tasks_prs.py
+    python scripts/audit_tasks_prs.py --visual-pilot --created-after 2026-06-01T00:00:00Z
 
 The script combines deployed orchestrator task state with GitHub PR metadata.
 It does not mutate tasks, branches, PRs, or repo state.
@@ -11,16 +12,18 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
+from argparse import ArgumentParser
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 from blueprint_api import api, get_project_id, load_config
 
 
 ACTIVE_STATUSES = {"QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"}
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
+VISUAL_INFRA_SENTINEL = "VIEWPORT_GATE_INFRA_UNAVAILABLE"
 STATUSES = [
     "QUEUED",
     "PROVISIONING",
@@ -56,22 +59,45 @@ def _age(iso: str | None) -> str:
     return f"{seconds // 86400}d"
 
 
-def _fetch_tasks(status: str | None, limit: int = 200) -> list[dict[str, Any]]:
+def _fetch_tasks(
+    status: str | None,
+    limit: int = 200,
+    *,
+    created_after: str | None = None,
+    max_rows: int | None = None,
+) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
     offset = 0
     while True:
-        path = f"/api/admin/tasks?limit={limit}&offset={offset}"
+        params = {"limit": limit, "offset": offset}
         if status:
-            path += f"&status={status}"
+            params["status"] = status
+        if created_after:
+            params["created_after"] = created_after
+        path = f"/api/admin/tasks?{urlencode(params)}"
         data = api("GET", path)
         batch = data.get("tasks", data) if isinstance(data, dict) else data
         if not batch:
             break
         tasks.extend(batch)
+        if max_rows and len(tasks) >= max_rows:
+            return tasks[:max_rows]
         if len(batch) < limit:
             break
         offset += limit
     return tasks
+
+
+def _parse_iso(iso: str | None) -> datetime | None:
+    if not iso:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 def _task_type(task: dict[str, Any]) -> str:
@@ -106,6 +132,112 @@ def _task_pr_numbers(task: dict[str, Any]) -> set[int]:
         except (TypeError, ValueError):
             continue
     return numbers
+
+
+def _task_pr_url(task: dict[str, Any]) -> str:
+    ctx = task.get("context") or {}
+    if task.get("pr_url"):
+        return str(task["pr_url"])
+    if ctx.get("rollup_pr_url"):
+        return str(ctx["rollup_pr_url"])
+    for art in task.get("artifacts") or []:
+        if isinstance(art, dict) and art.get("pr_url"):
+            return str(art["pr_url"])
+    nums = sorted(_task_pr_numbers(task))
+    return f"PR #{nums[0]}" if nums else "(no PR link)"
+
+
+def _changed_files(task: dict[str, Any]) -> list[str]:
+    ctx = task.get("context") or {}
+    raw = ctx.get("_pr_changed_files") or task.get("changed_files") or []
+    if not raw and isinstance(ctx.get("_file_change_details"), list):
+        raw = [item.get("path") for item in ctx["_file_change_details"] if isinstance(item, dict)]
+    if not raw and isinstance(task.get("file_change_details"), list):
+        raw = [item.get("path") for item in task["file_change_details"] if isinstance(item, dict)]
+    return [str(path) for path in raw if path]
+
+
+def _touches_admin_ui(task: dict[str, Any]) -> bool:
+    return any(path == "admin-ui" or path.startswith("admin-ui/") or "/admin-ui/" in path for path in _changed_files(task))
+
+
+def _visual_entry(task: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+    outcome = (task.get("context") or {}).get("_self_review_outcome") or task.get("self_review_outcome")
+    if isinstance(outcome, str):
+        try:
+            outcome = json.loads(outcome)
+        except json.JSONDecodeError:
+            return None, True
+    if not isinstance(outcome, dict):
+        return None, False
+    entry = outcome.get("visual_verification")
+    if entry is None and isinstance(outcome.get("check_results"), dict):
+        entry = outcome["check_results"].get("visual_verification")
+    return (entry, not isinstance(entry, dict)) if entry is not None else (None, False)
+
+
+def _intish(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _infra_occurrences(entry: dict[str, Any]) -> int:
+    raw = entry.get("infra_failures") or entry.get("infra_failure_occurrences")
+    if isinstance(raw, list):
+        return len(raw)
+    count = _intish(raw)
+    text = " ".join(str(entry.get(k, "")) for k in ("failure_class", "failure_reason", "issue", "evidence"))
+    return max(count, 1 if VISUAL_INFRA_SENTINEL in text or "viewport infra-unavailable" in text.lower() else 0)
+
+
+def _print_visual_pilot_report(tasks: list[dict[str, Any]], *, created_after: str | None, created_before: str | None) -> None:
+    before = _parse_iso(created_before)
+    completed = [t for t in tasks if t.get("status") == "COMPLETED"]
+    if before:
+        completed = [t for t in completed if (_parse_iso(t.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)) <= before]
+    admin_tasks = [t for t in completed if _touches_admin_ui(t)]
+    entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    malformed = 0
+    for task in admin_tasks:
+        entry, bad = _visual_entry(task)
+        malformed += int(bad)
+        if entry:
+            entries.append((task, entry))
+
+    pairs_inspected = sum(_intish(e.get("pairs_inspected")) for _, e in entries)
+    pairs_changed = sum(_intish(e.get("pairs_changed")) for _, e in entries)
+    infra_total = sum(_infra_occurrences(e) for _, e in entries)
+    caught = [(t, e) for t, e in entries if bool(e.get("caught_visual_issue"))]
+    start = _parse_iso(created_after) or min((_parse_iso(t.get("created_at")) for t, _ in entries), default=None)
+    days_elapsed = (datetime.now(timezone.utc) - start).days if start else 0
+    infra_rate = (infra_total / len(entries)) if entries else 0.0
+
+    print("=== Visual Verification Pilot Outcome ===")
+    print(f"Completed admin-ui-touching tasks scanned: {len(admin_tasks)}")
+    print(f"Tasks carrying visual_verification entries: {len(entries)}")
+    print(f"Malformed visual_verification entries skipped: {malformed}")
+    print(f"Pairs inspected/changed: {pairs_inspected} / {pairs_changed}")
+    print(f"Infra-failure occurrences (viewport infra-unavailable): {infra_total}")
+    print()
+    print("caught_visual_issue=true tasks")
+    if caught:
+        for task, entry in caught:
+            fix = entry.get("in_session_fix_followed", entry.get("fix_followed"))
+            if fix is None:
+                outcome = (task.get("context") or {}).get("_self_review_outcome")
+                fix = outcome.get("fixes_applied") if isinstance(outcome, dict) else None
+            print(f"- {str(task.get('id', ''))[:8]} {_task_pr_url(task)} fix_followed={fix if fix is not None else 'unknown'}")
+    else:
+        print("- none")
+    print()
+    print("Kill-Criterion Inputs")
+    print(f"- Window progress: {len(entries)} of 25 PR/tasks, {days_elapsed} of 42 days elapsed")
+    print(f"- Catches beyond assertion gates: {len(caught)}")
+    print(f"- Infra-failure rate: {infra_total}/{len(entries)} ({infra_rate:.1%})")
 
 
 def _task_line(task: dict[str, Any], width: int = 86) -> str:
@@ -214,7 +346,17 @@ def _classify_pr(pr: dict[str, Any], linked_tasks: list[dict[str, Any]]) -> str:
     return "inspect manually"
 
 
-def main() -> int:
+def _args(argv: list[str] | None = None):
+    parser = ArgumentParser(description="Read-only audit of Blueprint tasks and PRs.")
+    parser.add_argument("--visual-pilot", action="store_true", help="print only visual_verification pilot outcome aggregates")
+    parser.add_argument("--created-after", help="ISO timestamp lower bound for task.created_at")
+    parser.add_argument("--created-before", help="ISO timestamp upper bound for task.created_at")
+    parser.add_argument("--task-window", type=int, default=200, help="max completed task rows to scan in visual-pilot mode")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _args(argv)
     cfg = load_config()
     repo = cfg.get("default_repo")
     project_id = get_project_id(cfg.get("project_id"))
@@ -222,6 +364,17 @@ def main() -> int:
     print(f"Project: {project_id}")
     print(f"Repo:    {repo}")
     print()
+
+    if args.visual_pilot:
+        # An upper bound needs the full completed-task stream so older matches
+        # are not truncated away before local filtering.
+        tasks = _fetch_tasks(
+            "COMPLETED",
+            created_after=args.created_after,
+            max_rows=None if args.created_before else args.task_window,
+        )
+        _print_visual_pilot_report(tasks, created_after=args.created_after, created_before=args.created_before)
+        return 0
 
     deploy = api("GET", "/api/admin/deploy-state")
     settings = api("GET", "/api/admin/settings")
