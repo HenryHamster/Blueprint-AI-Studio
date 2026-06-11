@@ -165,7 +165,7 @@ async def get_app_info() -> dict:
         logger.error("Could not retrieve GitHub App metadata: %s", resp.text)
         raise HTTPException(
             status_code=resp.status_code,
-            detail=f"GitHub API error: {resp.text}",
+            detail="Failed to retrieve GitHub App metadata",
         )
     return resp.json()
 
@@ -183,7 +183,7 @@ async def get_user_installations(user_token: str) -> list[dict]:
         if resp.status_code != 200:
             logger.error(f"Failed to fetch user installations: {resp.text}")
             raise HTTPException(
-                status_code=resp.status_code, detail=f"GitHub API error: {resp.text}"
+                status_code=resp.status_code, detail="Failed to fetch GitHub App installations"
             )
         data = resp.json()
         installations.extend(data.get("installations", []))
@@ -245,7 +245,7 @@ async def generate_installation_access_token(
         logger.error(f"Failed to generate installation access token: {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to authenticate with GitHub App ({response.status_code}): {response.text[:200]}",
+            detail="Failed to authenticate with GitHub App",
         )
 
     return response.json().get("token")

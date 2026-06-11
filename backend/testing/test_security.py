@@ -599,3 +599,47 @@ class TestThresholdIntegration:
         result = evaluate_findings(findings)
         assert not result["blocked"]
         assert result["high_count"] == 0
+
+
+# ── Exception Handler Leak Guard ─────────────────────────────────────────────
+
+
+class TestGenericExceptionHandlerDoesNotLeakDetails:
+    """Verify that the 500 exception handler returns a generic message,
+    not internal exception details."""
+
+    def _load_main_source(self) -> str:
+        import pathlib
+
+        main_py = pathlib.Path(__file__).parent.parent / "app" / "main.py"
+        return main_py.read_text()
+
+    def test_generic_message_present(self):
+        src = self._load_main_source()
+        assert '"Internal Server Error"' in src, (
+            "generic_exception_handler must return 'Internal Server Error' "
+            "as the detail — found no such string in main.py"
+        )
+
+    def test_exc_type_name_not_in_response(self):
+        import re
+
+        src = self._load_main_source()
+        # Ensure the old leaking pattern is gone from the response body
+        # (it may still appear in logger calls, which is fine)
+        # Look for the content= kwarg in generic_exception_handler
+        handler_match = re.search(
+            r"async def generic_exception_handler.*?return _apply_cors_headers",
+            src,
+            re.DOTALL,
+        )
+        assert handler_match, "Could not locate generic_exception_handler body"
+        handler_body = handler_match.group(0)
+        assert "type(exc).__name__" not in handler_body.split("content=", 1)[-1], (
+            "generic_exception_handler must not include type(exc).__name__ "
+            "in the HTTP response content"
+        )
+        assert "str(exc)" not in handler_body.split("content=", 1)[-1], (
+            "generic_exception_handler must not include str(exc) "
+            "in the HTTP response content"
+        )

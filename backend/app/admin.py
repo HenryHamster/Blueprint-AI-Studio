@@ -1624,7 +1624,8 @@ async def create_task_manually(
     try:
         task_payload = validate_task_payload(task_payload)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=422, detail="Invalid request")
 
     # Guard: cap active tasks per project to prevent queue explosion
     active_count = (
@@ -1888,7 +1889,8 @@ async def create_compute_experiment_task(
     try:
         task_payload = validate_task_payload(task_payload_raw)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=422, detail="Invalid request")
 
     active_count = (
         await session.execute(

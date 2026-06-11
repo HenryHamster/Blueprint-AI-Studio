@@ -7,6 +7,7 @@ needs viewer, killing needs member.
 """
 
 import json
+import logging
 import uuid
 from datetime import timedelta
 from typing import Any, Dict
@@ -21,6 +22,8 @@ from app.compute_jobs import kill_compute_job, list_compute_jobs
 from app.database import get_session
 from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
 from app.schemas import serialize_compute_job_response_safe
+
+logger = logging.getLogger(__name__)
 
 _COMPUTE_JOB_TERMINAL_STATUSES = frozenset(
     {
@@ -141,7 +144,8 @@ async def kill_project_compute_job(
             killed_by=current_user.get("email") or current_user.get("user_id"),
         )
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.warning("Validation error killing compute job: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=409, detail="Invalid request") from exc
     if killed is None:
         # A peer drove the job terminal during the lock-free RPC window; re-fetch
         # the now-terminal job so the caller still gets the final state.

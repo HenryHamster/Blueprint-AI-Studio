@@ -1194,6 +1194,7 @@ async def get_viewport_failure_screenshot_download_url(
     project_id: uuid.UUID,
     component: str,
     width: int,
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Generate a 1-hour signed download URL for a viewport failure screenshot.
@@ -1216,6 +1217,8 @@ async def get_viewport_failure_screenshot_download_url(
         StorageUriError,
         generate_download_signed_url,
     )
+
+    await _get_user_project(project_id, current_user["user_id"], session)
 
     safe_component = _re.sub(r"[^A-Za-z0-9._-]", "_", component)[:100]
     object_name = f"viewport-failures/{project_id}/{safe_component}-{width}.png"
@@ -1684,13 +1687,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error(
+    logger.exception(
         f"[UNHANDLED] {request.method} {request.url.path}: {type(exc).__name__}: {exc}",
-        exc_info=True,
     )
     resp = JSONResponse(
         status_code=500,
-        content={"detail": f"{type(exc).__name__}: {str(exc)[:200]}"},
+        content={"detail": "Internal Server Error"},
     )
     return _apply_cors_headers(resp, request)
 

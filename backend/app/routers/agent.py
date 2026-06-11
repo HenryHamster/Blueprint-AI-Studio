@@ -4362,7 +4362,8 @@ async def spawn_subtask(
         try:
             payload = validate_task_payload(payload)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+            raise HTTPException(status_code=422, detail="Invalid request") from exc
         parent_payload = parent_task.first_payload
         parent_context = {
             "parent_task_id": str(parent_task.id),

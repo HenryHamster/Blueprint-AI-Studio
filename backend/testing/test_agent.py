@@ -25,6 +25,7 @@ from app.models import (
     LLMProviderName,
     MaxPlanAccount,
     Project,
+    ProjectMember,
     ProjectStatus,
     ReleaseDeployArtifact,
     ReleaseVersion,
@@ -18140,6 +18141,9 @@ async def test_viewport_failure_screenshot_download_url(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="member")
+    db_session.add(member)
+    await db_session.commit()
 
     captured = {}
     fake_url = (
@@ -18186,6 +18190,9 @@ async def test_viewport_failure_screenshot_download_url_storage_failure(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="member")
+    db_session.add(member)
+    await db_session.commit()
 
     mocker.patch(
         "google.cloud.storage.Client", side_effect=RuntimeError("gcs unavailable")
@@ -18200,6 +18207,30 @@ async def test_viewport_failure_screenshot_download_url_storage_failure(
         },
     )
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_viewport_failure_screenshot_download_url_non_member_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Non-member cannot download screenshots from a project they don't belong to."""
+    project = Project(
+        name="Viewport Download Auth Test", user_id="user-viewport-dl-003"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # Intentionally do NOT add test-user-123 as a project member
+
+    resp = await client.get(
+        "/api/admin/viewport-failures/download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "MessagesPanel",
+            "width": 375,
+        },
+    )
+    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

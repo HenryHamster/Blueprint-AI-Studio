@@ -1,5 +1,6 @@
 """Agent-facing compute-job launch and polling endpoints."""
 
+import logging
 import uuid
 from typing import Any, Dict
 
@@ -20,6 +21,7 @@ from app.shared_state import limiter
 from app.task_capabilities import COMPUTE_JOB_LAUNCH_TASK_TYPES
 from app.vm_cost_rates import resolve_compute_machine_type, supported_machine_types
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 
@@ -115,7 +117,8 @@ async def launch_compute_job(
     except ComputeLaunchPreconditionFailed as exc:
         raise HTTPException(status_code=412, detail=exc.detail) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        logger.warning("Validation error launching compute job: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=422, detail="Invalid request") from exc
 
     return {"status": "success", "data": serialize_compute_job_response(job)}
 
