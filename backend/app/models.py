@@ -1247,6 +1247,10 @@ class Task(SQLModel, table=True):
         # narrower prefix.
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
+        Index("ix_task_project_status_updated", "project_id", "status", "updated_at"),
+        Index(
+            "ix_task_project_status_completed", "project_id", "status", "completed_at"
+        ),
         # BLOCKED joins the active-status set here (alembic 0138): a blocked
         # task is non-terminal and still owns its idempotency slot, so a
         # duplicate insert with the same key while the original is parked must
@@ -1317,6 +1321,20 @@ class Task(SQLModel, table=True):
             "status",
             "last_heartbeat",
             postgresql_where=text("status IN ('IN_PROGRESS', 'PROVISIONING')"),
+        ),
+        # Partial index for the admin health-overview query that selects
+        # COMPLETED/FAILED tasks with vm_instance_id IS NOT NULL ordered by
+        # last_heartbeat desc. The existing ix_task_status_last_heartbeat is
+        # partial on IN_PROGRESS/PROVISIONING so it actively excludes these rows.
+        Index(
+            "ix_task_terminal_last_heartbeat",
+            "last_heartbeat",
+            postgresql_where=text(
+                "status IN ('COMPLETED', 'FAILED') AND vm_instance_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "status IN ('COMPLETED', 'FAILED') AND vm_instance_id IS NOT NULL"
+            ),
         ),
         Index(
             "ix_task_parent_task_id_status",

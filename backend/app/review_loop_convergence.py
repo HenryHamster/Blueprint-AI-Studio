@@ -263,11 +263,10 @@ async def _cap_exhausted_after_approve(
                     select(Task)
                     .where(
                         Task.project_id == orig.project_id,
-                        Task.status.in_(
-                            [TaskStatus.COMPLETED, TaskStatus.EVALUATING]
-                        ),
+                        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.EVALUATING]),
                     )
                     .order_by(Task.completed_at.desc().nullslast())
+                    .limit(200)
                 )
             )
             .scalars()
@@ -517,9 +516,7 @@ async def _handle_cap_exhaustion(
         try:
             from app.task_completion import _record_remediation_if_terminal
 
-            await _record_remediation_if_terminal(
-                orig, TaskStatus.CANCELLED, session
-            )
+            await _record_remediation_if_terminal(orig, TaskStatus.CANCELLED, session)
             await session.commit()
         except Exception as e:  # noqa: BLE001
             logger.warning(
@@ -578,9 +575,7 @@ async def _handle_cap_exhaustion(
         from sqlalchemy.orm.attributes import flag_modified
 
         _preserve_kind = (
-            "back-merge resolver"
-            if _is_backmerge_resolver(orig)
-            else "rollup"
+            "back-merge resolver" if _is_backmerge_resolver(orig) else "rollup"
         )
         logger.info(
             f"[PIPELINE] Cap reached for PR #{pr_number} on a non-empty, "
