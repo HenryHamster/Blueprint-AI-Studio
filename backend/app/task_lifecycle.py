@@ -88,6 +88,46 @@ logger = logging.getLogger(__name__)
 _PR_OPENING_COMPLETION_TYPES: frozenset[str] = (WRITE_TASK_TYPES - {"fix"}) | {""}
 
 
+def _sidecar_application_marker(
+    *, lane: str, sidecar_id: object, verdict_key: str
+) -> dict[str, str]:
+    return {
+        "lane": lane,
+        "sidecar_task_id": str(sidecar_id),
+        "verdict_key": verdict_key,
+    }
+
+
+def _sidecar_application_pending(
+    ctx: dict, *, lane: str, sidecar_id: object | None = None
+) -> bool:
+    marker = ctx.get("sidecar_verdict_application_pending")
+    if not isinstance(marker, dict) or marker.get("lane") != lane:
+        return False
+    return sidecar_id is None or marker.get("sidecar_task_id") == str(sidecar_id)
+
+
+def _set_sidecar_application_pending(
+    ctx: dict, *, lane: str, sidecar_id: object, verdict_key: str
+) -> None:
+    ctx["sidecar_verdict_application_pending"] = _sidecar_application_marker(
+        lane=lane,
+        sidecar_id=sidecar_id,
+        verdict_key=verdict_key,
+    )
+
+
+def _clear_sidecar_application_pending(
+    task: Task, *, lane: str, sidecar_id: object | None = None
+) -> None:
+    ctx = dict(task.context or {})
+    if not _sidecar_application_pending(ctx, lane=lane, sidecar_id=sidecar_id):
+        return
+    ctx.pop("sidecar_verdict_application_pending", None)
+    task.context = ctx
+    flag_modified(task, "context")
+
+
 # Verdict-word aliases used by the structured-verdict fallback parser. Each
 # canonical verdict maps to the surface forms an agent might emit. Matched only
 # when *anchored* (quoted, JSON-field, or standalone verdict line) so a bare
@@ -446,7 +486,29 @@ async def _resolve_quality_grader_completion(
         return
 
     ctx = dict(source.context or {})
-    if is_adversarial:
+    lane = "adversarial_grader" if is_adversarial else "quality_grader"
+    verdict_key = (
+        ADVERSARIAL_GATE_VERDICT_KEY if is_adversarial else QUALITY_GRADER_VERDICT_KEY
+    )
+    pending_application = _sidecar_application_pending(
+        ctx, lane=lane, sidecar_id=grader.id
+    )
+    if not pending_application and (
+        verdict_key in ctx
+        or (
+            ("awaiting_adversarial_grader" if is_adversarial else "awaiting_quality_grader")
+            not in ctx
+        )
+    ):
+        await session.commit()
+        logger.info(
+            "[GRADER] Grader %s for source %s already resolved; ignoring replayed terminal status",
+            grader.id,
+            source.id,
+        )
+        return
+
+    if is_adversarial and not pending_application:
         # Prefer the source-side persisted hashes, then the grader copy written
         # at spawn time, then the legacy plan_output reconstruction.
         all_hashes = _resolve_adversarial_challenged_hashes(source, grader)
@@ -530,11 +592,17 @@ async def _resolve_quality_grader_completion(
         }
         ctx[ADVERSARIAL_GATE_VERDICT_KEY] = gate_record
         ctx.pop("awaiting_adversarial_grader", None)
+        _set_sidecar_application_pending(
+            ctx,
+            lane=lane,
+            sidecar_id=grader.id,
+            verdict_key=ADVERSARIAL_GATE_VERDICT_KEY,
+        )
         grader.latest_status_message = (
             f"Adversarial challenge: {failed_count}/{len(finding_verdicts)} "
             f"finding(s) failed"
         )[:500]
-    else:
+    elif not pending_application:
         verdict = parse_grader_verdict(grader_logs, completed=completed)
         grader.latest_status_message = (
             f"Forward-quality grade: {'PASS' if verdict.passed else 'FAIL'} — "
@@ -547,6 +615,12 @@ async def _resolve_quality_grader_completion(
             "strategy": "forward-quality",
         }
         ctx.pop("awaiting_quality_grader", None)
+        _set_sidecar_application_pending(
+            ctx,
+            lane=lane,
+            sidecar_id=grader.id,
+            verdict_key=QUALITY_GRADER_VERDICT_KEY,
+        )
     session.add(grader)
     source.context = ctx
     flag_modified(source, "context")
@@ -588,6 +662,9 @@ async def _resolve_quality_grader_completion(
         else:
             resume_logs = source.latest_status_message or ""
         await handler(source, resume_logs, session)
+        await session.refresh(source)
+        _clear_sidecar_application_pending(source, lane=lane, sidecar_id=grader.id)
+        session.add(source)
     else:
         logger.warning(
             "[GRADER] No resume handler for source type %r (task %s); verdict "
@@ -595,6 +672,8 @@ async def _resolve_quality_grader_completion(
             source_type,
             source.id,
         )
+        _clear_sidecar_application_pending(source, lane=lane, sidecar_id=grader.id)
+        session.add(source)
     await session.commit()
 
     # Source is now terminal — propagate to its parent rollup and broadcast.
@@ -646,15 +725,6 @@ async def _resolve_safeguard_challenge_completion(
     )
     from app.task_completion import _maybe_release_safeguard_gate
 
-    completed = payload.status == TaskStatus.COMPLETED
-    challenge_logs = payload.logs or challenge.latest_status_message or ""
-    verdict = parse_safeguard_challenge_outcome(challenge_logs, completed=completed)
-
-    challenge.latest_status_message = (
-        f"Safeguard challenge: {verdict['outcome']} — {verdict['reasoning']}"
-    )[:500]
-    session.add(challenge)
-
     source_id = (challenge.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY)
     try:
         source_uuid = uuid.UUID(str(source_id))
@@ -681,12 +751,44 @@ async def _resolve_safeguard_challenge_completion(
         return
 
     ctx = dict(safeguard.context or {})
-    ctx[SAFEGUARD_CHALLENGE_VERDICT_KEY] = {
-        "outcome": verdict["outcome"],
-        "reasoning": verdict["reasoning"],
-        "challenge_task_id": str(challenge.id),
-    }
-    ctx.pop("awaiting_safeguard_challenge", None)
+    lane = "safeguard_challenge"
+    pending_application = _sidecar_application_pending(
+        ctx, lane=lane, sidecar_id=challenge.id
+    )
+    if not pending_application and (
+        SAFEGUARD_CHALLENGE_VERDICT_KEY in ctx
+        or "awaiting_safeguard_challenge" not in ctx
+    ):
+        await session.commit()
+        logger.info(
+            "[SAFEGUARD] Challenge %s for safeguard %s already resolved; ignoring replayed terminal status",
+            challenge.id,
+            safeguard.id,
+        )
+        return
+
+    if not pending_application:
+        completed = payload.status == TaskStatus.COMPLETED
+        challenge_logs = payload.logs or challenge.latest_status_message or ""
+        verdict = parse_safeguard_challenge_outcome(
+            challenge_logs, completed=completed
+        )
+        challenge.latest_status_message = (
+            f"Safeguard challenge: {verdict['outcome']} — {verdict['reasoning']}"
+        )[:500]
+        session.add(challenge)
+        ctx[SAFEGUARD_CHALLENGE_VERDICT_KEY] = {
+            "outcome": verdict["outcome"],
+            "reasoning": verdict["reasoning"],
+            "challenge_task_id": str(challenge.id),
+        }
+        ctx.pop("awaiting_safeguard_challenge", None)
+        _set_sidecar_application_pending(
+            ctx,
+            lane=lane,
+            sidecar_id=challenge.id,
+            verdict_key=SAFEGUARD_CHALLENGE_VERDICT_KEY,
+        )
     safeguard.context = ctx
     flag_modified(safeguard, "context")
     # Restore terminal status so _maybe_release_safeguard_gate sees a resolved task.
@@ -704,12 +806,20 @@ async def _resolve_safeguard_challenge_completion(
         findings = None
 
     await _maybe_release_safeguard_gate(safeguard, findings, session)
+    await session.refresh(safeguard)
+    _clear_sidecar_application_pending(
+        safeguard, lane=lane, sidecar_id=challenge.id
+    )
+    session.add(safeguard)
+    await session.commit()
 
     logger.info(
         "[SAFEGUARD] Challenge %s resolved safeguard %s with outcome=%s",
         challenge.id,
         safeguard.id,
-        verdict["outcome"],
+        ((safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY) or {}).get(
+            "outcome", "applied"
+        ),
     )
 
 
@@ -764,20 +874,12 @@ async def _resolve_review_second_opinion(
         )
         return
 
-    # Idempotence guard: resolution must run exactly once per challenge. The
-    # challenger's post-commit can legitimately re-fire after the first pass
-    # has consumed the parked verdict — an agent HTTP retry or the
-    # post_commit_pending sweep replays it while the first pass is still in
-    # (or died during) the slow re-dispatch below, and the replay payload
-    # carries no logs. Without this guard the replay falls into the
-    # fail-closed branch and OVERWRITES the real reconciliation with a
-    # "challenge unresolved — manual review required" escalation (observed
-    # fleet-wide on PRs #9303/#9308/#9319, 2026-06-10). The first pass pops
-    # AWAITING and writes the reconciliation record under the review row's
-    # FOR UPDATE lock, so under our own lock those keys are authoritative:
-    # either one says the challenge is already resolved — no-op.
     _review_ctx = review.context or {}
-    if (
+    lane = "review_second_opinion"
+    pending_application = _sidecar_application_pending(
+        dict(_review_ctx), lane=lane, sidecar_id=challenger.id
+    )
+    if not pending_application and (
         REVIEW_SECOND_OPINION_RECONCILIATION_KEY in _review_ctx
         or REVIEW_SECOND_OPINION_AWAITING_KEY not in _review_ctx
     ):
@@ -793,14 +895,21 @@ async def _resolve_review_second_opinion(
     primary_verdict = parked.get("verdict") or "REQUEST_CHANGES"
     primary_issues = parked.get("issues") or []
 
-    completed = payload.status == TaskStatus.COMPLETED
-    panel = (
-        _parse_panel_review_output(
-            payload.logs or challenger.latest_status_message or ""
+    if pending_application:
+        record = dict(
+            (review.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
+            or {}
         )
-        if completed
-        else None
-    )
+        panel = {"pending_replay": True} if record else None
+    else:
+        completed = payload.status == TaskStatus.COMPLETED
+        panel = (
+            _parse_panel_review_output(
+                payload.logs or challenger.latest_status_message or ""
+            )
+            if completed
+            else None
+        )
 
     if panel is None:
         original_task_id = parked.get("original_task_id") or ""
@@ -861,26 +970,30 @@ async def _resolve_review_second_opinion(
             )
         return
 
-    record = reconcile_review_second_opinion(primary_verdict, primary_issues, panel)
-    record["challenger_task_id"] = str(challenger.id)
-    record["review_task_id"] = str(review.id)
+    if not pending_application:
+        record = reconcile_review_second_opinion(primary_verdict, primary_issues, panel)
+        record["challenger_task_id"] = str(challenger.id)
+        record["review_task_id"] = str(review.id)
 
-    ctx = dict(review.context or {})
-    ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = record
-    ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
-    # Drop the parked snapshot too — it holds the PRE-reconciliation verdict +
-    # issues and has been consumed; leaving it invites stale reads downstream.
-    ctx.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
-    review.context = ctx
-    flag_modified(review, "context")
-    review.status = TaskStatus.COMPLETED
-    session.add(review)
-    challenger.latest_status_message = (
-        f"Second-opinion panel: {record['state']} "
-        f"→ {record['reconciled_verdict']}"
-    )[:500]
-    session.add(challenger)
-    await session.commit()
+        ctx = dict(review.context or {})
+        ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = record
+        ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
+        _set_sidecar_application_pending(
+            ctx,
+            lane=lane,
+            sidecar_id=challenger.id,
+            verdict_key=REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+        )
+        review.context = ctx
+        flag_modified(review, "context")
+        review.status = TaskStatus.COMPLETED
+        session.add(review)
+        challenger.latest_status_message = (
+            f"Second-opinion panel: {record['state']} "
+            f"→ {record['reconciled_verdict']}"
+        )[:500]
+        session.add(challenger)
+        await session.commit()
 
     reconstructed = AgentStatusPayload(
         task_id=review.id,
@@ -903,6 +1016,15 @@ async def _resolve_review_second_opinion(
         record["reconciled_verdict"],
     )
     await _process_post_commit(review.id, reconstructed)
+    await session.refresh(review)
+    ctx = dict(review.context or {})
+    ctx.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
+    review.context = ctx
+    _clear_sidecar_application_pending(
+        review, lane=lane, sidecar_id=challenger.id
+    )
+    session.add(review)
+    await session.commit()
 
 
 async def _resolve_finding_challenge_completion(
@@ -927,24 +1049,10 @@ async def _resolve_finding_challenge_completion(
     )
     from app.research_completion import _handle_research_completion
 
-    completed = payload.status == TaskStatus.COMPLETED
-    challenge_logs = payload.logs or challenge.latest_status_message or ""
     cctx = challenge.context or {}
     boundary = str(cctx.get("challenged_boundary") or "")
     first_verdict = str(cctx.get("challenged_first_verdict") or "")
     source_id = cctx.get(FINDING_CHALLENGE_SOURCE_KEY)
-    record = parse_finding_challenge_verdict(
-        challenge_logs,
-        first_verdict,
-        boundary,
-        str(challenge.id),
-        completed=completed,
-        source_task_id=str(source_id) if source_id else None,
-    )
-    challenge.latest_status_message = (
-        f"Finding challenge ({boundary}): {record.agreement} — {record.reason}"
-    )[:500]
-    session.add(challenge)
 
     try:
         source_uuid = uuid.UUID(str(source_id))
@@ -971,8 +1079,44 @@ async def _resolve_finding_challenge_completion(
         return
 
     ctx = dict(source.context or {})
-    ctx[FINDING_CHALLENGE_VERDICT_KEY] = record.to_context()
-    ctx.pop("awaiting_finding_challenge", None)
+    lane = "finding_challenge"
+    pending_application = _sidecar_application_pending(
+        ctx, lane=lane, sidecar_id=challenge.id
+    )
+    if not pending_application and (
+        FINDING_CHALLENGE_VERDICT_KEY in ctx or "awaiting_finding_challenge" not in ctx
+    ):
+        await session.commit()
+        logger.info(
+            "[CHALLENGE] Challenge %s for source %s already resolved; ignoring replayed terminal status",
+            challenge.id,
+            source.id,
+        )
+        return
+
+    if not pending_application:
+        completed = payload.status == TaskStatus.COMPLETED
+        challenge_logs = payload.logs or challenge.latest_status_message or ""
+        record = parse_finding_challenge_verdict(
+            challenge_logs,
+            first_verdict,
+            boundary,
+            str(challenge.id),
+            completed=completed,
+            source_task_id=str(source_id) if source_id else None,
+        )
+        challenge.latest_status_message = (
+            f"Finding challenge ({boundary}): {record.agreement} — {record.reason}"
+        )[:500]
+        session.add(challenge)
+        ctx[FINDING_CHALLENGE_VERDICT_KEY] = record.to_context()
+        ctx.pop("awaiting_finding_challenge", None)
+        _set_sidecar_application_pending(
+            ctx,
+            lane=lane,
+            sidecar_id=challenge.id,
+            verdict_key=FINDING_CHALLENGE_VERDICT_KEY,
+        )
     source.context = ctx
     flag_modified(source, "context")
     source.status = TaskStatus.COMPLETED
@@ -999,6 +1143,11 @@ async def _resolve_finding_challenge_completion(
         else:
             resume_logs = source.latest_status_message or ""
         await handler(source, resume_logs, session)
+        await session.refresh(source)
+        _clear_sidecar_application_pending(
+            source, lane=lane, sidecar_id=challenge.id
+        )
+        session.add(source)
     else:
         logger.warning(
             "[CHALLENGE] No resume handler for source type %r (task %s); verdict recorded but source not re-dispatched",
@@ -5276,7 +5425,7 @@ async def _process_post_commit(
                     raise PostCommitFinalCommitFailed(
                         f"research mid-spawn transient error for {task_id}; "
                         f"sweep retries spawn: {handler_exc!r}"
-                    )
+                    ) from handler_exc
                 if is_transient and task.attempt_count < _runtime_config["max_retries"]:
                     task.status = TaskStatus.QUEUED
                     # The earlier COMPLETED/FAILED assignment fired the SQLAlchemy set
@@ -5328,7 +5477,7 @@ async def _process_post_commit(
                     try:
                         await session.commit()
                     except Exception as _requeue_commit_exc:
-                        logger.error(
+                        logger.exception(
                             "[HANDLER] Failed to commit QUEUED state for task %s: %r — "
                             "preserving post_commit_pending for sweep retry",
                             task_id,

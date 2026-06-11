@@ -9144,6 +9144,188 @@ async def test_adversarial_gate_uses_bounded_valid_manifest_for_long_findings(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Parked-awaiting re-dispatch guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_pytest.mark.asyncio
+async def test_redispatch_while_awaiting_adversarial_grader_spawns_nothing(
+    db_session, mocker
+):
+    """ACCEPTANCE TEST: re-dispatching a parked source is a safe no-op.
+
+    A research task parked EVALUATING (awaiting_adversarial_grader set, no verdict
+    yet) must not spawn implementation work when the completion handler is invoked
+    again — the adversarial gate's single-shot guard blocks a second grader spawn,
+    but without the parked-awaiting guard the spawn loop runs ungated and high-stakes
+    findings bypass the gate entirely.
+
+    After the no-op re-entry the task must still be EVALUATING with no children.
+    """
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-redispatch01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs = _high_stakes_finding(direction["id"], "Security-critical re-dispatch finding")
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    # Simulate a task that is already parked awaiting adversarial grader but has
+    # no verdict yet — the state that the post-commit sweep or a duplicate terminal
+    # status post would trigger a re-dispatch from.
+    task.status = TaskStatus.EVALUATING
+    task.context = {
+        **(task.context or {}),
+        "awaiting_adversarial_grader": "some-grader-id",
+        "_adversarial_challenged_hashes": ["deadbeef"],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # The task must remain EVALUATING — no status change.
+    assert task.status == TaskStatus.EVALUATING, (
+        "Re-dispatch while parked must leave task EVALUATING"
+    )
+
+    # No implementation children may have been spawned.
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], (
+        "Re-dispatch while parked must not spawn any implementation tasks"
+    )
+
+    # The awaiting flag must still be set — the guard must not clear it.
+    assert task.context.get("awaiting_adversarial_grader") == "some-grader-id", (
+        "awaiting_adversarial_grader flag must still be set after no-op re-dispatch"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_redispatch_while_awaiting_finding_challenge_spawns_nothing(
+    db_session, mocker
+):
+    """Re-dispatch while parked awaiting a finding challenge is a safe no-op."""
+    from test_autonomous_research import _patch_research_externals, _make_finding
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-redispatch02")
+    _patch_research_externals(mocker)
+
+    finding = _make_finding(direction_id=direction["id"], title="Challenge-pending finding")
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    # Simulate a task parked awaiting a finding challenge with no verdict yet.
+    task.status = TaskStatus.EVALUATING
+    task.context = {
+        **(task.context or {}),
+        "awaiting_finding_challenge": "some-challenge-id",
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.EVALUATING, (
+        "Re-dispatch while parked awaiting finding challenge must leave task EVALUATING"
+    )
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], (
+        "Re-dispatch while parked awaiting finding challenge must not spawn children"
+    )
+
+    assert task.context.get("awaiting_finding_challenge"), (
+        "awaiting_finding_challenge flag must still be set after no-op re-dispatch"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_verdict_present_allows_reentry(db_session, mocker):
+    """When the adversarial verdict IS present, re-entry must proceed normally.
+
+    The parked-awaiting guard must only fire when the verdict is absent.
+    A task with awaiting_adversarial_grader=True AND a verdict in context is a
+    legitimate re-entry (the grader completed) and must not be blocked.
+    """
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-redispatch03")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs = _high_stakes_finding(direction["id"], "Verdict-present re-entry finding")
+    fhash = _finding_hash(hs["title"], hs.get("description", "") or hs.get("prompt", ""))
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    # Task holds BOTH the awaiting flag AND a verdict — re-entry after grader completed.
+    task.status = TaskStatus.COMPLETED
+    task.plan_output = [hs]
+    task.context = {
+        **(task.context or {}),
+        # awaiting flag has already been cleared by _resolve_quality_grader_completion,
+        # but simulate the edge where it was not cleaned up yet — the guard's condition
+        # is _adversarial_verdict_raw is None, so having a verdict bypasses the guard.
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                fhash: {"passed": True, "reason": "all criteria met", "explicit": True}
+            },
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # With a PASS verdict the finding must spawn normally.
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) >= 1, (
+        "With a PASS adversarial verdict, finding must spawn even if awaiting flag was set"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _commit_or_handle_duplicate_spawn — self-claim collision recovery
 # ─────────────────────────────────────────────────────────────────────────────
 

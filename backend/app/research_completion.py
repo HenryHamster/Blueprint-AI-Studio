@@ -1760,6 +1760,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
     _adversarial_verdict_raw = (task.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
     _finding_challenge_verdict = (task.context or {}).get(FINDING_CHALLENGE_VERDICT_KEY)
+
+    # Parked-awaiting guards: re-dispatch while a sidecar verdict is pending is
+    # a safe no-op — return immediately so the spawn loop does not run ungated.
+    # The stranded-sidecar sweep owns redelivery when a sidecar dies silently.
+    if (task.context or {}).get("awaiting_adversarial_grader") and _adversarial_verdict_raw is None:
+        logger.info(
+            "[RESEARCH] Task %s re-dispatched while parked awaiting adversarial "
+            "grader — no-op (verdict not yet present)",
+            task.id,
+        )
+        return
+    if (task.context or {}).get("awaiting_finding_challenge") and _finding_challenge_verdict is None:
+        logger.info(
+            "[RESEARCH] Task %s re-dispatched while parked awaiting finding "
+            "challenge — no-op (verdict not yet present)",
+            task.id,
+        )
+        return
+
     if _grader_verdict is not None and not _grader_verdict.get("passed", False):
         # FAILED forward-quality gate: do NOT spawn implementation tasks and do
         # NOT complete clean. Mark FAILED so the research is not trusted, and

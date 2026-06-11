@@ -2634,6 +2634,31 @@ async def _sweep_post_commit_pending():
                 # DUPLICATE children. A childed EVALUATING parent is a normal
                 # parked parent whose marker is stale; clear it without re-run.
                 if task.status == TaskStatus.EVALUATING:
+                    # Parked-awaiting sidecar guard: an EVALUATING task that holds
+                    # an awaiting_* key is intentionally parked waiting for a
+                    # side-car verdict — it is NOT a dead childless handler. The
+                    # stranded-sidecar sweep owns redelivery when the sidecar dies.
+                    # Clear the stale post_commit_pending flag without re-running.
+                    _awaiting_sidecar = any(
+                        ctx.get(k) for k in _AWAITING_SIDECAR_KEYS
+                    )
+                    if _awaiting_sidecar:
+                        logger.info(
+                            f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} is "
+                            f"EVALUATING and parked awaiting sidecar — clearing "
+                            f"stale pending marker without re-run"
+                        )
+                        from sqlalchemy.orm.attributes import flag_modified as _fm2
+
+                        new_ctx = dict(ctx)
+                        new_ctx.pop("_post_commit_pending_meta", None)
+                        task.context = new_ctx
+                        task.post_commit_pending = False
+                        _fm2(task, "context")
+                        session.add(task)
+                        await session.commit()
+                        continue
+
                     child_count = (
                         await session.execute(
                             select(func.count())
@@ -3527,6 +3552,7 @@ _AWAITING_SIDECAR_KEYS = (
     "awaiting_finding_challenge",
     "awaiting_review_second_opinion",
 )
+_SIDECAR_VERDICT_APPLICATION_PENDING_KEY = "sidecar_verdict_application_pending"
 
 
 async def _sweep_stranded_sidecar_sources() -> None:
@@ -3542,7 +3568,9 @@ async def _sweep_stranded_sidecar_sources() -> None:
     (post-spawn; initial value is ``True``), loads each referenced sidecar, and,
     if the sidecar is terminal (FAILED/CANCELLED), calls the lane resolver via
     ``trigger_stranded_sidecar_resolution``, which constructs a synthetic payload
-    and invokes the resolver with existing fail-closed semantics.
+    and invokes the resolver with existing fail-closed semantics. It also retries
+    terminal source tasks that already recorded a side-car verdict but still carry
+    the durable application-pending marker.
     """
     import uuid as _uuid
 
@@ -3593,6 +3621,75 @@ async def _sweep_stranded_sidecar_sources() -> None:
                 logger.info(
                     "[SIDECAR-RECOVERY] Resolved %d stranded source task(s)", resolved
                 )
+
+            if resolve_dialect_name(session) == "postgresql":
+                pending_marker_present = Task.context.has_key(
+                    _SIDECAR_VERDICT_APPLICATION_PENDING_KEY
+                )
+            else:
+                pending_marker_present = func.json_extract(
+                    Task.context,
+                    f"$.{_SIDECAR_VERDICT_APPLICATION_PENDING_KEY}",
+                ).isnot(None)
+
+            pending_result = await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.archived,
+                        Task.project_id,
+                        Task.context,
+                    )
+                )
+                .where(
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.archived.is_(False),
+                    pending_marker_present,
+                )
+            )
+            terminal_sources = pending_result.scalars().all()
+            retried = 0
+            for source in terminal_sources:
+                ctx = source.context or {}
+                marker = ctx.get(_SIDECAR_VERDICT_APPLICATION_PENDING_KEY)
+                if not isinstance(marker, dict):
+                    continue
+                sidecar_ref = marker.get("sidecar_task_id")
+                try:
+                    sidecar_uuid = _uuid.UUID(str(sidecar_ref))
+                except (ValueError, TypeError):
+                    continue
+                sidecar = await session.get(Task, sidecar_uuid)
+                if sidecar is None or sidecar.status not in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }:
+                    continue
+                logger.warning(
+                    "[SIDECAR-RECOVERY] Source %s has unapplied side-car verdict "
+                    "(lane=%s sidecar=%s status=%s) — retrying application",
+                    source.id,
+                    marker.get("lane"),
+                    sidecar.id,
+                    sidecar.status,
+                )
+                try:
+                    await trigger_stranded_sidecar_resolution(sidecar, session)
+                    retried += 1
+                except Exception:
+                    logger.exception(
+                        "[SIDECAR-RECOVERY] Application retry failed for sidecar %s / source %s",
+                        sidecar.id,
+                        source.id,
+                    )
+            if retried:
+                logger.info(
+                    "[SIDECAR-RECOVERY] Retried %d unapplied side-car verdict(s)",
+                    retried,
+                )
     except Exception:
         logger.exception("[SIDECAR-RECOVERY] Stranded-sidecar sweep failed")
 
@@ -3630,7 +3727,7 @@ async def _try_bootstrap_spawn_advisory_lock(session, project_id: object) -> boo
                 {"k": _bootstrap_spawn_lock_key(project_id)},
             )
         ).scalar()
-    except Exception:  # noqa: BLE001 — SQLite/test dialects raise NotSupportedError; treat as no contention
+    except Exception:
         return True
     return bool(got)
 

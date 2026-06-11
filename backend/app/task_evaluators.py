@@ -149,6 +149,12 @@ FINDING_CHALLENGE_SOURCE_KEY = "finding_challenge_for_task_id"
 # to drop or dispatch the finding, and to avoid re-spawning a challenge.
 FINDING_CHALLENGE_VERDICT_KEY = "finding_challenge"
 
+# Context key written on a SOURCE task after a side-car verdict/reconciliation
+# has been durably recorded but before the source's completion/gate handler has
+# successfully applied it. Recovery sweeps use this to retry application for a
+# terminal source that would otherwise look finished.
+SIDECAR_VERDICT_APPLICATION_PENDING_KEY = "sidecar_verdict_application_pending"
+
 # Agreement of the second opinion with the first verdict being challenged.
 CHALLENGE_AGREES = "agrees"
 CHALLENGE_DISAGREES = "disagrees"

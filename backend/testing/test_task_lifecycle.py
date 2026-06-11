@@ -8415,6 +8415,114 @@ async def _make_research_source_and_grader(session, *, terminal_status=TaskStatu
 
 
 @pytest.mark.asyncio
+async def test_grader_verdict_handler_crash_is_recoverable(tl_db, mocker):
+    """A crash after verdict-record commit must leave a marker the sweep can recover."""
+    from app.schemas import AgentStatusPayload
+    from app.services import _sweep_stranded_sidecar_sources
+    from app.task_evaluators import (
+        ADVERSARIAL_GATE_VERDICT_KEY,
+        SIDECAR_VERDICT_APPLICATION_PENDING_KEY,
+    )
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    session, Session = tl_db
+    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    handler = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(side_effect=[RuntimeError("handler crashed"), None]),
+    )
+
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+    source.plan_output = []
+    source.context = {"awaiting_adversarial_grader": str(grader.id)}
+    grader.context = {
+        **(grader.context or {}),
+        "_adversarial_challenged_hashes": ["finding-hash-recoverable"],
+    }
+    session.add(source)
+    session.add(grader)
+    await session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='[{"hash": "finding-hash-recoverable", "verdict": "pass", "reason": "valid"}]',
+    )
+    with pytest.raises(RuntimeError, match="handler crashed"):
+        await _resolve_quality_grader_completion(grader, payload, session)
+
+    await session.refresh(source)
+    ctx = source.context or {}
+    assert source.status == TaskStatus.COMPLETED
+    assert ctx.get(ADVERSARIAL_GATE_VERDICT_KEY, {}).get("parse_outcome") == "ok"
+    assert ctx.get(SIDECAR_VERDICT_APPLICATION_PENDING_KEY) == {
+        "lane": "adversarial_grader",
+        "sidecar_task_id": str(grader.id),
+        "verdict_key": ADVERSARIAL_GATE_VERDICT_KEY,
+    }
+
+    await _sweep_stranded_sidecar_sources()
+
+    await session.refresh(source)
+    assert handler.await_count == 2
+    assert SIDECAR_VERDICT_APPLICATION_PENDING_KEY not in (source.context or {})
+    assert (source.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY, {}).get(
+        "finding_verdicts", {}
+    ).get("finding-hash-recoverable", {}).get("passed") is True
+
+
+@pytest.mark.asyncio
+async def test_duplicate_grader_resolution_after_application_is_noop(tl_db, mocker):
+    """A duplicate terminal status post after application must not re-dispatch."""
+    from app.schemas import AgentStatusPayload
+    from app.task_evaluators import ADVERSARIAL_GATE_VERDICT_KEY
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    session, _ = tl_db
+    handler = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+    source.plan_output = []
+    source.context = {"awaiting_adversarial_grader": str(grader.id)}
+    grader.context = {
+        **(grader.context or {}),
+        "_adversarial_challenged_hashes": ["finding-hash-once"],
+    }
+    session.add(source)
+    session.add(grader)
+    await session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='[{"hash": "finding-hash-once", "verdict": "pass", "reason": "valid"}]',
+    )
+    await _resolve_quality_grader_completion(grader, payload, session)
+    await session.refresh(source)
+    first_record = (source.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
+
+    replay_payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='[{"hash": "finding-hash-once", "verdict": "fail", "reason": "stale replay"}]',
+    )
+    await _resolve_quality_grader_completion(grader, replay_payload, session)
+    await session.refresh(source)
+
+    assert handler.await_count == 1
+    assert (source.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY) == first_record
+
+
+@pytest.mark.asyncio
 async def test_reaper_terminal_grader_resolves_parked_source_fail_closed(tl_db, mocker):
     """A reaper-killed adversarial grader (FAILED applied directly, no status POST)
     must cause the parked research source to resolve fail-closed — findings deferred,
