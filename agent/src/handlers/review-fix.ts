@@ -263,6 +263,58 @@ function preinstallNodeDeps(
   }
 }
 
+// ── Lane-resume section (review-fix improvement-lane pilot) ──────────────────
+// Cap rendered items per lane-resume list. The backend already bounds the block;
+// this is a belt-and-suspenders render cap so a malformed oversized block can
+// never balloon the prompt.
+const _RESUME_LIST_RENDER_MAX = 12;
+
+// Renders the bounded `lane_resume` block the backend attaches to a lane-arm
+// FIX task context (accumulated chain knowledge: prior phase summaries,
+// changed/critical files, open issues, known risks, last checkpoint). Returns
+// '' when the block is absent or carries no usable signal — so the section
+// renders only on lane-arm fix tasks and never on classic/control fixes or any
+// reviewer (the key is stripped from review/audit spawns backend-side).
+export function formatLaneResumeSection(
+  resume: Record<string, unknown> | undefined | null,
+): string {
+  if (!resume || typeof resume !== 'object') return '';
+  const lines: string[] = [];
+  const fmtList = (key: string, label: string) => {
+    const v = resume[key];
+    if (Array.isArray(v) && v.length > 0) {
+      const items = v
+        .filter((x): x is string => typeof x === 'string' && x.length > 0)
+        .slice(0, _RESUME_LIST_RENDER_MAX);
+      if (items.length > 0) {
+        lines.push(`${label}:\n${items.map(i => `  - ${i}`).join('\n')}`);
+      }
+    }
+  };
+  fmtList('phase_log', 'Prior phases of this chain');
+  fmtList('critical_files', 'Files changed across the chain');
+  fmtList('remaining', 'Open issues carried into this fix');
+  fmtList('failing_tests', 'Known failing tests / test-failure summary');
+  fmtList('risks', 'Known risks / deferred items');
+  fmtList('progress', 'Progress so far');
+  const sha = typeof resume.last_checkpoint_sha === 'string' ? resume.last_checkpoint_sha : '';
+  if (lines.length === 0 && !sha) return '';
+  const seq = typeof resume.checkpoint_seq === 'number' ? resume.checkpoint_seq : undefined;
+  const phase = typeof resume.last_phase === 'string' ? resume.last_phase : '';
+  const headerSuffix = seq !== undefined && seq > 0
+    ? ` (checkpoint ${seq}${phase ? `, last phase ${phase}` : ''})`
+    : '';
+  const shaLine = sha ? `Resumed from checkpoint SHA \`${sha}\`.\n` : '';
+  return (
+    `## Lane Resume — accumulated chain knowledge${headerSuffix}\n` +
+    shaLine +
+    `This fix runs on a persistent improvement lane. The context below accumulated ` +
+    `across prior phases of this chain — use it to avoid re-investigating from scratch ` +
+    `(it is supplementary; trust the current review feedback for what to change):\n\n` +
+    `${lines.join('\n\n')}\n\n`
+  );
+}
+
 // ── Handler: Review (review a PR, output verdict) ───────────────────────────
 export async function handleReview(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -1063,6 +1115,20 @@ export async function handleFix(
       `## Reviewer's Working Set\n` +
       `The reviewer Read/Edit/Grep'd these paths while forming the verdict above. Start your investigation here — they are the most likely place the cited issues live. You may look elsewhere if the trail leads there:\n${formatted}\n\n` +
       enrichedPrompt;
+  }
+
+  // Lane-resume block: when the backend dispatched this fix on a persistent
+  // improvement lane (lane arm of the review-fix pilot), it attaches accumulated
+  // chain knowledge under `lane_resume`. Surface it so the fix agent starts with
+  // the chain's accumulated context. Present ONLY on lane-arm fix tasks —
+  // reviewers/audits never carry it (stripped backend-side as a transient lane
+  // directive), and classic/control fixes never have it set. Empty string when
+  // the block is absent or carries no usable signal.
+  const laneResumeSection = formatLaneResumeSection(
+    taskContext.lane_resume as Record<string, unknown> | undefined,
+  );
+  if (laneResumeSection) {
+    enrichedPrompt = `${laneResumeSection}${enrichedPrompt}`;
   }
 
   // Prepend the per-type rejection-patterns block (backend-injected at claim

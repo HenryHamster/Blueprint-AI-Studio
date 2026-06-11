@@ -66,6 +66,10 @@ _LANE_PILOT_FUTILITY_N = 90                   # n per arm without reaching adopt
 # ADOPT conditions
 _LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR = -0.01   # merge-rate lift must exceed this (non-inferiority)
 _LANE_PILOT_ADOPT_COST_IMPROVEMENT = 0.05    # cost-per-merged-PR must improve >= this
+# Engagement guard: futility KILL is suppressed when warm-resume engagement is below
+# this fraction among lane-arm fix tasks.  A trial that never exercised warm-resume
+# cannot produce a valid futility verdict — the treatment was never delivered.
+_LANE_PILOT_FUTILITY_MIN_ENGAGEMENT = 0.50
 
 # ── Canonical exported keys (downstream pilot-wiring subtask imports these) ──
 LANE_PILOT_CAP_NAME = "review_fix_lane"
@@ -88,6 +92,14 @@ class LanePilotAggregates(TypedDict, total=False):
     control_cost_per_merged: float | None
     gate_integrity_violations: int
     checkpoint_loss_rate: float | None
+    # Treatment-engagement telemetry (optional; absent when no fix tasks yet).
+    # warm_resume_fraction: fraction of lane-arm fix tasks that carried the
+    #   warm-resume receipt (actually claimed a warm workspace).
+    # checkpoint_fraction: fraction of lane-arm fix tasks that wrote a checkpoint.
+    # lane_fix_tasks_sampled: denominator for the two fractions above.
+    warm_resume_fraction: float | None
+    checkpoint_fraction: float | None
+    lane_fix_tasks_sampled: int
 
 
 def is_lane_pilot_arm_member(context: dict[str, Any]) -> str | None:
@@ -133,6 +145,9 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
     control_cost = aggregates.get("control_cost_per_merged")
     gate_violations = int(aggregates.get("gate_integrity_violations") or 0)
     checkpoint_loss = aggregates.get("checkpoint_loss_rate")
+    warm_resume_fraction = aggregates.get("warm_resume_fraction")
+    checkpoint_fraction = aggregates.get("checkpoint_fraction")
+    lane_fix_tasks_sampled = int(aggregates.get("lane_fix_tasks_sampled") or 0)
 
     thresholds = {
         "min_n": _LANE_PILOT_MIN_N,
@@ -143,6 +158,7 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
         "futility_n": _LANE_PILOT_FUTILITY_N,
         "adopt_merge_lift_floor": _LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR,
         "adopt_cost_improvement": _LANE_PILOT_ADOPT_COST_IMPROVEMENT,
+        "futility_min_engagement": _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT,
     }
 
     base: dict[str, Any] = {
@@ -154,6 +170,9 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
         "control_cost_per_merged": control_cost,
         "gate_integrity_violations": gate_violations,
         "checkpoint_loss_rate": checkpoint_loss,
+        "warm_resume_fraction": warm_resume_fraction,
+        "checkpoint_fraction": checkpoint_fraction,
+        "lane_fix_tasks_sampled": lane_fix_tasks_sampled,
         "thresholds": thresholds,
     }
 
@@ -188,6 +207,18 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
         and gate_violations == 0
     )
     if n_lane >= _LANE_PILOT_FUTILITY_N and n_control >= _LANE_PILOT_FUTILITY_N and not adopt_criteria_met:
+        # Engagement guard: if the treatment was never delivered (warm-resume
+        # engagement below threshold), futility cannot be concluded — the trial
+        # accrued arm counts without the treatment actually running.  Emit
+        # CONTINUE so the operator can diagnose the infrastructure gap.
+        if warm_resume_fraction is not None and warm_resume_fraction < _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT:
+            return {
+                **base,
+                "verdict": "CONTINUE",
+                "verdict_reason": "treatment_not_engaging",
+                "immediate_alert": True,
+                "engagement_low": True,
+            }
         return {**base, "verdict": "KILL", "verdict_reason": "futility_at_max_n", "immediate_alert": False}
 
     # ── ADOPT check ───────────────────────────────────────────────────────────
@@ -266,6 +297,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "futility_n": _LANE_PILOT_FUTILITY_N,
             "adopt_merge_lift_floor": _LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR,
             "adopt_cost_improvement": _LANE_PILOT_ADOPT_COST_IMPROVEMENT,
+            "futility_min_engagement": _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT,
         },
     },
 ]

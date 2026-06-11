@@ -165,15 +165,16 @@ def _merge_manifest_patch(
 
     # Trim if over budget by pruning the longest list fields first.
     while len(json.dumps(merged, default=str).encode()) > _LANE_MANIFEST_MAX_BYTES:
-        trimmed = False
-        for field in ("phase_log", "progress", "risks", "failing_tests"):
+        longest_field: str | None = None
+        longest_size = 0
+        for field in _LIST_FIELDS:
             lst = merged.get(field)
-            if isinstance(lst, list) and len(lst) > 1:
-                merged[field] = lst[1:]
-                trimmed = True
-                break
-        if not trimmed:
+            if isinstance(lst, list) and len(lst) > 1 and len(lst) > longest_size:
+                longest_field = field
+                longest_size = len(lst)
+        if longest_field is None:
             break
+        merged[longest_field] = merged[longest_field][1:]
 
     return merged
 

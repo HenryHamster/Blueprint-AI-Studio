@@ -1775,3 +1775,68 @@ class TestEvaluateLanePilotVerdict:
         assert result["verdict"] == "CONTINUE"
         assert "thresholds" in result
         assert "immediate_alert" in result
+
+
+class TestEvaluateLanePilotVerdictEngagement:
+    """Engagement guard: futility KILL is suppressed when warm-resume fraction
+    is below _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT.  Tests verify BOTH the guard
+    firing and the passthrough (engagement absent or sufficient)."""
+
+    def test_futility_blocked_when_treatment_not_engaging(self):
+        """Acceptance: n ≥ 90, adopt not met, engagement=0.0 → CONTINUE not KILL."""
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        aggs["warm_resume_fraction"] = 0.0
+        aggs["checkpoint_fraction"] = 0.0
+        aggs["lane_fix_tasks_sampled"] = 90
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+        assert result["verdict_reason"] == "treatment_not_engaging"
+        assert result["immediate_alert"] is True
+        assert result["engagement_low"] is True
+
+    def test_futility_kill_proceeds_when_engagement_meets_threshold(self):
+        """When warm_resume_fraction meets the threshold, futility KILL fires normally."""
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        aggs["warm_resume_fraction"] = 0.80
+        aggs["checkpoint_fraction"] = 0.75
+        aggs["lane_fix_tasks_sampled"] = 90
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "futility_at_max_n"
+        assert result.get("engagement_low") is not True
+
+    def test_futility_kill_proceeds_when_engagement_exactly_at_threshold(self):
+        """warm_resume_fraction == threshold (0.50) is NOT below threshold → KILL."""
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        aggs["warm_resume_fraction"] = 0.50
+        aggs["lane_fix_tasks_sampled"] = 90
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "futility_at_max_n"
+
+    def test_engagement_guard_skipped_when_fields_absent(self):
+        """_good_aggs without engagement fields → falls through to futility_at_max_n."""
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        # warm_resume_fraction absent (None from aggregates.get) → guard is skipped
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "futility_at_max_n"
+
+    def test_engagement_fields_propagated_in_snapshot(self):
+        """warm_resume_fraction / checkpoint_fraction / lane_fix_tasks_sampled appear
+        in the returned dict regardless of verdict path."""
+        aggs = _good_aggs(n=40)
+        aggs["warm_resume_fraction"] = 0.6
+        aggs["checkpoint_fraction"] = 0.5
+        aggs["lane_fix_tasks_sampled"] = 40
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["warm_resume_fraction"] == 0.6
+        assert result["checkpoint_fraction"] == 0.5
+        assert result["lane_fix_tasks_sampled"] == 40
+
+    def test_engagement_threshold_in_thresholds_snapshot(self):
+        """thresholds dict includes futility_min_engagement."""
+        aggs = _good_aggs(n=10)  # CONTINUE (insufficient data)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert "futility_min_engagement" in result["thresholds"]
+        assert result["thresholds"]["futility_min_engagement"] == 0.50

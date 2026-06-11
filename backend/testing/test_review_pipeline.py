@@ -13966,3 +13966,118 @@ async def test_lane_pilot_is_review_fix_lane_pilot_active_for_project():
         "app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True
     ):
         assert is_review_fix_lane_pilot_active_for_project(_make_mock_project()) is False
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_manifest_patch_and_fix_resume_context(db_session, mocker):
+    """End-to-end manifest leg: an implement/fix phase checkpoint derives a
+    manifest patch that accumulates onto the lane; the next fix spawn's
+    wire_fix_lane_context attaches a bounded lane-resume block derived from that
+    manifest; the unconditional strip removes the resume key from a review/audit
+    spawn (gate integrity); and classic/control contexts stay untouched.
+
+    Exercises production code in review_fix_lane_pilot.py:
+    checkpoint_and_reserve_on_phase_complete -> build_lane_manifest_patch,
+    wire_fix_lane_context -> build_fix_resume_block, and
+    strip_transient_lane_context over LANE_RESUME_CONTEXT_KEY.
+    """
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.models import ImprovementLaneStatus
+    from app.review_fix_lane_pilot import (
+        LANE_RESUME_CONTEXT_KEY,
+        checkpoint_and_reserve_on_phase_complete,
+        strip_transient_lane_context,
+        wire_fix_lane_context,
+    )
+
+    # Reachable SHA so the checkpoint is recorded (not degraded to missing).
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="lane-manifest-leg",
+        goal="accumulate manifest",
+        branch_name="lane/manifest-leg",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    await db_session.flush()
+    await cas_transition(
+        db_session,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=None,
+    )
+
+    # Implement/fix phase task carrying durable phase state to harvest.
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "fix", "pr_number": 4242, "base_branch": "main"}],
+        context={
+            "head_sha": "cafe1234beef5678",
+            "_pr_changed_files": ["backend/app/foo.py", "agent/src/bar.ts"],
+            "review_loop": {
+                "iteration": 2,
+                "review_history": [
+                    {"issues": [{"severity": "major", "description": "guard null", "file": "foo.py"}]},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    await db_session.refresh(lane)
+
+    # (1) Manifest accumulation: the checkpoint records a derived manifest patch.
+    wrote = await checkpoint_and_reserve_on_phase_complete(
+        db_session, source_task, lane,
+        sha="cafe1234beef5678", summary="addressed null-guard review",
+    )
+    assert wrote is True
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+    manifest = lane.manifest or {}
+    assert manifest.get("phase_log") == ["fix PR#4242 iter2: addressed null-guard review"]
+    assert "backend/app/foo.py" in manifest.get("critical_files", [])
+    assert manifest.get("remaining") == ["[MAJOR] [foo.py] guard null"]
+
+    # (2) Fix-only resume injection: the next fix ctx gets a bounded resume block.
+    fix_ctx: dict = {}
+    wire_fix_lane_context(fix_ctx, lane)
+    assert fix_ctx["improvement_lane_id"] == str(lane.id)
+    assert fix_ctx["is_lane_phase"] is True
+    assert fix_ctx["lane_checkpoint_sha"] == "cafe1234beef5678"
+    resume = fix_ctx[LANE_RESUME_CONTEXT_KEY]
+    assert resume["last_checkpoint_sha"] == "cafe1234beef5678"
+    assert resume["phase_log"] == ["fix PR#4242 iter2: addressed null-guard review"]
+    assert "backend/app/foo.py" in resume["critical_files"]
+
+    # (3) Review/audit stripping: the unconditional strip removes the resume key
+    #     (and the other transient dispatch directives) so a reviewer never sees
+    #     stale fix context — gate integrity.
+    review_ctx = dict(fix_ctx)
+    strip_transient_lane_context(review_ctx)
+    assert LANE_RESUME_CONTEXT_KEY not in review_ctx
+    assert "improvement_lane_id" not in review_ctx
+    assert "is_lane_phase" not in review_ctx
+    assert "lane_checkpoint_sha" not in review_ctx
+
+    # (4) Classic/control purity: no lane → no lane keys, no resume content.
+    classic_ctx: dict = {"scope": "small"}
+    wire_fix_lane_context(classic_ctx, None)
+    assert classic_ctx == {"scope": "small"}

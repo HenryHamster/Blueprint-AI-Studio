@@ -154,6 +154,12 @@ export interface CapabilityTrialVerdict {
   control_cost_per_merged?: number | null;
   gate_integrity_violations?: number;
   checkpoint_loss_rate?: number | null;
+  // Treatment-engagement telemetry (absent when no fix tasks recorded yet).
+  warm_resume_fraction?: number | null;
+  checkpoint_fraction?: number | null;
+  lane_fix_tasks_sampled?: number;
+  // Set to true when the futility engagement guard fired (treatment never engaged).
+  engagement_low?: boolean;
   immediate_alert?: boolean;
   evaluated_at?: string;
   window_hours?: number | null;
@@ -170,6 +176,7 @@ export interface CapabilityTrialVerdict {
     kill_checkpoint_loss_ceiling?: number;
     adopt_merge_lift_floor?: number;
     adopt_cost_improvement?: number;
+    futility_min_engagement?: number;
   };
   accumulation_basis?: string;
   arm_composition?: { with_assigned?: number; with_receipt?: number; without_assigned?: number; without_receipt?: number };

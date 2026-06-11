@@ -36,6 +36,7 @@ use-receipt keys which are written only when lane mechanics actually engage.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import uuid
 from typing import Any
@@ -62,13 +63,33 @@ logger = logging.getLogger(__name__)
 # binding survives, while the active dispatch directive does not.
 LANE_CHAIN_ID_KEY = "_review_fix_lane_id"
 
+# Transient lane-resume block attached ONLY to a fix-task context. Carries the
+# accumulated chain knowledge (prior phase summaries, changed/critical files,
+# open issues, known risks) derived from the lane manifest + last checkpoint so
+# the fix agent starts warm on chain context. It is a transient dispatch
+# directive: it must NEVER ride a review/audit spawn (a reviewer reading stale
+# fix context would erode the independence the review provides), so it is listed
+# in TRANSIENT_LANE_CONTEXT_KEYS and re-attached freshly per fix phase.
+LANE_RESUME_CONTEXT_KEY = "lane_resume"
+
 # Per-phase dispatch directives that must NEVER be inherited from a source task.
 # They are (re)attached freshly and only ever for a fix task on a lane arm.
 TRANSIENT_LANE_CONTEXT_KEYS = (
     "improvement_lane_id",
     "is_lane_phase",
     "lane_checkpoint_sha",
+    LANE_RESUME_CONTEXT_KEY,
 )
+
+# Bounds for the derived manifest patch and the fix-resume block. Kept well
+# under the 8KB ImprovementLane.manifest contract (_LANE_MANIFEST_MAX_BYTES) so
+# accumulation across phases never breaches it, and so the LaneCheckpointPayload
+# 8KB manifest_patch validator never rejects a single phase's patch.
+_MANIFEST_LIST_MAX_ITEMS = 6
+_MANIFEST_STR_MAX_CHARS = 200
+_MANIFEST_PATCH_MAX_BYTES = 6000
+_RESUME_LIST_MAX_ITEMS = 6
+_RESUME_BLOCK_MAX_BYTES = 4000
 
 # Underscore-prefixed context keys that the review pipeline must propagate
 # across iterations (the spawn-time copy filters underscore keys by default).
@@ -235,6 +256,156 @@ async def ensure_chain_lane(
     return lane
 
 
+# ── Bounded manifest-patch / resume-block derivation ──────────────────────────
+def _clip(value: Any, limit: int = _MANIFEST_STR_MAX_CHARS) -> str:
+    """Coerce *value* to a length-bounded string."""
+    return str(value)[:limit]
+
+
+def _bound_json_size(payload: dict[str, Any], max_bytes: int) -> dict[str, Any]:
+    """Trim list fields of *payload* until its JSON encoding fits *max_bytes*.
+
+    Drops the trailing element of the currently-longest list field on each pass.
+    Mutates and returns *payload*. Non-list fields are never dropped (they are
+    small scalars). A defence-in-depth bound: the per-field caps usually keep the
+    payload small, but a pathological set of long strings could still overrun.
+    """
+    while len(json.dumps(payload, default=str).encode()) > max_bytes:
+        longest: str | None = None
+        for key, val in payload.items():
+            if (
+                isinstance(val, list)
+                and len(val) > 1
+                and (longest is None or len(val) > len(payload[longest]))
+            ):
+                longest = key
+        if longest is None:
+            break
+        payload[longest] = payload[longest][:-1]
+    return payload
+
+
+def build_lane_manifest_patch(source_task: Any, *, summary: str) -> dict[str, Any]:
+    """Derive a compact manifest patch from a completed implement/fix phase.
+
+    Read-only over ``source_task`` durable state the backend already holds. The
+    returned patch uses ONLY the list-field keys ``_merge_manifest_patch`` knows
+    how to bound (``progress``/``remaining``/``critical_files``/``failing_tests``/
+    ``risks``/``phase_log``) so the existing bounded merge keeps the accumulated
+    ImprovementLane.manifest under the 8KB contract. Empty-source phases yield a
+    minimal single-entry ``phase_log`` patch. The result is itself size-bounded so
+    the LaneCheckpointPayload 8KB validator never rejects it.
+    """
+    ctx = getattr(source_task, "context", None) or {}
+    try:
+        payload = source_task.first_payload or {}
+    except Exception:  # noqa: BLE001 - payload access is best-effort
+        payload = {}
+    phase = str(payload.get("type") or "phase")
+    review_loop = ctx.get("review_loop") or {}
+    iteration = review_loop.get("iteration")
+    pr_number = payload.get("pr_number") or review_loop.get("pr_number")
+
+    patch: dict[str, Any] = {}
+
+    # phase_log: one rolling entry describing this phase + its checkpoint summary.
+    label = phase
+    if pr_number:
+        label += f" PR#{pr_number}"
+    if iteration is not None:
+        label += f" iter{iteration}"
+    patch["phase_log"] = [_clip(f"{label}: {summary}")]
+
+    # critical_files: files this phase changed, plus reviewer/investigated paths.
+    files: list[str] = []
+    for source in (ctx.get("_pr_changed_files"), ctx.get("investigated_files")):
+        if isinstance(source, list):
+            files.extend(str(f) for f in source if f)
+    deduped: list[str] = []
+    for f in files:
+        if f not in deduped:
+            deduped.append(f)
+    if deduped:
+        patch["critical_files"] = [
+            _clip(f, 200) for f in deduped[:_MANIFEST_LIST_MAX_ITEMS]
+        ]
+
+    # failing_tests: a bounded test-failure / CI-failure summary string, if any.
+    tf_summary = ctx.get("_test_failure_summary") or ctx.get("_ci_failure_logs")
+    if isinstance(tf_summary, str) and tf_summary.strip():
+        patch["failing_tests"] = [_clip(tf_summary)]
+
+    # remaining: the open review issues this phase was addressing (latest entry).
+    history = review_loop.get("review_history")
+    latest_issues: list[Any] = []
+    if isinstance(history, list) and history and isinstance(history[-1], dict):
+        latest_issues = history[-1].get("issues") or []
+    remaining: list[str] = []
+    for issue in latest_issues:
+        if isinstance(issue, dict):
+            sev = str(issue.get("severity") or "").upper()
+            loc = f" [{issue.get('file')}]" if issue.get("file") else ""
+            remaining.append(_clip(f"[{sev}]{loc} {issue.get('description') or ''}"))
+    if remaining:
+        patch["remaining"] = remaining[:_MANIFEST_LIST_MAX_ITEMS]
+
+    # risks: fix-agent disputed/deferred responses (claims + known risks).
+    responses = review_loop.get("fix_agent_responses") or []
+    risks: list[str] = []
+    for r in responses:
+        if isinstance(r, dict):
+            claim = str(r.get("claim") or r.get("issue_summary") or "")
+            if claim:
+                rtype = str(r.get("response_type") or "")
+                risks.append(_clip(f"{rtype}: {claim}" if rtype else claim))
+    if risks:
+        patch["risks"] = risks[:_MANIFEST_LIST_MAX_ITEMS]
+
+    return _bound_json_size(patch, _MANIFEST_PATCH_MAX_BYTES)
+
+
+def build_fix_resume_block(lane: Any) -> dict[str, Any] | None:
+    """Build a bounded transient lane-resume block for a FIX spawn.
+
+    Derived from the lane's accumulated manifest + last checkpoint pointers.
+    Returns None when there is nothing useful to resume from (no manifest content
+    and no checkpoint SHA) so callers attach the key only when it carries signal.
+    The block is size-bounded so it never bloats the fix task context.
+    """
+    if lane is None:
+        return None
+    manifest = getattr(lane, "manifest", None) or {}
+    last_sha = getattr(lane, "last_checkpoint_sha", None)
+    last_phase = getattr(lane, "last_checkpoint_phase", None)
+    seq = getattr(lane, "checkpoint_seq", 0) or 0
+
+    block: dict[str, Any] = {}
+    for field in (
+        "phase_log",
+        "remaining",
+        "critical_files",
+        "failing_tests",
+        "risks",
+        "progress",
+    ):
+        value = manifest.get(field) if isinstance(manifest, dict) else None
+        if isinstance(value, list) and value:
+            block[field] = [
+                _clip(x) for x in value[-_RESUME_LIST_MAX_ITEMS:]
+            ]
+
+    # Nothing to resume from: no accumulated manifest content and no checkpoint.
+    if not block and not last_sha:
+        return None
+
+    block["checkpoint_seq"] = int(seq)
+    if last_sha:
+        block["last_checkpoint_sha"] = _clip(last_sha, 64)
+    if last_phase:
+        block["last_phase"] = _clip(last_phase, 40)
+    return _bound_json_size(block, _RESUME_BLOCK_MAX_BYTES)
+
+
 # ── Phase-completion checkpoint + warm reservation (implement/fix -> review) ───
 async def checkpoint_and_reserve_on_phase_complete(
     session: AsyncSession,
@@ -342,6 +513,10 @@ async def checkpoint_and_reserve_on_phase_complete(
                 LANE_PILOT_WARM_RESUME_RECEIPT_KEY
             )
         ),
+        # Derive a compact manifest patch from the just-completed phase's durable
+        # state so ImprovementLane.manifest accumulates chain knowledge across
+        # phases via the existing bounded merge (never exceeding the 8KB cap).
+        manifest_patch=build_lane_manifest_patch(source_task, summary=summary),
     )
     try:
         await checkpoint_lane(
@@ -414,9 +589,11 @@ def wire_fix_lane_context(ctx: dict, lane: Any) -> None:
 
     Sets ``improvement_lane_id`` (so the warm-pool dispatch hook leases the
     lane-reserved member), ``is_lane_phase`` + ``lane_checkpoint_sha`` (so the
-    agent fetch+resets to the checkpoint, skipping clone/install). Receipts are
-    intentionally NOT stamped here — they record actual warm engagement and are
-    written only by ``confirm_lane_warm_resume`` at the warm-claim site.
+    agent fetch+resets to the checkpoint, skipping clone/install), and the
+    bounded ``lane_resume`` block (accumulated chain knowledge the agent renders
+    into its fix prompt). Receipts are intentionally NOT stamped here — they
+    record actual warm engagement and are written only by
+    ``confirm_lane_warm_resume`` at the warm-claim site.
     """
     if lane is None:
         return
@@ -424,6 +601,16 @@ def wire_fix_lane_context(ctx: dict, lane: Any) -> None:
     ctx["is_lane_phase"] = True
     if lane.last_checkpoint_sha:
         ctx["lane_checkpoint_sha"] = str(lane.last_checkpoint_sha)
+    # Attach the bounded transient lane-resume block (accumulated chain knowledge)
+    # so the fix agent starts from the lane's manifest/checkpoint instead of cold.
+    # Only ever set here (fix-side) and stripped from every review/audit spawn via
+    # TRANSIENT_LANE_CONTEXT_KEYS — gate integrity. Omitted when there is no
+    # accumulated signal to resume from.
+    resume_block = build_fix_resume_block(lane)
+    if resume_block is not None:
+        ctx[LANE_RESUME_CONTEXT_KEY] = resume_block
+    else:
+        ctx.pop(LANE_RESUME_CONTEXT_KEY, None)
 
 
 def confirm_lane_warm_resume(ctx: dict, *, has_checkpoint: bool) -> None:
@@ -804,6 +991,59 @@ async def compute_lane_pilot_aggregates(
         (await session.execute(_gate_stmt)).scalar() or 0
     )
 
+    # ── Treatment-engagement receipts (warm-resume + checkpoint) ─────────────
+    # Among terminal lane-arm fix-phase tasks, count how many carried each
+    # durable receipt.  Receipt keys are stamped only at the actual warm-claim
+    # or checkpoint site, so absence means the treatment was not delivered.
+    if is_sqlite:
+        _warm_receipt_expr = func.json_extract(
+            Task.context, f"$.{LANE_PILOT_WARM_RESUME_RECEIPT_KEY}"
+        )
+        _ckpt_receipt_expr = func.json_extract(
+            Task.context, f"$.{LANE_PILOT_CHECKPOINT_RECEIPT_KEY}"
+        )
+        _fix_payload_type_expr = func.json_extract(Task.payloads, "$[0].type")
+        _engagement_stmt = (
+            select(_warm_receipt_expr, _ckpt_receipt_expr)
+            .where(
+                Task.project_id == project_id,
+                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}") == "lane",
+                _fix_payload_type_expr.in_(["fix", "implement"]),
+            )
+        )
+    else:
+        _engagement_stmt = (
+            select(
+                Task.context[LANE_PILOT_WARM_RESUME_RECEIPT_KEY].astext,
+                Task.context[LANE_PILOT_CHECKPOINT_RECEIPT_KEY].astext,
+            )
+            .where(
+                Task.project_id == project_id,
+                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext == "lane",
+                Task.payloads[0]["type"].as_string().in_(["fix", "implement"]),
+            )
+        )
+
+    engagement_rows = (await session.execute(_engagement_stmt)).all()
+    lane_fix_tasks_sampled = len(engagement_rows)
+    warm_resume_count = 0
+    checkpoint_count = 0
+    _TRUTHY = (True, 1, "true", "True", "1")
+    for warm_val, ckpt_val in engagement_rows:
+        if warm_val in _TRUTHY:
+            warm_resume_count += 1
+        if ckpt_val in _TRUTHY:
+            checkpoint_count += 1
+
+    warm_resume_fraction: float | None = (
+        warm_resume_count / lane_fix_tasks_sampled if lane_fix_tasks_sampled > 0 else None
+    )
+    checkpoint_fraction: float | None = (
+        checkpoint_count / lane_fix_tasks_sampled if lane_fix_tasks_sampled > 0 else None
+    )
+
     return {
         "n_lane": n_lane,
         "n_control": n_control,
@@ -813,4 +1053,7 @@ async def compute_lane_pilot_aggregates(
         "control_cost_per_merged": control_cost_per_merged,
         "gate_integrity_violations": gate_integrity_violations,
         "checkpoint_loss_rate": checkpoint_loss_rate,
+        "warm_resume_fraction": warm_resume_fraction,
+        "checkpoint_fraction": checkpoint_fraction,
+        "lane_fix_tasks_sampled": lane_fix_tasks_sampled,
     }

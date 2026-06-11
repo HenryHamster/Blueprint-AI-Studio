@@ -26,7 +26,7 @@ function verdictClass(verdict: CapabilityVerdict['verdict']): string {
 }
 
 function laneMetricSummary(v: CapabilityVerdict): string[] {
-  return [
+  const lines = [
     `Lane samples ${v.n_lane ?? 0}`,
     `Control samples ${v.n_control ?? 0}`,
     `Merge rate ${fmtRate(v.lane_merge_rate)} lane / ${fmtRate(v.control_merge_rate)} control`,
@@ -34,6 +34,11 @@ function laneMetricSummary(v: CapabilityVerdict): string[] {
     `Checkpoint loss ${fmtRate(v.checkpoint_loss_rate)}`,
     `Gate violations ${v.gate_integrity_violations ?? 0}`,
   ];
+  if (v.lane_fix_tasks_sampled != null) {
+    lines.push(`Warm resume ${fmtRate(v.warm_resume_fraction)} (${v.lane_fix_tasks_sampled} fix tasks)`);
+    lines.push(`Checkpoint receipt ${fmtRate(v.checkpoint_fraction)}`);
+  }
+  return lines;
 }
 
 export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null }) {
@@ -72,6 +77,11 @@ export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null })
                     <span>Control cost/merged: <span className="text-neutral-300 tabular-nums">{fmtMoney(v.control_cost_per_merged)}</span></span>
                     <span>Checkpoint loss: <span className="text-neutral-300 tabular-nums">{fmtRate(v.checkpoint_loss_rate)}</span></span>
                     <span>Gate violations: <span className="text-neutral-300 tabular-nums">{v.gate_integrity_violations ?? 0}</span></span>
+                    {v.lane_fix_tasks_sampled != null && <>
+                      <span>Warm resume: <span className="text-neutral-300 tabular-nums">{fmtRate(v.warm_resume_fraction)} ({v.lane_fix_tasks_sampled} fix)</span></span>
+                      <span>Checkpoint receipt: <span className="text-neutral-300 tabular-nums">{fmtRate(v.checkpoint_fraction)}</span></span>
+                    </>}
+                    {v.engagement_low && <span className="text-amber-300">Engagement low — treatment not delivered</span>}
                     {v.immediate_alert && <span className="text-red-300">Immediate alert: yes</span>}
                     <span>Evaluated: <span className="text-neutral-300">{fmtDate(v.evaluated_at)}</span></span>
                   </div>
@@ -116,7 +126,7 @@ export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null })
                 </td>
                 <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">{isLane ? <>{fmtRate(v.lane_merge_rate)} / {fmtRate(v.control_merge_rate)}</> : fmtLift(v.lift ?? null)}</td>
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{v.n_lane ?? 0} lane / {v.n_control ?? 0} control</> : <>{v.n_with}/{minN}</>}</td>
-                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{fmtMoney(v.lane_cost_per_merged)} / {fmtMoney(v.control_cost_per_merged)}<div className="text-[10px] text-neutral-500">loss {fmtRate(v.checkpoint_loss_rate)} · gates {v.gate_integrity_violations ?? 0}</div></> : <>{v.n_without}/{minN}</>}</td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{fmtMoney(v.lane_cost_per_merged)} / {fmtMoney(v.control_cost_per_merged)}<div className="text-[10px] text-neutral-500">loss {fmtRate(v.checkpoint_loss_rate)} · gates {v.gate_integrity_violations ?? 0}</div>{v.lane_fix_tasks_sampled != null && <div className="text-[10px] text-neutral-500">warm {fmtRate(v.warm_resume_fraction)} · ckpt {fmtRate(v.checkpoint_fraction)} ({v.lane_fix_tasks_sampled} fix)</div>}{v.engagement_low && <div className="text-[10px] text-amber-400">engagement low</div>}</> : <>{v.n_without}/{minN}</>}</td>
                 <td className="text-right px-3 py-2 text-neutral-300">{fmtDate(v.evaluated_at)}</td>
               </tr>
             );

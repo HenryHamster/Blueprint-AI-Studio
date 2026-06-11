@@ -521,6 +521,31 @@ def test_merge_manifest_patch_bounded():
     assert size <= _LANE_MANIFEST_MAX_BYTES, f"merged manifest exceeds 8KB: {size} bytes"
 
 
+def test_merge_manifest_patch_bounded_with_all_append_only_lists():
+    """Long critical_files and remaining lists are trimmed like other append-only fields."""
+    import json
+
+    from app.improvement_lane_ops import _merge_manifest_patch
+    from app.models import _LANE_MANIFEST_MAX_BYTES
+
+    existing = {
+        "phase_log": ["p" * 220 for _ in range(18)],
+        "progress": ["progress " + "x" * 220 for _ in range(18)],
+        "critical_files": [f"critical/{i}/" + "c" * 180 for i in range(18)],
+        "remaining": [f"[MAJOR] issue {i}: " + "r" * 180 for i in range(18)],
+        "failing_tests": ["test_" + "t" * 220 for _ in range(18)],
+        "risks": ["risk " + "k" * 220 for _ in range(18)],
+    }
+    patch = {
+        "critical_files": [f"critical/new/{i}/" + "n" * 180 for i in range(6)],
+        "remaining": [f"[MAJOR] new issue {i}: " + "m" * 180 for i in range(6)],
+    }
+
+    merged = _merge_manifest_patch(existing, patch)
+    size = len(json.dumps(merged, default=str).encode())
+    assert size <= _LANE_MANIFEST_MAX_BYTES, f"merged manifest exceeds 8KB: {size} bytes"
+
+
 # ---------------------------------------------------------------------------
 # LaneCheckpointPayload validation
 # ---------------------------------------------------------------------------
@@ -547,6 +572,197 @@ def test_lane_checkpoint_payload_manifest_patch_too_large():
     big_data = {"key": "x" * 9000}
     with pytest.raises(Exception, match="8KB"):
         LaneCheckpointPayload(sha="abc1234", summary="overflow", manifest_patch=big_data)
+
+
+# ---------------------------------------------------------------------------
+# build_lane_manifest_patch / build_fix_resume_block — bounded derivation
+# ---------------------------------------------------------------------------
+
+
+class _FakeTask:
+    """Minimal stand-in for a Task exposing .context and .first_payload."""
+
+    def __init__(self, context: dict, payloads: list[dict]):
+        self.context = context
+        self._payloads = payloads
+
+    @property
+    def first_payload(self) -> dict:
+        return self._payloads[0] if self._payloads else {}
+
+
+def test_build_lane_manifest_patch_uses_known_list_fields():
+    """Patch is built from durable phase state using only the merge-bounded keys."""
+    from app.review_fix_lane_pilot import build_lane_manifest_patch
+
+    task = _FakeTask(
+        context={
+            "_pr_changed_files": ["backend/app/foo.py", "agent/src/bar.ts"],
+            "investigated_files": ["backend/app/foo.py", "backend/app/baz.py"],
+            "_test_failure_summary": "test_foo failed: AssertionError",
+            "review_loop": {
+                "iteration": 2,
+                "review_history": [
+                    {"issues": [{"severity": "major", "description": "null case", "file": "a.ts"}]},
+                ],
+                "fix_agent_responses": [
+                    {"response_type": "disputed", "claim": "flag is intentional"},
+                ],
+            },
+        },
+        payloads=[{"type": "fix", "pr_number": 42}],
+    )
+    patch = build_lane_manifest_patch(task, summary="addressed review")
+
+    # Only the bounded list-field keys the merge understands appear.
+    assert set(patch).issubset(
+        {"progress", "remaining", "critical_files", "failing_tests", "risks", "phase_log"}
+    )
+    assert patch["phase_log"] == ["fix PR#42 iter2: addressed review"]
+    # changed + investigated files, deduped, order-preserving.
+    assert patch["critical_files"] == [
+        "backend/app/foo.py", "agent/src/bar.ts", "backend/app/baz.py",
+    ]
+    assert patch["failing_tests"] == ["test_foo failed: AssertionError"]
+    assert patch["remaining"] == ["[MAJOR] [a.ts] null case"]
+    assert patch["risks"] == ["disputed: flag is intentional"]
+
+
+def test_build_lane_manifest_patch_minimal_when_no_phase_state():
+    """A bare phase with no context still yields a minimal phase_log patch."""
+    from app.review_fix_lane_pilot import build_lane_manifest_patch
+
+    task = _FakeTask(context={}, payloads=[{"type": "create"}])
+    patch = build_lane_manifest_patch(task, summary="built it")
+    assert patch == {"phase_log": ["create: built it"]}
+
+
+def test_build_lane_manifest_patch_is_size_bounded():
+    """A pathological set of long strings is trimmed under the patch byte bound."""
+    import json
+
+    from app.review_fix_lane_pilot import _MANIFEST_PATCH_MAX_BYTES, build_lane_manifest_patch
+
+    task = _FakeTask(
+        context={
+            "_pr_changed_files": ["x" * 500 for _ in range(40)],
+            "review_loop": {
+                "review_history": [
+                    {"issues": [{"severity": "major", "description": "y" * 500} for _ in range(40)]},
+                ],
+                "fix_agent_responses": [{"claim": "z" * 500} for _ in range(40)],
+            },
+        },
+        payloads=[{"type": "fix", "pr_number": 1}],
+    )
+    patch = build_lane_manifest_patch(task, summary="s")
+    size = len(json.dumps(patch, default=str).encode())
+    assert size <= _MANIFEST_PATCH_MAX_BYTES, f"patch exceeds bound: {size}"
+    # And it stays under the LaneCheckpointPayload 8KB validator.
+    LaneCheckpointPayload(sha="abc1234", summary="s", manifest_patch=patch)
+
+
+def test_build_lane_manifest_patch_accumulates_under_8kb_across_phases():
+    """Repeated patches merged into a manifest stay under the 8KB lane contract."""
+    import json
+
+    from app.improvement_lane_ops import _merge_manifest_patch
+    from app.models import _LANE_MANIFEST_MAX_BYTES
+    from app.review_fix_lane_pilot import build_lane_manifest_patch
+
+    manifest: dict = {}
+    for i in range(40):
+        task = _FakeTask(
+            context={
+                "_pr_changed_files": [
+                    f"deeply/nested/path/{i}/file_{j}_" + "x" * 160 + ".py" for j in range(6)
+                ],
+                "review_loop": {
+                    "iteration": i,
+                    "review_history": [
+                        {
+                            "issues": [
+                                {
+                                    "severity": "major",
+                                    "file": f"deeply/nested/path/{i}/issue_{j}.py",
+                                    "description": f"issue {i}-{j} " + "y" * 180,
+                                }
+                                for j in range(6)
+                            ]
+                        },
+                    ],
+                },
+            },
+            payloads=[{"type": "fix", "pr_number": 100 + i}],
+        )
+        patch = build_lane_manifest_patch(task, summary=f"phase {i} " + "d" * 100)
+        manifest = _merge_manifest_patch(manifest, patch)
+
+    size = len(json.dumps(manifest, default=str).encode())
+    assert size <= _LANE_MANIFEST_MAX_BYTES, f"accumulated manifest exceeds 8KB: {size}"
+
+
+def test_build_fix_resume_block_from_manifest_and_checkpoint():
+    """Resume block surfaces manifest list fields + checkpoint pointers."""
+    from types import SimpleNamespace
+
+    from app.review_fix_lane_pilot import build_fix_resume_block
+
+    lane = SimpleNamespace(
+        manifest={
+            "phase_log": ["create PR#1: built", "fix PR#1: fixed"],
+            "critical_files": ["a.py", "b.ts"],
+            "remaining": ["[MAJOR] open issue"],
+            "risks": ["disputed: x"],
+        },
+        last_checkpoint_sha="deadbeef1234",
+        last_checkpoint_phase="fix",
+        checkpoint_seq=2,
+    )
+    block = build_fix_resume_block(lane)
+    assert block is not None
+    assert block["checkpoint_seq"] == 2
+    assert block["last_checkpoint_sha"] == "deadbeef1234"
+    assert block["last_phase"] == "fix"
+    assert block["phase_log"] == ["create PR#1: built", "fix PR#1: fixed"]
+    assert block["critical_files"] == ["a.py", "b.ts"]
+    assert block["remaining"] == ["[MAJOR] open issue"]
+
+
+def test_build_fix_resume_block_none_when_empty():
+    """No manifest content and no checkpoint sha → no block to attach."""
+    from types import SimpleNamespace
+
+    from app.review_fix_lane_pilot import build_fix_resume_block
+
+    assert build_fix_resume_block(None) is None
+    empty = SimpleNamespace(
+        manifest={}, last_checkpoint_sha=None, last_checkpoint_phase=None, checkpoint_seq=0,
+    )
+    assert build_fix_resume_block(empty) is None
+
+
+def test_build_fix_resume_block_is_size_bounded():
+    """A large manifest yields a resume block under the resume byte bound."""
+    import json
+    from types import SimpleNamespace
+
+    from app.review_fix_lane_pilot import _RESUME_BLOCK_MAX_BYTES, build_fix_resume_block
+
+    lane = SimpleNamespace(
+        manifest={
+            "phase_log": ["p" * 300 for _ in range(20)],
+            "critical_files": ["f" * 300 for _ in range(20)],
+            "risks": ["r" * 300 for _ in range(20)],
+        },
+        last_checkpoint_sha="abc1234",
+        last_checkpoint_phase="fix",
+        checkpoint_seq=9,
+    )
+    block = build_fix_resume_block(lane)
+    assert block is not None
+    size = len(json.dumps(block, default=str).encode())
+    assert size <= _RESUME_BLOCK_MAX_BYTES, f"resume block exceeds bound: {size}"
 
 
 # ---------------------------------------------------------------------------
