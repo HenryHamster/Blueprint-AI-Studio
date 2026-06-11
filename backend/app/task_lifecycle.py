@@ -1096,6 +1096,17 @@ async def _resolve_review_second_opinion(
         primary_verdict,
         record["reconciled_verdict"],
     )
+    # Release the review row's FOR UPDATE lock (acquired above) BEFORE
+    # _process_post_commit: it opens a SEPARATE session and re-acquires FOR UPDATE
+    # SKIP LOCKED on this same review row. On the pending_application=True REPLAY
+    # path the commit inside `if not pending_application:` above is skipped, so
+    # without this the outer lock is still held → the inner acquire returns None
+    # every retry → PostCommitLocked, the marker cleanup below is never reached,
+    # and the reconciled verdict is never applied (deadlock-by-construction on
+    # PostgreSQL). Mirrors the invariant honored at routers/agent_status.py and by
+    # the non-replay branch's commit above; a second commit on the already-committed
+    # non-replay path is a harmless no-op.
+    await session.commit()
     await _process_post_commit(review.id, reconstructed)
     await session.refresh(review)
     ctx = dict(review.context or {})

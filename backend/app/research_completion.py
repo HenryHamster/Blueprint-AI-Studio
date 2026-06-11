@@ -5108,6 +5108,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _working_registry_caps = working_capability_names(
         getattr(project_obj, "problem_model", None)
     )
+    # Prerequisites already satisfied by SHIPPED prior-cycle work or a durable
+    # knowledge document are resolved at spawn time too — the completed-foundation
+    # and knowledge rungs the BLOCKED-resume sweep applies
+    # (reaper_sweeps._resolve_blocked_task_needs) but the spawn-time provider
+    # universe (active tasks + same-cycle siblings, built above) OMITS. Without
+    # them a task-kind prerequisite whose only provider is a COMPLETED+merged
+    # foundation is mis-routed to CANCEL ("no_live_or_deferred_provider"), so the
+    # dependent — runnable all along — is permanently discarded and deterministically
+    # re-cancelled on every re-discovery. recent_tasks_for_dedup already holds the
+    # 90-day same-project COMPLETED rows; completed_foundation_for_need re-applies
+    # the shipped gate (pr_merged + non-ghost via failed_parent_ids).
+    from app.blocked_need_resolution import (
+        completed_foundation_for_need,
+        knowledge_substance_satisfies_need,
+    )
+    from app.knowledge_query import fetch_knowledge_substance_index
+
+    _completed_foundations = [
+        t for t in recent_tasks_for_dedup if t.status == TaskStatus.COMPLETED
+    ]
+    _knowledge_substance_index = await fetch_knowledge_substance_index(
+        session, task.project_id
+    )
     # Identities (kind, ref) that a finding deferred THIS cycle would satisfy. A
     # dependent blocked on one of these sits live-blocked behind dormant data: the
     # deferred foundation is not a real task, so nothing can satisfy the need until
@@ -5318,6 +5341,45 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     seen_keys.add(key)
                     deduped_needs.append(need)
             needs = deduped_needs
+
+        # Drop needs already satisfied by a SHIPPED COMPLETED foundation or a
+        # durable knowledge document — the completed-foundation/knowledge rungs the
+        # spawn-time provider universe omits (see _completed_foundations /
+        # _knowledge_substance_index above). A task-kind need satisfied here was
+        # runnable all along, so it must NOT cancel or block the dependent;
+        # capability needs are already covered by the working registry and never
+        # reach this filter. If this empties `needs`, the dependent spawns runnable
+        # via the `if not needs` guard below (resume-with-no-edge semantics).
+        if needs:
+            _satisfied_keys = set()
+            for _need in needs:
+                if not (isinstance(_need, dict) and _need.get("kind") == "task"):
+                    continue
+                if (
+                    completed_foundation_for_need(
+                        ct, _need, _completed_foundations, failed_parent_ids
+                    )
+                    is not None
+                    or knowledge_substance_satisfies_need(
+                        _need, _knowledge_substance_index
+                    )
+                ):
+                    _satisfied_keys.add((_need.get("kind"), _need.get("ref")))
+            if _satisfied_keys:
+                for _k in _satisfied_keys:
+                    logger.info(
+                        "[RESEARCH] Finding '%s' prerequisite %s:%s already satisfied "
+                        "by shipped COMPLETED foundation or knowledge document — "
+                        "resolved at spawn (no gate)",
+                        finding_title,
+                        _k[0],
+                        _k[1],
+                    )
+                needs = [
+                    n
+                    for n in needs
+                    if (n.get("kind"), n.get("ref")) not in _satisfied_keys
+                ]
 
         if not needs:
             if structurally_dead_entries:

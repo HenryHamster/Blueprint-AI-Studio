@@ -5877,6 +5877,165 @@ class TestDuplicateNeedDeduplication:
         }, "the explicit prerequisite must not be dropped on co-deferral"
 
 
+class TestCompletedFoundationSatisfiesPrereqAtSpawn:
+    """Spawn-time prerequisite resolution must consult the SHIPPED-completed and
+    knowledge rungs the BLOCKED-resume sweep applies — not only active tasks +
+    same-cycle siblings. A task prerequisite already satisfied by a merged
+    foundation was runnable all along and must NOT be cancelled as
+    'no_live_or_deferred_provider' (v10 release-audit HIGH)."""
+
+    async def test_completed_shipped_foundation_satisfies_prereq_no_cancel(
+        self, mocker, db_session
+    ):
+        """A finding whose explicit task prerequisite is satisfied by an
+        already-COMPLETED, merged (shipped) foundation must spawn RUNNABLE — not be
+        cancelled. The spawn-time provider universe (active tasks + same-cycle
+        siblings) omits completed/merged foundations; the completed-foundation rung
+        recognizes it the same way the reaper resume sweep does."""
+        from test_autonomous_research import (
+            _make_finding,
+            _patch_research_externals,
+            _active_direction,
+            _make_research_task,
+        )
+
+        direction = _active_direction("d-completed-found", "Completed foundation test")
+        project = _Project(
+            name="Completed Foundation Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        # An already-shipped foundation: COMPLETED + merged (pr_merged), no failed
+        # parent — exactly the provider the active-only spawn universe cannot see.
+        foundation = _Task(
+            project_id=project.id,
+            title="Already shipped foundation",
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        finding_b = {
+            **_make_finding(title="Finding B (needs shipped foundation)"),
+            "actionability_grade": "HIGH",
+            "prerequisite": {"kind": "task", "ref": str(foundation.id)},
+        }
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding_b],
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        b_children = [c for c in children if c.title.startswith("Finding B")]
+        assert b_children, "the dependent must exist as a child task"
+        for c in b_children:
+            assert c.status != TaskStatus.CANCELLED, (
+                "a prereq satisfied by a shipped COMPLETED foundation must NOT cancel "
+                "the dependent (regression: no_live_or_deferred_provider)"
+            )
+            assert c.status != TaskStatus.BLOCKED, (
+                "a satisfied prereq must not block the dependent either — "
+                "resume-with-no-edge semantics"
+            )
+            assert (c.context or {}).get(
+                "prerequisite_escalation_reason"
+            ) != "no_live_or_deferred_provider"
+
+    async def test_unmerged_completed_foundation_still_escalates(
+        self, mocker, db_session
+    ):
+        """Negative control: a COMPLETED-but-UNMERGED foundation has NOT shipped, so
+        it must NOT satisfy the prerequisite — the dependent is still cancelled. Proves
+        the fix gates on the shipped (pr_merged) signal and does not unblock against
+        unmerged work."""
+        from test_autonomous_research import (
+            _make_finding,
+            _patch_research_externals,
+            _active_direction,
+            _make_research_task,
+        )
+
+        direction = _active_direction("d-unmerged-found", "Unmerged foundation test")
+        project = _Project(
+            name="Unmerged Foundation Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        foundation = _Task(
+            project_id=project.id,
+            title="Unmerged foundation",
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={},  # NO pr_merged -> never shipped
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        finding_b = {
+            **_make_finding(title="Finding B (needs unmerged foundation)"),
+            "actionability_grade": "HIGH",
+            "prerequisite": {"kind": "task", "ref": str(foundation.id)},
+        }
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding_b],
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        b_children = [c for c in children if c.title.startswith("Finding B")]
+        assert b_children, "the dependent must exist as a child task"
+        assert all(c.status == TaskStatus.CANCELLED for c in b_children), (
+            "an UNMERGED (unshipped) foundation must NOT satisfy the prereq — the "
+            "dependent stays escalated/cancelled"
+        )
+
+
 class TestBreakFindingDependencyCycles:
     """_break_dependency_cycles: minimally break a cycle in declared finding
     edges, preserving valid prerequisite chains elsewhere in the batch."""
