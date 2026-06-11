@@ -40,6 +40,8 @@ describe('OrchestratorHealthBar cost pill', () => {
 
     await act(async () => { render(<OrchestratorHealthBar {...baseProps} />); });
 
+    expect(apiFetchMock.mock.calls[0]?.[0]).toBe('/api/admin/digest?hours=24');
+
     const pill = screen.getByTitle(/Daily cost: \$5\.50\. Click/);
     expect(pill).toBeTruthy();
     expect(pill.textContent).toContain('$5.50');

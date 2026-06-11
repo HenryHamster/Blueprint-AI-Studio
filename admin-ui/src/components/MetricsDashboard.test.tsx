@@ -3,6 +3,7 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { act } from 'react';
 import MetricsDashboard from './MetricsDashboard';
 import type { Task } from '../types/task';
+import { __pollerInternals } from '../hooks/usePoller';
 
 const { apiFetch } = vi.hoisted(() => ({
   apiFetch: vi.fn(async (url: string) => {
@@ -66,6 +67,14 @@ const { apiFetch } = vi.hoisted(() => ({
             estimated_cost_usd: 7.0,
           },
         ],
+      }), { status: 200 });
+    }
+    if (url.includes('/digest-latency-stats')) {
+      return new Response(JSON.stringify({
+        latency_percentiles: { p50_seconds: 0.42, p95_seconds: 1.87, sample_n: 12 },
+        tier_counts: { l1_precompute: 7, l2_shared_cache: 3, l3_on_demand: 2 },
+        total_served: 12,
+        instance_note: 'per-instance aggregate; does not sum across replicas',
       }), { status: 200 });
     }
     return new Response(JSON.stringify({
@@ -132,9 +141,11 @@ describe('MetricsDashboard', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-04-24T12:00:00Z'));
     apiFetch.mockClear();
+    __pollerInternals.reset();
   });
 
   afterEach(() => {
+    __pollerInternals.reset();
     vi.useRealTimers();
   });
 
@@ -191,6 +202,32 @@ describe('MetricsDashboard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '6h' }));
     expect(onWindowChange).toHaveBeenCalledWith('6h');
+  });
+
+  it('renders digest latency p50/p95, tier mix, and per-instance caveat', async () => {
+    render(
+      <MetricsDashboard
+        metricsHistory={[]}
+        cumulativeCost={0}
+        cumulativeVmHours={0}
+        maxConcurrentVMs={4}
+        tasks={[]}
+        metricsWindow="1h"
+        onWindowChange={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('Digest Latency')).toBeInTheDocument();
+    expect(screen.getByText('0.42s')).toBeInTheDocument();
+    expect(screen.getByText('1.87s')).toBeInTheDocument();
+    expect(screen.getByText('7 | 58%')).toBeInTheDocument();
+    expect(screen.getByText('3 | 25%')).toBeInTheDocument();
+    expect(screen.getByText('2 | 17%')).toBeInTheDocument();
+    expect(screen.getByTestId('digest-latency-caveat')).toHaveTextContent('per-instance aggregate');
   });
 
   it('exports the currently filtered metric series as CSV and JSON', () => {

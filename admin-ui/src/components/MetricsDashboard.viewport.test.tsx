@@ -4,6 +4,7 @@ import { act } from 'react';
 import MetricsDashboard from './MetricsDashboard';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 import type { Task } from '../types/task';
+import { __pollerInternals } from '../hooks/usePoller';
 
 const now = Date.now();
 const POPULATED_TASKS: Task[] = [
@@ -116,6 +117,14 @@ vi.mock('../api', () => ({
         per_pr_phase_breakdown: [],
       }), { status: 200 });
     }
+    if (url.includes('/digest-latency-stats')) {
+      return new Response(JSON.stringify({
+        latency_percentiles: { p50_seconds: 0.42, p95_seconds: 1.87, sample_n: 12 },
+        tier_counts: { l1_precompute: 7, l2_shared_cache: 3, l3_on_demand: 2 },
+        total_served: 12,
+        instance_note: 'per-instance aggregate; does not sum across replicas',
+      }), { status: 200 });
+    }
     return new Response(JSON.stringify({
       axes: {
         cost_per_merged_pr: {
@@ -151,9 +160,11 @@ describe('MetricsDashboard — viewport regression', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    __pollerInternals.reset();
   });
 
   afterEach(() => {
+    __pollerInternals.reset();
     const r = root;
     if (r) {
       act(() => {
@@ -210,7 +221,7 @@ describe('MetricsDashboard — viewport regression', () => {
           />,
         );
       });
-    });
+    }, { selector: 'button, a[href]', waitMs: 50 });
   });
 
   test('interactive controls meet 44px touch target at 375px', async () => {

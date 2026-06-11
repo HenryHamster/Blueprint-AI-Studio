@@ -1,10 +1,11 @@
-import { useMemo, useState, useEffect } from 'react';
+import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
 import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint } from '../api';
 import { LaneDiagPanel } from './LaneDiagPanel';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
+import { usePoller } from '../hooks/usePoller';
 import type { WarmStartOriginBreakdown } from '../hooks/useEfficiencySnapshot';
 import {
   ResponsiveContainer,
@@ -274,6 +275,21 @@ interface TaskCostBreakdownResponse {
   top_tasks: TopCostTask[];
 }
 
+interface DigestLatencyStats {
+  latency_percentiles: {
+    p50_seconds: number | null;
+    p95_seconds: number | null;
+    sample_n: number;
+  };
+  tier_counts: {
+    l1_precompute: number;
+    l2_shared_cache: number;
+    l3_on_demand: number;
+  };
+  total_served: number;
+  instance_note: string;
+}
+
 const COLD_START_STAGE_LABELS: [string, string, boolean][] = [
   ['dispatch_to_slot_ms', 'Queue wait (slot)', true],
   ['dispatch_to_creds_ms', 'Dispatch → creds', false],
@@ -302,6 +318,97 @@ function ColdStartBreakdown({ breakdown }: { breakdown: Record<string, number | 
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+function formatSeconds(value: number | null): string {
+  if (value === null) return '—';
+  return `${value.toFixed(2)}s`;
+}
+
+function formatShare(count: number, total: number): string {
+  if (total === 0) return '—';
+  return `${Math.round((count / total) * 100)}%`;
+}
+
+function DigestLatencyWidget() {
+  const [data, setData] = useState<DigestLatencyStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const hasLoadedRef = useRef(false);
+
+  const fetchDigestLatency = useCallback(async (signal: AbortSignal) => {
+    if (!hasLoadedRef.current) setLoading(true);
+    try {
+      const res = await apiFetch('/api/admin/digest-latency-stats', undefined, 2, 30000, signal);
+      if (!res.ok) throw new Error(`Failed to fetch digest latency stats: ${res.status}`);
+      const json = await res.json() as DigestLatencyStats;
+      if (!signal.aborted) {
+        setData(json);
+        hasLoadedRef.current = true;
+        setError(null);
+      }
+    } catch (err) {
+      if (signal.aborted) return;
+      setError(err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      if (!signal.aborted) setLoading(false);
+    }
+  }, []);
+
+  usePoller(fetchDigestLatency, { intervalMs: 60_000, deps: [fetchDigestLatency] });
+
+  if (loading && !data) {
+    return <div className="flex items-center justify-center h-20 text-neutral-500 text-xs">Loading digest latency...</div>;
+  }
+
+  if (error) {
+    return <div className="flex items-center justify-center h-20 text-red-400 text-xs">{error}</div>;
+  }
+
+  if (!data) {
+    return <div className="flex items-center justify-center h-20 text-neutral-500 text-xs">No digest latency samples yet</div>;
+  }
+
+  const tiers = [
+    { key: 'l1_precompute', label: 'L1 precompute', count: data.tier_counts.l1_precompute },
+    { key: 'l2_shared_cache', label: 'L2 shared cache', count: data.tier_counts.l2_shared_cache },
+    { key: 'l3_on_demand', label: 'L3 on-demand', count: data.tier_counts.l3_on_demand },
+  ] as const;
+
+  return (
+    <div className="space-y-2 text-xs">
+      <div className="grid grid-cols-3 gap-2">
+        <div className="rounded bg-neutral-800/50 px-3 py-2">
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">p50</div>
+          <div className="font-mono text-neutral-100">{formatSeconds(data.latency_percentiles.p50_seconds)}</div>
+        </div>
+        <div className="rounded bg-neutral-800/50 px-3 py-2">
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">p95</div>
+          <div className="font-mono text-neutral-100">{formatSeconds(data.latency_percentiles.p95_seconds)}</div>
+        </div>
+        <div className="rounded bg-neutral-800/50 px-3 py-2">
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Samples</div>
+          <div className="font-mono text-neutral-100">{data.latency_percentiles.sample_n}</div>
+        </div>
+      </div>
+      <div className="rounded bg-neutral-800/50 px-3 py-2">
+        <div className="mb-1 text-[10px] uppercase tracking-wide text-neutral-500">Serve mix</div>
+        <div className="space-y-1">
+          {tiers.map((tier) => (
+            <div key={tier.key} className="flex items-center justify-between gap-3">
+              <span className="text-neutral-300">{tier.label}</span>
+              <span className="font-mono text-neutral-400 tabular-nums">
+                {tier.count} | {formatShare(tier.count, data.total_served)}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div data-testid="digest-latency-caveat" className="text-[10px] text-amber-400/80">
+        {data.instance_note}
       </div>
     </div>
   );
@@ -809,6 +916,15 @@ export default function MetricsDashboard({
               <div className="text-[10px] text-neutral-500">24h</div>
             </div>
           </div>
+        </div>
+
+        {/* Digest latency card */}
+        <div className={`${cardClass} sm:col-span-2`}>
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide">Digest Latency</div>
+            <div className="text-[10px] text-neutral-500">Shared visibility-aware poll, 60s cadence</div>
+          </div>
+          <DigestLatencyWidget />
         </div>
 
         {/* Task Outcomes chart — full width */}

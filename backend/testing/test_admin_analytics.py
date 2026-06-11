@@ -1326,6 +1326,46 @@ class TestTaskCostBreakdown:
         )
 
     @pytest.mark.asyncio
+    async def test_old_created_task_completed_in_window_is_included(
+        self, client: AsyncClient, db_session
+    ):
+        """A task whose VM stopped before the cutoff but whose completion was logged
+        inside the window still contributes to the cost window."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        now = _utcnow()
+        completed_at = now - timedelta(minutes=20)
+        vm_stopped_at = now - timedelta(hours=2)
+        vm_started_at = vm_stopped_at - timedelta(seconds=1800)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Old created late completed",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=vm_started_at,
+                created_at=now - timedelta(days=3),
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                vm_provisioned_at=vm_started_at,
+                vm_stopped_at=vm_stopped_at,
+                vm_spot=False,
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_count"] == 1
+        assert body["total_estimated_cost_usd"] == pytest.approx(
+            round(1800 * admin_analytics.ON_DEMAND_RATE, 2)
+        )
+
+    @pytest.mark.asyncio
     async def test_max_tasks_caps_materialized_set(
         self, client: AsyncClient, db_session
     ):
@@ -1658,6 +1698,76 @@ class TestOpenPrs:
                 "task_status": TaskStatus.PROVISIONING,
                 "task_type": "plan",
                 "task_title": "Rollup monitor",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_open_pr_filters_to_current_pr_numbers_before_cap(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """An older linked active task still shows up even when newer unrelated
+        active tasks would otherwise consume the 500-row cap."""
+        project = make_project(github_owner="acme", github_repo="widgets")
+        db_session.add(project)
+        await db_session.commit()
+
+        for i in range(500):
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.IN_PROGRESS,
+                title=f"Unrelated active {i}",
+                payloads=[{"type": "review", "prompt": "x"}],
+                context={"review_loop": {"pr_number": 1000 + i}},
+            )
+            db_session.add(task)
+            db_session.add(
+                Artifact(
+                    task_id=task.id,
+                    artifact_type=ArtifactType.PULL_REQUEST,
+                    pr_url=f"https://github.com/acme/widgets/pull/{1000 + i}",
+                )
+            )
+
+        linked_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            title="Linked legacy task",
+            payloads=[{"type": "review", "prompt": "x"}],
+            created_at=_utcnow() - timedelta(days=2),
+            context={
+                "review_loop": {"pr_number": 99},
+                "rollup_pr_number": 99,
+            },
+        )
+        db_session.add(linked_task)
+        db_session.add(
+            Artifact(
+                task_id=linked_task.id,
+                artifact_type=ArtifactType.PULL_REQUEST,
+                pr_url="https://github.com/acme/widgets/pull/99",
+            )
+        )
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value="token")
+        prs_mock = AsyncMock(
+            return_value=[self._github_pr(99, title="Legacy PR", branch="legacy-branch")]
+        )
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["open_prs"][0]["is_orphaned"] is False
+        assert body["open_prs"][0]["tasks"] == [
+            {
+                "task_id": str(linked_task.id),
+                "task_status": TaskStatus.IN_PROGRESS,
+                "task_type": "review",
+                "task_title": "Linked legacy task",
             }
         ]
 

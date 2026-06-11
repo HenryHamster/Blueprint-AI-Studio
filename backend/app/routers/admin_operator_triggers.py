@@ -9,6 +9,7 @@ project's findings. Each route resolves the project/task with a role check via
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import func as _func
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -43,6 +44,8 @@ from app import release_qualifier, release_version
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["admin"])
+
+_MAX_QUEUED_WAVE_EDGE_REPAIR_SCAN = 500
 
 
 async def _clear_manual_rollup_create_claim(
@@ -395,17 +398,29 @@ async def clear_wave_deps(
 
     Response: ``cleared`` (tasks whose stale edges were removed — kept for
     backward compat), ``preserved`` (tasks that retained ≥1 prerequisite edge),
-    and ``total_queued``.
+    ``total_queued`` (exact queued count), and ``processed_queued`` (the capped
+    number scanned this run).
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    result = await session.execute(
-        select(Task).where(
-            Task.project_id == project_id, Task.status == TaskStatus.QUEUED
+    total_queued = (
+        await session.execute(
+            select(_func.count())
+            .select_from(Task)
+            .where(Task.project_id == project_id, Task.status == TaskStatus.QUEUED)
         )
+    ).scalar() or 0
+    result = await session.execute(
+        select(Task)
+        .where(Task.project_id == project_id, Task.status == TaskStatus.QUEUED)
+        .order_by(Task.created_at.asc())
+        .limit(_MAX_QUEUED_WAVE_EDGE_REPAIR_SCAN)
     )
     tasks = result.scalars().all()
+    truncated = total_queued > _MAX_QUEUED_WAVE_EDGE_REPAIR_SCAN
+    processed_queued = len(tasks)
+    skipped_queued = total_queued - processed_queued if truncated else 0
 
     # Batch-load every referenced foundation task in one query so the per-edge
     # classifier can check landed status without N round-trips.
@@ -442,7 +457,14 @@ async def clear_wave_deps(
         if kept:
             preserved += 1
     await session.commit()
-    return {"cleared": cleared, "preserved": preserved, "total_queued": len(tasks)}
+    return {
+        "cleared": cleared,
+        "preserved": preserved,
+        "total_queued": total_queued,
+        "processed_queued": processed_queued,
+        "truncated": truncated,
+        "skipped_queued": skipped_queued,
+    }
 
 
 @router.post("/tasks/{task_id}/rollup")

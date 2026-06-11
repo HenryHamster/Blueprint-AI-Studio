@@ -448,13 +448,6 @@ async def get_task_cost_breakdown(
                     )
                 )
                 .where(*filters)
-                # Windowing is by completion time (derived in Python from
-                # status_log/context), so we cannot push the cutoff into SQL.
-                # Bound the materialized set instead: most-recently-created
-                # tasks first, capped at max_tasks, so a large unarchived
-                # backlog cannot OOM the worker. completed_at >= created_at,
-                # so ordering by created_at desc keeps the recent window's
-                # tasks at the front of the result set.
                 .order_by(Task.created_at.desc())
                 .limit(max_tasks)
             )
@@ -1100,12 +1093,29 @@ async def get_open_prs(
     github_prs = await get_open_pull_requests(
         token, project.github_owner, project.github_repo
     )
+    open_pr_numbers = {
+        pr_number
+        for pr_number in (gh_pr.get("number") for gh_pr in github_prs)
+        if isinstance(pr_number, int)
+    }
+    if not open_pr_numbers:
+        payload = {
+            "open_prs": [],
+            "project_integration_branch": get_project_integration_branch(project),
+            "project_promotion_target": get_project_promotion_target(project),
+        }
+        _open_prs_cache[project_id] = (time.time(), payload)
+        return payload
 
     # Build task lookup: pr_number -> list of linked active tasks.
     # Terminal statuses (COMPLETED/FAILED/CANCELLED) are excluded — the widget
     # is for in-flight work. Dedupe by task.id since a task can match via
     # both a PR artifact and a context pr_number.
     pr_task_map: Dict[int, Dict[uuid.UUID, Task]] = {}
+
+    artifact_pr_filters = [
+        Artifact.pr_url.like(f"%/pull/{pr_num}") for pr_num in open_pr_numbers
+    ]
 
     # Source 1: PR artifacts (agent-created PRs — extract number from URL)
     artifact_rows = (
@@ -1117,7 +1127,10 @@ async def get_open_prs(
                 Artifact.pr_url.isnot(None),
                 Task.project_id == project_id,
                 Task.status.in_(list(_ACTIVE_STATUSES)),
+                or_(*artifact_pr_filters),
             )
+            .order_by(Task.created_at.desc(), Artifact.pr_url)
+            .limit(500)
         )
     ).all()
     for art, task in artifact_rows:
@@ -1128,6 +1141,13 @@ async def get_open_prs(
         pr_task_map.setdefault(pr_num, {})[task.id] = task
 
     # Source 2: Tasks with pr_number in context (review/fix pipeline + rollups)
+    context_pr_filters = [
+        Task.context["review_loop"]["pr_number"].as_integer() == pr_num
+        for pr_num in open_pr_numbers
+    ] + [
+        Task.context["rollup_pr_number"].as_integer() == pr_num
+        for pr_num in open_pr_numbers
+    ]
     active_tasks = (
         (
             await session.execute(
@@ -1145,13 +1165,10 @@ async def get_open_prs(
                 .where(
                     Task.project_id == project_id,
                     Task.status.in_(list(_ACTIVE_STATUSES)),
-                    or_(
-                        Task.context["review_loop"]["pr_number"]
-                        .as_integer()
-                        .isnot(None),
-                        Task.context["rollup_pr_number"].as_integer().isnot(None),
-                    ),
+                    or_(*context_pr_filters),
                 )
+                .order_by(Task.created_at.desc())
+                .limit(500)
             )
         )
         .scalars()
@@ -1159,11 +1176,13 @@ async def get_open_prs(
     )
     for t in active_tasks:
         ctx = t.context or {}
-        pr_num = (ctx.get("review_loop") or {}).get("pr_number") or ctx.get(
+        context_pr_num: int | None = (
+            (ctx.get("review_loop") or {}).get("pr_number") or ctx.get(
             "rollup_pr_number"
+            )
         )
-        if pr_num and isinstance(pr_num, int):
-            pr_task_map.setdefault(pr_num, {})[t.id] = t
+        if context_pr_num and isinstance(context_pr_num, int):
+            pr_task_map.setdefault(context_pr_num, {})[t.id] = t
 
     result = []
     for gh_pr in github_prs:

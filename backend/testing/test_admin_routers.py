@@ -11833,8 +11833,11 @@ class TestClearWaveDeps:
         project = await _make_project(db_session)
         resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
         assert resp.status_code == 200
-        assert resp.json()["cleared"] == 0
-        assert resp.json()["total_queued"] == 0
+        body = resp.json()
+        assert body["cleared"] == 0
+        assert body["total_queued"] == 0
+        assert body["truncated"] is False
+        assert body["skipped_queued"] == 0
 
     @pytest.mark.asyncio
     async def test_clears_ordering_only_edge_when_dispatch_gate_says_eligible(
@@ -12105,6 +12108,29 @@ class TestClearWaveDeps:
 
         await db_session.refresh(dependent)
         assert dependent.depends_on == [str(live_foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_truncates_queue_scan_at_cap(self, client: AsyncClient, db_session):
+        """The stale-edge repair scan is capped and reports skipped queued rows."""
+        project = await _make_project(db_session)
+        for idx in range(503):
+            db_session.add(
+                Task(
+                    project_id=project.id,
+                    title=f"Queued task {idx}",
+                    payloads=[{"type": "smoketest"}],
+                    status=TaskStatus.QUEUED,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_queued"] == 503
+        assert body["processed_queued"] == 500
+        assert body["truncated"] is True
+        assert body["skipped_queued"] == 3
 
 
 class TestCancelStrategicRefresh:

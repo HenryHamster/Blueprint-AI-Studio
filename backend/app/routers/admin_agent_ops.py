@@ -1919,23 +1919,17 @@ async def strategic_operation(
                 Task.project_id == project.id,
                 Task.created_by == "STRATEGIC_AGENT",
                 Task.created_at >= dedup_since,
+                Task.context["spawned_by"].as_string() == "strategic_direct",
+                Task.context["parent_strategic_task_id"].as_string() == str(task.id),
+                Task.payloads[0]["type"].as_string() == spawn_type,
             )
             .order_by(Task.created_at.asc())
+            .limit(200)
         )
-        same_scope_candidates: list[Task] = []
-        for candidate in (await session.execute(dupe_stmt)).scalars().all():
-            cctx = candidate.context or {}
-            if (
-                cctx.get("spawned_by") == "strategic_direct"
-                and cctx.get("parent_strategic_task_id") == str(task.id)
-                and (candidate.first_payload or {}).get("type") == spawn_type
-            ):
-                same_scope_candidates.append(candidate)
-
         dedup_overlap_threshold = _runtime_config.get(
             "strategist_spawn_dedup_overlap_threshold", 4
         )
-        for candidate in same_scope_candidates:
+        for candidate in (await session.execute(dupe_stmt)).scalars().all():
             exact = candidate.title == title
             semantic = (
                 not exact

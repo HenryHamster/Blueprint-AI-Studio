@@ -3450,6 +3450,70 @@ async def test_agent_claim_active_tasks_related_files_defaults_to_empty(
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_preserves_active_and_queued_caps_under_status_skew(
+    client: AsyncClient, db_session
+):
+    """A queued flood must not crowd out active tasks or expand the queued slice.
+
+    Regression for the combined-status limit bug: the claim path should still
+    surface the older active task even when there are more than 100 newer queued
+    tasks, and it should cap queued_tasks independently at 50.
+    """
+    project = Project(name="Active Queued Skew", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    active_task = Task(
+        project_id=project.id,
+        title="Older active task",
+        payloads=[{"type": "create", "prompt": "Do active work"}],
+        vm_instance_id="agent-vm-active-skew",
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/main.py"]},
+    )
+    db_session.add(active_task)
+    await db_session.commit()
+    await db_session.refresh(active_task)
+
+    for i in range(101):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Queued task {i}",
+                payloads=[{"type": "create", "prompt": f"Queued work {i}"}],
+                vm_instance_id=f"agent-vm-queued-{i}",
+                status=TaskStatus.QUEUED,
+                context={"related_files": [f"queued/{i}.py"]},
+            )
+        )
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Claimer task",
+        payloads=[{"type": "research", "prompt": "Investigate skew"}],
+        vm_instance_id="agent-vm-skew-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-skew-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_context = resp.json().get("project_context", {})
+    active_tasks = project_context.get("active_tasks", [])
+    queued_tasks = project_context.get("queued_tasks", [])
+
+    assert len(active_tasks) == 1
+    assert active_tasks[0]["title"] == "Older active task"
+    assert len(queued_tasks) == 50
+    assert all(entry["title"].startswith("Queued task") for entry in queued_tasks)
+
+
+@pytest.mark.asyncio
 async def test_recently_completed_tasks_include_outcome_context(
     client: AsyncClient, db_session
 ):
@@ -3525,6 +3589,88 @@ async def test_recently_completed_tasks_include_outcome_context(
     assert done_entry["related_files"] == ["a.py", "b.py"]
     assert done_entry["changed_files"] == ["modded1.py", "modded2.py"]
     assert done_entry["prompt"] == "Short prompt"
+
+
+@pytest.mark.asyncio
+async def test_recently_completed_tasks_preserve_completed_and_failed_history(
+    client: AsyncClient, db_session
+):
+    """Artifact-heavy completed tasks must not starve the completed or failed slices."""
+    project = Project(name="Terminal History Skew", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(9):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Completed peer {i}",
+                payloads=[{"type": "create", "prompt": f"Completed work {i}"}],
+                vm_instance_id=f"agent-vm-term-completed-{i}",
+                status=TaskStatus.COMPLETED,
+            )
+        )
+    await db_session.commit()
+
+    heavy_completed = Task(
+        project_id=project.id,
+        title="Artifact-heavy completed",
+        payloads=[{"type": "create", "prompt": "Heavy terminal fanout"}],
+        vm_instance_id="agent-vm-term-heavy",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(heavy_completed)
+    await db_session.commit()
+    await db_session.refresh(heavy_completed)
+
+    db_session.add_all(
+        [
+            Artifact(
+                task_id=heavy_completed.id,
+                artifact_type=ArtifactType.RESEARCH_FINDINGS,
+                logs=f"finding {i}",
+            )
+            for i in range(210)
+        ]
+    )
+
+    for i in range(6):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Failed peer {i}",
+                payloads=[{"type": "create", "prompt": f"Failed work {i}"}],
+                vm_instance_id=f"agent-vm-term-failed-{i}",
+                status=TaskStatus.FAILED,
+                latest_status_message=f"failure {i}",
+            )
+        )
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Terminal claimer",
+        payloads=[{"type": "research", "prompt": "Inspect terminal history"}],
+        vm_instance_id="agent-vm-term-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-term-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    recent = resp.json()["project_context"]["recently_completed_tasks"]
+    completed = [entry for entry in recent if entry["status"] == TaskStatus.COMPLETED.value]
+    failed = [entry for entry in recent if entry["status"] == TaskStatus.FAILED.value]
+
+    assert len(recent) == 15
+    assert len(completed) == 10
+    assert len(failed) == 5
+    assert any(entry["title"] == "Artifact-heavy completed" for entry in completed)
+    assert any(entry["title"] == "Completed peer 0" for entry in completed)
 
 
 @pytest.mark.asyncio
@@ -3636,6 +3782,71 @@ async def test_lessons_include_first_feedback_when_distinct(
     lesson = lessons[0]
     assert lesson["first_feedback"] == "Initial rejection: wrong approach"
     assert lesson["last_feedback"] == "Still failing: missing tests"
+
+
+@pytest.mark.asyncio
+async def test_lessons_and_direction_history_survive_terminal_summary_cap(
+    client: AsyncClient, db_session
+):
+    """Lessons and same-direction history still see older terminal rows even when
+    newer completed tasks fill the 10-row claim summary."""
+    project = Project(name="Terminal History Window", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(10):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Recent completed {i}",
+                payloads=[{"type": "create", "prompt": f"Recent work {i}"}],
+                vm_instance_id=f"agent-vm-terminal-recent-{i}",
+                status=TaskStatus.COMPLETED,
+            )
+        )
+    older_lesson = Task(
+        project_id=project.id,
+        title="Historic lesson",
+        payloads=[{"type": "create", "prompt": "Build history"}],
+        vm_instance_id="agent-vm-terminal-lesson",
+        status=TaskStatus.COMPLETED,
+        created_at=datetime.utcnow() - timedelta(hours=2),
+        context={
+            "direction_id": "dir-history",
+            "review_loop": {
+                "iteration": 2,
+                "review_history": [
+                    {"iteration": 0, "feedback": "Initial rejection"},
+                    {"iteration": 1, "feedback": "Second pass"},
+                ],
+            },
+        },
+    )
+    db_session.add(older_lesson)
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="History claimer",
+        payloads=[{"type": "research", "prompt": "Inspect history"}],
+        vm_instance_id="agent-vm-terminal-claimer",
+        context={"direction_id": "dir-history"},
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-terminal-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    pc = resp.json()["project_context"]
+    assert any(entry["task_title"] == "Historic lesson" for entry in pc["lessons"])
+    assert any(
+        entry["title"] == "Historic lesson"
+        for entry in pc["direction_recent_tasks"]
+    )
 
 
 @pytest.mark.asyncio
@@ -3766,6 +3977,71 @@ async def test_agent_claim_sibling_tasks_include_terminal_outcomes(
     # Completed sibling does not get error_excerpt / changed_files
     assert "error_excerpt" not in completed_entry
     assert "changed_files" not in completed_entry
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_limits_terminal_sibling_history(client: AsyncClient, db_session):
+    """Sibling history keeps active siblings and caps terminal siblings at five."""
+    project = Project(name="Sibling History Limit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Sibling parent",
+        payloads=[{"type": "research", "prompt": "parent"}],
+        vm_instance_id="agent-vm-sib-limit-parent",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    active_sib = Task(
+        project_id=project.id,
+        title="Active sibling",
+        payloads=[{"type": "create", "prompt": "active"}],
+        vm_instance_id="agent-vm-sib-limit-active",
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent.id,
+    )
+    db_session.add(active_sib)
+
+    for i in range(7):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Terminal sibling {i}",
+                payloads=[{"type": "create", "prompt": f"terminal {i}"}],
+                vm_instance_id=f"agent-vm-sib-limit-terminal-{i}",
+                status=TaskStatus.COMPLETED if i % 2 == 0 else TaskStatus.FAILED,
+                parent_task_id=parent.id,
+            )
+        )
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Sibling claimer",
+        payloads=[{"type": "create", "prompt": "claim siblings"}],
+        vm_instance_id="agent-vm-sib-limit-claimer",
+        parent_task_id=parent.id,
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-sib-limit-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    siblings = resp.json().get("project_context", {}).get("sibling_tasks", [])
+    active = [entry for entry in siblings if entry["active"]]
+    terminal = [entry for entry in siblings if not entry["active"]]
+
+    assert any(entry["title"] == "Active sibling" for entry in active)
+    assert len(terminal) == 5
 
 
 @pytest.mark.smoketest
