@@ -90,6 +90,12 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
+# Mixed surface marker: this module deliberately hosts both /api/admin and
+# /api/agent routes. The route-table invariant in backend/testing/test_invariants.py
+# uses this marker to include the sibling /api/agent endpoints in the same
+# auth scan as the admin routes.
+ADMIN_AGENT_OPS_MODULE = __name__
+
 
 def _cap_str(
     value: Any, max_len: int, field_name: str, warnings: List[str] | None = None

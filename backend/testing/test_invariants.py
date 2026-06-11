@@ -15,6 +15,12 @@ from pathlib import Path
 
 import pytest
 
+# auth.py raises ValueError at module load if these are absent; keeping them
+# here lets the route-table invariant run in standalone mode without the
+# backend test conftest.
+os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check")
+os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
+
 
 def _assert_backmerge_modules_do_not_import_rollup_management(
     source: str, *, filename: str
@@ -257,6 +263,78 @@ def _ast_branch_implies_named_str_compare(
                 return not branch_truth
 
     return False
+
+
+def _collect_dependency_callables(dependant, visited: set[int] | None = None) -> set[object]:
+    """Return every callable present in a FastAPI dependency tree."""
+    if visited is None:
+        visited = set()
+    if id(dependant) in visited:
+        return set()
+    visited.add(id(dependant))
+
+    found: set[object] = set()
+    call = getattr(dependant, "call", None)
+    if call is not None:
+        found.add(call)
+    for dep in getattr(dependant, "dependencies", []) or []:
+        found.update(_collect_dependency_callables(dep, visited))
+    return found
+
+
+def _is_admin_surface_route(route) -> bool:
+    """True for live admin-surface routes and the mixed admin_agent_ops siblings."""
+    from app.routers.admin_agent_ops import ADMIN_AGENT_OPS_MODULE
+
+    endpoint_module = getattr(getattr(route, "endpoint", None), "__module__", "")
+    return route.path.startswith("/api/admin") or endpoint_module == ADMIN_AGENT_OPS_MODULE
+
+
+def test_all_admin_routes_require_auth():
+    """Every admin-surface route must resolve an auth dependency somewhere."""
+    from fastapi.routing import APIRoute
+
+    from app.auth import get_current_user, require_admin
+    from app.main import app
+    from app.routers.agent import verify_agent_token
+
+    # Intentional exceptions — should stay empty. If a route is intentionally
+    # public (for example, a monitored liveness probe), add its path here with
+    # a short comment explaining why the public surface is deliberate.
+    public_allowlist: dict[str, str] = {}
+
+    auth_callables = frozenset({get_current_user, require_admin, verify_agent_token})
+    scanned_routes: list[str] = []
+    offenders: list[str] = []
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        if not _is_admin_surface_route(route):
+            continue
+
+        scanned_routes.append(route.path)
+        if route.path in public_allowlist:
+            continue
+
+        dep_callables = _collect_dependency_callables(route.dependant, set())
+        if not dep_callables.intersection(auth_callables):
+            reason = public_allowlist.get(route.path)
+            methods = ", ".join(sorted(route.methods or []))
+            offenders.append(
+                f"{methods} {route.path} (module={route.endpoint.__module__}"
+                + (f", allowlist={reason}" if reason else "")
+                + ")"
+            )
+
+    assert scanned_routes, "No admin-surface routes were discovered in the live app."
+    assert not offenders, (
+        "The following admin-surface routes have NO recognized auth dependency "
+        "(require_admin, get_current_user, or verify_agent_token):\n"
+        + "\n".join(f"  - {r}" for r in sorted(offenders))
+        + "\n\nIf a route is intentionally public, add it to public_allowlist "
+        "with a reviewed justification."
+    )
 
 
 # ── Safety Constants ────────────────────────────────────────────────────────
