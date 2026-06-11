@@ -52,7 +52,7 @@ from typing import Any, Mapping
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only, selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.acceptance_gate import (
@@ -265,11 +265,15 @@ async def count_merged_since(
     That keeps post-terminal writes (for example consumption-proof updates to
     a merged producer task) from re-opening the version window.
     """
-    stmt = select(Task).where(
-        Task.project_id == project_id,
-        Task.status == TaskStatus.COMPLETED,
-        landed_signal_predicate(session),
-        Task.updated_at >= since,
+    stmt = (
+        select(Task)
+        .options(load_only(Task.id, Task.status_log, Task.created_at))
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            landed_signal_predicate(session),
+            Task.updated_at >= since,
+        )
     )
     rows = (await session.execute(stmt)).scalars().all()
     return sum(1 for task in rows if _task_completed_at(task) >= since)

@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import get_session
@@ -1051,7 +1052,8 @@ async def create_direction_research_task(
     active_research = (
         (
             await session.execute(
-                select(Task).where(
+                select(Task)
+                .where(
                     Task.project_id == project.id,
                     Task.status.in_(
                         [
@@ -1063,6 +1065,8 @@ async def create_direction_research_task(
                         ]
                     ),
                 )
+                .options(load_only(Task.id, Task.payloads, Task.status))
+                .limit(500)
             )
         )
         .scalars()
