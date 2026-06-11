@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, ChevronDown, ChevronRight } from 'lucide-react';
-import { fetchPipelineRegressions, type PipelineRegression } from '../api';
+import { fetchPipelineRegressions, resolveViewportFailureDownloadUrl, type PipelineRegression } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 
@@ -62,6 +62,98 @@ function worstSeverity(regressions: PipelineRegression[]): string | null {
     }
   }
   return worst;
+}
+
+function isViewportRegression(regression: PipelineRegression): boolean {
+  return regression.regression_class.startsWith('viewport_regression:')
+    || regression.viewport_component != null
+    || regression.viewport_width != null;
+}
+
+function viewportMetadata(regression: PipelineRegression): { component: string; width: number } | null {
+  const component = regression.viewport_component;
+  const width = regression.viewport_width;
+  if (typeof component !== 'string' || component.trim().length === 0) return null;
+  if (typeof width !== 'number' || !Number.isFinite(width) || width <= 0) return null;
+  return { component, width };
+}
+
+interface ScreenshotResolution {
+  key: string;
+  url: string | null;
+  message: string | null;
+}
+
+function ViewportRegressionScreenshot({
+  projectId,
+  regression,
+}: {
+  projectId: string;
+  regression: PipelineRegression;
+}) {
+  const metadata = viewportMetadata(regression);
+  const component = metadata?.component ?? null;
+  const width = metadata?.width ?? null;
+  const requestKey = component && width != null ? `${component}:${width}` : null;
+  const [resolution, setResolution] = useState<ScreenshotResolution | null>(null);
+
+  useEffect(() => {
+    if (!component || width == null || !requestKey) return;
+    const controller = new AbortController();
+    resolveViewportFailureDownloadUrl(projectId, component, width, controller.signal)
+      .then((resolvedUrl) => {
+        if (controller.signal.aborted) return;
+        setResolution({ key: requestKey, url: resolvedUrl, message: null });
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        const detail = error instanceof Error ? error.message : 'resolver failed';
+        setResolution({ key: requestKey, url: null, message: `Screenshot unavailable: ${detail}` });
+      });
+    return () => controller.abort();
+  }, [component, projectId, requestKey, width]);
+
+  if (!metadata) {
+    return (
+      <div className="border-t border-neutral-800/80 px-3 py-2 text-[11px] text-amber-300">
+        Screenshot unavailable: missing viewport metadata
+      </div>
+    );
+  }
+
+  const currentResolution = resolution?.key === requestKey ? resolution : null;
+  const url = currentResolution?.url ?? null;
+  const message = currentResolution ? currentResolution.message : 'Loading screenshot…';
+
+  return (
+    <div className="border-t border-neutral-800/80 px-3 py-2">
+      <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] uppercase tracking-wide text-neutral-500">
+        <span>Viewport screenshot</span>
+        <span className="font-mono normal-case tracking-normal text-neutral-400">
+          {metadata.component} · {metadata.width}px
+        </span>
+      </div>
+      {message && (
+        <div className="rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-300">
+          {message}
+        </div>
+      )}
+      {url && (
+        <img
+          src={url}
+          alt={`${metadata.component} viewport failure at ${metadata.width}px`}
+          className="max-h-96 w-full rounded border border-neutral-800 bg-neutral-950 object-contain"
+          onError={() => {
+            setResolution({
+              key: requestKey ?? '',
+              url: null,
+              message: 'Screenshot unavailable: image failed to load',
+            });
+          }}
+        />
+      )}
+    </div>
+  );
 }
 
 export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanelProps) {
@@ -234,30 +326,35 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
                     </button>
 
                     {isOpen && (
-                      <div className="grid grid-cols-1 gap-2 border-t border-neutral-800/80 px-3 py-2 sm:grid-cols-3">
-                        <div>
-                          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Detected</div>
-                          <div className="mt-0.5 break-words text-neutral-300">{detectedAt}</div>
-                        </div>
-                        <div>
-                          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Current</div>
-                          <div className="mt-0.5 flex items-center gap-1.5 text-neutral-300">
-                            <ArrowUpRight className="h-3 w-3 shrink-0 text-sky-400" />
-                            <span>{formatRate(regression.current_rate)}</span>
+                      <>
+                        <div className="grid grid-cols-1 gap-2 border-t border-neutral-800/80 px-3 py-2 sm:grid-cols-3">
+                          <div>
+                            <div className="text-[10px] uppercase tracking-wide text-neutral-500">Detected</div>
+                            <div className="mt-0.5 break-words text-neutral-300">{detectedAt}</div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] uppercase tracking-wide text-neutral-500">Current</div>
+                            <div className="mt-0.5 flex items-center gap-1.5 text-neutral-300">
+                              <ArrowUpRight className="h-3 w-3 shrink-0 text-sky-400" />
+                              <span>{formatRate(regression.current_rate)}</span>
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] uppercase tracking-wide text-neutral-500">Prior / change</div>
+                            <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-neutral-300">
+                              <span>{formatRate(regression.prior_rate)}</span>
+                              <span className="text-neutral-600">·</span>
+                              <span className="inline-flex items-center gap-1">
+                                <ArrowDownRight className="h-3 w-3 shrink-0 text-neutral-500" />
+                                {formatRateChange(regression)}
+                              </span>
+                            </div>
                           </div>
                         </div>
-                        <div>
-                          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Prior / change</div>
-                          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-neutral-300">
-                            <span>{formatRate(regression.prior_rate)}</span>
-                            <span className="text-neutral-600">·</span>
-                            <span className="inline-flex items-center gap-1">
-                              <ArrowDownRight className="h-3 w-3 shrink-0 text-neutral-500" />
-                              {formatRateChange(regression)}
-                            </span>
-                          </div>
-                        </div>
-                      </div>
+                        {isViewportRegression(regression) && (
+                          <ViewportRegressionScreenshot projectId={projectId} regression={regression} />
+                        )}
+                      </>
                     )}
                   </div>
                 );

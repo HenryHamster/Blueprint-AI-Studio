@@ -130,6 +130,115 @@ fi
 `;
 }
 
+/** Emit a bash sub-block that uploads the failed viewport screenshot(s) for a
+ *  PR-only regression through the signed-URL endpoint.  Every failure mode is
+ *  non-fatal (WARN + continue) so the only blocking gate remains the viewport
+ *  regression itself.  Emitted only inside the PR-only-regression else-branch
+ *  so it never runs for --full or baseline-also-broken paths.
+ *
+ *  The block:
+ *  1. Guards on jq, curl, AGENT_API_TOKEN, and ORCHESTRATOR_URL.
+ *  2. Reads admin-ui/test-results/viewport-failures.json (written by the JSON
+ *     reporter in vitest.viewport.config.ts).
+ *  3. For each failed test, extracts component and width from the fullName
+ *     (e.g. "EffortEfficiencyPanel — viewport regression renders without
+ *     overflow at 375px") using sed/grep — no eval, no unquoted expansions.
+ *  4. Finds the screenshot whose filename best matches that failed test rather
+ *     than reusing the first PNG in admin-ui/test-results/.
+ *  5. POSTs to the signed-URL endpoint and PUTs the PNG to the returned URL.
+ *  6. Logs the storage_uri on success. */
+function buildViewportUploadBlock(taskId: string): string {
+  return `
+      # ── viewport screenshot upload (PR-only regression evidence) ──────────
+      # Non-fatal: missing JSON / PNG / tools / token → WARN and skip.
+      if command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \\
+          && [ -n "\${AGENT_API_TOKEN:-}" ] && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
+        VP_JSON="admin-ui/test-results/viewport-failures.json"
+        if [ -f "$VP_JSON" ]; then
+          _vp_slugify() {
+            printf '%s' "$1" | sed -E 's/[^A-Za-z0-9]+/-/g; s/^-+|-+$//g'
+          }
+          _vp_component_from_name() {
+            printf '%s' "$1" | sed -E 's/[[:space:]]+viewport[[:space:]].*$//' | sed -E 's/[[:space:]]+[-—–]+$//' | awk '
+              {
+                last = $NF;
+                for (i = 1; i <= NF; i++) {
+                  if ($i ~ /^[A-Z][A-Za-z0-9._-]*$/) {
+                    comp = $i;
+                  }
+                }
+              }
+              END {
+                if (comp != "") print comp;
+                else if (last != "") print last;
+              }
+            '
+          }
+          while IFS=$'\t' read -r _vp_file _vp_name; do
+            [ -z "$_vp_name" ] && continue
+            # Extract component from the pre-viewport title while preserving
+            # compound component names like "MessagesPanel composed with shell
+            # panels — viewport regression ...".
+            _vp_comp=$(_vp_component_from_name "$_vp_name")
+            # Extract width: first run of digits immediately before "px".
+            _vp_width=$(printf '%s' "$_vp_name" | grep -oE '[0-9]+px' | head -1 | tr -d 'px')
+            if [ -z "$_vp_comp" ] || [ -z "$_vp_width" ]; then
+              echo "[check] WARN: viewport upload — could not parse component/width from: $_vp_name"
+              continue
+            fi
+            # Match the screenshot for this exact failed assertion when Vitest
+            # emits one. Falling back to a broad glob would risk publishing the
+            # wrong pixels for a different failure.
+            _vp_name_slug=$(_vp_slugify "$_vp_name")
+            _vp_file_slug=$(_vp_slugify "\${_vp_file##*/}")
+            _vp_png=$(
+              find admin-ui/test-results -maxdepth 6 -type f -name "*\${_vp_file_slug}*\${_vp_name_slug}*.png" 2>/dev/null \
+                | sort | head -1 || true
+            )
+            if [ -z "$_vp_png" ]; then
+              _vp_png=$(find admin-ui/test-results -maxdepth 6 -type f -name "*\${_vp_name_slug}*.png" 2>/dev/null | sort | head -1 || true)
+            fi
+            if [ -z "$_vp_png" ]; then
+              echo "[check] WARN: viewport upload — no screenshot PNG found for $_vp_comp@\${_vp_width}px"
+              continue
+            fi
+            # POST for a signed upload URL.
+            _vp_resp=$(curl -sf -X POST \\
+              -H "Authorization: Bearer \${AGENT_API_TOKEN}" \\
+              -H "Content-Type: application/json" \\
+              -d "{\\"task_id\\":\\"${taskId}\\",\\"component\\":\\"$_vp_comp\\",\\"width\\":$_vp_width}" \\
+              "\${ORCHESTRATOR_URL}/api/agent/viewport/failure-screenshot-upload-url") || {
+              echo "[check] WARN: viewport upload — signing request failed for $_vp_comp@\${_vp_width}px"
+              continue
+            }
+            _vp_url=$(printf '%s' "$_vp_resp" | jq -r '.upload_url // empty' 2>/dev/null || true)
+            _vp_uri=$(printf '%s' "$_vp_resp" | jq -r '.storage_uri // empty' 2>/dev/null || true)
+            if [ -z "$_vp_url" ]; then
+              echo "[check] WARN: viewport upload — empty upload_url for $_vp_comp@\${_vp_width}px"
+              continue
+            fi
+            # PUT the PNG to the signed URL.
+            curl -sf -T "$_vp_png" -H "Content-Type: image/png" "$_vp_url" || {
+              echo "[check] WARN: viewport upload — PUT failed for $_vp_comp@\${_vp_width}px"
+              continue
+            }
+            echo "[check] viewport screenshot uploaded: $_vp_uri ($_vp_comp@\${_vp_width}px)"
+          done < <(
+            jq -r '
+              .testResults[]
+              | ((.name // .filepath // .file // .testFile // "") | tostring) as $file
+              | .assertionResults[]
+              | select(.status=="failed")
+              | [$file, (.fullName // .title // "")]
+              | @tsv
+            ' "$VP_JSON" 2>/dev/null || true
+          )
+        fi
+      fi
+      # ── end viewport screenshot upload ───────────────────────────────────
+`;
+}
+
 export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   const ciFailureSelectors = sanitizeCiFailureSelectors(cfg.ciFailureSelectors);
@@ -423,7 +532,7 @@ if admin_ui_runtime_touched; then
         [ -n "$BASELINE_REASON" ] && echo "[check] (baseline check skipped: $BASELINE_REASON — treating PR failure as real)"
         tail -100 "$PR_VP_LOG" || true
         FAILED+=("$VIEWPORT_LABEL")
-      fi
+${buildViewportUploadBlock(cfg.taskId)}      fi
     fi
   fi
 

@@ -15,6 +15,110 @@ from testing.factories import (
 
 
 @pytest.mark.asyncio
+async def test_pipeline_regressions_includes_viewport_metadata_from_failed_task_key(
+    client,
+    db_session,
+):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    failed = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=_utcnow() - timedelta(hours=1),
+        latest_status_message="viewport assertion failed",
+        context={
+            "failure_category": "VIEWPORT_REGRESSION",
+            "viewport_regression:TaskCard:overflow@375": True,
+        },
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/pipeline-regressions?project_id={project.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["project_id"] == str(project.id)
+    assert data["healthy"] is False
+    row = data["regressions"][0]
+    assert row["signal_name"] == "Viewport regression: TaskCard at 375px"
+    assert row["regression_class"] == "viewport_regression:TaskCard:overflow@375"
+    assert row["severity"] == "critical"
+    assert row["current_rate"] is None
+    assert row["prior_rate"] is None
+    assert row["resolved"] is False
+    assert row["spawned_task_id"] is None
+    assert row["viewport_component"] == "TaskCard"
+    assert row["viewport_assertion_type"] == "overflow"
+    assert row["viewport_width"] == 375
+
+
+@pytest.mark.asyncio
+async def test_pipeline_regressions_derives_viewport_metadata_from_failure_text(
+    client,
+    db_session,
+):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    failed = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=_utcnow() - timedelta(hours=1),
+        latest_status_message=(
+            "expectNoOverflowAt(375) failed: MessagesPanel overflows viewport"
+        ),
+        context={"failure_class": "VIEWPORT_REGRESSION"},
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/pipeline-regressions?project_id={project.id}")
+    assert resp.status_code == 200
+    rows = resp.json()["regressions"]
+    assert len(rows) == 1
+    assert rows[0]["regression_class"] == "viewport_regression:MessagesPanel:overflow@375"
+    assert rows[0]["viewport_component"] == "MessagesPanel"
+    assert rows[0]["viewport_assertion_type"] == "overflow"
+    assert rows[0]["viewport_width"] == 375
+
+
+@pytest.mark.asyncio
+async def test_pipeline_regressions_surfaces_viewport_row_when_metadata_missing(
+    client,
+    db_session,
+):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    failed = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=_utcnow() - timedelta(hours=1),
+        latest_status_message="viewport assertion failed before screenshot metadata",
+        context={"failure_category": "VIEWPORT_REGRESSION"},
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/pipeline-regressions?project_id={project.id}")
+    assert resp.status_code == 200
+    rows = resp.json()["regressions"]
+    assert len(rows) == 1
+    assert rows[0]["signal_name"] == "Viewport regression: metadata unavailable"
+    assert rows[0]["regression_class"] == f"viewport_regression:metadata_unavailable:{failed.id}"
+    assert rows[0]["viewport_component"] is None
+    assert rows[0]["viewport_assertion_type"] is None
+    assert rows[0]["viewport_width"] is None
+
+
+@pytest.mark.asyncio
 async def test_outer_loop_convergence_hydrates_original_task_outside_window(
     client,
     db_session,

@@ -326,6 +326,10 @@ export interface ArtifactDownloadUrlResponse {
   url: string;
 }
 
+export interface ViewportFailureDownloadUrlResponse {
+  url: string;
+}
+
 export async function resolveArtifactDownloadUrl(
   projectId: string,
   storageUri: string,
@@ -350,6 +354,36 @@ export async function resolveArtifactDownloadUrl(
   const data = await res.json().catch(() => ({})) as Partial<ArtifactDownloadUrlResponse>;
   if (typeof data.url !== 'string' || data.url.length === 0) {
     throw new Error('Artifact download resolver returned an empty URL');
+  }
+  return data.url;
+}
+
+export async function resolveViewportFailureDownloadUrl(
+  projectId: string,
+  component: string,
+  width: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const query = new URLSearchParams({
+    project_id: projectId,
+    component,
+    width: String(width),
+  });
+  const res = await apiFetch(
+    `/api/admin/viewport-failures/download-url?${query.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to resolve viewport screenshot: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to resolve viewport screenshot: ${res.status}`);
+  }
+  const data = await res.json().catch(() => ({})) as Partial<ViewportFailureDownloadUrlResponse>;
+  if (typeof data.url !== 'string' || data.url.length === 0) {
+    throw new Error('Viewport screenshot resolver returned an empty URL');
   }
   return data.url;
 }
@@ -575,6 +609,9 @@ export interface PipelineRegression {
   spawned_task_id?: string | null;
   spawned_task_status?: string | null;
   spawned_task_title?: string | null;
+  viewport_component?: string | null;
+  viewport_assertion_type?: string | null;
+  viewport_width?: number | null;
   [key: string]: unknown;
 }
 

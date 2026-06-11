@@ -5,6 +5,7 @@ import {
   fetchComputeJobs,
   analyzeComputeJob,
   retryProjectBootstrap,
+  resolveViewportFailureDownloadUrl,
 } from './api';
 
 vi.mock('./firebase', () => ({
@@ -114,6 +115,47 @@ describe('retryProjectBootstrap', () => {
     );
 
     await expect(retryProjectBootstrap('proj-1')).rejects.toThrow('project is not eligible');
+  });
+});
+
+describe('resolveViewportFailureDownloadUrl', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('serializes the stable viewport screenshot lookup query and returns the URL', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ url: 'https://storage.example/signed.png' }), { status: 200 }),
+    );
+
+    await expect(resolveViewportFailureDownloadUrl('proj-1', 'Messages Panel', 375)).resolves.toBe(
+      'https://storage.example/signed.png',
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/api/admin/viewport-failures/download-url?project_id=proj-1&component=Messages+Panel&width=375',
+    );
+  });
+
+  it('throws the backend detail when screenshot resolution fails', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ detail: 'Screenshot not found' }), { status: 404 }),
+    );
+
+    await expect(
+      resolveViewportFailureDownloadUrl('proj-1', 'MessagesPanel', 375),
+    ).rejects.toThrow('Screenshot not found');
+  });
+
+  it('rejects an empty resolver payload', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ url: '' }), { status: 200 }),
+    );
+
+    await expect(
+      resolveViewportFailureDownloadUrl('proj-1', 'MessagesPanel', 375),
+    ).rejects.toThrow('Viewport screenshot resolver returned an empty URL');
   });
 });
 

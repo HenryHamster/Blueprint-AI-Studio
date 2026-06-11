@@ -1055,3 +1055,242 @@ describe('sanitizeCiFailureSelectors', () => {
     ])).toEqual(['testing/test_ok.py::test_good']);
   });
 });
+
+// ── viewport screenshot upload: generated ./check evidence gate ──────────────
+describe('writeCodeChangeHelpers — viewport upload block', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  const selfRepoCfg = {
+    taskId: 'task-vp-upload-123',
+    workBranch: 'blueprint/task-vp-upload-123',
+    baseBranch: 'main',
+    owner: 'HenryHamster',
+    repo: 'BlueprintAIStudio',
+    testsOnMainBranch: true,
+  };
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('viewport upload block: POST endpoint is referenced in generated check script', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(selfRepoCfg);
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    expect(checkScript).toContain('/api/agent/viewport/failure-screenshot-upload-url');
+  });
+
+  it('viewport upload block: upload endpoint absent from --full failure path', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(selfRepoCfg);
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    // The --full branch outputs "FAILED (--full, no baseline recheck)" and adds to FAILED.
+    // The upload endpoint must NOT appear in that branch.
+    const fullFailIdx = checkScript.indexOf('FAILED (--full, no baseline recheck)');
+    const prOnlyIdx = checkScript.indexOf('passes on $BASE_REF, fails on PR. Real regression.');
+    expect(fullFailIdx).toBeGreaterThan(-1);
+    expect(prOnlyIdx).toBeGreaterThan(-1);
+    // Upload endpoint appears only AFTER the PR-only regression marker, never before it
+    // (which would mean it's reachable from the --full path).
+    const uploadIdx = checkScript.indexOf('/api/agent/viewport/failure-screenshot-upload-url');
+    expect(uploadIdx).toBeGreaterThan(prOnlyIdx);
+    expect(uploadIdx).toBeGreaterThan(fullFailIdx);
+    // The --full branch uses FULL_SCOPE=1 guard: ensure the upload block is inside
+    // the else (non-full) branch by checking it does not appear between the --full
+    // marker and the PR-only marker.
+    const blockBetweenFullAndPrOnly = checkScript.slice(fullFailIdx, prOnlyIdx);
+    expect(blockBetweenFullAndPrOnly).not.toContain('/api/agent/viewport/failure-screenshot-upload-url');
+  });
+
+  it('viewport upload block: inside PR-only else, not in baseline-also-broken WARN path', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(selfRepoCfg);
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    // WARN path marker
+    const warnIdx = checkScript.indexOf('WARN — also broken on $BASE_REF; not blocking PR');
+    const prOnlyIdx = checkScript.indexOf('passes on $BASE_REF, fails on PR. Real regression.');
+    const uploadIdx = checkScript.indexOf('/api/agent/viewport/failure-screenshot-upload-url');
+    expect(warnIdx).toBeGreaterThan(-1);
+    expect(prOnlyIdx).toBeGreaterThan(-1);
+    expect(uploadIdx).toBeGreaterThan(-1);
+    // Upload block appears after the PR-only marker, not inside the WARN block.
+    // The WARN and PR-only markers are siblings in an if/else; upload is in else (after PR-only).
+    expect(uploadIdx).toBeGreaterThan(prOnlyIdx);
+    // Slice from WARN marker to PR-only marker — upload must NOT appear in that region.
+    const warnRegion = checkScript.slice(warnIdx, prOnlyIdx);
+    expect(warnRegion).not.toContain('/api/agent/viewport/failure-screenshot-upload-url');
+  });
+
+  it('generated ./check with upload block passes bash -n syntax check', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(selfRepoCfg);
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/check_vp_upload_syntax_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, checkScript);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+
+  it('viewport upload: stubbed curl captures POST only for PR-only regression', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(selfRepoCfg);
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+
+    // Extract the upload sub-block in isolation (start..end markers keep the
+    // extracted block self-contained so extra fi/done from surrounding bash
+    // structure don't cause syntax errors when run standalone).
+    const startMarker = '# ── viewport screenshot upload (PR-only regression evidence) ──────────';
+    const endMarker = '# ── end viewport screenshot upload ───────────────────────────────────';
+    const startIdx = checkScript.indexOf(startMarker);
+    expect(startIdx).toBeGreaterThan(-1);
+    const endIdx = checkScript.indexOf(endMarker, startIdx);
+    expect(endIdx).toBeGreaterThan(startIdx);
+    const uploadBlock = checkScript.slice(startIdx, endIdx + endMarker.length);
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+
+    // Build a stubbed environment: fake viewport-failures.json + PNGs + a curl stub.
+    const runUploadBlock = (
+      vpJson: string,
+      pngNames: string[],
+    ): { exit: number; postLog: string[]; putLog: string[] } => {
+      const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'vp-upload-'));
+      try {
+        // Write fake test-results structure.
+        realFs.mkdirSync(realPath.join(dir, 'admin-ui', 'test-results'), { recursive: true });
+        realFs.writeFileSync(realPath.join(dir, 'admin-ui', 'test-results', 'viewport-failures.json'), vpJson);
+        for (const pngName of pngNames) {
+          realFs.writeFileSync(realPath.join(dir, 'admin-ui', 'test-results', pngName), 'PNG');
+        }
+        // Stub curl: record POST payloads and PUT sources, return a fake signed URL response.
+        const postLog = realPath.join(dir, 'curl_post.log');
+        const putLog = realPath.join(dir, 'curl_put.log');
+        const bin = realPath.join(dir, 'bin');
+        realFs.mkdirSync(bin);
+        realFs.writeFileSync(
+          realPath.join(bin, 'curl'),
+          [
+            '#!/bin/bash',
+            'method=""',
+            'prev=""',
+            'for a in "$@"; do',
+            '  if [ "$a" = "POST" ]; then',
+            '    method="POST"',
+            '  fi',
+            '  if [ "$prev" = "-T" ]; then',
+            `    echo "PUT $(basename "$a")" >> "${putLog}"`,
+            '  fi',
+            '  if [ "$prev" = "-d" ]; then',
+            `    echo "POST $a" >> "${postLog}"`,
+            '  fi',
+            '  prev="$a"',
+            'done',
+            'if [ "$method" = "POST" ]; then',
+            `  printf '{"upload_url":"http://fake-gcs/upload","storage_uri":"gs://bucket/vp.png"}'`,
+            '  exit 0',
+            'fi',
+            // PUT: just succeed silently.
+            'exit 0',
+          ].join('\n'),
+          { mode: 0o755 },
+        );
+        const harness = [
+          'set -uo pipefail',
+          `cd "${dir}"`,
+          uploadBlock,
+        ].join('\n');
+        const harnessFile = realPath.join(dir, 'harness.sh');
+        realFs.writeFileSync(harnessFile, harness);
+        const env = {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          ORCHESTRATOR_URL: 'http://orchestrator.test',
+          AGENT_API_TOKEN: 'tok',
+        };
+        let exit = 0;
+        try {
+          realCp.execFileSync('bash', [harnessFile], { stdio: 'pipe', env });
+        } catch (err: unknown) {
+          exit = (err as { status?: number }).status ?? -1;
+        }
+        const postPayloads = realFs.existsSync(postLog)
+          ? realFs.readFileSync(postLog, 'utf8').trim().split('\n').filter(Boolean)
+          : [];
+        const putPayloads = realFs.existsSync(putLog)
+          ? realFs.readFileSync(putLog, 'utf8').trim().split('\n').filter(Boolean)
+          : [];
+        return { exit, postLog: postPayloads, putLog: putPayloads };
+      } finally {
+        realFs.rmSync(dir, { recursive: true, force: true });
+      }
+    };
+
+    // With two failed tests and matching PNGs: each POST should use the right
+    // component and each PUT should target the matching screenshot.
+    const failedJson = JSON.stringify({
+      testResults: [
+        {
+          name: 'src/components/NewTaskModal.viewport.test.tsx',
+          assertionResults: [{
+            status: 'failed',
+            fullName: 'NewTaskModal — viewport regression renders without overflow at 375px (mobile)',
+          }],
+        },
+        {
+          name: 'src/components/MessagesPanel.viewport.test.tsx',
+          assertionResults: [{
+            status: 'failed',
+            fullName: 'MessagesPanel composed with shell panels — viewport regression renders without overflow at 768px (tablet)',
+          }],
+        },
+      ],
+    });
+    const withFailure = runUploadBlock(failedJson, [
+      'NewTaskModal-viewport-regression-renders-without-overflow-at-375px-mobile.png',
+      'MessagesPanel-composed-with-shell-panels-viewport-regression-renders-without-overflow-at-768px-tablet.png',
+      'screenshot.png',
+    ]);
+    expect(withFailure.exit).toBe(0);
+    expect(withFailure.postLog).toEqual([
+      'POST {"task_id":"task-vp-upload-123","component":"NewTaskModal","width":375}',
+      'POST {"task_id":"task-vp-upload-123","component":"MessagesPanel","width":768}',
+    ]);
+    expect(withFailure.putLog).toEqual([
+      'PUT NewTaskModal-viewport-regression-renders-without-overflow-at-375px-mobile.png',
+      'PUT MessagesPanel-composed-with-shell-panels-viewport-regression-renders-without-overflow-at-768px-tablet.png',
+    ]);
+
+    // With all tests passing: no POST should be attempted.
+    const passingJson = JSON.stringify({
+      testResults: [{
+        assertionResults: [{
+          status: 'passed',
+          fullName: 'EffortEfficiencyPanel viewport renders without overflow at 375px (mobile)',
+        }],
+      }],
+    });
+    const withPassing = runUploadBlock(passingJson, []);
+    expect(withPassing.exit).toBe(0);
+    expect(withPassing.postLog).toEqual([]);
+    expect(withPassing.putLog).toEqual([]);
+  });
+});
