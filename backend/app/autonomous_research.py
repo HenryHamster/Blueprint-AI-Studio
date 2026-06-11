@@ -280,8 +280,25 @@ async def _directed_research_recently_completed(
     Mirrors ``_undirected_research_recently_active`` for the directed case; the
     undirected guard already covers all statuses, so this companion only checks
     COMPLETED.  Set ``completed_research_cooldown_minutes`` <= 0 to disable.
+
+    Absent an explicit ``completed_research_cooldown_minutes`` value the window
+    derives from the operator's ``autonomous_direction_cooldown_minutes`` knob
+    (same single-knob semantics as the refractory derivation in
+    research_direction_state.py) instead of a hardcoded constant — otherwise
+    this guard silently outlives every operator-tuned cooldown and holds all
+    recently-cycled directions at once.
     """
-    cooldown_minutes = _runtime_config.get("completed_research_cooldown_minutes", 120)
+    cooldown_minutes = _runtime_config.get("completed_research_cooldown_minutes")
+    if not isinstance(cooldown_minutes, (int, float)) or isinstance(
+        cooldown_minutes, bool
+    ):
+        cooldown_minutes = _runtime_config.get(
+            "autonomous_direction_cooldown_minutes", 120
+        )
+        if not isinstance(cooldown_minutes, (int, float)) or isinstance(
+            cooldown_minutes, bool
+        ):
+            cooldown_minutes = 120.0
     if cooldown_minutes <= 0:
         return False
     cutoff = _utcnow() - timedelta(minutes=cooldown_minutes)

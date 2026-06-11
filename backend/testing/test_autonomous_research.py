@@ -12841,6 +12841,148 @@ async def test_spawn_allowed_when_completed_directed_research_outside_cooldown(
 
 
 @pytest.mark.asyncio
+async def test_directed_completed_guard_derives_from_operator_cooldown(db_session):
+    """Without an explicit completed_research_cooldown_minutes, the window derives
+    from autonomous_direction_cooldown_minutes — a completion outside the operator
+    window must not hold the direction (it would under the old hardcoded 120)."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    sentinel = object()
+    prior_operator = _runtime_config.get("autonomous_direction_cooldown_minutes", sentinel)
+    _runtime_config.pop("completed_research_cooldown_minutes", None)
+    _runtime_config["autonomous_direction_cooldown_minutes"] = 60
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-derive01",
+            status=TaskStatus.COMPLETED,
+            age_minutes=90,  # outside the 60-min operator window, inside old 120
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-derive01", db_session
+        )
+        assert result is False
+    finally:
+        if prior_operator is sentinel:
+            _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+        else:
+            _runtime_config["autonomous_direction_cooldown_minutes"] = prior_operator
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_derived_window_still_blocks_recent(db_session):
+    """The derived window keeps the anti-churn intent: a completion inside the
+    operator cooldown still blocks an immediate re-spawn."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    sentinel = object()
+    prior_operator = _runtime_config.get("autonomous_direction_cooldown_minutes", sentinel)
+    _runtime_config.pop("completed_research_cooldown_minutes", None)
+    _runtime_config["autonomous_direction_cooldown_minutes"] = 60
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-derive02",
+            status=TaskStatus.COMPLETED,
+            age_minutes=30,  # inside the 60-min operator window
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-derive02", db_session
+        )
+        assert result is True
+    finally:
+        if prior_operator is sentinel:
+            _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+        else:
+            _runtime_config["autonomous_direction_cooldown_minutes"] = prior_operator
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_explicit_key_overrides_operator_cooldown(
+    db_session,
+):
+    """An explicit completed_research_cooldown_minutes wins over the operator knob."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    sentinel = object()
+    prior_operator = _runtime_config.get("autonomous_direction_cooldown_minutes", sentinel)
+    _runtime_config["completed_research_cooldown_minutes"] = 120
+    _runtime_config["autonomous_direction_cooldown_minutes"] = 60
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-derive03",
+            status=TaskStatus.COMPLETED,
+            age_minutes=90,  # outside operator 60, inside explicit 120
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-derive03", db_session
+        )
+        assert result is True
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+        if prior_operator is sentinel:
+            _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+        else:
+            _runtime_config["autonomous_direction_cooldown_minutes"] = prior_operator
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_falls_back_when_no_keys_set(db_session):
+    """With neither key configured the guard keeps the historical 120-min window."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    sentinel = object()
+    prior_operator = _runtime_config.get("autonomous_direction_cooldown_minutes", sentinel)
+    _runtime_config.pop("completed_research_cooldown_minutes", None)
+    _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-derive04",
+            status=TaskStatus.COMPLETED,
+            age_minutes=90,  # inside the 120-min fallback
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-derive04", db_session
+        )
+        assert result is True
+    finally:
+        if prior_operator is sentinel:
+            _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+        else:
+            _runtime_config["autonomous_direction_cooldown_minutes"] = prior_operator
+
+
+@pytest.mark.asyncio
 async def test_idle_research_skips_paused_project(db_session, mocker):
     """`_check_idle_research` must not spawn work for a paused project even when
     autonomous_enabled is True and it has an active direction; a non-paused
