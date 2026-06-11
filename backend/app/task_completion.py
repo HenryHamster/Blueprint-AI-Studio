@@ -17,7 +17,7 @@ import re
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -101,6 +101,40 @@ logger = logging.getLogger(__name__)
 _COMPUTE_WAKE_POST_COMMIT_META_KEY = "_compute_wake_post_commit_meta"
 _COMPUTE_WAKE_NEXT_RETRY_KEY = "_compute_wake_next_retry_after"
 _COMPUTE_WAKE_MAX_ATTEMPTS = 12
+
+# Auto-delivery of the cited LLM analysis classifies the
+# ``analyze_compute_experiment_knowledge`` unavailable-cause tokens by whether a
+# retry could ever change the outcome.
+#
+# * TERMINAL — structurally measured-only forever: no durable artifact / no
+#   usable evidence (``no-evidence``), the analysis cited nothing durable
+#   (``citations-ungrounded``), the operator disabled it (``analysis-disabled``),
+#   or the credential precondition is absent (``precondition-not-met``). These
+#   persist a measured-only ``unavailable_cause`` and are NEVER retried.
+# * RECOVERABLE — a transient runtime/API error (``llm-error``) worth a bounded
+#   re-attempt through the existing compute-wake Pass 0 sweep until it converges
+#   on an ``llm`` upgrade or the attempt ceiling clears the marker.
+#
+# Any unrecognised reason fails closed as TERMINAL so a stuck job cannot loop the
+# LLM forever.
+_ANALYSIS_RECOVERABLE_CAUSES = frozenset({"llm-error"})
+_ANALYSIS_TERMINAL_CAUSES = frozenset(
+    {"no-evidence", "citations-ungrounded", "analysis-disabled", "precondition-not-met"}
+)
+
+
+class _ComputeKnowledgeOutcome(NamedTuple):
+    """Disposition of the best-effort durable-knowledge step for a compute task.
+
+    * ``deterministic_ok`` — the deterministic measured KnowledgeDocument is
+      durably persisted (or there was no measurement to record).
+    * ``analysis_retry_pending`` — the deterministic doc exists but the cited LLM
+      analysis hit a RECOVERABLE error; the caller should keep the durable wake
+      marker and schedule a bounded backoff retry so the sweep re-attempts.
+    """
+
+    deterministic_ok: bool
+    analysis_retry_pending: bool
 
 # Shared marker used by both the TypeScript agent handler (review-fix.ts
 # buildBlueprintPrFooter) and this Python helper so either side can update
@@ -2278,10 +2312,61 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 # ---------------------------------------------------------------------------
 
 
+async def _auto_analyze_compute_experiment_best_effort(
+    task: Task, logs: str, criterion: Optional[dict], session: AsyncSession
+) -> str:
+    """Auto-attempt the cited LLM analysis once the deterministic doc exists.
+
+    Reuses the SAME machinery the admin analyze endpoint calls
+    (:func:`knowledge_completion.analyze_compute_experiment_knowledge`) so the
+    autonomous path and the manual operator path converge on one persisted
+    outcome — either an ``analysis_mode="llm"`` upgrade or a machine-readable
+    ``unavailable_cause`` stamp. It is strictly best-effort: it NEVER raises into
+    the completion gate, never mutates ``task.status`` or
+    ``plan_output['compute_result']``, and the task has already COMPLETED before
+    it runs, so acceptance-grade analysis is never coupled to artifact completion.
+
+    Returns a compact disposition token: ``"upgraded"`` (now llm), ``"terminal"``
+    (structurally measured-only — persisted, do NOT retry), ``"recoverable"`` (a
+    transient error worth a bounded retry), or ``"skipped"`` (no measurement).
+    """
+    measurement = _extract_compute_measurement(logs)
+    if measurement is None:
+        return "skipped"
+    outcome, cost = measurement
+    try:
+        from app.knowledge_completion import analyze_compute_experiment_knowledge
+
+        envelope = await analyze_compute_experiment_knowledge(
+            task,
+            outcome=outcome,
+            cost=cost,
+            criterion=criterion,
+            result_reference=_extract_compute_result_reference(logs),
+            session=session,
+            logs=logs,
+        )
+    except Exception:  # noqa: BLE001 — auto analysis must never break completion
+        logger.warning(
+            "[COMPUTE] Auto LLM analysis raised for task %s", task.id, exc_info=True
+        )
+        return "recoverable"
+    if (envelope or {}).get("status") == "upgraded":
+        return "upgraded"
+    reason = str((envelope or {}).get("reason") or "").strip()
+    if reason in _ANALYSIS_RECOVERABLE_CAUSES:
+        return "recoverable"
+    # Terminal causes — and any unrecognised reason — fail closed: the
+    # measured-only outcome with its unavailable_cause is durably persisted and
+    # must not be retried so a structurally-stuck job cannot loop the LLM forever.
+    return "terminal"
+
+
 async def _persist_compute_experiment_knowledge_best_effort(
     task: Task, logs: str, criterion: Optional[dict], session: AsyncSession
-) -> bool:
-    """Persist a compute_experiment's measured verdict as durable knowledge.
+) -> _ComputeKnowledgeOutcome:
+    """Persist a compute_experiment's measured verdict as durable knowledge, then
+    auto-attempt the cited LLM analysis.
 
     Best-effort, additive, and self-contained: it runs only when the experiment
     produced a measurement (terminal ``outcome`` + measured ``cost``) and records
@@ -2289,10 +2374,18 @@ async def _persist_compute_experiment_knowledge_best_effort(
     was NOT met — as a queryable ``KnowledgeDocument`` discoverable as prior
     knowledge by future research/strategist cycles. Wrapped so durable-knowledge
     persistence can NEVER break the compute task's completion semantics.
+
+    After the deterministic record exists it autonomously attempts the cited LLM
+    analysis (:func:`_auto_analyze_compute_experiment_best_effort`). The return
+    value reports both whether the deterministic doc persisted and whether the
+    analysis hit a RECOVERABLE error worth a bounded retry through the sweep.
     """
     measurement = _extract_compute_measurement(logs)
     if measurement is None:
-        return True  # No measured verdict (crash / no terminal outcome) — nothing durable to record.
+        # No measured verdict (crash / no terminal outcome) — nothing durable to record.
+        return _ComputeKnowledgeOutcome(
+            deterministic_ok=True, analysis_retry_pending=False
+        )
     outcome, cost = measurement
     try:
         from app.knowledge_completion import persist_compute_experiment_knowledge
@@ -2327,8 +2420,20 @@ async def _persist_compute_experiment_knowledge_best_effort(
             await session.commit()
         except Exception:  # noqa: BLE001
             pass
-        return False
-    return True
+        return _ComputeKnowledgeOutcome(
+            deterministic_ok=False, analysis_retry_pending=False
+        )
+    # Deterministic knowledge is durable. Autonomously attempt the cited LLM
+    # analysis so acceptance-grade delivery does not depend on an operator
+    # manually hitting the analyze endpoint — best-effort, decoupled from the
+    # already-committed completion.
+    analysis = await _auto_analyze_compute_experiment_best_effort(
+        task, logs, criterion, session
+    )
+    return _ComputeKnowledgeOutcome(
+        deterministic_ok=True,
+        analysis_retry_pending=(analysis == "recoverable"),
+    )
 
 
 async def _finalize_compute_experiment(
@@ -2472,11 +2577,16 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             return False
         logs = build_compute_result_logs(job)
         criterion = (task.context or {}).get("compute_success_criterion")
-        persisted = await _persist_compute_experiment_knowledge_best_effort(
+        knowledge = await _persist_compute_experiment_knowledge_best_effort(
             task, logs, criterion, session
         )
-        if not persisted:
-            # Transient failure: schedule a backoff retry.
+        if not knowledge.deterministic_ok or knowledge.analysis_retry_pending:
+            # Either durable knowledge did not persist, OR it persisted but the
+            # cited LLM analysis hit a RECOVERABLE error. Keep the durable marker
+            # and schedule a bounded backoff retry so Pass 0 re-attempts until it
+            # converges on an llm upgrade or the attempt ceiling clears the marker
+            # (leaving a terminal measured-only outcome). Bounded by
+            # _COMPUTE_WAKE_MAX_ATTEMPTS so a stuck job never retries forever.
             with contextlib.suppress(Exception):
                 await _schedule_post_commit_backoff(session, registration, attempts)
             return False

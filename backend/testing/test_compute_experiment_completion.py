@@ -2789,9 +2789,10 @@ async def test_compute_llm_strips_signed_url_when_durable_citation_also_present(
     are acceptance-grade evidence. This verifies that supplementary citations
     included in the LLM prompt (for convenience) are stripped from storage even
     when the LLM explicitly cites them alongside real durable evidence.
-    """
-    from app.knowledge_completion import analyze_compute_experiment_knowledge
 
+    Completion now auto-delivers the cited analysis, so the upgrade happens
+    without an explicit operator analyze call.
+    """
     signed_url = "https://signed.storage.example.com/token=abc123/artifacts.tar.gz"
     mocker.patch(
         "app.storage.generate_download_signed_url",
@@ -2818,24 +2819,8 @@ async def test_compute_llm_strips_signed_url_when_durable_citation_also_present(
         ),
         patch("anthropic.AsyncAnthropic", mock_cls),
     ):
+        # Completion auto-delivers the cited analysis — no explicit operator call.
         await _handle_compute_experiment_completion(task, logs, db_session)
-        result = await analyze_compute_experiment_knowledge(
-            task,
-            outcome="SUCCESS",
-            cost=0.37,
-            criterion={
-                "metric": "accuracy",
-                "operator": ">=",
-                "threshold": 0.9,
-                "value": 0.93,
-                "met": True,
-                "measurable": True,
-            },
-            result_reference=None,
-            session=db_session,
-            logs=logs,
-        )
-    assert result["status"] == "upgraded"
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
@@ -3447,3 +3432,239 @@ async def test_prerequisite_no_flag_remains_fail_soft_without_durable(
     delivery = task.plan_output["compute_result"]["artifact_delivery"]
     assert delivery["delivered"] is False
     assert delivery["durability"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_completion_auto_delivers_cited_llm_analysis_acceptance_grade(
+    db_session, mocker, _quiet_compute_io
+):
+    """Completion AUTONOMOUSLY upgrades the deterministic doc to a cited llm
+    analysis — no operator analyze call — yielding an acceptance-grade document
+    and a success task outcome.
+
+    Proves the auto-delivery path: after the deterministic knowledge record
+    exists, the same machinery the admin endpoint uses
+    (``analyze_compute_experiment_knowledge``) runs automatically and upgrades
+    ``analysis_mode`` to ``llm`` when durable artifact evidence grounds it.
+    """
+    from app.task_outcomes import evaluate_task_outcome
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    mock_cls, mock_create = _mock_anthropic_returning([artifact_uri, metric_ref])
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    # The analysis was attempted automatically during completion — once.
+    mock_create.assert_awaited_once()
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    assert verdict["analysis_mode"] == "llm"
+    assert verdict["knowledge_acceptance_evidence"] is True
+    assert verdict["compute_acceptance_grade"] == "acceptance"
+    assert verdict["compute_acceptance_reason"] == "llm_artifact_cited"
+    # Grounded in REAL durable artifact/metric evidence.
+    assert artifact_uri in docs[0].source_citations
+    # The compute_result the handler owns is untouched by the knowledge pass.
+    assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
+    assert task.plan_output["knowledge_document"]["analysis_mode"] == "llm"
+    assert (
+        task.plan_output["knowledge_document"]["compute_acceptance_grade"]
+        == "acceptance"
+    )
+    # Acceptance-grade knowledge ⇒ a success task outcome.
+    assert evaluate_task_outcome(task).status == "success"
+
+
+@pytest.mark.asyncio
+async def test_completion_auto_analysis_terminal_unavailable_stays_measured_only(
+    db_session, _quiet_compute_io
+):
+    """A structurally-unavailable analysis persists a machine-readable
+    ``unavailable_cause``, the task still COMPLETES, and the doc stays
+    measured-only / non-acceptance — never silently credited, never retried.
+
+    No re-coupling: the artifact-completion gate does not depend on the analysis,
+    so the task reaches COMPLETED with the deterministic doc even though the
+    cited analysis is unavailable.
+    """
+    from app.task_outcomes import evaluate_task_outcome
+
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    # Operator-disabled analysis is a TERMINAL cause: stamped once, never retried.
+    with patch.dict(
+        os.environ,
+        {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": "1"},
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    # Still deterministic / measured-only — the analysis never upgraded it.
+    assert verdict["analysis_mode"] == "deterministic"
+    assert verdict["compute_acceptance_grade"] == "measured_only"
+    assert verdict["knowledge_acceptance_evidence"] is False
+    # The terminal cause is durably stamped in a machine-readable form.
+    assert verdict["unavailable_cause"] == "analysis-disabled"
+    assert "analysis_attempted_at" in verdict
+    # SUCCESS compute outcome but measured-only ⇒ NOT a success task outcome.
+    assert evaluate_task_outcome(task).status == "neutral"
+
+
+@pytest.mark.asyncio
+async def test_recoverable_analysis_retries_via_wake_sweep_until_upgraded(
+    db_session, mocker, _quiet_compute_io
+):
+    """A recoverable analysis error leaves the durable wake marker + a backoff
+    retry timestamp; the compute-wake post-commit retry (the callee reaper_sweeps
+    Pass 0 invokes for marked DELIVERED rows) re-attempts and converges on an
+    acceptance-grade llm upgrade.
+    """
+    from app.models import TaskWakeRegistration, WakeAction, WakeDeliveryState
+    from app.task_completion import (
+        _COMPUTE_WAKE_NEXT_RETRY_KEY,
+        _COMPUTE_WAKE_POST_COMMIT_META_KEY,
+        run_compute_wake_post_commit,
+    )
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+
+    # A DELIVERED compute-wake registration carrying the durable post-commit
+    # marker — exactly the row reaper_sweeps Pass 0 selects and re-attempts.
+    reg = TaskWakeRegistration(
+        task_id=task.id,
+        project_id=task.project_id,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        delivery_state=WakeDeliveryState.DELIVERED,
+        delivered_at=datetime.utcnow(),
+        source_metadata={_COMPUTE_WAKE_POST_COMMIT_META_KEY: {"attempts": 0}},
+    )
+    db_session.add(reg)
+    await db_session.commit()
+    await db_session.refresh(reg)
+
+    success_doc = {
+        "title": "Analysis: durable artifacts cleared the bar",
+        "summary": "Grounded analysis citing the durable artifact bundle + metric.",
+        "body": "# Analysis\n\nThe run cleared the bar; see the cited evidence.",
+        "source_citations": [artifact_uri, metric_ref],
+    }
+
+    with patch.dict(
+        os.environ,
+        {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+    ):
+        # Attempt 1: the LLM call fails transiently (recoverable). Deterministic
+        # knowledge persists, but the analysis cannot upgrade the doc yet.
+        mocker.patch(
+            "app.knowledge_completion._call_compute_analysis_llm",
+            new=AsyncMock(return_value=None),
+        )
+        ok = await run_compute_wake_post_commit(db_session, reg)
+        assert ok is False
+
+        await db_session.refresh(reg)
+        # The durable marker is KEPT and a backoff retry timestamp was written so
+        # Pass 0 re-attempts after the window elapses.
+        assert _COMPUTE_WAKE_POST_COMMIT_META_KEY in (reg.source_metadata or {})
+        assert _COMPUTE_WAKE_NEXT_RETRY_KEY in (reg.source_metadata or {})
+        docs = await _knowledge_docs_for(db_session, task)
+        assert len(docs) == 1
+        det_verdict = docs[0].forward_quality_verdict
+        assert det_verdict["analysis_mode"] == "deterministic"
+        assert det_verdict["unavailable_cause"] == "llm-error"
+
+        # Attempt 2 (the sweep re-attempt): the LLM now succeeds → llm upgrade.
+        mocker.patch(
+            "app.knowledge_completion._call_compute_analysis_llm",
+            new=AsyncMock(return_value=success_doc),
+        )
+        ok2 = await run_compute_wake_post_commit(db_session, reg)
+        assert ok2 is True
+
+    await db_session.refresh(reg)
+    # Converged: the durable marker is cleared — no further retries.
+    assert _COMPUTE_WAKE_POST_COMMIT_META_KEY not in (reg.source_metadata or {})
+    assert _COMPUTE_WAKE_NEXT_RETRY_KEY not in (reg.source_metadata or {})
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    assert verdict["analysis_mode"] == "llm"
+    assert verdict["compute_acceptance_grade"] == "acceptance"
+    assert verdict["knowledge_acceptance_evidence"] is True
+    assert artifact_uri in docs[0].source_citations
+    # The unavailable_cause stamp from the failed attempt is gone after upgrade.
+    assert "unavailable_cause" not in verdict
+
+
+@pytest.mark.asyncio
+async def test_absent_or_measured_only_knowledge_never_earns_acceptance(
+    db_session, _quiet_compute_io
+):
+    """Fail-closed acceptance: a compute SUCCESS with an ABSENT KnowledgeDocument,
+    or a measured-only (deterministic) one, is NEVER a success task outcome — only
+    an acceptance-grade llm document credits success."""
+    from app.task_outcomes import evaluate_task_outcome
+
+    # Case 1: SUCCESS compute_result but NO knowledge_document mirror at all.
+    absent = await _make_compute_task(db_session)
+    absent.plan_output = {
+        "compute_result": {"outcome": "SUCCESS", "final_cost_usd": 0.2}
+    }
+    db_session.add(absent)
+    await db_session.commit()
+    await db_session.refresh(absent)
+    assert "knowledge_document" not in (absent.plan_output or {})
+    assert evaluate_task_outcome(absent).status == "neutral"
+
+    # Case 2: SUCCESS with a measured-only deterministic knowledge mirror.
+    measured = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, _uri = await _setup_durable_job_with_artifact(db_session, measured)
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(measured, logs, db_session)
+    await db_session.refresh(measured)
+    assert (
+        measured.plan_output["knowledge_document"]["compute_acceptance_grade"]
+        == "measured_only"
+    )
+    assert evaluate_task_outcome(measured).status == "neutral"

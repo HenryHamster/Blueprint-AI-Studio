@@ -4890,7 +4890,7 @@ async def test_wake_post_commit_recoverable_when_crash_before_marker_write(
     )
     monkeypatch.setattr(
         "app.knowledge_completion._analyze_compute_experiment_with_llm",
-        AsyncMock(return_value=None),
+        AsyncMock(return_value=(None, "precondition-not-met")),
     )
 
     again = await sweep_deliver_task_wakes(db_session, _utcnow())
@@ -5119,7 +5119,7 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
     )
     monkeypatch.setattr(
         "app.knowledge_completion._analyze_compute_experiment_with_llm",
-        AsyncMock(return_value=None),
+        AsyncMock(return_value=(None, "precondition-not-met")),
     )
 
     # Run sweep with the default batch_size. The batch_size markerless rows must NOT
@@ -5351,7 +5351,7 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
     )
     monkeypatch.setattr(
         "app.knowledge_completion._analyze_compute_experiment_with_llm",
-        AsyncMock(return_value=None),
+        AsyncMock(return_value=(None, "precondition-not-met")),
     )
 
     # Run sweep with batch_size. The batch_size backlog rows have a far-future

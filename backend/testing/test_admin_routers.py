@@ -13619,6 +13619,167 @@ class TestComputeExperimentTaskLaunch:
         payload = task.payloads[0]
         assert "live_proof" not in payload
 
+    @pytest.mark.asyncio
+    async def test_accelerator_only_supported_request_persists(
+        self, client: AsyncClient, db_session
+    ):
+        """An accelerator-only request for a supported accelerator stays valid.
+
+        The canonical single-GPU machine type is resolved downstream when the
+        agent launches the actual compute job, so omitting machine_type here is
+        not a rejection.
+        """
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload()
+        payload.pop("machine_type", None)
+        payload["accelerator"] = "L4"
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.payloads[0]["accelerator"] == "L4"
+
+    @pytest.mark.asyncio
+    async def test_supported_explicit_t4_pairing_persists(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload(
+            accelerator="T4", machine_type="n1-standard-1"
+        )
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.payloads[0]["accelerator"] == "T4"
+        assert task.payloads[0]["machine_type"] == "n1-standard-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("override", "expected_detail"),
+        [
+            # Unsupported / over-quota accelerator.
+            ({"accelerator": "A100", "machine_type": None}, "unsupported accelerator"),
+            # GPU accelerator paired with an unpriced GPU machine type.
+            (
+                {"accelerator": "T4", "machine_type": "n1-standard-99"},
+                "not a valid single-GPU shape",
+            ),
+            # CPU-only request with a machine type that is not explicitly priced.
+            (
+                {"accelerator": None, "machine_type": "bogus-machine-type"},
+                "unsupported machine_type",
+            ),
+            # GPU / machine-family mismatch: T4 (n1) paired with a G2 shape.
+            (
+                {"accelerator": "T4", "machine_type": "g2-standard-4"},
+                "not a valid single-GPU shape",
+            ),
+        ],
+    )
+    async def test_gpu_shape_validation_rejects_without_creating_task(
+        self, client: AsyncClient, db_session, override, expected_detail
+    ):
+        """Invalid accelerator/machine-shape combinations fail fast with 422.
+
+        The launch endpoint applies the same accelerator/machine-shape truth as
+        compute-job creation (``app.vm_cost_rates.validate_compute_request``)
+        before persisting a Task, so no Task row is created for a rejected
+        contract.
+        """
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload()
+        for key, value in override.items():
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert expected_detail in resp.text
+        from sqlalchemy import func as _func
+
+        count = (
+            await db_session.execute(select(_func.count(Task.id)))
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_require_durable_artifact_persists_in_payload(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(require_durable_artifact=True),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["require_durable_artifact"] is True
+
+    @pytest.mark.asyncio
+    async def test_require_durable_artifact_default_omits_payload_flag(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert "require_durable_artifact" not in payload
+
 
 class TestBugReportCitationGate:
     """Reproduce-on-HEAD citation grounding for free-text bug reports.

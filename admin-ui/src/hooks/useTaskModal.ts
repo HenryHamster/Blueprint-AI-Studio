@@ -34,6 +34,18 @@ export interface ComputeExperimentForm {
   successOperator: ComputeSuccessOperator;
   successThreshold: string;
   requireLiveRelease: boolean;
+  requireDurableArtifact: boolean;
+}
+
+export const COMPUTE_ACCELERATOR_OPTIONS = [
+  { accelerator: 'T4', machineType: 'n1-standard-1' },
+  { accelerator: 'L4', machineType: 'g2-standard-4' },
+  { accelerator: 'V100', machineType: 'n1-standard-1' },
+] as const;
+
+export function canonicalMachineTypeForAccelerator(accelerator: string): string | null {
+  const trimmed = accelerator.trim().toUpperCase();
+  return COMPUTE_ACCELERATOR_OPTIONS.find(option => option.accelerator === trimmed)?.machineType ?? null;
 }
 
 export function defaultComputeExperimentForm(): ComputeExperimentForm {
@@ -51,6 +63,7 @@ export function defaultComputeExperimentForm(): ComputeExperimentForm {
     successOperator: '>=',
     successThreshold: '',
     requireLiveRelease: false,
+    requireDurableArtifact: false,
   };
 }
 
@@ -322,6 +335,11 @@ export function useTaskModal(
     }
     const accelerator = computeExperiment.accelerator.trim();
     const machineType = computeExperiment.machineType.trim();
+    const canonicalMachineType = accelerator ? canonicalMachineTypeForAccelerator(accelerator) : null;
+    if (accelerator && (!canonicalMachineType || (machineType && machineType !== canonicalMachineType))) {
+      addToast('Machine type must match the selected accelerator canonical shape', 'error');
+      return;
+    }
     const experiment = computeExperiment.experiment.trim();
     const benchmark = computeExperiment.benchmark.trim();
     const hypothesis = computeExperiment.hypothesis.trim();
@@ -344,6 +362,9 @@ export function useTaskModal(
       ...(metric ? { metric } : {}),
       ...(successCriterion ? { success_criterion: successCriterion } : {}),
       ...(computeExperiment.requireLiveRelease ? { require_live_release: true } : {}),
+      ...(computeExperiment.requireDurableArtifact
+        ? { require_durable_artifact: true }
+        : {}),
       ...(newTaskModel ? { model: newTaskModel } : {}),
       ...(newTaskEffort ? { effort: newTaskEffort } : {}),
     };

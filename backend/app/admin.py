@@ -63,6 +63,7 @@ from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
 )
+from app.vm_cost_rates import validate_compute_request
 from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
 from app.task_outcomes import build_task_evaluation_summary
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
@@ -1376,6 +1377,7 @@ class ComputeExperimentTaskPayload(BaseModel):
     metric: str | None = None
     success_criterion: ComputeSuccessCriterion | None = None
     require_live_release: bool = False
+    require_durable_artifact: bool = False
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
@@ -1832,6 +1834,18 @@ async def create_compute_experiment_task(
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
 
+    # Apply the same accelerator / machine-shape validation as compute-job
+    # creation BEFORE persisting a Task, so invalid GPU launch contracts fail
+    # fast with a clear 422 instead of creating a task that can never launch.
+    # Accelerator-only requests for supported accelerators stay valid and are
+    # canonicalized downstream when the agent launches the actual compute job.
+    _, gpu_reason = validate_compute_request(
+        launch_contract.get("accelerator"),
+        launch_contract.get("machine_type"),
+    )
+    if gpu_reason is not None:
+        raise HTTPException(status_code=422, detail=gpu_reason)
+
     requires_approval, threshold = resolve_compute_spend_approval(
         runtime_config=runtime_config,
         direction=None,
@@ -1865,6 +1879,11 @@ async def create_compute_experiment_task(
             if launch_contract.get(k) is not None
         },
         **({"live_proof": True} if payload.require_live_release else {}),
+        **(
+            {"require_durable_artifact": True}
+            if payload.require_durable_artifact
+            else {}
+        ),
     }
     try:
         task_payload = validate_task_payload(task_payload_raw)

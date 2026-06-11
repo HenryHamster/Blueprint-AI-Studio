@@ -358,7 +358,9 @@ describe('useTaskModal', () => {
       result.current.setNewTaskPrompt('Make it work');
     });
     await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+      await result.current.handleCreateTask({
+        preventDefault: vi.fn(),
+      } as unknown as React.FormEvent);
     });
     expect(fetchSpy).toHaveBeenCalledWith(
       expect.stringContaining('/api/admin/tasks'),
@@ -379,7 +381,9 @@ describe('useTaskModal', () => {
       result.current.setNewTaskPrompt('Some prompt');
     });
     await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+      await result.current.handleCreateTask({
+        preventDefault: vi.fn(),
+      } as unknown as React.FormEvent);
     });
     expect(result.current.showNewTaskModal).toBe(false);
     expect(result.current.newTaskTitle).toBe('');
@@ -415,7 +419,9 @@ describe('useTaskModal', () => {
       result.current.setNewTaskPrNumber('');
     });
     await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+      await result.current.handleCreateTask({
+        preventDefault: vi.fn(),
+      } as unknown as React.FormEvent);
     });
     expect(addToast).toHaveBeenCalledWith('PR number must be a positive integer', 'error');
     expect(fetchSpy).not.toHaveBeenCalledWith(
@@ -434,7 +440,9 @@ describe('useTaskModal', () => {
       result.current.setNewTaskPrNumber('abc');
     });
     await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+      await result.current.handleCreateTask({
+        preventDefault: vi.fn(),
+      } as unknown as React.FormEvent);
     });
     expect(addToast).toHaveBeenCalledWith('PR number must be a positive integer', 'error');
   });
@@ -449,7 +457,9 @@ describe('useTaskModal', () => {
       result.current.setNewTaskPrNumber('');
     });
     await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+      await result.current.handleCreateTask({
+        preventDefault: vi.fn(),
+      } as unknown as React.FormEvent);
     });
     expect(addToast).toHaveBeenCalledWith('PR number must be a positive integer', 'error');
   });
@@ -465,7 +475,9 @@ describe('useTaskModal', () => {
       result.current.setNewTaskPrBranch('');
     });
     await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+      await result.current.handleCreateTask({
+        preventDefault: vi.fn(),
+      } as unknown as React.FormEvent);
     });
     expect(addToast).toHaveBeenCalledWith('PR branch is required for review tasks', 'error');
   });
@@ -875,7 +887,7 @@ describe('useTaskModal', () => {
         ...f,
         command: 'python train.py',
         accelerator: 'T4',
-        machineType: 'n1-standard-4',
+        machineType: 'n1-standard-1',
         spendCapUsd: '5',
         deadlineSeconds: '1800',
         hypothesis: 'accuracy improves',
@@ -901,12 +913,65 @@ describe('useTaskModal', () => {
       spend_cap_usd: 5,
       deadline_seconds: 1800,
       accelerator: 'T4',
-      machine_type: 'n1-standard-4',
+      machine_type: 'n1-standard-1',
       hypothesis: 'accuracy improves',
       success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
     });
     expect(addToast).toHaveBeenCalledWith('Compute experiment launched', 'success');
     expect(fetchTasksRef.current).toHaveBeenCalled();
+  });
+
+  it('handleCreateTask routes accelerator-only compute_experiment without machine_type', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        accelerator: 'T4',
+        machineType: '',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body.accelerator).toBe('T4');
+    expect(body).not.toHaveProperty('machine_type');
+    expect(addToast).toHaveBeenCalledWith('Compute experiment launched', 'success');
+    expect(fetchTasksRef.current).toHaveBeenCalled();
+  });
+
+  it('handleCreateTask rejects an explicit non-canonical GPU machine pairing', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        accelerator: 'T4',
+        machineType: 'n1-standard-4',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('Machine type must match the selected accelerator canonical shape', 'error');
+    expect(mockCreateComputeExperiment).not.toHaveBeenCalled();
   });
 
   it('handleCreateComputeExperiment shows held-for-approval toast when requires_approval is true', async () => {
@@ -1111,5 +1176,56 @@ describe('useTaskModal', () => {
     expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
     const body = mockCreateComputeExperiment.mock.calls[0][0];
     expect(body).not.toHaveProperty('require_live_release');
+  });
+
+  it('handleCreateTask sends require_durable_artifact when requireDurableArtifact is set', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        requireDurableArtifact: true,
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body.require_durable_artifact).toBe(true);
+  });
+
+  it('handleCreateTask omits require_durable_artifact when requireDurableArtifact is false', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body).not.toHaveProperty('require_durable_artifact');
   });
 });

@@ -217,6 +217,7 @@ export interface ComputeExperimentLaunchRequest {
   metric?: string;
   success_criterion?: ComputeSuccessCriterion;
   require_live_release?: boolean;
+  require_durable_artifact?: boolean;
   model?: string;
   effort?: string;
 }
