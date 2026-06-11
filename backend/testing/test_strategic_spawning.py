@@ -474,6 +474,49 @@ async def test_spawn_review_includes_operator_overrides_when_present(db_session)
 
 
 @pytest.mark.asyncio
+async def test_drift_snapshot_failure_does_not_expire_caller_instances(
+    db_session, mocker
+):
+    """A failed best-effort drift snapshot must not poison the shared session.
+
+    The prior code cleared the resulting pending-rollback with a bare
+    ``session.rollback()``, which expired EVERY ORM instance in the session —
+    ``project`` and the in-flight strategic ``task`` included (rollback expires
+    even under ``expire_on_commit=False``). The next *synchronous* attribute
+    read then attempted IO and raised ``MissingGreenlet``, failing the whole
+    design_doc completion (tasks a9bf1317 / 94594516, 2026-06-11). The drift
+    block now runs in a SAVEPOINT, so its failure leaves ``project`` loaded.
+    """
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    # Force the best-effort drift snapshot to fail mid-spawn.
+    mocker.patch(
+        "app.drift_detection.persist_drift_snapshot",
+        new=AsyncMock(side_effect=RuntimeError("drift flush boom")),
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    # The spawn still lands the strategic_review task despite the drift failure.
+    assert spawned is True
+    # Regression guard: the caller's ``project`` is NOT expired — a synchronous
+    # attribute read must return the in-memory value without IO. Under the old
+    # bare-rollback this access raised MissingGreenlet.
+    assert project.vision.get("purpose") == "test purpose"
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    assert any(
+        t.payloads[0].get("type") == "strategic_review"
+        for t in result.scalars().all()
+    )
+
+
+@pytest.mark.asyncio
 async def test_spawn_review_includes_capability_trial_verdicts(db_session):
     """The strategic_review payload carries durable capability trial verdicts."""
     project = _make_project(

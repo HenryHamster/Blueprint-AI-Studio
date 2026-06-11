@@ -3937,6 +3937,7 @@ async def _handle_design_doc_completion(
     # which REPLACES chain_exc, masks the real failure, skips the retry
     # marker, and fails the whole completion (task a9bf1317, 2026-06-11).
     task_id_str = str(task.id)
+    task_id_value = task.id
     task_project_id = task.project_id
 
     if project is None:
@@ -4004,6 +4005,15 @@ async def _handle_design_doc_completion(
     rev = doc.get("_meta", {}).get("revision", 0)
     page_count = sum(1 for k in doc if not k.startswith("_"))
     logger.info(f"[DESIGN DOC] Task {task.id} completed: {page_count} pages, rev {rev}")
+    # Snapshot the vision while ``project`` is known-loaded. _spawn_strategic_review
+    # never writes project.vision, but it can roll back / expire the instance on
+    # its failure paths; building the retry marker from this captured base
+    # (instead of re-reading ``project.vision`` on the deferred/except paths below)
+    # avoids a MissingGreenlet lazy-load. ``status_message`` is captured for the
+    # same reason so the post-commit emit never reads it back off a possibly
+    # expired ``task``.
+    base_vision = dict(project.vision or {})
+    status_message: str | None = None
 
     if page_count == 0:
         await _create_strategic_alert(
@@ -4044,19 +4054,19 @@ async def _handle_design_doc_completion(
         )
         if spawned:
             phase2_spawned = True
-            task.latest_status_message = (
+            task.latest_status_message = status_message = (
                 f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
             )
         else:
             # Spawn silently skipped (active strategic task) — create retry marker
             logger.warning(
-                f"[DESIGN DOC] Phase 2 spawn skipped for task {task.id} (active strategic task exists)"
+                f"[DESIGN DOC] Phase 2 spawn skipped for task {task_id_str} (active strategic task exists)"
             )
-            task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review deferred (active task exists)"
+            task.latest_status_message = status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review deferred (active task exists)"
             project.vision = {
-                **(project.vision or {}),
+                **base_vision,
                 "_pending_strategic_review": {
-                    "design_doc_task_id": str(task.id),
+                    "design_doc_task_id": task_id_str,
                     "failed_at": _utcnow().isoformat(),
                     "error": "skipped: active strategic task exists",
                     "cycle_id": cycle_id,
@@ -4072,7 +4082,7 @@ async def _handle_design_doc_completion(
             f"[DESIGN DOC] Failed to chain Phase 2 for task {task_id_str}: {chain_exc}",
             exc_info=True,
         )
-        task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[
+        task.latest_status_message = status_message = f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[
             :500
         ]
         await _create_strategic_alert(
@@ -4082,7 +4092,7 @@ async def _handle_design_doc_completion(
         )
         # Save a retry marker so the next research spawn can retry the strategic review
         project.vision = {
-            **(project.vision or {}),
+            **base_vision,
             "_pending_strategic_review": {
                 "design_doc_task_id": task_id_str,
                 "failed_at": _utcnow().isoformat(),
@@ -4114,15 +4124,20 @@ async def _handle_design_doc_completion(
     # otherwise never paired. Emit completed so the indicator clears. A
     # successful spawn already emitted a Phase-2 started, so it is skipped.
     if not phase2_spawned:
+        # Pre-captured identifiers + captured status string: ``task`` may have
+        # been expired by a rollback inside _spawn_strategic_review, so reading
+        # task.project_id / task.id / task.latest_status_message here would
+        # lazy-load and raise MissingGreenlet (the site that failed task
+        # 94594516, 2026-06-11, after the a9bf1317 partial fix).
         await emit_strategic_cycle_completed(
-            task.project_id,
-            task.id,
+            task_project_id,
+            task_id_value,
             1,
             cycle_id=cycle_id,
             phase_state="deferred",
             completion={
                 "status": "deferred",
-                "status_message": task.latest_status_message,
+                "status_message": status_message,
             },
         )
 

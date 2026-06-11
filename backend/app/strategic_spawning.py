@@ -4290,18 +4290,26 @@ async def _spawn_strategic_review(
     try:
         from app.drift_detection import compute_direction_drift, persist_drift_snapshot
 
-        drift_raw = await compute_direction_drift(session, project)
-        await persist_drift_snapshot(session, project, drift_raw)
-        drift_summary = _summarize_drift_signals(drift_raw)
-        if drift_summary.get("by_direction"):
-            drift_summary = await _enrich_drift_with_trend(
-                session, project.id, drift_summary
-            )
+        # Best-effort drift signals must not poison the shared session. A failed
+        # snapshot flush leaves the session pending-rollback; clearing it with a
+        # bare ``session.rollback()`` (the prior approach) expires EVERY ORM
+        # instance in the session — ``project`` and the in-flight ``task``
+        # included — even though the factory sets ``expire_on_commit=False``
+        # (that flag governs commit, not rollback). The next *synchronous*
+        # attribute read then triggers a lazy-load and raises ``MissingGreenlet``,
+        # failing the whole strategic completion handler (design_doc_update tasks
+        # a9bf1317 / 94594516, 2026-06-11). A SAVEPOINT contains the failure:
+        # rolling back to it discards only the drift writes and leaves
+        # ``project``/``task`` loaded for the caller.
+        async with session.begin_nested():
+            drift_raw = await compute_direction_drift(session, project)
+            await persist_drift_snapshot(session, project, drift_raw)
+            drift_summary = _summarize_drift_signals(drift_raw)
+            if drift_summary.get("by_direction"):
+                drift_summary = await _enrich_drift_with_trend(
+                    session, project.id, drift_summary
+                )
     except Exception:
-        # A failed best-effort snapshot flush leaves the AsyncSession in a
-        # pending-rollback state; clear it so the rest of the strategic spawn
-        # can continue on the same session.
-        await session.rollback()
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
     # LTS version/phase context — active whenever the integration branch and
