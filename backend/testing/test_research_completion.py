@@ -7848,9 +7848,18 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
     assert len(retry_graders) == 1
     retry_grader = retry_graders[0]
     assert (retry_grader.context or {}).get("adversarial_grader") is True
-    assert task.context.get("_adversarial_wholesale_retry_count") == 1
+    # A bare-FAILED grader (no status/logs) is classified as AGENT_TIMEOUT by
+    # classify_failure, which now routes to the targeted retry path.  The targeted
+    # retry count is incremented; the wholesale count must remain untouched.
+    assert task.context.get("_adversarial_targeted_retry_count") == 1, (
+        "AGENT_TIMEOUT cause must use targeted retry first"
+    )
+    assert task.context.get("_adversarial_wholesale_retry_count") in (None, 0), (
+        "wholesale count must not be incremented on the first (targeted) retry"
+    )
     assert (task.context or {}).get("deferred_findings") in (None, [])
 
+    # Second grader failure: targeted count is exhausted (1) — falls through to wholesale.
     retry_grader.status = TaskStatus.FAILED
     db_session.add(retry_grader)
     await db_session.commit()
@@ -7860,6 +7869,40 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
         logs=None,
     )
     await _resolve_quality_grader_completion(retry_grader, retry_payload, db_session)
+    await db_session.refresh(task)
+
+    # After targeted retry exhausted, wholesale retry is spawned — still no children.
+    wholesale_graders = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id,
+                    _Task.id.notin_([task.id, grader.id, retry_grader.id]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(wholesale_graders) == 1, (
+        "targeted retry exhausted must fall through to wholesale grader"
+    )
+    wholesale_grader = wholesale_graders[0]
+    assert task.context.get("_adversarial_wholesale_retry_count") == 1, (
+        "wholesale count must be 1 after targeted retry is exhausted"
+    )
+    assert (task.context or {}).get("deferred_findings") in (None, [])
+
+    # Third grader failure: wholesale count exhausted — defer fail-closed.
+    wholesale_grader.status = TaskStatus.FAILED
+    db_session.add(wholesale_grader)
+    await db_session.commit()
+    wholesale_payload = AgentStatusPayload(
+        task_id=wholesale_grader.id,
+        status=TaskStatus.FAILED,
+        logs=None,
+    )
+    await _resolve_quality_grader_completion(wholesale_grader, wholesale_payload, db_session)
     await db_session.refresh(task)
 
     children = (
@@ -7873,8 +7916,8 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
     )
     assert children == [], "retry-exhausted finding must not spawn"
 
-    # After the bounded retry is exhausted, the failed finding must appear in
-    # deferred_findings for the next cycle.
+    # After both targeted and wholesale retries are exhausted, the failed finding
+    # must appear in deferred_findings for the next cycle.
     deferred = (task.context or {}).get("deferred_findings", [])
     assert any(
         d.get("title") == hs["title"] for d in deferred
@@ -9873,6 +9916,640 @@ async def test_adversarial_gate_uses_poolvm_provenance_after_cache_loss(
     assert verdict["grader_agent_image_build_ts"] == 1749417600
     assert verdict["grader_agent_runtime_fingerprint"] == "b" * 64
     assert verdict["grader_agent_source_sha"] == "fedcba9876543210"
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Machine-readable cause for grader non-response (observability only).
+# Production code: failure_classification.classify_grader_nonresponse_cause /
+# append_grader_diagnostic_trail, task_lifecycle._resolve_quality_grader_completion,
+# research_completion per-finding + per-cycle cause export.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestGraderNonresponseCauseHelpers:
+    """Unit coverage for the cause helper + trail accumulator."""
+
+    @_pytest.mark.asyncio
+    async def test_completed_unparseable_refusal_vs_format_miss(self, db_session):
+        from app.failure_classification import (
+            GRADER_CAUSE_FORMAT_MISS,
+            GRADER_CAUSE_REFUSAL,
+            classify_grader_nonresponse_cause,
+        )
+        from app.task_evaluators import (
+            ADVERSARIAL_PARSE_EMPTY_LOGS,
+            ADVERSARIAL_PARSE_INVALID_JSON,
+            ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+        )
+
+        _project, _direction, grader = await _grader_project_and_task(
+            db_session, "d-cause-refusal"
+        )
+
+        # Prose that reads as a refusal, with no verdict array → refusal.
+        refusal = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+            {},
+            completed=True,
+            logs="I cannot comply with this challenge request.",
+            session=None,
+        )
+        assert refusal["category"] == GRADER_CAUSE_REFUSAL
+        assert refusal["source"] == "output_inspection"
+        # session=None → stale tag must be absent, never raise.
+        assert "stale_agent_image" not in refusal
+
+        # Garbled JSON → format miss (tried in-format, missed schema).
+        garbled = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_INVALID_JSON,
+            {},
+            completed=True,
+            logs='[{"hash": "abc", "verdict": ',
+            session=None,
+        )
+        assert garbled["category"] == GRADER_CAUSE_FORMAT_MISS
+
+        # Structurally empty output → format miss (nothing to refuse with).
+        empty = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_EMPTY_LOGS,
+            {},
+            completed=True,
+            logs="",
+            session=None,
+        )
+        assert empty["category"] == GRADER_CAUSE_FORMAT_MISS
+
+        # Prose with no refusal marker and no array → format miss, not refusal.
+        prose = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+            {},
+            completed=True,
+            logs="Here is my analysis of the three findings under review.",
+            session=None,
+        )
+        assert prose["category"] == GRADER_CAUSE_FORMAT_MISS
+
+    @_pytest.mark.asyncio
+    async def test_failed_grader_draws_taxonomy_cause(self, db_session):
+        from app.failure_classification import classify_grader_nonresponse_cause
+        from app.task_evaluators import ADVERSARIAL_PARSE_CHALLENGER_FAILED
+
+        _project, _direction, grader = await _grader_project_and_task(
+            db_session, "d-cause-failed"
+        )
+        # Persisted agent failure category → classify_failure returns AGENT_TIMEOUT.
+        grader.context = {**(grader.context or {}), "failure_category": "timeout"}
+        db_session.add(grader)
+        await db_session.commit()
+
+        cause = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_CHALLENGER_FAILED,
+            {},
+            completed=False,
+            logs=None,
+            session=None,
+        )
+        assert cause["category"] == "AGENT_TIMEOUT"
+        assert cause["source"] == "failure_taxonomy"
+        assert cause["parse_outcome"] == ADVERSARIAL_PARSE_CHALLENGER_FAILED
+
+    @_pytest.mark.asyncio
+    async def test_stale_agent_image_tag_set_and_absent(self, db_session, mocker):
+        from app.failure_classification import classify_grader_nonresponse_cause
+
+        project, _direction, grader = await _grader_project_and_task(
+            db_session, "d-cause-stale"
+        )
+
+        # Serving SHA known + different + grader SHA is an ancestor → stale=True.
+        mocker.patch(
+            "app.compute.expected_serving_source_sha",
+            new=AsyncMock(return_value="new_serving_sha"),
+        )
+        mocker.patch(
+            "app.release_promotion._resolve_github_with_session",
+            new=AsyncMock(return_value=("tok", "owner", "repo")),
+        )
+        ancestor = mocker.patch(
+            "app.github_refs.is_ancestor_of",
+            new=AsyncMock(return_value=True),
+        )
+        cause = await classify_grader_nonresponse_cause(
+            grader,
+            "ok",
+            {"grader_agent_source_sha": "old_grader_sha"},
+            completed=True,
+            logs="[]",
+            session=db_session,
+            project_id=project.id,
+        )
+        assert cause["stale_agent_image"] is True
+        ancestor.assert_awaited_once()
+
+        # Expected serving SHA unknown → tag gracefully absent.
+        mocker.patch(
+            "app.compute.expected_serving_source_sha",
+            new=AsyncMock(return_value=None),
+        )
+        cause_unknown = await classify_grader_nonresponse_cause(
+            grader,
+            "ok",
+            {"grader_agent_source_sha": "old_grader_sha"},
+            completed=True,
+            logs="[]",
+            session=db_session,
+            project_id=project.id,
+        )
+        assert "stale_agent_image" not in cause_unknown
+
+    def test_append_grader_diagnostic_trail_accumulates_and_caps(self):
+        from app.failure_classification import (
+            GRADER_DIAGNOSTIC_TRAIL_KEY,
+            append_grader_diagnostic_trail,
+        )
+
+        ctx: dict = {}
+        for i in range(7):
+            append_grader_diagnostic_trail(
+                ctx,
+                grader_task_id=f"grader-{i}",
+                parse_outcome="empty_logs",
+                cause={"category": "grader_format_miss"},
+                vm_provenance={},
+            )
+        trail = ctx[GRADER_DIAGNOSTIC_TRAIL_KEY]
+        # Capped at 5, keeping the most-recent entries, attempts monotonically increasing.
+        assert len(trail) == 5
+        assert [e["attempt"] for e in trail] == [3, 4, 5, 6, 7]
+        assert trail[-1]["grader_task_id"] == "grader-6"
+
+
+@_pytest.mark.asyncio
+async def test_resolution_records_cause_and_accumulating_trail(db_session, mocker):
+    """Two FAILED grader resolutions accumulate per-attempt trail entries (not
+    overwrite) and stamp a taxonomy-drawn cause into the diagnostic."""
+    from app.research_completion import _finding_hash  # noqa: F401
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-cause-trail")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs = _high_stakes_finding(direction["id"], "Risky finding for trail")
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[hs]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+    grader = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id, _Task.id != task.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert grader is not None
+
+    # Resolution 1: grader FAILED with a persisted timeout category.
+    grader.status = TaskStatus.FAILED
+    grader.context = {**(grader.context or {}), "failure_category": "timeout"}
+    db_session.add(grader)
+    await db_session.commit()
+    await _resolve_quality_grader_completion(
+        grader, AgentStatusPayload(task_id=grader.id, status=TaskStatus.FAILED, logs=None),
+        db_session,
+    )
+    await db_session.refresh(task)
+
+    diag = (task.context or {}).get("adversarial_gate_diagnostic") or {}
+    assert diag.get("cause", {}).get("category") == "AGENT_TIMEOUT"
+    trail = (task.context or {}).get("grader_diagnostic_trail") or []
+    assert len(trail) == 1
+    assert trail[0]["attempt"] == 1
+
+    # The first failure spawns one bounded retry grader.
+    retry_grader = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id,
+                    _Task.id.notin_([task.id, grader.id]),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert retry_grader is not None
+
+    # Resolution 2: retry grader also FAILED → trail accumulates, not overwrites.
+    retry_grader.status = TaskStatus.FAILED
+    retry_grader.context = {**(retry_grader.context or {}), "failure_category": "rate_limited"}
+    db_session.add(retry_grader)
+    await db_session.commit()
+    await _resolve_quality_grader_completion(
+        retry_grader,
+        AgentStatusPayload(task_id=retry_grader.id, status=TaskStatus.FAILED, logs=None),
+        db_session,
+    )
+    await db_session.refresh(task)
+
+    trail2 = (task.context or {}).get("grader_diagnostic_trail") or []
+    assert len(trail2) == 2, "second resolution must append, not overwrite"
+    assert [e["attempt"] for e in trail2] == [1, 2]
+    assert trail2[1]["cause"]["category"] == "RATE_LIMIT"
+
+
+@_pytest.mark.asyncio
+async def test_unresolved_finding_and_cycle_summary_carry_cause(db_session, mocker):
+    """The deferred unresolved finding carries the cause, and the cycle exports a
+    machine-readable cause summary alongside the spawn-gate metrics."""
+    from app.research_completion import _finding_hash
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-cause-perfind")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs_verdicted = _high_stakes_finding(direction["id"], "Finding with verdict")
+    hs_unresolved = _high_stakes_finding(direction["id"], "Finding without verdict")
+    fhash_verdicted = _finding_hash(
+        hs_verdicted["title"],
+        hs_verdicted.get("description", "") or hs_verdicted.get("prompt", ""),
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs_verdicted, hs_unresolved],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+    grader = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id, _Task.id != task.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert grader is not None
+
+    # Grader returns an explicit verdict for one hash only (parse_outcome == ok);
+    # the second hash is unresolved.
+    grader.status = TaskStatus.COMPLETED
+    db_session.add(grader)
+    await db_session.commit()
+    await _resolve_quality_grader_completion(
+        grader,
+        AgentStatusPayload(
+            task_id=grader.id,
+            status=TaskStatus.COMPLETED,
+            logs='[{"hash": "' + fhash_verdicted + '", "verdict": "fail", "reason": "x"}]',
+        ),
+        db_session,
+    )
+    await db_session.refresh(task)
+
+    # Per-finding attribution: the deferred unresolved finding carries the cause.
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert deferred, "unresolved finding must be deferred"
+    assert any(
+        isinstance(d.get("adversarial_gate_cause"), dict)
+        and d["adversarial_gate_cause"].get("category")
+        for d in deferred
+    ), "deferred finding must carry adversarial_gate_cause"
+
+    # Per-cycle export: machine-readable cause summary alongside spawn-gate metrics.
+    cause = (task.context or {}).get("research_spawn_gate_cause")
+    assert isinstance(cause, dict) and cause.get("category"), (
+        "research_spawn_gate_cause must be exported"
+    )
+    counts = (task.context or {}).get("research_spawn_gate_cause_counts")
+    assert isinstance(counts, dict) and counts, (
+        "research_spawn_gate_cause_counts must be exported"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_forward_quality_lane_records_cause(db_session, mocker):
+    """The dark forward-quality lane must now also record a diagnostic + cause +
+    trail entry (it previously recorded nothing)."""
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    _project, _direction, task = await _grader_project_and_task(db_session, "d-cause-fq")
+
+    grader = await spawn_forward_quality_grader(task, "artifact text", db_session)
+    assert grader is not None
+    await db_session.refresh(task)
+    assert task.context.get("awaiting_quality_grader")
+
+    grader.status = TaskStatus.COMPLETED
+    db_session.add(grader)
+    await db_session.commit()
+
+    # Stub the research resume handler + broadcast so we isolate the diagnostic write.
+    mocker.patch(
+        "app.research_completion._handle_research_completion", new_callable=AsyncMock
+    )
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+
+    await _resolve_quality_grader_completion(
+        grader,
+        AgentStatusPayload(
+            task_id=grader.id,
+            status=TaskStatus.COMPLETED,
+            logs='{"verdict": "pass", "reasoning": "well grounded"}',
+        ),
+        db_session,
+    )
+    await db_session.refresh(task)
+
+    fq_diag = (task.context or {}).get("quality_grader_diagnostic")
+    assert fq_diag is not None, "forward-quality lane must record a diagnostic"
+    assert fq_diag["cause"]["category"] == "grader_responsive"
+    assert fq_diag["completion_state"] == "completed"
+    trail = (task.context or {}).get("grader_diagnostic_trail") or []
+    assert trail, "forward-quality lane must append a trail entry"
+    assert trail[-1]["cause"]["category"] == "grader_responsive"
+
+
+# ---------------------------------------------------------------------------
+# Cause-keyed targeted retry tests (acceptance test: test_spawn_gate_targeted_retry_routes_by_cause)
+# ---------------------------------------------------------------------------
+
+@_pytest.mark.asyncio
+async def test_spawn_gate_targeted_retry_routes_by_cause(db_session, mocker):
+    """ACCEPTANCE TEST: cause-keyed routing sends each non-response cause to the
+    correct retry strategy.
+
+    Scenario A — timeout cause: spawns a targeted retry with a reduced manifest
+    (half the findings), not the full wholesale retry.
+    Scenario B — transient-infra cause: uses the existing wholesale retry path.
+    Scenario C — refusal cause: skips all retries and marks exhausted immediately.
+    Scenario D — targeted retry exhausted (timeout on second attempt): falls
+    through to wholesale retry.
+    """
+    from app.failure_classification import (
+        AGENT_TIMEOUT,
+        GRADER_CAUSE_REFUSAL,
+        RATE_LIMIT,
+    )
+    from app.research_completion import (
+        _ADVERSARIAL_TARGETED_RETRY_KEY,
+        _ADVERSARIAL_WHOLESALE_RETRY_KEY,
+        _finding_hash,
+    )
+    from test_autonomous_research import _patch_research_externals
+
+    async def _make_task_with_cause(db_session, direction_suffix, cause_category, *, targeted_count=0):
+        """Helper: build a task whose ADVERSARIAL_GATE_VERDICT_KEY carries a given cause."""
+        project, direction, task = await _grader_project_and_task(
+            db_session, f"d-targeted-{direction_suffix}"
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._is_high_stakes_finding",
+            side_effect=lambda f: f.get("risk") == "high",
+        )
+
+        # Two high-stakes findings so the "half" slice is non-trivial.
+        hs1 = _high_stakes_finding(direction["id"], f"Finding A ({direction_suffix})")
+        hs2 = _high_stakes_finding(direction["id"], f"Finding B ({direction_suffix})")
+        fhash1 = _finding_hash(hs1["title"], hs1.get("description", ""))
+        fhash2 = _finding_hash(hs2["title"], hs2.get("description", ""))
+
+        task.plan_output = [hs1, hs2]
+        task.status = TaskStatus.COMPLETED
+        task.context = {
+            **(task.context or {}),
+            ADVERSARIAL_GATE_VERDICT_KEY: {
+                "finding_verdicts": {},
+                "grader_task_id": f"test-grader-{direction_suffix}",
+                "parse_outcome": "no_hash_matches",
+                "cause": {"category": cause_category, "parse_outcome": "no_hash_matches"},
+            },
+            "_adversarial_challenged_hashes": [fhash1, fhash2],
+        }
+        if targeted_count:
+            task.context[_ADVERSARIAL_TARGETED_RETRY_KEY] = targeted_count
+
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[hs1, hs2],
+        )
+        db_session.add(project)
+        db_session.add(task)
+        await db_session.commit()
+        return project, direction, task, fhash1, fhash2
+
+    # --- Scenario A: timeout → targeted retry with reduced manifest ---
+    _proj_a, _dir_a, task_a, fhash1_a, fhash2_a = await _make_task_with_cause(
+        db_session, "timeout", AGENT_TIMEOUT
+    )
+
+    await _handle_research_completion(task_a, "", db_session)
+    await db_session.refresh(task_a)
+
+    all_tasks_a = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_a.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_a = [t for t in all_tasks_a if (t.context or {}).get("adversarial_grader")]
+    assert len(graders_a) == 1, "timeout cause must spawn exactly one targeted retry grader"
+    assert task_a.status == TaskStatus.EVALUATING
+    # Targeted retry counter must be incremented.
+    assert task_a.context.get(_ADVERSARIAL_TARGETED_RETRY_KEY) == 1, (
+        "targeted retry count must be 1 after first targeted retry"
+    )
+    # Wholesale counter must remain untouched.
+    assert task_a.context.get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) in (None, 0), (
+        "wholesale retry count must not be incremented for targeted retry"
+    )
+    # Reduced manifest: only ONE of the two findings should be challenged.
+    challenged_hashes_a = task_a.context.get("_adversarial_challenged_hashes") or []
+    assert len(challenged_hashes_a) == 1, (
+        "targeted retry must challenge only half the findings (1 of 2)"
+    )
+    # No child spawns yet (task is parked waiting for grader).
+    children_a = [t for t in all_tasks_a if t.parent_task_id == task_a.id]
+    assert len(children_a) == 0, "targeted retry must not spawn child research tasks"
+
+    # --- Scenario B: transient infra (rate-limit) → existing wholesale retry ---
+    _proj_b, _dir_b, task_b, fhash1_b, fhash2_b = await _make_task_with_cause(
+        db_session, "ratelimit", RATE_LIMIT
+    )
+
+    await _handle_research_completion(task_b, "", db_session)
+    await db_session.refresh(task_b)
+
+    all_tasks_b = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_b.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_b = [t for t in all_tasks_b if (t.context or {}).get("adversarial_grader")]
+    assert len(graders_b) == 1, "rate-limit cause must spawn a wholesale retry grader"
+    assert task_b.status == TaskStatus.EVALUATING
+    # Wholesale counter must be incremented.
+    assert task_b.context.get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) == 1, (
+        "wholesale retry count must be 1 for transient-infra cause"
+    )
+    # Targeted counter must remain untouched.
+    assert task_b.context.get(_ADVERSARIAL_TARGETED_RETRY_KEY) in (None, 0), (
+        "targeted retry count must not be incremented for transient-infra cause"
+    )
+    # Wholesale manifest should include BOTH findings.
+    challenged_hashes_b = task_b.context.get("_adversarial_challenged_hashes") or []
+    assert len(challenged_hashes_b) == 2, (
+        "wholesale retry must challenge all originally challenged findings"
+    )
+
+    # --- Scenario C: refusal → skip all retries, mark exhausted ---
+    _proj_c, _dir_c, task_c, fhash1_c, fhash2_c = await _make_task_with_cause(
+        db_session, "refusal", GRADER_CAUSE_REFUSAL
+    )
+
+    await _handle_research_completion(task_c, "", db_session)
+    await db_session.refresh(task_c)
+
+    all_tasks_c = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_c.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_c = [t for t in all_tasks_c if (t.context or {}).get("adversarial_grader")]
+    # No new grader should be spawned for a refusal.
+    assert len(graders_c) == 0, "refusal cause must NOT spawn any retry grader"
+    # Must be marked as exhausted immediately.
+    assert task_c.context.get("research_spawn_gate_wholesale_retry_exhausted") is True, (
+        "refusal cause must mark retry as exhausted immediately"
+    )
+    assert task_c.context.get("research_spawn_gate_refusal_skip_retry") is True, (
+        "refusal cause must set refusal_skip_retry flag"
+    )
+    # Both findings must be deferred fail-closed.
+    deferred_c = task_c.context.get("deferred_findings") or []
+    assert fhash1_c or fhash2_c  # just ensure hashes were computed
+    assert len(deferred_c) >= 2, (
+        "both challenged findings must be deferred fail-closed on refusal"
+    )
+
+    # --- Scenario D: timeout cause with targeted already exhausted → wholesale retry ---
+    _proj_d, _dir_d, task_d, fhash1_d, fhash2_d = await _make_task_with_cause(
+        db_session, "timeout-exhausted", AGENT_TIMEOUT, targeted_count=1
+    )
+
+    await _handle_research_completion(task_d, "", db_session)
+    await db_session.refresh(task_d)
+
+    all_tasks_d = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_d.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_d = [t for t in all_tasks_d if (t.context or {}).get("adversarial_grader")]
+    assert len(graders_d) == 1, (
+        "timeout with targeted exhausted must fall through to wholesale retry grader"
+    )
+    assert task_d.status == TaskStatus.EVALUATING
+    # Wholesale counter must now be incremented (targeted was already at limit).
+    assert task_d.context.get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) == 1, (
+        "wholesale retry count must be 1 after targeted retry is exhausted"
+    )
+    # Targeted counter must stay at limit (not incremented again).
+    assert task_d.context.get(_ADVERSARIAL_TARGETED_RETRY_KEY) == 1, (
+        "targeted retry count must remain at limit (1) after exhaustion"
+    )
+    # Wholesale manifest should include both findings (full retry).
+    challenged_hashes_d = task_d.context.get("_adversarial_challenged_hashes") or []
+    assert len(challenged_hashes_d) == 2, (
+        "wholesale retry after targeted exhaustion must challenge all findings"
+    )
+
+    # --- Scenario E: targeted retry itself times out → wholesale must use original full set ---
+    # This exercises the production path:
+    #   initial timeout → targeted retry spawned (narrows _adversarial_challenged_hashes to 1)
+    #   → targeted retry also times out → wholesale fallback must recover original 2-hash set
+    #     via _adversarial_original_challenged_hashes and challenge all findings.
+    _proj_e, _dir_e, task_e, fhash1_e, fhash2_e = await _make_task_with_cause(
+        db_session, "timeout-targeted-then-wholesale", AGENT_TIMEOUT, targeted_count=1
+    )
+    # Simulate what the targeted retry spawn wrote: narrowed challenged hashes + saved original.
+    task_e.context = {
+        **task_e.context,
+        "_adversarial_challenged_hashes": [fhash1_e],  # reduced subset
+        "_adversarial_original_challenged_hashes": [fhash1_e, fhash2_e],  # full original
+    }
+    db_session.add(task_e)
+    await db_session.commit()
+
+    await _handle_research_completion(task_e, "", db_session)
+    await db_session.refresh(task_e)
+
+    all_tasks_e = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_e.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_e = [t for t in all_tasks_e if (t.context or {}).get("adversarial_grader")]
+    assert len(graders_e) == 1, (
+        "targeted-then-timeout must fall through to wholesale retry grader"
+    )
+    assert task_e.status == TaskStatus.EVALUATING
+    assert task_e.context.get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) == 1, (
+        "wholesale retry count must be 1 after targeted timeout falls through"
+    )
+    # Wholesale manifest must include BOTH findings (recovered from original, not the reduced 1).
+    challenged_hashes_e = task_e.context.get("_adversarial_challenged_hashes") or []
+    assert len(challenged_hashes_e) == 2, (
+        "wholesale retry after targeted timeout must challenge all original findings, "
+        "not just the targeted-retry subset"
+    )
+    # Original preservation key must be cleared after wholesale consumes it.
+    assert "_adversarial_original_challenged_hashes" not in task_e.context, (
+        "original hash preservation key must be cleared after wholesale retry"
+    )
 
 
 # ---------------------------------------------------------------------------

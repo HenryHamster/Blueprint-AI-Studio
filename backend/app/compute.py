@@ -1170,6 +1170,28 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
     }
 
 
+async def expected_serving_source_sha(session, project_id=None) -> str | None:
+    """Best-effort: the source git SHA the live agent fleet is currently serving.
+
+    Returns the dominant (most-observed) ``agent_source_sha`` across live agent
+    VMs from :func:`agent_fleet_source_sha_snapshot`, or ``None`` when no live VM
+    has reported a source SHA yet. The snapshot already sorts buckets so the
+    first non-null bucket is the most-observed served SHA. Read-only and never
+    raises — callers that compare a grader VM's recorded SHA against this for a
+    staleness tag must treat ``None`` as "expected SHA unknown" and skip the tag.
+    """
+    try:
+        snap = await agent_fleet_source_sha_snapshot(session, project_id=project_id)
+        for bucket in snap.get("buckets") or []:
+            sha = bucket.get("source_sha")
+            if sha:
+                return str(sha)
+        return None
+    except Exception as e:
+        logger.debug(f"[COMPUTE] expected_serving_source_sha failed: {e}")
+        return None
+
+
 async def persist_pool_vm_image_state(
     session,
     vm_instance_id: str,

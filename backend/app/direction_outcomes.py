@@ -654,6 +654,12 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "research_spawn_gate_parse_outcome": {
         "consumer": "digest_direction_progress.py, strategic_spawning.py (machine-readable adversarial parse classification for unresolved cycles)"
     },
+    "research_spawn_gate_cause": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (machine-readable grader non-response cause object for unresolved cycles)"
+    },
+    "research_spawn_gate_cause_counts": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (per-cause count of unresolved findings for cause distribution aggregation)"
+    },
     "research_spawn_gate_manifest_excluded_fail_closed_count": {
         "consumer": "digest_direction_progress.py, strategic_spawning.py (manifest-excluded high-stakes fail-closed deferral count)"
     },
@@ -802,6 +808,8 @@ async def _update_direction_research_outcomes(
         research_task_ctx.get("research_spawn_gate_wholesale_retry_exhausted")
     )
     spawn_gate_parse_outcome = research_task_ctx.get("research_spawn_gate_parse_outcome")
+    spawn_gate_cause = research_task_ctx.get("research_spawn_gate_cause")
+    spawn_gate_cause_counts = research_task_ctx.get("research_spawn_gate_cause_counts")
     spawn_gate_manifest_excluded_count = int(
         research_task_ctx.get(
             "research_spawn_gate_manifest_excluded_fail_closed_count"
@@ -896,6 +904,10 @@ async def _update_direction_research_outcomes(
             entry["research_spawn_gate_refuted_reasons"] = spawn_gate_refuted_reasons
         if spawn_gate_parse_outcome:
             entry["research_spawn_gate_parse_outcome"] = spawn_gate_parse_outcome
+        if spawn_gate_cause:
+            entry["research_spawn_gate_cause"] = spawn_gate_cause
+        if spawn_gate_cause_counts:
+            entry["research_spawn_gate_cause_counts"] = spawn_gate_cause_counts
         if spawn_gate_manifest_excluded_count:
             entry["research_spawn_gate_manifest_excluded_fail_closed_count"] = (
                 spawn_gate_manifest_excluded_count

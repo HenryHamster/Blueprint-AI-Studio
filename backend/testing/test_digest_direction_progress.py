@@ -2530,3 +2530,39 @@ async def test_retirement_critiques_skips_sentinel_entries(
     data = response.json()
     assert data["total"] == 1
     assert data["critiques"][0]["direction_id"] == "dir-real"
+
+
+def test_compute_spawn_gate_aggregate_cause_distribution():
+    """compute_spawn_gate_aggregate sums cause_counts across history entries into cause_distribution."""
+    from app.digest_direction_progress import compute_spawn_gate_aggregate
+
+    history = [
+        {
+            "research_spawn_gate_challenged_count": 3,
+            "research_spawn_gate_unresolved_count": 2,
+            "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 2},
+        },
+        {
+            "research_spawn_gate_challenged_count": 2,
+            "research_spawn_gate_unresolved_count": 1,
+            "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 1, "RATE_LIMIT": 1},
+        },
+    ]
+    result = compute_spawn_gate_aggregate(history)
+    assert result is not None
+    cause_dist = result.get("cause_distribution")
+    assert cause_dist is not None
+    assert cause_dist["AGENT_TIMEOUT"] == 3
+    assert cause_dist["RATE_LIMIT"] == 1
+
+
+def test_compute_spawn_gate_aggregate_cause_distribution_absent_when_no_cause():
+    """cause_distribution is None when no entries carry cause_counts."""
+    from app.digest_direction_progress import compute_spawn_gate_aggregate
+
+    history = [
+        {"research_spawn_gate_challenged_count": 2, "research_spawn_gate_survived_count": 1},
+    ]
+    result = compute_spawn_gate_aggregate(history)
+    assert result is not None
+    assert result.get("cause_distribution") is None

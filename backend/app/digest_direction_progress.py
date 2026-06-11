@@ -123,6 +123,7 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
     adversarial_give_up_samples: List[Dict[str, str]] = []
     _seen_adversarial_give_up: set[str] = set()
     parse_outcome_distribution: dict[str, int] = {}
+    cause_distribution: dict[str, int] = {}
     for entry in history or []:
         challenged += entry.get("research_spawn_gate_challenged_count") or 0
         refuted += entry.get("research_spawn_gate_refuted_count") or 0
@@ -193,6 +194,14 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
             parse_outcome_distribution[_parse_outcome] = (
                 parse_outcome_distribution.get(_parse_outcome, 0) + 1
             )
+        for _cause_cat, _cause_cnt in (
+            entry.get("research_spawn_gate_cause_counts") or {}
+        ).items():
+            _cause_cat = str(_cause_cat).strip()
+            if _cause_cat:
+                cause_distribution[_cause_cat] = (
+                    cause_distribution.get(_cause_cat, 0) + int(_cause_cnt or 0)
+                )
     if not any([
         challenged,
         refuted,
@@ -233,6 +242,7 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
         "exhaustion_count": exhaustion_count,
         "refuted_reasons": refuted_reasons,
         "parse_outcome_distribution": parse_outcome_distribution or None,
+        "cause_distribution": cause_distribution or None,
     }
 
 

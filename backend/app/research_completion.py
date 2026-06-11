@@ -53,6 +53,9 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
 )
 from app.failure_classification import (
     CO_DEFERRED_SHELVED,
+    GRADER_CAUSE_REFUSAL,
+    GRADER_TIMEOUT_CAUSES,
+    GRADER_TRANSIENT_INFRA_CAUSES,
     INFRA_CLASSES,
     classify_failure,
 )
@@ -233,6 +236,11 @@ _SPAWN_GATE_REASONS_SAMPLE_CAP = 5
 _SPAWN_GATE_REASON_MAX_LEN = 200
 _ADVERSARIAL_WHOLESALE_RETRY_KEY = "_adversarial_wholesale_retry_count"
 _ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
+# Targeted retry: used when the non-response cause is time-based (timeout/stall).
+# A reduced-manifest grader is spawned BEFORE falling back to the wholesale retry,
+# so the total grader budget is: initial + at most one targeted + at most one wholesale.
+_ADVERSARIAL_TARGETED_RETRY_KEY = "_adversarial_targeted_retry_count"
+_ADVERSARIAL_TARGETED_RETRY_LIMIT = 1
 
 # Verification-basis tiers, ordered from highest evidence (the finding's claim
 # was checked against real code) to lowest (asserted/deduced). Defined once here
@@ -2255,6 +2263,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     for f in _decayed[:5]
                 ],
             }
+            # Carry the grader non-response cause onto the give-up record when any
+            # adversarial-gate finding was decayed, so a structural give-up driven
+            # by a non-responsive grader is attributable. Observability only.
+            _give_up_cause = (
+                (task.context or {}).get("adversarial_gate_diagnostic") or {}
+            ).get("cause")
+            if _give_up_cause and any(
+                f.get("deferred_reason") == "adversarial_gate" for f in _decayed
+            ):
+                _finding_give_up["adversarial_gate_cause"] = _give_up_cause
         prior_actionable = _kept
         # Stale-targeting: a deferred finding carries the integration HEAD it was
         # generated against. On re-dispatch, ask whether any cited file changed
@@ -2401,6 +2419,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _spawn_gate_parse_outcome = None
     if _adversarial_verdict_raw is not None:
         _spawn_gate_parse_outcome = _adversarial_verdict_raw.get("parse_outcome")
+        # Machine-readable non-response cause from the resolution-time diagnostic
+        # (or the gate record). Stamped onto each unresolved finding below so the
+        # deferred record is attributable. Observability only.
+        _spawn_gate_cause = _adversarial_verdict_raw.get("cause") or (
+            (task.context or {}).get("adversarial_gate_diagnostic") or {}
+        ).get("cause")
         _adv_verdicts: dict[str, dict] = (
             _adversarial_verdict_raw.get("finding_verdicts") or {}
         )
@@ -2427,71 +2451,206 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             and _wholesale_parse_outcome in ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES
         )
         if _wholesale_non_response:
-            _retry_count = int(
-                (task.context or {}).get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) or 0
+            # Dispatch on the diagnosed non-response cause so the retry
+            # strategy matches the failure mode rather than always doing the
+            # same wholesale re-challenge.
+            _cause_category = (
+                (_adversarial_verdict_raw.get("cause") or {}).get("category") or ""
             )
-            if _retry_count < _ADVERSARIAL_WHOLESALE_RETRY_LIMIT:
-                _retry_findings = []
-                for _f in findings:
-                    _fhash = _fh(
-                        str(_f.get("title", "")),
-                        str(_f.get("description", "") or _f.get("prompt", "")),
-                    )
-                    if _fhash in _challenged_hashes_set:
-                        _retry_findings.append({**_f, "hash": _fhash})
-                _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
-                    _retry_findings
+            # _do_wholesale: True means fall through to the existing wholesale
+            # retry logic.  The refusal path sets it False to skip retries.
+            _do_wholesale = True
+
+            if _cause_category in GRADER_TIMEOUT_CAUSES:
+                # The grader ran out of time.  Retry with a reduced manifest
+                # (half the challenged findings) so the next grader is less
+                # likely to time out.  Findings excluded from the reduced set
+                # fail closed via the existing manifest-exclusion path.
+                _targeted_count = int(
+                    (task.context or {}).get(_ADVERSARIAL_TARGETED_RETRY_KEY) or 0
                 )
-                _retry_hashes = [
-                    item["hash"]
-                    for item in _manifest_items
-                    if item.get("hash") in _challenged_hashes_set
-                ]
-                if _retry_hashes:
-                    _ctx = dict(task.context or {})
-                    _ctx.pop(ADVERSARIAL_GATE_VERDICT_KEY, None)
-                    _ctx[_ADVERSARIAL_WHOLESALE_RETRY_KEY] = _retry_count + 1
-                    _ctx["_adversarial_challenged_hashes"] = _retry_hashes
-                    _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
-                        _wholesale_parse_outcome
-                    )
-                    _ctx["research_spawn_gate_challenged_count"] = len(_retry_hashes)
-                    _ctx["research_spawn_gate_refuted_count"] = 0
-                    _ctx["research_spawn_gate_survived_count"] = 0
-                    _ctx["research_spawn_gate_explicit_pass_count"] = 0
-                    _ctx["research_spawn_gate_fail_open_count"] = 0
-                    _ctx["research_spawn_gate_unresolved_count"] = len(_retry_hashes)
-                    _ctx["research_spawn_gate_parse_outcome"] = _wholesale_parse_outcome
-                    task.context = _ctx
-                    flag_modified(task, "context")
-                    session.add(task)
-                    await session.flush()
-                    adv_grader = await spawn_forward_quality_grader(
-                        task,
-                        _manifest_json,
-                        session,
-                        adversarial_mode=True,
-                        finding_hashes=_retry_hashes,
-                    )
-                    if adv_grader is not None:
-                        logger.warning(
-                            "[RESEARCH] Task %s deferred wholesale adversarial "
-                            "non-response (%s) and spawned bounded retry grader %s",
-                            task.id,
-                            _wholesale_parse_outcome,
-                            adv_grader.id,
+                if _targeted_count < _ADVERSARIAL_TARGETED_RETRY_LIMIT:
+                    _half = max(1, len(_challenged_hashes_set) // 2)
+                    _retry_findings = []
+                    for _f in findings:
+                        _fhash = _fh(
+                            str(_f.get("title", "")),
+                            str(_f.get("description", "") or _f.get("prompt", "")),
                         )
-                        return
-                    # If the single-shot guard refuses a retry, continue into the
-                    # fail-closed path; high-stakes work still must not spawn.
-            else:
+                        if (
+                            _fhash in _challenged_hashes_set
+                            and len(_retry_findings) < _half
+                        ):
+                            _retry_findings.append({**_f, "hash": _fhash})
+                    _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
+                        _retry_findings
+                    )
+                    _retry_hashes = [
+                        item["hash"]
+                        for item in _manifest_items
+                        if item.get("hash") in _challenged_hashes_set
+                    ]
+                    if _retry_hashes:
+                        _ctx = dict(task.context or {})
+                        _ctx.pop(ADVERSARIAL_GATE_VERDICT_KEY, None)
+                        _ctx[_ADVERSARIAL_TARGETED_RETRY_KEY] = _targeted_count + 1
+                        # Preserve the original full hash list before narrowing to the
+                        # reduced targeted-retry manifest. The wholesale fallback reads
+                        # this key so a second timeout still challenges all findings
+                        # rather than only the already-reduced subset.
+                        if not _ctx.get("_adversarial_original_challenged_hashes"):
+                            _ctx["_adversarial_original_challenged_hashes"] = list(
+                                _challenged_hashes_set
+                            )
+                        _ctx["_adversarial_challenged_hashes"] = _retry_hashes
+                        _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
+                            _wholesale_parse_outcome
+                        )
+                        _ctx["research_spawn_gate_challenged_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_refuted_count"] = 0
+                        _ctx["research_spawn_gate_survived_count"] = 0
+                        _ctx["research_spawn_gate_explicit_pass_count"] = 0
+                        _ctx["research_spawn_gate_fail_open_count"] = 0
+                        _ctx["research_spawn_gate_unresolved_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_parse_outcome"] = _wholesale_parse_outcome
+                        task.context = _ctx
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.flush()
+                        adv_grader = await spawn_forward_quality_grader(
+                            task,
+                            _manifest_json,
+                            session,
+                            adversarial_mode=True,
+                            finding_hashes=_retry_hashes,
+                        )
+                        if adv_grader is not None:
+                            logger.warning(
+                                "[RESEARCH] Task %s deferred timeout adversarial "
+                                "non-response (%s) and spawned targeted retry "
+                                "grader %s (%d/%d findings in reduced manifest)",
+                                task.id,
+                                _wholesale_parse_outcome,
+                                adv_grader.id,
+                                len(_retry_hashes),
+                                len(_challenged_hashes_set),
+                            )
+                            return
+                        # Single-shot guard blocked spawn; fall through to wholesale.
+                # Targeted retry exhausted or spawn blocked: fall through to
+                # wholesale retry so the cycle still gets one more chance with
+                # the full manifest before deferring everything fail-closed.
+
+            elif _cause_category in GRADER_TRANSIENT_INFRA_CAUSES:
+                # Transient-infra failure (rate-limit, provisioning, etc.):
+                # fall through to wholesale retry with _do_wholesale=True.
+                pass
+
+            elif _cause_category == GRADER_CAUSE_REFUSAL:
+                # The grader completed but explicitly refused to answer.
+                # Re-asking an identical prompt predictably refuses again;
+                # skip all retries and defer fail-closed immediately so the
+                # cycle does not burn extra budget on a known-futile re-ask.
+                logger.warning(
+                    "[RESEARCH] Task %s adversarial grader refused (parse=%s) — "
+                    "skipping retries, all challenged findings deferred fail-closed",
+                    task.id,
+                    _wholesale_parse_outcome,
+                )
                 _ctx = dict(task.context or {})
                 _ctx["research_spawn_gate_wholesale_retry_exhausted"] = True
+                _ctx["research_spawn_gate_refusal_skip_retry"] = True
                 _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
                     _wholesale_parse_outcome
                 )
                 task.context = _ctx
                 flag_modified(task, "context")
+                _do_wholesale = False
+
+            if _do_wholesale:
+                # Transient-infra cause (rate-limit, provisioning, reassignment,
+                # etc.), format miss, unknown, or timeout after targeted retry
+                # exhausted: use the existing wholesale retry (same manifest,
+                # fresh grader), counted against the wholesale budget.
+                _retry_count = int(
+                    (task.context or {}).get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) or 0
+                )
+                if _retry_count < _ADVERSARIAL_WHOLESALE_RETRY_LIMIT:
+                    # If the targeted retry narrowed _adversarial_challenged_hashes to
+                    # a subset, _challenged_hashes_set reflects only that subset here.
+                    # Recover the original full list from the preservation key written
+                    # at targeted-retry spawn time so the wholesale challenge covers all
+                    # originally-challenged findings, not just the reduced half.
+                    _wholesale_original = (task.context or {}).get(
+                        "_adversarial_original_challenged_hashes"
+                    )
+                    _wholesale_hashes_set = (
+                        set(_wholesale_original)
+                        if _wholesale_original
+                        else _challenged_hashes_set
+                    )
+                    _retry_findings = []
+                    for _f in findings:
+                        _fhash = _fh(
+                            str(_f.get("title", "")),
+                            str(_f.get("description", "") or _f.get("prompt", "")),
+                        )
+                        if _fhash in _wholesale_hashes_set:
+                            _retry_findings.append({**_f, "hash": _fhash})
+                    _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
+                        _retry_findings
+                    )
+                    _retry_hashes = [
+                        item["hash"]
+                        for item in _manifest_items
+                        if item.get("hash") in _wholesale_hashes_set
+                    ]
+                    if _retry_hashes:
+                        _ctx = dict(task.context or {})
+                        _ctx.pop(ADVERSARIAL_GATE_VERDICT_KEY, None)
+                        _ctx.pop("_adversarial_original_challenged_hashes", None)
+                        _ctx[_ADVERSARIAL_WHOLESALE_RETRY_KEY] = _retry_count + 1
+                        _ctx["_adversarial_challenged_hashes"] = _retry_hashes
+                        _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
+                            _wholesale_parse_outcome
+                        )
+                        _ctx["research_spawn_gate_challenged_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_refuted_count"] = 0
+                        _ctx["research_spawn_gate_survived_count"] = 0
+                        _ctx["research_spawn_gate_explicit_pass_count"] = 0
+                        _ctx["research_spawn_gate_fail_open_count"] = 0
+                        _ctx["research_spawn_gate_unresolved_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_parse_outcome"] = _wholesale_parse_outcome
+                        task.context = _ctx
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.flush()
+                        adv_grader = await spawn_forward_quality_grader(
+                            task,
+                            _manifest_json,
+                            session,
+                            adversarial_mode=True,
+                            finding_hashes=_retry_hashes,
+                        )
+                        if adv_grader is not None:
+                            logger.warning(
+                                "[RESEARCH] Task %s deferred wholesale adversarial "
+                                "non-response (%s) and spawned bounded retry grader %s",
+                                task.id,
+                                _wholesale_parse_outcome,
+                                adv_grader.id,
+                            )
+                            return
+                        # If the single-shot guard refuses a retry, continue into the
+                        # fail-closed path; high-stakes work still must not spawn.
+                else:
+                    _ctx = dict(task.context or {})
+                    _ctx["research_spawn_gate_wholesale_retry_exhausted"] = True
+                    _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
+                        _wholesale_parse_outcome
+                    )
+                    task.context = _ctx
+                    flag_modified(task, "context")
 
         for _f in findings:
             _fhash = _fh(
@@ -2566,6 +2725,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         or _reason
                         or "fail-closed: no verdict returned for this finding"
                     )
+                    # Attribute the unresolved finding to the grader non-response
+                    # cause so the deferred record carries WHY, not just WHAT.
+                    if _spawn_gate_cause:
+                        _f["_adversarial_verdict_cause"] = _spawn_gate_cause
             _f["_adversarial_verdict_reason"] = _reason
             _f["_adversarial_verdict_explicit"] = _explicit
         # Bound counters to findings that were actually in the challenge manifest.
@@ -4577,6 +4740,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # missing-verdict deferral to its challenger task without opening each one.
     _adv_diagnostic = (task.context or {}).get("adversarial_gate_diagnostic") or {}
     _adv_challenger_id = str(_adv_diagnostic.get("challenger_task_id") or "").strip() or None
+    # Machine-readable cause (taxonomy class / refusal / format-miss + optional
+    # stale-image tag) for the grader non-response, lifted from the resolution-
+    # time diagnostic so each deferred finding is attributable without opening
+    # the challenger task. Observability only.
+    _adv_cause = _adv_diagnostic.get("cause") if isinstance(_adv_diagnostic, dict) else None
     for _adf in _adversarial_gate_deferred:
         _adf_stamped = _stamp_deferral(_adf, "adversarial_gate")
         # Re-key the finding_hash the SAME way adversarial verdicts are keyed
@@ -4594,6 +4762,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _adf_stamped["adversarial_gate_reason"] = _gate_reason
         if _adv_challenger_id:
             _adf_stamped["adversarial_challenger_task_id"] = _adv_challenger_id
+        if _adv_cause:
+            _adf_stamped["adversarial_gate_cause"] = _adv_cause
         _adv_deferred_stamped.append(_adf_stamped)
 
     _all_deferred = (
@@ -4781,6 +4951,27 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ctx["research_spawn_gate_refuted_reasons"] = _spawn_gate_refuted_reasons
             if _spawn_gate_parse_outcome:
                 ctx["research_spawn_gate_parse_outcome"] = _spawn_gate_parse_outcome
+            # Per-cycle machine-readable cause export (additive observability):
+            # surfaces the grader non-response WHY (taxonomy class / refusal /
+            # format-miss + optional stale-image tag) alongside the existing
+            # spawn-gate metrics so a downstream consumer can plumb it into
+            # research_history. `research_spawn_gate_cause` is the cause object;
+            # `research_spawn_gate_cause_counts` maps its category to the number
+            # of unresolved findings it accounts for this cycle.
+            _cycle_cause = (
+                ctx.get("adversarial_gate_diagnostic") or {}
+            ).get("cause")
+            if _cycle_cause:
+                ctx["research_spawn_gate_cause"] = _cycle_cause
+                _cause_category = (
+                    _cycle_cause.get("category")
+                    if isinstance(_cycle_cause, dict)
+                    else None
+                )
+                if _cause_category:
+                    ctx["research_spawn_gate_cause_counts"] = {
+                        _cause_category: _spawn_gate_unresolved_count
+                    }
         if _spawn_gate_manifest_excluded_count:
             ctx["research_spawn_gate_manifest_excluded_fail_closed_count"] = (
                 _spawn_gate_manifest_excluded_count

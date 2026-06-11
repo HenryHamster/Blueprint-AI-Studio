@@ -577,12 +577,43 @@ async def _resolve_quality_grader_completion(
             ),
         }
         _diag_explicit = sum(1 for v in finding_verdicts.values() if v.get("explicit"))
+        # Machine-readable WHY the grader did not respond (cause), drawn from the
+        # existing failure taxonomy for a FAILED grader or a bounded refusal-vs-
+        # format-miss distinction for a completed-but-unparseable one, plus a
+        # best-effort stale-agent-image tag. Observability only — does NOT alter
+        # any fail-open/fail-closed, retry, or deferral decision below.
+        from app.failure_classification import (
+            append_grader_diagnostic_trail,
+            classify_grader_nonresponse_cause,
+        )
+
+        _grader_cause = await classify_grader_nonresponse_cause(
+            grader,
+            parse_outcome,
+            gate_record,
+            completed=completed,
+            logs=grader_logs,
+            session=session,
+            project_id=source.project_id,
+        )
+        _vm_provenance = {
+            "grader_vm_instance_id": gate_record.get("grader_vm_instance_id"),
+            "grader_agent_source_sha": gate_record.get("grader_agent_source_sha"),
+            "grader_agent_image_name": gate_record.get("grader_agent_image_name"),
+            "grader_agent_image_build_ts": gate_record.get(
+                "grader_agent_image_build_ts"
+            ),
+            "grader_agent_runtime_fingerprint": gate_record.get(
+                "grader_agent_runtime_fingerprint"
+            ),
+        }
         ctx["adversarial_gate_diagnostic"] = {
             "challenger_task_id": str(grader.id),
             "completion_state": "completed" if completed else "failed",
             "challenged_count": len(all_hashes),
             "parse_state": parse_outcome,
             "parse_cause": _parse_causes.get(parse_outcome, parse_outcome),
+            "cause": _grader_cause,
             "parsed_verdict_count": _diag_explicit,
             "unresolved_count": len(finding_verdicts) - _diag_explicit,
             "vm_image_name": gate_record.get("grader_agent_image_name"),
@@ -590,6 +621,16 @@ async def _resolve_quality_grader_completion(
             "vm_runtime_fingerprint": gate_record.get("grader_agent_runtime_fingerprint"),
             "vm_source_sha": gate_record.get("grader_agent_source_sha"),
         }
+        gate_record["cause"] = _grader_cause
+        # Append (don't overwrite) a per-attempt trail entry so the bounded
+        # wholesale-retry sequence is auditable after the fact.
+        append_grader_diagnostic_trail(
+            ctx,
+            grader_task_id=grader.id,
+            parse_outcome=parse_outcome,
+            cause=_grader_cause,
+            vm_provenance=_vm_provenance,
+        )
         ctx[ADVERSARIAL_GATE_VERDICT_KEY] = gate_record
         ctx.pop("awaiting_adversarial_grader", None)
         _set_sidecar_application_pending(
@@ -614,6 +655,46 @@ async def _resolve_quality_grader_completion(
             "grader_task_id": str(grader.id),
             "strategy": "forward-quality",
         }
+        # Same observability treatment as the adversarial lane: record a
+        # diagnostic + cause + per-attempt trail entry for the (default-OFF)
+        # forward-quality lane, which previously recorded nothing here. The
+        # forward-quality grader returns a single artifact-level verdict (no
+        # per-finding hashes), so synthesize a parse_state from its output:
+        # FAILED → taxonomy cause; empty/unparseable → format-miss; else
+        # responsive. Pure observability; the verdict application below is
+        # unchanged.
+        from app.failure_classification import (
+            append_grader_diagnostic_trail,
+            classify_grader_nonresponse_cause,
+            synthesize_forward_quality_parse_state,
+        )
+
+        _fq_parse_state = synthesize_forward_quality_parse_state(
+            completed, grader_logs, verdict.reason
+        )
+        _fq_cause = await classify_grader_nonresponse_cause(
+            grader,
+            _fq_parse_state,
+            {},
+            completed=completed,
+            logs=grader_logs,
+            session=session,
+            project_id=source.project_id,
+        )
+        ctx["quality_grader_diagnostic"] = {
+            "challenger_task_id": str(grader.id),
+            "completion_state": "completed" if completed else "failed",
+            "parse_state": _fq_parse_state,
+            "cause": _fq_cause,
+            "verdict_passed": verdict.passed,
+        }
+        append_grader_diagnostic_trail(
+            ctx,
+            grader_task_id=grader.id,
+            parse_outcome=_fq_parse_state,
+            cause=_fq_cause,
+            vm_provenance={},
+        )
         ctx.pop("awaiting_quality_grader", None)
         _set_sidecar_application_pending(
             ctx,
