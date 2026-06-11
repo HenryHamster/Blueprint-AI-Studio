@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Activity, AlertTriangle, ArrowDownRight, ArrowUpRight } from 'lucide-react';
+import { Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, ChevronDown, ChevronUp } from 'lucide-react';
 import { fetchPipelineRegressions, type PipelineRegression } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
+
+const STORAGE_KEY = 'blueprint-admin:pipelineRegressionsPanelCollapsed';
 
 interface PipelineRegressionsPanelProps {
   projectId: string | null;
@@ -50,6 +52,13 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
   const [regressions, setRegressions] = useState<PipelineRegression[]>([]);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem(STORAGE_KEY) === 'true');
+
+  const toggle = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    localStorage.setItem(STORAGE_KEY, String(next));
+  };
 
   const load = useCallback(async (signal?: AbortSignal) => {
     if (!projectId) return;
@@ -86,7 +95,12 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
 
   return (
     <div className="mb-3 shrink-0">
-      <div className="flex items-center gap-2 px-1 py-1 text-[11px] font-bold uppercase tracking-widest text-neutral-400">
+      <button
+        onClick={toggle}
+        data-testid="pipeline-regressions-toggle"
+        className="flex min-h-[44px] items-center gap-2 px-1 py-1 text-[11px] font-bold uppercase tracking-widest text-neutral-400 transition-colors hover:text-neutral-300"
+      >
+        {collapsed ? <ChevronDown className="h-3 w-3" /> : <ChevronUp className="h-3 w-3" />}
         <Activity className="h-3 w-3" />
         Pipeline regressions
         {!loading && !fetchError && regressions.length > 0 && (
@@ -99,8 +113,14 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
             Healthy
           </span>
         )}
-      </div>
+        {collapsed && fetchError && (
+          <span className="ml-1 rounded-full border border-red-500/30 bg-red-500/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-red-300">
+            Error
+          </span>
+        )}
+      </button>
 
+      {!collapsed && (
       <div className="mt-1 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-xs">
         {fetchError && (
           <div className="flex items-start gap-2 rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-red-300">
@@ -178,6 +198,7 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }
