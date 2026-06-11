@@ -14387,3 +14387,61 @@ class TestDeriveSaturation:
 
         assert _derive_saturation(None, None) is None
         assert _derive_saturation(None, 0.5) is None
+
+
+class TestGetBuildConfigCommands:
+    @pytest.mark.asyncio
+    async def test_unauthenticated_returns_401_or_403(self, override_get_session):
+        """Unauthenticated GET to build-config/commands must be rejected."""
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    f"/api/admin/projects/{uuid.uuid4()}/build-config/commands"
+                )
+            assert resp.status_code in (401, 403)
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_admin_authenticated_returns_200(self, client: AsyncClient, db_session):
+        """Authenticated admin GET returns 200 with directories payload."""
+        project = await _make_project(db_session, name="BuildCfg Commands")
+        project.build_config = {
+            "directories": [
+                {
+                    "path": "backend",
+                    "type": "python",
+                    "test_cmd": "pytest",
+                    "build_cmd": None,
+                    "install_cmd": "pip install -r requirements.txt",
+                    "lint_cmd": "ruff check .",
+                    "confirmed_test_cmd": "pytest -x",
+                    "confirmed_build_cmd": None,
+                    "confirmed_install_cmd": None,
+                    "confirmed_lint_cmd": None,
+                    "commands_confirmed_at": None,
+                    "confirming_task_id": None,
+                }
+            ]
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/build-config/commands"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["project_id"] == str(project.id)
+        assert len(data["directories"]) == 1
+        assert data["directories"][0]["path"] == "backend"
+        assert data["directories"][0]["detected_test_cmd"] == "pytest"
+        assert data["directories"][0]["confirmed_test_cmd"] == "pytest -x"

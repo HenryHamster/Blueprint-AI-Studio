@@ -239,6 +239,25 @@ Update dependencies and manage versions.
 
 ## Review Task Types
 
+### `panel_review`
+
+Run a fixed multi-agent review workflow over a PR and persist a structured verdict. Spawns multiple review passes from distinct lenses (correctness, security, performance, etc.) and emits a structured `PANEL_REVIEW` artifact.
+
+**Payload:** Extends `review` payload fields.
+
+```json
+{
+  "pr_number": number,                   // PR to review (required)
+  "focus_areas": "string[]",             // Lenses to activate (optional)
+  "effort": "low|medium|high"            // Review depth (default: "medium")
+}
+```
+
+**Output artifacts:**
+- `PANEL_REVIEW` — Structured multi-lens verdict
+
+---
+
 ### `review`
 
 Review a PR and leave detailed comments.
@@ -548,7 +567,120 @@ Self-review checklist for autonomous agents.
 
 ---
 
+## Pipeline & Verification Task Types
+
+### `verify_tests`
+
+Clone a PR head, run the detected test suite, and post a pass/fail verdict. Used as a merge-gate step in the CI pipeline.
+
+**Payload:**
+
+```json
+{
+  "branch": "string",                    // PR head branch to test (optional, system-populated)
+  "pr_number": number                    // PR being gated (optional, for artifact correlation)
+}
+```
+
+**Output artifacts:**
+- `VERIFY_TESTS_RESULT` — Structured verdict with `detected`, `passed`, test list, and output
+
+---
+
+### `compute_experiment`
+
+Launch a budgeted compute job on a separate VM and monitor it to a terminal state. The agent parks itself after launch — the backend wakes it when the job completes, freeing the agent VM slot during the run.
+
+**Payload:**
+
+```json
+{
+  "command": "string",                   // Shell command to run on the compute VM
+  "spend_cap_usd": number,               // Budget ceiling in USD (required by agent)
+  "deadline_seconds": number,            // Wall-clock timeout (required by agent)
+  "machine_type": "string",              // GCP machine type (optional)
+  "accelerator": "string",               // GPU short name e.g. "T4", "L4" (optional)
+  "cwd": "string",                       // Working directory on compute VM (optional)
+  "env": { "KEY": "VALUE" },             // Extra env vars (optional)
+  "experiment": "string",                // Experiment label echoed to result artifact
+  "hypothesis": "string",                // Hypothesis text echoed to result artifact
+  "metric": "string",                    // Primary metric name
+  "success_criterion": {                 // Optional acceptance gate
+    "metric": "string",
+    "operator": ">=|<=|>|<|==|!=",
+    "threshold": number
+  },
+  "require_durable_artifact": boolean    // Fail unless result links a gs:// artifact
+}
+```
+
+**Output artifacts:**
+- `COMPUTE_RESULT` — Terminal job outcome, final cost, and optional result reference
+
+---
+
 ## System Task Types
+
+### `release_audit_challenge`
+
+Independently re-examine release-audit findings and emit structured per-finding verdicts. Spawned as a binding second-opinion pass alongside `release_audit`.
+
+**Payload:**
+
+```json
+{
+  "candidate_sha": "string",             // Commit SHA being audited (system-populated)
+  "diff_range": "string",                // Git diff range (system-populated)
+  "primary_audit_report": {}             // Findings from the primary audit pass (optional)
+}
+```
+
+**Output artifacts:**
+- `RELEASE_AUDIT_CHALLENGE` — Per-finding `upheld`/`overturned`/`inconclusive` verdicts
+
+---
+
+### `web_research`
+
+Web-first research that produces a cited knowledge document. The task runs with web access and emits a structured document graded by a forward-quality gate before being persisted as a `KnowledgeDocument`.
+
+**Payload:**
+
+```json
+{
+  "prompt": "string",                    // Research question (required)
+  "topic": "string",                     // Topic label for categorization (optional)
+  "tags": ["string"],                    // Tags for the knowledge document (optional)
+  "direction_id": "uuid",                // Originating direction (optional)
+  "project_name": "string"               // Project context label (optional)
+}
+```
+
+**Output artifacts:**
+- `KNOWLEDGE_DOCUMENT` — Cited research document (title, summary, body, citations, tags)
+
+---
+
+### `design`
+
+Codebase-grounded design work that produces a durable design document. The task runs read-only over a repo clone and emits a structured knowledge document (same shape as `web_research`) graded by a forward-quality gate.
+
+**Payload:**
+
+```json
+{
+  "prompt": "string",                    // Design question (required)
+  "topic": "string",                     // Topic label (optional)
+  "tags": ["string"],                    // Tags (optional)
+  "direction_id": "uuid",                // Originating direction (optional)
+  "project_name": "string"               // Project context label (optional)
+}
+```
+
+**Output artifacts:**
+- `KNOWLEDGE_DOCUMENT` — Design document (title, summary, body, citations, tags)
+
+---
 
 ### `memo`
 

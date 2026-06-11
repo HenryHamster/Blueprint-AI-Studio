@@ -79,6 +79,7 @@ from app.task_capabilities import (
     STRATEGIC_TASK_TYPES,
     STRATEGIST_SPAWNABLE_TASK_TYPES,
 )
+from app.auth import require_admin
 from app.task_locking import (
     lock_project_or_429 as _lock_project_or_429,
     with_directions_locked as _with_directions_locked,
@@ -2702,9 +2703,12 @@ async def strategic_operation(
 
 
 @router.get("/api/admin/projects/{project_id}/build-config/commands")
+@limiter.limit("60/minute")
 async def admin_get_build_config_commands(
+    request: Request,
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
 ):
     """Return all directory entries with confirmed vs detected commands and staleness.
 

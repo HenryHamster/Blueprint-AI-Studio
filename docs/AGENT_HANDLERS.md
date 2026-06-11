@@ -414,6 +414,117 @@ Verify code is production-ready before release.
 
 ---
 
+## Panel Review Handler
+
+### `handlePanelReview` (panel-review.ts)
+
+**Task type:** `panel_review`
+
+Runs a fixed multi-lens review workflow over a PR. Each lens (correctness, security, performance, maintainability, test coverage) is evaluated independently, and the results are merged into a single structured `PANEL_REVIEW` verdict artifact.
+
+**Workflow:**
+1. Clone repo to the PR head branch
+2. Build the diff context and review checklist
+3. Run Claude Code with a lens-specific system prompt for each activated lens
+4. Merge lens verdicts into the structured output
+5. Persist `PANEL_REVIEW` artifact
+
+---
+
+## Verify Tests Handler
+
+### `handleVerifyTests` (verify-tests.ts)
+
+**Task type:** `verify_tests`
+
+Clone a PR head, detect and run the test suite, and post a `VERIFY_TESTS_RESULT` verdict. Used as a merge-gate step in the CI pipeline.
+
+**Workflow:**
+1. Clone repo at PR head branch
+2. Auto-detect test runners (language-specific discovery)
+3. Run the test suite with a bounded timeout
+4. On setup failure, retry up to `MAX_VERIFY_SETUP_RETRIES` times
+5. Emit `VERIFY_TESTS_RESULT` artifact with `detected`, `passed`, and test list
+
+**Key result fields:**
+- `detected` — whether any test suite was found
+- `passed` — whether all detected tests passed
+- `setupFailed` — set when infrastructure (dep install, runner spawn) failed
+- `partialSetupFailed` — set when only some runners in a polyglot repo failed setup
+- `recovered` — set when the stored build config was stale and a replacement suite was found
+
+---
+
+## Compute Experiment Handler
+
+### `handleComputeExperiment` (compute-experiment.ts)
+
+**Task type:** `compute_experiment`
+
+Launch a budgeted compute job via `POST /api/agent/compute-jobs` and immediately park the task on a `compute_job_terminal` wake registration, releasing the agent VM slot. The backend wakes the task when the job reaches a terminal state.
+
+**Workflow:**
+1. Validate launch fields (command, spend cap, deadline)
+2. POST job to `/api/agent/compute-jobs`
+3. Register a `compute_job_terminal` park-and-wake keyed to the launched job ID
+4. Agent VM is released; backend monitor accrues cost and enforces limits
+5. On wake: backend finalizes the task with the job's terminal outcome and result artifact
+
+**No repo clone is performed.** All cloud side-effects are mediated by the backend.
+
+---
+
+## Web Research Handler
+
+### `handleWebResearch` (web-research.ts)
+
+**Task type:** `web_research`
+
+Web-first research producing a cited knowledge document. The agent runs with web access, searches for sources, and emits a structured document that a forward-quality gate grades before it is persisted as a `KnowledgeDocument`.
+
+**Workflow:**
+1. No repo clone (web-access only)
+2. Fetch prior knowledge context from existing documents
+3. Run Claude Code with web search tools enabled
+4. Parse structured output (title/summary/body/citations/tags/topic)
+5. Repair/validate JSON with `repairStructuredOutput`
+6. Submit to forward-quality gate; persist as `KnowledgeDocument` on pass
+
+---
+
+## Design Handler
+
+### `handleDesign` (design.ts)
+
+**Task type:** `design`
+
+Codebase-grounded design producing a durable design document. Mirrors `handleWebResearch` but runs over a repo clone instead of the web. Emits a structured `KnowledgeDocument` graded by the same forward-quality gate.
+
+**Workflow:**
+1. Clone repo (read-only; no edits, no PR)
+2. Fetch prior knowledge and design-doc context
+3. Run Claude Code over the codebase
+4. Parse structured output (title/summary/body/citations/tags/topic)
+5. Submit to forward-quality gate; persist as `KnowledgeDocument` on pass
+
+---
+
+## Release Audit Challenge Handler
+
+### `handleReleaseAuditChallenge` (audit-challenge.ts)
+
+**Task type:** `release_audit_challenge`
+
+Independently re-examines release-audit findings and emits per-finding verdicts (`upheld`/`overturned`/`inconclusive`). Spawned as a binding second-opinion pass alongside `release_audit`.
+
+**Workflow:**
+1. Clone repo at `candidate_sha`
+2. Provision audit fetch helpers and design-doc context
+3. Run Claude Code instructed to challenge each finding independently
+4. Emit structured `RELEASE_AUDIT_CHALLENGE` artifact with per-finding verdicts
+
+---
+
 ## Design Doc Handler
 
 ### `handleDesignDocUpdate` (design-doc.ts)
@@ -517,7 +628,9 @@ const dispatchResearch: Handler = (taskId, payload, task, ghToken, owner, repo, 
 export const handlers: Record<AgentTaskType, Handler> = {
   create: handleCreate,
   review: handleReview,
+  panel_review: handlePanelReview,
   fix: handleFix,
+  verify_tests: handleVerifyTests,
   plan: handlePlan,
   research: dispatchResearch,
   docs: handleDocs,
@@ -534,7 +647,11 @@ export const handlers: Record<AgentTaskType, Handler> = {
   design_doc_update: handleDesignDocUpdate,
   strategic_review: handleStrategic,
   release_audit: handleReleaseAudit,
+  release_audit_challenge: handleReleaseAuditChallenge,
   memo: handleMemo,
+  compute_experiment: handleComputeExperiment,
+  web_research: handleWebResearch,
+  design: handleDesign,
 };
 ```
 
@@ -551,9 +668,15 @@ To add a new task type:
 Each handler has a corresponding test file:
 - `standard.test.ts` — Tests for create, refactor, docs, deps, qa
 - `review-fix.test.ts` — Tests for review, fix
+- `panel-review.test.ts` — Tests for panel_review
 - `research-plan.test.ts` — Tests for research, plan
 - `specialized.test.ts` — Tests for security_audit, migrate, etc.
 - `memo.test.ts` — Tests for memo
+- `verify-tests.test.ts` — Tests for verify_tests
+- `compute-experiment.test.ts` — Tests for compute_experiment
+- `web-research.test.ts` — Tests for web_research
+- `design.test.ts` — Tests for design
+- `audit-challenge.test.ts` — Tests for release_audit_challenge
 
 Tests mock:
 - Git operations
