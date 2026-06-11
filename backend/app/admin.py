@@ -84,9 +84,6 @@ from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
     router as _operator_triggers_router,
 )
-from app.research_completion import resolve_research_findings_for_surface
-
-
 # Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts
 # (MAX_LINT_FIX_ATTEMPTS=5, MAX_TEST_FIX_ATTEMPTS=3); "check" has no
 # agent-side constant — 5 is a heuristic default used only for the
@@ -217,6 +214,8 @@ async def get_all_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    from app.research_completion import resolve_research_findings_for_surface
+
     limit = min(limit, ADMIN_TASKS_MAX_LIMIT)
 
     # Build shared filter conditions
@@ -982,6 +981,8 @@ async def get_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    from app.research_completion import resolve_research_findings_for_surface
+
     try:
         tid = uuid.UUID(task_id)
     except ValueError:

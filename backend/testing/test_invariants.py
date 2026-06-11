@@ -11,6 +11,7 @@ import ast
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -8817,3 +8818,26 @@ class TestSpawnResumeNeedSignalParity:
                 f"resume path lost legacy blocked capability fallback for case "
                 f"'{label}'"
             )
+
+
+def test_standalone_smoke_modules_importable_as_root():
+    env = os.environ.copy()
+    env.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check")
+    env.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
+    cwd = Path("/app") if Path("/app").exists() else Path(__file__).resolve().parents[1]
+
+    for module in ("app.research_completion", "app.security"):
+        result = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            f"{module} failed to import from /app: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert "ImportError" not in result.stderr
+        assert "circular import" not in result.stderr
