@@ -22,6 +22,7 @@ module object so that test patches against ``app.services.<name>`` (e.g.
 
 import asyncio
 import contextlib
+import hashlib as _hashlib
 import json
 import logging
 import re
@@ -3601,6 +3602,39 @@ async def _sweep_stranded_sidecar_sources() -> None:
 _BOOTSTRAP_SWEEP_BATCH_SIZE = 20
 
 
+def _bootstrap_spawn_lock_key(project_id: object) -> int:
+    """Stable 31-bit advisory-lock key for a project's bootstrap spawn.
+
+    Uses SHA-256 (not Python hash()) because hash() is PYTHONHASHSEED-salted
+    and two orchestrator processes compute DIFFERENT keys for the same project —
+    the advisory lock would never exclude anything across instances.
+    """
+    digest = _hashlib.sha256(f"bootstrap_spawn:{project_id}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") % (2**31)
+
+
+async def _try_bootstrap_spawn_advisory_lock(session, project_id: object) -> bool:
+    """Try to take the per-project bootstrap-spawn advisory lock (Postgres).
+
+    Transaction-scoped (``pg_try_advisory_xact_lock``) so it is released when
+    the transaction commits or rolls back. Best-effort: reduces duplicate
+    work between concurrently-ticking orchestrator instances. Non-Postgres
+    dialects (tests) report no contention and always return True.
+    """
+    from sqlalchemy import text as _sql_text
+
+    try:
+        got = (
+            await session.execute(
+                _sql_text("SELECT pg_try_advisory_xact_lock(:k)"),
+                {"k": _bootstrap_spawn_lock_key(project_id)},
+            )
+        ).scalar()
+    except Exception:  # noqa: BLE001 — SQLite/test dialects raise NotSupportedError; treat as no contention
+        return True
+    return bool(got)
+
+
 async def _sweep_bootstrap_recovery() -> None:
     """Enqueue one repo_bootstrap task for each eligible unbootstrapped project.
 
@@ -3610,7 +3644,11 @@ async def _sweep_bootstrap_recovery() -> None:
 
     The sweep is bounded and idempotent: the shared spawn_bootstrap_task helper
     refuses to create a duplicate when one is already active, so repeated ticks
-    never pile up duplicate tasks.
+    never pile up duplicate tasks. A per-project transaction-scoped advisory
+    lock (``pg_try_advisory_xact_lock``) further guards against the non-atomic
+    check-then-act race that lets two concurrent orchestrator instances both
+    find no active task and both spawn one in the same second (mirrors the
+    strategic double-spawn fix, PR #8927).
     """
     from app.models import Project
     from app.repo_bootstrap import spawn_bootstrap_task
@@ -3655,6 +3693,20 @@ async def _sweep_bootstrap_recovery() -> None:
 
             spawned = 0
             for project in candidates:
+                # Per-project advisory lock guards the non-atomic check-then-act:
+                # two concurrent orchestrator instances may both read "no active
+                # task" before either's spawn commits, then both insert a duplicate.
+                # The transaction-scoped lock serialises spawns per project so only
+                # one instance wins; the other sees "already_active" on its next
+                # spawn_bootstrap_task call and skips. Non-Postgres (tests) returns
+                # True (no contention) so test behaviour is unchanged.
+                if not await _try_bootstrap_spawn_advisory_lock(session, project.id):
+                    logger.debug(
+                        "[BOOTSTRAP-RECOVERY] Another instance holds bootstrap lock "
+                        "for project %s — skipping this tick",
+                        project.id,
+                    )
+                    continue
                 spawn_result = await spawn_bootstrap_task(
                     project,
                     session,

@@ -1006,6 +1006,10 @@ class Task(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    completed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Auto-populated on INSERT (default_factory + server_default) and UPDATE
     # (onupdate). Consumed by reaper.py's EVALUATING stale sweep and
     # rollup_management.py age calculations so "last touched" can be

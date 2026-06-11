@@ -2252,6 +2252,224 @@ def test_editor_purpose_edit_survives_divergent_agent_cycle():
 
 
 # ---------------------------------------------------------------------------
+# user_purpose — durable operator-owned intent field
+# ---------------------------------------------------------------------------
+
+
+def test_apply_user_intent_patch_sets_user_purpose():
+    """Patching intent.purpose through the operator path also sets user_purpose."""
+    model = apply_user_intent_patch(
+        None,
+        {"intent": {"purpose": "Ship a CLI tool", "current_focus": ""}},
+        "2026-06-11T00:00:00",
+    )
+    assert model.intent.purpose == "Ship a CLI tool"
+    assert model.intent.user_purpose == "Ship a CLI tool", (
+        "user_purpose must mirror the operator-set purpose"
+    )
+
+
+def test_apply_user_intent_patch_blanking_purpose_clears_user_purpose():
+    """Blanking the purpose via operator patch also clears user_purpose."""
+    model = apply_user_intent_patch(
+        {"revision": 1, "intent": {"purpose": "Had a goal", "user_purpose": "Had a goal"}},
+        {"intent": {"purpose": ""}},
+        "2026-06-11T00:00:00",
+    )
+    assert model.intent.purpose.strip() == ""
+    assert model.intent.user_purpose == "", (
+        "user_purpose must be cleared when purpose is blanked by operator"
+    )
+
+
+def test_apply_user_intent_patch_non_intent_patch_preserves_user_purpose():
+    """A patch that omits intent (context-only / constraints-only) carries
+    the existing user_purpose forward — the shallow merge would otherwise drop it."""
+    model = apply_user_intent_patch(
+        {
+            "revision": 1,
+            "intent": {
+                "purpose": "Ship a CLI",
+                "user_purpose": "Ship a CLI",
+                "source": {"type": "user_message", "message_id": "m-1"},
+            },
+        },
+        {"context": {"project_type": "startup"}},
+        "2026-06-11T00:00:00",
+    )
+    assert model.intent.user_purpose == "Ship a CLI", (
+        "user_purpose must survive a context-only patch (shallow merge replaces intent)"
+    )
+    assert model.context.project_type == "startup"
+
+
+def test_apply_agent_update_strips_user_purpose_from_proposal():
+    """Agents can NEVER overwrite user_purpose — any proposed value is silently
+    stripped and replaced with the durable current value."""
+    current = {
+        "revision": 10,
+        "intent": {
+            "purpose": "Real purpose",
+            "user_purpose": "Durable operator purpose",
+            "source": {"type": "user_message", "message_id": "m-1"},
+        },
+    }
+    # Agent attempts to clobber user_purpose (e.g. after a JSON-repair session).
+    proposed = {
+        "intent": {
+            "purpose": "Agent-rewritten purpose",
+            "user_purpose": "CLOBBERED by repair session",
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-11T00:00:00")
+    assert new_raw["intent"]["user_purpose"] == "Durable operator purpose", (
+        "user_purpose must be restored from current regardless of agent proposal"
+    )
+
+
+def test_apply_agent_update_strips_blank_user_purpose_from_proposal():
+    """An agent proposal that blanks user_purpose (e.g. schema-template repair)
+    must be silently corrected — user_purpose is unconditionally restored from current."""
+    current = {
+        "revision": 5,
+        "intent": {
+            "purpose": "Build a dashboard",
+            "user_purpose": "Build a dashboard",
+        },
+    }
+    # Agent (or a repair session) submits a blank user_purpose.
+    proposed = {
+        "intent": {
+            "purpose": "Build a dashboard",
+            "user_purpose": "",
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-11T00:00:00")
+    assert new_raw["intent"]["user_purpose"] == "Build a dashboard", (
+        "blank user_purpose in agent proposal must be replaced with current durable value"
+    )
+
+
+def test_user_purpose_survives_full_agent_cycle_rewrite():
+    """End-to-end: user_purpose set at onboarding survives a complete strategic
+    cycle that rewrites intent.purpose and blanks user_purpose.
+
+    The defect scenario (BUG_REPORT 2026-06-11): when baseline_raw is None
+    (legacy path), _preserve_operator_intent only protects BLANK agent proposals
+    — a non-blank agent rewrite of intent.purpose drops the user_message source,
+    which breaks the 3-way merge protection on the NEXT cycle (purpose_was_operator
+    becomes False, so constraints are no longer guarded). user_purpose is the
+    durable backstop that survives regardless of provenance.
+    """
+    # Onboarding seeds purpose and user_purpose.
+    seeded = apply_user_intent_patch(
+        None,
+        {
+            "intent": {"purpose": "Operator intent", "current_focus": ""},
+            "constraints": ["No breaking changes"],
+        },
+        "2026-06-11T00:00:00",
+    )
+    assert seeded.intent.user_purpose == "Operator intent"
+
+    # Strategic agent proposes a full rewrite that blanks user_purpose.
+    # baseline_raw=None exercises the legacy path where _preserve_operator_intent
+    # only blocks blank proposals — a non-blank rewrite goes through and drops source.
+    proposed = {
+        "intent": {
+            "purpose": "Agent-rewritten purpose",
+            "current_focus": "Working on X",
+            "user_purpose": "",  # blanked — this is the clobber scenario
+        },
+        "constraints": [],  # blanked
+    }
+    new_raw, _ = apply_agent_update(
+        seeded.model_dump(),
+        proposed,
+        "2026-06-11T01:00:00",
+        baseline_raw=None,  # legacy path: no 3-way merge, only blank-preservation
+    )
+    # user_purpose must be the durable operator value, regardless of agent proposal —
+    # even on the legacy path where intent.purpose could be rewritten.
+    assert new_raw["intent"]["user_purpose"] == "Operator intent", (
+        "user_purpose must survive a full agent cycle rewrite that blanks it"
+    )
+    # Without the 3-way merge (baseline_raw=None), the agent's non-blank purpose
+    # rewrites intent.purpose — this is the known limitation user_purpose backstops.
+    assert new_raw["intent"]["purpose"] == "Agent-rewritten purpose", (
+        "intent.purpose is agent-volatile on the legacy path (no 3-way merge) — "
+        "user_purpose is the durable backstop that survives"
+    )
+
+
+def test_constraints_survive_full_agent_cycle_wipe_legacy_path():
+    """Operator-seeded constraints survive a legacy-path agent cycle that proposes
+    constraints: [].
+
+    The observed incident (2026-06-11, rev 345→365): an agent rewrote intent.purpose
+    with non-empty text, dropping the user_message source.  On the NEXT cycle
+    (baseline_raw=None), purpose_was_operator=False and last_updated_by='agent', so
+    _preserve_operator_intent's operator_owned gate evaluated to False and a
+    subsequent agent proposal with constraints:[] silently wiped the seeded
+    constraints.
+
+    Constraints must now be unconditionally operator-owned, regardless of provenance.
+    """
+    # Step 1: Operator seeds purpose and constraints at onboarding.
+    seeded = apply_user_intent_patch(
+        None,
+        {
+            "intent": {"purpose": "Operator intent", "current_focus": ""},
+            "constraints": ["No breaking changes", "PCI-DSS compliance"],
+        },
+        "2026-06-11T00:00:00",
+    )
+    assert seeded.constraints == ["No breaking changes", "PCI-DSS compliance"]
+    assert seeded.intent.user_purpose == "Operator intent"
+
+    # Step 2: Agent rewrites intent.purpose with non-empty text, dropping provenance.
+    # This is the first cycle — it rewrites purpose so intent.source is cleared,
+    # making purpose_was_operator=False going into the next cycle.
+    first_cycle, _ = apply_agent_update(
+        seeded.model_dump(),
+        {
+            "intent": {
+                "purpose": "Agent-rewritten purpose",
+                "current_focus": "Working on something",
+            },
+            "constraints": ["No breaking changes", "PCI-DSS compliance"],
+        },
+        "2026-06-11T01:00:00",
+        baseline_raw=None,
+    )
+    # Verify provenance was dropped by the agent rewrite.
+    assert first_cycle["intent"].get("source") is None, (
+        "after agent purpose rewrite, source should be absent"
+    )
+    assert first_cycle["last_updated_by"] == "agent"
+
+    # Step 3: Second agent cycle — proposes constraints:[] with dropped provenance.
+    # This is the exact observed defect path: operator_owned=False so the old
+    # _preserve_operator_intent guard was bypassed and constraints were wiped.
+    second_cycle, _ = apply_agent_update(
+        first_cycle,
+        {
+            "intent": {
+                "purpose": "Agent-rewritten purpose v2",
+                "current_focus": "Different focus",
+            },
+            "constraints": [],  # agent drops all constraints
+        },
+        "2026-06-11T02:00:00",
+        baseline_raw=None,  # legacy path: no 3-way merge
+    )
+    assert second_cycle["constraints"] == ["No breaking changes", "PCI-DSS compliance"], (
+        "operator-seeded constraints must survive an agent proposal with constraints:[] "
+        "even on the legacy path where provenance is lost"
+    )
+
+
+# ---------------------------------------------------------------------------
 # apply_agent_update — non-destructive merge of AGENT-OWNED collections
 #
 # capabilities/gaps/friction/pending advance freely each cycle, but the agent

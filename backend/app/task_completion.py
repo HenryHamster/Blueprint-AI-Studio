@@ -4063,6 +4063,15 @@ async def _handle_repo_bootstrap_completion(
         project.build_config = build_config
         flag_modified(project, "build_config")
         session.add(project)
+
+        # Stamp task.completed_at so the row is queryable by completion time.
+        # repo_bootstrap tasks reach COMPLETED status via the normal agent status
+        # path (which sets task.status) but that path never stamped completed_at,
+        # leaving rows with status=COMPLETED and completed_at=null.
+        if task.completed_at is None:
+            task.completed_at = _utcnow()
+            session.add(task)
+
         await session.commit()
 
 

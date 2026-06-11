@@ -261,6 +261,9 @@ def _build_problem_model_summary(pm_raw: dict | None) -> "dict | None":
         return None
 
     summary: dict = {}
+    user_purpose = model.intent.user_purpose
+    if isinstance(user_purpose, str) and user_purpose.strip():
+        summary["user_purpose"] = user_purpose.strip()[:600]
     purpose = model.intent.purpose
     if isinstance(purpose, str) and purpose.strip():
         summary["purpose"] = purpose.strip()[:600]
