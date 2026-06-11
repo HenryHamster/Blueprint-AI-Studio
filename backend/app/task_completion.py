@@ -3610,6 +3610,13 @@ async def _handle_design_doc_completion(
     phase1_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
         "strategic_cycle_id"
     )
+    # Pre-capture identifiers while the instance is known-loaded. A failed
+    # _spawn_strategic_review can roll back / expire the Task instance, and a
+    # lazy-load of task.id inside the except block raises MissingGreenlet —
+    # which REPLACES chain_exc, masks the real failure, skips the retry
+    # marker, and fails the whole completion (task a9bf1317, 2026-06-11).
+    task_id_str = str(task.id)
+    task_project_id = task.project_id
 
     if project is None:
         # Legacy / direct-caller path: acquire the lock here. Post-commit
@@ -3739,23 +3746,24 @@ async def _handle_design_doc_completion(
             flag_modified(project, "vision")
             session.add(project)
     except Exception as chain_exc:
+        # Only pre-captured identifiers in here — task may be expired (see above).
         logger.error(
-            f"[DESIGN DOC] Failed to chain Phase 2 for task {task.id}: {chain_exc}",
+            f"[DESIGN DOC] Failed to chain Phase 2 for task {task_id_str}: {chain_exc}",
             exc_info=True,
         )
         task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[
             :500
         ]
         await _create_strategic_alert(
-            task.project_id,
+            task_project_id,
             session,
-            f"Strategic review failed to spawn after design doc update (task {str(task.id)[:8]}): {chain_exc!r}",
+            f"Strategic review failed to spawn after design doc update (task {task_id_str[:8]}): {chain_exc!r}",
         )
         # Save a retry marker so the next research spawn can retry the strategic review
         project.vision = {
             **(project.vision or {}),
             "_pending_strategic_review": {
-                "design_doc_task_id": str(task.id),
+                "design_doc_task_id": task_id_str,
                 "failed_at": _utcnow().isoformat(),
                 "error": str(chain_exc)[:200],
                 "cycle_id": cycle_id,
