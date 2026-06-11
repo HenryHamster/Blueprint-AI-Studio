@@ -122,6 +122,14 @@ def classify_knowledge_acceptance(
         elif int(grounding.get("grounded") or 0) <= 0:
             reason = "no_grounded_artifact_citation"
 
+    if reason is None and isinstance(verdict.get("release_evidence"), dict):
+        binding = verdict.get("release_binding") or {}
+        binding_status = str(binding.get("status") or "absent")
+        if binding_status == "mismatched":
+            reason = "release_binding_mismatched"
+        elif binding_status != "verified":
+            reason = "release_binding_absent"
+
     accepted = reason is None
     return {
         "knowledge_acceptance_evidence": accepted,

@@ -3668,3 +3668,201 @@ async def test_absent_or_measured_only_knowledge_never_earns_acceptance(
         == "measured_only"
     )
     assert evaluate_task_outcome(measured).status == "neutral"
+
+
+# ── Live-proof release identity binding acceptance gate ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_live_proof_acceptance_requires_echo_verified(
+    db_session, mocker, _quiet_compute_io
+):
+    """A live-proof job without an echo degrades acceptance to measured_only."""
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    release_evidence = {
+        "promoted_sha": "liveproof001sha",
+        "aggregate_serving_status": "serving_confirmed",
+        "release_version_number": 9,
+    }
+    # Set live_release_evidence but NO release_echo_sha (echo absent).
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "live_release_evidence": release_evidence,
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    mock_cls, _ = _mock_anthropic_returning([artifact_uri, metric_ref])
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    assert verdict["release_evidence"] == release_evidence
+    assert verdict["release_binding"]["status"] == "absent"
+    assert verdict["compute_acceptance_grade"] == "measured_only"
+    assert verdict["compute_acceptance_reason"] == "release_binding_absent"
+    assert verdict["knowledge_acceptance_evidence"] is False
+
+
+@pytest.mark.asyncio
+async def test_live_proof_acceptance_with_verified_echo(
+    db_session, mocker, _quiet_compute_io
+):
+    """A live-proof job with a matching echo earns acceptance grade."""
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    promoted_sha = "verifiedechosha999"
+    release_evidence = {
+        "promoted_sha": promoted_sha,
+        "aggregate_serving_status": "serving_confirmed",
+        "release_version_number": 9,
+    }
+    # Both live_release_evidence and release_echo_sha set; echo matches.
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "live_release_evidence": release_evidence,
+        "release_echo_sha": promoted_sha,
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    mock_cls, _ = _mock_anthropic_returning([artifact_uri, metric_ref])
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    assert verdict["release_evidence"] == release_evidence
+    assert verdict["release_binding"]["status"] == "verified"
+    assert verdict["release_binding"]["echo_sha"] == promoted_sha
+    assert verdict["compute_acceptance_grade"] == "acceptance"
+    assert verdict["compute_acceptance_reason"] == "llm_artifact_cited"
+    assert verdict["knowledge_acceptance_evidence"] is True
+
+
+@pytest.mark.asyncio
+async def test_live_proof_mismatched_echo_degrades_to_measured_only(
+    db_session, mocker, _quiet_compute_io
+):
+    """A live-proof job with a mismatched echo records mismatched reason."""
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    release_evidence = {
+        "promoted_sha": "expected-sha-111",
+        "aggregate_serving_status": "serving_confirmed",
+        "release_version_number": 9,
+    }
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "live_release_evidence": release_evidence,
+        "release_echo_sha": "different-sha-999",
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    mock_cls, _ = _mock_anthropic_returning([artifact_uri, metric_ref])
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    assert verdict["release_binding"]["status"] == "mismatched"
+    assert verdict["release_binding"]["echo_sha"] == "different-sha-999"
+    assert verdict["release_binding"]["expected_sha"] == "expected-sha-111"
+    assert verdict["compute_acceptance_grade"] == "measured_only"
+    assert verdict["compute_acceptance_reason"] == "release_binding_mismatched"
+
+
+@pytest.mark.asyncio
+async def test_non_live_proof_acceptance_unaffected_by_release_binding(
+    db_session, mocker, _quiet_compute_io
+):
+    """Jobs without release_evidence are unaffected by the release binding check."""
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("no gcs in tests")),
+    )
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    job, artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    # No live_release_evidence on the job — ordinary (non-live-proof) experiment.
+
+    metric_ref = f"{artifact_uri}#metric:accuracy=0.93"
+    mock_cls, _ = _mock_anthropic_returning([artifact_uri, metric_ref])
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.93)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_cls),
+    ):
+        await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    # No release_evidence means no release_binding key and no binding check.
+    assert verdict.get("release_evidence") is None
+    assert "release_binding" not in verdict
+    assert verdict["compute_acceptance_grade"] == "acceptance"
+    assert verdict["knowledge_acceptance_evidence"] is True

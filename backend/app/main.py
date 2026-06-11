@@ -1210,18 +1210,16 @@ async def get_viewport_failure_screenshot_download_url(
     the general artifact-download resolver share one bucket-allowlisting +
     V4-signing implementation instead of duplicating it.
     """
-    import re as _re
-
     from app.storage import (
         ARTIFACT_BUCKET_NAME,
         StorageUriError,
         generate_download_signed_url,
     )
+    from app.viewport_evidence import viewport_object_name
 
     await _get_user_project(project_id, current_user["user_id"], session)
 
-    safe_component = _re.sub(r"[^A-Za-z0-9._-]", "_", component)[:100]
-    object_name = f"viewport-failures/{project_id}/{safe_component}-{width}.png"
+    object_name = viewport_object_name(project_id, component, width)
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
 
     try:

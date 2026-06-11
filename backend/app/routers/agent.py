@@ -3787,16 +3787,13 @@ async def get_viewport_failure_screenshot_upload_url(
         raise HTTPException(status_code=404, detail="Task not found")
 
     import datetime as _dt
-    import re as _re
 
     from google.cloud import storage as _gcs
 
     from app.storage import ARTIFACT_BUCKET_NAME, GCP_PROJECT_ID
+    from app.viewport_evidence import viewport_object_name
 
-    safe_component = _re.sub(r"[^A-Za-z0-9._-]", "_", req.component)[:100]
-    object_name = (
-        f"viewport-failures/{task.project_id}/{safe_component}-{req.width}.png"
-    )
+    object_name = viewport_object_name(task.project_id, req.component, req.width)
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
 
     def _generate() -> str:

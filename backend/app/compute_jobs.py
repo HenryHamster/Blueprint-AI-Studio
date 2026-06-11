@@ -1444,6 +1444,8 @@ async def _apply_polled_compute_job_result(
             _set_meta(live, result_metrics=dict(status.metrics))
         if status.command_log:
             _set_meta(live, command_log=dict(status.command_log))
+        if status.echoed_release_sha is not None:
+            _set_meta(live, release_echo_sha=status.echoed_release_sha)
         if compute_rpc_diagnostic is None:
             _clear_compute_rpc_diagnostic(live)
         if terminal_status is not None and outcome is not None:
@@ -1519,6 +1521,20 @@ async def _apply_task_terminal_cancellation(
 
 def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
     meta = job.polling_metadata or {}
+    env = {str(k): str(v) for k, v in (meta.get("env") or {}).items()}
+    live_evidence = meta.get(_LIVE_PROOF_METADATA_KEY)
+    if isinstance(live_evidence, dict):
+        release_env = {
+            "BLUEPRINT_RELEASE_SHA": str(live_evidence.get("promoted_sha") or ""),
+            "BLUEPRINT_RELEASE_VERSION": str(
+                live_evidence.get("release_version_number") or ""
+            ),
+            "BLUEPRINT_RELEASE_VERSION_ID": str(
+                live_evidence.get("release_version_id") or ""
+            ),
+        }
+        # Caller-provided env takes precedence over release defaults.
+        env = {**release_env, **env}
     return ComputeLaunchSpec(
         job_id=job.id,
         external_id=job.external_compute_id,
@@ -1530,7 +1546,7 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         runtime_deadline_seconds=int(meta.get("requested_deadline_seconds") or 0)
         or None,
         cwd=meta.get("cwd"),
-        env={str(k): str(v) for k, v in (meta.get("env") or {}).items()},
+        env=env,
         provisioning_model=str(meta.get("provisioning_model") or "STANDARD"),
         accelerator=job.accelerator_type,
         accelerator_count=int(job.accelerator_count or 1),

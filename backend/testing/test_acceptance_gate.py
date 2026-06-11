@@ -3,9 +3,11 @@
 Covers the fail-closed numeric core shared with the compute success-criterion
 gate, and the code acceptance evaluation: no-declaration passes (and records
 nothing), a declared named_test that is present + verified + touches a changed
-seam passes and is recorded (machine-checked proof), a consumed
-downstream_artifact is upgraded to proven by recorded consumption, and the
-fail-closed cases (test missing, test-only diff, unverified merge). Standalone
+seam passes and is recorded (machine-checked proof), a declared visual
+declaration that matches the uploaded viewport screenshot is recorded as
+machine-checked proof, a consumed downstream_artifact is upgraded to proven by
+recorded consumption, and the fail-closed cases (test missing, test-only diff,
+unverified merge). Standalone
 in-memory tests run under ``bash scripts/test-backend.sh --standalone``; DB
 tests (consumed artifact upgrade) run under the full test harness.
 """
@@ -124,8 +126,9 @@ def test_named_test_present_verified_touches_seam_passes_and_records():
     assert verdict.declared is True
     assert verdict.satisfied is True
     assert verdict.kind == "named_test"
-    # named_test is one of two proven kinds; a consumed downstream_artifact is
-    # the other (see test_consumed_downstream_artifact_upgrades_to_proven).
+    # named_test and visual are proven at evaluation time; a consumed
+    # downstream_artifact is the third proven path (see
+    # test_consumed_downstream_artifact_upgrades_to_proven).
     assert verdict.proven is True
 
     recorded = record_code_acceptance_verdict(task)
@@ -688,9 +691,9 @@ def test_malformed_recorded_verdict_buckets_as_malformed():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# proven axis — evaluate_code_acceptance: named_test is the only kind that
-# sets proven=True at evaluation time; downstream_artifact becomes proven later
-# via record_artifact_consumptions_for_task (see DB tests below)
+# proven axis — evaluate_code_acceptance: named_test and visual are proven at
+# evaluation time; downstream_artifact becomes proven later via
+# record_artifact_consumptions_for_task (see DB tests below)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -724,6 +727,54 @@ def test_soft_kinds_are_satisfied_but_not_proven():
         # Declared (so coverage counts it) but NOT proven.
         assert acceptance_was_declared(recorded) is True
         assert acceptance_is_proven(recorded) is False
+
+
+def test_visual_kind_requires_matching_viewport_screenshot_and_is_proven():
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "visual",
+            "component": "MetricsDashboard",
+            "viewport_width": 1280,
+        },
+        changed_files=["admin-ui/src/components/MetricsDashboard.tsx"],
+    )
+
+    verdict_missing = evaluate_code_acceptance(task)
+    assert verdict_missing.satisfied is False
+    assert verdict_missing.proven is False
+    assert "matching viewport screenshot" in verdict_missing.reason
+
+    record_code_acceptance_verdict(task)
+    recorded_missing = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert recorded_missing["satisfied"] is False
+    assert acceptance_blocks_success(recorded_missing) is True
+
+    task_with_screenshot = _make_code_task(
+        acceptance_evidence={
+            "kind": "visual",
+            "component": "MetricsDashboard",
+            "viewport_width": 1280,
+        },
+        changed_files=["admin-ui/src/components/MetricsDashboard.tsx"],
+    )
+    task_with_screenshot.context["viewport_failure_screenshot_uri"] = (
+        "gs://bucket/viewport-failures/"
+        f"{task_with_screenshot.project_id}/MetricsDashboard-1280.png"
+    )
+
+    verdict = evaluate_code_acceptance(task_with_screenshot)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "viewport-failures" in verdict.reason
+
+    recorded = record_code_acceptance_verdict(task_with_screenshot)
+    stamped = task_with_screenshot.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert recorded is not None
+    assert stamped["satisfied"] is True
+    assert stamped["proven"] is True
+    assert acceptance_was_declared(stamped) is True
+    assert acceptance_is_proven(stamped) is True
+    assert acceptance_blocks_success(stamped) is False
 
 
 def test_failed_named_test_is_declared_but_not_proven():
@@ -825,6 +876,20 @@ _VERDICT_MIX = [
         False,
     ),
     (
+        "visual_proven",
+        {
+            "acceptance_evidence": {
+                "kind": "visual",
+                "component": "MetricsDashboard",
+                "viewport_width": 1280,
+            },
+            "changed_files": ["admin-ui/src/components/MetricsDashboard.tsx"],
+        },
+        True,
+        True,
+        True,
+    ),
+    (
         "declared_unsatisfied_named_test_missing",
         {
             "acceptance_evidence": {
@@ -888,6 +953,11 @@ def test_verdict_axis_implication_invariant_over_mix():
     Drives the REAL gate and REAL predicates, never a reimplementation."""
     for label, kwargs, exp_declared, exp_satisfied, exp_proven in _VERDICT_MIX:
         task = _make_code_task(**kwargs)
+        if label == "visual_proven":
+            task.context["viewport_failure_screenshot_uri"] = (
+                "gs://bucket/viewport-failures/"
+                f"{task.project_id}/MetricsDashboard-1280.png"
+            )
         verdict = evaluate_code_acceptance(task)
 
         # The verdict matches the expected per-axis outcome for this kind.
@@ -904,9 +974,9 @@ def test_verdict_axis_implication_invariant_over_mix():
             # NEVER proven.
             assert not verdict.proven, label
 
-        # Only a satisfied named_test is ever proven.
+        # Only a satisfied named_test or visual is ever proven at evaluation time.
         if verdict.proven:
-            assert verdict.kind == "named_test", label
+            assert verdict.kind in {"named_test", "visual"}, label
 
         # Now exercise the recorded-verdict predicates the aggregates consume.
         recorded = record_code_acceptance_verdict(task)
@@ -1109,9 +1179,9 @@ def test_invariant_no_declaration_records_nothing():
 
 
 def test_invariant_all_valid_kinds_covered():
-    """Every VALID kind is tested: named_test, observable_behavior, downstream_artifact."""
+    """Every VALID kind is tested: named_test, observable_behavior, downstream_artifact, visual."""
     # This invariant ensures there is no blind spot in the kind matrix.
-    # The only valid kinds per AcceptanceEvidence schema are these three.
+    # The only valid kinds per AcceptanceEvidence schema are these four.
     # (Unknown kinds cannot be created by validation, so we test only real ones.)
     from app.payload_schemas import AcceptanceEvidence
 
@@ -1127,7 +1197,13 @@ def test_invariant_all_valid_kinds_covered():
     da = AcceptanceEvidence(kind="downstream_artifact", artifact_id="some-artifact")
     assert da.kind == "downstream_artifact"
 
-    # Verify the three kinds are the closed set by checking the schema.
+    # visual kind
+    vis = AcceptanceEvidence(
+        kind="visual", component="MetricsDashboard", viewport_width=1280
+    )
+    assert vis.kind == "visual"
+
+    # Verify the four kinds are the closed set by checking the schema.
     # (This documents that if AcceptanceEvidence.kind ever adds a fourth kind,
     # this test's assertion will need updating, triggering a review of whether
     # the evaluation logic covers the new kind.)
@@ -1137,7 +1213,12 @@ def test_invariant_all_valid_kinds_covered():
     kind_annotation = hints.get("kind")
     if hasattr(kind_annotation, "__args__"):
         valid_kinds = set(kind_annotation.__args__)
-        assert valid_kinds == {"named_test", "observable_behavior", "downstream_artifact"}
+        assert valid_kinds == {
+            "named_test",
+            "observable_behavior",
+            "downstream_artifact",
+            "visual",
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

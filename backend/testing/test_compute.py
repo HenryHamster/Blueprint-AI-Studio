@@ -8119,3 +8119,181 @@ async def test_compute_job_concurrency_cap_per_project_isolation(db_session):
 
     assert job is not None
     assert job.project_id == project_b.id
+
+
+# ── Release identity injection, echo, and echo parsing ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_launch_spec_injects_release_env_vars(db_session, monkeypatch):
+    """_build_launch_spec injects BLUEPRINT_RELEASE_* when live_release_evidence is set."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="gcp",
+    )
+    evidence = {
+        "promoted_sha": "abc123def456",
+        "release_version_number": 9,
+        "release_version_id": "11111111-0000-0000-0000-000000000001",
+        "aggregate_serving_status": "serving_confirmed",
+    }
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "live_release_evidence": evidence,
+    }
+
+    spec = compute_jobs._build_launch_spec(job)
+    assert spec.env is not None
+    assert spec.env["BLUEPRINT_RELEASE_SHA"] == "abc123def456"
+    assert spec.env["BLUEPRINT_RELEASE_VERSION"] == "9"
+    assert spec.env["BLUEPRINT_RELEASE_VERSION_ID"] == "11111111-0000-0000-0000-000000000001"
+
+
+@pytest.mark.asyncio
+async def test_build_launch_spec_no_env_injection_without_evidence(db_session, monkeypatch):
+    """_build_launch_spec does NOT inject BLUEPRINT_RELEASE_* for non-live-proof jobs."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="gcp",
+    )
+    spec = compute_jobs._build_launch_spec(job)
+    env = spec.env or {}
+    assert "BLUEPRINT_RELEASE_SHA" not in env
+    assert "BLUEPRINT_RELEASE_VERSION" not in env
+    assert "BLUEPRINT_RELEASE_VERSION_ID" not in env
+
+
+@pytest.mark.asyncio
+async def test_build_launch_spec_caller_env_takes_precedence_over_release_env(
+    db_session, monkeypatch
+):
+    """Caller-provided env overrides injected release env vars."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="gcp",
+    )
+    evidence = {
+        "promoted_sha": "abc123def456",
+        "release_version_number": 9,
+    }
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "live_release_evidence": evidence,
+        "env": {"BLUEPRINT_RELEASE_SHA": "caller-override"},
+    }
+    spec = compute_jobs._build_launch_spec(job)
+    assert spec.env["BLUEPRINT_RELEASE_SHA"] == "caller-override"
+
+
+def test_gcp_startup_script_emits_release_echo_when_sha_present():
+    """GCP startup script contains the release echo emission block."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        env={"BLUEPRINT_RELEASE_SHA": "abc123def456"},
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "BLUEPRINT_COMPUTE_RELEASE_ECHO=" in script
+    assert "BLUEPRINT_RELEASE_SHA" in script
+    assert "RELEASE_ECHO_B64" in script
+
+
+def test_gcp_startup_script_release_echo_block_is_no_op_without_sha():
+    """GCP startup script echo block is safely present but no-op without env var."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # The echo block is in the script but only fires when the env var is set.
+    assert "BLUEPRINT_COMPUTE_RELEASE_ECHO=" in script
+    assert "BLUEPRINT_RELEASE_SHA" in script
+
+
+def test_parse_serial_status_extracts_release_echo():
+    """_parse_serial_status decodes BLUEPRINT_COMPUTE_RELEASE_ECHO into echoed_release_sha."""
+    sha = "abc123def456"
+    echo_b64 = base64.b64encode(sha.encode("utf-8")).decode("ascii")
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_REASON=completed",
+            "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+            f"BLUEPRINT_COMPUTE_RELEASE_ECHO={echo_b64}",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.echoed_release_sha == sha
+
+
+def test_parse_serial_status_missing_echo_yields_none():
+    """_parse_serial_status returns echoed_release_sha=None when marker is absent."""
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_REASON=completed",
+            "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.echoed_release_sha is None
+
+
+def test_parse_serial_status_garbled_echo_is_tolerated():
+    """Garbled release echo marker is tolerated — echoed_release_sha stays None."""
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+            "BLUEPRINT_COMPUTE_RELEASE_ECHO=not-valid-base64-$$$",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.echoed_release_sha is None
+
+
+def test_local_wrapper_command_writes_release_echo_to_terminal_file():
+    """Local wrapper writes RELEASE_ECHO= to the terminal state file."""
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi", external_id="local-releasetest"
+    )
+    assert "RELEASE_ECHO=$RELEASE_ECHO_B64" in wrapper
+    assert "RELEASE_ECHO_B64" in wrapper
+    assert "BLUEPRINT_RELEASE_SHA" in wrapper

@@ -1731,7 +1731,8 @@ async def _latest_compute_live_release_evidence(
     session: AsyncSession,
     *,
     job_id: uuid.UUID | None = None,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], str | None] | None:
+    """Return (evidence, echo_sha) from the most-recent compute job, or None."""
     if job_id is not None:
         job = await session.get(ComputeJob, job_id)
         if job is None or job.task_id != task.id or not isinstance(job.polling_metadata, dict):
@@ -1749,7 +1750,10 @@ async def _latest_compute_live_release_evidence(
         if job is None or not isinstance(job.polling_metadata, dict):
             return None
     evidence = job.polling_metadata.get(_LIVE_RELEASE_EVIDENCE_KEY)
-    return evidence if isinstance(evidence, dict) else None
+    if not isinstance(evidence, dict):
+        return None
+    echo_sha = job.polling_metadata.get("release_echo_sha") or None
+    return evidence, echo_sha
 
 
 async def _persist_compute_knowledge_document(
@@ -1785,13 +1789,27 @@ async def _persist_compute_knowledge_document(
 
     verdict_record = dict(document["verdict_record"])
     verdict_record.setdefault("analysis_mode", mode)
-    release_evidence = await _latest_compute_live_release_evidence(
+    live_data = await _latest_compute_live_release_evidence(
         task,
         session,
         job_id=compute_job_id,
     )
-    if release_evidence is not None:
+    release_evidence: dict[str, Any] | None = None
+    if live_data is not None:
+        release_evidence, echo_sha = live_data
         verdict_record["release_evidence"] = release_evidence
+        expected_sha = release_evidence.get("promoted_sha") or None
+        if echo_sha is None:
+            binding_status = "absent"
+        elif echo_sha == expected_sha:
+            binding_status = "verified"
+        else:
+            binding_status = "mismatched"
+        verdict_record["release_binding"] = {
+            "status": binding_status,
+            "echo_sha": echo_sha,
+            "expected_sha": expected_sha,
+        }
 
     # Attach citation-grounding probe detail (additive, best-effort).
     # Reuses the shared _grounding_probe_detail helper so the shape is identical
