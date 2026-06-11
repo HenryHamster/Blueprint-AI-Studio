@@ -8566,6 +8566,20 @@ async def _seed_infra_failure_children(
     return audit_task, smoke_task
 
 
+async def _infra_verdicts_for_version(db_session, version) -> list[QualificationVerdict]:
+    return (
+        (
+            await db_session.execute(
+                select(QualificationVerdict)
+                .where(QualificationVerdict.release_version_id == version.id)
+                .order_by(QualificationVerdict.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
 class TestFinalizeInfraFailure:
     """_finalize_qualification correctly distinguishes infra failures from verdicts."""
 
@@ -8597,19 +8611,10 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_task_failed"
 
-        # No QualificationVerdict row — the qualifier never rendered a verdict.
-        verdicts = (
-            (
-                await db_session.execute(
-                    select(QualificationVerdict).where(
-                        QualificationVerdict.release_version_id == version.id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        assert len(verdicts) == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
+        assert verdicts[0].sub_scores["infra_failure"]["error"] == "audit_task_failed"
 
         # An operator notification was posted with release_infra_failure event.
         msgs = (
@@ -8649,15 +8654,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_task_cancelled"
 
-        # No verdict row.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_audit_task_blocked_records_infra_failure_not_verdict(
@@ -8683,14 +8682,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_task_blocked"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_smoketest_task_failed_records_infra_failure_when_enabled(
@@ -8718,15 +8712,9 @@ class TestFinalizeInfraFailure:
         await db_session.refresh(version)
         assert version.last_qualification["status"] == "infra_failure"
 
-        # No verdict row even though audit completed.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_smoketest_task_blocked_records_infra_failure_when_enabled(
@@ -8753,22 +8741,15 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "smoketest_task_blocked"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_infra_failure_does_not_appear_in_promotion_readiness(
         self, db_session
     ):
-        """An infra-failure finalization writes no QualificationVerdict row, so
-        compute_promotion_readiness sees verdicts_evaluated == 0 (the infra
-        failure does not pollute the dry-run track record)."""
+        """Infra verdict rows do not pollute the dry-run readiness track record."""
         project, version = await _make_project_and_version(db_session)
         await _seed_infra_failure_children(
             db_session,
@@ -8790,8 +8771,8 @@ class TestFinalizeInfraFailure:
     ):
         """A COMPLETED audit task whose RELEASE_AUDIT_REPORT artifact is absent
         is now reclassified as infra_failure — the agent ran but emitted no
-        usable output.  No QualificationVerdict row is written; the operator
-        notification is 'release_infra_failure', not 'release_blocked'."""
+        usable output. The operator notification is 'release_infra_failure',
+        not 'release_blocked'."""
         project, version = await _make_project_and_version(db_session)
         # Both children COMPLETED but NO artifacts seeded — audit produced
         # no report, which is an infra failure (defense-in-depth path).
@@ -8811,15 +8792,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "audit_report_missing"
 
-        # NO QualificationVerdict row written — infra failure, not quality blocker.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_audit_completed_empty_artifact_reclassified_as_infra_failure(
@@ -8851,14 +8826,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "audit_report_empty_dict"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_audit_completed_unparseable_artifact_reclassified_as_infra_failure(
@@ -8893,14 +8863,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "audit_report_missing"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_audit_completed_parseable_but_unscoreable_reclassified_as_infra_failure(
@@ -8944,14 +8909,9 @@ class TestFinalizeInfraFailure:
             == "audit_report_parseable_but_unscoreable"
         )
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_legitimate_empty_findings_audit_reaches_verdict_not_infra_failure(
@@ -9055,14 +9015,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "smoketest_report_missing"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_smoketest_completed_unparseable_artifact_reclassified_as_infra_failure(
@@ -9106,14 +9061,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "smoketest_report_missing"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_consecutive_infra_errors_backstop_fires_alert(self, db_session):
@@ -9466,15 +9416,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert "audit_challenge_task_failed" in version.last_qualification["error"]
 
-        # No QualificationVerdict row — infra path never records a quality verdict.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_challenge_provision_failure_respawns_new_task(self, db_session):
@@ -9587,14 +9531,8 @@ class TestFinalizeInfraFailure:
         assert new_qual["challenge_task_id"] != original_challenge_id
 
         # No QualificationVerdict — verdict not rendered on respawn.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
 
     @pytest.mark.asyncio
     async def test_challenge_infra_respawn_cap_exceeded_routes_to_infra_failure(
@@ -9840,14 +9778,8 @@ class TestFinalizeInfraFailure:
         assert new_qual["audit_task_id"] != original_audit_id
 
         # No QualificationVerdict row — verdict was not rendered.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
 
         # No infra_failure ProjectMessage — this is a transient respawn, not a
         # hard pipeline failure.
@@ -9984,14 +9916,8 @@ class TestFinalizeInfraFailure:
         assert new_qual["audit_task_id"] != original_audit_id
 
         # No QualificationVerdict — verdict not rendered on respawn.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
 
         # No infra_failure ProjectMessage — transient respawn, not a hard failure.
         infra_msg_count = (
@@ -10120,6 +10046,121 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_infra_respawn_cap_exceeded"
 
+    @pytest.mark.asyncio
+    async def test_infra_failure_repeat_signature_recorded_across_attempts(
+        self, db_session, mocker
+    ):
+        """Re-requested qualifications carry prior infra signature/history forward."""
+        from app.failure_classification import PROVISION_FAILURE, persist_failure_category
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(
+            db_session, phase="stabilize"
+        )
+        first_candidate = "11112222" * 5
+        first_audit = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "base_branch": "automain",
+                    "diff_range": f"automain...{first_candidate}",
+                    "candidate_sha": first_candidate,
+                }
+            ],
+            vm_instance_id="vm-first-repeat",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(first_audit)
+        await db_session.commit()
+        await db_session.refresh(first_audit)
+        persist_failure_category(first_audit, PROVISION_FAILURE)
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": first_candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(first_audit.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+            "audit_infra_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        first_result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        assert first_result["status"] == "infra_failure"
+
+        await db_session.refresh(version)
+        first_qual = version.last_qualification
+        first_signature = first_qual["infra_failure_signature"]
+        assert first_qual["same_error_as_prior"] is False
+        assert len(first_qual["infra_attempt_history"]) == 1
+
+        second_candidate = "33334444" * 5
+        mocker.patch(
+            "app.github.get_repo_installation_token",
+            new=AsyncMock(return_value="gh-token"),
+        )
+        mocker.patch(
+            "app.github.get_branch_sha",
+            new=AsyncMock(return_value=second_candidate),
+        )
+        mocker.patch(
+            "app.github.get_check_runs_cached",
+            new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+        )
+
+        spawned = await rq.run_qualification(db_session, project.id, version)
+        await db_session.commit()
+        assert spawned["status"] == "spawned"
+
+        await db_session.refresh(version)
+        pending = dict(version.last_qualification)
+        assert pending["previous_infra_failure_signature"] == first_signature
+        assert pending["previous_infra_failure_candidate_sha"] == first_candidate
+        assert pending["infra_attempt_history"][0]["signature"] == first_signature
+
+        second_audit = await db_session.get(
+            Task, uuid.UUID(str(pending["audit_task_id"]))
+        )
+        second_audit.status = TaskStatus.FAILED
+        persist_failure_category(second_audit, PROVISION_FAILURE)
+        pending["audit_infra_respawn_count"] = _MAX_AUDIT_RL_RESPAWNS
+        version.last_qualification = pending
+        db_session.add(second_audit)
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        second_result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        assert second_result["status"] == "infra_failure"
+        assert second_result["infra_failure_signature"] == first_signature
+        assert second_result["same_error_as_prior"] is True
+        assert second_result["same_error_different_candidate"] is True
+
+        await db_session.refresh(version)
+        final_qual = version.last_qualification
+        assert final_qual["same_infra_failure_as_previous"] is True
+        assert final_qual["same_infra_failure_different_candidate"] is True
+        assert len(final_qual["infra_attempt_history"]) == 2
+        assert final_qual["infra_attempt_history"][1]["child_failures"][0][
+            "failure_category"
+        ] == PROVISION_FAILURE
+
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 2
+        latest_evidence = verdicts[-1].sub_scores["infra_failure"]
+        assert latest_evidence["signature"] == first_signature
+        assert latest_evidence["same_error_as_prior"] is True
+        assert latest_evidence["same_error_different_candidate"] is True
+
     # -----------------------------------------------------------------------
     # Malformed audit artifact shapes — each must produce either a real verdict
     # OR an infra_failure; never both, never neither, never a silent clean score.
@@ -10155,14 +10196,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_report_empty_dict"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_findings_list_no_audit_score_field_reaches_verdict(self, db_session):
@@ -10226,7 +10262,7 @@ class TestFinalizeInfraFailure:
 
         A single finding dict missing severity/level is "parseable_but_unscoreable" —
         the agent produced structured output but _score_audit() cannot apply any
-        deduction.  No QualificationVerdict row is written."""
+        deduction. An infra QualificationVerdict row is written."""
         project, version = await _make_project_and_version(db_session)
         await _seed_qualification_children(
             db_session,
@@ -10249,14 +10285,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "audit_report_parseable_but_unscoreable"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_issues_key_equivalent_to_findings_reaches_verdict(self, db_session):
@@ -10320,7 +10351,7 @@ class TestFinalizeInfraFailure:
         A "findings" key whose value is not a list causes _score_audit() to fall
         through to the "issues" fallback (also absent here), yielding a silent
         clean 1.0 without the wrong-type guard.  Verify infra_failure is returned
-        and no QualificationVerdict row is written."""
+        and an infra QualificationVerdict row is written."""
         project, version = await _make_project_and_version(db_session)
         await _seed_qualification_children(
             db_session,
@@ -10347,14 +10378,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_report_findings_wrong_type"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
 
 # ===========================================================================
@@ -10372,11 +10398,11 @@ class TestReaperInducedAuditHeartbeatTimeout:
 
     @pytest.mark.asyncio
     async def test_reaper_heartbeat_timeout_routes_to_infra_failure(self, db_session):
-        """Heartbeat-stale audit reaped as FAILED → infra_failure, no verdict.
+        """Heartbeat-stale audit reaped as FAILED → infra_failure.
 
         Five assertions (matching the task contract):
           (a) status is infra_failure, not not_promoted / dry_run.
-          (b) No QualificationVerdict row is created.
+          (b) An infra QualificationVerdict row is created.
           (c) Version remains open with phase=stabilize.
           (d) Error label carries the heartbeat_timeout enrichment so the
               operator can distinguish a VM heartbeat death from a code-defect
@@ -10462,15 +10488,9 @@ class TestReaperInducedAuditHeartbeatTimeout:
             f"expected infra_failure, got {result['status']}: {result}"
         )
 
-        # (b) No QualificationVerdict row — the qualifier never rendered a verdict.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0, f"expected 0 QualificationVerdict rows, got {count}"
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
         # (c) Version remains open with phase=stabilize.
         await db_session.refresh(version)

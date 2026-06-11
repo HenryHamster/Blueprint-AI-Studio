@@ -4260,7 +4260,7 @@ async def compute_release_qualifier_infra_metrics(
     """Aggregate release-qualifier audit-pipeline infra failure counters.
 
     Scans ReleaseVersion.last_qualification JSONB (one record per version,
-    latest qualification only) and returns six counters over the digest window.
+    latest qualification only) and returns infra counters over the digest window.
     Returns zeroed counters when no qualifying rows exist.
 
     Counters:
@@ -4270,6 +4270,8 @@ async def compute_release_qualifier_infra_metrics(
       audit_report_parseable_but_unscoreable_count — error==audit_report_parseable_but_unscoreable
       smoketest_report_missing_count             — error==smoketest_report_missing
       release_infra_failure_streak_max           — highest consecutive_infra_errors seen
+      release_infra_failure_repeat_signature_total — infra failures matching prior signature
+      release_infra_failure_repeat_different_candidate_total — repeat signature on new candidate
     """
     stmt = select(ReleaseVersion)
     if project_id:
@@ -4286,6 +4288,8 @@ async def compute_release_qualifier_infra_metrics(
     audit_report_parseable_but_unscoreable_count = 0
     smoketest_report_missing_count = 0
     release_infra_failure_streak_max = 0
+    release_infra_failure_repeat_signature_total = 0
+    release_infra_failure_repeat_different_candidate_total = 0
 
     for version in versions:
         qual = version.last_qualification
@@ -4298,6 +4302,14 @@ async def compute_release_qualifier_infra_metrics(
         if qual.get("status") != "infra_failure":
             continue
         release_infra_failure_total += 1
+        if qual.get("same_error_as_prior") or qual.get(
+            "same_infra_failure_as_previous"
+        ):
+            release_infra_failure_repeat_signature_total += 1
+        if qual.get("same_error_different_candidate") or qual.get(
+            "same_infra_failure_different_candidate"
+        ):
+            release_infra_failure_repeat_different_candidate_total += 1
         error = qual.get("error") or ""
         if error == "audit_report_missing":
             audit_report_missing_count += 1
@@ -4316,6 +4328,8 @@ async def compute_release_qualifier_infra_metrics(
         "audit_report_parseable_but_unscoreable_count": audit_report_parseable_but_unscoreable_count,
         "smoketest_report_missing_count": smoketest_report_missing_count,
         "release_infra_failure_streak_max": release_infra_failure_streak_max,
+        "release_infra_failure_repeat_signature_total": release_infra_failure_repeat_signature_total,
+        "release_infra_failure_repeat_different_candidate_total": release_infra_failure_repeat_different_candidate_total,
     }
 
 

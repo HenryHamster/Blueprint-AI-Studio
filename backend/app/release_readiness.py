@@ -449,7 +449,10 @@ async def get_challenged_vs_unchallenged_telemetry(
     """
     stmt = (
         select(QualificationVerdict)
-        .where(QualificationVerdict.project_id == project_id)
+        .where(
+            QualificationVerdict.project_id == project_id,
+            QualificationVerdict.terminal_status != "infra_failure",
+        )
         .order_by(QualificationVerdict.created_at.desc())
         .limit(window)
     )
@@ -524,6 +527,7 @@ async def compute_promotion_readiness(
         .where(
             QualificationVerdict.project_id == project_id,
             QualificationVerdict.promotion_enabled.is_(False),
+            QualificationVerdict.terminal_status != "infra_failure",
         )
         .order_by(QualificationVerdict.created_at.desc())
         .limit(_READINESS_HISTORY_WINDOW)

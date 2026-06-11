@@ -2397,6 +2397,8 @@ async def test_release_qualifier_infra_metrics_no_versions(db_session):
     assert result["audit_report_parseable_but_unscoreable_count"] == 0
     assert result["smoketest_report_missing_count"] == 0
     assert result["release_infra_failure_streak_max"] == 0
+    assert result["release_infra_failure_repeat_signature_total"] == 0
+    assert result["release_infra_failure_repeat_different_candidate_total"] == 0
 
 
 @pytest.mark.asyncio
@@ -2442,6 +2444,57 @@ async def test_release_qualifier_infra_metrics_counts_by_error_category(db_sessi
     assert result["audit_report_missing_count"] == 1
     assert result["audit_report_parseable_but_unscoreable_count"] == 1
     assert result["smoketest_report_missing_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_release_qualifier_infra_metrics_counts_repeat_signatures(db_session):
+    """Repeated infra signatures are surfaced as digest counters."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    finalized_at = (now - timedelta(hours=1)).isoformat()
+    rows = [
+        {
+            "same_error_as_prior": True,
+            "same_error_different_candidate": True,
+        },
+        {
+            "same_infra_failure_as_previous": True,
+            "same_infra_failure_different_candidate": False,
+        },
+        {
+            "same_error_as_prior": False,
+            "same_error_different_candidate": False,
+        },
+    ]
+    for i, evidence in enumerate(rows):
+        db_session.add(
+            ReleaseVersion(
+                project_id=project.id,
+                version_number=i + 1,
+                phase="stabilize",
+                last_qualification={
+                    "status": "infra_failure",
+                    "error": "audit_infra_respawn_cap_exceeded",
+                    "consecutive_infra_errors": i + 1,
+                    "finalized_at": finalized_at,
+                    **evidence,
+                },
+            )
+        )
+    await db_session.commit()
+
+    result = await compute_release_qualifier_infra_metrics(
+        db_session,
+        project_id=project.id,
+        window_start=now - timedelta(hours=24),
+    )
+    assert result["release_infra_failure_total"] == 3
+    assert result["release_infra_failure_repeat_signature_total"] == 2
+    assert result["release_infra_failure_repeat_different_candidate_total"] == 1
 
 
 @pytest.mark.asyncio

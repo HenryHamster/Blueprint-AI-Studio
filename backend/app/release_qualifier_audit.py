@@ -46,11 +46,141 @@ logger = logging.getLogger("backend.app.release_qualifier")
 # Mirrors _MIN_CALCIFICATION_ATTEMPTS: three consecutive infra failures
 # strongly suggest the qualifier pipeline itself (agent VM / clone) is broken.
 _MIN_INFRA_ERROR_STREAK = 3
+_INFRA_ATTEMPT_HISTORY_LIMIT = 5
 
 # Strong references to in-flight fire-and-forget infra-failure webhook tasks.
 # asyncio only holds weak references to scheduled tasks, so without this a
 # webhook coroutine could be garbage-collected mid-flight (RUF006).
 _INFRA_WEBHOOK_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _bounded_infra_history(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    rows = [row for row in value if isinstance(row, dict)]
+    return rows[-_INFRA_ATTEMPT_HISTORY_LIMIT:]
+
+
+def _task_failure_category(task: Task | None) -> str | None:
+    if task is None:
+        return None
+    ctx = task.context or {}
+    category = ctx.get("failure_category") or ctx.get("failure_class")
+    return str(category) if category else None
+
+
+def _compact_infra_child_event(
+    *,
+    leg: str,
+    failed_task: Task | None,
+    replacement_task_id: str | None = None,
+    label: str | None = None,
+    respawn_count: int | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {"leg": leg}
+    if failed_task is not None:
+        event["failed_task_id"] = str(failed_task.id)
+        event["status"] = failed_task.status
+        category = _task_failure_category(failed_task)
+        if category:
+            event["failure_category"] = category
+    if replacement_task_id:
+        event["replacement_task_id"] = replacement_task_id
+    if label:
+        event["label"] = label
+    if respawn_count is not None:
+        event["respawn_count"] = respawn_count
+    return event
+
+
+def append_infra_failure_child_event(
+    qual: dict[str, Any],
+    *,
+    leg: str,
+    failed_task: Task | None,
+    replacement_task_id: str | None = None,
+    label: str | None = None,
+    respawn_count: int | None = None,
+) -> dict[str, Any]:
+    """Return ``qual`` with a compact child-failure event appended."""
+    events = qual.get("infra_failure_child_events")
+    if not isinstance(events, list):
+        events = []
+    event = _compact_infra_child_event(
+        leg=leg,
+        failed_task=failed_task,
+        replacement_task_id=replacement_task_id,
+        label=label,
+        respawn_count=respawn_count,
+    )
+    return {**qual, "infra_failure_child_events": [*events, event][-20:]}
+
+
+def _infer_infra_leg(infra_error: str) -> str:
+    if infra_error.startswith("audit_challenge") or infra_error.startswith(
+        "challenge_"
+    ):
+        return "challenge"
+    if infra_error.startswith("smoketest"):
+        return "smoketest"
+    return "audit"
+
+
+def _infra_failure_signature(
+    infra_error: str, child_failures: list[dict[str, Any]]
+) -> str:
+    terminal = child_failures[-1] if child_failures else {}
+    leg = terminal.get("leg") or _infer_infra_leg(infra_error)
+    category = terminal.get("failure_category") or terminal.get("status") or "unknown"
+    return f"{leg}:{category}:{infra_error}"
+
+
+async def _collect_terminal_infra_child_events(
+    session: AsyncSession,
+    qual: dict[str, Any],
+    infra_error: str,
+) -> list[dict[str, Any]]:
+    existing = [
+        row
+        for row in qual.get("infra_failure_child_events", [])
+        if isinstance(row, dict)
+    ]
+    terminal_ids: list[tuple[str, str]] = []
+    if qual.get("audit_task_id"):
+        terminal_ids.append(("audit", str(qual.get("audit_task_id"))))
+    challenge_id = qual.get("challenge_task_id") or qual.get("audit_challenge_task_id")
+    if challenge_id:
+        terminal_ids.append(("challenge", str(challenge_id)))
+    if qual.get("smoketest_task_id"):
+        terminal_ids.append(("smoketest", str(qual.get("smoketest_task_id"))))
+
+    seen_failed_ids = {
+        str(row.get("failed_task_id"))
+        for row in existing
+        if row.get("failed_task_id") is not None
+    }
+    terminal_events: list[dict[str, Any]] = []
+    for leg, task_id in terminal_ids:
+        if task_id in seen_failed_ids:
+            continue
+        try:
+            task = await session.get(Task, uuid.UUID(task_id))
+        except (TypeError, ValueError):
+            continue
+        if task is None or task.status not in (
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.BLOCKED,
+        ):
+            continue
+        terminal_events.append(
+            _compact_infra_child_event(
+                leg=leg,
+                failed_task=task,
+                label=infra_error if leg == _infer_infra_leg(infra_error) else None,
+            )
+        )
+    return [*existing, *terminal_events][-20:]
 
 
 def _release_qualifier_module():
@@ -541,6 +671,41 @@ async def _handle_infra_failure(
     finalized_at = _utcnow().isoformat()
     prior_streak = int(qual.get("prior_infra_streak") or 0)
     current_streak = prior_streak + 1
+    child_failures = await _collect_terminal_infra_child_events(
+        session, qual, infra_error
+    )
+    signature = _infra_failure_signature(infra_error, child_failures)
+    previous_signature = qual.get("previous_infra_failure_signature") or qual.get(
+        "prior_infra_failure_signature"
+    )
+    previous_candidate_sha = qual.get("previous_infra_failure_candidate_sha")
+    same_error_as_prior = bool(previous_signature and signature == previous_signature)
+    same_error_different_candidate = bool(
+        same_error_as_prior
+        and previous_candidate_sha
+        and qual.get("candidate_sha")
+        and previous_candidate_sha != qual.get("candidate_sha")
+    )
+    prior_history = _bounded_infra_history(qual.get("infra_attempt_history"))
+    attempt_entry = {
+        "finalized_at": finalized_at,
+        "error": infra_error,
+        "signature": signature,
+        "candidate_sha": qual.get("candidate_sha"),
+        "failing_leg": _infer_infra_leg(infra_error),
+        "child_failures": child_failures,
+    }
+    attempt_history = [*prior_history, attempt_entry][-_INFRA_ATTEMPT_HISTORY_LIMIT:]
+    infra_evidence = {
+        "error": infra_error,
+        "signature": signature,
+        "previous_signature": previous_signature,
+        "same_error_as_prior": same_error_as_prior,
+        "same_error_different_candidate": same_error_different_candidate,
+        "consecutive_infra_errors": current_streak,
+        "attempt": attempt_entry,
+        "attempt_history": attempt_history,
+    }
 
     record: dict[str, Any] = {
         "candidate_sha": qual.get("candidate_sha"),
@@ -548,6 +713,14 @@ async def _handle_infra_failure(
         "smoketest_enabled": qual.get("smoketest_enabled", True),
         "status": "infra_failure",
         "error": infra_error,
+        "infra_failure_signature": signature,
+        "previous_infra_failure_signature": previous_signature,
+        "same_error_as_prior": same_error_as_prior,
+        "same_infra_failure_as_previous": same_error_as_prior,
+        "same_error_different_candidate": same_error_different_candidate,
+        "same_infra_failure_different_candidate": same_error_different_candidate,
+        "infra_failure_child_events": child_failures,
+        "infra_attempt_history": attempt_history,
         "consecutive_infra_errors": current_streak,
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
@@ -587,7 +760,9 @@ async def _handle_infra_failure(
                     f"agent VM or clone pipeline is broken. This is NOT a "
                     f"quality finding about the release candidate. Inspect the "
                     f"release_audit / qualifier-smoketest agent infrastructure "
-                    f"and re-queue to retry once the issue is resolved."
+                    f"and re-queue to retry once the issue is resolved. "
+                    f"Signature: {signature}; same as previous: "
+                    f"{same_error_as_prior}."
                 ),
             )
         )
@@ -608,10 +783,15 @@ async def _handle_infra_failure(
             f"v{version.version_number} qualifier infrastructure failure — "
             f"{infra_error.replace('_', ' ')} (agent VM / clone failure, "
             f"not a quality finding). Returned to stabilize for "
-            f"re-qualification. Consecutive infra errors: {current_streak}."
+            f"re-qualification. Consecutive infra errors: {current_streak}. "
+            f"Signature: {signature}; same as previous: {same_error_as_prior}."
         ),
         extra={
             "error": infra_error,
+            "infra_failure_signature": signature,
+            "previous_infra_failure_signature": previous_signature,
+            "same_error_as_prior": same_error_as_prior,
+            "same_error_different_candidate": same_error_different_candidate,
             "consecutive_infra_errors": current_streak,
         },
     )
@@ -624,6 +804,10 @@ async def _handle_infra_failure(
                 "version_number": version.version_number,
                 "version_id": str(version.id),
                 "infra_error": infra_error,
+                "infra_failure_signature": signature,
+                "previous_infra_failure_signature": previous_signature,
+                "same_error_as_prior": same_error_as_prior,
+                "same_error_different_candidate": same_error_different_candidate,
                 "consecutive_infra_errors": current_streak,
             },
         )
@@ -633,14 +817,26 @@ async def _handle_infra_failure(
 
     logger.warning(
         "[RELEASE_QUALIFIER] v%d infra failure: %s (streak=%d) — "
-        "no verdict recorded, version returned to stabilize",
+        "infra verdict recorded best-effort, version returned to stabilize",
         version.version_number,
         infra_error,
         current_streak,
     )
+    promotion_enabled = resolve_project_promotion_enabled(version.project_id)
+    await _record_qualification_verdict(
+        session,
+        version,
+        {**record, "sub_scores": {"infra_failure": infra_evidence}},
+        terminal_status="infra_failure",
+        would_promote=False,
+        promotion_enabled=promotion_enabled,
+    )
     return {
         "status": "infra_failure",
         "error": infra_error,
+        "infra_failure_signature": signature,
+        "same_error_as_prior": same_error_as_prior,
+        "same_error_different_candidate": same_error_different_candidate,
         "consecutive_infra_errors": current_streak,
     }
 

@@ -127,6 +127,7 @@ from app.release_qualifier_audit import (
     # Re-exports — release_qualifier stays the canonical import + patch surface
     # for the qualifier's audit/spawn and infra-failure seam.
     _MIN_INFRA_ERROR_STREAK,  # noqa: F401 — re-exported for callers/tests
+    append_infra_failure_child_event,
     _enrich_infra_error,
     _handle_independent_blocker,  # noqa: F401 — re-exported for callers/tests
     _handle_infra_failure,
@@ -1281,6 +1282,21 @@ async def run_qualification(
         if prior_qual.get("status") == "infra_failure"
         else 0
     )
+    prior_infra_failure_signature = (
+        prior_qual.get("infra_failure_signature")
+        if prior_qual.get("status") == "infra_failure"
+        else None
+    )
+    prior_infra_failure_candidate_sha = (
+        prior_qual.get("candidate_sha")
+        if prior_qual.get("status") == "infra_failure"
+        else None
+    )
+    infra_attempt_history = (
+        prior_qual.get("infra_attempt_history")
+        if prior_qual.get("status") == "infra_failure"
+        else []
+    )
 
     # 5. Spawn the heavy children.
     started_at = _utcnow().isoformat()
@@ -1382,6 +1398,9 @@ async def run_qualification(
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "smoketest_task_id": smoketest_task_id,
         "prior_infra_streak": prior_infra_streak,
+        "previous_infra_failure_signature": prior_infra_failure_signature,
+        "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
+        "infra_attempt_history": infra_attempt_history,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -2016,8 +2035,16 @@ async def _finalize_qualification(
                         candidate_sha=candidate_sha,
                     )
                     new_count = infra_respawn_count + 1
+                    updated_qual = append_infra_failure_child_event(
+                        qual,
+                        leg="audit",
+                        failed_task=_audit_task_obj,
+                        replacement_task_id=str(new_audit_task.id),
+                        label="audit_infra_respawned",
+                        respawn_count=new_count,
+                    )
                     updated_qual = {
-                        **qual,
+                        **updated_qual,
                         "audit_task_id": str(new_audit_task.id),
                         "audit_infra_respawn_count": new_count,
                     }
@@ -2287,8 +2314,16 @@ async def _finalize_qualification(
                                 )
                             else:
                                 _chal_new_count = challenge_infra_respawn_count + 1
+                                updated_qual = append_infra_failure_child_event(
+                                    qual,
+                                    leg="challenge",
+                                    failed_task=_challenge_task_obj,
+                                    replacement_task_id=str(_new_challenge_task.id),
+                                    label="challenge_infra_respawned",
+                                    respawn_count=_chal_new_count,
+                                )
                                 version.last_qualification = {
-                                    **qual,
+                                    **updated_qual,
                                     "status": "pending",
                                     "challenge_task_id": str(_new_challenge_task.id),
                                     "audit_challenge_task_id": str(
