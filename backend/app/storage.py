@@ -353,6 +353,33 @@ async def count_compute_job_artifacts(job_id) -> int:
         )
         return 0
 
+
+async def get_compute_job_artifact_total_bytes(job_id) -> int:
+    """Best-effort total byte size of durable artifact objects under a job's prefix.
+
+    Same listing as :func:`count_compute_job_artifacts` but sums ``blob.size``
+    instead of counting objects. Used together with the count to populate the
+    ``durable_payload_bytes`` backend-derived metric for success-criterion evaluation.
+
+    Best-effort by contract: returns ``0`` on ANY error — never raises.
+    """
+    prefix = compute_job_artifact_object_prefix(job_id) + "/"
+
+    def _total() -> int:
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        return sum(b.size or 0 for b in bucket.list_blobs(prefix=prefix))
+
+    try:
+        return await asyncio.to_thread(_total)
+    except Exception:
+        logger.warning(
+            "Failed to sum durable artifact bytes for compute job %s",
+            job_id,
+            exc_info=True,
+        )
+        return 0
+
 async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
     """
     Uploads a JSON payload to GCS and returns the gs:// URI.

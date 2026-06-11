@@ -1878,6 +1878,16 @@ def build_compute_result_logs(job: ComputeJob) -> str:
         "terminal_reason": job.terminal_reason,
         "result_reference": job.result_reference,
     }
+    # Inject backend-derived durable-artifact metrics as top-level numeric keys.
+    # These are stamped by _link_terminal_artifact and remain evaluable even when
+    # the job timed out or crashed before writing a command result.  Command-reported
+    # values (below) are NOT allowed to overwrite these reserved backend keys.
+    _BACKEND_DERIVED_KEYS = ("durable_file_count", "durable_payload_bytes")
+    for key in _BACKEND_DERIVED_KEYS:
+        raw = meta.get(key)
+        num = _coerce_metric_number(raw)
+        if num is not None:
+            result[key] = num
     # Flatten command-reported result metrics to top-level numeric keys so the
     # success-criterion gate can read them by name, exactly as the agent did. A
     # reported metric whose name collides with a job-level key is skipped so it
@@ -1885,7 +1895,7 @@ def build_compute_result_logs(job: ComputeJob) -> str:
     reported = meta.get("result_metrics")
     if isinstance(reported, dict):
         for name, value in reported.items():
-            if name in result:
+            if name in result or name in _BACKEND_DERIVED_KEYS:
                 continue
             num = _coerce_metric_number(value)
             if num is not None:
@@ -1916,6 +1926,13 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
     reference = await collect_terminal_artifact_reference(job)
     if reference is None:
         return
+    # Stamp backend-derived durable metrics so build_compute_result_logs can
+    # surface them as evaluable top-level keys even for timed-out/failed jobs.
+    _set_meta(
+        job,
+        durable_file_count=reference.file_count,
+        durable_payload_bytes=reference.total_size_bytes,
+    )
     task = await session.get(Task, job.task_id)
     try:
         async with session.begin_nested():

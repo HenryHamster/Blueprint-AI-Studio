@@ -1009,9 +1009,10 @@ def build_adversarial_challenge_manifest(
     """Build a compact, budget-bounded JSON manifest for the adversarial challenger.
 
     Each item keeps only the fields the challenger needs to judge a finding:
-    ``hash``, ``title``, ``description`` (≤400 chars), ``risk``, ``scope``,
-    plus provenance sentinels ``verification_basis_downgraded_from`` and
-    ``needs_revalidation`` when present.
+    ``index`` (1-based ordinal for robust binding), ``hash``, ``title``,
+    ``description`` (≤400 chars), ``risk``, ``scope``, plus provenance
+    sentinels ``verification_basis_downgraded_from`` and ``needs_revalidation``
+    when present.
 
     Items are admitted greedily until the serialised JSON would exceed
     ``_ADVERSARIAL_MANIFEST_CHAR_BUDGET``.  The returned list is always a
@@ -1024,6 +1025,9 @@ def build_adversarial_challenge_manifest(
         h = str(item.get("hash") or "")
         if not h:
             continue
+        # 1-based index so the challenger can echo it back for robust binding
+        # even when it mis-transcribes the hash.
+        entry["index"] = len(compact) + 1
         entry["hash"] = h
         entry["title"] = str(item.get("title") or "")[:200]
         desc = str(item.get("description") or item.get("prompt") or "")
@@ -1069,13 +1073,15 @@ def build_adversarial_finding_prompt(high_stakes_findings_json: str) -> str:
         "or impact beyond what the cited evidence actually shows?\n\n"
         "FAIL when uncertain. Only PASS a finding when all three criteria "
         "clearly hold at HEAD.\n\n"
-        "Findings to challenge (JSON array, each has a 'hash' identifier):\n"
+        "Findings to challenge (JSON array, each has an 'index' and 'hash' "
+        "identifier):\n"
         "-----8<----- FINDINGS START -----8<-----\n"
         f"{high_stakes_findings_json}\n"
         "-----8<----- FINDINGS END -----8<-----\n\n"
         "End your response with EXACTLY ONE JSON array, one object per finding "
         "in the SAME ORDER as the input, and nothing after it:\n"
-        '[{"hash": "<finding_hash from input>", "verdict": "pass" | "fail", '
+        '[{"index": <1-based index from input>, "hash": "<finding_hash from input>", '
+        '"verdict": "pass" | "fail", '
         '"reason": "<one-sentence justification>"}]'
     )
 
@@ -1146,7 +1152,10 @@ def parse_adversarial_finding_verdicts(
         h: _default_entry(ADVERSARIAL_PARSE_NO_HASH_MATCHES) for h in finding_hashes
     }
     matched_any = False
-    for item in parsed:
+
+    # Pass 1: exact hash matching (primary binding).
+    hash_matched_positions: set[int] = set()
+    for i, item in enumerate(parsed):
         if not isinstance(item, dict):
             continue
         h = str(item.get("hash") or "").strip()
@@ -1157,12 +1166,63 @@ def parse_adversarial_finding_verdicts(
         if v in ("pass", "passed", "approve", "approved"):
             result[h] = {"passed": True, "reason": reason, "explicit": True}
             matched_any = True
+            hash_matched_positions.add(i)
         elif v in ("fail", "failed", "reject", "rejected"):
             result[h] = {"passed": False, "reason": reason, "explicit": True}
             matched_any = True
+            hash_matched_positions.add(i)
         else:
             result[h]["unresolved_reason"] = "verdict_unrecognized"
             matched_any = True
+            hash_matched_positions.add(i)
+
+    # Pass 2 & 3: ordinal fallback for verdicts that did not match by hash.
+    # Bind each unmatched verdict to the finding at the same ordinal position
+    # (1-based index field takes priority over array position as a tiebreaker
+    # when the challenger echoes the manifest's index field back).
+    # Only binds to findings that still carry no explicit verdict (fail-closed
+    # defaults from Pass 1 remain bindable until their position is claimed).
+    unbound_positions: dict[int, str] = {
+        i: h
+        for i, h in enumerate(finding_hashes)
+        if not result[h].get("explicit")
+        and result[h].get("unresolved_reason") == ADVERSARIAL_PARSE_NO_HASH_MATCHES
+    }
+    claimed_positions: set[int] = set()
+
+    for i, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            continue
+        if i in hash_matched_positions:
+            continue  # already bound by exact hash
+        # Determine which finding position to bind to.
+        # Priority: explicit `index` field (1-based) > array position.
+        target_pos: int | None = None
+        idx_val = item.get("index")
+        if idx_val is not None:
+            try:
+                explicit_pos = int(idx_val) - 1  # convert 1-based → 0-based
+                if explicit_pos >= 0:
+                    target_pos = explicit_pos
+            except (ValueError, TypeError):
+                pass
+        if target_pos is None:
+            target_pos = i
+        if target_pos not in unbound_positions or target_pos in claimed_positions:
+            continue
+        target_hash = unbound_positions[target_pos]
+        v = str(item.get("verdict") or "").strip().lower()
+        reason = str(item.get("reason") or "")[:480]
+        if v in ("pass", "passed", "approve", "approved"):
+            result[target_hash] = {"passed": True, "reason": reason, "explicit": True}
+            matched_any = True
+        elif v in ("fail", "failed", "reject", "rejected"):
+            result[target_hash] = {"passed": False, "reason": reason, "explicit": True}
+            matched_any = True
+        else:
+            result[target_hash]["unresolved_reason"] = "verdict_unrecognized"
+            matched_any = True
+        claimed_positions.add(target_pos)
 
     if not matched_any:
         return result, ADVERSARIAL_PARSE_NO_HASH_MATCHES

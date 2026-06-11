@@ -163,6 +163,7 @@ class TerminalArtifactReference:
     uri: str
     backend: str
     file_count: int
+    total_size_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -814,7 +815,10 @@ def _collect_local_artifact_reference(
         return None
     uri = str(meta.get("artifact_uri") or "").strip() or f"file://{artifact_dir}"
     return TerminalArtifactReference(
-        uri=uri, backend=LOCAL_BACKEND_NAME, file_count=file_count
+        uri=uri,
+        backend=LOCAL_BACKEND_NAME,
+        file_count=file_count,
+        total_size_bytes=_compute_tree_size_bytes(artifact_dir),
     )
 
 
@@ -828,8 +832,12 @@ async def _collect_gcp_artifact_reference(
     file_count = await storage.count_compute_job_artifacts(job.id)
     if file_count <= 0:
         return None
+    total_size_bytes = await storage.get_compute_job_artifact_total_bytes(job.id)
     return TerminalArtifactReference(
-        uri=artifact_uri, backend=GCP_BACKEND_NAME, file_count=file_count
+        uri=artifact_uri,
+        backend=GCP_BACKEND_NAME,
+        file_count=file_count,
+        total_size_bytes=total_size_bytes,
     )
 
 
@@ -840,6 +848,20 @@ def _count_files_in_tree(path: str) -> int:
     total = 0
     for _root, _dirs, files in os.walk(path):
         total += len(files)
+    return total
+
+
+def _compute_tree_size_bytes(path: str) -> int:
+    """Sum the byte sizes of all regular files under ``path`` (0 if unreadable)."""
+    if not path or not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
     return total
 
 

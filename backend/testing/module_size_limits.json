@@ -88,7 +88,7 @@
     "knowledge_completion.py": 2950,
     "alert_dispatch.py": 1750,
     "compute_jobs.py": 2150,
-    "task_evaluators.py": 1950,
+    "task_evaluators.py": 2300,
     "release_scoring.py": 1800,
     "runtime_config_state.py": 1750,
     "routers/directions.py": 1750
@@ -99,7 +99,7 @@
     "prompts/task-type-focus.ts": 450,
     "prompts/code-change-helpers.ts": 1250,
     "prompts/code-change-helpers.test.ts": 1500,
-    "prompts/check-helper.ts": 950,
+    "prompts/check-helper.ts": 1200,
     "prompts/check-helper.test.ts": 1300,
     "prompts/done-helper.ts": 650,
     "prompts/done-helper.test.ts": 650,

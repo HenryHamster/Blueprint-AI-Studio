@@ -38,6 +38,7 @@ from app.compute_backends import (
     ComputeCostResult,
     ComputeLaunchResult,
     ComputeStatusResult,
+    TerminalArtifactReference,
 )
 from app.database import resolve_async_engine
 from app.models import (
@@ -4620,3 +4621,328 @@ async def test_salvage_poll_failure_does_not_block_termination(db_session, monke
     assert job.status == ComputeJobStatus.TIMED_OUT
     assert job.outcome == ComputeJobOutcome.TIMED_OUT
     assert "runtime deadline" in (job.terminal_reason or "")
+
+
+# ── Backend-derived durable-artifact success criteria ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_durable_artifact_criterion_backend_derived_on_timeout(
+    db_session, _quiet_compute_io
+):
+    """Acceptance proof: a TIMED_OUT job that left a durable artifact evaluates
+    durable_payload_bytes as measurable=True from the backend's own measurement
+    even though the command never reported it.  A job with no durable artifact
+    evaluates as met=False (fail-closed), not unmeasurable-and-skipped.
+
+    This is the named acceptance test declared in the task plan:
+    ``test_durable_artifact_criterion_backend_derived_on_timeout``.
+    """
+    task = await _make_compute_task_with_criterion(
+        db_session, "durable_payload_bytes", ">=", 8192
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    # ── Part A: TIMED_OUT job WITH backend-measured durable artifact ─────────
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.TIMED_OUT
+    job.outcome = ComputeJobOutcome.TIMED_OUT
+    job.accrued_cost_usd = 0.20
+    job.final_cost_usd = 0.20
+    job.terminal_reason = "wall clock deadline exceeded"
+    job.completed_at = datetime.utcnow()
+    # Simulate what _link_terminal_artifact stamps after detecting a durable artifact.
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "durable_payload_bytes": 16384,
+        "durable_file_count": 2,
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = compute_jobs.build_compute_result_logs(job)
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["measurable"] is True, (
+        "durable_payload_bytes stamped by backend must be measurable even on TIMED_OUT"
+    )
+    assert criterion["met"] is True
+    assert criterion["value"] == pytest.approx(16384)
+    assert criterion["metric"] == "durable_payload_bytes"
+    assert task.context["compute_success_criterion"]["measurable"] is True
+    assert task.context["compute_success_criterion"]["met"] is True
+
+    # ── Part B: job with NO durable artifact → fail-closed (met=False) ───────
+    task2 = await _make_compute_task_with_criterion(
+        db_session, "durable_payload_bytes", ">=", 8192
+    )
+    # No durable_payload_bytes in polling_metadata — no artifact survived teardown.
+    logs2 = _result_artifact(outcome="TIMED_OUT", status="TIMED_OUT", final_cost_usd=0.10)
+    await _handle_compute_experiment_completion(task2, logs2, db_session)
+
+    await db_session.refresh(task2)
+    criterion2 = task2.plan_output["compute_result"]["criterion"]
+    assert criterion2["met"] is False, (
+        "absent durable_payload_bytes must be fail-closed (met=False), not a pass"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_durable_payload_bytes_criterion_unmet(
+    db_session, _quiet_compute_io
+):
+    """Backend-measured payload below the declared threshold records met=False."""
+    task = await _make_compute_task_with_criterion(
+        db_session, "durable_payload_bytes", ">=", 65536
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.10
+    job.final_cost_usd = 0.10
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "durable_payload_bytes": 4096,  # below threshold of 65536
+        "durable_file_count": 1,
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = compute_jobs.build_compute_result_logs(job)
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["measurable"] is True
+    assert criterion["met"] is False
+    assert criterion["value"] == pytest.approx(4096)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_compute_durable_file_count_criterion(
+    db_session, _quiet_compute_io
+):
+    """Backend-measured durable_file_count satisfies a declared >= criterion."""
+    task = await _make_compute_task_with_criterion(
+        db_session, "durable_file_count", ">=", 3
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.15
+    job.final_cost_usd = 0.15
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "durable_payload_bytes": 8192,
+        "durable_file_count": 5,  # above threshold of 3
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = compute_jobs.build_compute_result_logs(job)
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["measurable"] is True
+    assert criterion["met"] is True
+    assert criterion["value"] == pytest.approx(5)
+    assert criterion["metric"] == "durable_file_count"
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_link_terminal_artifact_stamps_durable_metrics(
+    db_session, _quiet_compute_io, mocker
+):
+    """_link_terminal_artifact stamps durable_file_count and durable_payload_bytes
+    into job.polling_metadata when a TerminalArtifactReference is found, and
+    build_compute_result_logs surfaces those values so the success criterion gate
+    can evaluate them.
+
+    This test drives the real producer (_link_terminal_artifact) rather than
+    manually inserting values into polling_metadata, so a regression where the
+    collector stops populating total_size_bytes or the stamping step is removed
+    will be caught here.
+    """
+    task = await _make_compute_task_with_criterion(
+        db_session, "durable_payload_bytes", ">=", 8192
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.18
+    job.final_cost_usd = 0.18
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # Mock collect_terminal_artifact_reference to return a realistic reference.
+    fake_ref = TerminalArtifactReference(
+        backend="gcp",
+        uri="gs://blueprint-agent-artifacts/compute-jobs/test-job/",
+        file_count=3,
+        total_size_bytes=20480,
+    )
+    mocker.patch(
+        "app.compute_jobs.collect_terminal_artifact_reference",
+        new=AsyncMock(return_value=fake_ref),
+    )
+
+    await compute_jobs._link_terminal_artifact(db_session, job)
+    await db_session.refresh(job)
+
+    # Verify _link_terminal_artifact stamped durable metrics.
+    meta = job.polling_metadata or {}
+    assert meta.get("durable_file_count") == 3, (
+        "_link_terminal_artifact must stamp durable_file_count from TerminalArtifactReference"
+    )
+    assert meta.get("durable_payload_bytes") == 20480, (
+        "_link_terminal_artifact must stamp durable_payload_bytes from TerminalArtifactReference"
+    )
+
+    # Verify build_compute_result_logs surfaces those values as top-level keys.
+    logs = compute_jobs.build_compute_result_logs(job)
+    result = json.loads(logs)
+    assert result.get("durable_file_count") == 3
+    assert result.get("durable_payload_bytes") == 20480
+
+    # Verify the criterion evaluates using the backend-stamped values.
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["measurable"] is True
+    assert criterion["met"] is True
+    assert criterion["value"] == pytest.approx(20480)
+
+
+@pytest.mark.asyncio
+async def test_command_cannot_spoof_durable_metrics_via_result_metrics(
+    db_session, _quiet_compute_io
+):
+    """A command-reported result_metrics entry named durable_payload_bytes or
+    durable_file_count must NEVER satisfy a durable-artifact success criterion,
+    even when the backend stamped no value (i.e. no artifact survived teardown).
+
+    Without unconditional blocking of these reserved names in the result_metrics
+    flattening loop, a job that produced no durable output could be made to appear
+    as if it had by including the reserved key in its BLUEPRINT_RESULT_FILE payload.
+    """
+    task = await _make_compute_task_with_criterion(
+        db_session, "durable_payload_bytes", ">=", 8192
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.10
+    job.final_cost_usd = 0.10
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    # No durable artifact was linked; command reports spoofed reserved keys.
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "durable_payload_bytes": 999999,
+            "durable_file_count": 100,
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = compute_jobs.build_compute_result_logs(job)
+    result = json.loads(logs)
+    # Reserved names must not appear even though no backend value was stamped.
+    assert "durable_payload_bytes" not in result, (
+        "command-reported durable_payload_bytes must be blocked unconditionally"
+    )
+    assert "durable_file_count" not in result, (
+        "command-reported durable_file_count must be blocked unconditionally"
+    )
+
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["met"] is False, (
+        "spoofed durable_payload_bytes via result_metrics must not satisfy the criterion"
+    )

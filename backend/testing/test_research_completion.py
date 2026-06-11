@@ -7288,15 +7288,23 @@ class TestParseAdversarialFindingVerdicts:
         assert result["abc123"]["explicit"] is True
         assert outcome == "ok"
 
-    def test_missing_hash_defaults_to_fail_closed(self):
+    def test_ordinal_fallback_binds_by_position_when_hash_mismatches(self):
+        """Ordinal binding: a verdict at position 0 binds to finding[0] even with a wrong hash."""
         logs = '[{"hash": "other", "verdict": "fail", "reason": "unrelated"}]'
         result, outcome = parse_adversarial_finding_verdicts(logs, ["abc123"])
-        # fail-closed: absent hash → passed=False, not an implicit pass
+        # Ordinal binding: position 0 verdict → finding[0] = abc123
         assert result["abc123"]["passed"] is False
-        assert result["abc123"]["explicit"] is False
-        # The array was parsed but no known hash matched
-        assert outcome == "no_hash_matches"
-        assert result["abc123"]["unresolved_reason"] == "no_hash_matches"
+        assert result["abc123"]["explicit"] is True
+        assert outcome == "ok"
+        # Fail-closed only for a finding whose position has no corresponding verdict
+        logs2 = '[{"hash": "other", "verdict": "fail", "reason": "for first"}]'
+        result2, outcome2 = parse_adversarial_finding_verdicts(logs2, ["abc123", "xyz789"])
+        assert result2["abc123"]["passed"] is False
+        assert result2["abc123"]["explicit"] is True  # bound by ordinal
+        assert result2["xyz789"]["passed"] is False
+        assert result2["xyz789"]["explicit"] is False  # no verdict at position 1
+        assert result2["xyz789"]["unresolved_reason"] == "no_hash_matches"
+        assert outcome2 == "ok"
 
     def test_not_completed_defaults_all_to_fail_closed(self):
         logs = '[{"hash": "abc123", "verdict": "fail", "reason": "fail"}]'
@@ -7445,6 +7453,127 @@ def test_adversarial_parser_uses_final_verdict_after_echoed_schema():
     assert result["h_live_123"]["reason"] == "confirmed at HEAD"
 
 
+def test_spawn_gate_verdict_binds_by_index_despite_hash_mismatch():
+    """Acceptance proof: ordinal binding succeeds despite a mis-transcribed hash.
+
+    A challenger that echoes the wrong hash but places its verdict at the
+    correct ordinal position (or echoes the correct 'index' field) must have
+    that verdict bound to its finding — not degraded to no_hash_matches or
+    fail-closed.  This is the exact failure mode the research-spawn gate
+    suffered on live runs: real verdicts dropped because the hash was
+    mis-transcribed by one character.
+    """
+    # The real finding hash (as the manifest would contain it).
+    real_hash = "a1b2c3d4e5f6g7h8"
+
+    # Challenger mis-transcribed the hash but placed the verdict at position 0
+    # (the correct ordinal) — binding should succeed via ordinal fallback.
+    logs_wrong_hash = (
+        '[{"index": 1, "hash": "a1b2c3d4e5f6g7XX", "verdict": "pass", '
+        '"reason": "premise confirmed at HEAD"}]'
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs_wrong_hash, [real_hash])
+    assert outcome == "ok", (
+        f"ordinal binding must succeed despite hash mismatch; got {outcome!r}"
+    )
+    assert result[real_hash]["passed"] is True
+    assert result[real_hash]["explicit"] is True
+    assert result[real_hash]["reason"] == "premise confirmed at HEAD"
+
+    # Same scenario without the explicit index field — pure array-position binding.
+    logs_position_only = (
+        '[{"hash": "totally-wrong-hash", "verdict": "fail", '
+        '"reason": "stale premise; code was refactored"}]'
+    )
+    result2, outcome2 = parse_adversarial_finding_verdicts(
+        logs_position_only, [real_hash]
+    )
+    assert outcome2 == "ok", (
+        f"array-position ordinal binding must succeed; got {outcome2!r}"
+    )
+    assert result2[real_hash]["passed"] is False
+    assert result2[real_hash]["explicit"] is True
+    assert result2[real_hash]["reason"] == "stale premise; code was refactored"
+
+
+def test_adversarial_ordinal_binding_multi_finding_partial():
+    """Ordinal binding for multi-finding manifests with partial hash mismatches.
+
+    When some hashes match exactly and others do not, the ones with wrong
+    hashes should bind by position (or explicit index) — not collapse to
+    no_hash_matches for those entries.
+    """
+    h1 = "correct_hash_1111"
+    h2 = "correct_hash_2222"
+    h3 = "correct_hash_3333"
+
+    # h1 echoed correctly; h2 and h3 mis-transcribed but in the right order.
+    logs = (
+        '['
+        '{"index": 1, "hash": "correct_hash_1111", "verdict": "pass", "reason": "solid"},'
+        '{"index": 2, "hash": "WRONG_HASH_2222", "verdict": "fail", "reason": "stale"},'
+        '{"index": 3, "hash": "WRONG_HASH_3333", "verdict": "pass", "reason": "ok"}'
+        ']'
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs, [h1, h2, h3])
+    assert outcome == "ok"
+    assert result[h1]["passed"] is True
+    assert result[h1]["explicit"] is True
+    assert result[h2]["passed"] is False
+    assert result[h2]["explicit"] is True   # bound by explicit index=2
+    assert result[h2]["reason"] == "stale"
+    assert result[h3]["passed"] is True
+    assert result[h3]["explicit"] is True   # bound by explicit index=3
+
+
+def test_adversarial_explicit_index_overrides_array_position():
+    """An explicit 'index' field takes priority over array position as binding key.
+
+    If the challenger re-orders its output but still echoes the correct 1-based
+    index for each finding, the verdicts should bind to the correct findings.
+    """
+    h1 = "hash_for_finding_1"
+    h2 = "hash_for_finding_2"
+
+    # Output is in reverse order, but index fields point to the correct findings.
+    logs = (
+        '['
+        '{"index": 2, "hash": "wrong", "verdict": "fail", "reason": "stale"},'
+        '{"index": 1, "hash": "wrong", "verdict": "pass", "reason": "confirmed"}'
+        ']'
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs, [h1, h2])
+    assert outcome == "ok"
+    # index=1 → h1, index=2 → h2
+    assert result[h1]["passed"] is True
+    assert result[h1]["explicit"] is True
+    assert result[h2]["passed"] is False
+    assert result[h2]["explicit"] is True
+
+
+def test_adversarial_ordinal_does_not_double_bind():
+    """A finding that was matched by exact hash is never also bound by ordinal."""
+    h1 = "real_hash_abc"
+    h2 = "real_hash_xyz"
+
+    # h1 echoed correctly; h2's position in the array is also 0 after h1 is removed,
+    # but since h1 was hash-matched, ordinal position 0 should not rebind to h1 via h2.
+    logs = (
+        '['
+        '{"hash": "real_hash_abc", "verdict": "pass", "reason": "good"},'
+        '{"hash": "WRONG", "verdict": "fail", "reason": "bad"}'
+        ']'
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs, [h1, h2])
+    assert outcome == "ok"
+    # h1 bound by exact hash (position 0 is claimed)
+    assert result[h1]["passed"] is True
+    assert result[h1]["explicit"] is True
+    # h2 bound by ordinal at position 1 (hash mismatch → falls to array position)
+    assert result[h2]["passed"] is False
+    assert result[h2]["explicit"] is True
+
+
 def test_adversarial_gate_unresolved_reason_distinguishes_parse_failure_modes():
     """Each parse failure mode produces a distinct per-finding unresolved_reason.
 
@@ -7475,12 +7604,16 @@ def test_adversarial_gate_unresolved_reason_distinguishes_parse_failure_modes():
     assert outcome == "no_json_array"
     assert all(r["unresolved_reason"] == "no_json_array" for r in result.values())
 
-    # 4. JSON array with no known hashes → no_hash_matches
+    # 4. JSON array with no known hashes, but ordinal binding binds position 0 to h1.
+    # h1 gets a fail verdict via ordinal; h2 has no verdict at position 1 → unresolved.
     result, outcome = parse_adversarial_finding_verdicts(
         '[{"hash": "unknown-hash", "verdict": "fail", "reason": "x"}]', hashes
     )
-    assert outcome == "no_hash_matches"
-    assert all(r["unresolved_reason"] == "no_hash_matches" for r in result.values())
+    assert outcome == "ok"  # h1 was bound by ordinal at position 0
+    assert result["h1"]["passed"] is False
+    assert result["h1"]["explicit"] is True  # bound by ordinal fallback
+    assert result["h2"]["unresolved_reason"] == "no_hash_matches"  # no verdict at position 1
+    assert result["h2"]["explicit"] is False
 
     # 5. Happy path: both hashes receive explicit verdicts → ok, no unresolved_reason
     logs = (
