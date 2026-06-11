@@ -178,25 +178,28 @@ export function normalizeChallengeOutput(
     const verdictRaw = strVal(obj.verdict).trim().toLowerCase();
     if (!(CHALLENGE_VERDICTS as readonly string[]).includes(verdictRaw)) continue;
     let verdict = verdictRaw as ChallengeVerdict;
-    const severity = strVal(obj.severity).trim().toLowerCase() || 'unknown';
+    let severity = strVal(obj.severity).trim().toLowerCase() || 'unknown';
     const primaryFindingIndexRaw = obj.primary_finding_index;
     const primaryFindingIndex = (
       typeof primaryFindingIndexRaw === 'number' &&
       Number.isInteger(primaryFindingIndexRaw) &&
       primaryFindingIndexRaw > 0
     ) ? primaryFindingIndexRaw : undefined;
-    // When primary findings are supplied and the index resolves to a valid entry,
-    // overwrite the summary verbatim — model paraphrase must never reach the artifact.
+    let resolvedPrimaryFindingIndex: number | undefined;
+    let file = strVal(obj.file || obj.file_path).trim();
     let summary = strVal(obj.summary || obj.description || obj.title).trim();
     if (
       primaryFindingIndex !== undefined &&
       primaryFindings !== undefined &&
       primaryFindingIndex <= primaryFindings.length
     ) {
-      summary = primaryFindings[primaryFindingIndex - 1].summary;
+      const primaryFinding = primaryFindings[primaryFindingIndex - 1];
+      resolvedPrimaryFindingIndex = primaryFindingIndex;
+      severity = primaryFinding.severity;
+      summary = primaryFinding.summary;
+      file = primaryFinding.file;
     }
     if (!summary) continue;
-    const file = strVal(obj.file || obj.file_path).trim();
     const reason = strVal(obj.reason || obj.verification_note).trim();
     if (
       (verdict === 'confirmed' || verdict === 'refuted_false_positive') &&
@@ -205,7 +208,7 @@ export function normalizeChallengeOutput(
       verdict = 'uncertain';
     }
     const entry: ChallengeVerdictEntry = { severity, summary, file, verdict, reason };
-    if (primaryFindingIndex !== undefined) entry.primary_finding_index = primaryFindingIndex;
+    if (resolvedPrimaryFindingIndex !== undefined) entry.primary_finding_index = resolvedPrimaryFindingIndex;
     out.verdicts.push(entry);
   }
   return out;
@@ -232,7 +235,8 @@ function formatPrimaryFindingsSection(findings: PrimaryFinding[]): string {
     'IMPORTANT — index and verbatim summary requirement: for each verdict, set ' +
     '`primary_finding_index` to the 1-based number from this list (1 for the first ' +
     'finding, 2 for the second, etc.), and copy that finding\'s `summary` text EXACTLY ' +
-    'into the `summary` field — verbatim: same words, punctuation, and capitalization; do not paraphrase. ' +
+    'into the `summary` field and its listed severity EXACTLY into the `severity` field — ' +
+    'verbatim: same words, punctuation, capitalization, and severity label; do not paraphrase. ' +
     'The backend uses `primary_finding_index` first, then falls back to exact string ' +
     'matching on `summary` to bind verdicts to findings; its `summary` must be copied EXACTLY from that list. ' +
     'Do not paraphrase the `summary` on a primary-findings retry — paraphrasing breaks ' +
@@ -427,9 +431,9 @@ Rules:
     logs = sanitize(JSON.stringify(normalizeChallengeOutput(handlerOutput, candidateSha, primaryFindings)));
   } else {
     const reopenPrompt = primaryFindings.length > 0
-      ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nReturn ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index" and copy the listed primary finding summary exactly into "summary". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`
+      ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nReturn ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`
       : `Your prior release audit challenge response did not end with a parseable JSON verdict object.
-Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index" and copy the listed primary finding summary exactly into "summary". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`;
+Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`;
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['challenged_candidate_sha', 'verdicts'],

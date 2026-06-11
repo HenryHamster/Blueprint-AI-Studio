@@ -1208,6 +1208,16 @@ def _finding_summary_tokens(text: str) -> frozenset[str]:
     return frozenset(tok for tok in re.findall(r"[a-z0-9]+", text.lower()) if len(tok) >= 3)
 
 
+def _finding_summary_for_binding(finding: dict) -> str:
+    return str(
+        finding.get("summary")
+        or finding.get("description")
+        or finding.get("title")
+        or finding.get("text")
+        or ""
+    ).strip()[:_FINDING_SUMMARY_MAX]
+
+
 def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | None:
     """Score a candidate verdict against an audit finding, or None if no match.
 
@@ -1234,13 +1244,7 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
     """
     if not isinstance(verdict_entry, dict):
         return None
-    f_summary = str(
-        finding.get("summary")
-        or finding.get("description")
-        or finding.get("title")
-        or finding.get("text")
-        or ""
-    ).strip()
+    f_summary = _finding_summary_for_binding(finding)
     f_file = str(finding.get("file") or finding.get("file_path") or "").strip()
     cv_summary = str(verdict_entry.get("summary") or "").strip()
     cv_file = str(verdict_entry.get("file") or "").strip()
@@ -1295,6 +1299,14 @@ def _primary_finding_index_for_verdict(verdict_entry: dict) -> int | None:
     return raw if raw > 0 else None
 
 
+def _primary_finding_index_resolves(
+    verdict_entry: dict,
+    primary_order_fis: list[int],
+) -> bool:
+    index = _primary_finding_index_for_verdict(verdict_entry)
+    return index is not None and index <= len(primary_order_fis)
+
+
 def _indexed_verdict_can_bind(finding: dict, verdict_entry: dict) -> bool:
     """Validate non-text safety checks for an index-bound challenge verdict."""
     if not isinstance(verdict_entry, dict):
@@ -1334,6 +1346,8 @@ def _reconcile_audit_with_challenge(
         if not _finding_is_verified(f, sev):
             continue
         if _finding_subject_is_authorized_divergence(f):
+            continue
+        if not _finding_summary_for_binding(f):
             continue
         deductible.append((idx, f))
 
@@ -1412,13 +1426,7 @@ def _reconcile_audit_with_challenge(
         [
             fi
             for fi, (_, f) in enumerate(deductible)
-            if str(
-                f.get("summary")
-                or f.get("description")
-                or f.get("title")
-                or f.get("text")
-                or ""
-            ).strip()
+            if _finding_summary_for_binding(f)
         ],
         key=lambda fi: _SEVERITY_RANK.get(
             str(
@@ -1458,7 +1466,7 @@ def _reconcile_audit_with_challenge(
         f_sev = str(f.get("severity") or f.get("level") or "").lower()
         pairs: list[tuple[float, int]] = []
         for vi, cv in enumerate(available_verdicts):
-            if vi in match_vi or _primary_finding_index_for_verdict(cv) is not None:
+            if vi in match_vi or _primary_finding_index_resolves(cv, primary_order_fis):
                 continue
             s = _score_finding_to_challenge(f, cv)
             if s is not None:
@@ -1505,7 +1513,7 @@ def _reconcile_audit_with_challenge(
         cv = available_verdicts[vi]
         if str(cv.get("verdict") or "").lower().strip() != "refuted_false_positive":
             continue
-        if _primary_finding_index_for_verdict(cv) is not None:
+        if _primary_finding_index_resolves(cv, primary_order_fis):
             continue
         _, f = deductible[fi]
         bound_score = _score_finding_to_challenge(f, cv) or 0.0
@@ -1528,13 +1536,7 @@ def _reconcile_audit_with_challenge(
                 return "audit_challenge_uncertain", None, [], []
             remove_idxs.add(idx)
             sev = str(f.get("severity") or f.get("level") or "").lower()
-            summary = str(
-                f.get("summary")
-                or f.get("description")
-                or f.get("title")
-                or f.get("text")
-                or ""
-            ).strip()[:_FINDING_SUMMARY_MAX]
+            summary = _finding_summary_for_binding(f)
             challenger_refuted.append(
                 {
                     "severity": sev,
@@ -1550,13 +1552,7 @@ def _reconcile_audit_with_challenge(
         if len(binding_record) < _BINDING_RECORD_CAP:
             binding_record.append(
                 {
-                    "finding_summary": str(
-                        f.get("summary")
-                        or f.get("description")
-                        or f.get("title")
-                        or f.get("text")
-                        or ""
-                    ).strip()[:_FINDING_SUMMARY_MAX],
+                    "finding_summary": _finding_summary_for_binding(f),
                     "finding_severity": str(
                         f.get("severity") or f.get("level") or ""
                     ).lower(),

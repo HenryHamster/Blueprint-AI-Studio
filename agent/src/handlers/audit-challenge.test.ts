@@ -181,7 +181,7 @@ describe('normalizeChallengeOutput — stable RELEASE_AUDIT_CHALLENGE contract',
     expect(out.verdicts[0].reason).toBe(reason);
   });
 
-  it('preserves a positive integer primary_finding_index when supplied', () => {
+  it('drops primary_finding_index when no primaryFindings array is passed', () => {
     const out = normalizeChallengeOutput(
       {
         verdicts: [
@@ -205,7 +205,7 @@ describe('normalizeChallengeOutput — stable RELEASE_AUDIT_CHALLENGE contract',
       },
       CANDIDATE_SHA,
     );
-    expect(out.verdicts[0]).toMatchObject({ primary_finding_index: 2 });
+    expect(out.verdicts[0]).not.toHaveProperty('primary_finding_index');
     expect(out.verdicts[1]).not.toHaveProperty('primary_finding_index');
   });
 
@@ -266,7 +266,34 @@ describe('normalizeChallengeOutput — stable RELEASE_AUDIT_CHALLENGE contract',
     expect(out.verdicts[1].summary).toBe('SQL injection via user_id parameter.');
   });
 
-  it('leaves summary untouched when primary_finding_index is out of bounds', () => {
+  it('copies bound primary severity, summary, and file over model drift', () => {
+    const primary = { severity: 'high', summary: 'Unsafe retry binding in audit gate.', file: 'app/audit.py' };
+    const out = normalizeChallengeOutput(
+      {
+        verdicts: [
+          {
+            primary_finding_index: 1,
+            severity: 'low',
+            summary: 'retry issue',
+            file: 'wrong.py',
+            verdict: 'refuted_false_positive',
+            reason: 'Read app/audit.py:42 and confirmed the retry binding is a false positive.',
+          },
+        ],
+      },
+      CANDIDATE_SHA,
+      [primary],
+    );
+
+    expect(out.verdicts[0]).toMatchObject({
+      primary_finding_index: 1,
+      severity: primary.severity,
+      summary: primary.summary,
+      file: primary.file,
+    });
+  });
+
+  it('drops out-of-bounds primary_finding_index while leaving text available for backend matching', () => {
     const primaryFindings = [
       { severity: 'high', summary: 'Exact primary summary text.', file: 'app/x.py' },
     ];
@@ -287,27 +314,7 @@ describe('normalizeChallengeOutput — stable RELEASE_AUDIT_CHALLENGE contract',
       primaryFindings,
     );
     expect(out.verdicts[0].summary).toBe('independently derived summary');
-  });
-
-  it('leaves summary untouched when no primaryFindings array is passed (no regression)', () => {
-    const out = normalizeChallengeOutput(
-      {
-        verdicts: [
-          {
-            primary_finding_index: 2,
-            severity: 'high',
-            summary: 'unsafe retry binding',
-            file: 'app/x.py',
-            verdict: 'confirmed',
-            reason: 'Read app/x.py:42 and confirmed this retry binding issue is real.',
-          },
-        ],
-      },
-      CANDIDATE_SHA,
-      // no primaryFindings argument
-    );
-    expect(out.verdicts[0].summary).toBe('unsafe retry binding');
-    expect(out.verdicts[0].primary_finding_index).toBe(2);
+    expect(out.verdicts[0]).not.toHaveProperty('primary_finding_index');
   });
 
   it('returns an empty contract for non-object / missing-verdicts input', () => {
@@ -413,7 +420,8 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
     const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('`primary_finding_index` to the 1-based number from this list');
     expect(prompt).toContain('copy that finding\'s `summary` text EXACTLY');
-    expect(prompt).toContain('verbatim: same words, punctuation, and capitalization; do not paraphrase');
+    expect(prompt).toContain('its listed severity EXACTLY into the `severity` field');
+    expect(prompt).toContain('verbatim: same words, punctuation, capitalization, and severity label; do not paraphrase');
     expect(prompt).toContain('its `summary` must be copied EXACTLY from that list');
     expect(prompt).toContain('Do not paraphrase the `summary` on a primary-findings retry');
     expect(prompt).toContain('1. [high] Unsafe deserialization in upload handler. (file: app/upload.py)');

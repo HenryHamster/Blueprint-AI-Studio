@@ -2083,23 +2083,16 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         assert binding[0]["finding_summary"] == findings[0]["summary"]
 
     def test_empty_summary_finding_excluded_from_index_domain(self):
-        """Findings with empty summaries must be excluded from the indexed list.
-
-        _primary_findings_for_challenge_retry skips findings with no summary
-        before numbering them for the agent.  primary_order_fis must apply the
-        same filter so index 1 maps to the same finding the agent saw as #1.
-        """
-        # a has no summary — excluded from the agent's numbered list
+        """Empty-summary findings are excluded from the indexed and must-bind domains."""
         a = {
             "severity": "high",
             "summary": "",
             "file": "a.py",
             "verification_note": "confirmed via full repo scan with supporting evidence",
         }
-        # b has a summary — the agent sees it as index 1
         b = _make_verified_finding("Security critical authentication bypass")
         b["file"] = "b.py"
-        report = {"findings": [a, b]}  # a first, so without the fix index 1 → a (wrong)
+        report = {"findings": [a, b]}
 
         envelope = _make_challenge_envelope(
             self.SHA,
@@ -2111,11 +2104,6 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
                     "summary": "Security critical authentication bypass",
                     "reason": "thorough code review confirmed no authentication bypass",
                 },
-                {
-                    # No primary_finding_index; exact-match on empty summary for a.
-                    "verdict": "confirmed",
-                    "summary": "",
-                },
             ],
         )
 
@@ -2123,8 +2111,6 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
             report, envelope, self.SHA
         )
 
-        # With the fix: index 1 maps to b (a is excluded); b is refuted.
-        # Without the fix: index 1 maps to a; b has no matchable verdict → hold.
         assert hold is None
         assert len(refuted) == 1
         assert refuted[0]["summary"] == "Security critical authentication bypass"
@@ -2165,7 +2151,8 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
 
     def test_indexed_refuted_equal_severity_allowed(self):
         """An indexed refuted_false_positive with equal severity is accepted and
-        removes the finding from scoring (the allow branch of _indexed_verdict_can_bind).
+        removes the finding from scoring; this is the backend side of agent
+        canonicalization to the bound finding's severity.
         """
         finding = _make_verified_finding("SQL injection in query builder module")
         report = {"findings": [finding]}
@@ -2224,6 +2211,72 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         # Index-based binding bypasses summary matching; finding is removed.
         assert hold is None
         assert len(refuted) == 1
+
+    @pytest.mark.parametrize(
+        ("finding_summary", "verdict_summary"),
+        [
+            (
+                "Out of range index still has exact text",
+                "Out of range index still has exact text",
+            ),
+            (
+                "Release audit challenge binding retries lose primary verdict identity",
+                "challenge binding retry loses primary verdict identity",
+            ),
+        ],
+    )
+    def test_out_of_range_index_falls_back_to_content_matching(
+        self, finding_summary, verdict_summary
+    ):
+        finding = _make_verified_finding(finding_summary)
+        report = {"findings": [finding]}
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 99,
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": verdict_summary,
+                },
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is report
+        assert refuted == []
+        assert binding[0]["verdict_summary"] == verdict_summary
+
+    def test_truncated_primary_summary_exact_match_binds(self):
+        long_summary = "A" * (rq._FINDING_SUMMARY_MAX + 40)
+        finding = _make_verified_finding(long_summary)
+        report = {"findings": [finding]}
+        shown_to_agent = long_summary[: rq._FINDING_SUMMARY_MAX]
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": shown_to_agent,
+                },
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is report
+        assert refuted == []
+        assert binding[0]["finding_summary"] == shown_to_agent
 
     def test_refuted_verdict_consumed_second_finding_held(self):
         """One refuted verdict + one confirmed verdict match one finding each."""
