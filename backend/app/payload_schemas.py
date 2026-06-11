@@ -412,6 +412,8 @@ class StrategicReviewPayload(_SystemPopulated):
     conversation_thread: list[dict[str, Any]] | None = None
     project_name: str | None = None
     research_mode: str | None = None
+    is_self_repo: bool | None = None
+    enable_self_improvement: bool | None = None
     # Optional, agent-emitted prioritization mode hint. Allowed canonical
     # values: 'audit' | 'fundamentals' | 'ship' | 'pause'. Validated softly:
     # the field is just a string so unknown values still parse, but
@@ -702,6 +704,10 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # that finishes but misses its declared goal fails the gate honestly);
     # when absent, the gate preserves presence-based behavior.
     success_criterion: ComputeSuccessCriterion | None = None
+    # Optional strict-delivery gate. When True, completion FAILS unless the job
+    # links a COMPUTE_RESULT artifact whose storage URI is durable-class (gs://,
+    # s3://, az://, file:). Absent/False preserves existing fail-soft behavior.
+    require_durable_artifact: bool | None = None
 
 
 class WebResearchPayload(BasePayload):
@@ -740,6 +746,36 @@ class DesignPayload(BasePayload):
     project_name: str | None = None
 
 
+class RepoBootstrapPayload(BasePayload):
+    """Payload for a one-time repo bootstrap task.
+
+    Auto-spawned at project onboarding time for non-self-repo, non-empty
+    projects. The agent reads repository structure, confirms build/test
+    commands (writing them back via PATCH /api/agent/projects/{id}/build-config/commands),
+    and seeds design doc sections before implementation tasks fan out.
+    """
+
+    type: Literal["repo_bootstrap"] = "repo_bootstrap"
+    github_owner: str = ""
+    github_repo: str = ""
+    integration_branch: str = ""
+    is_first_bootstrap: bool = True
+
+
+class RepoBootstrapOverview(BaseModel):
+    """Structured repo-overview payload returned by repo_bootstrap completions."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    tech_stack: str
+    directory_layout: str
+    first_steps_summary: str
+    entry_points: str | None = None
+    test_layout: str | None = None
+    key_conventions: str | None = None
+    environment_requirements: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -771,6 +807,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.compute_experiment: ComputeExperimentPayload,
     TaskType.web_research: WebResearchPayload,
     TaskType.design: DesignPayload,
+    TaskType.repo_bootstrap: RepoBootstrapPayload,
 }
 
 

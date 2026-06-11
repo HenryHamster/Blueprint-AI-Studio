@@ -225,6 +225,7 @@ async def test_guard_no_child_tasks(db_session: AsyncSession):
         "research_spawn_gate_explicit_pass_count": 1,
         "research_spawn_gate_fail_open_count": 0,
         "research_spawn_gate_unresolved_count": 1,
+        "research_spawn_gate_wholesale_retry_exhausted": True,
         "research_spawn_gate_refuted_reasons": ["fail-closed: no verdict"],
     }
     project.directions = [_make_direction(direction_id, research_task_id)]
@@ -245,6 +246,7 @@ async def test_guard_no_child_tasks(db_session: AsyncSession):
     assert entry["research_spawn_gate_explicit_pass_count"] == 1
     assert entry["research_spawn_gate_fail_open_count"] == 0
     assert entry["research_spawn_gate_unresolved_count"] == 1
+    assert entry["research_spawn_gate_wholesale_retry_exhausted"] is True
     assert entry["research_spawn_gate_refuted_reasons"] == [
         "fail-closed: no verdict"
     ]
@@ -2924,6 +2926,141 @@ async def test_update_outcomes_writes_cost_by_provider_model(db_session: AsyncSe
     assert abs(sum(by_pm.values()) - entry["estimated_cost_usd"]) < 1e-3
 
 
+@pytest.mark.asyncio
+async def test_update_outcomes_cost_provider_switch_retry_no_chimera(
+    db_session: AsyncSession,
+):
+    """Banked retry attempts must contribute to cost under their OWN recorded
+    (provider, model) pair, not a chimera mix of attempt-1 provider + attempt-2
+    model or vice versa. Specifically:
+
+    (a) No cross-provider chimera bucket (providerA|modelB or providerB|modelA).
+    (b) Each attempt's cost lands under its own recorded pair.
+    (c) The banked earlier-attempt cost is NOT lost from the rollup.
+    (d) The breakdown bucket sum equals estimated_cost_usd.
+    (e) An unresolvable half degrades to unknown|unknown wholesale.
+    """
+    direction_id = "d-chimera-test"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    now = _utcnow()
+
+    # Task that retried: attempt 1 on anthropic/claude-opus-4-7, attempt 2 on
+    # openai/gpt-5.4. Both attempts are banked via attempt_history snapshots
+    # (banking clears vm_provisioned_at/vm_stopped_at).
+    attempt1_cost = 0.012
+    attempt2_cost = 0.007
+    retried_task = Task(
+        project_id=project.id,
+        parent_task_id=research_task.id,
+        title="retried",
+        payloads=[{"type": "create", "scope": "small"}],
+        context={},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        provider="openai",
+        model="gpt-5.4",
+        # No live span (both attempts banked)
+        vm_provisioned_at=None,
+        vm_stopped_at=None,
+        vm_spot=False,
+    )
+    retried_task.attempt_history = [
+        {
+            "vm_provisioned_at": (now - timedelta(hours=2)).isoformat(),
+            "vm_stopped_at": (now - timedelta(hours=1)).isoformat(),
+            "vm_spot": False,
+            "vm_machine_type": "e2-standard-2",
+            "provider": "anthropic",
+            "model": "claude-opus-4-7",
+            "vm_runtime_cost_usd": attempt1_cost,
+            "llm_input_tokens": 0,
+            "llm_output_tokens": 0,
+            "llm_call_count": 0,
+        },
+        {
+            "vm_provisioned_at": (now - timedelta(minutes=60)).isoformat(),
+            "vm_stopped_at": (now - timedelta(minutes=30)).isoformat(),
+            "vm_spot": False,
+            "vm_machine_type": "e2-standard-2",
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "vm_runtime_cost_usd": attempt2_cost,
+            "llm_input_tokens": 0,
+            "llm_output_tokens": 0,
+            "llm_call_count": 0,
+        },
+    ]
+
+    # Task with only provider set (no model) — must degrade to unknown|unknown
+    partial_task = Task(
+        project_id=project.id,
+        parent_task_id=research_task.id,
+        title="partial",
+        payloads=[{"type": "create", "scope": "small"}],
+        context={},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        provider="anthropic",
+        model=None,
+    )
+    partial_cost = 0.005
+    partial_task.attempt_history = [
+        {
+            "vm_provisioned_at": (now - timedelta(minutes=20)).isoformat(),
+            "vm_stopped_at": (now - timedelta(minutes=10)).isoformat(),
+            "vm_spot": True,
+            "vm_machine_type": "e2-standard-2",
+            "provider": "anthropic",
+            "model": None,
+            "vm_runtime_cost_usd": partial_cost,
+            "llm_input_tokens": 0,
+            "llm_output_tokens": 0,
+            "llm_call_count": 0,
+        },
+    ]
+
+    db_session.add_all([retried_task, partial_task])
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    entry = project.directions[0]["research_history"][0]
+    by_pm = entry.get("cost_by_provider_model")
+    assert isinstance(by_pm, dict) and by_pm, "cost_by_provider_model must be populated"
+
+    # (a) No cross-provider chimera keys
+    assert "anthropic|gpt-5.4" not in by_pm, "chimera key anthropic|gpt-5.4 must not appear"
+    assert "openai|claude-opus-4-7" not in by_pm, "chimera key openai|claude-opus-4-7 must not appear"
+
+    # (b) Each attempt's own pair present
+    assert "anthropic|claude-opus-4-7" in by_pm, "attempt-1 pair must appear"
+    assert "openai|gpt-5.4" in by_pm, "attempt-2 pair must appear"
+
+    # (c) Banked earlier-attempt cost not lost
+    assert by_pm["anthropic|claude-opus-4-7"] == pytest.approx(attempt1_cost, abs=1e-4)
+    assert by_pm["openai|gpt-5.4"] == pytest.approx(attempt2_cost, abs=1e-4)
+
+    # (e) Unresolvable half degrades to unknown|unknown
+    assert "unknown|unknown" in by_pm, "partial provider/model must degrade to unknown|unknown"
+    assert "anthropic|unknown" not in by_pm, "half-resolved key must not appear"
+
+    # (d) Bucket sum == estimated_cost_usd
+    assert abs(sum(by_pm.values()) - entry["estimated_cost_usd"]) < 1e-3
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. Cascade-cancellation exclusion from failure metrics
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5338,11 +5475,17 @@ async def test_per_direction_format_metrics_have_a_consumer_or_are_retired(
     # Verify manifest entries have been promoted from pending to consumer.
     fc_entry = RESEARCH_HISTORY_METRIC_MANIFEST["format_compliance_rate"]
     sr_entry = RESEARCH_HISTORY_METRIC_MANIFEST["self_repair_success_rate"]
+    sg_entry = RESEARCH_HISTORY_METRIC_MANIFEST[
+        "research_spawn_gate_wholesale_retry_exhausted"
+    ]
     assert "consumer" in fc_entry, (
         "format_compliance_rate must have a named consumer in RESEARCH_HISTORY_METRIC_MANIFEST"
     )
     assert "consumer" in sr_entry, (
         "self_repair_success_rate must have a named consumer in RESEARCH_HISTORY_METRIC_MANIFEST"
+    )
+    assert "consumer" in sg_entry, (
+        "research_spawn_gate_wholesale_retry_exhausted must have a named consumer in RESEARCH_HISTORY_METRIC_MANIFEST"
     )
 
     # Functional check: verify the fields are correctly computed and stored.
@@ -5498,9 +5641,18 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
         "research_spawn_gate_explicit_pass_count": 1,
         "research_spawn_gate_fail_open_count": 1,
         "research_spawn_gate_unresolved_count": 1,
+        "research_spawn_gate_parse_outcome": "no_hash_matches",
+        "research_spawn_gate_manifest_excluded_fail_closed_count": 1,
+        "research_spawn_gate_manifest_excluded_fail_closed_samples": [
+            {
+                "hash": "excluded-hash",
+                "title": "Budget-excluded finding",
+                "reason": "fail-closed: high-stakes finding was not admitted to the adversarial manifest",
+            }
+        ],
         "research_spawn_gate_refuted_reasons": [
             "stale premise",
-            "fail-closed: no verdict returned for this finding",
+            "no_hash_matches",
             # Duplicate is deduped by the producer; assert resilience anyway.
             "stale premise",
         ],
@@ -5554,6 +5706,15 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
     assert entry["research_spawn_gate_explicit_pass_count"] == 1
     assert entry["research_spawn_gate_fail_open_count"] == 1
     assert entry["research_spawn_gate_unresolved_count"] == 1
+    assert entry["research_spawn_gate_parse_outcome"] == "no_hash_matches"
+    assert entry["research_spawn_gate_manifest_excluded_fail_closed_count"] == 1
+    assert entry["research_spawn_gate_manifest_excluded_fail_closed_samples"] == [
+        {
+            "hash": "excluded-hash",
+            "title": "Budget-excluded finding",
+            "reason": "fail-closed: high-stakes finding was not admitted to the adversarial manifest",
+        }
+    ]
     # Denominators / sample sizes preserved (merge rates travel with them).
     assert entry["research_spawn_gate_challenged_spawned"] == 1
     assert entry["research_spawn_gate_challenged_merged"] == 1
@@ -5564,6 +5725,97 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
     # Compact reasons sample rolled up, deduped, and capped.
     reasons = entry["research_spawn_gate_refuted_reasons"]
     assert "stale premise" in reasons
-    assert any("fail-closed" in r for r in reasons)
+    assert "no_hash_matches" in reasons
     assert len(reasons) == len(set(reasons)), "reasons sample must be deduped"
     assert len(reasons) <= 5
+
+
+@pytest.mark.asyncio
+async def test_adversarial_give_up_count_rolls_up_to_spawn_gate_metrics(
+    db_session: AsyncSession,
+):
+    """Adversarial give-up events from finding_structural_give_up roll into history.
+
+    When a research task's context carries a finding_structural_give_up dict with
+    by_reason.adversarial_gate > 0, the count must appear in the research_history
+    entry as research_spawn_gate_adversarial_give_up_count and the adversarial-gate
+    filtered sample must appear as research_spawn_gate_adversarial_give_up_samples.
+    Non-adversarial-gate samples must NOT be included in the samples list.
+    """
+    direction_id = "d-adversarial-give-up"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_challenged_count": 0,
+        "research_spawn_gate_refuted_count": 0,
+        "research_spawn_gate_survived_count": 0,
+        "research_spawn_gate_explicit_pass_count": 0,
+        "research_spawn_gate_fail_open_count": 0,
+        "research_spawn_gate_unresolved_count": 0,
+        "finding_structural_give_up": {
+            "at": "2026-06-10T00:00:00",
+            "total": 3,
+            "by_reason": {
+                "adversarial_gate": 2,
+                "manifest_excluded": 1,
+            },
+            "by_direction": {direction_id: 3},
+            "sample": [
+                {
+                    "title": "Adversarial-killed finding A",
+                    "reason": "adversarial_gate",
+                    "direction_id": direction_id,
+                },
+                {
+                    "title": "Adversarial-killed finding B",
+                    "reason": "adversarial_gate",
+                    "direction_id": direction_id,
+                },
+                {
+                    "title": "Manifest-excluded finding C",
+                    "reason": "manifest_excluded",
+                    "direction_id": direction_id,
+                },
+            ],
+        },
+    }
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="surviving-task",
+        context={"direction_id": direction_id},
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Adversarial give-up count reflects only the adversarial_gate bucket.
+    assert entry["research_spawn_gate_adversarial_give_up_count"] == 2
+
+    # Samples contain only adversarial-gate entries (manifest_excluded is filtered out).
+    samples = entry.get("research_spawn_gate_adversarial_give_up_samples", [])
+    assert len(samples) == 2
+    titles = [s["title"] for s in samples]
+    assert "Adversarial-killed finding A" in titles
+    assert "Adversarial-killed finding B" in titles
+    assert "Manifest-excluded finding C" not in titles
+
+    # Give-up count is a separate bucket — legacy refuted/survived counters unchanged.
+    assert entry["research_spawn_gate_refuted_count"] == 0
+    assert entry["research_spawn_gate_survived_count"] == 0

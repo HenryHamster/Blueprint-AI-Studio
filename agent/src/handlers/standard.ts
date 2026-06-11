@@ -13,7 +13,7 @@ import {
   buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   getTaskTypeFocusBlock,
   assembleFailureGuidanceBlocks,
-  readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
+  readClaudeMd, buildContextPrefix, buildFileTree, buildRepoMap, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, extractModuleInterfaces,
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
@@ -142,6 +142,11 @@ export interface StandardHandlerOpts {
   issueReference?: string;
   relatedFiles?: string[];
   runMigrationCheck?: boolean;
+  promptSectionFlags?: {
+    hadModuleInterfaces?: boolean;
+    hadRelatedTests?: boolean;
+    hadAffectedConsumers?: boolean;
+  };
 }
 
 /**
@@ -212,6 +217,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     captureBaseline = false,
     runSmallScopeAnalysis = false,
     includeTaskTypeHints = true,
+    promptSectionFlags,
   } = opts;
   // commitPrefix, prTitlePrefix, runLintFix, runSelfReview, lintContext,
   // issueReference, relatedFiles, runMigrationCheck are no longer
@@ -386,6 +392,33 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   }
 
   const fileTree = buildFileTree(ws);
+  let repoMap = buildRepoMap(ws);
+
+  // ── Deterministic repo-map holdback arm ──────────────────────────────────
+  // A fraction of tasks (configurable via runtime_config.repo_map_holdback_fraction,
+  // injected into project_metadata at claim time) are assigned to the "without repo
+  // map" arm. The assignment is computed from a stable djb2 hash of the task ID,
+  // independent of whether buildRepoMap returns content. This ensures intent-to-treat
+  // analysis can use the assignment signal rather than the receipt boolean.
+  // repoMapArm=true → treatment (map injected); false → holdback; null → no trial.
+  const projectMetaForHoldback = task.project_metadata as Record<string, unknown> | undefined;
+  const holdbackFraction = typeof projectMetaForHoldback?.repo_map_holdback_fraction === 'number'
+    ? projectMetaForHoldback.repo_map_holdback_fraction
+    : 0.0;
+  let repoMapArm: boolean | null = null;
+  if (holdbackFraction > 0) {
+    // djb2 hash of the taskId string → stable float in [0, 1)
+    let h = 5381;
+    for (let i = 0; i < taskId.length; i++) {
+      h = ((h << 5) + h + taskId.charCodeAt(i)) >>> 0;
+    }
+    const taskHash = h / 0xffffffff;
+    repoMapArm = taskHash >= holdbackFraction; // true = treatment, false = holdback
+    if (!repoMapArm) {
+      sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (hash=${taskHash.toFixed(4)}, fraction=${holdbackFraction}) — suppressing repo map\n`);
+      repoMap = '';
+    }
+  }
 
   // ── Phase 1: Pre-implementation analysis (medium-scope tasks only) ──────────
   // Runs a read-only pass to map module interfaces and dependencies before coding.
@@ -588,7 +621,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedUrls.size} signed URL(s).\n`);
   }
 
-  const finalPromptWithTree = fileTree + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection + finalPrompt;
+  const finalPromptWithTree = fileTree + repoMap + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection + finalPrompt;
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
   });
@@ -597,7 +630,18 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before Claude starts so short code-change tasks persist the
   // fingerprint even if they finish before the next periodic heartbeat.
-  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
+  // Send both the arm assignment (intent-to-treat) and receipt (compliance).
+  const _heartbeatOpts: Record<string, unknown> = {
+    prompt_fingerprint: promptFingerprint,
+    had_repo_map: repoMap !== '',
+    ...(promptSectionFlags?.hadModuleInterfaces !== undefined && { had_module_interfaces: promptSectionFlags.hadModuleInterfaces }),
+    ...(promptSectionFlags?.hadRelatedTests !== undefined && { had_related_tests: promptSectionFlags.hadRelatedTests }),
+    ...(promptSectionFlags?.hadAffectedConsumers !== undefined && { had_affected_consumers: promptSectionFlags.hadAffectedConsumers }),
+  };
+  if (repoMapArm !== null) {
+    _heartbeatOpts.repo_map_arm = repoMapArm;
+  }
+  sendHeartbeatSync(taskId, statusRef.value, _heartbeatOpts);
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
   const baseCommit = git(['rev-parse', 'HEAD']);
   // 2026-05-04: wrapper-driven lint/test/push/PR pipeline replaced with
@@ -861,6 +905,11 @@ export async function handleCreate(
     issueReference,
     relatedFiles,
     runMigrationCheck: true,
+    promptSectionFlags: {
+      hadModuleInterfaces: moduleInterfaceContext !== '',
+      hadRelatedTests: relatedTestContext !== '',
+      hadAffectedConsumers: affectedConsumersContext !== '',
+    },
   });
 }
 
@@ -922,6 +971,11 @@ export async function handleRefactor(
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
+    promptSectionFlags: {
+      hadModuleInterfaces: refactorModuleInterfaceContext !== '',
+      hadRelatedTests: refactorRelatedTestContext !== '',
+      hadAffectedConsumers: refactorAffectedConsumersContext !== '',
+    },
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
       `${contextPrefix}${refactorModuleInterfaceContext}${refactorAffectedConsumersContext}${refactorRelatedTestContext}${refactorOverlapWarningText}${refactorScopeBudgetNote}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.

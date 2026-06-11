@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_, text
+from sqlalchemy import desc, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -40,6 +40,12 @@ from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SP
 from app import strategic_cycle as _strategic_cycle
 from app.strategic_analysis import _compute_prediction_calibration
 from app.strategic_completion import strategic_challenge_summary
+from app.capability_trial_verdict import (
+    evaluate_trial_verdict,
+    get_trial_definitions,
+    get_trial_verdicts,
+    record_trial_verdict,
+)
 from app.digest_metrics import (
     _compute_edges_considered_metrics,  # noqa: F401  re-exported for external importers
     _compute_first_attempt_breakdowns,
@@ -52,6 +58,7 @@ from app.digest_metrics import (
     compute_anomaly_adjustment_summary,  # noqa: F401  re-exported for external importers
     compute_effort_model_efficiency,
     compute_dependency_health_signals,
+    compute_trial_arm_accumulation,
     compute_wake_post_commit_health_signals,
     compute_park_wake_health,
     compute_merge_gate_fleet_health,
@@ -60,6 +67,7 @@ from app.digest_metrics import (
     compute_direction_progress,
     compute_failure_grouping,  # noqa: F401  re-exported for external importers
     compute_format_compliance_metrics,
+    compute_research_output_quality,
     _CPM_RETIREMENT_MULTIPLIER,  # noqa: F401  re-exported for external importers
     compute_migration_health,  # noqa: F401  re-exported for external importers
     compute_migration_slot_contention,
@@ -76,6 +84,7 @@ from app.digest_metrics import (
     compute_release_qualifier_infra_metrics,  # noqa: F401  re-exported for external importers
     compute_review_quality_metrics,
     compute_scope_mismatch_summary,
+    compute_problem_model_gc_health,
 )
 
 logger = logging.getLogger(__name__)
@@ -344,6 +353,8 @@ async def _compute_digest(
                     # Per-(provider, model) cost attribution on direction CPM.
                     Task.provider,
                     Task.model,
+                    # Per-attempt banked costs for pair-atomic cost_by_provider_model.
+                    Task.attempt_history_db,
                     # Token telemetry for the per-effort/per-model LLM efficiency
                     # rollup (compute_effort_model_efficiency). api_call_summary is
                     # accessed directly (not via __dict__), so it MUST be loaded
@@ -403,6 +414,8 @@ async def _compute_digest(
                     # Per-(provider, model) cost attribution on direction CPM.
                     Task.provider,
                     Task.model,
+                    # Per-attempt banked costs for pair-atomic cost_by_provider_model.
+                    Task.attempt_history_db,
                     # Token telemetry for the per-effort/per-model LLM efficiency
                     # rollup (compute_effort_model_efficiency).
                     Task.api_call_summary,
@@ -543,9 +556,11 @@ async def _compute_digest(
         "composition": [],
     }
 
+    _digest_project: Optional[Project] = None
     if project_id:
         project = await session.get(Project, project_id)
         if project:
+            _digest_project = project
             (
                 direction_progress_list,
                 scope_conversion_rates,
@@ -1187,48 +1202,56 @@ async def _compute_digest(
             _sft = (_proj.design_doc or {}).get("sr_false_attestation_trends")
             if _sft:
                 sr_false_attestation_trends = _sft
-            cycle_history = (_proj.vision or {}).get("_strategic_cycle_history", [])
-            completed_cycles = [
-                c
-                for c in cycle_history
-                if c.get("outcome") not in (None, "in_progress")
-            ]
-            if completed_cycles:
-                last = max(completed_cycles, key=lambda c: c.get("started_at") or "")
+            # Read the newest terminal cycle from the StrategicCycle table.
+            # Terminal = outcome not in ACTIVE_OUTCOMES (completed, failed_*, stalled_*).
+            # vision._strategic_cycle_history was retired in migration 0047.
+            _sc_stmt = (
+                select(StrategicCycle)
+                .where(
+                    StrategicCycle.project_id == project_id,
+                    StrategicCycle.outcome.not_in(
+                        list(_strategic_cycle.ACTIVE_OUTCOMES)
+                    ),
+                )
+                .order_by(desc(StrategicCycle.phase1_started_at))
+                .limit(1)
+            )
+            _sc_row = (await session.execute(_sc_stmt)).scalars().first()
+            if _sc_row is not None:
                 latest_cycle = {
-                    "cycle_id": last.get("cycle_id"),
-                    "started_at": last.get("started_at"),
-                    "completed_at": last.get("phase2_completed_at"),
-                    "outcome": last.get("outcome"),
-                    "directions_created": last.get("directions_created", 0),
-                    "directions_retired": last.get("directions_retired", 0),
-                    "vision_updated": last.get("vision_updated", False),
-                    "summary_text": last.get("summary_text"),
+                    "cycle_id": _sc_row.id,
+                    "started_at": _sc_row.phase1_started_at.isoformat()
+                    if _sc_row.phase1_started_at
+                    else None,
+                    "completed_at": _sc_row.phase2_completed_at.isoformat()
+                    if _sc_row.phase2_completed_at
+                    else None,
+                    "outcome": _sc_row.outcome,
+                    "directions_created": int(_sc_row.directions_created or 0),
+                    "directions_retired": int(_sc_row.directions_retired or 0),
+                    "vision_updated": bool(_sc_row.vision_updated),
+                    "summary_text": _sc_row.summary_text,
                 }
-                _cycle_id = last.get("cycle_id")
-                if _cycle_id:
-                    _sc_row = await session.get(StrategicCycle, _cycle_id)
-                    if _sc_row is not None:
-                        _ms = _sc_row.memo_stats()
-                        latest_cycle[CYCLE_META_MEMOS_AVAILABLE] = _ms[
-                            CYCLE_META_MEMOS_AVAILABLE
-                        ]
-                        latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[
-                            CYCLE_META_MEMOS_CITED
-                        ]
-                        # Compact strategic-judgment-challenge summary when this
-                        # cycle carried a challenge record; omit entirely for
-                        # legacy cycles so absence never reads as a failure.
-                        _challenge_record = (_sc_row.cycle_metadata or {}).get(
-                            "strategic_judgment_challenge"
-                        )
-                        _challenge_summary = strategic_challenge_summary(
-                            _challenge_record
-                        )
-                        if _challenge_summary is not None:
-                            latest_cycle["strategic_judgment_challenge"] = (
-                                _challenge_summary
-                            )
+                _ms = _sc_row.memo_stats()
+                latest_cycle[CYCLE_META_MEMOS_AVAILABLE] = _ms[
+                    CYCLE_META_MEMOS_AVAILABLE
+                ]
+                latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[
+                    CYCLE_META_MEMOS_CITED
+                ]
+                # Compact strategic-judgment-challenge summary when this
+                # cycle carried a challenge record; omit entirely for
+                # legacy cycles so absence never reads as a failure.
+                _challenge_record = (_sc_row.cycle_metadata or {}).get(
+                    "strategic_judgment_challenge"
+                )
+                _challenge_summary = strategic_challenge_summary(
+                    _challenge_record
+                )
+                if _challenge_summary is not None:
+                    latest_cycle["strategic_judgment_challenge"] = (
+                        _challenge_summary
+                    )
             _sc_history = await _strategic_cycle.recent_for_agent_context(
                 session,
                 project_id,
@@ -1360,6 +1383,46 @@ async def _compute_digest(
         completed_tasks + failed_tasks,
         prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
     )
+
+    # --- Capability trial verdict (write-through side-effect) ---
+    # Persist a durable adopt/reject/continue-trial verdict on the project.  Only
+    # runs when a specific project is in scope (no-op for cross-project digests).
+    #
+    # The DECISION basis is CUMULATIVE, not windowed: at realistic task volume the
+    # holdback (without-)arm never reaches the min-N threshold inside any single
+    # digest window, so a windowed basis emits continue-trial forever.  We instead
+    # evaluate over ALL terminal tasks carrying the trial's arm flag since the trial
+    # began (a bounded aggregate count that does NOT widen the digest's own task
+    # scan).  The WINDOWED per-arm rates/counts in ``_first_attempt_success_rate``
+    # (``trial_breakdowns``, ``with_{cap}_n``, …) are left untouched for dashboard
+    # display — only the decision basis changes.
+    if _digest_project is not None:
+        from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
+        _verdict_evaluated_at = _tv_utcnow().isoformat()
+        for _td in get_trial_definitions():
+            _cap = _td["cap_name"]
+            _accum = await compute_trial_arm_accumulation(
+                session,
+                project_id=project_id,
+                context_key=_td["context_key"],
+                assignment_key=_td.get("assignment_key"),
+            )
+            _verdict_entry = evaluate_trial_verdict(
+                lift=_accum["lift"],
+                n_with=_accum["with_n"],
+                n_without=_accum["without_n"],
+                window_hours=hours,
+                evaluated_at=_verdict_evaluated_at,
+                config=_td["thresholds"],
+                accumulation_basis="cumulative_terminal_arm_tasks",
+                arm_composition=_accum.get("arm_composition"),
+            )
+            record_trial_verdict(_digest_project, _cap, _verdict_entry)
+        try:
+            await session.flush()
+        except Exception:
+            logger.warning("[CAPABILITY_TRIAL] failed to flush verdicts", exc_info=True)
+
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(
         completed_tasks + failed_tasks
     )
@@ -1367,6 +1430,7 @@ async def _compute_digest(
         completed_tasks + failed_tasks,
         prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
     )
+    _research_output_quality = compute_research_output_quality(all_tasks)
 
     # Migration-serialization-slot contention (read-only) — surfaces whether a
     # migration task currently holds the per-project slot and for how long, how
@@ -1385,6 +1449,12 @@ async def _compute_digest(
         active_tasks=active_tasks_all,
         migration_slot_contention=migration_slot_contention,
     )
+
+    problem_model_gc_health = None
+    if project_id:
+        problem_model_gc_health = await compute_problem_model_gc_health(
+            session, project_id
+        )
 
     return {
         "window_hours": hours,
@@ -1508,4 +1578,9 @@ async def _compute_digest(
         if prediction_calibration
         else None,
         "release_qualifier_infra_metrics": release_qualifier_infra_metrics,
+        "capability_adoption_verdicts": get_trial_verdicts(_digest_project)
+        if _digest_project is not None
+        else {},
+        "research_output_quality": _research_output_quality,
+        "problem_model_gc_health": problem_model_gc_health,
     }

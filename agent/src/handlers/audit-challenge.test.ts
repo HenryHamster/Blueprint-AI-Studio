@@ -327,6 +327,71 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
     expect(parsed.verdicts[0].verdict).toBe('confirmed');
   });
 
+  it('keeps a valid empty challenge artifact as COMPLETED without reopening', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      challenged_candidate_sha: CANDIDATE_SHA,
+      verdicts: [],
+    });
+
+    await handleReleaseAuditChallenge(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    expect(recordFormatMiss).not.toHaveBeenCalled();
+    expect(recordFormatRepairAttempt).not.toHaveBeenCalled();
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('RELEASE_AUDIT_CHALLENGE');
+    expect(JSON.parse(call.logs as string)).toEqual({
+      challenged_candidate_sha: CANDIDATE_SHA,
+      verdicts: [],
+    });
+  });
+
+  it.each([
+    [
+      'missing top-level keys',
+      { verdicts: [] },
+      'missing_required_key',
+      '{"verdicts":[]}',
+    ],
+    [
+      'non-list verdicts field',
+      { challenged_candidate_sha: CANDIDATE_SHA, verdicts: 'oops' },
+      'parsed_object_schema_mismatch',
+      JSON.stringify({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: 'oops' }),
+    ],
+  ] as const)('repairs schema-wrong audit_challenge output for %s', async (_, invalidHandlerOutput, expectedMissReason, firstRunJson) => {
+    vi.mocked(readHandlerOutput).mockReturnValue(invalidHandlerOutput as Record<string, unknown>);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: firstRunJson,
+        lastResultText: firstRunJson,
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] }),
+      });
+
+    await handleReleaseAuditChallenge(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expectCalledWith(recordFormatMiss, expectedMissReason, 'audit_challenge');
+    expectCalledWith(recordFormatRepairAttempt, 'audit_challenge');
+    expectCalledWith(recordFormatRepairSuccess, 'audit_challenge');
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('RELEASE_AUDIT_CHALLENGE');
+    expect(JSON.parse(call.logs as string)).toEqual({
+      challenged_candidate_sha: CANDIDATE_SHA,
+      verdicts: [],
+    });
+  });
+
   it('self-repairs once then FAILS unparseable when no JSON is ever produced', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'no json here', lastResultText: 'still none' });

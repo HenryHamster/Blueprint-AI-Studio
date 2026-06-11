@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, ChevronDown, ChevronUp } from 'lucide-react';
+import { Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, ChevronDown, ChevronRight } from 'lucide-react';
 import { fetchPipelineRegressions, type PipelineRegression } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 
 const STORAGE_KEY = 'blueprint-admin:pipelineRegressionsPanelCollapsed';
+const LEGACY_STORAGE_KEY = 'blueprint-admin:pipelineRegressionsCollapsed';
 
 interface PipelineRegressionsPanelProps {
   projectId: string | null;
 }
+
+const SEVERITY_RANK: Record<string, number> = { critical: 3, warning: 2, info: 1 };
 
 function formatRate(value: number | null | undefined): string {
   if (value == null || Number.isNaN(value)) return '—';
@@ -48,17 +51,29 @@ function rowBorderClasses(severity: string): string {
   }
 }
 
+function worstSeverity(regressions: PipelineRegression[]): string | null {
+  let worst: string | null = null;
+  let rank = 0;
+  for (const regression of regressions) {
+    const r = SEVERITY_RANK[regression.severity.toLowerCase()] ?? 0;
+    if (r > rank) {
+      rank = r;
+      worst = regression.severity;
+    }
+  }
+  return worst;
+}
+
 export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanelProps) {
   const [regressions, setRegressions] = useState<PipelineRegression[]>([]);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [collapsed, setCollapsed] = useState(() => localStorage.getItem(STORAGE_KEY) === 'true');
-
-  const toggle = () => {
-    const next = !collapsed;
-    setCollapsed(next);
-    localStorage.setItem(STORAGE_KEY, String(next));
-  };
+  // null = no explicit operator preference yet; fall back to a health-derived default.
+  const [collapsedPref, setCollapsedPref] = useState<boolean | null>(() => {
+    const stored = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY);
+    return stored === null ? null : stored === 'true';
+  });
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
 
   const load = useCallback(async (signal?: AbortSignal) => {
     if (!projectId) return;
@@ -89,23 +104,56 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
     deps: [projectId],
   });
 
+  const toggleRow = useCallback((key: string) => {
+    setExpandedRows((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
   if (!projectId) return null;
 
   const healthy = !loading && !fetchError && regressions.length === 0;
+  const hasActive = !loading && !fetchError && regressions.length > 0;
+  // Default: collapsed when healthy, expanded when there are active regressions.
+  const collapsed = collapsedPref ?? healthy;
+  const worst = hasActive ? worstSeverity(regressions) : null;
+
+  const togglePanel = () => {
+    setCollapsedPref((prev) => {
+      const next = !(prev ?? healthy);
+      try {
+        localStorage.setItem(STORAGE_KEY, String(next));
+      } catch { /* localStorage unavailable — keep in-memory state */ }
+      return next;
+    });
+  };
 
   return (
     <div className="mb-3 shrink-0">
       <button
-        onClick={toggle}
+        type="button"
+        onClick={togglePanel}
         data-testid="pipeline-regressions-toggle"
-        className="flex min-h-[44px] items-center gap-2 px-1 py-1 text-[11px] font-bold uppercase tracking-widest text-neutral-400 transition-colors hover:text-neutral-300"
+        aria-expanded={!collapsed}
+        className="flex min-h-[44px] w-full items-center gap-2 px-1 py-1 text-[11px] font-bold uppercase tracking-widest text-neutral-400 transition-colors hover:text-neutral-300"
       >
-        {collapsed ? <ChevronDown className="h-3 w-3" /> : <ChevronUp className="h-3 w-3" />}
+        {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
         <Activity className="h-3 w-3" />
         Pipeline regressions
-        {!loading && !fetchError && regressions.length > 0 && (
+        {hasActive && (
           <span className="ml-1 rounded-full border border-red-500/30 bg-red-500/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-red-300">
             {regressions.length} active
+          </span>
+        )}
+        {collapsed && worst && (
+          <span
+            data-testid="pipeline-regression-worst-severity"
+            className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${severityClasses(worst)}`}
+          >
+            {worst}
           </span>
         )}
         {healthy && (
@@ -121,52 +169,72 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
       </button>
 
       {!collapsed && (
-      <div className="mt-1 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-xs">
-        {fetchError && (
-          <div className="flex items-start gap-2 rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-red-300">
-            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-            <span className="min-w-0 break-words">{fetchError}</span>
-          </div>
-        )}
+        <div className="mt-1 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-xs">
+          {fetchError && (
+            <div className="flex items-start gap-2 rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-red-300">
+              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+              <span className="min-w-0 break-words">{fetchError}</span>
+            </div>
+          )}
 
-        {loading && !fetchError && regressions.length === 0 && (
-          <div className="px-1 py-2 text-neutral-500">Loading pipeline regressions…</div>
-        )}
+          {loading && !fetchError && regressions.length === 0 && (
+            <div className="px-1 py-2 text-neutral-500">Loading pipeline regressions…</div>
+          )}
 
-        {healthy && (
-          <div className="flex items-center gap-2 rounded border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-emerald-300">
-            <span className="h-2 w-2 rounded-full bg-emerald-400" />
-            <span>No active pipeline regressions</span>
-          </div>
-        )}
+          {healthy && (
+            <div className="flex items-center gap-2 rounded border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-emerald-300">
+              <span className="h-2 w-2 rounded-full bg-emerald-400" />
+              <span>No active pipeline regressions</span>
+            </div>
+          )}
 
-        {!loading && !fetchError && regressions.length > 0 && (
-          <div className="space-y-2">
-            {regressions.map((regression) => {
-              const detectedAt = regression.detected_at ? formatAbsolute(parseTimestamp(regression.detected_at).getTime()) : '—';
-              return (
-                <div
-                  key={`${regression.regression_class}:${regression.signal_name}`}
-                  data-testid="pipeline-regression-row"
-                  className={`rounded-lg border bg-neutral-950/60 px-3 py-2 ${rowBorderClasses(regression.severity)}`}
-                >
-                  <div className="flex items-start gap-2">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-start gap-2">
-                        <div className="min-w-0 flex-1">
-                          <div className="break-words font-medium text-neutral-200">
-                            {regression.signal_name}
-                          </div>
-                          <div className="mt-0.5 break-words font-mono text-[10px] text-neutral-500">
-                            {regression.regression_class}
-                          </div>
-                        </div>
-                        <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${severityClasses(regression.severity)}`}>
-                          {regression.severity}
+          {hasActive && (
+            <div className="space-y-1.5">
+              {regressions.map((regression) => {
+                const key = `${regression.regression_class}:${regression.signal_name}`;
+                const isOpen = expandedRows.has(key);
+                const detectedAt = regression.detected_at
+                  ? formatAbsolute(parseTimestamp(regression.detected_at).getTime())
+                  : '—';
+                return (
+                  <div
+                    key={key}
+                    data-testid="pipeline-regression-row"
+                    className={`rounded-lg border bg-neutral-950/60 ${rowBorderClasses(regression.severity)}`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => toggleRow(key)}
+                      aria-expanded={isOpen}
+                      className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2 text-left"
+                    >
+                      {isOpen ? (
+                        <ChevronDown className="h-3 w-3 shrink-0 text-neutral-500" />
+                      ) : (
+                        <ChevronRight className="h-3 w-3 shrink-0 text-neutral-500" />
+                      )}
+                      <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${severityClasses(regression.severity)}`}>
+                        {regression.severity}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-medium text-neutral-200">
+                          {regression.signal_name}
                         </span>
-                      </div>
+                        <span className="block truncate font-mono text-[10px] text-neutral-500">
+                          {regression.regression_class}
+                        </span>
+                      </span>
+                      <span className="shrink-0 inline-flex items-center gap-1 text-neutral-300">
+                        <ArrowDownRight className="h-3 w-3 shrink-0 text-neutral-500" />
+                        {formatRateChange(regression)}
+                      </span>
+                      <span className="hidden shrink-0 text-[10px] text-neutral-500 sm:block">
+                        {detectedAt}
+                      </span>
+                    </button>
 
-                      <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    {isOpen && (
+                      <div className="grid grid-cols-1 gap-2 border-t border-neutral-800/80 px-3 py-2 sm:grid-cols-3">
                         <div>
                           <div className="text-[10px] uppercase tracking-wide text-neutral-500">Detected</div>
                           <div className="mt-0.5 break-words text-neutral-300">{detectedAt}</div>
@@ -190,14 +258,13 @@ export function PipelineRegressionsPanel({ projectId }: PipelineRegressionsPanel
                           </div>
                         </div>
                       </div>
-                    </div>
+                    )}
                   </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

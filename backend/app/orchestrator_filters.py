@@ -1624,6 +1624,58 @@ def apply_completion_priority(
     return result
 
 
+def apply_project_concurrency_cap(
+    eligible_ids: list,
+    project_by_id: dict,
+    active_by_project_id: dict,
+    cap_by_project_id: dict,
+) -> list:
+    """Defer candidates from projects that are at-or-over their per-project cap.
+
+    Pure single source of truth for the per-project concurrency filter (Step 2.92,
+    applied AFTER cap_pipeline_slots and BEFORE apply_project_fairness). Projects
+    with no configured cap are NEVER filtered — behavior is byte-identical for them.
+
+    Semantics are skip-not-block: filtered candidates stay QUEUED and dispatch
+    normally on a later cycle once the project's active count drops. This filter
+    never fails a task and never blocks another project's candidates.
+
+    The admitted-this-cycle counter tracks how many candidates from the same
+    project have already been admitted in this pass, so two candidates from the
+    same capped project cannot both slip past the cap in a single dispatch cycle.
+
+    Args:
+        eligible_ids: candidate ids in current dispatch order.
+        project_by_id: mapping ``id -> project_id``.
+        active_by_project_id: mapping ``project_id -> int`` count of currently
+            PROVISIONING/IN_PROGRESS tasks (computed from the already-fetched
+            active set — no extra DB query).
+        cap_by_project_id: mapping ``project_id -> int`` cap; absent or 0
+            means no cap for that project.
+
+    Returns:
+        The filtered ``eligible_ids`` with over-cap projects' candidates removed.
+    """
+    if not cap_by_project_id or not eligible_ids:
+        return eligible_ids
+
+    admitted_this_cycle: dict = {}
+    kept: list = []
+    for tid in eligible_ids:
+        pid = project_by_id.get(tid)
+        cap = cap_by_project_id.get(pid) if pid is not None else None
+        if not cap or cap <= 0:
+            kept.append(tid)
+            continue
+        active = int(active_by_project_id.get(pid, 0))
+        already_admitted = int(admitted_this_cycle.get(pid, 0))
+        if active + already_admitted >= cap:
+            continue
+        admitted_this_cycle[pid] = already_admitted + 1
+        kept.append(tid)
+    return kept
+
+
 async def reorder_by_completion_priority(
     eligible_ids: list,
     candidate_tasks: list[Task],

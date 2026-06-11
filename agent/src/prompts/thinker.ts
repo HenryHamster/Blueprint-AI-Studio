@@ -171,7 +171,7 @@ ${p.runningUpdateSection}
 ${p.runningUpdateSupersededSection || ''}
 ## Architecture (design document — overview index)
 ${p.designDocJson || 'No design document yet.'}
-${p.designDocJson ? '_The above is an OVERVIEW INDEX of the design document — which systems and capabilities exist, their reconciled presence status, and declared backing module paths. It is NOT the full design doc. To read any section\'s FULL prose/specs, run `./design-doc get <key>` (e.g. `./design-doc get systems/auth`); run `./design-doc list` to enumerate every section key. Fetch the full text whenever you need a section\'s detailed prose or specs to reason or decide._' : ''}
+${p.designDocJson ? '_The above is an OVERVIEW INDEX of the design document — which systems and capabilities exist, their reconciled presence status, and declared backing module paths. `repo_overview` additionally carries inline bootstrap context (tech_stack, directory_layout, first_steps) for immediate orientation; the full section remains fetchable. It is NOT the full design doc. To read any section\'s FULL prose/specs, run `./design-doc get <key>` (e.g. `./design-doc get systems/auth`); run `./design-doc list` to enumerate every section key. Fetch the full text whenever you need a section\'s detailed prose or specs to reason or decide._' : ''}
 
 ${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; retained for bootstrap reference only)\n${p.visionJson}\n` : ''}
 ${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
@@ -320,6 +320,10 @@ Normally your **whole** problem_model is shipped inline this cycle — full gaps
 
 To intentionally REMOVE an agent-owned entry (not just change its status), add a top-level \`_deletions\` field: \`{"capabilities": ["name"], "gaps": ["id"], "friction": ["id"]}\`. Removal is ONLY via \`_deletions\` — omitting an entry never deletes it. Closing a gap is a status change, not a deletion (set \`status: closed\` → it auto-archives). Operator-owned fields (\`intent.purpose\`, \`context\`, \`constraints\`) are protected separately — to change those, route through \`pending_user_confirmation\` (\`type: intent_change\`), don't overwrite them. The Executor reads this file verbatim; if it's missing the cycle fails loudly rather than fabricating.
 
+To CONSOLIDATE overlapping capabilities (shrink an overgrown registry safely), do NOT just delete the duplicates — that would strand every prerequisite, proof, and adoption verdict keyed on the old names. Instead, in the SAME update: (1) delete the old capability names via \`_deletions.capabilities\`, AND (2) add or keep one surviving capability whose \`absorbs\` field lists those old names, e.g. \`{"name": "ci-pipeline", "status": "working", "absorbs": ["ci-poll", "ci-resolve", "ci-fix-spawn"]}\`. The absorbed old names then keep RESOLVING for prerequisite resolution (a dependent that required \`ci-poll\` is still satisfied by the working survivor) and stay in the off-registry advisory known-set, while DISAPPEARING from the rendered \`available_capabilities\` vocabulary — which is what actually reduces the model size. Proof/verdict history also carries onto the survivor via these aliases. Only set \`absorbs\` on a survivor that genuinely subsumes the deleted names; \`absorbs\` defaults to empty and a normal update never needs it.
+
+To COMPACT gap histories (reduce the dominant history/past_moves bloat when gaps are marked \`heavy\` in \`_gap_memory_trimmed\`), add a top-level \`_compactions\` list: \`[{"gap_id": "gap-id", "history_watermark": "2026-05-01T00:00:00Z", "past_moves_watermark": "2026-04-01T00:00:00Z"}]\`. Each entry sets a per-gap watermark: history entries with \`ts\` at or before the \`history_watermark\` are permanently excluded from future write-back unions, so compacted entries cannot resurrect from the durable log. \`past_moves_watermark\` triggers replacement semantics for \`past_moves\` on that write: the list you submit in \`past_moves\` replaces the durable log entirely, so trim it to the entries you still need before emitting the directive. Omit either watermark to leave that field uncompacted. Both watermarks are monotonic and durable — once set they survive subsequent writes and cannot be regressed by a stale directive. Only compact gaps whose full history you have verified — use \`./fetch\` to view the durable log before deciding. Compaction events are recorded in the revision log. Do NOT compact history you may still need for context.
+
 # Problem model shape (quick reference)
 
 **Operator intent ownership:** The operator seeds \`intent.purpose\` and \`context\`/\`constraints\` at onboarding and may update them later. These are operator-owned — **do NOT blank them** even if you think they should change. If the model is replaced and these fields are omitted or emptied, the platform preserves the prior operator values. \`intent.current_focus\` is agent-owned and SHOULD advance as the project completes phases. If you genuinely believe the operator's purpose or steering should change, do NOT silently overwrite them — instead queue a \`pending_user_confirmation\` entry with \`type: "intent_change"\` proposing the change and asking for operator confirmation.
@@ -404,6 +408,17 @@ export async function runThinkerWithGate(
 
   let problemModelRepair: RepairStructuredOutputResult<Record<string, unknown>> | null = null;
   if (!problemModelParseable) {
+    // Embed the thinker's prior analysis in the repair prompt so the fresh
+    // session can extract the real problem_model JSON rather than echoing
+    // schema-template placeholders (incident: a repair with no prior context
+    // persisted intent.purpose = "Provide a parseable problem_model JSON
+    // object..." and wiped constraints — PR #7435 / BUG_REPORT 8154c2d3).
+    const progressPath = `/tmp/research_progress_${taskId}.md`;
+    const progressBreadcrumb = fs.existsSync(progressPath)
+      ? `\n\n===== RESEARCH PROGRESS BREADCRUMB =====\n${fs.readFileSync(progressPath, 'utf8').slice(0, 10_000)}\n===== END BREADCRUMB =====`
+      : '';
+    const priorAnalysis = thinkerResult.allOutput.slice(-60_000);
+
     problemModelRepair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['intent'],
@@ -414,10 +429,18 @@ export async function runThinkerWithGate(
       },
       reopenPrompt: [
         'Your strategic run completed cleanly, but the required problem_model JSON was not parseable.',
-        'Output ONLY the problem_model JSON object now - no markdown, no explanation, no code fences.',
+        'IMPORTANT: this is a FRESH session — you do NOT have the previous conversation.',
+        'Your previous analysis output is reproduced verbatim below.',
+        'Find the problem_model JSON in it and output ONLY that JSON object now — no markdown, no explanation, no code fences.',
+        'Do NOT use placeholder or template values. Extract the real content from the analysis below.',
         `Write the JSON for ${problemModelPath}.`,
         'Schema reminder:',
         '{"intent":{"purpose":"...","current_focus":"..."},"context":{},"constraints":[],"capabilities":[],"gaps":[],"archived_gaps":[],"friction":[],"pending_user_confirmation":[],"revision_log":[],"rejected_agent_edits":[]}',
+        '',
+        '===== YOUR PREVIOUS ANALYSIS OUTPUT (verbatim) =====',
+        priorAnalysis,
+        '===== END PREVIOUS ANALYSIS OUTPUT =====',
+        progressBreadcrumb,
       ].join('\n'),
       ws,
       statusRef,

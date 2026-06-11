@@ -183,7 +183,12 @@ export interface Task {
       title?: string;
       deferred_reason?: string;
       adversarial_gate_reason?: string | null;
+      adversarial_challenger_task_id?: string | null;
     }>;
+    // Bounded provenance for the last adversarial challenger — written by
+    // _resolve_quality_grader_completion in task_lifecycle.py when the adversarial
+    // grader completes or fails.
+    adversarial_gate_diagnostic?: AdversarialGateDiagnostic | null;
     research_spawn_gate_challenged_count?: number;
     research_spawn_gate_refuted_count?: number;
     research_spawn_gate_survived_count?: number;
@@ -195,6 +200,12 @@ export interface Task {
     research_spawn_gate_fail_open_count?: number;
     research_spawn_gate_unresolved_count?: number;
     research_spawn_gate_refuted_reasons?: string[];
+    research_spawn_gate_manifest_excluded_fail_closed_count?: number;
+    research_spawn_gate_manifest_excluded_fail_closed_samples?: Array<{
+      hash?: string;
+      title?: string;
+      reason?: string;
+    }>;
     research_spawn_gate_challenged_spawned?: number;
     research_spawn_gate_challenged_merged?: number;
     research_spawn_gate_unchallenged_spawned?: number;
@@ -242,6 +253,27 @@ export interface FixLoopAttempt {
 }
 
 /**
+ * Bounded provenance recorded on the source research task after an adversarial
+ * challenger returns (or fails). Lets operators root-cause absent verdicts
+ * (stale serving image vs malformed/crashed grader) without storing raw logs.
+ * All VM identity fields are optional — they are absent when the grader ran on
+ * a local/subprocess worker that never sent a heartbeat.
+ */
+export interface AdversarialGateDiagnostic {
+  challenger_task_id: string;
+  completion_state: 'completed' | 'failed';
+  challenged_count: number;
+  parse_state?: 'ok' | 'challenger_failed' | 'empty_logs' | 'no_json_array' | 'invalid_json' | 'no_hash_matches';
+  parse_cause?: string | null;
+  parsed_verdict_count: number;
+  unresolved_count: number;
+  vm_image_name?: string | null;
+  vm_image_build_ts?: number | null;
+  vm_runtime_fingerprint?: string | null;
+  vm_source_sha?: string | null;
+}
+
+/**
  * Aggregate research spawn-gate telemetry rolled up across a direction's
  * research cycles. Two backend producers emit nearly-identical shapes:
  *  - the digest direction-progress entry's `research_spawn_gate` payload
@@ -265,6 +297,12 @@ export interface ResearchSpawnGateAggregate {
   explicit_pass_count?: number;
   fail_open_count?: number;
   unresolved_count?: number;
+  manifest_excluded_fail_closed_count?: number;
+  manifest_excluded_fail_closed_samples?: Array<{
+    hash?: string;
+    title?: string;
+    reason?: string;
+  }>;
   // Preserved merge-rate sample sizes so a shown rate always travels with its
   // spawned/merged denominators.
   challenged_spawned?: number;
@@ -277,6 +315,8 @@ export interface ResearchSpawnGateAggregate {
   // a degraded-gate signal the strategist/operator can act on without opening
   // individual tasks.
   refuted_reasons?: string[];
+  // Compact parse-outcome histogram rolled up from research cycle records.
+  parse_outcome_distribution?: Record<string, number>;
 }
 
 /** Discriminated union of spawn-gate outcomes for a research-derived child task. */

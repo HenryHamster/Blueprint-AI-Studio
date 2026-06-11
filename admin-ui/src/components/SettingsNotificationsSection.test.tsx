@@ -16,6 +16,8 @@ const baseProps = {
   onUpdateEnabledEvents: vi.fn(),
   throttleSeconds: 30,
   onUpdateThrottleSeconds: vi.fn(),
+  dailyCostCeilingUsd: 0,
+  onUpdateDailyCostCeiling: vi.fn(),
   isAdmin: true,
 };
 
@@ -58,6 +60,21 @@ describe('SettingsNotificationsSection', () => {
     );
     fireEvent.click(getToggleButton('Account/Model Regression Quarantined'));
     expect(onUpdateEnabledEvents).toHaveBeenLastCalledWith(['TASK_FAILED', 'account_model_regression_quarantined']);
+  });
+
+  it('describes the active daily cost ceiling as alert-only, not a pause', () => {
+    render(<SettingsNotificationsSection {...baseProps} dailyCostCeilingUsd={50} />);
+
+    const help = screen.getByText(/daily spend exceeds \$50/i);
+    expect(help).toHaveTextContent('warning alert');
+    expect(help).toHaveTextContent('Autonomous tasks keep running');
+    expect(help.textContent?.toLowerCase()).not.toContain('pause autonomous');
+  });
+
+  it('describes a zero ceiling as no daily cost limit', () => {
+    render(<SettingsNotificationsSection {...baseProps} dailyCostCeilingUsd={0} />);
+
+    expect(screen.getByText(/No ceiling — pipeline runs without a daily cost limit/i)).toBeInTheDocument();
   });
 
   it('shows merged-without-test-verification and toggles it in enabled_events', () => {

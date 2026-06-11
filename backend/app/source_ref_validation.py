@@ -142,7 +142,8 @@ async def _file_exists_in_repo_branch(
     """Check whether *path* exists on ``owner/repo@branch``. Tri-state.
 
     Backed by the cached branch-tree snapshot
-    (:func:`app.github_repo_snapshot.path_exists_on_branch`): set membership
+    (:func:`app.github_repo_snapshot.path_exists_on_branch` and
+    :func:`app.github_repo_snapshot.glob_exists_on_branch`): set membership
     against one cached ``git/trees`` fetch instead of one ``/contents`` call
     per path, so a grounding pass costs O(1) API calls regardless of how many
     files it cites.
@@ -153,9 +154,21 @@ async def _file_exists_in_repo_branch(
     here read as ``False``, which let a quota outage downgrade design-doc
     entries to "missing".
     """
-    if not _looks_like_file_path(path):
-        return False
-    from app.github_repo_snapshot import path_exists_on_branch
+    if not isinstance(path, str):
+        return None
+    if not path or path != path.strip() or " " in path:
+        return None
+    from app.github_repo_snapshot import glob_exists_on_branch, path_exists_on_branch
+
+    if any(ch in path for ch in "*?[]{}"):
+        return await glob_exists_on_branch(
+            path,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
 
     return await path_exists_on_branch(
         path,

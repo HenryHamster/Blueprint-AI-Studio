@@ -19,7 +19,7 @@ from app.direction_outcomes import (
     proven_merged_count,
     verified_merged_count,
 )
-from app.models import Project, Task, TaskStatus
+from app.models import Project, Task, TaskStatus, get_task_cost_by_provider_model
 from app.task_evaluators import (
     CHALLENGE_AGREES,
     CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
@@ -109,12 +109,20 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
     explicit_pass = 0
     fail_open = 0
     unresolved = 0
+    manifest_excluded_fail_closed = 0
+    adversarial_give_up = 0
     challenged_spawned = 0
     challenged_merged = 0
     unchallenged_spawned = 0
     unchallenged_merged = 0
+    exhaustion_count = 0
     refuted_reasons: List[str] = []
     _seen_reasons: set[str] = set()
+    manifest_excluded_samples: List[Dict[str, str]] = []
+    _seen_manifest_excluded: set[tuple[str, str]] = set()
+    adversarial_give_up_samples: List[Dict[str, str]] = []
+    _seen_adversarial_give_up: set[str] = set()
+    parse_outcome_distribution: dict[str, int] = {}
     for entry in history or []:
         challenged += entry.get("research_spawn_gate_challenged_count") or 0
         refuted += entry.get("research_spawn_gate_refuted_count") or 0
@@ -122,10 +130,19 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
         explicit_pass += entry.get("research_spawn_gate_explicit_pass_count") or 0
         fail_open += entry.get("research_spawn_gate_fail_open_count") or 0
         unresolved += entry.get("research_spawn_gate_unresolved_count") or 0
+        manifest_excluded_fail_closed += (
+            entry.get("research_spawn_gate_manifest_excluded_fail_closed_count") or 0
+        )
+        adversarial_give_up += (
+            entry.get("research_spawn_gate_adversarial_give_up_count") or 0
+        )
         challenged_spawned += entry.get("research_spawn_gate_challenged_spawned") or 0
         challenged_merged += entry.get("research_spawn_gate_challenged_merged") or 0
         unchallenged_spawned += entry.get("research_spawn_gate_unchallenged_spawned") or 0
         unchallenged_merged += entry.get("research_spawn_gate_unchallenged_merged") or 0
+        exhaustion_count += (
+            1 if entry.get("research_spawn_gate_wholesale_retry_exhausted") else 0
+        )
         for _r in entry.get("research_spawn_gate_refuted_reasons") or []:
             _r = str(_r).strip()[:_SPAWN_GATE_REASON_MAX_LEN]
             if (
@@ -135,7 +152,57 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
             ):
                 _seen_reasons.add(_r)
                 refuted_reasons.append(_r)
-    if not any([challenged, refuted, survived, challenged_spawned, unchallenged_spawned]):
+        for _sample in (
+            entry.get("research_spawn_gate_manifest_excluded_fail_closed_samples") or []
+        ):
+            if not isinstance(_sample, dict):
+                continue
+            _compact = {
+                "hash": str(_sample.get("hash") or "")[:80],
+                "title": str(_sample.get("title") or "")[:120],
+                "reason": str(_sample.get("reason") or "")[:_SPAWN_GATE_REASON_MAX_LEN],
+            }
+            _key = (_compact["hash"], _compact["title"])
+            if (
+                (_compact["hash"] or _compact["title"])
+                and _key not in _seen_manifest_excluded
+                and len(manifest_excluded_samples) < _SPAWN_GATE_REASONS_SAMPLE_CAP
+            ):
+                _seen_manifest_excluded.add(_key)
+                manifest_excluded_samples.append(_compact)
+        for _gu_sample in (
+            entry.get("research_spawn_gate_adversarial_give_up_samples") or []
+        ):
+            if not isinstance(_gu_sample, dict):
+                continue
+            _gu_title = str(_gu_sample.get("title") or "")[:120]
+            if (
+                _gu_title
+                and _gu_title not in _seen_adversarial_give_up
+                and len(adversarial_give_up_samples) < _SPAWN_GATE_REASONS_SAMPLE_CAP
+            ):
+                _seen_adversarial_give_up.add(_gu_title)
+                _gu_compact: Dict[str, str] = {"title": _gu_title}
+                if _gu_sample.get("direction_id"):
+                    _gu_compact["direction_id"] = str(_gu_sample["direction_id"])
+                adversarial_give_up_samples.append(_gu_compact)
+        _parse_outcome = str(
+            entry.get("research_spawn_gate_parse_outcome") or ""
+        ).strip()
+        if _parse_outcome:
+            parse_outcome_distribution[_parse_outcome] = (
+                parse_outcome_distribution.get(_parse_outcome, 0) + 1
+            )
+    if not any([
+        challenged,
+        refuted,
+        survived,
+        manifest_excluded_fail_closed,
+        adversarial_give_up,
+        challenged_spawned,
+        unchallenged_spawned,
+        exhaustion_count,
+    ]):
         return None
     challenged_merge_rate = (
         round(challenged_merged / challenged_spawned, 3) if challenged_spawned > 0 else None
@@ -152,6 +219,10 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
         "explicit_pass_count": explicit_pass,
         "fail_open_count": fail_open,
         "unresolved_count": unresolved,
+        "manifest_excluded_fail_closed_count": manifest_excluded_fail_closed,
+        "manifest_excluded_fail_closed_samples": manifest_excluded_samples,
+        "adversarial_give_up_count": adversarial_give_up,
+        "adversarial_give_up_samples": adversarial_give_up_samples,
         # Sample sizes preserved so each merge rate travels with its denominator.
         "challenged_spawned": challenged_spawned,
         "challenged_merged": challenged_merged,
@@ -159,7 +230,9 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
         "unchallenged_merged": unchallenged_merged,
         "challenged_merge_rate": challenged_merge_rate,
         "unchallenged_merge_rate": unchallenged_merge_rate,
+        "exhaustion_count": exhaustion_count,
         "refuted_reasons": refuted_reasons,
+        "parse_outcome_distribution": parse_outcome_distribution or None,
     }
 
 
@@ -207,11 +280,8 @@ async def compute_direction_progress(
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
     from app.direction_outcomes import synthesize_prompt_quality_patterns
     from app.notification_dispatch import dispatch_external_notification
-    from app.routers.admin_analytics import (
-        ON_DEMAND_RATE,
-        SPOT_RATE,
-        _derive_completed_at,
-    )
+    from app.routers.admin_analytics import _derive_completed_at  # noqa: PLC0415
+    from app.vm_cost_rates import get_vm_rate_per_second  # noqa: PLC0415
 
     direction_progress_list: List[Dict[str, Any]] = []
     direction_portfolio_composition: List[Dict[str, Any]] = []
@@ -312,12 +382,20 @@ async def compute_direction_progress(
         spawn_gate_explicit_pass_count = 0
         spawn_gate_fail_open_count = 0
         spawn_gate_unresolved_count = 0
+        spawn_gate_manifest_excluded_fail_closed_count = 0
+        spawn_gate_adversarial_give_up_count = 0
         spawn_gate_challenged_spawned = 0
         spawn_gate_challenged_merged = 0
         spawn_gate_unchallenged_spawned = 0
         spawn_gate_unchallenged_merged = 0
+        spawn_gate_exhaustion_count = 0
         spawn_gate_refuted_reasons: List[str] = []
         _spawn_gate_seen_reasons: set[str] = set()
+        spawn_gate_manifest_excluded_samples: List[Dict[str, str]] = []
+        _spawn_gate_seen_manifest_excluded: set[tuple[str, str]] = set()
+        spawn_gate_adversarial_give_up_samples: List[Dict[str, str]] = []
+        _spawn_gate_seen_adversarial_give_up: set[str] = set()
+        spawn_gate_parse_outcome_distribution: dict[str, int] = {}
         for entry in d.get("research_history") or []:
             try:
                 entry_ts = _coerce_naive_utc(
@@ -482,6 +560,15 @@ async def compute_direction_progress(
                 spawn_gate_unresolved_count += (
                     entry.get("research_spawn_gate_unresolved_count") or 0
                 )
+                spawn_gate_manifest_excluded_fail_closed_count += (
+                    entry.get(
+                        "research_spawn_gate_manifest_excluded_fail_closed_count"
+                    )
+                    or 0
+                )
+                spawn_gate_adversarial_give_up_count += (
+                    entry.get("research_spawn_gate_adversarial_give_up_count") or 0
+                )
                 for _sg_reason in (
                     entry.get("research_spawn_gate_refuted_reasons") or []
                 ):
@@ -494,6 +581,56 @@ async def compute_direction_progress(
                     ):
                         _spawn_gate_seen_reasons.add(_sg_reason)
                         spawn_gate_refuted_reasons.append(_sg_reason)
+                for _sg_sample in (
+                    entry.get(
+                        "research_spawn_gate_manifest_excluded_fail_closed_samples"
+                    )
+                    or []
+                ):
+                    if not isinstance(_sg_sample, dict):
+                        continue
+                    _sample = {
+                        "hash": str(_sg_sample.get("hash") or "")[:80],
+                        "title": str(_sg_sample.get("title") or "")[:120],
+                        "reason": str(_sg_sample.get("reason") or "")[
+                            :_SPAWN_GATE_REASON_MAX_LEN
+                        ],
+                    }
+                    _sample_key = (_sample["hash"], _sample["title"])
+                    if (
+                        (_sample["hash"] or _sample["title"])
+                        and _sample_key not in _spawn_gate_seen_manifest_excluded
+                        and len(spawn_gate_manifest_excluded_samples)
+                        < _SPAWN_GATE_REASONS_SAMPLE_CAP
+                    ):
+                        _spawn_gate_seen_manifest_excluded.add(_sample_key)
+                        spawn_gate_manifest_excluded_samples.append(_sample)
+                for _gu_sample in (
+                    entry.get("research_spawn_gate_adversarial_give_up_samples") or []
+                ):
+                    if not isinstance(_gu_sample, dict):
+                        continue
+                    _gu_title = str(_gu_sample.get("title") or "")[:120]
+                    if (
+                        _gu_title
+                        and _gu_title not in _spawn_gate_seen_adversarial_give_up
+                        and len(spawn_gate_adversarial_give_up_samples)
+                        < _SPAWN_GATE_REASONS_SAMPLE_CAP
+                    ):
+                        _spawn_gate_seen_adversarial_give_up.add(_gu_title)
+                        _gu_compact: Dict[str, str] = {"title": _gu_title}
+                        if _gu_sample.get("direction_id"):
+                            _gu_compact["direction_id"] = str(_gu_sample["direction_id"])
+                        spawn_gate_adversarial_give_up_samples.append(_gu_compact)
+                _spawn_gate_parse_outcome = str(
+                    entry.get("research_spawn_gate_parse_outcome") or ""
+                ).strip()
+                if _spawn_gate_parse_outcome:
+                    spawn_gate_parse_outcome_distribution[
+                        _spawn_gate_parse_outcome
+                    ] = spawn_gate_parse_outcome_distribution.get(
+                        _spawn_gate_parse_outcome, 0
+                    ) + 1
                 spawn_gate_challenged_spawned += (
                     entry.get("research_spawn_gate_challenged_spawned") or 0
                 )
@@ -505,6 +642,9 @@ async def compute_direction_progress(
                 )
                 spawn_gate_unchallenged_merged += (
                     entry.get("research_spawn_gate_unchallenged_merged") or 0
+                )
+                spawn_gate_exhaustion_count += (
+                    1 if entry.get("research_spawn_gate_wholesale_retry_exhausted") else 0
                 )
             elif entry_ts >= prev_window_start:
                 for scope, stats in (entry.get("scope_breakdown") or {}).items():
@@ -553,8 +693,10 @@ async def compute_direction_progress(
                 and t.vm_stopped_at >= window_start
             ):
                 continue
-            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            t_cost = get_vm_rate_per_second(
+                machine_type=t.__dict__.get("vm_machine_type"),
+                spot=bool(t.vm_spot),
+            ) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
             dir_cost += t_cost
             if t.vm_spot:
                 dir_spot_cost += t_cost
@@ -566,12 +708,14 @@ async def compute_direction_progress(
             cost_by_status[status_key] = cost_by_status.get(status_key, 0.0) + t_cost
             type_key = (t.first_payload or {}).get("type", "create")
             cost_by_type[type_key] = cost_by_type.get(type_key, 0.0) + t_cost
-            provider_key = t.provider or "unknown"
-            model_key = t.model or "unknown"
-            pm_key = f"{provider_key}|{model_key}"
-            cost_by_provider_model[pm_key] = (
-                cost_by_provider_model.get(pm_key, 0.0) + t_cost
-            )
+            # Use pair-atomic helper for provider/model breakdown so chimera keys
+            # (e.g. openai|claude-opus-4-8 from independently-resolved columns)
+            # cannot appear. Banked attempt_history costs are included via window_start.
+            pm_costs = get_task_cost_by_provider_model(t, window_start=window_start)
+            for pm_key, pm_cost in pm_costs.items():
+                cost_by_provider_model[pm_key] = (
+                    cost_by_provider_model.get(pm_key, 0.0) + pm_cost
+                )
         cost_by_scope = {k: round(v, 4) for k, v in cost_by_scope.items()}
         cost_by_status = {k: round(v, 4) for k, v in cost_by_status.items()}
         cost_by_type = {k: round(v, 4) for k, v in cost_by_type.items()}
@@ -854,13 +998,25 @@ async def compute_direction_progress(
             "explicit_pass_count": spawn_gate_explicit_pass_count,
             "fail_open_count": spawn_gate_fail_open_count,
             "unresolved_count": spawn_gate_unresolved_count,
+            "manifest_excluded_fail_closed_count": (
+                spawn_gate_manifest_excluded_fail_closed_count
+            ),
+            "manifest_excluded_fail_closed_samples": (
+                spawn_gate_manifest_excluded_samples
+            ),
+            "adversarial_give_up_count": spawn_gate_adversarial_give_up_count,
+            "adversarial_give_up_samples": spawn_gate_adversarial_give_up_samples,
             "challenged_spawned": spawn_gate_challenged_spawned,
             "challenged_merged": spawn_gate_challenged_merged,
             "challenged_merge_rate": spawn_gate_challenged_merge_rate,
             "unchallenged_spawned": spawn_gate_unchallenged_spawned,
             "unchallenged_merged": spawn_gate_unchallenged_merged,
             "unchallenged_merge_rate": spawn_gate_unchallenged_merge_rate,
+            "exhaustion_count": spawn_gate_exhaustion_count,
             "refuted_reasons": spawn_gate_refuted_reasons,
+            "parse_outcome_distribution": (
+                spawn_gate_parse_outcome_distribution or None
+            ),
         }
         # Drop the reasons sample from the all-zero test so a cycle with only an
         # (empty) sample still collapses to None — gate emptiness is decided by
@@ -868,7 +1024,12 @@ async def compute_direction_progress(
         if not any(
             v
             for k, v in research_spawn_gate.items()
-            if k != "refuted_reasons"
+            if k
+            not in (
+                "refuted_reasons",
+                "manifest_excluded_fail_closed_samples",
+                "adversarial_give_up_samples",
+            )
         ):
             research_spawn_gate = None
 

@@ -71,6 +71,101 @@ describe('buildContextPrefix', () => {
     expect(prefix).not.toContain('## Existing knowledge documents');
   });
 
+  it('renders acceptance-grade badge for accepted compute_experiment entry', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-compute-1',
+            title: 'GPU accuracy benchmark',
+            summary: 'Accuracy reached 0.93 >= 0.9 threshold.',
+            topic: 'compute',
+            source_kind: 'compute_experiment',
+            compute_acceptance_grade: 'acceptance',
+            compute_acceptance_reason: 'llm_artifact_cited',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-compute-1] GPU accuracy benchmark');
+    expect(prefix).toContain('[acceptance]');
+    expect(prefix).not.toContain('[measured_only');
+  });
+
+  it('renders measured-only badge with reason for deterministic compute entry', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-compute-2',
+            title: 'Deterministic compute result',
+            summary: 'Outcome recorded without LLM analysis.',
+            topic: 'compute',
+            source_kind: 'compute_experiment',
+            compute_acceptance_grade: 'measured_only',
+            compute_acceptance_reason: 'analysis_mode_not_llm',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-compute-2] Deterministic compute result');
+    expect(prefix).toContain('[measured_only: analysis_mode_not_llm]');
+    expect(prefix).not.toContain('[acceptance]');
+  });
+
+  it('renders analysis-unavailable badge when unavailable_cause is present', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-compute-3',
+            title: 'Compute run with missing grounding',
+            summary: 'Analysis was not available for this run.',
+            topic: 'compute',
+            source_kind: 'compute_experiment',
+            compute_acceptance_grade: 'measured_only',
+            compute_acceptance_reason: 'missing_grounding_probe',
+            unavailable_cause: 'grounding_probe_absent',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-compute-3] Compute run with missing grounding');
+    expect(prefix).toContain('[analysis_unavailable: grounding_probe_absent]');
+    expect(prefix).not.toContain('[measured_only:');
+    expect(prefix).not.toContain('[acceptance]');
+  });
+
+  it('omits grade badge for non-compute knowledge entries', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-web-1',
+            title: 'OAuth flow research',
+            summary: 'Web research on OAuth device flow.',
+            topic: 'auth',
+            source_kind: 'web_research',
+            compute_acceptance_grade: null,
+            compute_acceptance_reason: 'non_compute_forward_quality_gate',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-web-1] OAuth flow research');
+    expect(prefix).not.toContain('[acceptance]');
+    expect(prefix).not.toContain('[measured_only');
+    expect(prefix).not.toContain('[analysis_unavailable');
+  });
+
   it('renders the acceptance-evidence section when context.acceptance_evidence is present', () => {
     const prefix = buildContextPrefix({
       payloads: [{ type: 'create' }],
@@ -268,5 +363,133 @@ describe('buildContextPrefix self-review calibration', () => {
       project_context: { open_prs: ['Some PR'], self_review_catch_rate: srSource },
     });
     expect(prefix).not.toContain('## Self-review calibration');
+  });
+
+  // repo_overview rendering
+  it('renders ## Repo Overview with all fields when repo_overview is present', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      repo_overview: {
+        tech_stack: 'Python, FastAPI, React',
+        directory_layout: 'backend/ agent/ admin-ui/',
+        first_steps_summary: 'Run pip install and npm install',
+        entry_points: 'backend/app/main.py; agent/src/index.ts',
+        test_layout: 'backend/testing/ and agent/src/**/*.test.ts',
+        key_conventions: 'Use shared prompt helpers from prompt.ts',
+        environment_requirements: 'Python 3.12 and Node 20',
+        bootstrap_completed_at: '2026-01-15T10:00:00Z',
+        provenance: {
+          refreshed_at: '2026-01-15T10:01:00Z',
+          source_branch: 'main',
+          source_revision: 'abc1234',
+        },
+      },
+    });
+    expect(prefix).toContain('## Repo Overview');
+    expect(prefix).toContain('**Tech stack:** Python, FastAPI, React');
+    expect(prefix).toContain('**Directory layout:** backend/ agent/ admin-ui/');
+    expect(prefix).toContain('**First steps:** Run pip install and npm install');
+    expect(prefix).toContain('**Entry points:** backend/app/main.py; agent/src/index.ts');
+    expect(prefix).toContain('**Test layout:** backend/testing/ and agent/src/**/*.test.ts');
+    expect(prefix).toContain('**Key conventions:** Use shared prompt helpers from prompt.ts');
+    expect(prefix).toContain('**Environment:** Python 3.12 and Node 20');
+    expect(prefix).toContain('**Bootstrapped:** 2026-01-15T10:00:00Z');
+    expect(prefix).toContain(
+      '**Provenance:** refreshed 2026-01-15T10:01:00Z; branch main; revision abc1234',
+    );
+  });
+
+  it('omits ## Repo Overview when repo_overview is absent', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+    });
+    expect(prefix).not.toContain('## Repo Overview');
+  });
+
+  it('omits ## Repo Overview when a required field is missing', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix' }],
+      repo_overview: {
+        tech_stack: 'Python',
+        // directory_layout and first_steps_summary missing
+      },
+    });
+    expect(prefix).not.toContain('## Repo Overview');
+  });
+
+  it('renders ## Repo Overview without bootstrapped line when bootstrap_completed_at is absent', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix' }],
+      repo_overview: {
+        tech_stack: 'TypeScript, Node',
+        directory_layout: 'src/ tests/',
+        first_steps_summary: 'npm install && npm test',
+      },
+    });
+    expect(prefix).toContain('## Repo Overview');
+    expect(prefix).not.toContain('**Bootstrapped:**');
+    // optional-field labels must not appear when the fields are absent
+    expect(prefix).not.toContain('**Entry points:**');
+    expect(prefix).not.toContain('**Test layout:**');
+    expect(prefix).not.toContain('**Key conventions:**');
+    expect(prefix).not.toContain('**Environment:**');
+  });
+
+  it('renders optional repo_overview fields when present', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      repo_overview: {
+        tech_stack: 'Python, FastAPI, React',
+        directory_layout: 'backend/ agent/ admin-ui/',
+        first_steps_summary: 'Run pip install and npm install',
+        entry_points: 'backend/app/main.py, admin-ui/src/App.tsx',
+        test_layout: 'backend/testing/, agent/src/**/*.test.ts',
+        key_conventions: 'async/await everywhere; functional React components',
+        environment_requirements: 'Python 3.11, Node 20, Postgres 15',
+        bootstrap_completed_at: '2026-01-15T10:00:00Z',
+      },
+    });
+    expect(prefix).toContain('**Entry points:** backend/app/main.py, admin-ui/src/App.tsx');
+    expect(prefix).toContain('**Test layout:** backend/testing/, agent/src/**/*.test.ts');
+    expect(prefix).toContain('**Key conventions:** async/await everywhere; functional React components');
+    expect(prefix).toContain('**Environment:** Python 3.11, Node 20, Postgres 15');
+    // optional fields render after required fields and before the bootstrapped timestamp
+    expect(prefix.indexOf('**First steps:**')).toBeLessThan(prefix.indexOf('**Entry points:**'));
+    expect(prefix.indexOf('**Environment:**')).toBeLessThan(prefix.indexOf('**Bootstrapped:**'));
+  });
+
+  it('renders only the present optional repo_overview fields in a mixed payload', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      repo_overview: {
+        tech_stack: 'Go',
+        directory_layout: 'cmd/ internal/',
+        first_steps_summary: 'go build ./...',
+        entry_points: 'cmd/server/main.go',
+        // test_layout and key_conventions absent
+        environment_requirements: 'Go 1.22',
+      },
+    });
+    expect(prefix).toContain('**Entry points:** cmd/server/main.go');
+    expect(prefix).toContain('**Environment:** Go 1.22');
+    expect(prefix).not.toContain('**Test layout:**');
+    expect(prefix).not.toContain('**Key conventions:**');
+  });
+
+  it('omits optional repo overview fields and provenance when absent', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'research' }],
+      repo_overview: {
+        tech_stack: 'TypeScript, Node',
+        directory_layout: 'src/ tests/',
+        first_steps_summary: 'npm install && npm test',
+      },
+    });
+    expect(prefix).toContain('## Repo Overview');
+    expect(prefix).not.toContain('**Entry points:**');
+    expect(prefix).not.toContain('**Test layout:**');
+    expect(prefix).not.toContain('**Key conventions:**');
+    expect(prefix).not.toContain('**Environment requirements:**');
+    expect(prefix).not.toContain('**Provenance:**');
   });
 });

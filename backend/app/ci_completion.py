@@ -553,6 +553,32 @@ async def _attempt_merge_with_retry_and_escalation(
                                 )
                             )
                         if record_pr_merged:
+                            # Ancestry gate before stamping the shipped badge:
+                            # ``record_pr_merged`` above trusts branch-NAME
+                            # equality / promotion-target classification, neither
+                            # of which confirms the merge commit actually reached
+                            # the integration branch. Verify reachability; a
+                            # definitive negative strands the orig (marker + alert
+                            # recorded by the gate) instead of stamping, while an
+                            # indeterminate result preserves flag-trust.
+                            from app.rollup_pr_verification import (
+                                verify_rollup_merge_landed,
+                            )
+
+                            if (
+                                await verify_rollup_merge_landed(
+                                    orig,
+                                    orig_project,
+                                    _orig_session,
+                                    pr_number=ci_pr_number,
+                                    merge_commit_sha=merge_result.get("sha"),
+                                    integration_branch=_integration_branch,
+                                    source="ci_completion.original_merge_success",
+                                )
+                                == "stranded"
+                            ):
+                                record_pr_merged = False
+                        if record_pr_merged:
                             apply_merged_landed_signal(
                                 orig,
                                 orig_project,
@@ -1669,7 +1695,18 @@ async def handle_ci_completion(
                 )
                 return False
 
-        ci_errors = ci_result.get("failed_logs", "CI checks failed")
+        ci_errors = ci_result.get("failed_logs", "") or ""
+        if not ci_errors.strip():
+            _fail_detail_names = ", ".join(
+                d.get("name", "")
+                for d in (ci_result.get("details") or [])
+                if d.get("conclusion") == "failure"
+            )
+            ci_errors = (
+                f"CI checks failed: {_fail_detail_names}"
+                if _fail_detail_names
+                else "no detail available (see workflow run)"
+            )
 
         # ── C2 lock-window break (CI-failure path) ──
         # The task row has been held FOR UPDATE since ~1341. ``create_pr_comment``

@@ -42,6 +42,21 @@ logger = logging.getLogger(__name__)
 # Maps priority string labels to integer values stored on Task.priority.
 TASK_PRIORITY_MAP: Dict[str, int] = {"high": 100, "medium": 50, "low": 0}
 
+# Maps mislabeled fresh-work type synonyms (LLM conventional-commit prefixes that
+# are not plan-spawnable) to the nearest eligible plan-spawnable type.  Applied
+# in-place before the skip gate in _handle_plan_completion so a subtask typed
+# "fix" or "feat" survives decomposition without widening PLAN_SUBTASK_TYPES.
+# Only types NOT already in the plan-child allowlist need an entry here.
+PLAN_SUBTASK_TYPE_COERCIONS: dict[str, str] = {
+    "fix": "create",
+    "bug": "create",
+    "feature": "create",
+    "feat": "create",
+    "improvement": "create",
+    "perf": "create",
+    "test": "qa",
+}
+
 
 def _parse_plan_output(text: str) -> Dict[str, Any] | None:
     """Extract structured plan JSON from agent output text.
@@ -593,6 +608,22 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     # The latter spawns AS ITSELF (no branch/PR) so a downstream implementation
     # child can validly depend on the knowledge it produces.
     plan_child_allowlist = PLAN_SUBTASK_TYPES | PLAN_KNOWLEDGE_SUBTASK_TYPES
+    # Coerce mislabeled fresh-work type synonyms before the skip gate so a
+    # subtask typed "fix" or "feat" survives without widening the allowlist.
+    type_coercions: dict[int, tuple[str, str]] = {}
+    for i, subtask_def in enumerate(subtasks):
+        raw_type = subtask_def.get("type", "create")
+        if raw_type not in plan_child_allowlist and raw_type in PLAN_SUBTASK_TYPE_COERCIONS:
+            target = PLAN_SUBTASK_TYPE_COERCIONS[raw_type]
+            subtask_def["type"] = target
+            type_coercions[i] = (raw_type, target)
+            logger.info(
+                "[PLAN] Coerced subtask %r type %r → %r in plan %s",
+                subtask_def.get("title", f"#{i}"),
+                raw_type,
+                target,
+                task.id,
+            )
     skipped_indices = set()
     skipped_reasons: dict[int, str] = {}
     for i, subtask_def in enumerate(subtasks):
@@ -612,50 +643,77 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                     f"invalid compute_experiment launch contract ({contract_reason})"
                 )
 
-    for i, subtask_def in enumerate(subtasks):
-        if i in skipped_indices:
-            continue
-        dep_indices = subtask_def.get("depends_on_indices", [])
-        for dep_idx in dep_indices:
-            if 0 <= dep_idx < len(subtasks) and dep_idx in skipped_indices:
-                skipped_title = subtasks[dep_idx].get("title", f"#{dep_idx}")
-                skipped_type = subtasks[dep_idx].get("type", "create")
-                dependent_title = subtask_def.get("title", f"#{i}")
-                skipped_reason = skipped_reasons.get(
-                    dep_idx, "not a registered plan-spawnable task type"
-                )
-                task.latest_status_message = (
-                    f"Plan has unsatisfiable dependency: {dependent_title!r} "
-                    f"depends on {skipped_title!r} (type {skipped_type!r}, "
-                    f"skipped because {skipped_reason})"
-                )[:500]
-                task.status = TaskStatus.FAILED
-                from app.failure_classification import (
-                    classify_failure,
-                    persist_failure_category,
-                )
-                from app.routers.agent_status import record_task_result
+    # Transitive cascade-skip: propagate skips to dependents whose declared
+    # producer was skipped.  Repeat until stable so multi-hop chains are
+    # fully resolved.  Only fail outright when nothing spawnable remains;
+    # when unrelated siblings exist they are still spawned.
+    cascade_changed = True
+    cascade_skipped: dict[int, tuple[str, int]] = {}
+    while cascade_changed:
+        cascade_changed = False
+        for i, subtask_def in enumerate(subtasks):
+            if i in skipped_indices:
+                continue
+            for dep_idx in subtask_def.get("depends_on_indices", []):
+                if 0 <= dep_idx < len(subtasks) and dep_idx in skipped_indices:
+                    dep_title = subtasks[dep_idx].get("title", f"#{dep_idx}")
+                    skipped_indices.add(i)
+                    skipped_reasons[i] = (
+                        f"cascade-skipped: depends on skipped subtask {dep_title!r}"
+                    )
+                    cascade_skipped[i] = (subtask_def.get("title", f"#{i}"), dep_idx)
+                    cascade_changed = True
+                    break
 
-                _fc = classify_failure(task)
-                persist_failure_category(task, _fc)
-                record_task_result(
-                    success=False,
-                    failure_class=_fc,
-                    task_id=str(task.id),
-                    task_type=task.first_payload.get("type", ""),
-                )
-                session.add(task)
-                await _maybe_create_failure_alert(
-                    task, session, task.latest_status_message
-                )
-                await session.commit()
-                logger.error(
-                    "[PLAN] Plan %s failed — dependent %r references skipped producer %r",
-                    task.id,
-                    dependent_title,
-                    skipped_title,
-                )
-                return
+    if cascade_skipped:
+        ctx = dict(task.context or {})
+        ctx["plan_subtask_cascade_skipped"] = [
+            {"index": i, "title": title, "skipped_dep_index": dep_idx}
+            for i, (title, dep_idx) in cascade_skipped.items()
+        ]
+        task.context = ctx
+        session.add(task)
+
+    if len(skipped_indices) == len(subtasks):
+        if cascade_skipped:
+            first_cs_dep = next(iter(cascade_skipped.values()))[1]
+            root_title = subtasks[first_cs_dep].get("title", f"#{first_cs_dep}")
+            root_reason = skipped_reasons.get(
+                first_cs_dep, "not a registered plan-spawnable task type"
+            )
+            msg = (
+                f"Plan has unsatisfiable dependency: all subtasks skipped "
+                f"(root: {root_title!r} — {root_reason})"
+            )
+        else:
+            msg = "Plan has no spawnable subtasks: all subtask types are ineligible"
+        task.latest_status_message = msg[:500]
+        task.status = TaskStatus.FAILED
+        from app.failure_classification import (
+            classify_failure,
+            persist_failure_category,
+        )
+        from app.routers.agent_status import record_task_result
+
+        _fc = classify_failure(task)
+        persist_failure_category(task, _fc)
+        record_task_result(
+            success=False,
+            failure_class=_fc,
+            task_id=str(task.id),
+            task_type=task.first_payload.get("type", ""),
+        )
+        session.add(task)
+        await _maybe_create_failure_alert(task, session, task.latest_status_message)
+        await session.commit()
+        logger.error(
+            "[PLAN] Plan %s failed — no spawnable subtasks after cascade-skip "
+            "(%d of %d total skipped)",
+            task.id,
+            len(skipped_indices),
+            len(subtasks),
+        )
+        return
 
     # Acceptance-evidence forward-carry through decomposition (parent → child).
     # A finding routed through the plan agent carries its declared acceptance
@@ -851,6 +909,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "experiment",
                             "benchmark",
                             "metric",
+                            "hypothesis",
                             "cwd",
                             "env",
                             "accelerator",
@@ -860,6 +919,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "live_release_proof",
                             "live_release_proof_marker",
                             "requires_live_release",
+                            "require_durable_artifact",
                         )
                         if compute_contract.get(key) is not None
                     },
@@ -960,6 +1020,16 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                     else {}
                 ),
                 **({"hotfix": True} if parent_hotfix else {}),
+                **(
+                    {
+                        "type_coercion": {
+                            "original_type": type_coercions[i][0],
+                            "coerced_type": type_coercions[i][1],
+                        }
+                    }
+                    if i in type_coercions
+                    else {}
+                ),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,

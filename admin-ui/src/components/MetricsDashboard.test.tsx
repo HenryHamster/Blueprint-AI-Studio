@@ -58,6 +58,8 @@ const { apiFetch } = vi.hoisted(() => ({
       },
       baseline_captured_at: '2026-05-01T00:00:00Z',
       last_snapshot_at: '2026-05-08T00:00:00Z',
+      format_compliance: { format_compliance_rate: { current: 0.5, baseline: 0.4, drift_pct: 25.0, history: [{ captured_at: '2026-05-01T00:00:00Z', value: 0.5 }] }, self_repair_success_rate: { current: 0.75, baseline: 0.5, drift_pct: 50.0, history: [{ captured_at: '2026-05-01T00:00:00Z', value: 0.75 }] }, tasks_measured: 8, well_formed_tasks: 4, format_error_total: 4, repair_attempts: 2, repair_successes: 2 },
+      agent_timeout_rate: { overall: { current: 0.125, baseline: 0.25, drift_pct: -50.0, history: [{ captured_at: '2026-05-01T00:00:00Z', value: 0.125 }] }, by_subtype: { execution_timeout: { current: 0.125, baseline: 0.25, drift_pct: -50.0 } }, dominant_subtype: 'execution_timeout', dominant_share: 0.75, denominator: 8, denominator_definition: 'timed-out tasks / completed-or-failed tasks', timeout_count: 1, window_days: 7 },
       warm_start_origin_breakdown: {
         warm_pool: 9,
         backlog_reuse: 3,
@@ -257,6 +259,162 @@ describe('MetricsDashboard', () => {
     expect(caveat).toHaveTextContent(/pool share/i);
   });
 
+  it('renders optional nested efficiency blocks when present and omits them when absent', async () => {
+    const renderDashboard = () => render(
+      <MetricsDashboard
+        metricsHistory={[]}
+        cumulativeCost={0}
+        cumulativeVmHours={0}
+        maxConcurrentVMs={4}
+        tasks={[]}
+        metricsWindow="6h"
+        onWindowChange={vi.fn()}
+        projectId="project-1"
+      />,
+    );
+
+    const { unmount } = renderDashboard();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const formatCompliance = screen.getByTestId('format-compliance-block');
+    expect(formatCompliance).toHaveTextContent('50.0%');
+    expect(formatCompliance).toHaveTextContent('75.0%');
+
+    const timeoutRate = screen.getByTestId('agent-timeout-rate-block');
+    expect(timeoutRate).toHaveTextContent('12.5%');
+    expect(timeoutRate).toHaveTextContent('dominant subtype: execution_timeout');
+
+    const original = apiFetch.getMockImplementation();
+    if (!original) throw new Error('apiFetch mock implementation missing');
+    unmount();
+    apiFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/efficiency-axes')) {
+        return new Response(JSON.stringify({ axes: { cost_per_merged_pr: { current: 45.2, baseline: 50.0, drift_pct: -9.6, history: [] } }, baseline_captured_at: '2026-05-01T00:00:00Z', last_snapshot_at: '2026-05-08T00:00:00Z' }), { status: 200 });
+      }
+      return original(url);
+    });
+
+    renderDashboard();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByTestId('format-compliance-block')).toBeNull();
+    expect(screen.queryByTestId('agent-timeout-rate-block')).toBeNull();
+    apiFetch.mockImplementation(original);
+  });
+
+  it('renders efficiency axis baseline provenance when seeded_at differs from baseline_captured_at', async () => {
+    const original = apiFetch.getMockImplementation();
+    if (!original) throw new Error('apiFetch mock implementation missing');
+    apiFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/efficiency-axes')) {
+        return new Response(JSON.stringify({
+          axes: {
+            cost_per_merged_pr: {
+              current: 40.0,
+              baseline: 50.0,
+              drift_pct: -20.0,
+              history: [],
+              baseline_seeded_at: '2026-05-15T00:00:00Z',
+              baseline_seed_snapshot_at: '2026-05-15T00:00:00Z',
+            },
+            vm_reuse_rate: {
+              current: 72,
+              baseline: 68,
+              drift_pct: 5.9,
+              history: [],
+            },
+          },
+          baseline_captured_at: '2026-05-01T00:00:00Z',
+          last_snapshot_at: '2026-05-20T00:00:00Z',
+        }), { status: 200 });
+      }
+      return original(url);
+    });
+
+    try {
+      render(
+        <MetricsDashboard
+          metricsHistory={[]}
+          cumulativeCost={0}
+          cumulativeVmHours={0}
+          maxConcurrentVMs={4}
+          tasks={[]}
+          metricsWindow="6h"
+          onWindowChange={vi.fn()}
+          projectId="project-1"
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      // Axis that was re-seeded after the top-level baseline shows provenance
+      const provenance = screen.getByTestId('axis-reseed-provenance-cost_per_merged_pr');
+      expect(provenance).toBeInTheDocument();
+      expect(provenance).toHaveTextContent(/baseline re-seeded/i);
+      expect(provenance).toHaveTextContent(/snapshot/i);
+
+      // Axis without re-seed provenance does not show the provenance element
+      expect(screen.queryByTestId('axis-reseed-provenance-vm_reuse_rate')).toBeNull();
+    } finally {
+      apiFetch.mockImplementation(original);
+    }
+  });
+
+  it('renders cleanly when per-axis provenance fields are absent (older payload)', async () => {
+    const original = apiFetch.getMockImplementation();
+    if (!original) throw new Error('apiFetch mock implementation missing');
+    apiFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/efficiency-axes')) {
+        return new Response(JSON.stringify({
+          axes: {
+            cost_per_merged_pr: {
+              current: 45.2,
+              baseline: 50.0,
+              drift_pct: -9.6,
+              history: [],
+              // No baseline_seeded_at or baseline_seed_snapshot_at — older payload
+            },
+          },
+          baseline_captured_at: '2026-05-01T00:00:00Z',
+          last_snapshot_at: '2026-05-08T00:00:00Z',
+        }), { status: 200 });
+      }
+      return original(url);
+    });
+
+    try {
+      render(
+        <MetricsDashboard
+          metricsHistory={[]}
+          cumulativeCost={0}
+          cumulativeVmHours={0}
+          maxConcurrentVMs={4}
+          tasks={[]}
+          metricsWindow="6h"
+          onWindowChange={vi.fn()}
+          projectId="project-1"
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      // Baseline value still renders
+      expect(screen.getByText(/baseline: 50.0\$/)).toBeInTheDocument();
+      // No provenance row rendered
+      expect(screen.queryByTestId('axis-reseed-provenance-cost_per_merged_pr')).toBeNull();
+    } finally {
+      apiFetch.mockImplementation(original);
+    }
+  });
+
   it('omits the origin breakdown when the axes response lacks it', async () => {
     const original = apiFetch.getMockImplementation();
     if (!original) throw new Error('apiFetch mock implementation missing');
@@ -296,4 +454,5 @@ describe('MetricsDashboard', () => {
       apiFetch.mockImplementation(original);
     }
   });
+
 });

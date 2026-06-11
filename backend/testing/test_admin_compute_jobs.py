@@ -13,11 +13,15 @@ import pytest
 from httpx import AsyncClient
 
 from app.models import (
+    Artifact,
+    ArtifactType,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
+    KnowledgeDocument,
     Project,
     ProjectMember,
+    SourceKind,
     Task,
     TaskStatus,
 )
@@ -38,7 +42,15 @@ async def _add_member(session, project_id, role):
     await session.commit()
 
 
-async def _make_job(session, project, *, status=ComputeJobStatus.RUNNING, title="compute_experiment task"):
+async def _make_job(
+    session,
+    project,
+    *,
+    status=ComputeJobStatus.RUNNING,
+    title="compute_experiment task",
+    with_artifact=False,
+    polling_metadata=None,
+):
     task = Task(
         project_id=project.id,
         title=title,
@@ -48,6 +60,17 @@ async def _make_job(session, project, *, status=ComputeJobStatus.RUNNING, title=
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    artifact = None
+    if with_artifact:
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.COMPUTE_RESULT,
+            storage_uri="gs://bucket/jobs/job-1/result.parquet",
+            logical_key="compute-result-job-1",
+        )
+        session.add(artifact)
+        await session.commit()
+        await session.refresh(artifact)
     job = ComputeJob(
         task_id=task.id,
         project_id=project.id,
@@ -57,18 +80,27 @@ async def _make_job(session, project, *, status=ComputeJobStatus.RUNNING, title=
         spend_cap_usd=2.0,
         accrued_cost_usd=0.5,
         result_reference="https://storage.example.com/jobs/job-1/result.json",
+        artifact_id=artifact.id if artifact else None,
+        polling_metadata=polling_metadata or {},
     )
     session.add(job)
     await session.commit()
     await session.refresh(job)
-    return task, job
+    return task, job, artifact
 
 
 @pytest.mark.asyncio
 async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     project = await _make_project(db_session)
     await _add_member(db_session, project.id, "viewer")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
+    job.polling_metadata = {
+        "zone": "us-central1-a",
+        "operation": "op-123",
+        "command": "python launch.py --secret",
+    }
+    db_session.add(job)
+    await db_session.commit()
 
     resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
     assert resp.status_code == 200
@@ -78,6 +110,55 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     assert jobs[0]["task_title"] == "compute_experiment task"
     assert jobs[0]["task_type"] == "compute_experiment"
     assert jobs[0]["result_reference"] == "https://storage.example.com/jobs/job-1/result.json"
+    # A job with only a raw result_reference and no linked Artifact must expose
+    # the descriptor explicitly as null so operators can tell the two apart.
+    assert jobs[0]["artifact"] is None
+    assert "command" not in jobs[0]["polling_metadata"]
+
+
+@pytest.mark.asyncio
+async def test_linked_compute_result_artifact_descriptor_serialized(
+    client: AsyncClient, db_session
+):
+    """A job whose artifact_id resolves to a COMPUTE_RESULT Artifact exposes a
+    structured `artifact` descriptor carrying the artifact's identity and
+    download affordance (id/type/storage_uri/logical_key/created_at)."""
+    project = await _make_project(db_session, name="Linked Artifact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job, artifact = await _make_job(db_session, project, with_artifact=True)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["id"] == str(job.id)
+    assert jobs[0]["artifact_id"] == str(artifact.id)
+
+    descriptor = jobs[0]["artifact"]
+    assert descriptor is not None
+    assert descriptor["id"] == str(artifact.id)
+    assert descriptor["artifact_type"] == ArtifactType.COMPUTE_RESULT.value
+    assert descriptor["storage_uri"] == "gs://bucket/jobs/job-1/result.parquet"
+    assert descriptor["logical_key"] == "compute-result-job-1"
+    assert descriptor["created_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_no_artifact_omits_descriptor(
+    client: AsyncClient, db_session
+):
+    """A job carrying only a result_reference (no artifact_id) must serialize a
+    null `artifact` descriptor — the distinction has to be explicit."""
+    project = await _make_project(db_session, name="No Artifact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job, _artifact = await _make_job(db_session, project)
+    assert job.artifact_id is None
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert jobs[0]["artifact"] is None
+    assert jobs[0]["result_reference"] is not None
 
 
 @pytest.mark.asyncio
@@ -93,7 +174,7 @@ async def test_list_compute_jobs_non_member_404(client: AsyncClient, db_session)
 async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Killable")
     await _add_member(db_session, project.id, "member")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 200
@@ -109,7 +190,7 @@ async def test_kill_compute_job_backend_terminate_failure_returns_diagnostic(
 ):
     project = await _make_project(db_session, name="Kill RPC Failure")
     await _add_member(db_session, project.id, "member")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
     job.external_compute_id = "admin-kill-rpc-failure"
     db_session.add(job)
     await db_session.commit()
@@ -134,16 +215,35 @@ async def test_kill_compute_job_backend_terminate_failure_returns_diagnostic(
 
 
 @pytest.mark.asyncio
-async def test_kill_compute_job_viewer_forbidden(client: AsyncClient, db_session):
+async def test_kill_compute_job_viewer_returns_404(client: AsyncClient, db_session):
+    """Viewers must not be able to confirm job existence via a 403 response (IDOR)."""
     project = await _make_project(db_session, name="Viewer Only")
     await _add_member(db_session, project.id, "viewer")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
-    assert resp.status_code == 403
-    # Job remains active — the forbidden kill must not have mutated it.
+    # Must be 404, not 403, so job existence is not leaked to callers without kill rights.
+    assert resp.status_code == 404
+    # Job remains active — the unauthorized kill must not have mutated it.
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_kill_cross_project_job_returns_404(client: AsyncClient, db_session):
+    """A member of project A must get 404 (not 403) when killing project B's job.
+
+    The response must be indistinguishable from a missing job to prevent IDOR.
+    """
+    project_a = await _make_project(db_session, name="Project A")
+    await _add_member(db_session, project_a.id, "member")
+
+    project_b = await _make_project(db_session, name="Project B")
+    # Deliberately no membership in project_b for the test user.
+    _task_b, job_b, _artifact_b = await _make_job(db_session, project_b)
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job_b.id}/kill")
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -156,10 +256,123 @@ async def test_kill_compute_job_missing_404(client: AsyncClient, db_session):
 async def test_kill_already_terminal_returns_409(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Already Done")
     await _add_member(db_session, project.id, "member")
-    _task, job = await _make_job(db_session, project, status=ComputeJobStatus.SUCCEEDED)
+    _task, job, _artifact = await _make_job(db_session, project, status=ComputeJobStatus.SUCCEEDED)
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 409
+
+
+async def _make_job_with_polling_metadata(session, project, polling_metadata):
+    """Seed a job whose polling_metadata carries the given dict (for redaction tests)."""
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        polling_metadata=polling_metadata,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return task, job
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_redacts_launch_secrets(client: AsyncClient, db_session):
+    """Operator list must not expose raw env values, command, or cwd, but must
+    preserve operator-useful keys like live_release_evidence, result_metrics,
+    and compute_rpc_diagnostic."""
+    project = await _make_project(db_session, name="Redact List")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "command": ["python3", "run_experiment.py"],
+            "cwd": "/workspace",
+            "env": {"SECRET_TOKEN": "super-secret-value", "ANOTHER_VAR": "another-secret"},
+            "live_release_evidence": {"version": "v8", "metrics": {"cpm": 1.23}},
+            "result_metrics": {"accuracy": 0.95},
+            "compute_rpc_diagnostic": {"operation": "poll", "error_message": "timeout"},
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_jobs"][0]["polling_metadata"]
+
+    # Secret-bearing fields must be absent.
+    assert "command" not in pm
+    assert "cwd" not in pm
+
+    assert "env" not in pm
+
+    # Operator-useful keys must survive redaction.
+    assert pm["live_release_evidence"] == {"version": "v8", "metrics": {"cpm": 1.23}}
+    assert pm["result_metrics"] == {"accuracy": 0.95}
+    assert pm["compute_rpc_diagnostic"]["operation"] == "poll"
+
+
+@pytest.mark.asyncio
+async def test_kill_compute_job_redacts_launch_secrets(client: AsyncClient, db_session):
+    """Kill response must apply the same polling_metadata redaction as the list."""
+    project = await _make_project(db_session, name="Redact Kill")
+    await _add_member(db_session, project.id, "member")
+    _task, job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "command": ["python3", "run.py"],
+            "cwd": "/workspace",
+            "env": {"API_KEY": "top-secret"},
+            "live_release_evidence": {"version": "v8"},
+        },
+    )
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_job"]["polling_metadata"]
+
+    assert "command" not in pm
+    assert "cwd" not in pm
+    assert "env" not in pm
+    assert pm["live_release_evidence"] == {"version": "v8"}
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_strips_non_dict_env_payload(
+    client: AsyncClient, db_session
+):
+    """Operator list must drop env entirely even if the payload shape is odd."""
+    project = await _make_project(db_session, name="Non Dict Env")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "env": "PATH=/workspace/bin",
+            "command": ["python3", "run.py"],
+            "cwd": "/workspace",
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    metadata = resp.json()["compute_jobs"][0]["polling_metadata"]
+    assert "env" not in metadata
+    assert "command" not in metadata
+    assert "cwd" not in metadata
 
 
 @pytest.mark.asyncio
@@ -169,7 +382,7 @@ async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_se
     terminal job rather than blowing up with a 500."""
     project = await _make_project(db_session, name="Peer Terminal")
     await _add_member(db_session, project.id, "member")
-    _task, job = await _make_job(db_session, project)
+    _task, job, _artifact = await _make_job(db_session, project)
 
     # Simulate the peer-terminal race: kill_compute_job returns None (peer won),
     # but the job in DB is already CANCELLED.
@@ -189,3 +402,215 @@ async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_se
     body = resp.json()["compute_job"]
     assert body["status"] == ComputeJobStatus.CANCELLED.value
     assert body["outcome"] == ComputeJobOutcome.CANCELLED.value
+
+
+
+_SENSITIVE_POLLING_METADATA = {
+    "env": {"SECRET_KEY": "mysecret", "DATABASE_URL": "postgres://..."},
+    "command": "python3 run_experiment.py --flag",
+    "cwd": "/home/agent/workspace",
+    "status_message": "running",
+    "result_metrics": {"accuracy": 0.95},
+}
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_strips_sensitive_polling_metadata(
+    client: AsyncClient, db_session
+):
+    """List endpoint must not expose env, command, or cwd in polling_metadata."""
+    project = await _make_project(db_session, name="Sensitive List")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job, _artifact = await _make_job(
+        db_session, project, polling_metadata=_SENSITIVE_POLLING_METADATA
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    job_data = resp.json()["compute_jobs"][0]
+    metadata = job_data["polling_metadata"]
+    assert "env" not in metadata
+    assert "command" not in metadata
+    assert "cwd" not in metadata
+    # Non-sensitive fields are preserved
+    assert metadata.get("status_message") == "running"
+    assert metadata.get("result_metrics") == {"accuracy": 0.95}
+
+
+@pytest.mark.asyncio
+async def test_kill_compute_job_strips_sensitive_polling_metadata(
+    client: AsyncClient, db_session
+):
+    """Kill endpoint must not expose env, command, or cwd in polling_metadata."""
+    project = await _make_project(db_session, name="Sensitive Kill")
+    await _add_member(db_session, project.id, "member")
+    _task, job, _artifact = await _make_job(
+        db_session, project, polling_metadata=_SENSITIVE_POLLING_METADATA
+    )
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
+    assert resp.status_code == 200
+    metadata = resp.json()["compute_job"]["polling_metadata"]
+    assert "env" not in metadata
+    assert "command" not in metadata
+    assert "cwd" not in metadata
+    # Non-sensitive fields survive (result_metrics is not mutated by the kill path)
+    assert metadata.get("result_metrics") == {"accuracy": 0.95}
+
+
+# ---------------------------------------------------------------------------
+# Analyze endpoint tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_terminal_job_with_task(
+    session,
+    project,
+    *,
+    status=ComputeJobStatus.SUCCEEDED,
+    plan_output=None,
+    result_reference="gs://bucket/jobs/job-1/result.json",
+):
+    """Seed a terminal compute job with an optional plan_output on its task."""
+    task = Task(
+        project_id=project.id,
+        title="compute experiment task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "experiment": "exp_v1"}],
+        plan_output=plan_output or {},
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=status,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=1.5,
+        result_reference=result_reference,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return task, job
+
+
+async def _seed_knowledge_doc(session, project, task):
+    """Seed a deterministic compute-experiment KnowledgeDocument for task."""
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        title="Compute experiment: exp_v1 — SUCCESS",
+        summary="Outcome: SUCCESS.",
+        body="# Compute experiment verdict\n- **Outcome:** SUCCESS",
+        topic="exp_v1",
+        tags=["compute_experiment", "SUCCESS"],
+        source_citations=[],
+        forward_quality_verdict={
+            "strategy": "metric",
+            "outcome": "SUCCESS",
+            "analysis_mode": "deterministic",
+        },
+    )
+    session.add(doc)
+    await session.commit()
+    await session.refresh(doc)
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_analyze_compute_job_missing_404(client: AsyncClient, db_session):
+    resp = await client.post(f"/api/admin/compute-jobs/{uuid.uuid4()}/analyze")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_analyze_compute_job_viewer_forbidden(client: AsyncClient, db_session):
+    project = await _make_project(db_session, name="Analyze Viewer")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job = await _make_terminal_job_with_task(db_session, project)
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job.id}/analyze")
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_analyze_compute_job_nonterminal_returns_409(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session, name="Analyze Running")
+    await _add_member(db_session, project.id, "member")
+    _task, job, _artifact = await _make_job(db_session, project, status=ComputeJobStatus.RUNNING)
+
+    resp = await client.post(f"/api/admin/compute-jobs/{job.id}/analyze")
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_analyze_compute_job_member_ok(client: AsyncClient, db_session):
+    """A terminal job returns 200 with status=upgraded when analysis succeeds (mocked)."""
+    project = await _make_project(db_session, name="Analyze Member OK")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.5}},
+    )
+    doc = await _seed_knowledge_doc(db_session, project, task)
+
+    canned_envelope = {
+        "status": "upgraded",
+        "reason": None,
+        "analysis_mode": "llm",
+        "knowledge_document_id": str(doc.id),
+    }
+    with patch(
+        "app.knowledge_completion.analyze_compute_experiment_knowledge",
+        new=AsyncMock(return_value=canned_envelope),
+    ):
+        resp = await client.post(f"/api/admin/compute-jobs/{job.id}/analyze")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "upgraded"
+    assert body["analysis_mode"] == "llm"
+
+
+@pytest.mark.asyncio
+async def test_analyze_endpoint_persists_unavailable_cause(
+    client: AsyncClient, db_session
+):
+    """When analysis ends unavailable, the cause is stamped on the stored doc's
+    forward_quality_verdict without changing analysis_mode, and the endpoint
+    returns status=analysis_unavailable with the doc id."""
+    project = await _make_project(db_session, name="Analyze Unavailable")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.5}},
+    )
+    doc = await _seed_knowledge_doc(db_session, project, task)
+    original_mode = doc.forward_quality_verdict.get("analysis_mode")
+
+    # Force the analysis-disabled path for deterministic behavior.
+    with patch.dict("os.environ", {"DISABLE_LLM_COMPUTE_ANALYSIS": "1"}):
+        resp = await client.post(f"/api/admin/compute-jobs/{job.id}/analyze")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "analysis_unavailable"
+    assert body["reason"] == "analysis-disabled"
+    assert body.get("knowledge_document_id") == str(doc.id)
+
+    # The stored doc must carry the unavailable_cause stamp.
+    await db_session.refresh(doc)
+    verdict = doc.forward_quality_verdict
+    assert verdict.get("unavailable_cause") == "analysis-disabled"
+    assert verdict.get("analysis_attempted_at") is not None
+    # analysis_mode must not have changed.
+    assert verdict.get("analysis_mode") == original_mode

@@ -4,14 +4,17 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 // processes or touching the network. execFileAsync is the runner-invocation
 // seam we control per-test to simulate placeholder / empty / real suites.
 // vi.hoisted so the fn is initialized before the hoisted vi.mock factory runs.
-const { execFileAsync } = vi.hoisted(() => ({
+const { execFileAsync, mockApiPost, mockReaddirSync } = vi.hoisted(() => ({
   execFileAsync: vi.fn<(cmd: string, args: string[], opts?: unknown) => Promise<string>>(),
+  mockApiPost: vi.fn<(path: string, body?: Record<string, unknown>) => Promise<unknown>>(),
+  mockReaddirSync: vi.fn<(path: fs.PathLike) => string[]>(),
 }));
 vi.mock('../index.js', () => ({
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
   sendHeartbeatSync: vi.fn(),
   execFileAsync,
+  apiPost: mockApiPost,
   errorFingerprint: (s: string) => s.slice(0, 64),
   git: vi.fn(() => ''),
 }));
@@ -42,14 +45,17 @@ vi.mock('fs', () => ({
     existsSync: vi.fn((p: unknown) =>
       typeof p === 'string' && (p.endsWith('/node_modules') || p.includes('/node_modules/')),
     ),
+    readdirSync: mockReaddirSync,
     readFileSync: vi.fn(() => ''),
     unlinkSync: vi.fn(),
   },
 }));
 
 import fs from 'fs';
-import { testFixLoop, matchesSizeBreachSignature, matchesTransientSetupFailure } from './test-fix-loop.js';
+import { captureTestBaseline, testFixLoop, matchesSizeBreachSignature, matchesTransientSetupFailure } from './test-fix-loop.js';
 import { runClaudeCode } from '../providers/runners.js';
+import { apiPost } from '../index.js';
+import { expectCalledWith } from './typed-mock-call.js';
 import type { TestRunner } from './test-runners.js';
 
 // Default fs.existsSync behavior matching the module-level mock factory:
@@ -74,6 +80,7 @@ const statusRef = { value: '' };
 describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(apiPost).mockResolvedValue({ persisted: true });
   });
 
   it('placeholder command that exits non-zero → noTestsExecuted=true', async () => {
@@ -350,6 +357,85 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
   });
 });
 
+describe('captureTestBaseline build-config discovery reporting', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(apiPost).mockResolvedValue({ persisted: true });
+  });
+
+  it('posts a successful root runner as repo-relative path "."', async () => {
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) => {
+      const s = String(p);
+      return s.endsWith('/package.json');
+    });
+    vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
+      const s = String(p);
+      if (s.endsWith('/package.json')) return JSON.stringify({ scripts: { test: 'npm test' } });
+      return '';
+    });
+    vi.mocked(execFileAsync).mockResolvedValueOnce('ok');
+
+    const result = await captureTestBaseline(null, { value: '' });
+
+    expect(result).toBeInstanceOf(Set);
+    expect((result as Set<string>).size).toBe(0);
+    expect(vi.mocked(apiPost)).toHaveBeenCalledTimes(1);
+    expectCalledWith(apiPost, '/api/agent/build-config-discovery', {
+      discovered_directories: [
+        {
+          path: '.',
+          type: 'node',
+          test_cmd: 'npm test',
+          executed_successfully: true,
+        },
+      ],
+    });
+  });
+
+  it('omits runners that fail or time out and still reports earlier successes', async () => {
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) => {
+      const s = String(p);
+      return (
+        s.endsWith('/packages') ||
+        s.endsWith('/packages/a/package.json') ||
+        s.endsWith('/packages/b/package.json')
+      );
+    });
+    const workspace = process.env.AGENT_WORKSPACE ?? '/tmp/workspace';
+    mockReaddirSync.mockImplementation((p: fs.PathLike) => {
+      const s = String(p);
+      if (s === workspace) return ['packages'] as unknown as string[];
+      if (s === `${workspace}/packages`) return ['a', 'b'] as unknown as string[];
+      return [] as unknown as string[];
+    });
+    vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
+      const s = String(p);
+      if (s.endsWith('/packages/a/package.json') || s.endsWith('/packages/b/package.json')) {
+        return JSON.stringify({ scripts: { test: 'npm test' } });
+      }
+      return '';
+    });
+    execFileAsync
+      .mockResolvedValueOnce('ok')
+      .mockRejectedValueOnce(Object.assign(new Error('Command failed: npm test'), { killed: true, code: 'ETIMEDOUT' }));
+
+    const result = await captureTestBaseline(null, { value: '' });
+
+    expect(result).toBeNull();
+    expect(vi.mocked(apiPost)).toHaveBeenCalledTimes(1);
+    expectCalledWith(apiPost, '/api/agent/build-config-discovery', {
+      discovered_directories: [
+        {
+          path: 'packages/a',
+          type: 'node',
+          test_cmd: 'npm test',
+          executed_successfully: true,
+        },
+      ],
+    });
+  });
+});
+
 // The structured assertion test_invariants._size_breach_message emits, verbatim
 // in shape (path + line count + limit + the module_size_limits.json pointer).
 const SIZE_BREACH_FAILURE =
@@ -414,6 +500,7 @@ describe('matchesSizeBreachSignature', () => {
 describe('testFixLoop — deterministic size-breach remediation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
   });
 
   it('auto-bumps the cap via check_size_limits.py --fix and re-verifies — no LLM call', async () => {

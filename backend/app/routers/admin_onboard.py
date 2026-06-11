@@ -951,6 +951,31 @@ async def onboard_project(
     await session.commit()
     await session.refresh(project)
 
+    # Auto-spawn a repo_bootstrap task for non-self-repo, non-empty projects
+    # that have not already been bootstrapped. This runs once before the first
+    # strategic cycle to seed design doc sections and confirm build/test commands.
+    try:
+        from app.repo_bootstrap import spawn_bootstrap_task
+
+        _result = await spawn_bootstrap_task(
+            project,
+            session,
+            is_first_bootstrap=True,
+            spawn_reason="first_cycle",
+        )
+        if _result.outcome == "spawned":
+            await session.commit()
+            logger.info(
+                "[ONBOARD] Spawned repo_bootstrap task %s for project %s",
+                _result.task_id,
+                project.id,
+            )
+    except Exception:
+        logger.exception(
+            "[ONBOARD] Failed to spawn repo_bootstrap task for project %s — continuing",
+            project.id,
+        )
+
     response["project_id"] = str(project.id)
     response["build_config"] = project.build_config or build_config or {}
     response["merge_verification_verdict"] = compute_merge_verification_verdict(project)

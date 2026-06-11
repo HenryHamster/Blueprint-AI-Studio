@@ -2,17 +2,31 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import DeploymentState, ReleaseDeployArtifact, ReleaseVersion
+from app.deploy_identity import (
+    DeployIdentity,
+    deploy_repo_identity,
+    project_matches_deploy_identity,
+)
+from app.models import (
+    DeploymentState,
+    Project,
+    ReleaseDeployArtifact,
+    ReleaseVersion,
+)
+
+logger = logging.getLogger(__name__)
 
 BACKEND_REVISION_ARTIFACT_KIND = "backend_revision"
 AGENT_IMAGE_ARTIFACT_KIND = "agent_image"
+PROMOTION_MERGE_ARTIFACT_KIND = "promotion_merge"
 
 ServingDecision = tuple[str, str | None, datetime | None]
 ServingCheck = Callable[
@@ -20,12 +34,49 @@ ServingCheck = Callable[
     Awaitable[ServingDecision | None],
 ]
 
+# Per-project observability predicate: given a project and the resolved
+# deploy-level identity (``(owner, repo)`` or ``None``), is this provider's
+# serving signal READABLE for that project?  A provider that is not observable
+# is never armed at promotion and never swept — so it can never strand a
+# version waiting on a signal nothing can read.
+ObservabilityPredicate = Callable[[Project | None, DeployIdentity], bool]
+
+
+def _observable_for_any_github_project(
+    project: Project | None,
+    _identity: DeployIdentity,
+) -> bool:
+    """Merge-level observability: any project with an authorized GitHub repo.
+
+    The promotion target branch is reachable through the project's own GitHub
+    credentials, so the merge-persisted verdict is available for every GitHub
+    project regardless of the deploy identity.
+    """
+    if project is None:
+        return False
+    return bool(
+        (getattr(project, "github_owner", None) or "")
+        and (getattr(project, "github_repo", None) or "")
+    )
+
+
+def _observable_for_deploy_identity(
+    project: Project | None,
+    identity: DeployIdentity,
+) -> bool:
+    """Deploy-level observability: the project IS the repo this deploy serves."""
+
+    return project_matches_deploy_identity(project, identity)
+
 
 @dataclass(frozen=True)
 class ReleaseArtifactProvider:
     artifact_kind: str
     check: ServingCheck
     required: bool = True
+    # Default: observable everywhere (a provider that does not opt into a
+    # narrower predicate is treated as universally readable).
+    observable: ObservabilityPredicate = lambda _project, _identity: True
 
 
 _ARTIFACT_PROVIDERS: dict[str, ReleaseArtifactProvider] = {}
@@ -46,16 +97,44 @@ def register_release_artifact_provider(
     check: ServingCheck,
     *,
     required: bool = True,
+    observable: ObservabilityPredicate | None = None,
 ) -> None:
     _ARTIFACT_PROVIDERS[artifact_kind] = ReleaseArtifactProvider(
         artifact_kind=artifact_kind,
         check=check,
         required=required,
+        **(
+            {"observable": observable}
+            if observable is not None
+            else {}
+        ),
     )
 
 
 def iter_release_artifact_providers() -> tuple[ReleaseArtifactProvider, ...]:
     return tuple(_ARTIFACT_PROVIDERS.values())
+
+
+def observable_release_artifact_providers(
+    project: Project | None,
+    identity: DeployIdentity = None,
+) -> tuple[ReleaseArtifactProvider, ...]:
+    """Providers whose serving signal is READABLE for *project*.
+
+    ``identity`` (the resolved deploy-level ``(owner, repo)``) may be passed in
+    to resolve it once per sweep; left ``None`` it is resolved here.  This is
+    the single source of truth for which artifact rows a version gets armed and
+    swept with: a provider absent from this set is never created/checked for the
+    project, so a deploy-level provider can never strand a non-deploy project's
+    promotion waiting on a Cloud Run signal that does not exist for it.
+    """
+    if identity is None:
+        identity = deploy_repo_identity()
+    return tuple(
+        provider
+        for provider in _ARTIFACT_PROVIDERS.values()
+        if provider.observable(project, identity)
+    )
 
 
 def required_release_artifact_kinds() -> tuple[str, ...]:
@@ -148,6 +227,9 @@ def aggregate_required_artifact_status(
 def summarize_release_artifacts(
     version: ReleaseVersion,
     artifacts: Iterable[ReleaseDeployArtifact] | None,
+    *,
+    project: Project | None = None,
+    identity: DeployIdentity = None,
 ) -> tuple[dict[str, str | None], list[dict[str, Any]]]:
     """Summarize aggregate serving truth plus per-provider evidence.
 
@@ -165,7 +247,28 @@ def summarize_release_artifacts(
     the sweep can never resolve, wedging the next version. When no artifact
     evidence exists at all (for example, an open version that has never
     promoted), the helper preserves the scalar truth instead of inventing one.
+
+    When ``project`` is supplied the backend_revision legacy-scalar projection is
+    gated on the backend_revision provider being OBSERVABLE for that project (the
+    deploy-level identity matches): for an external project the Cloud Run backend
+    revision is unobservable and has no row, so projecting the version scalar
+    onto it would invent a misleading ``backend_revision`` signal (and a phantom
+    "waiting on backend_revision" gap during the merge-level confirmation
+    window). A missing row for a non-observable provider stays vacuous (None).
+    With ``project=None`` (legacy callers) the projection is unconditional, so
+    existing self-repo behavior is byte-for-byte preserved.
     """
+
+    if project is not None and identity is None:
+        identity = deploy_repo_identity()
+    observable_kinds: set[str] | None = (
+        None
+        if project is None
+        else {
+            provider.artifact_kind
+            for provider in observable_release_artifact_providers(project, identity)
+        }
+    )
 
     artifact_by_kind = {
         artifact.artifact_kind: artifact
@@ -177,6 +280,9 @@ def summarize_release_artifacts(
 
     for provider in iter_release_artifact_providers():
         artifact = artifact_by_kind.get(provider.artifact_kind)
+        backend_scalar_projectable = is_backend_revision_artifact(
+            provider.artifact_kind
+        ) and (observable_kinds is None or provider.artifact_kind in observable_kinds)
         if artifact is not None:
             evidence = ReleaseArtifactEvidence(
                 artifact_kind=provider.artifact_kind,
@@ -186,7 +292,7 @@ def summarize_release_artifacts(
                 served_at=artifact.served_at,
                 reason_code=artifact.reason_code,
             )
-        elif is_backend_revision_artifact(provider.artifact_kind):
+        elif backend_scalar_projectable:
             # No backend artifact row — project the legacy ReleaseVersion scalar
             # DIRECTLY. Do NOT manufacture "unconfirmed" from status=="promoted":
             # serving-confirmation arming (serving_status="unconfirmed" + the
@@ -279,6 +385,18 @@ def summarize_required_artifact_gap(
             continue
         artifact_kind = str(artifact.get("artifact_kind") or "?")
         status = artifact.get("serving_status")
+        # A required row with serving_status None is VACUOUS, not pending — it
+        # mirrors the aggregate projection (``summarize_release_artifacts``
+        # excludes None-status evidence from the aggregate; #8964) and the
+        # un-armed/legacy promotion case (no row, scalar NULL → plain
+        # "promoted"/NA).  Counting it as PENDING was the v8 incident: an
+        # un-armed promotion whose required backend_revision/agent_image rows
+        # were never created (or whose legacy scalar is NULL) projected a
+        # phantom "waiting on required artifacts: backend_revision, agent_image"
+        # for a version that verifiably shipped.  Skip it so only rows with a
+        # real (non-None) status drive the gap.
+        if status is None:
+            continue
         reason = artifact.get("reason_code")
         if status == "deploy_failed":
             failed_parts.append(
@@ -425,6 +543,9 @@ register_release_artifact_provider(
     BACKEND_REVISION_ARTIFACT_KIND,
     _check_backend_revision_serving,
     required=True,
+    # Cloud Run backend revision (DEPLOY_SHA resolver / DeploymentState) is only
+    # observable for the project this deployment was built from.
+    observable=_observable_for_deploy_identity,
 )
 
 
@@ -488,15 +609,18 @@ async def _check_agent_image_serving(
         return None
 
     project = await session.get(Project, version.project_id)
-    if project is None or not getattr(project, "is_self_repo", False):
-        # The agent VM image gate is scoped to the self-repo — only the self
-        # deploy runs the agent fleet this dimension reasons about.  A
-        # non-self-repo never gets an agent_image artifact at promotion time, so
-        # this is reached only if the generic refresh lazily created one.  There
-        # is no agent fleet to gate on, so the dimension is VACUOUSLY served:
+    if not project_matches_deploy_identity(project):
+        # The agent VM image gate is scoped to the deploy's OWN repo — only the
+        # deployment that runs the agent fleet can observe this dimension.  The
+        # provider's observability predicate already withholds the artifact from
+        # any project that is not the deploy identity, so an armed agent_image
+        # row only exists for the deploy project; this is reached only if a
+        # generic refresh lazily created one for a mismatched project.  There is
+        # no agent fleet to gate on there, so the dimension is VACUOUSLY served:
         # confirm immediately rather than strand the artifact unconfirmed (the
         # same "never strand a bake that will never run" principle as the
-        # no-bake-path branch below).
+        # no-bake-path branch below).  Deliberately does NOT read
+        # ``project.is_self_repo`` (deprecated for deploy-level observability).
         return ("serving_confirmed", promoted_sha, now)
 
     ds = await session.get(DeploymentState, 1)
@@ -543,4 +667,146 @@ if AGENT_IMAGE_ARTIFACT_KIND not in _ARTIFACT_PROVIDERS:
         AGENT_IMAGE_ARTIFACT_KIND,
         _check_agent_image_serving,
         required=True,
+        # The agent VM image / fleet serving signal is observable only for the
+        # deploy's own repo (the deployment that runs the agent fleet).
+        observable=_observable_for_deploy_identity,
+    )
+
+
+async def _check_promotion_merge_serving(
+    session: AsyncSession,
+    version: ReleaseVersion,
+    artifact: ReleaseDeployArtifact,
+    now: datetime,
+) -> ServingDecision | None:
+    """Baseline merge-level serving check — observable for EVERY GitHub project.
+
+    Confirms the promotion actually persisted by asking GitHub (through the
+    project's own credentials) two things:
+
+      1. Is ``promoted_sha`` STILL reachable from the promotion target branch
+         head?  If a merge was later reverted / force-pushed away, the promoted
+         commit is no longer an ancestor of the target head — a real failure
+         (``deploy_failed`` / ``merge_reverted``).
+      2. When a deploy/release workflow ran on that SHA, did it conclude
+         successfully?  A completed-but-failed required check on the merge
+         commit downgrades to ``deploy_failed`` (``deploy_workflow_failed``);
+         an in-flight check defers (``None`` → keep waiting).
+
+    Resolution:
+      * ancestry indeterminate (API error) → ``None`` (the bounded confirmation
+        window eventually times this out — never a false failure);
+      * ancestry False (merge not persisted) → ``deploy_failed`` /
+        ``merge_reverted``;
+      * ancestry True + checks success / no checks → ``serving_confirmed`` so
+        every promotion, for any project, gets at least a merge-level verdict;
+      * ancestry True + checks completed-failure → ``deploy_failed`` /
+        ``deploy_workflow_failed``;
+      * ancestry True + checks in-flight → ``None`` (defer).
+
+    Lazy imports avoid a load-time cycle (``release_promotion`` imports this
+    module), mirroring ``_check_backend_revision_serving``.
+    """
+    from app import github
+    from app.release_promotion import (
+        _DEPLOY_CONFIRM_WINDOW_SECONDS,
+        _lts_branch_names,
+        _resolve_github_with_session,
+    )
+    from app.release_reconciliation import _to_naive_utc
+
+    promoted_sha = version.promoted_sha
+    if not promoted_sha:
+        # _confirm_serving_or_fail handles this with its promoted_sha_missing bypass.
+        return None
+
+    project = await session.get(Project, version.project_id)
+    if project is None:
+        return None
+
+    # Effective confirmation deadline — mirrors the backstop in _classify_serving_outcome.
+    # Used below to time out bounded-defer (indeterminate) paths instead of waiting forever.
+    _raw_deadline = artifact.confirmation_deadline or version.deploy_confirm_deadline
+    if _raw_deadline is None and version.promoted_at is not None:
+        _raw_deadline = version.promoted_at + timedelta(seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS)
+    _deadline = _to_naive_utc(_raw_deadline)
+    _now_naive = _to_naive_utc(now) or now
+
+    def _defer_or_timeout() -> ServingDecision | None:
+        """Return confirmation_timed_out if deadline elapsed, else None (keep waiting)."""
+        if _deadline is not None and _now_naive >= _deadline:
+            return ("confirmation_timed_out", "promotion_merge_indeterminate", None)
+        return None
+
+    resolved = await _resolve_github_with_session(session, project)
+    if resolved is None:
+        # No credentials → indeterminate — times out at deadline rather than waiting forever.
+        return _defer_or_timeout()
+    token, owner, repo = resolved
+    _integration_branch, promotion_target = _lts_branch_names(project)
+
+    try:
+        ancestry = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            promoted_sha,
+            promotion_target,
+            project_id=str(version.project_id),
+        )
+    except Exception:  # noqa: BLE001 — a check failure must not crash the sweep
+        return _defer_or_timeout()
+    if ancestry is None:
+        # Indeterminate (API error / ref missing) — times out at deadline.
+        return _defer_or_timeout()
+    if ancestry is False:
+        # The promoted SHA is no longer reachable from the promotion target —
+        # the merge was reverted / rewritten away.  A real, loud failure.
+        return ("deploy_failed", "merge_reverted", None)
+
+    # Merge persisted.  Consult the deploy/release workflow conclusion on the
+    # merge commit as a secondary signal — best-effort: any lookup failure
+    # degrades to the merge-level confirmation rather than a false failure.
+    try:
+        from app import github_checks
+
+        checks = await github_checks.get_check_runs_cached(
+            token,
+            owner,
+            repo,
+            promoted_sha,
+            project_id=str(version.project_id),
+            treat_missing_as_success=True,
+        )
+        status = checks.get("status")
+        conclusion = checks.get("conclusion")
+        if status in ("in_progress", "pending"):
+            # A deploy/release workflow is still running — defer to deadline.
+            return _defer_or_timeout()
+        if status == "completed" and conclusion not in ("success", None):
+            return ("deploy_failed", "deploy_workflow_failed", None)
+    except Exception as exc:  # noqa: BLE001 — workflow lookup is a best-effort secondary signal
+        # A check-run lookup failure must NOT manufacture a deploy failure — the
+        # merge demonstrably persisted (ancestry True above), so degrade to the
+        # merge-level confirmation rather than a false negative.
+        logger.debug(
+            "[RELEASE_ARTIFACTS] promotion_merge workflow lookup failed for v%s "
+            "(non-fatal; confirming merge-level): %s",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+
+    return ("serving_confirmed", promoted_sha, now)
+
+
+# Baseline merge-level serving provider.  Observable for EVERY GitHub project
+# (its signal is the promotion target branch, reachable via the project's own
+# credentials), so every promotion — for any project, not just the deploy's own
+# repo — gets armed and resolves to at least a merge-persisted verdict.
+if PROMOTION_MERGE_ARTIFACT_KIND not in _ARTIFACT_PROVIDERS:
+    register_release_artifact_provider(
+        PROMOTION_MERGE_ARTIFACT_KIND,
+        _check_promotion_merge_serving,
+        required=True,
+        observable=_observable_for_any_github_project,
     )

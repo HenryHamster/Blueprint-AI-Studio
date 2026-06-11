@@ -225,6 +225,56 @@ describe('reconcileEntry direct', () => {
   });
 });
 
+describe('glob-path entries', () => {
+  it('reconcileEntry with only-glob modules is not downgraded', () => {
+    // All modules are glob patterns — fs.existsSync on a literal glob always
+    // returns false, so concretePaths is empty and the check is skipped entirely.
+    const entry = {
+      id: 'sys-glob-only',
+      status: 'functional',
+      modules: ['backend/app/routers/*.py'],
+    };
+    const out = reconcileEntry(entry, root, 'system');
+    expect(out).toBe(entry); // pure no-op returns same reference
+    expect(out.status).toBe('functional');
+  });
+
+  it('reconcileEntry with mixed glob and absent concrete path is downgraded', () => {
+    // The glob does NOT protect the entry — the one concrete path is absent,
+    // so concretePaths.length > 0 and all concrete paths are missing → downgrade.
+    const entry = {
+      id: 'sys-glob-and-absent',
+      status: 'functional',
+      modules: ['backend/app/routers/*.py', 'backend/app/gone.py'],
+    };
+    const out = reconcileEntry(entry, root, 'system');
+    expect(out.status).toBe('missing');
+    expect(out.presence_warning).toMatch(/absent/);
+  });
+
+  it('reconcileEntry with glob and present concrete path is not downgraded', () => {
+    const entry = {
+      id: 'sys-glob-and-present',
+      status: 'mature',
+      modules: ['backend/app/routers/*.py', 'backend/app/present.py'],
+    };
+    const out = reconcileEntry(entry, root, 'system');
+    expect(out).toBe(entry);
+    expect(out.status).toBe('mature');
+  });
+
+  it('reconcileEntry with all-absent concrete paths and no globs still downgrades', () => {
+    const entry = {
+      id: 'sys-no-glob-absent',
+      status: 'mature',
+      modules: ['backend/app/gone.py', 'backend/app/also_gone.py'],
+    };
+    const out = reconcileEntry(entry, root, 'system');
+    expect(out.status).toBe('missing');
+    expect(out.presence_warning).toMatch(/absent/);
+  });
+});
+
 describe('symbol-level grounding (present file + absent symbol)', () => {
   it('present file + present symbol → NOT flagged', () => {
     const sys = {

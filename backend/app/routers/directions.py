@@ -32,6 +32,7 @@ from app.task_locking import (
 )
 from app.direction_lifecycle import _reset_outcome_detection_state
 from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
+from app.capability_proof import enrich_problem_model_capability_proofs
 from app.problem_model import compute_model_size_signal, ProblemModel
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,10 @@ async def get_directions(
             }
         )
     problem_model_dict = project.problem_model or {}
+    proof_problem_model = enrich_problem_model_capability_proofs(
+        problem_model_dict,
+        getattr(project, "capability_proof_records", None),
+    )
     problem_model_size_health = None
     if problem_model_dict:
         try:
@@ -265,7 +270,7 @@ async def get_directions(
         "autonomous_enabled": project.autonomous_enabled,
         "vision": project.vision or {},
         "design_doc": project.design_doc or {},
-        "problem_model": problem_model_dict,
+        "problem_model": proof_problem_model,
         "problem_model_size_health": problem_model_size_health,
         "running_update": project.running_update or None,
         "running_update_acknowledged_at": (

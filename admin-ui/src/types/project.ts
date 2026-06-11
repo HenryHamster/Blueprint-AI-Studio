@@ -28,6 +28,12 @@ export interface BuildConfigDirectory {
   test_cmd?: string;
 }
 
+export interface ResourceEnvelopeConfig {
+  max_concurrent_vms?: number | null;
+  spend_ceiling_usd?: number | null;
+  spend_window_days?: number;
+}
+
 export interface BuildConfig {
   language?: string | null;
   directories?: BuildConfigDirectory[];
@@ -58,6 +64,28 @@ export interface BuildConfig {
   max_parallel_research?: number | null;
   max_total_research?: number | null;
   max_autonomous_tasks_per_hour?: number | null;
+  resource_envelope?: ResourceEnvelopeConfig | null;
+  /** ISO timestamp stamped when a repo_bootstrap task finishes successfully.
+   *  Absent/null means bootstrap has not yet completed. */
+  bootstrap_completed_at?: string | null;
+  /** True when detection determined the repository has no committed content yet. */
+  repo_is_empty?: boolean;
+  /** Reason string stamped when a repo_bootstrap task completes but without
+   *  fully succeeding (e.g. partial failure). When set and bootstrap_completed_at
+   *  is absent, the project bootstrap is in a degraded state. */
+  bootstrap_degraded_reason?: string | null;
+  bootstrap_recovery_attempts?: number | null;
+  bootstrap_recovery_state?: 'backoff' | 'exhausted' | 'operator_retry' | 'completed' | string | null;
+  bootstrap_recovery_next_at?: string | null;
+  bootstrap_recovery_last_degraded_at?: string | null;
+  bootstrap_recovery_exhausted_at?: string | null;
+  /** ISO timestamp stamped when a refresh bootstrap completed and replaced the
+   *  prior repo_overview. Absent/null means no refresh has run yet. */
+  bootstrap_overview_refreshed_at?: string | null;
+  /** Branch the refreshed overview describes (set alongside bootstrap_overview_refreshed_at). */
+  bootstrap_overview_source_branch?: string | null;
+  /** Commit SHA the refreshed overview was captured at (optional; may be absent). */
+  bootstrap_overview_source_revision?: string | null;
 }
 
 export interface StagingBranchPrefixesConfig {
@@ -125,6 +153,43 @@ export interface MergeGateRuntime {
   summary?: MergeGateSummary;
 }
 
+export interface CapabilityProofSummary {
+  proof_count: number;
+  latest_proof_kind?: string;
+  latest_proved_at?: string;
+  latest_commit_sha?: string;
+}
+
+export interface CapabilityAdoptionVerdict {
+  verdict?: 'adopt' | 'reject' | 'continue-trial';
+  lift?: number | null;
+  n_with?: number;
+  n_without?: number;
+  window_hours?: number | null;
+  evaluated_at?: string;
+  thresholds?: {
+    min_n_per_arm?: number;
+    adopt_lift?: number;
+    reject_lift?: number;
+  };
+}
+
+export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig {
+  project_id: string;
+  active_vm_count: number;
+  recent_spend_usd: number;
+}
+
+export interface RepoOverview {
+  tech_stack?: string | null;
+  directory_layout?: string | null;
+  first_steps_summary?: string | null;
+  entry_points?: string | null;
+  test_layout?: string | null;
+  key_conventions?: string | null;
+  environment_requirements?: string | null;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -154,6 +219,16 @@ export interface Project {
   merge_gate_runtime?: MergeGateRuntime;
   is_self_repo?: boolean;
   sr_catch_rate_targets?: Record<string, number>;
+  /** Per-capability proof summary (proof count and latest entry details).
+   *  Present on detail endpoint; absent on list endpoint. */
+  capability_proof_summary?: Record<string, CapabilityProofSummary>;
+  /** Durable adopt-or-reject verdicts for capability trials.
+   *  Present on detail endpoint; absent on list endpoint. */
+  capability_adoption_verdicts?: Record<string, CapabilityAdoptionVerdict>;
+  /** Design doc produced by the bootstrap agent. `repo_overview` holds the
+   *  structured summary of the repository (tech stack, layout, first steps).
+   *  Present on detail endpoint when a bootstrap has completed. */
+  design_doc?: { repo_overview?: RepoOverview } | null;
 }
 
 export interface AutoRemediationConfig {

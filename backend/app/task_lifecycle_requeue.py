@@ -61,7 +61,8 @@ async def _resolve_terminal_parent_verdict(
     chosen so the call sites can emit an accurate operator message and decide
     whether to penalize direction health. ``reason`` is one of:
     ``"genuine_failure"``, ``"rollup_pending"``, ``"blocked"``,
-    ``"all_non_genuine_cancelled"``, ``"no_subtasks"``.
+    ``"all_non_death_cancelled"``, ``"all_non_genuine_cancelled"``,
+    ``"no_subtasks"``.
 
     Distinguishes blocked-on-precondition (recoverable, not a failure), genuine
     terminal failures, and rollup-re-evaluation cases that should stay EVALUATING.
@@ -79,17 +80,24 @@ async def _resolve_terminal_parent_verdict(
     replacement may still land), the parent should stay EVALUATING so the genuine
     outcome can be recomputed without burning retry budget.
 
-    The remaining terminal case — every unsucceeded child is a NON-genuine cancel
-    (superseded / replaced-by-retry / reassigned / scope-empty) with no completed,
-    active, blocked, or genuinely-failed sibling — has nothing left to roll up or
-    wait for. It resolves to FAILED with reason ``all_non_genuine_cancelled`` so
-    the parent finalizes immediately instead of parking EVALUATING forever and
-    being re-poked by the reaper every cycle until the 48h backstop force-fails it.
+    The remaining terminal cases — every unsucceeded child is a non-death
+    cancellation (co-deferred shelving, requeue replacement, scope-empty no-op)
+    OR a NON-genuine cancel (superseded / replaced-by-retry / reassigned /
+    scope-empty) with no completed, active, blocked, or genuinely-failed sibling
+    — have nothing left to roll up or wait for.  The non-death case resolves to
+    CANCELLED with reason ``all_non_death_cancelled`` (no failure semantics,
+    checked first so co-deferred children — not recognized by
+    _is_non_genuine_cancelled — are caught here rather than inflating
+    genuine_failures).  The non-genuine-only case resolves to FAILED +
+    ``all_non_genuine_cancelled`` so the parent finalizes immediately instead of
+    parking EVALUATING forever and being re-poked by the reaper every cycle until
+    the 48h backstop force-fails it.
 
     Centralizing the verdict here keeps the requeue-limit path and the
     all-children-terminal sweep from silently drifting apart.
     """
     from app.direction_outcomes import _is_non_genuine_cancelled
+    from app.failure_classification import is_non_death_cancellation
 
     failed_children = [c for c in children if c.status == TaskStatus.FAILED]
     blocked_children = [c for c in children if c.status == TaskStatus.BLOCKED]
@@ -121,6 +129,23 @@ async def _resolve_terminal_parent_verdict(
         )
         for c in children
     )
+
+    # Non-death cancellations (co-deferred shelving, requeue replacements,
+    # scope-empty no-ops) are recoverable or already-landed — the parent must NOT
+    # be FAILED.  Check BEFORE genuine_failures so co-deferred children (which
+    # _is_non_genuine_cancelled does NOT recognize) don't inflate genuine_failures
+    # and trigger a false AGENT_TIMEOUT ding.  Guard: only fire when there are no
+    # other terminal classes (failures, active/completed work, blocked siblings)
+    # that would keep EVALUATING or BLOCKED treatment in play.
+    if (
+        cancelled_children
+        and not failed_children
+        and not has_completed_children
+        and not has_active_children
+        and total_blocked == 0
+        and all(is_non_death_cancellation(c) for c in cancelled_children)
+    ):
+        return TaskStatus.CANCELLED, "all_non_death_cancelled"
 
     if genuine_failures > 0:
         return TaskStatus.FAILED, "genuine_failure"
@@ -186,6 +211,47 @@ async def _terminate_all_non_genuine_cancelled(
         f"[REQUEUE] Parent {parent.id} FAILED — all {cancelled_count} "
         f"subtask(s) non-genuine cancelled (superseded/replaced); nothing to "
         f"roll up. No direction-health penalty, no failure alert."
+    )
+    return 0
+
+
+async def _terminate_all_non_death_cancelled(
+    parent: Task,
+    children: list,
+    session: AsyncSession,
+    broadcast_to_project,
+) -> int:
+    """Finalize a parent whose cancelled children are ALL non-death cancellations.
+
+    Non-death cancellations (co-deferred shelving, requeue replacements, scope-empty
+    no-ops) are recoverable or already-landed — the parent must NOT be FAILED and
+    must NOT ding direction health.  Shared by both terminal paths so the treatment
+    stays in lockstep.  Branch cleanup is the caller's responsibility (rollup path
+    owns branches; requeue path does not).
+
+    Decision: finalize as CANCELLED with a clear operator message — NOT FAILED —
+    and raise NO failure alert and record NO direction-health penalty.  A
+    co-deferred child's finding re-surfaces from the ledger next cycle; a
+    requeue-replacement child's work continues under the new clone; a scope-empty
+    child found nothing to do.  None of these represent a genuine failure.
+    """
+    cancelled_count = len([c for c in children if c.status == TaskStatus.CANCELLED])
+    parent.status = TaskStatus.CANCELLED
+    parent.latest_status_message = (
+        f"All {cancelled_count} subtask(s) deliberately shelved or superseded — "
+        f"not a failure"
+    )
+    session.add(parent)
+    await session.commit()
+    await broadcast_to_project(
+        str(parent.project_id),
+        "task_updated",
+        {"task_id": str(parent.id), "status": TaskStatus.CANCELLED},
+    )
+    logger.info(
+        f"[REQUEUE] Parent {parent.id} CANCELLED — all {cancelled_count} "
+        f"subtask(s) non-death cancelled (co-deferred / superseded / scope-empty). "
+        f"No direction-health penalty, no failure alert."
     )
     return 0
 
@@ -310,6 +376,10 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 f"[REQUEUE] Parent {parent.id} kept at EVALUATING — rollup re-evaluation needed"
             )
             return 0
+        if limit_reason == "all_non_death_cancelled":
+            return await _terminate_all_non_death_cancelled(
+                parent, children, session, broadcast_to_project
+            )
         if limit_reason == "all_non_genuine_cancelled":
             return await _terminate_all_non_genuine_cancelled(
                 parent, children, session, broadcast_to_project
@@ -531,12 +601,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         if prev_model:
             clone_ctx["_previous_model"] = prev_model
 
-        # RATE_LIMIT: propagate the quarantine so the clone can't re-select the
-        # same account before its cooldown elapses. agent_status.py already put
-        # the failed account in child_ctx["blacklisted_accounts"] — re-applying
-        # it here closes the gap where _ctx_keys_to_strip would otherwise clear
+        # RATE_LIMIT / DEAD_AUTH: propagate the quarantine so the clone can't
+        # re-select the same account. agent_status.py / reaper already put the
+        # failed account in child_ctx["blacklisted_accounts"] — re-applying it
+        # here closes the gap where _ctx_keys_to_strip would otherwise clear
         # the list and the clone starts with a blank slate.
-        if failure_class == "RATE_LIMIT":
+        if failure_class in ("RATE_LIMIT", "DEAD_AUTH"):
             rl_acct_id = child_ctx.get("llm_account_id") or child_ctx.get(
                 "max_plan_account_id"
             )
@@ -546,8 +616,9 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                     prior_bl.append(rl_acct_id)
                 clone_ctx["blacklisted_accounts"] = prior_bl
                 logger.info(
-                    "[REQUEUE] RATE_LIMIT on account %s — propagating blacklist to clone "
+                    "[REQUEUE] %s on account %s — propagating blacklist to clone "
                     "(total blocked: %d)",
+                    failure_class,
                     rl_acct_id[:8],
                     len(prior_bl),
                 )
@@ -558,10 +629,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # Accumulate VM cost of prior failed attempts so the digest can compute
         # total compute burned on retries that eventually succeeded.
         try:
-            from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+            from app.vm_cost_rates import get_vm_rate_per_second
 
             if child.vm_provisioned_at and child.vm_stopped_at:
-                _rate = SPOT_RATE if child.vm_spot else ON_DEMAND_RATE
+                _rate = get_vm_rate_per_second(
+                    machine_type=child.vm_machine_type, spot=child.vm_spot
+                )
                 _attempt_cost = (
                     _rate
                     * (child.vm_stopped_at - child.vm_provisioned_at).total_seconds()
@@ -850,6 +923,10 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                     f"[REQUEUE] Parent {parent.id} kept at EVALUATING — rollup re-evaluation needed"
                 )
                 return 0
+            if verdict_reason == "all_non_death_cancelled":
+                return await _terminate_all_non_death_cancelled(
+                    parent, children, session, broadcast_to_project
+                )
             if verdict_reason == "all_non_genuine_cancelled":
                 return await _terminate_all_non_genuine_cancelled(
                     parent, children, session, broadcast_to_project

@@ -100,6 +100,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "compute_experiment_spend_threshold_usd",
         "cross_provider_fallback_enabled",
         "daily_cost_ceiling_usd",
+        "deploy_repo_identity",
         "drift_over_claim_consistency_threshold",
         "drift_over_claim_min_claims",
         "drift_stall_min_claims",
@@ -109,6 +110,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "max_active_directions",
         "max_autonomous_tasks_per_hour",
         "max_concurrent_auto_remediations",
+        "max_concurrent_compute_jobs_by_project",
+        "max_concurrent_tasks_by_project",
         "max_concurrent_vms",
         "max_global_autonomous_tasks_per_hour",
         "max_parallel_research_per_project",
@@ -327,6 +330,7 @@ async def get_settings(
             _runtime_config
         )
         in ("balanced", "preferred"),
+        "deploy_repo_identity": _runtime_config.get("deploy_repo_identity"),
         "providers": _build_provider_catalog(_runtime_config),
         # Published, backend-owned task-capability contract. Operator/agent
         # surfaces consume this map instead of maintaining private task-type
@@ -431,6 +435,20 @@ async def get_settings(
         "warm_pool_target_size_by_project": _normalize_warm_pool_target_map(
             _runtime_config.get("warm_pool_target_size_by_project") or {}
         ),
+        "max_concurrent_tasks_by_project": {
+            str(k): int(v)
+            for k, v in (
+                _runtime_config.get("max_concurrent_tasks_by_project") or {}
+            ).items()
+            if v and int(v) > 0
+        },
+        "max_concurrent_compute_jobs_by_project": {
+            str(k): int(v)
+            for k, v in (
+                _runtime_config.get("max_concurrent_compute_jobs_by_project") or {}
+            ).items()
+            if v and int(v) > 0
+        },
         "warm_pool_idle_ttl_secs": int(
             _runtime_config.get("warm_pool_idle_ttl_secs", 1800)
         ),
@@ -1080,6 +1098,95 @@ async def _apply_settings(
                 detail="warm_pool_target_size must be between 0 and 50",
             )
         _runtime_config["warm_pool_target_size"] = val
+    if "max_concurrent_tasks_by_project" in payload:
+        raw = payload["max_concurrent_tasks_by_project"]
+        # Per-project concurrent-VM cap: a mapping of project-id strings to
+        # positive integers in 1..50. An empty map means no per-project cap
+        # for any project (all fall back to uncapped behavior). A zero or
+        # missing entry for a given project also means no cap for that project.
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "max_concurrent_tasks_by_project must be a mapping of "
+                    "project-id strings to integers"
+                ),
+            )
+        cleaned_proj_caps: dict[str, int] = {}
+        for key, value in raw.items():
+            sid = str(key).strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "max_concurrent_tasks_by_project keys must be "
+                        "non-empty project ids"
+                    ),
+                )
+            try:
+                ival = int(value)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"max_concurrent_tasks_by_project[{sid}] must be an integer"
+                    ),
+                )
+            if not (0 <= ival <= 50):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"max_concurrent_tasks_by_project[{sid}] must be "
+                        "between 0 and 50"
+                    ),
+                )
+            if ival > 0:
+                cleaned_proj_caps[sid] = ival
+        _runtime_config["max_concurrent_tasks_by_project"] = cleaned_proj_caps
+    if "max_concurrent_compute_jobs_by_project" in payload:
+        raw = payload["max_concurrent_compute_jobs_by_project"]
+        # Per-project concurrent compute-job cap: a mapping of project-id strings
+        # to positive integers in 0..50. An empty map removes all caps. A zero
+        # or absent entry for a project means no cap for that project.
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "max_concurrent_compute_jobs_by_project must be a mapping of "
+                    "project-id strings to integers"
+                ),
+            )
+        cleaned_job_caps: dict[str, int] = {}
+        for key, value in raw.items():
+            sid = str(key).strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "max_concurrent_compute_jobs_by_project keys must be "
+                        "non-empty project ids"
+                    ),
+                )
+            try:
+                ival = int(value)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"max_concurrent_compute_jobs_by_project[{sid}] must be an integer"
+                    ),
+                )
+            if not (0 <= ival <= 50):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"max_concurrent_compute_jobs_by_project[{sid}] must be "
+                        "between 0 and 50"
+                    ),
+                )
+            if ival > 0:
+                cleaned_job_caps[sid] = ival
+        _runtime_config["max_concurrent_compute_jobs_by_project"] = cleaned_job_caps
     if "warm_pool_target_size_by_project" in payload:
         raw = payload["warm_pool_target_size_by_project"]
         # Per-project IDLE target overrides: a mapping of project-id strings to
@@ -1512,6 +1619,30 @@ async def _apply_settings(
             )
         _runtime_config["cross_provider_fallback_enabled"] = val
         _runtime_config["provider_selection_mode"] = "preferred" if val else "exclusive"
+    if "deploy_repo_identity" in payload:
+        # Deploy-level identity: the "owner/repo" this deployment serves. Accept
+        # a non-empty "owner/repo" string, or null/"" to clear it (no deploy
+        # identity → only the merge-level provider is observable). Validated as a
+        # well-formed slug pair so a malformed value can't silently mis-gate
+        # which project's Cloud Run serving signals are observable.
+        val = payload["deploy_repo_identity"]
+        if val is None or (isinstance(val, str) and not val.strip()):
+            _runtime_config["deploy_repo_identity"] = None
+        elif isinstance(val, str) and "/" in val:
+            owner, _, repo = val.strip().partition("/")
+            if not owner.strip() or not repo.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="deploy_repo_identity must be 'owner/repo'",
+                )
+            _runtime_config["deploy_repo_identity"] = (
+                f"{owner.strip()}/{repo.strip()}"
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="deploy_repo_identity must be 'owner/repo' or null",
+            )
     if "provider_settings_defaults" in payload:
         val = payload["provider_settings_defaults"]
         if not isinstance(val, dict):
@@ -2161,6 +2292,13 @@ async def _apply_settings(
                         _runtime_config
                     )
                     in ("balanced", "preferred"),
+                    # Persist the deploy-level identity so an operator override
+                    # survives a Cloud Run restart (config-sync reads it back on
+                    # boot; otherwise the in-memory value reverts to the env
+                    # default).
+                    "deploy_repo_identity": _runtime_config.get(
+                        "deploy_repo_identity"
+                    ),
                     "provider_settings_defaults": _runtime_config.get(
                         "provider_settings_defaults", {}
                     ),
@@ -2311,6 +2449,22 @@ async def _apply_settings(
                     "warm_pool_target_size_by_project": _normalize_warm_pool_target_map(
                         _runtime_config.get("warm_pool_target_size_by_project") or {}
                     ),
+                    "max_concurrent_tasks_by_project": {
+                        str(k): int(v)
+                        for k, v in (
+                            _runtime_config.get("max_concurrent_tasks_by_project") or {}
+                        ).items()
+                        if v and int(v) > 0
+                    },
+                    "max_concurrent_compute_jobs_by_project": {
+                        str(k): int(v)
+                        for k, v in (
+                            _runtime_config.get(
+                                "max_concurrent_compute_jobs_by_project"
+                            ) or {}
+                        ).items()
+                        if v and int(v) > 0
+                    },
                     "warm_pool_idle_ttl_secs": int(
                         _runtime_config.get("warm_pool_idle_ttl_secs", 1800)
                     ),

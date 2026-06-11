@@ -32,11 +32,16 @@ def normalize_capability_name(raw: object) -> str | None:
 
 
 def _iter_capability_entries(problem_model: object):
-    """Yield ``(raw_name, status)`` pairs from a problem_model's capabilities.
+    """Yield ``(raw_name, status, absorbs)`` triples from a problem_model's
+    capabilities.
 
     Accepts either the pydantic ``ProblemModel`` instance or a dict-like payload
-    carrying a ``capabilities`` collection. Shared by the name reader and the
-    richer vocabulary reader so both draw from the exact same source.
+    carrying a ``capabilities`` collection. Shared by the name reader, the richer
+    vocabulary reader, and the working-set reader so all three draw from the exact
+    same source. ``absorbs`` is the list of old capability names the entry merged
+    in during a consolidation (empty list when absent / older payload) — the
+    alias-aware readers fold these into their output while the vocabulary reader
+    ignores them so the rendered vocabulary stays survivor-only.
     """
     if isinstance(problem_model, Mapping):
         raw_caps = problem_model.get("capabilities")
@@ -46,42 +51,76 @@ def _iter_capability_entries(problem_model: object):
         return
     for cap in raw_caps:
         if isinstance(cap, Mapping):
-            yield cap.get("name"), cap.get("status")
+            absorbs = cap.get("absorbs")
+            yield cap.get("name"), cap.get("status"), absorbs
         else:
-            yield getattr(cap, "name", None), getattr(cap, "status", None)
+            absorbs = getattr(cap, "absorbs", None)
+            yield getattr(cap, "name", None), getattr(cap, "status", None), absorbs
+
+
+def _normalized_absorbed_names(absorbs: object) -> list[str]:
+    """Canonicalize the ``absorbs`` list of one capability, dropping non-strings
+    and unnormalizable / blank entries. Tolerates a non-list ``absorbs`` (returns
+    ``[]``) so older payloads and junk shapes pass through harmlessly."""
+    if not isinstance(absorbs, Iterable) or isinstance(absorbs, (str, bytes)):
+        return []
+    out: list[str] = []
+    for name in absorbs:
+        normalized = normalize_capability_name(name)
+        if normalized:
+            out.append(normalized)
+    return out
 
 
 def registry_capability_names(problem_model: object) -> list[str]:
-    """Return canonical capability names declared in ``problem_model``.
+    """Return the advisory known-set of canonical capability names.
 
     Accepts either the pydantic ``ProblemModel`` instance or a dict-like payload
     carrying a ``capabilities`` collection. Output preserves first-seen order
     while dropping blanks and duplicates.
+
+    Alias-aware: each capability contributes its own canonical name AND the
+    canonical form of every name in its ``absorbs`` list. This is the advisory
+    known-set fed to :func:`off_registry_capability_refs` at every call site, so
+    an old name absorbed during a consolidation is still treated as KNOWN (never
+    flagged off-registry). It deliberately diverges from
+    :func:`registry_capability_vocabulary`, which renders survivor names only so
+    the consolidation actually shrinks the agent-facing vocabulary.
     """
     seen: set[str] = set()
     names: list[str] = []
-    for raw_name, _status in _iter_capability_entries(problem_model):
-        normalized = normalize_capability_name(raw_name)
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            names.append(normalized)
+    for raw_name, _status, absorbs in _iter_capability_entries(problem_model):
+        for normalized in (
+            normalize_capability_name(raw_name),
+            *_normalized_absorbed_names(absorbs),
+        ):
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                names.append(normalized)
     return names
 
 
 def registry_capability_vocabulary(problem_model: object) -> list[dict]:
     """Return the agent-facing capability vocabulary: canonical name + status.
 
-    Built from the same registry as :func:`registry_capability_names` (so the
-    names match exactly), pairing each canonical kebab-case name with its declared
-    status (``working`` / ``partial`` / ``planned``) for prompt rendering. Output
+    Built from the same registry source as :func:`registry_capability_names`,
+    pairing each canonical kebab-case name with its declared status
+    (``working`` / ``partial`` / ``planned``) for prompt rendering. Output
     preserves first-seen order, drops blanks and duplicates, and omits ``status``
     when it is absent/blank. Returns ``[]`` for a model with no capabilities, so
     callers can omit the additive ``available_capabilities`` payload field on the
     empty path.
+
+    Survivor-only by design: unlike :func:`registry_capability_names` (the
+    advisory known-set, which folds in each capability's ``absorbs`` aliases),
+    this rendered vocabulary deliberately does NOT re-add absorbed old names. A
+    consolidation removes the old names from what the agent sees here — that
+    shrinkage is the whole point — while the old names keep RESOLVING through the
+    alias-aware known-set and :func:`working_capability_names`.
     """
     seen: set[str] = set()
     vocab: list[dict] = []
-    for raw_name, status in _iter_capability_entries(problem_model):
+    for raw_name, status, _absorbs in _iter_capability_entries(problem_model):
         normalized = normalize_capability_name(raw_name)
         if not normalized or normalized in seen:
             continue
@@ -93,6 +132,39 @@ def registry_capability_vocabulary(problem_model: object) -> list[dict]:
     return vocab
 
 
+def annotate_capability_proof_status(
+    vocab: list[dict], proof_records: dict | None
+) -> list[dict]:
+    """Annotate each capability vocab entry with its durable proof status.
+
+    Adds a ``proof_status`` field to each entry:
+      - ``"proven"`` when ``proof_records`` contains at least one proof entry
+        for that capability (evidence-grounded, machine-checked).
+      - ``"unproven"`` otherwise (mere claim, no verified evidence yet).
+
+    Input ``vocab`` is not mutated — a shallow copy of each entry is returned.
+    Fail-open: unexpected shapes pass through unchanged. Shared by every spawn
+    path (strategic, design, research, plan/finding) so all four prompt
+    surfaces ship the SAME proven/unproven annotation alongside ``status``.
+    """
+    if not isinstance(vocab, list):
+        return vocab
+    records = proof_records if isinstance(proof_records, dict) else {}
+    annotated: list[dict] = []
+    for entry in vocab:
+        if not isinstance(entry, dict):
+            annotated.append(entry)
+            continue
+        entry2 = dict(entry)
+        cap_name = entry2.get("name")
+        if isinstance(cap_name, str) and records.get(cap_name):
+            entry2["proof_status"] = "proven"
+        else:
+            entry2["proof_status"] = "unproven"
+        annotated.append(entry2)
+    return annotated
+
+
 def working_capability_names(problem_model: object) -> set[str]:
     """Return canonical names of registry capabilities declared ``working``.
 
@@ -101,14 +173,24 @@ def working_capability_names(problem_model: object) -> set[str]:
     the repo itself — no task has to provide it. Only the exact ``working``
     status qualifies: ``partial`` / ``planned`` capabilities still gate, since
     the declared foundation genuinely does not (fully) exist yet.
+
+    Alias-aware: a ``working`` capability contributes its own canonical name AND
+    the canonical form of every name in its ``absorbs`` list. So after a
+    consolidation merges several old capabilities into one working survivor, a
+    prerequisite that named any absorbed old capability still resolves as
+    satisfied-by-the-codebase — exactly as it did before consolidation. Both the
+    spawn-time resolver (``research_completion``) and the blocked-resume matcher
+    (``reaper_sweeps``) consume this set via
+    :func:`registry_satisfies_capability_need`, so neither needs its own edit.
     """
     working: set[str] = set()
-    for raw_name, status in _iter_capability_entries(problem_model):
+    for raw_name, status, absorbs in _iter_capability_entries(problem_model):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue
         normalized = normalize_capability_name(raw_name)
         if normalized:
             working.add(normalized)
+        working.update(_normalized_absorbed_names(absorbs))
     return working
 
 

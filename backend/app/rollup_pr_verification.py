@@ -30,9 +30,143 @@ from app.models import (
     Project,
 )
 from app.branch_resolution import merged_pr_counts_as_integration_landing
-from app.landed_signal import mark_landed_on_integration, mark_unblocked_non_merge
+from app.landed_signal import (
+    mark_landed_on_integration,
+    mark_stranded_non_landing,
+    mark_unblocked_non_merge,
+)
 
 logger = logging.getLogger(__name__)
+
+
+async def verify_rollup_merge_landed(
+    task: Task,
+    project: "Project | None",
+    session: AsyncSession,
+    *,
+    pr_number: int | None,
+    merge_commit_sha: str | None = None,
+    integration_branch: str | None = None,
+    source: str,
+) -> str:
+    """Tri-state ancestry gate run BEFORE stamping a rollup integration landing.
+
+    Confirms the rollup PR's merge commit is actually an ancestor of the
+    project's integration branch before a caller stamps ``pr_merged`` / the
+    shipped badge on the rollup-orig (``ci_completion``) or the rollup parent
+    (``rollup_management``). Both stamping sites historically trusted a pure
+    branch-NAME equality (``base == integration_branch``) which can be true while
+    the merge commit never actually reached the integration trunk (e.g. a rollup
+    chain whose ``rollup -> automain`` step never completed), inflating merge-rate
+    and shipping false badges.
+
+    Mirrors the precedent in :mod:`app.research_completion` (the non-terminal
+    parent ancestry block): a DEFINITIVE negative strands the task; anything
+    indeterminate preserves flag-trust so a transient GitHub outage never blocks
+    completion. ``None`` is never coerced to ``False``.
+
+    Returns one of:
+      * ``"landed"``        — ``is_ancestor_of`` returned ``True``. The merge
+        commit is on the integration branch; the caller stamps as today.
+      * ``"indeterminate"`` — ``is_ancestor_of`` returned ``None``, no merge
+        commit SHA was available, or GitHub credentials / the PR / the compare
+        call could not be resolved. The caller PRESERVES current flag-trust
+        stamping.
+      * ``"stranded"``      — ``is_ancestor_of`` returned a definitive ``False``.
+        This helper has already recorded the durable stranded marker via
+        :func:`mark_stranded_non_landing` and raised the operator alert via
+        ``_maybe_create_failure_alert``; the caller must NOT stamp ``pr_merged``.
+
+    Reuses the credential-resolution / PR-fetch pattern of
+    ``research_completion`` and the existing ``app.github`` helpers; never raises
+    for a GitHub/credential error (it degrades to ``"indeterminate"``).
+    """
+    from app import github as _gh
+    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.branch_resolution import get_project_integration_branch
+
+    if project is None:
+        return "indeterminate"
+
+    project_id = str(getattr(task, "project_id", "") or "") or None
+
+    # Resolve GitHub credentials via the project (same order as
+    # research_completion's ancestry block). A credential failure -> indeterminate
+    # so a transient outage never blocks rollup completion.
+    creds: tuple | None = None
+    try:
+        from app.release_qualifier import _resolve_github_with_session
+
+        creds = await _resolve_github_with_session(session, project)
+    except Exception as exc:  # noqa: BLE001 — credential failure -> indeterminate
+        logger.debug(
+            "[ROLLUP_ANCESTRY] credential resolution skipped for %s: %s", source, exc
+        )
+        return "indeterminate"
+    if creds is None:
+        return "indeterminate"
+    token, owner, repo = creds
+
+    # Resolve the merge commit SHA from the merged PR when the caller did not
+    # supply one (``merge_pull_request`` does not return it). No merge commit
+    # SHA -> indeterminate (the PR may not be merged yet, or the API omitted it).
+    if not merge_commit_sha and pr_number is not None:
+        try:
+            pr_data = await _gh.get_pull_request(
+                token, owner, repo, pr_number, project_id=project_id
+            )
+            merge_commit_sha = (pr_data or {}).get("merge_commit_sha")
+        except Exception as exc:  # noqa: BLE001 — API error -> indeterminate
+            logger.debug(
+                "[ROLLUP_ANCESTRY] PR #%s fetch failed for %s: %s",
+                pr_number,
+                source,
+                exc,
+            )
+            return "indeterminate"
+    if not merge_commit_sha:
+        return "indeterminate"
+
+    if integration_branch is None:
+        integration_branch = get_project_integration_branch(project)
+
+    try:
+        is_anc = await _gh.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            merge_commit_sha,
+            integration_branch,
+            project_id=project_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — API error -> indeterminate
+        logger.debug("[ROLLUP_ANCESTRY] is_ancestor_of failed for %s: %s", source, exc)
+        return "indeterminate"
+
+    if is_anc is True:
+        return "landed"
+    if is_anc is None:
+        # Compare API error / ref not found. None is never coerced to False.
+        return "indeterminate"
+
+    # DEFINITIVE negative: the merge commit is NOT reachable from integration.
+    reason = (
+        f"Rollup merge commit {merge_commit_sha[:8]} (PR #{pr_number}) is NOT an "
+        f"ancestor of integration branch {integration_branch!r}; the "
+        f"rollup->integration merge did not land. Leaving pr_merged/shipped unset "
+        f"and marking the task stranded ({source})."
+    )
+    mark_stranded_non_landing(task, reason=reason)
+    logger.error("[ROLLUP_ANCESTRY] %s task=%s", reason, getattr(task, "id", None))
+    try:
+        await _maybe_create_failure_alert(task, session, reason)
+    except Exception as exc:  # noqa: BLE001 — alert failure must not undo the gate
+        logger.warning(
+            "[ROLLUP_ANCESTRY] stranded alert failed for task %s: %s",
+            getattr(task, "id", None),
+            exc,
+        )
+    return "stranded"
 
 
 # Circuit-breaker: cap how many times the stale-PR rollup recovery in

@@ -68,6 +68,36 @@ vi.mock('../api', () => ({
     },
     unpriced_combos: ['openai:gpt-5-codex', 'gemini:gemini-2.5-pro'],
     approximate_priced_combos: [],
+    by_task_type: [
+      {
+        task_type: 'create',
+        total_input_tokens: 10_000_000,
+        total_output_tokens: 2_500_000,
+        total_cost_usd: 157.5,
+        llm_call_count: 1200,
+        task_count: 312,
+        merged_count: 240,
+        merge_rate: 0.769,
+        verified_merged_count: 228,
+        verified_merge_rate: 0.731,
+        cost_per_merge: 0.69,
+        share_of_total_cost: 0.641,
+      },
+      {
+        task_type: 'review',
+        total_input_tokens: 6_500_000,
+        total_output_tokens: 1_600_000,
+        total_cost_usd: 88.27,
+        llm_call_count: 620,
+        task_count: 134,
+        merged_count: 66,
+        merge_rate: 0.493,
+        verified_merged_count: 60,
+        verified_merge_rate: 0.448,
+        cost_per_merge: 1.47,
+        share_of_total_cost: 0.359,
+      },
+    ],
   })),
 }));
 
@@ -138,6 +168,7 @@ describe('LlmCostBreakdownPanel — viewport regression', () => {
       },
       unpriced_combos: ['custom-provider:custom-model'],
       approximate_priced_combos: [],
+      by_task_type: [],
     };
     vi.mocked(api.fetchLlmCostBreakdown).mockResolvedValueOnce(unpriced);
 

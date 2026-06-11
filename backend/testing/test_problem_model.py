@@ -1709,31 +1709,64 @@ def test_apply_agent_update_operator_context_and_constraints_edit_wins():
     assert fields == {"context", "constraints"}
 
 
-def test_apply_agent_update_operator_untouched_field_takes_agent_value():
-    """When the operator did NOT touch a field (current == baseline), the agent's
-    new value applies even with a baseline supplied — no ledger entry."""
+def test_apply_agent_update_operator_purpose_rejected_without_user_message_provenance():
+    """Always-protect: when purpose is operator-owned (user_message source) and
+    current == baseline, an agent change without user_message provenance is
+    rejected to the ledger and the operator value is preserved."""
     baseline = _operator_seeded_current()
     current = _operator_seeded_current()  # identical to baseline → untouched
     proposed = {
         "intent": {
             "purpose": "Refined: reliable billing, fast onboarding.",
-            "current_focus": "x",
+            "current_focus": "Phase 2: invoicing.",
         },
     }
     new_raw, diff = apply_agent_update(
         current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
     )
+    # Purpose preserved — no user_message provenance on the proposed change.
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    # Agent-owned current_focus still advances freely.
+    assert new_raw["intent"]["current_focus"] == "Phase 2: invoicing."
+    assert diff.get("intent_changed") is True  # current_focus changed
+    # Rejected purpose change recorded to the ledger.
+    ledger = new_raw["rejected_agent_edits"]
+    assert len(ledger) == 1
+    assert ledger[0]["field"] == "intent.purpose"
+    assert ledger[0]["agent_value"] == "Refined: reliable billing, fast onboarding."
+    assert ledger[0]["operator_value"] == "Ship a reliable billing system."
+
+
+def test_apply_agent_update_operator_purpose_allowed_with_user_message_provenance():
+    """Escape hatch: when the agent supplies user_message provenance on the
+    proposed intent, the purpose change is accepted even though it is
+    operator-owned (current == baseline, no mid-cycle edit)."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {
+            "purpose": "Refined: reliable billing, fast onboarding.",
+            "current_focus": "Phase 2: invoicing.",
+            "source": {"type": "user_message", "message_id": "m-42", "excerpt": "Please refine the billing goal"},
+        },
+    }
+    new_raw, diff = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    # Purpose accepted — agent supplied user_message provenance.
     assert new_raw["intent"]["purpose"] == "Refined: reliable billing, fast onboarding."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    assert new_raw["intent"]["source"]["message_id"] == "m-42"
     assert diff.get("intent_changed") is True
-    # No conflict → no ledger key surfaced (byte-identical to pre-merge output).
     assert "rejected_agent_edits" not in new_raw
 
 
-def test_apply_agent_update_agent_only_change_to_operator_field_applies():
-    """Operator did not edit (current == baseline) but the agent changed an
-    operator-owned field: the agent's value applies, no rejection."""
+def test_apply_agent_update_agent_context_and_constraints_change_applies():
+    """When the operator did NOT touch a field (current == baseline), the agent's
+    new value applies even with a baseline supplied — no ledger entry."""
     baseline = _operator_seeded_current()
-    current = _operator_seeded_current()
+    current = _operator_seeded_current()  # identical to baseline → untouched
     proposed = {
         "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
         "context": {"project_type": "scale-up", "users": "SMBs"},
@@ -1742,7 +1775,9 @@ def test_apply_agent_update_agent_only_change_to_operator_field_applies():
     new_raw, _ = apply_agent_update(
         current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
     )
+    # Context: agent's change applies (not always-protected).
     assert new_raw["context"]["project_type"] == "scale-up"
+    # Constraints: no mid-cycle operator edit — agent's new value applies.
     assert new_raw["constraints"] == ["No PII in logs", "GDPR compliant", "SOC2"]
     assert "rejected_agent_edits" not in new_raw
 
@@ -1838,6 +1873,81 @@ def test_apply_agent_update_ledger_carried_forward_and_capped():
     # Newest (this cycle's purpose conflict) retained at the end; oldest dropped.
     assert ledger[-1]["field"] == "intent.purpose"
     assert ledger[0]["i"] == 1  # entry 0 rolled off
+
+
+# ---------------------------------------------------------------------------
+# always-protect: repair-path clobber scenario (BUG_REPORT 8154c2d3)
+# ---------------------------------------------------------------------------
+
+
+def test_always_protect_repair_placeholder_purpose_rejected():
+    """Concrete repair-path clobber scenario: the JSON repair reopen runs as a
+    fresh session with no prior analysis context and echoes schema-template text
+    as intent.purpose. Because current.intent.source.type == 'user_message' and
+    the proposed intent carries no user_message provenance, the placeholder is
+    rejected and the operator's real purpose is preserved.
+    Note: constraints have no always-protect; the thinker-side fix (embedding
+    prior analysis in the repair prompt) prevents garbage constraints."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    placeholder = (
+        "Provide a parseable problem_model JSON object with all required "
+        "top-level keys for /tmp/problem_model_abc123.json"
+    )
+    proposed = {
+        "intent": {"purpose": placeholder, "current_focus": "x"},
+        "constraints": ["Provide all required top-level keys"],
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    # Operator purpose is preserved; placeholder is rejected.
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    # Purpose override recorded.
+    ledger = new_raw["rejected_agent_edits"]
+    fields = {e["field"] for e in ledger}
+    assert "intent.purpose" in fields
+    purpose_entry = next(e for e in ledger if e["field"] == "intent.purpose")
+    assert purpose_entry["agent_value"] == placeholder
+
+
+def test_always_protect_purpose_baseline_equal_no_ledger_when_agent_unchanged():
+    """When the agent does NOT attempt to change an operator-owned purpose
+    (proposed == current), no ledger entry is emitted."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {
+            "purpose": "Ship a reliable billing system.",  # same as current
+            "current_focus": "Phase 2.",
+        },
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert "rejected_agent_edits" not in new_raw
+
+
+def test_always_protect_empty_constraints_not_flagged():
+    """When current constraints are empty, an agent that also sends empty
+    constraints generates no ledger entry (nothing to protect)."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    # Operator cleared their constraints.
+    current["constraints"] = []
+    baseline_empty = dict(baseline)
+    baseline_empty["constraints"] = []
+    proposed = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
+        "constraints": [],
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline_empty
+    )
+    assert new_raw["constraints"] == []
+    assert "rejected_agent_edits" not in new_raw
 
 
 # ---------------------------------------------------------------------------
@@ -2920,3 +3030,634 @@ def test_model_size_signal_byte_dimension_is_part_of_worst_wins():
     # Byte information is always present
     assert "serialized_bytes" in sig_many
     assert sig_many["serialized_bytes"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Alias-aware capability consolidation
+# ---------------------------------------------------------------------------
+
+
+def test_capability_absorbs_defaults_empty_and_old_payload_validates():
+    """A capability with no ``absorbs`` parses with an empty list, so every
+    stored model and older agent payload remains valid."""
+    cap = Capability(name="ci-pipeline", status="working")
+    assert cap.absorbs == []
+    # Old-shape payload (no absorbs key) validates unchanged.
+    restored = Capability.model_validate(
+        {"name": "ci-pipeline", "status": "working"}
+    )
+    assert restored.absorbs == []
+
+
+def test_capability_consolidation_resolves_absorbed_prereq():
+    """End-to-end (the exact pair the blocked-resume matcher uses): a
+    consolidation write — ``_deletions.capabilities`` removing several old names
+    plus a working survivor that declares them in ``absorbs`` — makes each old
+    name resolve through ``working_capability_names`` +
+    ``registry_satisfies_capability_need``."""
+    from app.capability_registry import (
+        registry_satisfies_capability_need,
+        working_capability_names,
+    )
+
+    current = {
+        "revision": 1,
+        "capabilities": [
+            {"name": "ci-poll", "status": "working"},
+            {"name": "ci-resolve", "status": "working"},
+            {"name": "ci-fix-spawn", "status": "working"},
+        ],
+    }
+    # Strategist consolidates the three CI capabilities into one survivor that
+    # absorbs them, deleting the old names in the same write.
+    proposed = {
+        "capabilities": [
+            {
+                "name": "ci-pipeline",
+                "status": "working",
+                "absorbs": ["ci-poll", "ci-resolve", "ci-fix-spawn"],
+            },
+        ],
+        "_deletions": {"capabilities": ["ci-poll", "ci-resolve", "ci-fix-spawn"]},
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+
+    # The durable model now holds only the survivor.
+    names = [c["name"] for c in new_raw["capabilities"]]
+    assert names == ["ci-pipeline"]
+
+    # working_capability_names folds the absorbed aliases in alongside the
+    # survivor's own name.
+    working = working_capability_names(new_raw)
+    assert working == {"ci-pipeline", "ci-poll", "ci-resolve", "ci-fix-spawn"}
+
+    # Each absorbed old name resolves as satisfied-by-the-codebase through the
+    # exact helper pair the blocked-resume matcher uses.
+    for old_name in ("ci-poll", "ci-resolve", "ci-fix-spawn"):
+        assert registry_satisfies_capability_need(
+            {"kind": "capability", "ref": old_name}, working
+        )
+    # The survivor's own name resolves too.
+    assert registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "ci-pipeline"}, working
+    )
+
+
+def test_consolidation_shrinks_vocabulary_but_not_known_set():
+    """The rendered ``registry_capability_vocabulary`` SHRINKS (absorbed names
+    absent) while ``registry_capability_names`` (advisory known-set) still
+    contains them — the two readers deliberately diverge."""
+    from app.capability_registry import (
+        registry_capability_names,
+        registry_capability_vocabulary,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="ci-pipeline",
+                status="working",
+                absorbs=["ci-poll", "ci-resolve"],
+            ),
+            Capability(name="auth", status="working"),
+        ]
+    )
+
+    vocab_names = [entry["name"] for entry in registry_capability_vocabulary(model)]
+    # Vocabulary is survivor-only: absorbed names do NOT re-appear.
+    assert vocab_names == ["ci-pipeline", "auth"]
+    assert "ci-poll" not in vocab_names
+    assert "ci-resolve" not in vocab_names
+
+    # Advisory known-set folds the absorbed aliases back in.
+    known = registry_capability_names(model)
+    assert "ci-poll" in known
+    assert "ci-resolve" in known
+    assert "ci-pipeline" in known
+    assert "auth" in known
+    # The known-set is strictly larger than the vocabulary by exactly the
+    # absorbed aliases.
+    assert set(known) - set(vocab_names) == {"ci-poll", "ci-resolve"}
+
+
+def test_consolidation_recorded_in_revision_log_diff():
+    """A consolidation is recorded as ``capabilities_consolidated`` in the diff
+    and surfaced in the revision-log summary."""
+    current = {
+        "revision": 4,
+        "capabilities": [
+            {"name": "ci-poll", "status": "working"},
+            {"name": "ci-resolve", "status": "working"},
+        ],
+    }
+    proposed = {
+        "capabilities": [
+            {
+                "name": "ci-pipeline",
+                "status": "working",
+                "absorbs": ["ci-poll", "ci-resolve"],
+            },
+        ],
+        "_deletions": {"capabilities": ["ci-poll", "ci-resolve"]},
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+
+    assert diff["capabilities_consolidated"] == [
+        {"survivor": "ci-pipeline", "absorbed": ["ci-poll", "ci-resolve"]}
+    ]
+    # And it is folded into the appended revision-log entry.
+    last_entry = new_raw["revision_log"][-1]
+    assert last_entry["changes"]["capabilities_consolidated"] == [
+        {"survivor": "ci-pipeline", "absorbed": ["ci-poll", "ci-resolve"]}
+    ]
+    assert "consolidated 1 capability group(s)" in last_entry["summary"]
+
+
+def test_no_consolidation_write_is_byte_identical():
+    """A no-consolidation write is BYTE-IDENTICAL to today: the round-trip
+    model_dump emits no ``absorbs`` key when every capability absorbed
+    nothing."""
+    current = {
+        "revision": 2,
+        "capabilities": [
+            {"name": "auth", "status": "working", "notes": "stable"},
+            {"name": "billing", "status": "partial"},
+        ],
+    }
+    # A plain status-bump write that performs no consolidation.
+    proposed = {
+        "capabilities": [
+            {"name": "auth", "status": "working", "notes": "stable"},
+            {"name": "billing", "status": "working"},
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+
+    # No capability dict carries an ``absorbs`` key — output is byte-identical
+    # to the pre-field behavior.
+    for cap in new_raw["capabilities"]:
+        assert "absorbs" not in cap
+    assert "capabilities_consolidated" not in diff
+    # The whole serialized blob carries no ``absorbs`` token at all.
+    import json as _json
+
+    assert "absorbs" not in _json.dumps(new_raw)
+
+
+def test_absorbed_name_not_flagged_off_registry():
+    """An absorbed name is NOT flagged by ``off_registry_capability_refs`` when
+    passed the alias-aware known-set."""
+    from app.capability_registry import (
+        off_registry_capability_refs,
+        registry_capability_names,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="ci-pipeline",
+                status="working",
+                absorbs=["ci-poll", "ci-resolve"],
+            ),
+        ]
+    )
+    known = registry_capability_names(model)
+
+    # A prerequisite still naming the absorbed old capability is treated as
+    # known (not off-registry), exactly as before consolidation.
+    flagged = off_registry_capability_refs(
+        ["ci-poll", "Ci Resolve", "never-declared"], known
+    )
+    assert "ci-poll" not in flagged
+    # Normalization still applies on the ref side.
+    assert "Ci Resolve" not in flagged
+    # A genuinely unknown ref is still flagged.
+    assert flagged == ["never-declared"]
+
+
+def test_absorbs_floor_field_not_wiped_by_skeleton_resubmit():
+    """``absorbs`` is in _CAP_FLOOR_FIELDS, so a resubmitted skeleton capability
+    (seen floored) does not silently wipe a durable ``absorbs`` list."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {
+                "name": "ci-pipeline",
+                "status": "working",
+                "absorbs": ["ci-poll", "ci-resolve"],
+            },
+        ],
+    }
+    # Agent saw a skeletonized capabilities section and echoes the floor marker
+    # back; it resubmits only name+status (absorbs blank because it never saw it).
+    proposed = {
+        "capabilities": [{"name": "ci-pipeline", "status": "working"}],
+        "_agent_view_floor_applied": {"summarized_capabilities": 1},
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    assert new_raw["capabilities"][0]["absorbs"] == ["ci-poll", "ci-resolve"]
+
+
+# ---------------------------------------------------------------------------
+# Gap-history compaction watermark
+# ---------------------------------------------------------------------------
+
+
+def _gap_with_history(gap_id: str, events: list[dict]) -> dict:
+    return {
+        "id": gap_id,
+        "name": f"gap {gap_id}",
+        "history": events,
+    }
+
+
+def _evt(ts: str, event: str = "note") -> dict:
+    return {"ts": ts, "event": event}
+
+
+def test_watermark_prevents_stale_echo_resurrection():
+    """Core invariant: entries at or before history_compacted_at are excluded
+    from the write-back union — a trimmed echo cannot resurrect them."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # Durable store: gap has both old and new history entries
+    current = {
+        "revision": 1,
+        "gaps": [_gap_with_history("g-1", [old_evt, new_evt])],
+    }
+    # Agent sets a compaction watermark that covers old_evt
+    proposed = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [
+            {"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+
+    # The old entry is compacted out; only the new entry survives
+    history_ts = [e["ts"] for e in gap_result["history"]]
+    assert old_evt["ts"] not in history_ts
+    assert new_evt["ts"] in history_ts
+    # Watermark is persisted on the gap
+    assert gap_result["history_compacted_at"] == "2026-05-01T00:00:00Z"
+
+
+def test_watermark_prevents_resurrection_on_subsequent_write():
+    """A second write without _compactions still excludes entries below the
+    persistent watermark — the watermark survives the round-trip."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # First write: compact away old_evt
+    current = {
+        "revision": 1,
+        "gaps": [_gap_with_history("g-1", [old_evt, new_evt])],
+    }
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [
+            {"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+
+    # Second write: agent sends only new_evt (trimmed view); no _compactions
+    proposed_second = {
+        "revision": after_first["revision"],
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # old_evt is still excluded because the persisted watermark gates it out
+    history_ts = [e["ts"] for e in gap_result["history"]]
+    assert old_evt["ts"] not in history_ts
+    assert new_evt["ts"] in history_ts
+    # Watermark must survive the write that omits it (durable / Defect 1)
+    assert gap_result.get("history_compacted_at") == "2026-05-01T00:00:00Z"
+
+
+def test_compaction_observable_in_revision_log():
+    """Compaction events are recorded in the diff and the revision-log entry."""
+    current = {
+        "revision": 3,
+        "gaps": [_gap_with_history("g-x", [_evt("2026-01-01T00:00:00Z", "old")])],
+    }
+    proposed = {
+        "gaps": [_gap_with_history("g-x", [])],
+        "_compactions": [
+            {"gap_id": "g-x", "history_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+
+    # Diff carries the event
+    assert "gaps_history_compacted" in diff
+    compacted_events = diff["gaps_history_compacted"]
+    assert any(e["gap_id"] == "g-x" for e in compacted_events)
+
+    # Revision log records it too
+    last_log = new_raw["revision_log"][-1]
+    assert "gaps_history_compacted" in last_log["changes"]
+
+
+def test_no_op_without_compaction_directive():
+    """No _compactions → output is byte-identical to pre-watermark behavior:
+    no watermark keys on gaps, merge is unchanged."""
+    evt = _evt("2026-04-01T00:00:00Z", "entry")
+    current = {
+        "revision": 1,
+        "gaps": [_gap_with_history("g-1", [evt])],
+    }
+    proposed = {
+        "gaps": [_gap_with_history("g-1", [evt])],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+
+    # No watermark fields on output
+    assert "history_compacted_at" not in gap_result
+    assert "past_moves_compacted_at" not in gap_result
+    assert "gaps_history_compacted" not in diff
+    # History is unchanged (union of current + proposed)
+    assert any(e["ts"] == evt["ts"] for e in gap_result["history"])
+
+
+def test_watermark_on_trimmed_view():
+    """Agent receives a 5-entry trimmed view and can compact it: entries below
+    the watermark that ARE in the durable log are excluded, entries above are
+    preserved."""
+    # Durable: 10 history entries
+    all_events = [_evt(f"2026-0{i + 1}-01T00:00:00Z", f"evt-{i}") for i in range(9)]
+    all_events.append(_evt("2026-10-01T00:00:00Z", "evt-9"))
+    current = {"revision": 1, "gaps": [_gap_with_history("g-trim", all_events)]}
+
+    # Agent only sees last 5 (the trim); decides to compact everything before June
+    watermark = "2026-05-31T23:59:59Z"
+    agent_view = all_events[-5:]  # entries 5-9
+    proposed = {
+        "gaps": [_gap_with_history("g-trim", agent_view)],
+        "_compactions": [
+            {"gap_id": "g-trim", "history_watermark": watermark}
+        ],
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-trim")
+    result_ts = {e["ts"] for e in gap_result["history"]}
+
+    # Entries with ts <= watermark are excluded
+    for evt in all_events:
+        if evt["ts"] <= watermark:
+            assert evt["ts"] not in result_ts, f"{evt['ts']} should be compacted"
+        else:
+            assert evt["ts"] in result_ts, f"{evt['ts']} should survive"
+
+
+def test_past_moves_compacted_at_persisted():
+    """past_moves_compacted_at is stored on the gap for observability."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-old", "d-new"]}],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-old", "d-new"]}],
+        "_compactions": [
+            {"gap_id": "g-1", "past_moves_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+    assert gap_result.get("past_moves_compacted_at") == "2026-05-01T00:00:00Z"
+    assert any(e.get("past_moves_watermark") for e in diff.get("gaps_history_compacted", []))
+
+
+def test_compaction_directive_unknown_gap_is_noop():
+    """_compactions referencing a nonexistent gap_id is silently ignored."""
+    current = {"revision": 1, "gaps": [{"id": "g-real", "name": "real"}]}
+    proposed = {
+        "gaps": [{"id": "g-real", "name": "real"}],
+        "_compactions": [
+            {"gap_id": "g-nonexistent", "history_watermark": "2026-05-01T00:00:00Z"}
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    # No events recorded, no crash
+    assert "gaps_history_compacted" not in diff
+    gap = next(g for g in new_raw["gaps"] if g["id"] == "g-real")
+    assert "history_compacted_at" not in gap
+
+
+def test_gap_watermark_fields_default_none_byte_identical():
+    """apply_agent_update output strips None watermark fields from gaps so the
+    stored bytes of clean models are identical to before the fields existed."""
+    import json as _json
+
+    model = Gap(id="g-1", name="test")
+    assert model.history_compacted_at is None
+    assert model.past_moves_compacted_at is None
+
+    # Via apply_agent_update, the output should not carry the watermark keys
+    current = {"revision": 1, "gaps": [{"id": "g-1", "name": "test"}]}
+    proposed = {"gaps": [{"id": "g-1", "name": "test"}]}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_out = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+    dumped = _json.dumps(gap_out)
+    assert "history_compacted_at" not in dumped
+    assert "past_moves_compacted_at" not in dumped
+
+
+# ---------------------------------------------------------------------------
+# Defect 1: watermark wipe — durable watermark must survive writes that omit it
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_durable_across_write_without_compaction_directive():
+    """Watermark survives a write that omits _compactions entirely — the
+    durable current watermark is carried forward monotonically (Defect 1)."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # First write: set watermark
+    current = {"revision": 1, "gaps": [_gap_with_history("g-1", [old_evt, new_evt])]}
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+    assert after_first["gaps"][0]["history_compacted_at"] == "2026-05-01T00:00:00Z"
+
+    # Second write: no _compactions, no watermark field echoed
+    proposed_second = {"gaps": [_gap_with_history("g-1", [new_evt])]}
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # Watermark must survive
+    assert gap_result.get("history_compacted_at") == "2026-05-01T00:00:00Z"
+    # old_evt still excluded (watermark is effective)
+    assert old_evt["ts"] not in {e["ts"] for e in gap_result["history"]}
+
+
+# ---------------------------------------------------------------------------
+# Defect 2: stale-echo resurrection — proposed side must also be filtered
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_two_sided_filters_proposed_history_echoes():
+    """A stale echo that includes pre-compaction entries on the proposed side
+    cannot resurrect them — BOTH current and proposed history are filtered
+    before the union (Defect 2)."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # Compact old_evt
+    current = {"revision": 1, "gaps": [_gap_with_history("g-1", [old_evt, new_evt])]}
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+
+    # Second write: agent echoes BOTH entries (stale view); no _compactions
+    proposed_second = {
+        "gaps": [_gap_with_history("g-1", [old_evt, new_evt])],  # old_evt echoed back!
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # old_evt must NOT be resurrected even though it was on the proposed side
+    assert old_evt["ts"] not in {e["ts"] for e in gap_result["history"]}
+    assert new_evt["ts"] in {e["ts"] for e in gap_result["history"]}
+
+
+# ---------------------------------------------------------------------------
+# Defect 3: monotonic guard — stale directive cannot regress watermark
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_monotonic_stale_compaction_directive_cannot_regress():
+    """A _compactions directive with an older watermark cannot regress a
+    durable newer watermark (Defect 3 — monotonic guard in _apply_compactions)."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new")
+
+    # First write: set watermark to 2026-05-01
+    current = {"revision": 1, "gaps": [_gap_with_history("g-1", [old_evt, new_evt])]}
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+
+    # Second write: directive with OLDER watermark (stale replay)
+    proposed_second = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-04-01T00:00:00Z"}],
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # Watermark must NOT have regressed
+    assert gap_result["history_compacted_at"] == "2026-05-01T00:00:00Z"
+    # old_evt still excluded
+    assert old_evt["ts"] not in {e["ts"] for e in gap_result["history"]}
+
+
+# ---------------------------------------------------------------------------
+# past_moves: replacement semantics and durable watermark
+# ---------------------------------------------------------------------------
+
+
+def test_past_moves_replacement_semantics_on_directive_write():
+    """When _compactions sets past_moves_watermark, proposed.past_moves replaces
+    the durable log (not unioned) — allowing actual compaction of past_moves."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-old-1", "d-old-2", "d-new"]}],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-new"]}],
+        "_compactions": [{"gap_id": "g-1", "past_moves_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-10T12:00:00")
+    gap_result = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+
+    # Replacement semantics: only the agent's trimmed list survives, not the union
+    assert gap_result["past_moves"] == ["d-new"]
+    assert "d-old-1" not in gap_result["past_moves"]
+    assert "d-old-2" not in gap_result["past_moves"]
+    assert gap_result.get("past_moves_compacted_at") == "2026-05-01T00:00:00Z"
+    assert any(e.get("past_moves_watermark") for e in diff.get("gaps_history_compacted", []))
+
+
+def test_past_moves_compacted_at_durable_across_write_without_directive():
+    """past_moves_compacted_at survives a subsequent write that omits the
+    directive — the watermark is monotonically carried forward."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-old", "d-new"]}],
+    }
+    proposed_first = {
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-new"]}],
+        "_compactions": [{"gap_id": "g-1", "past_moves_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+    assert after_first["gaps"][0].get("past_moves_compacted_at") == "2026-05-01T00:00:00Z"
+
+    # Second write: no _compactions directive
+    proposed_second = {
+        "gaps": [{"id": "g-1", "name": "g", "past_moves": ["d-new", "d-newer"]}],
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # Watermark must survive the write that omits it
+    assert gap_result.get("past_moves_compacted_at") == "2026-05-01T00:00:00Z"
+    # d-newer is added (union semantics without directive), d-new stays
+    assert "d-new" in gap_result["past_moves"]
+    assert "d-newer" in gap_result["past_moves"]
+
+
+# ---------------------------------------------------------------------------
+# Acceptance evidence: combined Defect 1 + Defect 2 scenario
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_survives_echo_omitting_field_and_filters_proposed_side():
+    """Combined acceptance test: watermark survives a write that omits it AND
+    filters the proposed side so a stale echo cannot resurrect compacted entries.
+
+    This verifies both Defect 1 (watermark wipe) and Defect 2 (stale-echo
+    resurrection via proposed side) in a single scenario matching the real
+    multi-write-per-cycle pattern."""
+    old_evt = _evt("2026-04-01T00:00:00Z", "old-entry")
+    new_evt = _evt("2026-06-01T00:00:00Z", "new-entry")
+
+    # First write: compact old_evt with watermark
+    current = {"revision": 1, "gaps": [_gap_with_history("g-1", [old_evt, new_evt])]}
+    proposed_first = {
+        "gaps": [_gap_with_history("g-1", [new_evt])],
+        "_compactions": [{"gap_id": "g-1", "history_watermark": "2026-05-01T00:00:00Z"}],
+    }
+    after_first, _ = apply_agent_update(current, proposed_first, "2026-06-10T10:00:00")
+    gap_after_first = next(g for g in after_first["gaps"] if g["id"] == "g-1")
+    assert gap_after_first["history_compacted_at"] == "2026-05-01T00:00:00Z"
+
+    # Second write: agent sends the full pre-compaction view (stale echo); no directive,
+    # no watermark field echoed — simulates an agent whose context was built before or
+    # during the compaction write (common for multi-write cycles).
+    proposed_second = {
+        "gaps": [_gap_with_history("g-1", [old_evt, new_evt])],  # stale echo with old_evt
+        # deliberately omits history_compacted_at (not echoed by agent)
+    }
+    after_second, _ = apply_agent_update(after_first, proposed_second, "2026-06-10T11:00:00")
+    gap_result = next(g for g in after_second["gaps"] if g["id"] == "g-1")
+
+    # Defect 1: watermark must survive even though the agent didn't echo it
+    assert gap_result.get("history_compacted_at") == "2026-05-01T00:00:00Z"
+
+    # Defect 2: old_evt must NOT be resurrected even though it was on proposed side
+    history_ts = {e["ts"] for e in gap_result["history"]}
+    assert old_evt["ts"] not in history_ts
+    assert new_evt["ts"] in history_ts

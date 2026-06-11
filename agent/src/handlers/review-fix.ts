@@ -28,6 +28,7 @@ import {
   formatProjectVision,
   formatRejectionPatternsSection,
   formatStrategicIntent,
+  formatRepoOverview,
   type RejectionPatternsSource,
 } from '../prompts/context-prefix.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -326,6 +327,11 @@ export async function handleReview(
   } catch (e) {
     sendLog(ws, `WARNING: Failed to fetch origin/${baseBranch} for diff comparison: ${String(e)}\n`);
   }
+  // Pin the head SHA this review runs against so the backend can detect stale verdicts.
+  let reviewedHeadSha = '';
+  try {
+    reviewedHeadSha = git(['rev-parse', 'HEAD']).trim();
+  } catch { /* best-effort */ }
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('review');
@@ -524,7 +530,8 @@ export async function handleReview(
   const reviewStrategicIntent = formatStrategicIntent(
     task.strategic_intent as Record<string, unknown> | undefined,
   );
-  const reviewStrategicFraming = [reviewProjectVision, reviewStrategicIntent]
+  const reviewRepoOverview = formatRepoOverview(task.repo_overview);
+  const reviewStrategicFraming = [reviewProjectVision, reviewStrategicIntent, reviewRepoOverview]
     .filter(Boolean)
     .join('\n');
 
@@ -587,6 +594,9 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
     }
     if (parallelReviewInjected) {
       augmented.review_was_parallelized = true;
+    }
+    if (reviewedHeadSha && !augmented.reviewed_head_sha) {
+      augmented.reviewed_head_sha = reviewedHeadSha;
     }
     return JSON.stringify(augmented);
   }
@@ -1077,6 +1087,14 @@ export async function handleFix(
   );
   if (fixStrategicIntent) {
     enrichedPrompt = `${fixStrategicIntent}\n${enrichedPrompt}`;
+  }
+
+  // Prepend repo overview so fix agents know the tech stack and layout without
+  // re-discovering them. The fix path bypasses buildContextPrefix, so wire in
+  // the same formatter directly — mirroring the strategic intent block above.
+  const fixRepoOverview = formatRepoOverview(task.repo_overview);
+  if (fixRepoOverview) {
+    enrichedPrompt = `${fixRepoOverview}\n${enrichedPrompt}`;
   }
 
   // Prepend CLAUDE.md instructions + playbook

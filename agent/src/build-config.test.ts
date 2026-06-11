@@ -447,4 +447,57 @@ describe('resolveBuildConfig', () => {
     const task = { build_config: { directories: [{ path: 'backend', type: 'python' }] } };
     expect(resolveBuildConfig(task)?.migration).toBeUndefined();
   });
+
+  // ── confirmed_lint_cmd passthrough ─────────────────────────────────────────
+  it('resolveBuildConfig preserves confirmed_lint_cmd', () => {
+    const task = {
+      build_config: {
+        directories: [
+          {
+            path: 'backend',
+            type: 'python',
+            lint_cmd: 'ruff check',
+            confirmed_lint_cmd: 'ruff check --select ALL',
+          },
+        ],
+      },
+    };
+    const entry = resolveBuildConfig(task)?.directories?.[0];
+    expect(entry?.confirmed_lint_cmd).toBe('ruff check --select ALL');
+    expect(entry?.lint_cmd).toBe('ruff check');
+  });
+
+  it('carries confirmed_lint_cmd even when commands_stale is true (stale is enforced at read time by effectiveLintCmd)', () => {
+    const task = {
+      build_config: {
+        directories: [
+          {
+            path: 'backend',
+            type: 'python',
+            confirmed_lint_cmd: 'ruff check',
+            commands_stale: true,
+          },
+        ],
+      },
+    };
+    const entry = resolveBuildConfig(task)?.directories?.[0];
+    expect(entry?.confirmed_lint_cmd).toBe('ruff check');
+    expect(entry?.commands_stale).toBe(true);
+  });
+
+  it('omits confirmed_lint_cmd when not a string', () => {
+    const task = {
+      build_config: {
+        directories: [
+          {
+            path: 'backend',
+            type: 'python',
+            confirmed_lint_cmd: 42,
+          },
+        ],
+      },
+    };
+    const entry = resolveBuildConfig(task)?.directories?.[0];
+    expect(entry).not.toHaveProperty('confirmed_lint_cmd');
+  });
 });

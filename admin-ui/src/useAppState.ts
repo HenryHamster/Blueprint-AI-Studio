@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import type { Task } from './types/task';
+import type { Project } from './types/project';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
 import { usePersistedState } from './hooks/usePersistedState';
@@ -188,7 +189,7 @@ export function useAppState() {
 
   // ── Projects domain ──────────────────────────────────────────────────────
   const {
-    projects, projectsFetchError,
+    projects, setProjects, projectsFetchError,
     fetchProjects, handlePauseAllAutonomous, handleClearWaveDeps,
   } = useProjectsState(addToast, fetchTasksRef);
 
@@ -221,6 +222,7 @@ export function useAppState() {
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
     autoReviewConfig, handleUpdateAutoReviewConfig,
+    resourceEnvelopeData, resourceEnvelopeLoading, resourceEnvelopeError, handleUpdateResourceEnvelope,
     integrationBranchData, handleUpdateIntegrationBranch,
     promotionTargetData, handleUpdatePromotionTarget,
     taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,
@@ -290,6 +292,27 @@ export function useAppState() {
   }, [showResearchBrowser, selectedProjectId]);
 
   // ── Effects ─────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!user || !selectedProjectId) return;
+    const selectedProject = projects.find(project => project.id === selectedProjectId);
+    if (!selectedProject) return;
+    if (selectedProject.capability_proof_summary && selectedProject.capability_adoption_verdicts) return;
+
+    let cancelled = false;
+    authGet(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`)
+      .then(async res => {
+        if (!res.ok || cancelled) return;
+        const detailedProject = await res.json() as Project;
+        if (cancelled) return;
+        setProjects(prev => prev.map(project => (
+          project.id === selectedProjectId ? { ...project, ...detailedProject } : project
+        )));
+      })
+      .catch(() => {});
+
+    return () => { cancelled = true; };
+  }, [user, selectedProjectId, projects, setProjects]);
 
   // Handle OAuth redirect query params
   useEffect(() => {
@@ -597,6 +620,7 @@ export function useAppState() {
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
     autoReviewConfig, handleUpdateAutoReviewConfig,
+    resourceEnvelopeData, resourceEnvelopeLoading, resourceEnvelopeError, handleUpdateResourceEnvelope,
     integrationBranchData, handleUpdateIntegrationBranch,
     promotionTargetData, handleUpdatePromotionTarget,
     // Max plan accounts

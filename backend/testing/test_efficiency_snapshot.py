@@ -17,12 +17,19 @@ from app.efficiency_snapshot import (
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
     DESIGN_DOC_KEY,
+    FORMAT_COMPLIANCE_KEY,
+    FORMAT_COMPLIANCE_RATE_KEY,
     LLM_TOKEN_PRICING,
+    METRIC_DEF_VERSION,
+    NESTED_METRIC_CONSUMERS,
+    SELF_REPAIR_SUCCESS_RATE_KEY,
     _compute_cold_start_breakdown_p50,
     _compute_llm_cost_pricing_coverage,
     _last_run_due,
+    _task_llm_attempts,
     compute_current_axes,
     compute_llm_cost_breakdown,
+    compute_llm_cost_by_task_type,
     maybe_write_daily_snapshot,
     read_baseline_with_drift,
     write_snapshot,
@@ -698,7 +705,7 @@ async def test_efficiency_axes_endpoint_returns_shape(client: AsyncClient, db_se
     for axis in ALL_AXES:
         assert axis in data["axes"]
         entry = data["axes"][axis]
-        assert set(entry.keys()) == {"current", "baseline", "drift_pct", "history"}
+        assert {"current", "baseline", "drift_pct", "history"}.issubset(entry.keys())
         assert isinstance(entry["history"], list)
 
 
@@ -725,6 +732,94 @@ async def test_read_baseline_with_drift_history_reflects_snapshots(db_session):
         for entry in hist:
             assert "captured_at" in entry
             assert "value" in entry
+
+
+@pytest.mark.asyncio
+async def test_snapshot_carries_definition_version_and_change_boundary(db_session):
+    """Snapshots must stamp metric_def_version; read path must expose def_version
+    per history point so consumers can detect metric-definition discontinuities.
+
+    Acceptance requirement: new snapshots carry the current METRIC_DEF_VERSION,
+    the drift response exposes def_version on every history point, and a version
+    advance (simulated by back-patching an older snapshot) creates a visible
+    boundary (distinct def_version values) in the history series.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    # First snapshot — written by the current writer, carries METRIC_DEF_VERSION.
+    snap1 = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    assert snap1.get("metric_def_version") == METRIC_DEF_VERSION, (
+        f"write_snapshot must stamp metric_def_version={METRIC_DEF_VERSION!r}; "
+        f"got {snap1.get('metric_def_version')!r}"
+    )
+
+    # Second snapshot — also written by current writer, same version.
+    snap2 = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    assert snap2.get("metric_def_version") == METRIC_DEF_VERSION
+
+    # Simulate a pre-existing snapshot from a prior definition era by back-
+    # patching the first stored snapshot to an older version string.  This models
+    # the real scenario: persisted snapshots 2026-06-06..09 have no version stamp
+    # (metric_def_version absent), while future snapshots carry v6.
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.models import Project
+
+    proj = await db_session.get(Project, project.id)
+    assert proj is not None
+    doc = dict(proj.design_doc or {})
+    container = dict(doc.get("efficiency_baseline") or {})
+    snapshots = list(container.get("snapshots") or [])
+    assert len(snapshots) >= 2, "expected at least 2 snapshots to be stored"
+    # Remove version from first snapshot to simulate a pre-v6 era entry.
+    snapshots[0] = {k: v for k, v in snapshots[0].items() if k != "metric_def_version"}
+    container["snapshots"] = snapshots
+    doc["efficiency_baseline"] = container
+    proj.design_doc = doc
+    flag_modified(proj, "design_doc")
+    await db_session.commit()
+
+    # Now read back via the public API and verify def_version is surfaced.
+    result = await read_baseline_with_drift(db_session, project.id)
+
+    for axis in ALL_AXES:
+        hist = result["axes"][axis]["history"]
+        assert len(hist) >= 2, f"{axis}: expected >= 2 history entries"
+        # Every entry must carry the def_version key (value may be None for
+        # pre-stamping snapshots — that's the correct signal for old entries).
+        for entry in hist:
+            assert "def_version" in entry, (
+                f"{axis}: history entry missing 'def_version' key: {entry!r}"
+            )
+        # The first entry (back-patched to no version) must surface None,
+        # the last entry must surface the current version — a visible boundary.
+        first_version = hist[0]["def_version"]
+        last_version = hist[-1]["def_version"]
+        assert first_version is None, (
+            f"{axis}: expected None def_version for pre-stamping snapshot, "
+            f"got {first_version!r}"
+        )
+        assert last_version == METRIC_DEF_VERSION, (
+            f"{axis}: expected {METRIC_DEF_VERSION!r} on latest snapshot, "
+            f"got {last_version!r}"
+        )
+
+    # Also verify the cost_per_merged_pr_incl_pool_idle_axis history carries
+    # def_version for the same discontinuity detection requirement.
+    incl_axis = result.get("cost_per_merged_pr_incl_pool_idle_axis") or {}
+    incl_hist = incl_axis.get("history") or []
+    for entry in incl_hist:
+        assert "def_version" in entry, (
+            f"cost_per_merged_pr_incl_pool_idle_axis history entry missing "
+            f"'def_version': {entry!r}"
+        )
 
 
 @pytest.mark.asyncio
@@ -1582,6 +1677,284 @@ def test_llm_cost_pricing_coverage_unattributed_tasks():
     # coverage_fraction denominator includes unattributed: 1 priced / 2 total
     assert result["coverage_fraction"] == 0.5
     assert result["unpriced_combos"] == []
+
+
+def test_llm_cost_pricing_coverage_uses_attempt_provider_model():
+    """Banked and current attempts are classified by their own provider/model."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.IN_PROGRESS,
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 200,
+            "llm_call_count": 2,
+        },
+        provider="fakeprovider",
+        model="fake-model-x",
+        vm_provisioned_at=now - timedelta(minutes=8),
+    )
+    bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+
+    task.status = TaskStatus.COMPLETED
+    task.api_call_summary = {
+        "total_input_tokens": 1000,
+        "total_output_tokens": 500,
+        "llm_call_count": 3,
+    }
+    task.provider = "anthropic"
+    task.model = "claude-sonnet-4-6"
+
+    result = _compute_llm_cost_pricing_coverage([task])
+
+    assert result["priced_tasks"] == 1
+    assert result["unpriced_tasks"] == 1
+    assert result["unattributed_tasks"] == 0
+    assert result["coverage_fraction"] == 0.5
+    assert result["unpriced_combos"] == ["fakeprovider:fake-model-x"]
+
+
+def test_llm_cost_pricing_coverage_counts_missing_attempt_attribution():
+    """Token-bearing attempt rows with missing provider or model stay explicit."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    missing_provider = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+    )
+    missing_provider.attempt_history = [
+        {
+            "provider": None,
+            "model": "claude-sonnet-4-6",
+            "llm_input_tokens": 200,
+            "llm_output_tokens": 100,
+            "llm_call_count": 1,
+        }
+    ]
+    missing_model = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 300,
+            "total_output_tokens": 150,
+            "llm_call_count": 1,
+        },
+        provider="anthropic",
+        model=None,
+    )
+
+    result = _compute_llm_cost_pricing_coverage([missing_provider, missing_model])
+
+    assert result["priced_tasks"] == 0
+    assert result["unpriced_tasks"] == 0
+    assert result["unattributed_tasks"] == 2
+    assert result["coverage_fraction"] == 0.0
+    assert result["unpriced_combos"] == []
+
+
+# ---------------------------------------------------------------------------
+# Atomic (provider, model) pair resolution in _task_llm_attempts
+# ---------------------------------------------------------------------------
+
+
+def test_task_llm_attempts_resolves_provider_model_pair_atomically():
+    """The canonical acceptance test: half-filled rows degrade cleanly; complete
+    pairs use the attempt's own values; provider-switching retries never blend
+    halves from different sources into chimera combos."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    # Attempt 1: full pair from a different provider (e.g. a retry that switched).
+    # Must use the attempt's own pair, NOT the task's current provider.
+    # Attempt 2: provider set, model absent → half-filled → must degrade to (None, None).
+    # Attempt 3: model set, provider absent → half-filled → must degrade to (None, None).
+    # Attempt 4: neither set → must fall back to task's pair as a whole.
+    task.attempt_history = [
+        {
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "llm_input_tokens": 100,
+            "llm_output_tokens": 50,
+            "llm_call_count": 1,
+        },
+        {
+            "provider": "fakeprovider",
+            "model": None,
+            "llm_input_tokens": 200,
+            "llm_output_tokens": 80,
+            "llm_call_count": 1,
+        },
+        {
+            "provider": None,
+            "model": "claude-opus-4-8",
+            "llm_input_tokens": 300,
+            "llm_output_tokens": 120,
+            "llm_call_count": 1,
+        },
+        {
+            "llm_input_tokens": 400,
+            "llm_output_tokens": 160,
+            "llm_call_count": 2,
+        },
+    ]
+
+    result = _task_llm_attempts(task)
+
+    # Four banked attempts (no live tokens); order matches history.
+    assert len(result) == 4
+
+    # Attempt 1: full pair → uses attempt's own pair, not task's anthropic pair.
+    p0, m0, _in0, _out0, _c0 = result[0]
+    assert (p0, m0) == ("openai", "gpt-5.4"), f"expected openai:gpt-5.4, got {p0}:{m0}"
+
+    # Attempt 2: provider-only half-filled → (None, None); no chimera with task.model.
+    p1, m1, _in1, _out1, _c1 = result[1]
+    assert (p1, m1) == (None, None), (
+        f"expected (None, None) for provider-only row, got {p1}:{m1}"
+    )
+
+    # Attempt 3: model-only half-filled → (None, None); no chimera with task.provider.
+    p2, m2, _in2, _out2, _c2 = result[2]
+    assert (p2, m2) == (None, None), (
+        f"expected (None, None) for model-only row, got {p2}:{m2}"
+    )
+
+    # Attempt 4: neither field → falls back to task's pair as a whole.
+    p3, m3, _in3, _out3, _c3 = result[3]
+    assert (p3, m3) == ("anthropic", "claude-sonnet-4-6"), (
+        f"expected task fallback anthropic:claude-sonnet-4-6, got {p3}:{m3}"
+    )
+
+    # Validate that the cost breakdown never contains chimera combos.
+    breakdown = compute_llm_cost_breakdown([task])
+    combo_keys = {entry["model"] for entry in breakdown["by_model"]}
+    assert "claude-opus-4-8" not in combo_keys, "chimera model from model-only row leaked"
+    assert "gpt-5.4" in combo_keys  # legitimate pair must still appear
+
+
+def test_task_llm_attempts_no_chimera_half_filled_provider_only():
+    """Provider-only attempt row degrades to (None, None); task.model not spliced in."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-opus-4-8",
+    )
+    task.attempt_history = [
+        {
+            "provider": "openai",
+            "model": None,
+            "llm_input_tokens": 100,
+            "llm_output_tokens": 50,
+            "llm_call_count": 1,
+        }
+    ]
+
+    result = _task_llm_attempts(task)
+    assert len(result) == 1
+    p, m, _in, _out, _c = result[0]
+    assert (p, m) == (None, None), f"provider-only row must yield (None, None), got {p}:{m}"
+    # Specifically: must NOT be openai:claude-opus-4-8 (chimera).
+    assert not (p == "openai" and m == "claude-opus-4-8")
+
+
+def test_task_llm_attempts_no_chimera_half_filled_model_only():
+    """Model-only attempt row degrades to (None, None); task.provider not spliced in."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    task.attempt_history = [
+        {
+            "provider": None,
+            "model": "gpt-5.4",
+            "llm_input_tokens": 100,
+            "llm_output_tokens": 50,
+            "llm_call_count": 1,
+        }
+    ]
+
+    result = _task_llm_attempts(task)
+    assert len(result) == 1
+    p, m, _in, _out, _c = result[0]
+    assert (p, m) == (None, None), f"model-only row must yield (None, None), got {p}:{m}"
+    # Specifically: must NOT be anthropic:gpt-5.4 (chimera).
+    assert not (p == "anthropic" and m == "gpt-5.4")
+
+
+def test_task_llm_attempts_full_pair_used_atomically():
+    """Attempt with both fields uses its own pair, not the task's current values."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    task.attempt_history = [
+        {
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "llm_input_tokens": 500,
+            "llm_output_tokens": 200,
+            "llm_call_count": 3,
+        }
+    ]
+
+    result = _task_llm_attempts(task)
+    assert len(result) == 1
+    p, m, in_tok, out_tok, calls = result[0]
+    assert p == "openai" and m == "gpt-5.4", f"expected openai:gpt-5.4, got {p}:{m}"
+    assert in_tok == 500 and out_tok == 200 and calls == 3
+
+
+def test_task_llm_attempts_neither_field_falls_back_to_task():
+    """Attempt with neither provider nor model falls back to task's pair as a whole."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-haiku-4-5",
+    )
+    task.attempt_history = [
+        {
+            "llm_input_tokens": 300,
+            "llm_output_tokens": 100,
+            "llm_call_count": 2,
+        }
+    ]
+
+    result = _task_llm_attempts(task)
+    assert len(result) == 1
+    p, m, in_tok, out_tok, calls = result[0]
+    assert p == "anthropic" and m == "claude-haiku-4-5", (
+        f"expected task fallback anthropic:claude-haiku-4-5, got {p}:{m}"
+    )
+    assert in_tok == 300 and out_tok == 100 and calls == 2
 
 
 def test_compute_llm_cost_breakdown_priced_and_unpriced():
@@ -3046,6 +3419,53 @@ async def test_unpriced_alert_dedups_on_stable_degraded_state(db_session, mocker
 
 
 @pytest.mark.asyncio
+async def test_unpriced_alert_uses_attempt_provider_model(db_session, mocker):
+    """Priced current attempts must not hide unpriced banked retry attempts."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    for i in range(UNPRICED_ALERT_MIN_TASKS):
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            api_call_summary={
+                "total_input_tokens": 500 + i,
+                "total_output_tokens": 200,
+                "llm_call_count": 2,
+            },
+            provider="fakeprovider",
+            model="fake-model-x",
+            vm_provisioned_at=now - timedelta(minutes=10 + i),
+        )
+        db_session.add(task)
+        await db_session.flush()
+        bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+
+        task.status = TaskStatus.COMPLETED
+        task.api_call_summary = {
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 3,
+        }
+        task.provider = "anthropic"
+        task.model = "claude-sonnet-4-6"
+
+    await db_session.commit()
+
+    fired = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+
+    assert fired is True
+    alerts = await _unpriced_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert "fakeprovider:fake-model-x" in alerts[0].message
+    assert "50%" in alerts[0].message
+
+
+@pytest.mark.asyncio
 async def test_unpriced_alert_ignores_tokenless_and_unattributed(db_session, mocker):
     """Token-less and unattributed (no provider/model) tasks never trip the alert.
 
@@ -3102,6 +3522,24 @@ def _make_timeout_task(project_id, subtype: str):
         started_at=now - timedelta(minutes=10),
         updated_at=now,
         context={"failure_category": AGENT_TIMEOUT, "timeout_subtype": subtype},
+    )
+
+
+def _make_format_compliance_task(
+    project_id,
+    *,
+    errors: int,
+    repair_attempts: int = 0,
+    repair_successes: int = 0,
+):
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        format_compliance_summary={
+            "format_error_total": errors,
+            "format_repair_attempts": repair_attempts,
+            "format_repair_successes": repair_successes,
+        },
     )
 
 
@@ -3197,6 +3635,110 @@ async def test_agent_timeout_rate_backfilled_into_preexisting_baseline(db_sessio
 
 
 @pytest.mark.asyncio
+async def test_snapshot_persists_format_compliance_block(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_format_compliance_task(project.id, errors=0))
+    db_session.add(
+        _make_format_compliance_task(
+            project.id,
+            errors=2,
+            repair_attempts=2,
+            repair_successes=1,
+        )
+    )
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    block = snap[FORMAT_COMPLIANCE_KEY]
+    assert block["tasks_measured"] == 2
+    assert block[FORMAT_COMPLIANCE_RATE_KEY] == 0.5
+    assert block["format_error_total"] == 2
+    assert block["repair_attempts"] == 2
+    assert block["repair_successes"] == 1
+    assert block[SELF_REPAIR_SUCCESS_RATE_KEY] == 0.5
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    fc = drift[FORMAT_COMPLIANCE_KEY]
+    assert fc["tasks_measured"] == 2
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["current"] == 0.5
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["baseline"] == 0.5
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["drift_pct"] == 0.0
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["history"] == [
+        {"captured_at": snap["captured_at"], "value": 0.5}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_format_compliance_backfilled_into_preexisting_baseline(db_session):
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {"captured_at": "2020-01-01T00:00:00+00:00"},
+                "snapshots": [],
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_format_compliance_task(project.id, errors=0))
+    db_session.add(_make_format_compliance_task(project.id, errors=1))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    assert snap[FORMAT_COMPLIANCE_KEY][FORMAT_COMPLIANCE_RATE_KEY] == 0.5
+
+    await db_session.commit()
+    await db_session.refresh(project)
+    baseline = project.design_doc[DESIGN_DOC_KEY]["baseline"]
+    assert baseline[FORMAT_COMPLIANCE_KEY][FORMAT_COMPLIANCE_RATE_KEY] == 0.5
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    assert drift[FORMAT_COMPLIANCE_KEY][FORMAT_COMPLIANCE_RATE_KEY]["baseline"] == 0.5
+    assert drift[FORMAT_COMPLIANCE_KEY][FORMAT_COMPLIANCE_RATE_KEY]["drift_pct"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_efficiency_axes_endpoint_exposes_format_compliance(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    db_session.add(_make_format_compliance_task(project.id, errors=0))
+    db_session.add(
+        _make_format_compliance_task(
+            project.id,
+            errors=1,
+            repair_attempts=1,
+            repair_successes=1,
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/efficiency-axes")
+    assert resp.status_code == 200
+    body = resp.json()
+    fc = body[FORMAT_COMPLIANCE_KEY]
+    assert fc["tasks_measured"] == 2
+    assert fc["format_error_total"] == 1
+    assert fc[FORMAT_COMPLIANCE_RATE_KEY]["current"] == 0.5
+    assert fc[SELF_REPAIR_SUCCESS_RATE_KEY]["current"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_efficiency_axes_endpoint_exposes_timeout_rate(
     client: AsyncClient, db_session
 ):
@@ -3272,6 +3814,1202 @@ def test_all_axes_have_named_consumer_or_retired_record():
     )
 
 
+def test_nested_snapshot_metrics_have_ground_truth_and_named_consumer():
+    required = {"agent_timeout_rate", FORMAT_COMPLIANCE_KEY}
+    missing = required - set(NESTED_METRIC_CONSUMERS)
+    assert not missing, (
+        f"Nested snapshot metrics missing governance entries: {sorted(missing)}"
+    )
+    for metric_key in required:
+        entry = NESTED_METRIC_CONSUMERS[metric_key]
+        assert entry.get("ground_truth"), (
+            f"NESTED_METRIC_CONSUMERS['{metric_key}'] must name ground_truth"
+        )
+        assert entry.get("consumer"), (
+            f"NESTED_METRIC_CONSUMERS['{metric_key}'] must name consumer"
+        )
+
+
 def test_axis_llm_cost_constant_value():
     """AXIS_LLM_COST_PER_MERGED_PR resolves to the expected string key."""
     assert AXIS_LLM_COST_PER_MERGED_PR == "llm_cost_per_merged_pr"
+
+
+# ---------------------------------------------------------------------------
+# compute_llm_cost_by_task_type tests
+# ---------------------------------------------------------------------------
+
+
+def test_llm_cost_breakdown_by_task_type_basic():
+    """Tasks with distinct payload types bucket into separate rows; totals
+    reconcile with compute_llm_cost_breakdown's overall total_cost_usd."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # 'create' task: 2000 in, 1000 out — cost = 2000*3e-6 + 1000*15e-6 = 0.021
+    create_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # 'review' task: 1000 in, 500 out — cost = 1000*3e-6 + 500*15e-6 = 0.0105
+    review_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "review"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([create_task, review_task])
+    by_type = {r["task_type"]: r for r in rows}
+
+    assert set(by_type) == {"create", "review"}
+
+    create_row = by_type["create"]
+    expected_create_cost = round(2000 * input_rate + 1000 * output_rate, 6)
+    assert create_row["total_cost_usd"] == expected_create_cost
+    assert create_row["total_input_tokens"] == 2000
+    assert create_row["total_output_tokens"] == 1000
+    assert create_row["llm_call_count"] == 8
+    assert create_row["task_count"] == 1
+    assert create_row["merged_count"] == 1
+    assert create_row["merge_rate"] == 1.0
+    assert create_row["verified_merged_count"] == 1
+    assert create_row["verified_merge_rate"] == 1.0
+
+    review_row = by_type["review"]
+    expected_review_cost = round(1000 * input_rate + 500 * output_rate, 6)
+    assert review_row["total_cost_usd"] == expected_review_cost
+    assert review_row["merged_count"] == 0
+    assert review_row["merge_rate"] == 0.0
+
+    # share_of_total_cost must sum to 1.0
+    share_sum = sum(r["share_of_total_cost"] or 0.0 for r in rows)
+    assert abs(share_sum - 1.0) < 1e-6
+
+    # Total cost must reconcile with compute_llm_cost_breakdown
+    breakdown_total = compute_llm_cost_breakdown([create_task, review_task])["totals"]["total_cost_usd"]
+    type_total = round(sum(r["total_cost_usd"] for r in rows), 6)
+    assert type_total == breakdown_total
+
+    # Sorted cost descending: create (0.021) before review (0.0105)
+    assert rows[0]["task_type"] == "create"
+    assert rows[1]["task_type"] == "review"
+
+
+def test_llm_cost_breakdown_by_task_type_no_type_field():
+    """Tasks with no 'type' key in first_payload fall into 'unspecified' bucket."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # Payload has no 'type' key
+    no_type = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"effort": "high"}],
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 200,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Empty payloads list
+    empty_payload = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[],
+        api_call_summary={
+            "total_input_tokens": 300,
+            "total_output_tokens": 100,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([no_type, empty_payload])
+    assert len(rows) == 1
+    assert rows[0]["task_type"] == "unspecified"
+    assert rows[0]["task_count"] == 2
+    assert rows[0]["total_input_tokens"] == 800
+    assert rows[0]["total_output_tokens"] == 300
+
+
+def test_llm_cost_breakdown_by_task_type_merge_credited_once():
+    """A multi-attempt merged task credits merged_count once to its type bucket,
+    not once per attempt-row (regression guard for the per-model merge-once pattern)."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    now = _utcnow()
+    from app.models import bank_task_current_attempt
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"pr_merged": True},
+        payloads=[{"type": "fix"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+            "llm_call_count": 3,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(minutes=9),
+        vm_spot=True,
+    )
+    bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+
+    # Second attempt on the same model
+    task.status = TaskStatus.COMPLETED
+    task.vm_provisioned_at = now - timedelta(minutes=3)
+    task.vm_stopped_at = now
+    task.vm_spot = False
+    task.api_call_summary = {
+        "total_input_tokens": 250,
+        "total_output_tokens": 150,
+        "llm_call_count": 2,
+    }
+
+    rows = compute_llm_cost_by_task_type([task])
+    assert len(rows) == 1
+    fix_row = rows[0]
+    assert fix_row["task_type"] == "fix"
+    assert fix_row["task_count"] == 1
+    # Merged once, not once per attempt
+    assert fix_row["merged_count"] == 1
+    assert fix_row["merge_rate"] == 1.0
+    assert fix_row["verified_merged_count"] == 1
+    # Cost includes both attempts
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_cost = round((1000 + 250) * input_rate + (400 + 150) * output_rate, 6)
+    assert fix_row["total_cost_usd"] == expected_cost
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
+    client: AsyncClient, db_session
+):
+    """The /llm-cost-breakdown endpoint must include a 'by_task_type' list."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create"}],
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/llm-cost-breakdown")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "by_task_type" in data
+    by_type = {r["task_type"]: r for r in data["by_task_type"]}
+    assert "create" in by_type
+    row = by_type["create"]
+    assert row["task_count"] == 1
+    assert row["merged_count"] == 1
+    assert row["total_input_tokens"] == 1000
+    assert row["total_output_tokens"] == 500
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_cost = round(1000 * input_rate + 500 * output_rate, 6)
+    assert row["total_cost_usd"] == expected_cost
+
+
+# ---------------------------------------------------------------------------
+# Windowed idle-cost axis: out-of-window ledger rows must not inflate
+# cost_per_merged_pr_incl_pool_idle (acceptance gate: test named below).
+# ---------------------------------------------------------------------------
+
+from app.models import PoolIdleCostLedger, PoolIdleSpan, PoolVm, PoolVmState  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_out_of_window_idle_ledger_rows_do_not_inflate_inclusive_axis(
+    db_session,
+):
+    """Out-of-window PoolIdleSpan rows must not inflate the per-PR idle-
+    inclusive cost axis.
+
+    Seeds one in-window span ($1.00, settled 3 days ago) and one out-of-window
+    span ($99.00, settled 10 days ago — outside the 7-day window).  Also seeds
+    PoolIdleCostLedger rows (all-time carry-forward) and a merged PR task so
+    cost_per_merged_pr_incl_pool_idle is defined.
+    The axis value must reflect only the in-window $1.00; the out-of-window
+    $99.00 must be excluded even though it appears in pool_metrics["total_idle_cost_usd"].
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # One merged-PR task so the axis denominator is 1 and we can compare dollars.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=10),
+        vm_stopped_at=now - timedelta(minutes=1),
+        vm_spot=False,
+    )
+    db_session.add(task)
+
+    # In-window span: settled 3 days ago (within the 7-day cutoff).
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-in-window",
+            started_at=now - timedelta(days=3, hours=1),
+            settled_at=now - timedelta(days=3),
+            cost_usd=1.0,
+        )
+    )
+    # Out-of-window span: settled 10 days ago (before the 7-day cutoff).
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-out-of-window",
+            started_at=now - timedelta(days=10, hours=1),
+            settled_at=now - timedelta(days=10),
+            cost_usd=99.0,
+        )
+    )
+    # All-time ledger carry-forward (both entries) so pool_metrics sees the full spend.
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-in-window",
+            idle_cost_usd=1.0,
+            retired_at=now - timedelta(days=3),
+        )
+    )
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-out-of-window",
+            idle_cost_usd=99.0,
+            retired_at=now - timedelta(days=10),
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    incl = axes["cost_per_merged_pr_incl_pool_idle"]
+    assert incl is not None, "axis should be defined (we have a merged PR)"
+
+    # pool_metrics (all-time) still reflects the full $100 spend.
+    all_time = axes["pool_metrics"]["total_idle_cost_usd"]
+    assert all_time >= 100.0, (
+        "all-time pool_metrics must include both in- and out-of-window entries"
+    )
+
+    # The windowed axis must be dramatically lower than if the $99 were included.
+    # task VM cost is small (< $0.10 for 9 min on-demand), so incl ~ vm_cost + 1.0.
+    # If the $99 leaked in, incl would be > 99.
+    assert incl < 5.0, (
+        f"cost_per_merged_pr_incl_pool_idle={incl} should reflect only the "
+        f"in-window $1.00 span entry, not the $99 out-of-window entry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_windowed_idle_cost_live_member_clamped_to_window(db_session):
+    """A live IDLE member whose idle_since predates the window cutoff must have
+    its idle cost clamped to the window start rather than accruing from the
+    full (pre-cutoff) idle_since."""
+    from app.efficiency_snapshot import _AXIS_WINDOW_DAYS, _compute_windowed_idle_cost
+    from app.vm_cost_rates import idle_cost_usd as _idle_cost_usd
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=_AXIS_WINDOW_DAYS)
+
+    # idle_since is 10 days ago — well before the 7-day cutoff.
+    idle_since_pre_window = now - timedelta(days=10)
+    member = PoolVm(
+        project_id=project.id,
+        vm_instance_id="vm-old-idle",
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+        state=PoolVmState.IDLE,
+        idle_since=idle_since_pre_window,
+        idle_cost_banked=5.0,  # pre-accumulated banked cost — must NOT be counted
+    )
+    db_session.add(member)
+    await db_session.commit()
+
+    result = await _compute_windowed_idle_cost(db_session, project.id, cutoff)
+    windowed = result["total"]
+
+    # Expected: only the in-window portion (cutoff .. now) is billed.
+    # The full (10-day) idle period would be ~10x larger.
+    window_elapsed = (now - cutoff).total_seconds()
+    expected_max = _idle_cost_usd(window_elapsed) * 1.05  # 5% tolerance for clock skew
+    full_elapsed = (now - idle_since_pre_window).total_seconds()
+    full_cost = _idle_cost_usd(full_elapsed)
+
+    assert windowed < full_cost, (
+        f"windowed cost {windowed} should be less than full idle cost {full_cost}"
+    )
+    assert windowed <= expected_max, (
+        f"windowed cost {windowed} exceeds clamped window cost {expected_max}"
+    )
+    # idle_cost_banked (5.0) is not included: if it were, windowed would equal
+    # expected_max + 5.0.  The expected_max check above already gates this.
+    assert windowed <= expected_max, "windowed cost must not include idle_cost_banked"
+
+    # by_account must contain the member's account.
+    assert "acct-1" in result["by_account"], "by_account should contain the member account"
+    assert result["by_account"]["acct-1"]["total_idle_cost_usd"] == windowed
+
+
+@pytest.mark.asyncio
+async def test_all_time_pool_metrics_preserved_alongside_windowed_axis(db_session):
+    """pool_metrics['total_idle_cost_usd'] must still reflect all-time spend
+    (including pre-window ledger entries) while cost_per_merged_pr_incl_pool_idle
+    uses only windowed cost."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=10),
+        vm_stopped_at=now - timedelta(minutes=1),
+        vm_spot=False,
+    )
+    db_session.add(task)
+
+    # Only out-of-window spend ($50).
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-old",
+            idle_cost_usd=50.0,
+            retired_at=now - timedelta(days=14),
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    # All-time pool_metrics sees the $50.
+    assert axes["pool_metrics"]["total_idle_cost_usd"] >= 50.0
+
+    # Windowed axis excludes the $50 (nothing in-window).
+    incl = axes["cost_per_merged_pr_incl_pool_idle"]
+    assert incl is not None
+    # Without the $50 the inclusive axis is close to the plain vm-cost axis.
+    plain = axes[AXIS_COST_PER_MERGED_PR]
+    assert plain is not None
+    assert abs(incl - plain) < 1.0, (
+        f"incl ({incl}) should be close to plain ({plain}) when "
+        "all pool idle spend is out-of-window"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pool_cost_amortization_excludes_pre_window_idle_spend(db_session):
+    """read_baseline_with_drift must use windowed idle cost, not all-time."""
+    from app.vm_cost_rates import idle_cost_usd as _idle_cost_usd
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # Merged task so write_snapshot has real data to persist.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now - timedelta(minutes=1),
+        vm_spot=False,
+    )
+    db_session.add(task)
+
+    # In-window span: settled 2 hours ago (inside any 24h window).
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-in-window",
+            started_at=now - timedelta(hours=3),
+            settled_at=now - timedelta(hours=2),
+            cost_usd=0.50,
+        )
+    )
+    # All-time ledger carry-forward for the in-window span and an old one.
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-in-window",
+            idle_cost_usd=0.50,
+            retired_at=now - timedelta(hours=2),
+        )
+    )
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-out-of-window",
+            idle_cost_usd=50.0,
+            retired_at=now - timedelta(hours=48),
+        )
+    )
+    db_session.add(
+        PoolVm(
+            project_id=project.id,
+            vm_instance_id="vm-live-old",
+            account_id="acct-live",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            state=PoolVmState.IDLE,
+            idle_since=now - timedelta(days=10),
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    amort = drift["pool_cost_amortization"]
+
+    snapshot_all_time = drift.get("pool_idle_cost_usd") or 0.0
+    assert snapshot_all_time >= 50.0, (
+        "snapshot pool_idle_cost_usd must include all-time spend"
+    )
+
+    # The amortization view must use only the windowed (in-window) spend.
+    amort_idle = amort["pool_idle_cost_usd"]
+    assert amort_idle < 5.0, (
+        f"pool_cost_amortization.pool_idle_cost_usd={amort_idle} should reflect "
+        f"only the in-window $0.50 ledger entry, not the $50 out-of-window entry. "
+        f"All-time snapshot was {snapshot_all_time}"
+    )
+    assert amort_idle >= 0.49, (
+        f"pool_cost_amortization.pool_idle_cost_usd={amort_idle} should include "
+        "the in-window $0.50 span row"
+    )
+    # Per-account breakdown: live idle member's in-window clamped cost is attributed
+    # to acct-live. The window is 24h (get_pool_funnel_snapshot default); member is
+    # idle 10 days so its contribution is clamped to exactly 24h.
+    amort_by_account = drift["pool_cost_amortization_by_account"]
+    live_expected = _idle_cost_usd(24 * 3600)
+    assert amort_by_account["acct-live"]["pool_idle_cost_usd"] == pytest.approx(
+        live_expected, rel=0.05
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_windowed_idle_cost_fleet_wide(db_session):
+    """project_id=None (fleet-wide) includes IDLE members from multiple projects."""
+    from app.efficiency_snapshot import _compute_windowed_idle_cost
+
+    now = _utcnow()
+    cutoff = now - timedelta(hours=24)
+
+    proj_a = make_project(design_doc={})
+    proj_b = make_project(design_doc={})
+    db_session.add(proj_a)
+    db_session.add(proj_b)
+    await db_session.commit()
+    await db_session.refresh(proj_a)
+    await db_session.refresh(proj_b)
+
+    # One IDLE member per project, both idle for 1 hour (well within 24h window).
+    for project in (proj_a, proj_b):
+        db_session.add(
+            PoolVm(
+                project_id=project.id,
+                vm_instance_id=f"vm-fleet-{project.id}",
+                account_id="acct-fleet",
+                provider="anthropic",
+                model="claude-opus-4-8",
+                state=PoolVmState.IDLE,
+                idle_since=now - timedelta(hours=1),
+            )
+        )
+    await db_session.commit()
+
+    # Fleet-wide result (project_id=None) must sum both members.
+    fleet_result = await _compute_windowed_idle_cost(db_session, None, cutoff)
+    fleet_total = fleet_result["total"]
+
+    # Per-project result for proj_a alone must be about half of fleet.
+    proj_a_result = await _compute_windowed_idle_cost(db_session, proj_a.id, cutoff)
+    proj_a_total = proj_a_result["total"]
+
+    assert proj_a_total > 0, "proj_a windowed cost should be positive"
+    assert fleet_total > proj_a_total, (
+        f"fleet total ({fleet_total}) should exceed single-project total ({proj_a_total})"
+    )
+    # With both members having equal idle time the fleet total should be ~2x proj_a.
+    assert abs(fleet_total - 2 * proj_a_total) < 0.001, (
+        f"fleet ({fleet_total}) should be ~2x proj_a ({proj_a_total}) with equal idle time"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Acceptance gate: PoolIdleSpan-based windowed attribution (exact span counts)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_windowed_idle_cost_counts_settled_spans_exactly(db_session):
+    """_compute_windowed_idle_cost must include spans whose settled_at is within
+    the window and exclude spans settled before the cutoff — even when both span
+    to the same retired member (verifying per-span attribution, not lump
+    retirement attribution).
+
+    Regression: the old PoolIdleCostLedger approach attributed the member's
+    FULL lifetime banked cost to the retirement window, so a long-lived member
+    that accrued $5 over 5 days but retired at day 0 would contribute $5 to any
+    window it retired into, regardless of when the cost actually accrued.
+
+    This test seeds three PoolIdleSpan rows for the same vm:
+      - span A: settled 5 days ago (outside the 7-day window) — excluded
+      - span B: settled 3 days ago (inside the 7-day window) — included
+      - span C: settled 1 day ago (inside the 7-day window) — included
+
+    The windowed total must match span B + span C exactly.
+    Also verifies that project_id scoping works (a second project's spans are
+    excluded from the first project's windowed result).
+    """
+    from app.efficiency_snapshot import _AXIS_WINDOW_DAYS, _compute_windowed_idle_cost
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=_AXIS_WINDOW_DAYS)
+
+    project = make_project(design_doc={})
+    other_project = make_project(design_doc={})
+    db_session.add(project)
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other_project)
+
+    span_a_cost = 0.10  # out-of-window
+    span_b_cost = 0.25  # in-window
+    span_c_cost = 0.40  # in-window
+
+    # Span A: settled before the window cutoff — must be excluded.
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-multi-span",
+            started_at=now - timedelta(days=_AXIS_WINDOW_DAYS + 2),
+            settled_at=now - timedelta(days=_AXIS_WINDOW_DAYS + 1),
+            cost_usd=span_a_cost,
+        )
+    )
+    # Span B: settled 3 days ago (inside the window) — must be included.
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-multi-span",
+            started_at=now - timedelta(days=4),
+            settled_at=now - timedelta(days=3),
+            cost_usd=span_b_cost,
+        )
+    )
+    # Span C: settled 1 day ago (inside the window) — must be included.
+    db_session.add(
+        PoolIdleSpan(
+            project_id=project.id,
+            vm_instance_id="vm-multi-span",
+            started_at=now - timedelta(days=2),
+            settled_at=now - timedelta(days=1),
+            cost_usd=span_c_cost,
+        )
+    )
+    # A span from another project must not bleed into project's windowed total.
+    db_session.add(
+        PoolIdleSpan(
+            project_id=other_project.id,
+            vm_instance_id="vm-other-project",
+            started_at=now - timedelta(days=2),
+            settled_at=now - timedelta(days=1),
+            cost_usd=50.0,
+        )
+    )
+    await db_session.commit()
+
+    result = await _compute_windowed_idle_cost(db_session, project.id, cutoff)
+
+    expected = round(span_b_cost + span_c_cost, 6)
+    assert result["total"] == pytest.approx(expected, abs=1e-6), (
+        f"windowed total {result['total']} should equal span_b+span_c "
+        f"({expected}); span_a ({span_a_cost}) must be excluded"
+    )
+
+    # Fleet-wide query (project_id=None) adds the other-project span.
+    fleet_result = await _compute_windowed_idle_cost(db_session, None, cutoff)
+    assert fleet_result["total"] > result["total"], (
+        "fleet-wide total should exceed project-scoped total"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-axis seed provenance tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_snapshot_seeds_provenance(db_session):
+    """The first write_snapshot call records _member_provenance for every
+    ALL_AXES member that has a non-None value in the initial snapshot."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    prov = baseline.get("_member_provenance") or {}
+
+    # Every ALL_AXES member with a non-None value in the snapshot must have
+    # a provenance entry with seeded_at == snapshot captured_at.
+    for axis in ALL_AXES:
+        if snap.get(axis) is not None:
+            assert axis in prov, f"missing provenance for {axis}"
+            assert prov[axis]["seeded_at"] == snap["captured_at"]
+            assert prov[axis]["snapshot_captured_at"] == snap["captured_at"]
+
+
+@pytest.mark.asyncio
+async def test_reseed_after_migration_records_new_provenance(db_session):
+    """After a schema migration clears an axis and the re-seed loop refills it,
+    the _member_provenance entry for that axis must reflect the re-seed snapshot,
+    not the original baseline capture timestamp."""
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_LLM_COST_PER_MERGED_PR: 9999.0,
+                    AXIS_COST_PER_MERGED_PR: 0.03,
+                    "_schema_version": 3,  # v3 → v4 clears llm axis
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING as _LLP
+
+    input_rate, output_rate = _LLP[("anthropic", "claude-sonnet-4-6")]
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            api_call_summary={
+                "llm_call_count": 5,
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    prov = baseline.get("_member_provenance") or {}
+
+    # The re-seeded llm axis must show the NEW snapshot timestamp, not "2026-01-01".
+    assert AXIS_LLM_COST_PER_MERGED_PR in prov
+    assert prov[AXIS_LLM_COST_PER_MERGED_PR]["seeded_at"] == snap["captured_at"]
+    assert prov[AXIS_LLM_COST_PER_MERGED_PR]["seeded_at"] != "2026-01-01T00:00:00"
+
+
+@pytest.mark.asyncio
+async def test_backfilled_baseline_members_carry_seed_provenance(db_session):
+    """Backfilled nested blocks (agent_timeout_rate, format_compliance) record
+    per-member provenance at backfill time so operators can see which snapshot
+    those drift figures are measured against.
+
+    This is the acceptance-gate test: exercises the production backfill path
+    (agent_timeout_rate absent in pre-existing baseline → backfilled from current
+    snapshot on next write_snapshot) and asserts that provenance is durable.
+    """
+    # Construct a baseline that predates agent_timeout_rate (no such key).
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_COST_PER_MERGED_PR: 0.05,
+                    "_schema_version": 5,
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    prov = baseline.get("_member_provenance") or {}
+
+    # agent_timeout_rate was backfilled — provenance must exist and point at
+    # the snapshot that provided the data.
+    if baseline.get("agent_timeout_rate") is not None:
+        assert "agent_timeout_rate" in prov, (
+            "backfilled agent_timeout_rate must carry provenance"
+        )
+        assert prov["agent_timeout_rate"]["seeded_at"] == snap["captured_at"]
+        assert prov["agent_timeout_rate"]["snapshot_captured_at"] == snap["captured_at"]
+        # The backfill timestamp must differ from the pre-existing baseline capture.
+        assert prov["agent_timeout_rate"]["seeded_at"] != "2026-01-01T00:00:00"
+
+    # Axes already present in the original baseline are NOT re-seeded; provenance
+    # for them must be inferred retroactively (from the matching snapshot value)
+    # rather than stamped with the new captured_at.
+    # cost_per_merged_pr was 0.05 in the pre-existing baseline and unchanged.
+    cost_prov = prov.get(AXIS_COST_PER_MERGED_PR)
+    if cost_prov:
+        # Retroactively inferred: must not show the new snapshot's captured_at.
+        assert cost_prov.get("_inferred") or cost_prov["seeded_at"] != snap["captured_at"], (
+            "unchanged axis must not be re-stamped with the new snapshot time"
+        )
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_exposes_per_axis_provenance(db_session):
+    """read_baseline_with_drift must include baseline_seeded_at and
+    baseline_seed_snapshot_at on each axis entry in the drift response."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    for axis in ALL_AXES:
+        entry = drift["axes"][axis]
+        assert "baseline_seeded_at" in entry, f"missing baseline_seeded_at for {axis}"
+        assert "baseline_seed_snapshot_at" in entry, (
+            f"missing baseline_seed_snapshot_at for {axis}"
+        )
+        if snap.get(axis) is not None:
+            assert entry["baseline_seeded_at"] == snap["captured_at"]
+            assert entry["baseline_seed_snapshot_at"] == snap["captured_at"]
+
+    # Top-level baseline_provenance summary must also be present.
+    assert "baseline_provenance" in drift
+    assert isinstance(drift["baseline_provenance"], dict)
+
+
+@pytest.mark.asyncio
+async def test_retroactive_provenance_inference_for_existing_baseline(db_session):
+    """A baseline lacking _member_provenance is annotated retroactively on the
+    next write_snapshot call (inside the project lock) by matching axis values
+    against snapshot history."""
+    # Simulate a pre-provenance baseline: value matches a known snapshot entry
+    # but no _member_provenance key exists.
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-05-01T00:00:00",
+                    AXIS_COST_PER_MERGED_PR: 0.042,
+                    "_schema_version": 5,
+                    # No _member_provenance key — pre-provenance baseline.
+                },
+                "snapshots": [
+                    {
+                        "captured_at": "2026-05-01T00:00:00",
+                        AXIS_COST_PER_MERGED_PR: 0.042,  # matches baseline
+                    },
+                    {
+                        "captured_at": "2026-05-02T00:00:00",
+                        AXIS_COST_PER_MERGED_PR: 0.050,  # later, different value
+                    },
+                ],
+                "last_run_at": "2026-05-02T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    prov = baseline.get("_member_provenance") or {}
+
+    # cost_per_merged_pr was 0.042 in the baseline and the FIRST snapshot also
+    # has 0.042 — retroactive inference should have found that match.
+    assert AXIS_COST_PER_MERGED_PR in prov, (
+        "retroactive inference must annotate axis whose value matches a snapshot"
+    )
+    entry = prov[AXIS_COST_PER_MERGED_PR]
+    # Must point at the first (matching) snapshot, not the second.
+    assert entry["seeded_at"] == "2026-05-01T00:00:00"
+    assert entry.get("_inferred") is True
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_sums_llm_cost(db_session):
+    """compute_project_window_spend_usd sums VM + LLM spend for tasks in the window."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Task with known LLM tokens, no VM cost (no vm_provisioned_at)
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            created_at=now,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    in_rate, out_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected = round(1000 * in_rate + 500 * out_rate, 6)
+    assert total == expected, f"Expected LLM cost {expected}, got {total}"
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_zero_for_empty_project(db_session):
+    """Zero tasks in window → 0.0 spend."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    assert total == 0.0
+
+
+# ---------------------------------------------------------------------------
+# VM span overlap tests — acceptance requirement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_counts_overlapping_vm_spans(db_session):
+    """Acceptance test: tasks whose VM spans overlap the window must be counted even
+    when they started before the window boundary.
+
+    Covers three overlap shapes:
+      1. Started before window, stopped inside window (boundary-crosser).
+      2. Started before window, still in-flight (no vm_stopped_at).
+      3. Started and stopped inside window (normal case — must still work).
+
+    A fully-outside task (stopped before cutoff) must NOT be counted.
+    """
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # 1. Boundary-crosser: started 30h ago, stopped 2h ago (overlaps window).
+    boundary_start = now - timedelta(hours=30)
+    boundary_stop = now - timedelta(hours=2)
+    boundary_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_provisioned_at=boundary_start,
+        vm_stopped_at=boundary_stop,
+        vm_spot=False,
+    )
+    db_session.add(boundary_task)
+
+    # 2. In-flight: started 30h ago, no vm_stopped_at (still running).
+    inflight_start = now - timedelta(hours=30)
+    inflight_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=inflight_start,
+        vm_stopped_at=None,
+        vm_spot=False,
+    )
+    db_session.add(inflight_task)
+
+    # 3. Normal in-window task: started 1h ago, stopped just now.
+    normal_start = now - timedelta(hours=1)
+    normal_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_provisioned_at=normal_start,
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    db_session.add(normal_task)
+
+    # 4. Fully-outside task: started 48h ago, stopped 26h ago (before cutoff).
+    outside_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_provisioned_at=now - timedelta(hours=48),
+        vm_stopped_at=now - timedelta(hours=26),
+        vm_spot=False,
+    )
+    db_session.add(outside_task)
+
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    # Compute expected costs for the 3 overlapping tasks only.
+    boundary_cost = (boundary_stop - boundary_start).total_seconds() * ON_DEMAND_RATE
+    # In-flight cost uses (now - inflight_start); use a generous tolerance.
+    inflight_cost = (now - inflight_start).total_seconds() * ON_DEMAND_RATE
+    normal_cost = (now - normal_start).total_seconds() * ON_DEMAND_RATE
+    # Fully-outside task contributes 0.
+    expected_min = round(boundary_cost + normal_cost, 6)
+
+    assert total > 0.0, "expected non-zero spend from overlapping tasks"
+    # Boundary-crosser and normal task are always deterministic; in-flight adds
+    # a small time-dependent component — assert total is at least the two
+    # deterministic costs and within a generous upper bound.
+    assert total >= expected_min, (
+        f"expected total >= {expected_min} (boundary + normal); got {total}"
+    )
+    assert total < round(
+        boundary_cost + inflight_cost + normal_cost + 60 * ON_DEMAND_RATE, 6
+    ), "total unexpectedly large — outside task may have been included"
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_counts_task_started_before_window(
+    db_session,
+):
+    """A task whose VM started before the window but stopped inside must be counted."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    start = now - timedelta(hours=30)
+    stop = now - timedelta(hours=2)
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=start,
+            vm_stopped_at=stop,
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    expected = round((stop - start).total_seconds() * ON_DEMAND_RATE, 6)
+    assert total == pytest.approx(expected, rel=1e-4), (
+        f"boundary-crossing task cost should be {expected}, got {total}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_counts_inflight_task_started_before_window(
+    db_session,
+):
+    """An in-flight task with vm_provisioned_at before the window must be counted."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    start = now - timedelta(hours=30)
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            vm_provisioned_at=start,
+            vm_stopped_at=None,
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    # In-flight tasks accrue cost up to now; must be positive.
+    assert total > 0.0, "in-flight task started before window must contribute spend"
+    # Sanity: cost should be roughly start-to-now seconds * rate (within 1 min slack).
+    max_expected = round((now - start + timedelta(minutes=1)).total_seconds() * ON_DEMAND_RATE, 6)
+    assert total <= max_expected
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_excludes_fully_outside_task(db_session):
+    """A task whose VM span ended before the window cutoff must NOT be counted."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(hours=48),
+            vm_stopped_at=now - timedelta(hours=26),
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    assert total == 0.0, f"fully-outside task must not contribute spend; got {total}"
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_llm_only_task_in_window_still_counted(
+    db_session,
+):
+    """LLM-only task (no vm_provisioned_at) created inside the window is still counted."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=None,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            created_at=now,
+        )
+    )
+    await db_session.commit()
+
+    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+
+    in_rate, out_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected = round(1000 * in_rate + 500 * out_rate, 6)
+    assert total == expected, f"LLM-only in-window task should contribute {expected}; got {total}"

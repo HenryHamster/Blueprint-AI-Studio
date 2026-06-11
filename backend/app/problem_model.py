@@ -136,6 +136,25 @@ class Capability(BaseModel):
     absent/unverified, mixed presence as partial. Mirrors the design-doc
     ``systems/<id>.modules`` verification."""
 
+    absorbs: list[str] = Field(default_factory=list)
+    """Old capability names this (surviving or newly-merged) capability absorbed
+    during a strategist consolidation. Optional and default-empty so every
+    stored model and older agent payload validates unchanged.
+
+    Consolidating overlapping capabilities is destructive today: a capability
+    name is an exact-match key for prerequisite resolution
+    (``working_capability_names``), the off-registry advisory known-set
+    (``registry_capability_names``), and durable proof/verdict records. Deleting
+    the old names (via ``_deletions.capabilities``) while declaring them here on
+    the survivor keeps those old names *resolving* — ``working_capability_names``
+    and ``registry_capability_names`` fold an absorbed name into their output so
+    a prerequisite that referenced it stays satisfied — WITHOUT re-rendering the
+    absorbed names into the agent-facing vocabulary
+    (``registry_capability_vocabulary`` reports survivor names only), which is
+    how the consolidation actually shrinks the payload. The write path strips
+    this key when empty so a model with no consolidation serializes
+    byte-identically to before the field existed."""
+
 
 # ---------------------------------------------------------------------------
 # Gaps
@@ -232,6 +251,20 @@ class Gap(BaseModel):
     plain proposed-wins field it threads through :func:`_merge_gap` and
     ``apply_agent_update`` with no extra merge logic: the agent sets it to
     record a deferral and clears it (``None``) when it resumes the gap."""
+
+    history_compacted_at: str | None = Field(default=None)
+    """ISO-8601 watermark for history compaction.  Entries with ``ts`` at or
+    before this timestamp are excluded from future union passes so a trimmed
+    echo cannot resurrect compacted history.  Set via the ``_compactions``
+    directive in :func:`apply_agent_update`.  ``None`` means no compaction
+    has occurred; existing models validate unchanged."""
+
+    past_moves_compacted_at: str | None = Field(default=None)
+    """ISO-8601 watermark for past_moves compaction.  When a ``_compactions``
+    directive sets this for a gap, ``_merge_gap`` uses replacement semantics
+    for that write (``proposed.past_moves`` replaces the durable log rather
+    than unioning).  The watermark survives subsequent writes and is monotonic
+    (cannot be regressed by a stale directive)."""
 
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1075,8 @@ def _diff_summary(diff: dict[str, Any]) -> str:
         parts.append("intent updated")
     if caps := diff.get("capabilities_changed"):
         parts.append(f"{len(caps)} capability status changes")
+    if consolidated := diff.get("capabilities_consolidated"):
+        parts.append(f"consolidated {len(consolidated)} capability group(s)")
     if evicted := diff.get("archived_gaps_evicted"):
         parts.append(f"GC evicted {len(evicted)} archived gap(s)")
     if trimmed := diff.get("rejected_agent_edits_trimmed"):
@@ -1307,17 +1342,48 @@ def _merge_operator_owned_fields(
         current.intent.source is not None
         and current.intent.source.type == "user_message"
     )
-    if purpose_was_operator and current.intent.purpose != baseline.intent.purpose:
-        if proposed.intent.purpose not in (
-            baseline.intent.purpose,
-            current.intent.purpose,
+    if purpose_was_operator:
+        # Always-protect: when purpose is operator-owned, an agent-proposed
+        # change is accepted ONLY when the agent supplies user_message
+        # provenance (indicating the user directly updated the purpose
+        # through the conversation thread). Without that, the agent must
+        # route intent changes through pending_user_confirmation instead of
+        # silently overwriting. This closes the repair-path clobber where a
+        # fresh repair session with no prior analysis context echoes
+        # schema-template placeholder text as the purpose
+        # (BUG_REPORT 8154c2d3 / PR #7435).
+        agent_has_user_message_source = (
+            proposed.intent.source is not None
+            and proposed.intent.source.type == "user_message"
+        )
+        if current.intent.purpose != baseline.intent.purpose:
+            # Mid-cycle operator edit: operator always wins regardless of
+            # what the agent proposed.
+            if proposed.intent.purpose not in (
+                baseline.intent.purpose,
+                current.intent.purpose,
+            ):
+                _record(
+                    "intent.purpose",
+                    current.intent.purpose,
+                    proposed.intent.purpose,
+                )
+            proposed.intent.purpose = current.intent.purpose
+            proposed.intent.source = current.intent.source
+        elif (
+            proposed.intent.purpose != current.intent.purpose
+            and not agent_has_user_message_source
         ):
-            _record(
-                "intent.purpose", current.intent.purpose, proposed.intent.purpose
-            )
-        proposed.intent.purpose = current.intent.purpose
-        # Keep operator provenance on the surviving purpose.
-        proposed.intent.source = current.intent.source
+            # No mid-cycle operator edit, but agent is trying to change an
+            # operator-owned purpose without user_message provenance — reject.
+            if proposed.intent.purpose != baseline.intent.purpose:
+                _record(
+                    "intent.purpose",
+                    current.intent.purpose,
+                    proposed.intent.purpose,
+                )
+            proposed.intent.purpose = current.intent.purpose
+            proposed.intent.source = current.intent.source
 
     # context — a mid-cycle change of current vs baseline can only be an
     # operator edit (a single strategic cycle runs at a time), so operator wins.
@@ -1437,7 +1503,7 @@ def _upsert_by_key(
 # genuine clear of a field the agent actually SAW (no floor, or this field not
 # stripped) still applies — empty is not blindly treated as keep.
 _GAP_FLOOR_FIELDS = ("description", "evidence", "active_moves")
-_CAP_FLOOR_FIELDS = ("notes", "backing_paths", "source")
+_CAP_FLOOR_FIELDS = ("notes", "backing_paths", "source", "absorbs")
 _FRICTION_FLOOR_FIELDS = (
     "description",
     "seen_in",
@@ -1468,20 +1534,66 @@ def _restore_floored_fields(
             setattr(proposed, name, getattr(current, name))
 
 
-def _merge_gap(current: Gap, proposed: Gap) -> Gap:
+def _merge_gap(current: Gap, proposed: Gap, past_moves_directive: bool = False) -> Gap:
     """Upsert one gap: proposed wins for every field EXCEPT the append-only
     logs (``history``, ``past_moves``), which union current+proposed so a
     trimmed tail echoed back by the agent cannot truncate the full record. The
     unioned logs are bounded by :data:`GAP_HISTORY_DURABLE_MAX` /
     :data:`GAP_PAST_MOVES_DURABLE_MAX` (oldest entries roll off) so the JSONB
-    column cannot grow without limit across cycles."""
+    column cannot grow without limit across cycles.
+
+    History compaction watermark contract (durable, two-sided, monotonic):
+    - The effective watermark is ``max(current.history_compacted_at,
+      proposed.history_compacted_at)`` so a write that omits the field cannot
+      regress a durable watermark (Defect 1 fix).
+    - BOTH ``current.history`` and ``proposed.history`` are filtered before the
+      union, so a stale echo carrying pre-compaction entries on the proposed side
+      cannot resurrect them (Defect 2 fix).
+
+    ``past_moves_directive`` signals that a ``_compactions`` directive with
+    ``past_moves_watermark`` was present for this gap in the current write.
+    When ``True``, replacement semantics apply: ``proposed.past_moves`` is used
+    directly rather than unioned with ``current.past_moves``.  Without the
+    directive, union semantics preserve the omission-never-deletes invariant."""
     merged = proposed.model_copy(deep=True)
-    merged.history = _merge_append_log(current.history, proposed.history)[
+
+    # History watermark: monotonic max of current and proposed.  A write that
+    # omits the field cannot regress a durable watermark.
+    effective_h_wm = max(
+        (wm for wm in (current.history_compacted_at, merged.history_compacted_at) if wm),
+        default=None,
+    )
+    merged.history_compacted_at = effective_h_wm
+
+    # Filter BOTH sides of the history union: a stale echo carrying
+    # pre-compaction entries on the proposed side cannot resurrect them.
+    if effective_h_wm:
+        current_history = [e for e in current.history if e.ts > effective_h_wm]
+        proposed_history = [e for e in proposed.history if e.ts > effective_h_wm]
+    else:
+        current_history = current.history
+        proposed_history = proposed.history
+    merged.history = _merge_append_log(current_history, proposed_history)[
         -GAP_HISTORY_DURABLE_MAX:
     ]
-    merged.past_moves = _merge_append_log(current.past_moves, proposed.past_moves)[
-        -GAP_PAST_MOVES_DURABLE_MAX:
-    ]
+
+    # past_moves watermark: monotonic max for observability/durability.
+    effective_pm_wm = max(
+        (wm for wm in (current.past_moves_compacted_at, merged.past_moves_compacted_at) if wm),
+        default=None,
+    )
+    merged.past_moves_compacted_at = effective_pm_wm
+
+    # past_moves compaction: when a _compactions directive named this gap with
+    # past_moves_watermark, use replacement semantics so the agent's explicit
+    # trimmed list becomes the new durable baseline.  Without the directive,
+    # union as before (omission-never-deletes invariant is preserved).
+    if past_moves_directive:
+        merged.past_moves = list(proposed.past_moves)[-GAP_PAST_MOVES_DURABLE_MAX:]
+    else:
+        merged.past_moves = _merge_append_log(current.past_moves, proposed.past_moves)[
+            -GAP_PAST_MOVES_DURABLE_MAX:
+        ]
     return merged
 
 
@@ -1490,6 +1602,7 @@ def _merge_agent_owned_collections(
     proposed: ProblemModel,
     deletions: Any,
     floor: Any = None,
+    pm_compacted_gaps: set[str] | None = None,
 ) -> None:
     """Replace ``proposed``'s agent-owned collections with a non-destructive
     merge over ``current`` (mutates ``proposed`` in place). Removal is explicit
@@ -1517,9 +1630,10 @@ def _merge_agent_owned_collections(
     gap_floor_fields = tuple(f for f in _GAP_FLOOR_FIELDS if f in stripped_gap)
     caps_floored = bool(floor.get("summarized_capabilities"))
     friction_floored = bool(floor.get("summarized_friction"))
+    _pm_compacted = pm_compacted_gaps or set()
 
     def _merge_gap_preserving(c: Gap, p: Gap) -> Gap:
-        merged = _merge_gap(c, p)
+        merged = _merge_gap(c, p, p.id in _pm_compacted)
         if gap_floor_fields:
             _restore_floored_fields(c, merged, gap_floor_fields)
         return merged
@@ -1567,6 +1681,42 @@ def _merge_agent_owned_collections(
         proposed.archived_gaps = [
             g for g in proposed.archived_gaps if g.id not in del_gaps
         ]
+
+
+def _apply_compactions(
+    proposed: ProblemModel,
+    compactions_raw: Any,
+) -> list[dict[str, Any]]:
+    """Apply ``_compactions`` directive to *proposed* by setting per-gap
+    watermark fields.  Returns a list of event dicts for revision-log
+    observability.  No-op (returns ``[]``) when *compactions_raw* is absent,
+    not a list, or names no matching gaps."""
+    if not isinstance(compactions_raw, list):
+        return []
+    events: list[dict[str, Any]] = []
+    gap_by_id = {g.id: g for g in proposed.gaps}
+    for entry in compactions_raw:
+        if not isinstance(entry, dict):
+            continue
+        gap_id = entry.get("gap_id")
+        if not isinstance(gap_id, str) or gap_id not in gap_by_id:
+            continue
+        gap = gap_by_id[gap_id]
+        event: dict[str, Any] = {"gap_id": gap_id}
+        h_wm = entry.get("history_watermark")
+        if isinstance(h_wm, str) and h_wm:
+            # Monotonic guard: a stale directive cannot regress an already-set watermark.
+            existing_h = gap.history_compacted_at or ""
+            gap.history_compacted_at = max(h_wm, existing_h) or None
+            event["history_watermark"] = gap.history_compacted_at
+        pm_wm = entry.get("past_moves_watermark")
+        if isinstance(pm_wm, str) and pm_wm:
+            existing_pm = gap.past_moves_compacted_at or ""
+            gap.past_moves_compacted_at = max(pm_wm, existing_pm) or None
+            event["past_moves_watermark"] = gap.past_moves_compacted_at
+        if len(event) > 1:  # at least one watermark was set
+            events.append(event)
+    return events
 
 
 def apply_agent_update(
@@ -1631,11 +1781,22 @@ def apply_agent_update(
     "pending_user_confirmation": [id]}`` — lifted out before validation
     (``ProblemModel`` is ``extra="forbid"``). Removal by omission is impossible,
     so an agent on a partial view cannot wipe what it could not see.
+
+    Per-gap history compaction is driven by an optional ``_compactions`` key
+    — a list of ``{"gap_id": str, "history_watermark"?: ISO, "past_moves_watermark"?: ISO}``
+    entries — that sets watermark fields on the matched gaps before the merge
+    pass.  ``_merge_gap`` then excludes current history entries at or before
+    the watermark, preventing stale echoes from resurrecting compacted entries.
+    Compaction events are recorded in the revision-log diff.
     """
     # Lift the explicit-deletion directive out before validation — it is not
     # part of the durable model (extra="forbid" would reject it).
     proposed_raw = dict(proposed_raw)
     deletions = proposed_raw.pop("_deletions", None)
+    # Per-gap history compaction directive: ``{gap_id: {history?: ISO,
+    # past_moves?: ISO}}``.  Lifted out like _deletions so ProblemModel
+    # (extra="forbid") does not reject it.
+    compactions_raw = proposed_raw.pop("_compactions", None)
     # Read-time agent-view markers the packer injects into the floored model the
     # agent sees. They are not part of the durable model (extra="forbid" would
     # reject them), so lift them out before validation. ``_agent_view_floor_applied``
@@ -1670,10 +1831,20 @@ def apply_agent_update(
     # non-blank concurrent edits; this fills agent omissions/blanks.
     _preserve_operator_intent(current, proposed)
 
+    # Apply per-gap history compaction watermarks BEFORE the merge so
+    # _merge_gap respects them when filtering current entries.
+    compaction_events = _apply_compactions(proposed, compactions_raw)
+
+    # Derive the set of gaps that had a past_moves_watermark directive in THIS
+    # write — used by _merge_gap to trigger replacement semantics for past_moves.
+    pm_compacted_gaps = {
+        e["gap_id"] for e in compaction_events if "past_moves_watermark" in e
+    }
+
     # Non-destructive merge of agent-owned collections: an agent acting on a
     # trimmed/dropped payload view must not wipe entries it never saw. Runs
     # before the diff so the diff reflects the true merged state.
-    _merge_agent_owned_collections(current, proposed, deletions, floor_applied)
+    _merge_agent_owned_collections(current, proposed, deletions, floor_applied, pm_compacted_gaps)
 
     # Compute diff before archival so closed gaps are still visible on
     # proposed.gaps — otherwise _compute_diff can't see what got closed
@@ -1689,6 +1860,27 @@ def apply_agent_update(
         removed = sorted(_as_str_list(deletions, del_key))
         if removed:
             diff[diff_key] = removed
+
+    # Record compaction events in the diff for observability.
+    if compaction_events:
+        diff["gaps_history_compacted"] = compaction_events
+
+    # Surface a capability consolidation: a surviving capability whose ``absorbs``
+    # lists names deleted in THIS write (via ``_deletions.capabilities``) merged
+    # those old capabilities into itself. Recorded only when an actual
+    # consolidation occurred (a survivor absorbs at least one just-deleted name),
+    # so the no-consolidation path leaves the diff untouched.
+    deleted_cap_names = set(_as_str_list(deletions, "capabilities"))
+    if deleted_cap_names:
+        consolidated: list[dict[str, Any]] = []
+        for cap in proposed.capabilities:
+            absorbed = [name for name in cap.absorbs if name in deleted_cap_names]
+            if absorbed:
+                consolidated.append(
+                    {"survivor": cap.name, "absorbed": sorted(absorbed)}
+                )
+        if consolidated:
+            diff["capabilities_consolidated"] = consolidated
 
     archive_closed_gaps(proposed)
 
@@ -1718,5 +1910,28 @@ def apply_agent_update(
     # no-baseline path: only surface the ledger key when it carries entries.
     if not result.get(REJECTED_AGENT_EDITS_KEY):
         result.pop(REJECTED_AGENT_EDITS_KEY, None)
+    # ``absorbs`` is a default-empty list, so model_dump() emits ``"absorbs": []``
+    # on EVERY capability — which would change the stored bytes of every existing
+    # model. Strip it from any capability that absorbed nothing so a write with no
+    # consolidation stays byte-identical to before the field existed; only a
+    # genuine consolidation (a survivor with a non-empty ``absorbs``) carries it.
+    for cap in result.get("capabilities") or []:
+        if isinstance(cap, dict) and not cap.get("absorbs"):
+            cap.pop("absorbs", None)
+    # Watermark fields default to None; strip them from gaps that have never
+    # been compacted so the stored bytes of clean models stay identical to
+    # before the fields existed.
+    for gap in result.get("gaps") or []:
+        if isinstance(gap, dict):
+            if gap.get("history_compacted_at") is None:
+                gap.pop("history_compacted_at", None)
+            if gap.get("past_moves_compacted_at") is None:
+                gap.pop("past_moves_compacted_at", None)
+    for gap in result.get("archived_gaps") or []:
+        if isinstance(gap, dict):
+            if gap.get("history_compacted_at") is None:
+                gap.pop("history_compacted_at", None)
+            if gap.get("past_moves_compacted_at") is None:
+                gap.pop("past_moves_compacted_at", None)
 
     return result, diff

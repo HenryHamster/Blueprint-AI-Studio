@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
+from app.payload_schemas import RepoBootstrapOverview
 from app.task_blocked import (
     NEED_KINDS,
     NEED_LABEL_MAX_LEN,
@@ -175,6 +176,10 @@ class AgentStatusPayload(BaseModel):
     # Kept as Dict[str, Any] so agent_status.py can store it directly in the
     # task.context JSON column without an extra .model_dump() call.
     self_review_outcome: Dict[str, Any] | None = None
+    # Structured repo_bootstrap overview returned in the terminal COMPLETED
+    # payload. Persisted into task.context so the completion handler can write
+    # it into project.design_doc under the durable repo_overview section.
+    repo_overview: RepoBootstrapOverview | None = None
     diff_summary: List[Dict[str, Any]] | None = Field(None, max_length=50)
     file_change_details: List[Dict[str, Any]] | None = Field(None, max_length=50)
     analysis_plan: str | None = Field(None, max_length=5000)
@@ -346,6 +351,30 @@ class HeartbeatRequest(BaseModel):
     format_error_total: int | None = Field(None, ge=0)
     format_repair_attempts: int | None = Field(None, ge=0)
     format_repair_successes: int | None = Field(None, ge=0)
+    # Per-schema breakdown of format misses, repair attempts, and successes.
+    # Keys are schema label strings (e.g. "ResearchPlan", "StructuredVerdict").
+    # Older agents omitting these fields contribute only to scalar totals.
+    format_miss_by_schema: Dict[str, int] | None = None
+    format_repair_attempts_by_schema: Dict[str, int] | None = None
+    format_repair_successes_by_schema: Dict[str, int] | None = None
+    # Whether the language-aware repo map was non-empty and injected into the
+    # agent prompt for this task. Set once on the first heartbeat after the
+    # standard handler registers it; used as the receipt/compliance signal
+    # for the repo-map capability trial.
+    had_repo_map: bool | None = None
+    # Deterministic arm-assignment flag for the repo-map capability trial.
+    # True = treatment arm (task was assigned to receive the repo map),
+    # False = holdback arm. Separate from had_repo_map so intent-to-treat
+    # analysis uses assignment, not receipt. Only present when a trial is
+    # actively running (holdback_fraction > 0); older agents omit this field.
+    repo_map_arm: bool | None = None
+    # Whether module-interface, related-test, and affected-consumer sections
+    # were non-empty and injected into the agent prompt. Write-once flags
+    # mirroring had_repo_map; older agents that omit these fields leave the
+    # task.context key absent (fail-open).
+    had_module_interfaces: bool | None = None
+    had_related_tests: bool | None = None
+    had_affected_consumers: bool | None = None
 
 
 class ComputeJobResponse(BaseModel):
@@ -391,6 +420,26 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
         )
         if isinstance(diagnostic, dict):
             data["compute_rpc_diagnostic"] = diagnostic
+    return data
+
+
+_POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset({"env", "command", "cwd"})
+
+
+def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
+    """Return a JSON-ready compute-job response with launch-spec fields redacted.
+
+    Strips ``env``, ``command``, and ``cwd`` from ``polling_metadata`` before
+    returning so operator-facing endpoints never expose internal launch material
+    that may contain secrets or internal paths. The agent-facing endpoints use
+    ``serialize_compute_job_response`` directly — agents own their job and need
+    the full metadata.
+    """
+    data = serialize_compute_job_response(job)
+    metadata = data.get("polling_metadata")
+    if isinstance(metadata, dict):
+        for key in _POLLING_METADATA_LAUNCH_SPEC_KEYS:
+            metadata.pop(key, None)
     return data
 
 
@@ -498,6 +547,42 @@ class BuildConfigDirectoryEntry(BaseModel):
     build_cmd: str | None = None
     test_cmd: str | None = None
     install_cmd: str | None = None
+    # Agent-confirmed commands (write-back from runtime verification).
+    # These are set by the write-back endpoint and never overwrite the
+    # operator-detected originals (lint_cmd / test_cmd / build_cmd / install_cmd).
+    confirmed_lint_cmd: str | None = None
+    confirmed_test_cmd: str | None = None
+    confirmed_build_cmd: str | None = None
+    confirmed_install_cmd: str | None = None
+    commands_confirmed_at: str | None = None  # ISO 8601 UTC timestamp
+    confirming_task_id: str | None = None
+
+
+class DiscoveredBuildCommandEntry(BaseModel):
+    """A single directory entry reported by an agent VM after run-time build detection.
+
+    Field names mirror ``BuildConfigDirectoryEntry`` so the merge in
+    ``persist_discovered_build_commands`` is mechanical. ``executed_successfully``
+    is the per-entry evidence gate — only entries with it True are persisted.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    path: str = Field(..., min_length=1, max_length=500)
+    type: str | None = Field(None, pattern="^(python|node|go|rust|other)$")
+    lint_cmd: str | None = Field(None, max_length=500)
+    build_cmd: str | None = Field(None, max_length=500)
+    test_cmd: str | None = Field(None, max_length=500)
+    install_cmd: str | None = Field(None, max_length=500)
+    executed_successfully: bool = False
+
+
+class BuildDiscoveryReport(BaseModel):
+    """Request body for POST /api/agent/build-config-discovery."""
+
+    model_config = ConfigDict(extra="ignore")
+    discovered_directories: List[DiscoveredBuildCommandEntry] = Field(
+        default_factory=list, max_length=50
+    )
 
 
 class MigrationConfig(BaseModel):
@@ -526,6 +611,23 @@ class MigrationConfig(BaseModel):
     alembic_cwd: str | None = None
     schema_revision_file: str | None = None
     schema_revision_const: str | None = None
+
+
+class ResourceEnvelope(BaseModel):
+    """Per-project resource bounds for concurrent VM caps and spend ceilings.
+
+    All fields are optional; ``null``/absent means unlimited (inherit global
+    behavior).  Validated as a nested object inside ``BuildConfig`` under the
+    ``resource_envelope`` key so operators can set it via the project PATCH path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    # Maximum concurrent agent-VM tasks allowed for this project.
+    max_concurrent_vms: int | None = Field(None, ge=1)
+    # Spend ceiling in USD over the rolling window (spend_window_days).
+    spend_ceiling_usd: float | None = Field(None, gt=0)
+    # Rolling window length in days for spend aggregation. Default 30.
+    spend_window_days: int = Field(30, ge=1)
 
 
 class BuildConfig(BaseModel):
@@ -620,6 +722,41 @@ class BuildConfig(BaseModel):
     max_parallel_research: int | None = Field(None, ge=1, le=50)
     max_total_research: int | None = Field(None, ge=1, le=50)
     max_autonomous_tasks_per_hour: int | None = Field(None, ge=1, le=50)
+    # ISO timestamp stamped by _handle_repo_bootstrap_completion when a
+    # repo_bootstrap task finishes successfully. None (absent) means the bootstrap
+    # has not yet run or has not completed. The strategic spawn gate checks this
+    # to defer implementation tasks until the bootstrap has grounded repo knowledge.
+    bootstrap_completed_at: str | None = None
+    # Per-project resource envelope controlling concurrent VM caps and spend
+    # ceilings.  None/absent means unlimited (inherit global behavior).
+    # Validated by ResourceEnvelope; carried across re-detect by
+    # ``apply_operator_build_config_overrides``.
+    resource_envelope: "ResourceEnvelope | None" = None
+    # Per-project 24h rolling-window spend ceiling. When set, autonomous spawning
+    # is paused (and a deduped operator alert emitted) once the project's window
+    # spend meets or exceeds this value. None = disabled (today's behavior).
+    # Operator-created tasks are never blocked — this is a soft autonomous-only gate.
+    daily_spend_ceiling_usd: float | None = Field(None, gt=0)
+    # Explicit degraded marker stamped when repo_bootstrap completed without a
+    # structured overview. Preserved through build_config validation so routine
+    # saves do not erase the truth.
+    bootstrap_degraded_reason: str | None = None
+    # Stateful automatic repo_bootstrap recovery metadata. These fields are
+    # maintained by repo_bootstrap/task_completion so automatic sweeps can back
+    # off and eventually stop while operator retry remains available.
+    bootstrap_recovery_attempts: int | None = Field(None, ge=0)
+    bootstrap_recovery_state: str | None = None
+    bootstrap_recovery_next_at: str | None = None
+    bootstrap_recovery_last_degraded_at: str | None = None
+    bootstrap_recovery_exhausted_at: str | None = None
+    # Provenance for the persisted repo_overview, stamped by
+    # _handle_repo_bootstrap_completion whenever a bootstrap completes with a
+    # structured overview. Surfaced by the admin UI (which reads
+    # project.build_config) so operators can see overview freshness and which
+    # branch/revision it describes. All nullable for backward compatibility.
+    bootstrap_overview_refreshed_at: str | None = None
+    bootstrap_overview_source_branch: str | None = None
+    bootstrap_overview_source_revision: str | None = None
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"

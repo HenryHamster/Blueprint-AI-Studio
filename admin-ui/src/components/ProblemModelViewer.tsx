@@ -13,6 +13,7 @@ import type {
   Source,
   SelfReflectionEntry,
 } from '../types';
+import type { CapabilityProofRecord } from '../types/problemModel';
 
 interface ProblemModelViewerProps {
   projectId: string;
@@ -51,6 +52,11 @@ const pendingTypeLabels: Record<string, string> = {
   access_needed: 'Access needed',
   intent_change: 'Intent change',
   major_decision: 'Major decision',
+};
+
+const proofStatusLabels: Record<string, string> = {
+  proven: 'Proven',
+  unproven: 'Claimed only',
 };
 
 function SourceBadge({ source }: { source: Source }) {
@@ -93,6 +99,8 @@ function SectionHeader({ children, icon, count }: { children: React.ReactNode; i
 
 function CapabilityBar({ capability }: { capability: Capability }) {
   const status = capability.status || 'planned';
+  const proofRecords = Array.isArray(capability.proof_records) ? capability.proof_records : [];
+  const proofStatus = proofRecords.length > 0 ? 'proven' : 'unproven';
   return (
     <div className="flex items-center gap-3 py-1.5">
       <div className={`w-2 h-2 rounded-full ${capabilityBarColors[status] || capabilityBarColors.planned}`} />
@@ -100,9 +108,37 @@ function CapabilityBar({ capability }: { capability: Capability }) {
         <div className="flex items-baseline gap-2">
           <span className="text-sm text-neutral-200 truncate">{capability.name}</span>
           <span className="text-xs text-neutral-500">{capabilityStatusLabels[status] || status}</span>
+          <span className={`text-[10px] font-medium uppercase tracking-wide ${proofStatus === 'proven' ? 'text-emerald-400' : 'text-neutral-500'}`}>
+            {proofStatusLabels[proofStatus] || proofStatus}
+          </span>
         </div>
         {capability.notes && (
           <p className="text-xs text-neutral-500 truncate">{capability.notes}</p>
+        )}
+        {proofRecords.length > 0 && (
+          <div className="mt-1 space-y-1">
+            {proofRecords.map((record: CapabilityProofRecord, index: number) => (
+              <div
+                key={`${record.task_id}-${record.proof_ref}-${index}`}
+                className="rounded border border-emerald-500/20 bg-emerald-500/5 px-2 py-1 text-[11px] text-neutral-300"
+              >
+                <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+                  <span>
+                    <span className="text-neutral-500">kind</span> {record.proof_kind}
+                  </span>
+                  <span className="break-all">
+                    <span className="text-neutral-500">ref</span> {record.proof_ref}
+                  </span>
+                  <span className="font-mono">
+                    <span className="text-neutral-500 font-sans">commit</span> {record.commit_sha.slice(0, 12) || 'n/a'}
+                  </span>
+                  <span title={record.proved_at}>
+                    <span className="text-neutral-500">proved</span> {record.proved_at}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
         )}
       </div>
       {capability.source && <SourceBadge source={capability.source} />}

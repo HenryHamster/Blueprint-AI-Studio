@@ -203,6 +203,56 @@ describe('repairStructuredOutput', () => {
     expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('malformed_json');
   });
 
+  it('reopens once when parsed output fails schema validation and records schema-mismatch telemetry', async () => {
+    const invalidButParseable = JSON.stringify({
+      summary: 'present',
+      reasoning: 'present',
+      verdicts: 'not-a-list',
+    });
+    const repaired = JSON.stringify({
+      summary: 'A concise summary.',
+      reasoning: 'Detailed reasoning here.',
+      verdicts: [],
+    });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: repaired, lastResultText: repaired,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    const res = await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, lastResultText: invalidButParseable })),
+      validateParsedValue: (value) => {
+        if (
+          value &&
+          typeof value === 'object' &&
+          !Array.isArray(value) &&
+          Array.isArray((value as Record<string, unknown>).verdicts)
+        ) {
+          return { ok: true };
+        }
+        return {
+          ok: false,
+          reason: 'parsed_object_schema_mismatch',
+          detail: 'verdicts must be a list',
+        };
+      },
+    });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    expect(recordFormatMiss).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('parsed_object_schema_mismatch');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+    const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(sentPrompt).toContain('parsed as JSON');
+    expect(res.value).toEqual({
+      summary: 'A concise summary.',
+      reasoning: 'Detailed reasoning here.',
+      verdicts: [],
+    });
+    expect(res.retry?.exitCode).toBe(0);
+  });
+
   it('sets retryStatus on statusRef before the reopen run', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,

@@ -1,6 +1,7 @@
 """Pure-function helpers for claim_task endpoint."""
 
-from typing import Dict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +40,7 @@ _KNOWN_FAILURE_CATEGORIES = frozenset(
         "AGENT_TIMEOUT",
         "EXTERNAL_API",
         "RATE_LIMIT",
+        "DEAD_AUTH",
         "rejected in review",
     }
 )
@@ -379,3 +381,51 @@ def _build_direction_narrative(direction: dict) -> "dict | None":
     if not narrative:
         return None
     return narrative
+
+
+# ---------------------------------------------------------------------------
+# Stale confirmed-command helpers
+# ---------------------------------------------------------------------------
+
+_STALE_THRESHOLD_DAYS = 30
+
+
+def is_commands_stale(confirmed_at: str | None) -> bool:
+    """Return True when confirmed_at is absent or older than STALE_THRESHOLD_DAYS."""
+    if not confirmed_at:
+        return True
+    try:
+        ts = datetime.fromisoformat(confirmed_at.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return datetime.now(tz=timezone.utc) - ts > timedelta(days=_STALE_THRESHOLD_DAYS)
+    except (ValueError, TypeError):
+        return True
+
+
+def annotate_stale_build_config_dirs(
+    build_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return a copy of build_cfg with commands_stale annotated on each directory.
+
+    Does not mutate the original dict.  The injected ``commands_stale`` field
+    is purely informational for the claiming agent — it is never persisted.
+    """
+    if not build_cfg:
+        return build_cfg
+    directories = build_cfg.get("directories")
+    if not directories:
+        return build_cfg
+    annotated_dirs: List[Dict[str, Any]] = []
+    for entry in directories:
+        if isinstance(entry, dict):
+            annotated = dict(entry)
+            annotated["commands_stale"] = is_commands_stale(
+                entry.get("commands_confirmed_at")
+            )
+            annotated_dirs.append(annotated)
+        else:
+            annotated_dirs.append(entry)
+    result = dict(build_cfg)
+    result["directories"] = annotated_dirs
+    return result

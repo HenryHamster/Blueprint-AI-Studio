@@ -1,6 +1,6 @@
 import { AlertTriangle } from 'lucide-react';
 import { Skeleton } from './DashboardMetricCards';
-import type { FleetUtilizationResponse } from '../api';
+import type { AgentServingShasResponse, FleetUtilizationResponse } from '../api';
 
 export type { FleetUtilizationResponse };
 
@@ -15,17 +15,35 @@ function pct(v: number | null | undefined): string {
   return `${Math.round(v * 100)}%`;
 }
 
+function shortSha(sha: string | null | undefined): string {
+  return sha ? sha.slice(0, 12) : 'unknown';
+}
+
+function formatBuildDate(epochSeconds: number | null | undefined): string {
+  if (epochSeconds == null) return 'unknown build';
+  return new Date(epochSeconds * 1000).toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
 export function FleetCapacityCard({
   data,
+  agentServingShas,
   loading,
 }: {
   data: FleetUtilizationResponse | null;
+  agentServingShas?: AgentServingShasResponse | null;
   loading: boolean;
 }) {
   const satStyle = data?.saturation ? (_SAT_STYLE[data.saturation] ?? _SAT_STYLE.healthy) : null;
   const cooldownNote = data && data.cooled_accounts > 0
     ? `${data.cooled_accounts} account${data.cooled_accounts > 1 ? 's' : ''} rate-limited`
     : null;
+  const shaBuckets = agentServingShas?.fleet.buckets ?? [];
+  const unknownCount = agentServingShas?.fleet.unknown_count ?? 0;
 
   return (
     <section>
@@ -81,6 +99,79 @@ export function FleetCapacityCard({
           )}
           {data.saturation == null && (
             <p className="text-[10px] text-neutral-500">No enabled accounts — capacity unknown</p>
+          )}
+          {agentServingShas && (
+            <div className="border-t border-neutral-800/70 pt-2 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Agent Image</h3>
+                  {agentServingShas.fleet.mixed && (
+                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400">
+                      Mixed rollover
+                    </span>
+                  )}
+                </div>
+                <span className="text-[10px] text-neutral-500">
+                  {agentServingShas.fleet.total_observed} observed
+                </span>
+              </div>
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                {shaBuckets.length === 0 ? (
+                  <p className="text-[10px] text-neutral-500 sm:col-span-2">No agent image heartbeat data yet</p>
+                ) : shaBuckets.map(bucket => (
+                  <div
+                    key={bucket.source_sha ?? 'unknown'}
+                    className="rounded border border-neutral-800/70 bg-neutral-950/30 px-2 py-1.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className={`font-mono text-[11px] ${bucket.source_sha ? 'text-neutral-200' : 'text-amber-400'}`}>
+                        {shortSha(bucket.source_sha)}
+                      </span>
+                      <span className="text-[10px] text-neutral-400">{bucket.count} VM{bucket.count === 1 ? '' : 's'}</span>
+                    </div>
+                    <div className="mt-1 flex flex-wrap gap-1 text-[9px]">
+                      {bucket.matches_backend_served && <span className="text-emerald-400">backend</span>}
+                      {bucket.matches_current_image && <span className="text-sky-400">image</span>}
+                      {bucket.matches_active_candidate && <span className="text-violet-400">candidate</span>}
+                      {bucket.matches_integration_head && <span className="text-neutral-300">{agentServingShas.integration_branch ?? 'head'}</span>}
+                      {!bucket.source_sha && <span className="text-amber-400">pre-marker</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="grid gap-x-3 gap-y-1 text-[10px] sm:grid-cols-2">
+                <div className="flex justify-between gap-2">
+                  <span className="text-neutral-500">Current image</span>
+                  <span className="font-mono text-neutral-300 text-right">
+                    {shortSha(agentServingShas.current_image?.source_git_sha)}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-neutral-500">Image bake</span>
+                  <span className="text-neutral-300 text-right">
+                    {formatBuildDate(agentServingShas.current_image?.build_ts)}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-neutral-500">Backend served</span>
+                  <span className="font-mono text-neutral-300 text-right">{shortSha(agentServingShas.backend_served_sha)}</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-neutral-500">Candidate</span>
+                  <span className="font-mono text-neutral-300 text-right">{shortSha(agentServingShas.active_candidate_sha)}</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-neutral-500">{agentServingShas.integration_branch ?? 'Integration'}</span>
+                  <span className="font-mono text-neutral-300 text-right">{shortSha(agentServingShas.integration_head_sha)}</span>
+                </div>
+                {unknownCount > 0 && (
+                  <div className="flex justify-between gap-2">
+                    <span className="text-neutral-500">Unknown</span>
+                    <span className="text-amber-400 text-right">{unknownCount} VM{unknownCount === 1 ? '' : 's'}</span>
+                  </div>
+                )}
+              </div>
+            </div>
           )}
         </div>
       )}

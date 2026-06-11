@@ -1,6 +1,24 @@
 """Tests for ``app.github_checks`` CI-log helpers."""
 
+from __future__ import annotations
+
+import logging
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app import github_checks
 from app.github_checks import _extract_pytest_selectors
+
+
+def _make_response(status_code: int, json_data=None, text="", links=None):
+    """Minimal httpx-like response mock."""
+    m = MagicMock()
+    m.status_code = status_code
+    m.json.return_value = json_data if json_data is not None else {}
+    m.text = text
+    m.links = links or {}
+    return m
 
 
 class TestExtractPytestSelectors:
@@ -54,3 +72,58 @@ class TestExtractPytestSelectors:
     def test_empty_log_is_safe(self):
         assert _extract_pytest_selectors("") == []
         assert _extract_pytest_selectors(None) == []
+
+
+# ---------------------------------------------------------------------------
+# Job-logs fetch: non-200 responses must emit a WARNING (Fix 2 regression)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_job_logs_non200_emits_warning(caplog):
+    """Regression: a non-200 (e.g. 403) response to the job-logs fetch must emit
+    a WARNING including the HTTP status code so the failure mode is visible.
+
+    Before the fix, any non-200 silently skipped (no log), making it impossible
+    to tell from logs why 'Failing tests:' selectors never appeared in Blueprint
+    CI comments (likely 403: GitHub App installation token lacks Actions read
+    permission).
+    """
+    # check-runs list: one failed check-run with id=99
+    check_runs_resp = _make_response(
+        200,
+        json_data={
+            "check_runs": [
+                {
+                    "name": "ci-build",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "id": 99,
+                    "output": {},
+                }
+            ]
+        },
+    )
+    # workflow-runs pre-fetch: 200 but empty (no job IDs to map)
+    workflow_runs_resp = _make_response(200, json_data={"workflow_runs": []})
+    # job-logs fetch: 403 (the common production failure mode)
+    job_logs_403 = _make_response(403, text="Forbidden")
+    # annotations fallback: 200 empty
+    annotations_resp = _make_response(200, json_data=[])
+
+    call_iter = iter([check_runs_resp, workflow_runs_resp, job_logs_403, annotations_resp])
+
+    with patch.object(
+        github_checks, "_github_request", new=AsyncMock(side_effect=lambda *a, **kw: next(call_iter))
+    ):
+        with caplog.at_level(logging.WARNING, logger="app.github_checks"):
+            result = await github_checks.get_check_runs(
+                token="tok", owner="o", repo="r", ref="sha123abc"
+            )
+
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        "403" in msg and "job logs" in msg.lower() for msg in warning_messages
+    ), f"Expected WARNING with '403' and 'job logs' in messages, got: {warning_messages}"
+    # The result still has a non-empty failed_logs (falls back to check name)
+    assert result["conclusion"] == "failure"

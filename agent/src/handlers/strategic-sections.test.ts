@@ -792,6 +792,14 @@ describe('buildDirSummaryText', () => {
         explicit_pass_count: 2,
         fail_open_count: 1,
         unresolved_count: 1,
+        manifest_excluded_fail_closed_count: 1,
+        manifest_excluded_fail_closed_samples: [
+          {
+            hash: 'excluded-hash',
+            title: 'Budget-excluded finding',
+            reason: 'manifest cap',
+          },
+        ],
         challenged_spawned: 3,
         challenged_merged: 2,
         unchallenged_spawned: 4,
@@ -809,6 +817,8 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('2 explicit-pass');
     expect(result).toContain('1 fail-open');
     expect(result).toContain('1 unresolved');
+    expect(result).toContain('1 manifest-excluded fail-closed');
+    expect(result).toContain('Budget-excluded finding');
     // Merge-rate percentages travel with their merged/spawned denominators.
     expect(result).toContain('67% challenged (2/3)');
     expect(result).toContain('75% unchallenged (3/4)');

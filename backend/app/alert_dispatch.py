@@ -755,6 +755,51 @@ async def _maybe_create_circuit_breaker_alert(
     await _send_webhook_notification("CIRCUIT_BREAKER_OPEN", alert.title, alert.message)
 
 
+_SPEND_CEILING_ALERT_TITLE = "Spend ceiling reached: autonomous spawning paused"
+
+
+async def _maybe_create_spend_ceiling_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    window_spend_usd: float,
+    ceiling_usd: float,
+) -> None:
+    """Create a deduplicated WARNING alert when a project's 24h spend ceiling is hit.
+
+    Deduplicates on a stable title: one undismissed alert per project per trip.
+    Caller owns the commit.
+    """
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.severity == AlertSeverity.WARNING,
+            Alert.dismissed_at.is_(None),
+            Alert.title == _SPEND_CEILING_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=_SPEND_CEILING_ALERT_TITLE,
+        message=(
+            f"24h window spend ${window_spend_usd:.4f} has reached the "
+            f"per-project ceiling ${ceiling_usd:.4f}. New autonomous "
+            f"spawning is paused until spend falls below the ceiling."
+        ),
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+
+
 # Human-readable labels for the review-fix early-escalation reasons. The reason
 # key is part of the deduplicated alert title, so keep these stable.
 _ESCALATION_REASON_LABELS = {

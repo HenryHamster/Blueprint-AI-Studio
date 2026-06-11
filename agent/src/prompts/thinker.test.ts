@@ -528,10 +528,40 @@ describe('runThinkerWithGate', () => {
     expect(result).toEqual({ ok: true, analysisText: 'analysis output without JSON' });
     expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
     const reopenPrompt = mockRunClaudeCode.mock.calls[1][0];
-    expect(reopenPrompt).toContain('Output ONLY the problem_model JSON object now');
+    // Core schema re-ask is still present.
+    expect(reopenPrompt).toContain('output ONLY that JSON object now');
     expect(reopenPrompt).toContain(problemModelPath);
+    // Fix for BUG_REPORT 8154c2d3: the repair prompt must embed the prior analysis
+    // so the fresh session extracts real content instead of echoing placeholder text.
+    expect(reopenPrompt).toContain('FRESH session');
+    expect(reopenPrompt).toContain('Do NOT use placeholder or template values');
+    expect(reopenPrompt).toContain('YOUR PREVIOUS ANALYSIS OUTPUT');
+    expect(reopenPrompt).toContain('analysis output without JSON');
     expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
     expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
+  });
+
+  it('(b2) repair prompt includes research_progress breadcrumb when the file exists', async () => {
+    // Arrange: thinker wrote a research_progress breadcrumb file.
+    const progressPath = `/tmp/research_progress_${taskId}.md`;
+    fsMockState.presentFiles.add(progressPath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValueOnce(
+      '# Progress summary\nIntent: billing system\nGaps: g-billing',
+    );
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"intent":{"purpose":"ok"},"gaps":[]}',
+        lastResultText: '{"intent":{"purpose":"ok"},"gaps":[]}',
+      });
+    fsMockState.presentFiles.add(runningUpdatePath);
+
+    await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    const reopenPrompt = mockRunClaudeCode.mock.calls[1][0];
+    expect(reopenPrompt).toContain('RESEARCH PROGRESS BREADCRUMB');
+    expect(reopenPrompt).toContain('Intent: billing system');
   });
 
   it('(c) repair still fails, so the legacy focused retry remains the last resort for missing files', async () => {

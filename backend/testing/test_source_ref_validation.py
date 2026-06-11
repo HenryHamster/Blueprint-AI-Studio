@@ -11,12 +11,25 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.source_ref_validation import (
+    _file_exists_in_repo_branch,
     classify_existing_paths,
+    classify_paths_tristate,
     detect_absent_symbols,
     partition_missing,
     summarize_ungrounded_claims,
     validate_source_refs,
 )
+
+_BRANCH_KW = {"token": "ghs_test", "owner": "acme", "repo": "widget", "branch": "automain"}
+_SNAPSHOT_PATH = "app.github_repo_snapshot._get_snapshot"
+
+
+def _patch_snapshot(mocker, paths=None, truncated=False):
+    mocker.patch(_SNAPSHOT_PATH, new=AsyncMock(return_value=(paths or {}, truncated)))
+
+
+async def _branch_exists(path):
+    return await _file_exists_in_repo_branch(path, **_BRANCH_KW)
 
 
 # ── partition_missing (pure) ──────────────────────────────────────────────────
@@ -134,6 +147,61 @@ async def test_classify_existing_paths_uses_repo_branch_context_when_provided(mo
     assert present == ["x.py"]
     assert missing == ["y.py"]
     local_exists.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_file_exists_in_repo_branch_glob_present(mocker):
+    _patch_snapshot(mocker, {"backend/app/routers/admin.py": "a" * 40})
+    assert await _branch_exists("backend/app/routers/*.py") is True
+
+
+@pytest.mark.asyncio
+async def test_file_exists_in_repo_branch_glob_absent_on_complete_tree(mocker):
+    _patch_snapshot(mocker, {"backend/app/models.py": "a" * 40})
+    assert await _branch_exists("backend/app/routers/*.py") is False
+
+
+@pytest.mark.asyncio
+async def test_file_exists_in_repo_branch_glob_indeterminate_on_truncated_tree(mocker):
+    _patch_snapshot(mocker, {"backend/app/models.py": "a" * 40}, truncated=True)
+    assert await _branch_exists("backend/app/routers/*.py") is None
+
+
+@pytest.mark.asyncio
+async def test_file_exists_in_repo_branch_root_config_file_present(mocker):
+    _patch_snapshot(mocker, {"package.json": "a" * 40})
+    assert await _branch_exists("package.json") is True
+
+
+@pytest.mark.asyncio
+async def test_file_exists_in_repo_branch_root_config_file_absent(mocker):
+    _patch_snapshot(mocker, {"backend/app/models.py": "a" * 40})
+    assert await _branch_exists("package.json") is False
+
+
+@pytest.mark.asyncio
+async def test_file_exists_in_repo_branch_heuristic_rejected_path_is_not_false_when_snapshot_unavailable(
+    mocker,
+):
+    mocker.patch(_SNAPSHOT_PATH, new=AsyncMock(return_value=None))
+    assert await _branch_exists("README.md") is None
+    assert await _branch_exists(" backend/app/models.py") is None
+
+
+@pytest.mark.asyncio
+async def test_classify_paths_tristate_glob_not_in_missing_bucket_without_snapshot(
+    mocker,
+):
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(return_value=None),
+    )
+    present, missing, indeterminate = await classify_paths_tristate(
+        ["backend/app/routers/*.py"]
+    )
+    assert present == []
+    assert missing == []
+    assert indeterminate == ["backend/app/routers/*.py"]
 
 
 # ── summarize_ungrounded_claims (async, verifies symbol definitions) ──────────
@@ -431,6 +499,44 @@ async def test_reconcile_presence_local_indeterminate_unchanged(mocker, tmp_path
     )
     assert result["status"] == "mature"
     assert "presence_warning" not in result
+
+
+@pytest.mark.asyncio
+async def test_reconcile_presence_glob_modules_not_downgraded_without_snapshot(mocker):
+    from app.source_ref_validation import reconcile_design_doc_presence
+
+    mocker.patch(_SNAPSHOT_PATH, new=AsyncMock(return_value=None))
+    value = {"status": "mature", "modules": ["backend/app/routers/*.py"]}
+    result = await reconcile_design_doc_presence(
+        value,
+        "systems/auth",
+        token="ghs_tok",
+        owner="acme",
+        repo="widget",
+        branch="automain",
+    )
+    assert result["status"] == "mature"
+    assert "presence_warning" not in result
+
+
+@pytest.mark.asyncio
+async def test_reconcile_presence_glob_modules_downgraded_on_complete_tree_nonmatch(
+    mocker,
+):
+    from app.source_ref_validation import reconcile_design_doc_presence
+
+    _patch_snapshot(mocker, {"backend/app/models.py": "a" * 40})
+    value = {"status": "mature", "modules": ["backend/app/routers/*.py"]}
+    result = await reconcile_design_doc_presence(
+        value,
+        "systems/auth",
+        token="ghs_tok",
+        owner="acme",
+        repo="widget",
+        branch="automain",
+    )
+    assert result["status"] == "missing"
+    assert "presence_warning" in result
 
 
 @pytest.mark.asyncio
@@ -934,7 +1040,7 @@ async def test_symbol_defined_in_repo_branch_api_error_indeterminate(mocker):
 
 # ── summarize_bug_report_citations (free-text bug-report grounding) ────────────
 
-_CITE_CREDS = dict(token="t", owner="o", repo="r", branch="main", project_id="p")
+_CITE_CREDS = {"token": "t", "owner": "o", "repo": "r", "branch": "main", "project_id": "p"}
 
 
 @pytest.mark.asyncio

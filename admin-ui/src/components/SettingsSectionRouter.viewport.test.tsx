@@ -177,6 +177,10 @@ function makeProps(activeSection: SectionId): SettingsSectionRouterProps {
     onUpdateIssueImplementationConfig: async () => {},
     autoReviewConfig: null,
     onUpdateAutoReviewConfig: async () => {},
+    resourceEnvelopeData: null,
+    resourceEnvelopeLoading: false,
+    resourceEnvelopeError: null,
+    onUpdateResourceEnvelope: async () => {},
     integrationBranchData: null,
     onUpdateIntegrationBranch: async () => {},
     promotionTargetData: null,
@@ -187,7 +191,7 @@ function makeProps(activeSection: SectionId): SettingsSectionRouterProps {
 // Sections rendered by the router that present operator-facing layout/controls
 // purely from primitive props (no async fetch). These cover the General,
 // Orchestrator, Deploy, and Advanced bodies — the widest forms the router emits.
-const SECTIONS_UNDER_TEST: SectionId[] = ['general', 'orchestrator', 'deploy', 'advanced'];
+const SECTIONS_UNDER_TEST: SectionId[] = ['general', 'orchestrator', 'deploy', 'advanced', 'resource-envelope'];
 
 describe('SettingsSectionRouter — viewport regression', () => {
   let root: Root | null = null;

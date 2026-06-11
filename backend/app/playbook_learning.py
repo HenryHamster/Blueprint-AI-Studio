@@ -110,6 +110,8 @@ from app.playbook_storage import (  # noqa: F401
     ground_design_doc_systems,
     ground_design_doc_systems_branch_aware,
     mark_branch_grounding_done,
+    recover_grounding_downgrades,
+    recover_grounding_downgrades_branch_aware,
     maybe_archive_for_capacity,
     record_playbook_applied,
     record_playbook_confirmed,

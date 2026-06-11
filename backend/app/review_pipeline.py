@@ -33,6 +33,17 @@ from app.spawn_calibration import (
     _compute_scope_overflow_warning,
 )
 
+# Issue-ledger: derives per-region DEMANDED/APPLIED/CONTESTED state from
+# review_history. Side-effect-free; re-exported here so callers importing from
+# app.review_pipeline keep working.
+from app.issue_ledger import (  # noqa: F401
+    CONTESTED_JACCARD_THRESHOLD,
+    ISSUE_LEDGER_MAX_CONTESTED,
+    build_issue_ledger,
+    format_contested_regions_for_fix,
+    format_contested_regions_for_review,
+)
+
 # Pure, side-effect-free review-loop heuristics live in review_heuristics; they
 # are re-exported here so existing callers/tests that import them from
 # app.review_pipeline keep working unchanged.
@@ -40,6 +51,14 @@ from app.review_heuristics import (  # noqa: F401
     AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
     EARLY_NONCONVERGENCE_ESCALATE_AT,
     ISSUE_CHURN_WINDOW,
+    LANE_ARBITRATION,
+    LANE_CAP_ARBITRATION_DEFAULT,
+    LANE_CAP_CI_DEFAULT,
+    LANE_CAP_CONFLICT_DEFAULT,
+    LANE_CAP_NON_REVIEW_DEFAULT,
+    LANE_CI,
+    LANE_CONFLICT,
+    LANE_REVIEW_CONVERGENCE,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
@@ -60,6 +79,7 @@ from app.review_heuristics import (  # noqa: F401
     _reconcile_narrow_focus_with_fix_all,
     _repeating_issue_descriptions,
     _stuck_thresholds,
+    classify_iteration_lane,
     compute_drift_signal,
     detect_early_nonconvergence,
     detect_fix_all_issue_class,
@@ -469,6 +489,13 @@ SPAWN_REASON_NONCONVERGENCE = "early_nonconvergence"
 # debt, toolchain layer) rather than a code defect. Halt the chain and let
 # the strategic agent (or operator) decide whether to spawn an infra fix.
 SPAWN_REASON_BLOCKED_REPEAT = "blocked_repeat_fingerprint"
+
+# Grace window for the mid-retry defer: when a same-PR fix is FAILED/CANCELLED
+# with an infra failure_category and the failure is younger than this many minutes,
+# a review spawn is deferred so the fix can be requeued (rather than producing a
+# stale verdict on unchanged code). Outside the window or with budget exhausted,
+# review spawns proceed normally.
+_STALE_HEAD_MID_RETRY_GRACE_MINUTES = 20
 
 _PIPELINE_ACTIVE_STATUSES = (
     TaskStatus.QUEUED,
@@ -1066,6 +1093,96 @@ def build_merge_conflict_fix_prompt(
     return prompt
 
 
+async def _check_fix_mid_retry_defer(
+    source_task: Task,
+    session: AsyncSession,
+    pr_number: int,
+    resolved_original_id: str,
+    is_rollup_source: bool,
+) -> bool:
+    """True if a same-PR fix is FAILED/CANCELLED with an infra failure_category
+    within the grace window AND still has retry budget, so a review spawn should
+    be deferred rather than producing a verdict on unchanged code.
+
+    Outside the grace window or with budget exhausted, returns False so the
+    review spawn proceeds and the chain cannot wedge forever.
+    Best-effort: a lookup error always returns False (fail-open for review spawns).
+    """
+    from app.failure_classification import INFRA_CLASSES
+    from app.reaper_sweeps import _BLOCKED_OPTIMISTIC_RETRY_CAP
+
+    cutoff = _utcnow() - timedelta(minutes=_STALE_HEAD_MID_RETRY_GRACE_MINUTES)
+    try:
+        # Push updated_at and pr_number filters into SQL to avoid a full project
+        # table scan on long-lived projects. pr_number is matched Python-side via
+        # first_payload because the JSONB expression index (ix_task_payloads_pr_number)
+        # is on the payloads column; updated_at has a plain B-tree index.
+        dialect_name = resolve_dialect_name(session)
+        if dialect_name == "sqlite":
+            pr_number_match = (
+                func.json_extract(Task.payloads, "$[0].pr_number") == pr_number
+            )
+            type_match = func.json_extract(Task.payloads, "$[0].type") == "fix"
+        else:
+            pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
+            type_match = Task.payloads[0]["type"].as_string() == "fix"
+
+        candidates = (
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.status,
+                            Task.context,
+                            Task.payloads,
+                            Task.updated_at,
+                        )
+                    )
+                    .where(
+                        Task.project_id == source_task.project_id,
+                        Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                        Task.updated_at >= cutoff,
+                        pr_number_match,
+                        type_match,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for t in candidates:
+            fp = t.first_payload
+            if not is_rollup_source and (
+                fp.get("original_task_id") or ""
+            ) != resolved_original_id:
+                continue
+            ctx = t.context or {}
+            fc = ctx.get("failure_category")
+            if fc not in INFRA_CLASSES:
+                continue
+            # Budget check differs by terminal state:
+            # - FAILED: retried by the resurrection sweep (cap=1 via _resurrection_count
+            #   in reaper_infra_recovery.py). Budget exhausted when _resurrection_count >= 1.
+            # - CANCELLED: retried by the blocked-optimistic requeue path (cap via
+            #   _BLOCKED_OPTIMISTIC_RETRY_CAP / _blocked_optimistic_retries).
+            if t.status == TaskStatus.FAILED:
+                if int(ctx.get("_resurrection_count", 0)) >= 1:
+                    continue
+            else:
+                if int(ctx.get("_blocked_optimistic_retries", 0)) >= _BLOCKED_OPTIMISTIC_RETRY_CAP:
+                    continue
+            return True
+    except Exception:
+        logger.debug(
+            "[PIPELINE] _check_fix_mid_retry_defer lookup failed for "
+            f"PR #{pr_number} — allowing review spawn",
+            exc_info=True,
+        )
+    return False
+
+
 async def _spawn_pipeline_task(
     source_task: Task,
     task_type: str,
@@ -1334,6 +1451,27 @@ async def _spawn_pipeline_task(
         # replacement task in the same transaction.
         await session.flush()
 
+    # Mid-retry defer: when spawning a review, treat the chain as busy if a
+    # same-PR fix is FAILED/CANCELLED with an infra failure_category within the
+    # grace window AND still has retry budget remaining — the fix will be requeued
+    # by the reaper, and a review against the unchanged head would only produce a
+    # stale verdict that burns a cap slot. Outside the window or with budget
+    # exhausted, proceed; the chain cannot wedge forever.
+    if task_type == "review" and await _check_fix_mid_retry_defer(
+        source_task, session, pr_number, resolved_original_id, is_rollup_source
+    ):
+        logger.info(
+            f"[PIPELINE] Deferring review spawn for PR #{pr_number} — "
+            f"same-PR fix is in mid-retry infra-failure grace window"
+        )
+        source_task.latest_status_message = (
+            f"Review deferred for PR #{pr_number} — "
+            f"fix in mid-retry (infra failure, within grace window)"
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_DEFERRED)
+        session.add(source_task)
+        return (None, False)
+
     # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains.
     # Excludes archived tasks (manual iteration-cap reset path) and infra-class
     # failures: a task that died in VM provisioning / rate limit / agent timeout
@@ -1372,11 +1510,13 @@ async def _spawn_pipeline_task(
             func.json_extract(Task.payloads, "$[0].pr_number") == pr_number
         )
         type_match = func.json_extract(Task.payloads, "$[0].type").in_(
-            ("review", "fix")
+            ("review", "fix", "panel_review")
         )
     else:
         pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
-        type_match = Task.payloads[0]["type"].as_string().in_(("review", "fix"))
+        type_match = Task.payloads[0]["type"].as_string().in_(
+            ("review", "fix", "panel_review")
+        )
     pr_pipeline_tasks = (
         (
             await session.execute(
@@ -1582,9 +1722,71 @@ async def _spawn_pipeline_task(
             fc = (t.context or {}).get("failure_category")
             if fc in INFRA_CLASSES:
                 return False
+        # Stale-head discards: a review that ran against an older head than the
+        # live PR head is discarded and a fresh review respawned. Counting it
+        # toward the cap would penalise the chain for a verdict it couldn't
+        # act on.
+        if (t.context or {}).get("_review_stale_head"):
+            return False
         return True
 
     pr_iterations = sum(1 for t in pr_pipeline_tasks if _counts_toward_cap(t))
+
+    # ── Per-lane iteration counts ───────────────────────────────────────────
+    # Count existing iterations by lane (applying the same infra-class cap
+    # exemption) so sub-cap checks can block mechanical churn before it crowds
+    # out review-convergence work.
+    lane_counts: dict[str, int] = {
+        LANE_CONFLICT: 0,
+        LANE_CI: 0,
+        LANE_ARBITRATION: 0,
+        LANE_REVIEW_CONVERGENCE: 0,
+    }
+    for _lt in pr_pipeline_tasks:
+        if _counts_toward_cap(_lt):
+            _lane = classify_iteration_lane(_lt)
+            lane_counts[_lane] = lane_counts.get(_lane, 0) + 1
+    non_review_total = (
+        lane_counts[LANE_CONFLICT]
+        + lane_counts[LANE_CI]
+        + lane_counts[LANE_ARBITRATION]
+    )
+
+    # Runtime-config-tunable sub-caps.
+    _lane_cap_conflict = _runtime_config.get(
+        "review_lane_cap_conflict", LANE_CAP_CONFLICT_DEFAULT
+    )
+    _lane_cap_ci = _runtime_config.get("review_lane_cap_ci", LANE_CAP_CI_DEFAULT)
+    _lane_cap_arbitration = _runtime_config.get(
+        "review_lane_cap_arbitration", LANE_CAP_ARBITRATION_DEFAULT
+    )
+    _lane_cap_non_review = _runtime_config.get(
+        "review_lane_cap_non_review", LANE_CAP_NON_REVIEW_DEFAULT
+    )
+
+    def _lane_breakdown_detail() -> str:
+        return (
+            f"conflict={lane_counts[LANE_CONFLICT]}/{_lane_cap_conflict}, "
+            f"ci={lane_counts[LANE_CI]}/{_lane_cap_ci}, "
+            f"arbitration={lane_counts[LANE_ARBITRATION]}/{_lane_cap_arbitration}, "
+            f"non_review={non_review_total}/{_lane_cap_non_review}, "
+            f"review_convergence={lane_counts[LANE_REVIEW_CONVERGENCE]}"
+        )
+
+    # Classify the upcoming spawn's lane so we can gate on the right sub-cap.
+    _spawn_lane = classify_iteration_lane(source_task)
+    # For the upcoming spawn, fix_reason and task_type determine the lane more
+    # precisely than source_task's completed context (which may be from a prior
+    # review or a different fix iteration). Override with spawn parameters.
+    if task_type == "panel_review":
+        _spawn_lane = LANE_ARBITRATION
+    elif fix_reason in ("merge_conflict", "update_branch_failed"):
+        _spawn_lane = LANE_CONFLICT
+    elif fix_reason == "ci_failure":
+        _spawn_lane = LANE_CI
+    elif task_type in ("review", "fix") and fix_reason in ("", "code_review"):
+        _spawn_lane = LANE_REVIEW_CONVERGENCE
+
     # Load direction data for direction-aware cap adjustment.
     direction_data: dict | None = None
     direction_id = (source_task.context or {}).get("direction_id")
@@ -1615,10 +1817,137 @@ async def _spawn_pipeline_task(
             pr_iterations,
             session,
             scope="global",
+            lane_counts=lane_counts,
         )
         _set_spawn_reason(source_task, SPAWN_REASON_CAP)
         session.add(source_task)
         return (None, False)
+
+    # ── Per-lane sub-cap checks ─────────────────────────────────────────────
+    # Block a spawn when its lane's sub-cap is exhausted or non-review lanes
+    # collectively hit the collective ceiling. These fire before the global cap
+    # so mechanical churn never starves review-convergence work.
+    # Arbitration exhaustion → standoff escalation (mirrors the is_standoff
+    # path). Conflict/CI exhaustion routes to _handle_cap_exhaustion which
+    # uses _pr_is_preservable_on_cap to preserve rollup work.
+    _lane_exhausted: str | None = None
+    if _spawn_lane == LANE_ARBITRATION and lane_counts[LANE_ARBITRATION] >= _lane_cap_arbitration:
+        _lane_exhausted = LANE_ARBITRATION
+    elif _spawn_lane == LANE_CONFLICT and lane_counts[LANE_CONFLICT] >= _lane_cap_conflict:
+        _lane_exhausted = LANE_CONFLICT
+    elif _spawn_lane == LANE_CI and lane_counts[LANE_CI] >= _lane_cap_ci:
+        _lane_exhausted = LANE_CI
+    elif _spawn_lane != LANE_REVIEW_CONVERGENCE and non_review_total >= _lane_cap_non_review:
+        _lane_exhausted = "non_review_collective"
+
+    if _lane_exhausted is not None:
+        _detail = _lane_breakdown_detail()
+        if _lane_exhausted == LANE_ARBITRATION:
+            # Arbitration lane exhausted → treat as standoff escalation.
+            logger.warning(
+                f"[PIPELINE] PR #{pr_number} arbitration lane exhausted "
+                f"({lane_counts[LANE_ARBITRATION]}/{_lane_cap_arbitration} iterations). "
+                f"Lane breakdown: {_detail}"
+            )
+            try:
+                _ae_orig = await session.get(Task, uuid.UUID(resolved_original_id))
+                if _ae_orig:
+                    if _runtime_config.get("require_approval_gates", True):
+                        _ae_orig.requires_approval = True
+                    _ae_orig.latest_status_message = (
+                        f"Arbitration lane cap reached ({lane_counts[LANE_ARBITRATION]} "
+                        f"second-opinion iterations) — review-fix loop escalated for "
+                        f"manual resolution on PR #{pr_number}. {_detail}"
+                    )
+                    _set_review_loop_terminal_outcome(
+                        _ae_orig,
+                        kind="standoff",
+                        reason="arbitration_lane_exhausted",
+                        pr_number=pr_number,
+                        iterations=pr_iterations,
+                        detail=_detail,
+                    )
+                    session.add(_ae_orig)
+                    await session.commit()
+                    # Durable operator alert — fires regardless of
+                    # approval-gate state (mirrors the existing standoff path).
+                    try:
+                        from app.alert_dispatch import (
+                            _maybe_create_escalation_alert,
+                        )
+
+                        await _maybe_create_escalation_alert(
+                            _ae_orig,
+                            session,
+                            pr_number=pr_number,
+                            reason="arbitration_lane_exhausted",
+                            iteration=pr_iterations,
+                        )
+                    except Exception as _alert_err:  # noqa: BLE001
+                        logger.warning(
+                            f"[PIPELINE] Failed to create escalation alert for "
+                            f"arbitration-lane exhaustion on PR #{pr_number}: {_alert_err}",
+                            exc_info=True,
+                        )
+                    try:
+                        import asyncio as _asyncio
+                        from app.notification_dispatch import (
+                            dispatch_external_notification,
+                        )
+
+                        _asyncio.ensure_future(  # noqa: RUF006
+                            dispatch_external_notification(
+                                _ae_orig.project_id,
+                                "APPROVAL_NEEDED",
+                                {
+                                    "task_id": str(_ae_orig.id),
+                                    "task_title": _ae_orig.title
+                                    or str(_ae_orig.id)[:8],
+                                    "pr_number": pr_number,
+                                    "iteration": pr_iterations,
+                                    "reason": "Arbitration lane cap reached — manual review required",
+                                },
+                            )
+                        )
+                    except Exception as _ne:  # noqa: BLE001
+                        logger.warning(
+                            f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed "
+                            f"(arbitration-lane): {_ne}"
+                        )
+            except Exception as _ae_err:  # noqa: BLE001
+                logger.warning(
+                    f"[PIPELINE] Failed to mark arbitration-lane exhaustion on "
+                    f"{resolved_original_id[:8]}: {_ae_err}",
+                    exc_info=True,
+                )
+            _set_spawn_reason(source_task, SPAWN_REASON_STUCK)
+            session.add(source_task)
+            return (None, False)
+        else:
+            # Conflict or CI lane exhausted (or non-review collective cap) →
+            # route to _handle_cap_exhaustion. For rollup PRs,
+            # _pr_is_preservable_on_cap returns True → preserve work.
+            _scope_label = (
+                f"{_lane_exhausted}-lane"
+                if _lane_exhausted in (LANE_CONFLICT, LANE_CI)
+                else "non-review-collective"
+            )
+            logger.warning(
+                f"[PIPELINE] PR #{pr_number} {_scope_label} lane cap exhausted. "
+                f"Lane breakdown: {_detail}"
+            )
+            await _handle_cap_exhaustion(
+                source_task,
+                resolved_original_id,
+                pr_number,
+                pr_iterations,
+                session,
+                scope=_scope_label,
+                lane_counts=lane_counts,
+            )
+            _set_spawn_reason(source_task, SPAWN_REASON_CAP)
+            session.add(source_task)
+            return (None, False)
 
     # Track review-fix iteration count to prevent infinite loops (per-chain).
     # Rollup PRs use the same elevated cap as the global check above — without
@@ -1642,6 +1971,7 @@ async def _spawn_pipeline_task(
             per_chain_cap,
             session,
             scope="per-chain",
+            lane_counts=lane_counts,
         )
         _set_spawn_reason(source_task, SPAWN_REASON_CAP)
         session.add(source_task)
@@ -1714,6 +2044,21 @@ async def _spawn_pipeline_task(
     # Apply per-task-type model/effort defaults from settings
     type_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
     type_effort = _runtime_config.get("task_type_efforts", {}).get(task_type) or None
+
+    # Reviewer-model pin: once the first review in a chain uses a specific model,
+    # all subsequent reviews on the same chain reuse it. Prevents model-rotation
+    # from introducing reviewer personality drift mid-chain. Gated on the
+    # "pin_reviewer_model" runtime flag (default on). Carry-forward always happens
+    # (fix spawns thread it through review_loop so the next review sees it).
+    _pin_reviewer = bool(_runtime_config.get("pin_reviewer_model", True))
+    reviewer_model_for_chain = source_loop.get("reviewer_model") if _pin_reviewer else None
+    if task_type == "review" and _pin_reviewer:
+        if reviewer_model_for_chain:
+            # Use the pinned model from a prior review in this chain.
+            type_model = reviewer_model_for_chain
+        elif type_model:
+            # First review in the chain — stamp the resolved type_model as the pin.
+            reviewer_model_for_chain = type_model
 
     if task_type == "review":
         title = f"Review PR #{pr_number}"
@@ -2119,6 +2464,35 @@ async def _spawn_pipeline_task(
                 )
                 fix_prompt = early_prefix + (fix_prompt or "")
 
+    # Contested-region detection: derive the issue ledger from review_history and
+    # inject guidance when the same code region has been demanded, fixed, then
+    # demanded *differently* — the oscillation shape the stuck/churn detectors miss.
+    # Fix prompt: prepend a contested-region prefix (topmost, before churn/mid-budget
+    # prefixes that were prepended above, so the most actionable signal reads first).
+    # Review prompt: append — mirrors the overflow_instruction pattern below.
+    # Ledger is serialized into review_loop regardless of task_type so the full
+    # history of contested regions is visible to reviewers and fix agents alike.
+    _issue_ledger: dict = {}
+    if new_review_history:
+        _issue_ledger = build_issue_ledger(new_review_history)
+        _contested = _issue_ledger.get("contested") or []
+        if _contested:
+            if task_type == "fix":
+                contested_fix_prefix = format_contested_regions_for_fix(
+                    _contested, base_branch
+                )
+                if contested_fix_prefix:
+                    logger.info(
+                        f"[PIPELINE] Contested regions detected for PR #{pr_number}: "
+                        f"{len(_contested)} region(s). Injecting fix-prompt prefix."
+                    )
+                    payload_data["prompt"] = contested_fix_prefix + (
+                        payload_data.get("prompt") or ""
+                    )
+                    fix_prompt = contested_fix_prefix + (fix_prompt or "")
+            # Review-prompt injection happens after validate_internal_payload
+            # (same placement as overflow_instruction — see below).
+
     # Graduated scope-budget pressure cap: a medium- or large-scope fix cycle's
     # remaining iterations are scaled down by how close the PR is to its
     # production file budget. Activation is at SCOPE_PRESSURE_WARN_THRESHOLD
@@ -2303,6 +2677,23 @@ async def _spawn_pipeline_task(
                 + "\n\n"
                 + overflow_instruction
             ).strip()
+    # Contested-region review-prompt injection: append after overflow_instruction
+    # so the reviewer sees both when scope overflow is also present.
+    if task_type == "review" and _issue_ledger.get("contested"):
+        contested_review_appendix = format_contested_regions_for_review(
+            _issue_ledger["contested"], base_branch
+        )
+        if contested_review_appendix:
+            logger.info(
+                f"[PIPELINE] Contested regions detected for PR #{pr_number}: "
+                f"{len(_issue_ledger['contested'])} region(s). "
+                f"Appending review-prompt guidance."
+            )
+            payload_data["original_prompt"] = (
+                (payload_data.get("original_prompt") or "").strip()
+                + "\n\n"
+                + contested_review_appendix
+            ).strip()
     # Persist the scope-budget hard cap (either newly triggered this spawn or
     # carried forward from a prior spawn) so _max_review_iterations enforces
     # it on subsequent review/fix iterations for this chain.
@@ -2419,6 +2810,22 @@ async def _spawn_pipeline_task(
         **(
             {"fix_agent_responses": accumulated_responses}
             if accumulated_responses
+            else {}
+        ),
+        # Issue ledger: carries contested regions across iterations so each fix/review
+        # agent sees the full oscillation history without re-deriving from history.
+        # Only written when the ledger has at least one contested region.
+        **(
+            {"issue_ledger": _issue_ledger}
+            if _issue_ledger.get("contested")
+            else {}
+        ),
+        # Reviewer-model pin: first review stamps the resolved model; subsequent
+        # reviews and fix tasks carry it forward so all reviews on the chain use
+        # the same model (prevents reviewer personality drift mid-chain).
+        **(
+            {"reviewer_model": reviewer_model_for_chain}
+            if reviewer_model_for_chain
             else {}
         ),
         # First-pass minor-only marker: when set, the fix-completion handler

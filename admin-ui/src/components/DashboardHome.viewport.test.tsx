@@ -364,6 +364,16 @@ vi.mock('../api', () => ({
     window_hours: 1,
     saturation: 'healthy' as const,
   })),
+  fetchAgentServingShas: vi.fn(async () => ({
+    fleet: { total_observed: 0, unknown_count: 0, mixed: false, buckets: [] },
+    current_image: null,
+    backend_served_sha: null,
+    active_candidate_sha: null,
+    integration_branch: null,
+    integration_head_sha: null,
+    promotion_target: null,
+    promotion_head_sha: null,
+  })),
 }));
 
 describe('DashboardHome — viewport regression', () => {

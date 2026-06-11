@@ -2,12 +2,20 @@
 design-doc systems/capabilities, mirroring the playbook stale-ref sweep."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock
 
+import pytest
+
 from app.playbook_learning import (
+    branch_grounding_due,
     ground_design_doc_systems,
     ground_design_doc_systems_branch_aware,
+    mark_branch_grounding_done,
+    recover_grounding_downgrades,
+    recover_grounding_downgrades_branch_aware,
 )
+from app.shared_state import runtime_config
 
 
 def _make_repo(tmp_path, *rel_paths):
@@ -55,12 +63,129 @@ def test_branch_aware_grounding_works_without_local_checkout(monkeypatch):
             owner="acme",
             repo="widget",
             branch="automain",
+            sha="deadbeef",
         )
     )
     entry = result["systems/auth"]
     assert entry["status"] == "missing"
     assert "integration branch" in entry["presence_warning"]
+    assert entry["grounding_provenance"]["source"] == "github-snapshot"
+    assert entry["grounding_provenance"]["branch"] == "automain"
+    assert entry["grounding_provenance"]["sha"] == "deadbeef"
+    assert entry["grounding_provenance"]["checked_at"]
     assert result["_meta"]["updated_by"] == "design-doc-grounding"
+
+
+def test_grounding_cap_breach_persists_no_downgrades_and_emits_diagnostic(
+    tmp_path, monkeypatch, caplog
+):
+    """Cap breaches leave entries untouched and surface a machine-readable diagnostic."""
+    repo_root = _make_repo(tmp_path, "backend/app/present.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone_auth.py"],
+        },
+        "systems/billing": {
+            "status": "functional",
+            "modules": ["backend/app/gone_billing.py"],
+        },
+        "capabilities/retries": {
+            "status": "working",
+            "notes": "See backend/app/gone_retry.py.",
+        },
+        "capabilities/search": {
+            "status": "partial",
+            "notes": "See backend/app/gone_search.py.",
+        },
+    }
+    monkeypatch.setitem(
+        runtime_config,
+        "playbook_design_doc_grounding_max_downgrades",
+        2,
+    )
+    caplog.set_level(logging.WARNING)
+    expected_keys = list(doc)
+
+    result = ground_design_doc_systems(doc, repo_root)
+
+    for key in expected_keys:
+        assert result[key]["status"] == doc[key]["status"]
+        assert "presence_warning" not in result[key]
+        assert "grounding_provenance" not in result[key]
+
+    diagnostic = result["_meta"]["grounding_diagnostic"]
+    assert diagnostic["kind"] == "cap_breach"
+    assert diagnostic["source"] == "local-disk"
+    assert diagnostic["candidate_count"] == 4
+    assert diagnostic["cap"] == 2
+    assert diagnostic["affected_keys"] == expected_keys
+    assert any("Grounding cap breach" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_branch_aware_grounding_cap_breach_persists_no_downgrades_and_emits_diagnostic(
+    monkeypatch, caplog
+):
+    """GitHub-snapshot cap breaches leave entries untouched and emit diagnostics."""
+    branch_exists = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        branch_exists,
+    )
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone_auth.py"],
+        },
+        "systems/billing": {
+            "status": "functional",
+            "modules": ["backend/app/gone_billing.py"],
+        },
+        "capabilities/retries": {
+            "status": "working",
+            "notes": "See backend/app/gone_retry.py.",
+        },
+        "capabilities/search": {
+            "status": "partial",
+            "notes": "See backend/app/gone_search.py.",
+        },
+    }
+    monkeypatch.setitem(
+        runtime_config,
+        "playbook_design_doc_grounding_max_downgrades",
+        2,
+    )
+    caplog.set_level(logging.WARNING)
+    expected_keys = list(doc)
+
+    result = await ground_design_doc_systems_branch_aware(
+        doc,
+        token="ghs_tok",
+        owner="acme",
+        repo="widget",
+        branch="automain",
+        sha="deadbeef",
+        project_id="p1",
+    )
+
+    assert branch_exists.await_count == 4
+    for key in expected_keys:
+        assert result[key]["status"] == doc[key]["status"]
+        assert "presence_warning" not in result[key]
+        assert "grounding_provenance" not in result[key]
+
+    diagnostic = result["_meta"]["grounding_diagnostic"]
+    assert diagnostic["kind"] == "cap_breach"
+    assert diagnostic["source"] == "github-snapshot"
+    assert diagnostic["candidate_count"] == 4
+    assert diagnostic["cap"] == 2
+    assert diagnostic["affected_keys"] == expected_keys
+    assert diagnostic["indeterminate"] is True
+    assert any(
+        "Grounding cap breach on github-snapshot source" in record.message
+        for record in caplog.records
+    )
 
 
 def test_system_all_modules_absent_downgraded(tmp_path):
@@ -76,6 +201,8 @@ def test_system_all_modules_absent_downgraded(tmp_path):
     entry = result["systems/auth"]
     assert entry["status"] == "missing"
     assert "absent" in entry["presence_warning"]
+    assert entry["grounding_provenance"]["source"] == "local-disk"
+    assert entry["grounding_provenance"]["checked_at"]
     assert result["_meta"]["updated_by"] == "design-doc-grounding"
     assert result["_meta"]["revision"] == 1
 
@@ -293,3 +420,352 @@ def test_grounding_is_idempotent(tmp_path):
     second = ground_design_doc_systems(first, repo_root)
     # Already "missing" → falls out of the present-status set, no further change.
     assert second["_meta"]["revision"] == rev_after_first
+
+
+# ---------------------------------------------------------------------------
+# Self-healing recovery tests
+# ---------------------------------------------------------------------------
+
+
+def test_downgrade_preserves_grounding_prior_status(tmp_path):
+    """Downgrade stores the original status in grounding_prior_status."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    assert result["systems/auth"]["grounding_prior_status"] == "mature"
+
+
+def test_downgrade_appends_reconciled_marker(tmp_path):
+    """Downgrade appends a [reconciled: ...] marker to the appropriate text field."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    # systems/* → description field
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "description": "Auth module.",
+            "modules": ["backend/app/gone.py"],
+        },
+        "capabilities/retries": {
+            "status": "working",
+            "notes": "See backend/app/gone_retry.py.",
+        },
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    assert "[reconciled:" in result["systems/auth"]["description"]
+    assert "Auth module." in result["systems/auth"]["description"]
+    assert "[reconciled:" in result["capabilities/retries"]["notes"]
+
+
+def test_recover_restores_when_path_returns(tmp_path):
+    """Round-trip: downgrade then recover restores status and clears fields."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "description": "Auth subsystem.",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    doc = ground_design_doc_systems(doc, repo_root)
+    assert doc["systems/auth"]["status"] == "missing"
+
+    # Restore the file.
+    gone = tmp_path / "backend" / "app" / "gone.py"
+    gone.parent.mkdir(parents=True, exist_ok=True)
+    gone.write_text("# restored")
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    recovered = doc["systems/auth"]
+    assert recovered["status"] == "mature"
+    assert "presence_warning" not in recovered
+    assert "grounding_prior_status" not in recovered
+    assert "[reconciled:" not in recovered.get("description", "")
+    assert "Auth subsystem." in recovered.get("description", "")
+    assert doc["_meta"]["updated_by"] == "design-doc-grounding-recovery"
+
+
+def test_recover_no_op_when_still_absent(tmp_path):
+    """Recovery is a no-op when all referenced paths are still absent."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    doc = ground_design_doc_systems(doc, repo_root)
+    rev_after_downgrade = doc["_meta"]["revision"]
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    assert doc["systems/auth"]["status"] == "missing"
+    assert doc["_meta"]["revision"] == rev_after_downgrade
+
+
+def test_recover_no_op_without_grounding_prior_status(tmp_path):
+    """Authored-missing entries (no presence_warning) are never touched by recovery."""
+    repo_root = _make_repo(tmp_path, "backend/app/auth.py")
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/auth.py"],
+        }
+    }
+    doc = recover_grounding_downgrades(doc, repo_root)
+    assert doc["systems/auth"]["status"] == "missing"
+    assert "_meta" not in doc
+
+
+def test_recover_branch_aware_restores(monkeypatch):
+    """Branch-aware recovery restores when _file_exists_in_repo_branch returns True."""
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        AsyncMock(return_value=True),
+    )
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/auth.py"],
+            "presence_warning": "claimed mature but all referenced module file(s) are absent on the integration branch — treat as missing",
+            "grounding_prior_status": "mature",
+        }
+    }
+    result = asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+    assert result["systems/auth"]["status"] == "mature"
+    assert "presence_warning" not in result["systems/auth"]
+    assert result["_meta"]["updated_by"] == "design-doc-grounding-recovery"
+
+
+def test_downgrade_then_recover_idempotent(tmp_path):
+    """Two consecutive recover calls on a restored entry leave the state unchanged."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    doc = ground_design_doc_systems(doc, repo_root)
+
+    gone = tmp_path / "backend" / "app" / "gone.py"
+    gone.parent.mkdir(parents=True, exist_ok=True)
+    gone.write_text("# restored")
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    rev_after_first_recover = doc["_meta"]["revision"]
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    # Entry now has status=mature (not missing) → recovery skips it.
+    assert doc["systems/auth"]["status"] == "mature"
+    assert doc["_meta"]["revision"] == rev_after_first_recover
+
+
+def test_recovery_runs_when_cooldown_not_elapsed(monkeypatch):
+    """Recovery fires on every claim regardless of the 6h downgrade cooldown.
+
+    Simulates the path in agent.py where recover_grounding_downgrades_branch_aware
+    is called unconditionally before the branch_grounding_due guard.  Even when
+    the cooldown has NOT elapsed (branch_grounding_due returns False), recovery
+    should restore a falsely-downgraded entry and ground_design_doc_systems_branch_aware
+    must NOT be called.
+    """
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        AsyncMock(return_value=True),
+    )
+
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/auth.py"],
+            "presence_warning": (
+                "claimed mature but all referenced module file(s) are absent on the"
+                " integration branch — treat as missing"
+            ),
+            "grounding_prior_status": "mature",
+        }
+    }
+    # Stamp the cooldown so branch_grounding_due returns False.
+    mark_branch_grounding_done(doc)
+    assert not branch_grounding_due(doc), "precondition: cooldown window active"
+
+    # Recovery should still fire and restore the entry.
+    recovered = asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+
+    assert recovered["systems/auth"]["status"] == "mature"
+    assert "presence_warning" not in recovered["systems/auth"]
+    assert recovered["_meta"]["updated_by"] == "design-doc-grounding-recovery"
+
+    # The full downgrade sweep (ground_design_doc_systems_branch_aware) must
+    # NOT have been called — it stays behind the cooldown guard.
+    sweep_called = False
+
+    async def _mock_sweep(d, **kw):
+        nonlocal sweep_called
+        sweep_called = True
+        return d
+
+    monkeypatch.setattr(
+        "app.playbook_storage.ground_design_doc_systems_branch_aware",
+        _mock_sweep,
+    )
+    # Confirm: with the cooldown still active, calling only the recovery
+    # function leaves sweep_called False.
+    asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+    assert not sweep_called, "downgrade sweep must not run when cooldown is active"
+
+
+# ---------------------------------------------------------------------------
+# Mass-downgrade guard tests
+# ---------------------------------------------------------------------------
+
+
+def _make_absent_doc(n_systems=0, n_capabilities=0):
+    """Build a doc with all entries pointing at a nonexistent path."""
+    doc = {}
+    for i in range(n_systems):
+        doc[f"systems/sys{i}"] = {
+            "status": "mature",
+            "modules": [f"backend/app/gone_sys{i}.py"],
+        }
+    for i in range(n_capabilities):
+        doc[f"capabilities/cap{i}"] = {
+            "status": "working",
+            "notes": f"See backend/app/gone_cap{i}.py for the implementation.",
+        }
+    return doc
+
+
+def test_mass_downgrade_sweep_aborts_above_bound_and_persists_nothing(tmp_path):
+    """Core acceptance test: candidates exceeding the cap trigger an abort; nothing is persisted."""
+    # 11 systems, all pointing at absent paths — exceeds the cap (max(3, ceil(11*0.10))=3).
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = _make_absent_doc(n_systems=11)
+    original_statuses = {k: v["status"] for k, v in doc.items()}
+    original_rev = (doc.get("_meta") or {}).get("revision", 0)
+
+    result = ground_design_doc_systems(doc, repo_root)
+
+    # No entry should have been downgraded.
+    for key, orig_status in original_statuses.items():
+        assert result[key]["status"] == orig_status, f"{key} was incorrectly downgraded"
+        assert "presence_warning" not in result[key], f"{key} has unexpected warning"
+
+    # Revision must not have been bumped (abort does not count as a content update).
+    assert result["_meta"].get("revision", 0) == original_rev
+
+    # _meta must carry the cap-breach diagnostic.
+    abort_info = result["_meta"].get("grounding_diagnostic")
+    assert abort_info is not None, "grounding_diagnostic missing from _meta"
+    assert abort_info["candidate_count"] == 11
+    assert abort_info["kind"] == "cap_breach"
+
+
+def test_mass_downgrade_cap_aborts_when_exceeded(tmp_path):
+    """Cap fires when candidates exceed max(3, ceil(present_count * 0.10))."""
+    # 4 systems, all absent — cap = max(3, ceil(4*0.10)) = 3, candidates=4 > cap → breach.
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = _make_absent_doc(n_systems=4)
+    system_keys = list(doc.keys())
+    result = ground_design_doc_systems(doc, repo_root)
+
+    # No entry should be downgraded when cap is breached.
+    for key in system_keys:
+        assert result[key]["status"] == "mature", f"{key} was incorrectly downgraded"
+        assert "presence_warning" not in result[key]
+
+    abort_info = result["_meta"].get("grounding_diagnostic")
+    assert abort_info is not None
+    assert abort_info["candidate_count"] == 4
+    assert abort_info["kind"] == "cap_breach"
+
+
+def test_below_limit_singleton_downgrade_succeeds(tmp_path):
+    """A single absent entry well below any limit is still downgraded normally."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    assert result["systems/auth"]["status"] == "missing"
+    assert "presence_warning" in result["systems/auth"]
+    assert result["_meta"]["updated_by"] == "design-doc-grounding"
+    assert "grounding_diagnostic" not in result["_meta"]
+
+
+def test_limit_at_exact_threshold_does_not_abort(tmp_path):
+    """Exactly at the cap (== cap) is still allowed; abort fires at > cap."""
+    # 3 systems all absent — cap = max(3, ceil(3*0.10)) = 3, candidates=3 == cap → no abort.
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = _make_absent_doc(n_systems=3)
+    system_keys = list(doc.keys())
+
+    result = ground_design_doc_systems(doc, repo_root)
+
+    # All 3 must be downgraded (== cap, not exceeded).
+    for key in system_keys:
+        assert result[key]["status"] == "missing", f"{key} was not downgraded"
+    assert result["_meta"]["updated_by"] == "design-doc-grounding"
+    assert "grounding_diagnostic" not in result["_meta"]
+
+
+def test_mass_downgrade_branch_aware_aborts(monkeypatch):
+    """Branch-aware variant aborts when all entries in a large doc would be downgraded."""
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        AsyncMock(return_value=False),
+    )
+    doc = _make_absent_doc(n_systems=11)
+    original_statuses = {k: v["status"] for k, v in doc.items()}
+    original_rev = (doc.get("_meta") or {}).get("revision", 0)
+
+    result = asyncio.run(
+        ground_design_doc_systems_branch_aware(
+            doc,
+            repo_root="",
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+
+    for key, orig_status in original_statuses.items():
+        assert result[key]["status"] == orig_status, f"{key} was incorrectly downgraded"
+        assert "presence_warning" not in result[key]
+
+    assert result["_meta"].get("revision", 0) == original_rev
+    abort_info = result["_meta"].get("grounding_diagnostic")
+    assert abort_info is not None
+    assert abort_info["candidate_count"] == 11

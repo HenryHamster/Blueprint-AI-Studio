@@ -2,16 +2,17 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
+from datetime import timedelta
 
 from app.main import app
-from app.models import Project
+from app.models import Project, TaskStatus
 from app.shared_state import (
     get_project_broadcast_limit,
     get_project_integration_branch,
     get_project_promotion_target,
     runtime_config,
 )
-from testing.factories import make_membership
+from testing.factories import make_membership, make_task, _utcnow
 
 
 @pytest.fixture
@@ -26,6 +27,31 @@ async def project_owner(db_session):
     await db_session.commit()
     await db_session.refresh(project)
     member = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.fixture
+async def project_viewer(db_session):
+    """Create a project with test-user-123 as a viewer."""
+    project = Project(
+        name="Viewer Resource Envelope Project",
+        user_id="some-other-user",
+        is_self_repo=True,
+        build_config={
+            "resource_envelope": {
+                "max_concurrent_vms": 4,
+                "spend_ceiling_usd": 50.0,
+                "spend_window_days": 14,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = make_membership(project.id, user_id="test-user-123", role="member")
     db_session.add(member)
     await db_session.commit()
     await db_session.refresh(project)
@@ -1340,3 +1366,102 @@ async def test_patch_staging_branch_prefixes_trims_whitespace(
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["staging_branch_prefixes"] == ["feature/", "exp/"]
+
+
+# ---------------------------------------------------------------------------
+# Resource-envelope config tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_resource_envelope_returns_limits_and_usage(
+    client: AsyncClient, db_session, project_viewer
+):
+    """GET returns the stored envelope plus live active-VM count and spend."""
+    project = project_viewer
+    now = _utcnow()
+    active_one = make_task(
+        project_id=project.id,
+        status=TaskStatus.PROVISIONING,
+        updated_at=now - timedelta(minutes=15),
+    )
+    active_two = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        updated_at=now - timedelta(minutes=5),
+    )
+    completed = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_runtime_cost_banked_db=7.25,
+        updated_at=now - timedelta(days=1),
+    )
+    db_session.add_all([active_one, active_two, completed])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/resource-envelope")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["project_id"] == str(project.id)
+    assert data["max_concurrent_vms"] == 4
+    assert data["spend_ceiling_usd"] == 50.0
+    assert data["spend_window_days"] == 14
+    assert data["active_vm_count"] == 2
+    assert data["recent_spend_usd"] == pytest.approx(7.25, abs=1e-6)
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_resource_envelope_persists_into_build_config(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH stores the envelope under build_config['resource_envelope'] and returns live usage."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={
+            "max_concurrent_vms": None,
+            "spend_ceiling_usd": 25.0,
+            "spend_window_days": 21,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["max_concurrent_vms"] is None
+    assert data["spend_ceiling_usd"] == 25.0
+    assert data["spend_window_days"] == 21
+
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("resource_envelope") == {
+        "spend_ceiling_usd": 25.0,
+        "spend_window_days": 21,
+    }
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_resource_envelope_requires_owner_role(
+    client: AsyncClient, project_member
+):
+    """A non-owner cannot PATCH the resource envelope."""
+    project = project_member
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={"max_concurrent_vms": 2},
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_resource_envelope_rejects_invalid_values(
+    client: AsyncClient, project_owner
+):
+    """PATCH rejects invalid envelope values using the nested schema validation."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={"max_concurrent_vms": 0},
+    )
+    assert resp.status_code == 422, resp.text

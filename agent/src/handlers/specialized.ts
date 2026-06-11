@@ -39,6 +39,22 @@ function provisionFetchHelper(taskId: string, task: Record<string, unknown>): st
   return buildFetchGuidance(PLAN_FETCH_VERBS);
 }
 
+export function isRepoBootstrapOverview(value: unknown): value is {
+  tech_stack: string;
+  directory_layout: string;
+  first_steps_summary: string;
+  entry_points?: string;
+  test_layout?: string;
+  key_conventions?: string;
+  environment_requirements?: string;
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.tech_stack === 'string'
+    && typeof record.directory_layout === 'string'
+    && typeof record.first_steps_summary === 'string';
+}
+
 // ── Migration layout resolution ──────────────────────────────────────────────
 // Blueprint's database layout (`backend/alembic/versions/`, `app/models/`,
 // `app/main.py:EXPECTED_SCHEMA_REVISION`) is the DEFAULT. A second repo can
@@ -736,6 +752,96 @@ export async function handleInvestigate(
   const investigateCtx = task.context as Record<string, unknown> | undefined;
   const investigateCitationProvenance = formatInvestigateCitationProvenance(investigateCtx);
 
+  // ── Adversarial spawn-gate grader branch ──
+  // spawn_forward_quality_grader(adversarial_mode=True) spawns a task of
+  // type "investigate" whose payload prompt (build_adversarial_finding_prompt)
+  // already specifies its own output contract: a JSON array of
+  // [{hash, verdict, reason}] objects. Wrapping that prompt in the standard
+  // investigation template below would instruct Claude to instead write a
+  // single {summary, root_cause, ...} object with NO `hash` field, so the
+  // backend parser (parse_adversarial_finding_verdicts, anchored on the
+  // ['hash','verdict'] keywords) finds no array and every finding fails closed
+  // with "no verdict returned". When this is an adversarial grader, run the raw
+  // payload prompt and let its [{hash, verdict, reason}] output flow straight
+  // through to `logs` unmodified — _resolve_quality_grader_completion reads
+  // payload.logs directly.
+  if (investigateCtx?.adversarial_grader === true) {
+    statusRef.value = 'Running adversarial finding challenge...';
+    const challengeFingerprint = computePromptFingerprint('investigate');
+    setCurrentPromptFingerprint(challengeFingerprint);
+    sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: challengeFingerprint });
+    const { exitCode, allOutput, lastResultText } = await runClaudeCode(
+      `${userPrompt}\n\n${investigateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
+      ws, statusRef, model, effort, disallowedTools
+    );
+    // Locally validate the output is a parseable [{hash, verdict, reason}] array.
+    // On a format miss with exitCode===0, perform one bounded focused re-ask
+    // (matching the sibling handlers' self-repair path). The challenged hashes are
+    // included so the model can re-emit a complete array. On repair success, post
+    // the repaired array. On failure, pass the raw output through unchanged so the
+    // backend parser fail-closes findings (preserving current fail-closed behavior).
+    const challengedHashes = Array.isArray(investigateCtx._adversarial_challenged_hashes)
+      ? (investigateCtx._adversarial_challenged_hashes as string[])
+      : [];
+    const hashListStr = challengedHashes.length > 0
+      ? ` The following finding hashes must each appear in the array: ${challengedHashes.map(h => JSON.stringify(h)).join(', ')}.`
+      : '';
+    const RECOGNIZED_VERDICTS = new Set([
+      'pass', 'passed', 'approve', 'approved',
+      'fail', 'failed', 'reject', 'rejected',
+    ]);
+    const repaired = await repairStructuredOutput<Array<Record<string, unknown>>>({
+      mode: 'array',
+      requiredKeys: ['hash', 'verdict'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `Your prior adversarial challenge response did not end with a parseable JSON verdict array.
+Return ONLY the JSON array. Each element must have "hash", "verdict", and "reason" fields.
+The "verdict" value MUST be exactly "pass" or "fail" — no other values are accepted.${hashListStr} No markdown, prose, or code fences.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Repairing adversarial challenge verdict array...',
+      schemaLabel: 'research_spawn_adversarial_challenge',
+      validateParsedValue: (value) => {
+        const arr = value as Array<Record<string, unknown>>;
+        const unrecognized = arr
+          .map(item => {
+            const raw = item['verdict'];
+            return (typeof raw === 'string' ? raw : '').trim().toLowerCase();
+          })
+          .filter(v => !RECOGNIZED_VERDICTS.has(v));
+        if (unrecognized.length > 0) {
+          return {
+            ok: false,
+            reason: 'parsed_array_missing_key',
+            detail: `unrecognized verdict strings: ${unrecognized.join(', ')}`,
+          };
+        }
+        return { ok: true };
+      },
+    });
+    let challengeLogs: string;
+    if (repaired.value !== null && repaired.retry !== null) {
+      // A focused re-ask succeeded with recognized verdicts — post the repaired array.
+      challengeLogs = sanitize(JSON.stringify(repaired.value));
+    } else {
+      // First attempt was already parseable (retry===null), repair failed, or
+      // exitCode!==0 — pass raw output through unchanged.
+      challengeLogs = sanitize(lastResultText || (allOutput || '').slice(-50_000));
+    }
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+      ...(exitCode !== 0
+        ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' }
+        : { artifact_type: 'INVESTIGATION_REPORT' }),
+      logs: challengeLogs,
+    });
+    return;
+  }
+
   const investigatePrompt = `${investigateContextSection}${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 Use the Recent changes section first to correlate the issue with the latest deploy window and recently merged changes.
 
@@ -848,6 +954,113 @@ Return ONLY the JSON object for /tmp/investigation_report_${taskId}.json with to
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'INVESTIGATION_REPORT' }),
+    logs,
+  });
+}
+
+/**
+ * First-cycle repo bootstrap: reads project structure, confirms build/test commands,
+ * and seeds design doc sections before implementation tasks fan out.
+ *
+ * This is a read-only analysis task. The backend injects bootstrap_guidance into the
+ * claim response with structured instructions for what to read and write back.
+ * On COMPLETED, the backend completion handler stamps bootstrap_completed_at on
+ * build_config so the strategic spawn gate allows implementation tasks to proceed.
+ */
+export async function handleRepoBootstrap(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  const rawBaseBranch = resolveBaseBranch(payload, task);
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
+
+  statusRef.value = `Cloning ${owner}/${repo} for bootstrap...`;
+  sendLog(ws, `Starting repo bootstrap for ${owner}/${repo}...\n`);
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+  });
+  writePlaybookHelper(taskId);
+  const fetchGuidance = provisionFetchHelper(taskId, task);
+  const disallowedTools = configureAgentPermissions('investigate');
+  const retryContext = buildRetryContext(task);
+  const contextPrefix = buildContextPrefix(task);
+  const contextSection = contextPrefix ? `${contextPrefix}\n` : '';
+
+  // Extract bootstrap_guidance injected by the backend claim handler.
+  const bootstrapGuidance = task.bootstrap_guidance as Record<string, unknown> | undefined;
+  const filesToRead = Array.isArray(bootstrapGuidance?.files_to_read)
+    ? (bootstrapGuidance.files_to_read as string[]).join('\n- ')
+    : 'README.md, package.json, Makefile, Dockerfile, .github/workflows/*.yml';
+  const writebackEndpoint = typeof bootstrapGuidance?.build_config_writeback_endpoint === 'string'
+    ? bootstrapGuidance.build_config_writeback_endpoint
+    : 'PATCH /api/agent/projects/{project_id}/build-config/commands';
+  const completionPayloadField = typeof bootstrapGuidance?.completion_payload_field === 'string'
+    ? bootstrapGuidance.completion_payload_field
+    : 'repo_overview';
+
+  const claudeMdContent = readClaudeMd();
+  const claudeMdSection = claudeMdContent ? `\n\n## Project Instructions (CLAUDE.md)\n${claudeMdContent}` : '';
+
+  const bootstrapPrompt = `${contextSection}You are performing a first-cycle repository bootstrap for ${owner}/${repo}.
+
+Your goal: read the repository structure, understand the tech stack and build system, confirm working build/test commands, and write a repo overview so the first strategic cycle starts with grounded repo knowledge.
+
+## Files to read
+Read as many of these as exist:
+- ${filesToRead}
+
+Also read any detected build/CI manifests you find.
+
+## What to produce
+1. **Repo overview**: Write the following JSON object to \`/tmp/bootstrap_overview_${taskId}.json\` (NOT inside the repository):
+   \`\`\`json
+   {
+     "tech_stack": "programming language(s), key frameworks, dependency manager",
+     "directory_layout": "brief description of top-level dirs and their purpose",
+     "first_steps_summary": "how to clone, install deps, run build, run tests",
+     "entry_points": "if discoverable: main executable(s) or server entry files",
+     "test_layout": "if discoverable: test directory structure and how to run subsets",
+     "key_conventions": "if discoverable: branch naming, commit style, PR conventions",
+     "environment_requirements": "if discoverable: required env vars, runtime versions, .env.example notes"
+   }
+   \`\`\`
+   The file must contain ONLY the JSON object, no markdown wrapping.
+   Also include the same object in your terminal COMPLETED status payload as \`${completionPayloadField}\`.
+
+2. **Confirm build/test/lint commands**: Attempt to run the detected build and test commands. If they succeed, include them in the write-back. Also attempt to run the detected lint command for each directory (if one is present in the build config) — lint verification is best-effort: a lint command that fails or is absent should NOT block bootstrap from completing. If the lint command succeeds, include \`confirmed_lint_cmd\` in the per-directory write-back payload. Write back using:
+   \`${writebackEndpoint}\`
+   with the confirmed commands per directory.
+
+3. **Status**: After completing both steps, post COMPLETED status with \`${completionPayloadField}\` populated. If you cannot read the repo or run commands, still complete with whatever you found.
+
+${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
+
+  const promptFingerprint = computePromptFingerprint('repo_bootstrap');
+  setCurrentPromptFingerprint(promptFingerprint);
+  sendHeartbeatSync(taskId, 'Running repo bootstrap...', { prompt_fingerprint: promptFingerprint });
+
+  const { exitCode, allOutput } = await runClaudeCode(
+    bootstrapPrompt + PLAYBOOK_GUIDANCE + '\nNote: Save reusable setup/environment knowledge to the playbook — environment setup steps, build quirks, version requirements, install workarounds, required env vars, and test-setup knowledge a future agent would otherwise rediscover.\n',
+    ws, statusRef, model, effort, disallowedTools
+  );
+
+  const rateLimitDetected = matchesRateLimit(allOutput || '');
+  const parsedBootstrapOverview = exitCode === 0 ? readHandlerOutput(taskId, 'bootstrap_overview', ws) : null;
+  const bootstrapOverview = isRepoBootstrapOverview(parsedBootstrapOverview) ? parsedBootstrapOverview : null;
+  const logs = bootstrapOverview !== null
+    ? sanitize(JSON.stringify(bootstrapOverview))
+    : sanitize(allOutput ? allOutput.slice(-500) : 'Bootstrap complete');
+
+  await persistAndPostStatus(taskId, {
+    task_id: taskId,
+    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+    ...(exitCode !== 0
+      ? { artifact_type: 'ERROR_LOG', failure_category: rateLimitDetected ? 'rate_limited' : 'claude_code_failed' }
+      : {}),
+    ...(bootstrapOverview !== null ? { repo_overview: bootstrapOverview } : {}),
     logs,
   });
 }

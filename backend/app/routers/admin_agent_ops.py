@@ -21,6 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
+from app.capability_proof import carry_proof_records_for_consolidation
+from app.capability_trial_verdict import (
+    carry_adoption_verdicts_for_consolidation,
+    record_trial_verdict,
+)
 from app.database import get_session
 from app.strategic_events import (
     STRATEGIC_KIND_DIRECTIONS,
@@ -2152,6 +2157,22 @@ async def strategic_operation(
             ) from None
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
+        # Carry proof records and adoption verdicts onto survivor keys when a
+        # capability consolidation occurred in this write.
+        _consolidated = pm_diff.get("capabilities_consolidated")
+        if _consolidated:
+            if not isinstance(getattr(project, "capability_proof_records", None), dict):
+                project.capability_proof_records = {}
+            project.capability_proof_records = carry_proof_records_for_consolidation(
+                _consolidated, project.capability_proof_records
+            )
+            flag_modified(project, "capability_proof_records")
+            if not isinstance(getattr(project, "capability_adoption_verdicts", None), dict):
+                project.capability_adoption_verdicts = {}
+            project.capability_adoption_verdicts = carry_adoption_verdicts_for_consolidation(
+                _consolidated, project.capability_adoption_verdicts
+            )
+            flag_modified(project, "capability_adoption_verdicts")
         session.add(project)
         # Remember the agent's pre-merge operator-owned proposal so a subsequent
         # same-cycle write reconciles against it (see baseline resolution above).
@@ -2498,6 +2519,76 @@ async def strategic_operation(
             {"status": "ok", "op": "set_evidence_progress", "count": len(cleaned_ep)}
         )
 
+    elif payload.op == "declare_capability_adoption":
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "declare_capability_adoption: data must be "
+                    '{"cap_name": str, "verdict": "adopt" | "reject" | "continue-trial", "rationale": str | None}'
+                ),
+            )
+        cap_name = data.get("cap_name")
+        verdict = data.get("verdict")
+        rationale = data.get("rationale")
+        if not isinstance(cap_name, str) or not cap_name.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="declare_capability_adoption: cap_name must be a non-empty string",
+            )
+        if not isinstance(verdict, str) or verdict not in (
+            "adopt",
+            "reject",
+            "continue-trial",
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "declare_capability_adoption: verdict must be one of "
+                    "'adopt', 'reject', or 'continue-trial'"
+                ),
+            )
+        if rationale is not None and not isinstance(rationale, str):
+            raise HTTPException(
+                status_code=400,
+                detail="declare_capability_adoption: rationale must be a string or null",
+            )
+        entry: dict[str, Any] = {
+            "verdict": verdict,
+            "evidence_source": "strategic_review",
+            "evaluated_at": _utcnow().isoformat(),
+        }
+        rationale_text = rationale.strip() if isinstance(rationale, str) else ""
+        if rationale_text:
+            entry["rationale"] = rationale_text
+        record_trial_verdict(project, cap_name.strip(), entry)
+        await session.flush()
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            "_strategic_adoption_declared": ctx.get("_strategic_adoption_declared", 0)
+            + 1,
+            "_strategic_api_called": True,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] Declared capability adoption for %s=%s (%s) on project %s",
+            cap_name.strip(),
+            verdict,
+            entry["evidence_source"],
+            project.id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "declare_capability_adoption",
+                "cap_name": cap_name.strip(),
+                "verdict": verdict,
+            }
+        )
+
     elif payload.op == "cite_memos":
         # Store the memo task_ids the thinker cited in its analysis.
         # The completion handler reads this to count memos_cited reliably —
@@ -2603,3 +2694,51 @@ async def strategic_operation(
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
+
+
+# ---------------------------------------------------------------------------
+# Admin read endpoint: build-config confirmed commands
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/admin/projects/{project_id}/build-config/commands")
+async def admin_get_build_config_commands(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Return all directory entries with confirmed vs detected commands and staleness.
+
+    Allows operators to audit what commands have been agent-confirmed without
+    navigating the full build_config JSON.
+    """
+    from app.claim_task_helpers import is_commands_stale
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cfg = project.build_config or {}
+    directories = cfg.get("directories") or []
+    result = []
+    for entry in directories:
+        if not isinstance(entry, dict):
+            continue
+        confirmed_at = entry.get("commands_confirmed_at")
+        result.append(
+            {
+                "path": entry.get("path"),
+                "type": entry.get("type"),
+                "detected_test_cmd": entry.get("test_cmd"),
+                "detected_build_cmd": entry.get("build_cmd"),
+                "detected_install_cmd": entry.get("install_cmd"),
+                "detected_lint_cmd": entry.get("lint_cmd"),
+                "confirmed_test_cmd": entry.get("confirmed_test_cmd"),
+                "confirmed_build_cmd": entry.get("confirmed_build_cmd"),
+                "confirmed_install_cmd": entry.get("confirmed_install_cmd"),
+                "confirmed_lint_cmd": entry.get("confirmed_lint_cmd"),
+                "commands_confirmed_at": confirmed_at,
+                "confirming_task_id": entry.get("confirming_task_id"),
+                "commands_stale": is_commands_stale(confirmed_at),
+            }
+        )
+    return {"project_id": str(project_id), "directories": result}

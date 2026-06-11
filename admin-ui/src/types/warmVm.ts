@@ -171,6 +171,7 @@ export interface PoolMetrics {
     idle_cost_usd: number;
     min_hit_rate: number;
     min_idle_cost_usd: number;
+    window_hours?: number;
   } | null;
 }
 

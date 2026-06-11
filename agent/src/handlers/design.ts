@@ -12,7 +12,7 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   configureAgentPermissions, computePromptFingerprint, buildFileTree,
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
-  writePlaybookHelper, writeDesignDocHelper, formatPlaybook, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
 import {
   writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS,
@@ -134,6 +134,7 @@ export async function handleDesign(
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
   });
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   // The design prompt advertises `./design-doc get <key>` for architectural
   // grounding; provision the read-only helper so that contract is honest.
   writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });

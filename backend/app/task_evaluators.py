@@ -9,6 +9,7 @@ the agent's say-so.
 
 This module provides the FOUNDATION of a per-type forward gate. A small closed
 set of strategies (``none``, ``forward-quality``, ``metric``,
+``artifact-delivery``,
 ``structured-verdict``, plus the ``code-ci-review`` sentinel) each implement a
 cheap synchronous ``evaluate`` check, and ``resolve_evaluation_strategy`` picks
 the right one by reading the ``evaluation`` field DECLARED on each
@@ -68,6 +69,21 @@ QUALITY_GRADER_VERDICT_KEY = "quality_grader"
 # Absent hash → fail-closed (passed=False, explicit=False): only an explicit pass
 # from the challenger allows spawning; missing/malformed/non-completed → unspawned.
 ADVERSARIAL_GATE_VERDICT_KEY = "adversarial_gate"
+ADVERSARIAL_PARSE_OK = "ok"
+ADVERSARIAL_PARSE_CHALLENGER_FAILED = "challenger_failed"
+ADVERSARIAL_PARSE_EMPTY_LOGS = "empty_logs"
+ADVERSARIAL_PARSE_NO_JSON_ARRAY = "no_json_array"
+ADVERSARIAL_PARSE_INVALID_JSON = "invalid_json"
+ADVERSARIAL_PARSE_NO_HASH_MATCHES = "no_hash_matches"
+ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES = frozenset(
+    {
+        ADVERSARIAL_PARSE_CHALLENGER_FAILED,
+        ADVERSARIAL_PARSE_EMPTY_LOGS,
+        ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+        ADVERSARIAL_PARSE_INVALID_JSON,
+        ADVERSARIAL_PARSE_NO_HASH_MATCHES,
+    }
+)
 
 # Context key written on a spawned safeguard-challenge task, pointing at the
 # safeguard audit task whose merge-gate decision it challenges.
@@ -80,6 +96,13 @@ SAFEGUARD_CHALLENGE_SOURCE_KEY = "safeguard_challenge_for_task_id"
 # and ``reasoning``.  ``_maybe_release_safeguard_gate`` reads it on re-entry to
 # decide whether the merge gate is released or held.
 SAFEGUARD_CHALLENGE_VERDICT_KEY = "safeguard_challenge_verdict"
+
+# Context key written on the SAFEGUARD task when it operates in observe/shadow
+# mode. The value mirrors SAFEGUARD_CHALLENGE_VERDICT_KEY (same dict shape) but
+# the gate is NEVER released based on this key — it is a bounded, auditable
+# record of what the challenge WOULD have decided. Consumed by digest_metrics
+# to compute the false-positive-block rate without changing merge behavior.
+SAFEGUARD_OBSERVE_VERDICT_KEY = "safeguard_observe_verdict"
 
 
 # ---------------------------------------------------------------------------
@@ -445,14 +468,9 @@ class MetricStrategy:
     kills are honest terminal outcomes (they carry an ``outcome`` and a cost),
     so they PASS the gate — the experiment did its measured job.
 
-    On top of the presence check, when the experiment DECLARED a
-    ``success_criterion`` (a numeric metric/operator/threshold goal) the gate
-    ENFORCES it against the reported result: a criterion whose metric is present
-    as a numeric value in the COMPUTE_RESULT (a reserved cost/operational field
-    OR a command-reported experiment metric the agent flattens to a top-level
-    key) must actually be met to PASS; a declared metric that is absent or
-    non-numeric in the result FAILS CLOSED, never silently passing as
-    "unmeasurable".
+    Compute experiments now declare the separate ``artifact-delivery`` strategy.
+    This legacy type-aware branch remains presence-based for defensive callers
+    that instantiate MetricStrategy directly.
     """
 
     key = "metric"
@@ -518,29 +536,67 @@ class MetricStrategy:
             )
         outcome, cost = result
 
-        # Goal-level acceptance probe: when the experiment declared WHAT success
-        # means, ENFORCE it against the reported result. A declared metric that
-        # the result reports numerically (a reserved cost field OR a flattened
-        # command-reported experiment metric) must actually be met to pass; a
-        # metric absent / non-numeric in the result fails CLOSED (the goal was
-        # declared but the experiment reported nothing to check it against).
-        # ``met`` is False in BOTH cases, and ``_format_unmet_criterion``
-        # distinguishes them in the operator-readable reason. No declared
-        # criterion preserves the presence-based pass above.
         criterion = evaluate_compute_success_criterion(task, artifact_text)
-        if criterion is not None and not criterion["met"]:
-            return EvaluationVerdict(False, _format_unmet_criterion(criterion), self.key)
-
         reason = (
             f"compute experiment reached terminal outcome {outcome!r} "
             f"at measured cost ${cost}"
         )
         if criterion is not None:
+            status = "met" if criterion["met"] else "recorded as evidence"
             reason += (
-                f"; declared success criterion met "
+                f"; declared success criterion {status} "
                 f"({criterion['metric']} {criterion['operator']} "
                 f"{criterion['threshold']})"
             )
+        return EvaluationVerdict(True, reason, self.key)
+
+
+class ArtifactDeliveryStrategy:
+    """Check that a task delivered its durable artifact/resource.
+
+    For compute_experiment this is intentionally non-gating with respect to the
+    declared success criterion: a terminal, costed COMPUTE_RESULT is the durable
+    product even when the measured criterion is unmet or absent.
+    """
+
+    key = "artifact-delivery"
+
+    def evaluate(self, task: Task, artifact_text: str | None) -> EvaluationVerdict:
+        task_type = _task_type_of(task)
+        if task_type != "compute_experiment":
+            return EvaluationVerdict(
+                True,
+                "artifact delivery gate has no special contract for this task type",
+                self.key,
+            )
+        result = _extract_compute_measurement(artifact_text)
+        if result is None:
+            return EvaluationVerdict(
+                False,
+                "compute experiment delivered no durable terminal result "
+                "(missing terminal outcome or measured final/accrued cost)",
+                self.key,
+            )
+        outcome, cost = result
+        reason = (
+            f"compute experiment delivered terminal result {outcome!r} "
+            f"at measured cost ${cost}"
+        )
+        criterion = evaluate_compute_success_criterion(task, artifact_text)
+        if criterion is not None:
+            if criterion["met"]:
+                reason += (
+                    f"; success criterion met ({criterion['metric']} "
+                    f"{criterion['operator']} {criterion['threshold']})"
+                )
+            elif criterion["measurable"]:
+                reason += f"; success criterion unmet ({_format_unmet_criterion(criterion)})"
+            else:
+                reason += (
+                    "; success criterion not reported "
+                    f"({criterion['metric']} {criterion['operator']} "
+                    f"{criterion['threshold']})"
+                )
         return EvaluationVerdict(True, reason, self.key)
 
 
@@ -577,6 +633,7 @@ _STRATEGIES_SRC: tuple[EvaluationStrategy, ...] = (
     CodeCiReviewStrategy(),
     ForwardQualityStrategy(),
     MetricStrategy(),
+    ArtifactDeliveryStrategy(),
     StructuredVerdictStrategy(),
 )
 _STRATEGIES: dict[str, EvaluationStrategy] = {s.key: s for s in _STRATEGIES_SRC}
@@ -969,47 +1026,89 @@ def parse_adversarial_finding_verdicts(
     logs: str | None,
     finding_hashes: list[str],
     completed: bool = True,
-) -> dict[str, dict]:
+) -> tuple[dict[str, dict], str]:
     """Parse per-finding pass/fail verdicts from adversarial grader output.
 
-    Returns a dict mapping finding_hash → {passed: bool, reason: str, explicit: bool}.
-    FAIL-CLOSED: any finding whose hash is absent from the output defaults to
-    passed=False with explicit=False so a crashed or truncated adversarial grader
-    leaves findings unspawned and auditable as unresolved. ``explicit=False``
-    distinguishes an unresolved finding from a clean challenger pass (``explicit=True``).
-    Only an explicit ``verdict: pass`` from the challenger produces passed=True.
-    """
-    _unresolved: dict = {
-        "passed": False,
-        "reason": "fail-closed: no verdict returned for this finding",
-        "explicit": False,
-    }
-    result: dict[str, dict] = {h: dict(_unresolved) for h in finding_hashes}
-    if not completed or not logs:
-        return result
-    from app.task_completion import _extract_json_array
+    Returns ``(verdicts, parse_outcome)`` where ``verdicts`` maps
+    finding_hash → {passed, reason, explicit, unresolved_reason?} and
+    ``parse_outcome`` is a compact machine-readable classification of the
+    parse pipeline's highest-level failure:
 
-    text = (logs or "").strip()
-    json_str = _extract_json_array(text, "hash", "verdict")
-    if json_str:
-        try:
-            parsed = json.loads(json_str)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if not isinstance(item, dict):
-                        continue
-                    h = str(item.get("hash") or "").strip()
-                    if h not in result:
-                        continue
-                    v = str(item.get("verdict") or "").strip().lower()
-                    reason = str(item.get("reason") or "")[:480]
-                    if v in ("pass", "passed", "approve", "approved"):
-                        result[h] = {"passed": True, "reason": reason, "explicit": True}
-                    elif v in ("fail", "failed", "reject", "rejected"):
-                        result[h] = {"passed": False, "reason": reason, "explicit": True}
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return result
+    * ``"ok"``                - at least one finding received an explicit verdict
+    * ``"challenger_failed"`` - the challenger task itself failed (completed=False)
+    * ``"empty_logs"``        - the challenger posted no output
+    * ``"no_json_array"``     - logs contain no JSON array with the expected anchor keys
+    * ``"invalid_json"``      - a JSON array was found but could not be parsed
+    * ``"no_hash_matches"``   - array parsed but no known finding hash matched
+
+    FAIL-CLOSED: any finding with no explicit verdict defaults to
+    passed=False/explicit=False. ``unresolved_reason`` on those entries carries
+    the per-finding classification so operators can distinguish the failure mode
+    without reading raw logs.
+    """
+
+    def _default_entry(unresolved_reason: str) -> dict:
+        return {
+            "passed": False,
+            "reason": "fail-closed: no verdict returned for this finding",
+            "explicit": False,
+            "unresolved_reason": unresolved_reason,
+        }
+
+    if not completed:
+        return {
+            h: _default_entry(ADVERSARIAL_PARSE_CHALLENGER_FAILED)
+            for h in finding_hashes
+        }, ADVERSARIAL_PARSE_CHALLENGER_FAILED
+    if not logs or not logs.strip():
+        return {
+            h: _default_entry(ADVERSARIAL_PARSE_EMPTY_LOGS) for h in finding_hashes
+        }, ADVERSARIAL_PARSE_EMPTY_LOGS
+
+    from app.task_completion import _extract_last_json_array
+
+    text = logs.strip()
+    json_str = _extract_last_json_array(text, "hash", "verdict")
+    if not json_str:
+        return {
+            h: _default_entry(ADVERSARIAL_PARSE_NO_JSON_ARRAY)
+            for h in finding_hashes
+        }, ADVERSARIAL_PARSE_NO_JSON_ARRAY
+
+    try:
+        parsed = json.loads(json_str)
+        if not isinstance(parsed, list):
+            raise ValueError("not a list")
+    except (json.JSONDecodeError, ValueError):
+        return {
+            h: _default_entry(ADVERSARIAL_PARSE_INVALID_JSON) for h in finding_hashes
+        }, ADVERSARIAL_PARSE_INVALID_JSON
+
+    result: dict[str, dict] = {
+        h: _default_entry(ADVERSARIAL_PARSE_NO_HASH_MATCHES) for h in finding_hashes
+    }
+    matched_any = False
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        h = str(item.get("hash") or "").strip()
+        if h not in result:
+            continue
+        v = str(item.get("verdict") or "").strip().lower()
+        reason = str(item.get("reason") or "")[:480]
+        if v in ("pass", "passed", "approve", "approved"):
+            result[h] = {"passed": True, "reason": reason, "explicit": True}
+            matched_any = True
+        elif v in ("fail", "failed", "reject", "rejected"):
+            result[h] = {"passed": False, "reason": reason, "explicit": True}
+            matched_any = True
+        else:
+            result[h]["unresolved_reason"] = "verdict_unrecognized"
+            matched_any = True
+
+    if not matched_any:
+        return result, ADVERSARIAL_PARSE_NO_HASH_MATCHES
+    return result, ADVERSARIAL_PARSE_OK
 
 
 def build_forward_quality_grader_prompt(

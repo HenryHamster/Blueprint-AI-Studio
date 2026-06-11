@@ -236,6 +236,49 @@ export function formatProjectVision(vision: Record<string, unknown> | undefined)
 // below already surfaces task.strategic_intent (purpose, current focus, context,
 // constraints), so calling this here too would double-render the same payload.
 // Returns '' when the payload is absent or empty so no bare header is emitted.
+// Render the repo_overview block shipped by the backend at claim time.
+// Shows the required overview fields, optional bootstrap-enriched fields, and
+// freshness/provenance signals when available. Presence-gated: returns '' when
+// any required field is absent so the prompt is byte-identical for projects that
+// never ran bootstrap.
+export function formatRepoOverview(overview: unknown): string {
+  if (!overview || typeof overview !== 'object') return '';
+  const o = overview as Record<string, unknown>;
+  const techStack = typeof o.tech_stack === 'string' ? o.tech_stack.trim() : '';
+  const dirLayout = typeof o.directory_layout === 'string' ? o.directory_layout.trim() : '';
+  const firstSteps = typeof o.first_steps_summary === 'string' ? o.first_steps_summary.trim() : '';
+  if (!techStack || !dirLayout || !firstSteps) return '';
+  const lines: string[] = ['## Repo Overview'];
+  lines.push(`**Tech stack:** ${techStack}`);
+  lines.push(`**Directory layout:** ${dirLayout}`);
+  lines.push(`**First steps:** ${firstSteps}`);
+  const entryPoints = typeof o.entry_points === 'string' ? o.entry_points.trim() : '';
+  if (entryPoints) lines.push(`**Entry points:** ${entryPoints}`);
+  const testLayout = typeof o.test_layout === 'string' ? o.test_layout.trim() : '';
+  if (testLayout) lines.push(`**Test layout:** ${testLayout}`);
+  const keyConventions = typeof o.key_conventions === 'string' ? o.key_conventions.trim() : '';
+  if (keyConventions) lines.push(`**Key conventions:** ${keyConventions}`);
+  const environmentRequirements = typeof o.environment_requirements === 'string' ? o.environment_requirements.trim() : '';
+  if (environmentRequirements) lines.push(`**Environment:** ${environmentRequirements}`);
+  const completedAt = typeof o.bootstrap_completed_at === 'string' ? o.bootstrap_completed_at.trim() : '';
+  if (completedAt) lines.push(`**Bootstrapped:** ${completedAt}`);
+  const provenance = o.provenance && typeof o.provenance === 'object'
+    ? o.provenance as Record<string, unknown>
+    : undefined;
+  const refreshedAt = strVal(provenance?.refreshed_at);
+  const sourceBranch = strVal(provenance?.source_branch);
+  const sourceRevision = strVal(provenance?.source_revision);
+  if (refreshedAt || sourceBranch || sourceRevision) {
+    const parts: string[] = [];
+    if (refreshedAt) parts.push(`refreshed ${refreshedAt}`);
+    if (sourceBranch) parts.push(`branch ${sourceBranch}`);
+    if (sourceRevision) parts.push(`revision ${sourceRevision}`);
+    lines.push(`**Provenance:** ${parts.join('; ')}`);
+  }
+  lines.push('');
+  return lines.join('\n') + '\n';
+}
+
 export function formatStrategicIntent(intent: Record<string, unknown> | undefined): string {
   if (!intent || typeof intent !== 'object') return '';
   const lines: string[] = ['## Operator Steering'];
@@ -305,6 +348,10 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     }
   }
 
+  // Repo Overview — tech stack, directory layout, and first steps discovered
+  // during repo_bootstrap. Presence-gated: no-op when absent.
+  prefix += formatRepoOverview(task.repo_overview);
+
   // Existing knowledge documents — a compact, body-omitted index of
   // web_research / design output so the strategist / research agent knows what
   // knowledge already exists (and can fetch full bodies on demand) instead of
@@ -330,7 +377,22 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const sourceKind = strVal(entry.source_kind);
       if (sourceKind) meta.push(sourceKind);
       const metaSuffix = meta.length > 0 ? ` (${meta.join(', ')})` : '';
-      kdLines.push(`- [${id}] ${title}${metaSuffix}`);
+      let gradeBadge = '';
+      if (sourceKind === 'compute_experiment') {
+        const grade = strVal(entry.compute_acceptance_grade);
+        const unavailableCause = strVal(entry.unavailable_cause);
+        const acceptanceReason = strVal(entry.compute_acceptance_reason);
+        if (grade === 'acceptance') {
+          gradeBadge = ' [acceptance]';
+        } else if (unavailableCause) {
+          gradeBadge = ` [analysis_unavailable: ${unavailableCause}]`;
+        } else if (acceptanceReason) {
+          gradeBadge = ` [measured_only: ${acceptanceReason}]`;
+        } else {
+          gradeBadge = ' [measured_only]';
+        }
+      }
+      kdLines.push(`- [${id}] ${title}${metaSuffix}${gradeBadge}`);
       const summary = strVal(entry.summary);
       if (summary) kdLines.push(`  ${summary}`);
     }

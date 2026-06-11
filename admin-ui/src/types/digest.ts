@@ -141,6 +141,15 @@ export interface DirectionFindingChallengeSummary {
   fail_closed_unparseable?: number;
 }
 
+export interface CapabilityTrialVerdict {
+  verdict: 'adopt' | 'reject' | 'continue-trial';
+  lift: number | null;
+  n_with: number;
+  n_without: number;
+  evaluated_at?: string;
+  window_hours?: number | null;
+}
+
 type ScopeConversionRates = Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }>;
 
 /**
@@ -369,6 +378,7 @@ export interface DigestData<DP = unknown> {
   direction_portfolio?: DirectionPortfolio;
   recent_completions?: RecentCompletion[];
   failure_groups?: FailureGroup[];
+  capability_adoption_verdicts?: Record<string, CapabilityTrialVerdict> | null;
 
   // ----- catch-up window metadata -----
   // Counts are required (number) — the backend always emits them and CatchUp

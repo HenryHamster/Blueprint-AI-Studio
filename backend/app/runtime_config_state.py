@@ -126,17 +126,26 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
-    # Independent challenge of a safeguard merge-gate blocker: when True, a
-    # safeguard audit's critical/high finding is independently challenged before
-    # the merge gate is held, and a challenger verdict of "rejected" or
-    # "downgraded" automatically releases the gate with an auditable record.
-    # Ships DARK (default OFF) — OFF preserves today's behavior of blocking on
-    # any raw critical/high finding. Fail-closed: if the challenge errors or
-    # times out the gate stays closed.
-    "safeguard_challenge_enabled": os.getenv(
-        "SAFEGUARD_CHALLENGE_ENABLED", "false"
+    # Graduated rollout mode for the safeguard merge-gate challenge.
+    # Mirrors strategic_retirement_challenge_gate_mode.
+    #   "off"     — no challenge; gate held unconditionally on any
+    #               critical/high finding. Preserves pre-v9 behavior exactly.
+    #   "observe" — (default) shadow/observe mode: the challenge is spawned and its verdict
+    #               is recorded on the safeguard task as
+    #               ``safeguard_observe_verdict``, but the gate is NEVER released
+    #               by the verdict. Lets operators measure the false-positive rate
+    #               before flipping to enforce. Any challenge error/timeout records
+    #               ``{"outcome": "unavailable"}`` and never blocks.
+    #   "enforce" — full binding mode: a challenger verdict of "rejected" or
+    #               "downgraded" releases the gate with an auditable record.
+    #               Fail-closed: if the challenge errors or times out the gate
+    #               stays closed.
+    "safeguard_challenge_gate_mode": os.getenv(
+        "SAFEGUARD_CHALLENGE_GATE_MODE", "observe"
     ).lower()
-    in ("1", "true", "yes"),
+    if os.getenv("SAFEGUARD_CHALLENGE_GATE_MODE", "observe").lower()
+    in ("off", "observe", "enforce")
+    else "observe",
     # Per-finding second-opinion challenge for high-stakes research-finding
     # verdicts. When True, a single borderline/absent verdict (a reproduce-on-HEAD
     # 'absent' hard-drop or a low-actionability decay) is independently re-examined
@@ -300,6 +309,16 @@ runtime_config: Dict = {
     #                 fall through when the earlier provider has no capacity.
     #   "exclusive" — first listed provider only; never fall back cross-provider.
     "provider_selection_mode": "balanced",
+    # Deploy-level identity: the ``"owner/repo"`` of the GitHub repo THIS
+    # deployment was built from. Determines which project's Cloud Run serving
+    # signals (backend_revision / agent_image artifact providers) and live
+    # DeploymentState reads are observable — replaces the per-project
+    # ``is_self_repo`` gate with a deploy-level property. Seeded from the
+    # ``DEPLOY_REPO_IDENTITY`` env (stamped on the Cloud Run revision alongside
+    # ``DEPLOY_SHA``); operator-settable live via PATCH /api/admin/settings.
+    # None ⇒ no deploy identity (only the merge-level promotion_merge provider
+    # is observable, for every GitHub project).
+    "deploy_repo_identity": (os.getenv("DEPLOY_REPO_IDENTITY", "").strip() or None),
     # DEPRECATED: legacy boolean superseded by provider_selection_mode. Kept
     # readable in GET/PATCH for backwards compat — True ≡ "preferred",
     # False ≡ "exclusive". If both keys are present, mode wins.
@@ -660,6 +679,24 @@ runtime_config: Dict = {
     # ``warm_pool.resolve_project_warm_pool_target``; set via
     # /api/admin/settings and the per-project warm-pool target endpoint.
     "warm_pool_target_size_by_project": {},
+    # Per-project concurrent-VM cap ({project_id: int}). OPTIONAL — an EMPTY map
+    # (the default) means NO per-project cap, preserving today's behavior exactly.
+    # A non-zero entry for a project bounds how many CONCURRENT VMs (PROVISIONING
+    # or IN_PROGRESS tasks) that single project may occupy. Candidates from a
+    # project at-or-over its cap are DEFERRED for that dispatch cycle (skip-not-
+    # block: stay QUEUED, never failed, never blocking other projects). They
+    # dispatch normally once the project's active count drops below the cap.
+    # Values are clamped to 1..50; 0 or absent means no cap for that project.
+    # Set via /api/admin/settings. Read by resolve_project_concurrency_cap.
+    "max_concurrent_tasks_by_project": {},
+    # Per-project concurrent compute-job cap ({project_id: int}). OPTIONAL — an
+    # EMPTY map (the default) means NO per-project cap, preserving today's behavior.
+    # A non-zero entry bounds how many concurrent active ComputeJob rows a project
+    # may have simultaneously. Launch is rejected (ComputeLaunchPreconditionFailed)
+    # when the project is at or above its cap. 0 or absent means no cap.
+    # Values are clamped to 1..50. Set via /api/admin/settings.
+    # Read by resolve_project_compute_job_concurrency_cap.
+    "max_concurrent_compute_jobs_by_project": {},
     # Hard ceiling on concurrent live (PROVISIONING/IDLE/LEASED) pool members
     # fleet-wide. The maintainer never provisions past this even if every
     # project is below its target — a dedicated pool budget distinct from the
@@ -793,6 +830,14 @@ runtime_config: Dict = {
         "plan",
         "security_audit",
     ],
+    # Deterministic holdback fraction for the language-aware repo-map trial.
+    # Tasks whose stable per-task hash falls below this threshold run WITHOUT
+    # the repo map, allowing digest_metrics' without_repo_map arm to be
+    # populated by real holdback runs rather than map-build failures only.
+    # Default-on trial: keep a small holdback arm alive until the capability
+    # gets a durable verdict. Operators can still dial it to 0.0 to disable the
+    # trial or override it per deployment via runtime_config_json.
+    "repo_map_holdback_fraction": 0.1,
 }
 
 # Promotion-policy key set — the rubric controls that live in runtime_config.
@@ -1080,6 +1125,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "autonomous_periodic_tasks",
                     "health_check_urls",
                     "notification_config",
+                    "deploy_repo_identity",
                 ):
                     if key in config_json:
                         _set(key, config_json[key])
@@ -1150,6 +1196,12 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     ).strip().lower()
                     if raw_mode in ("observe", "advisory", "enforce"):
                         _set("strategic_retirement_challenge_gate_mode", raw_mode)
+                if "safeguard_challenge_gate_mode" in config_json:
+                    raw_mode = str(
+                        config_json["safeguard_challenge_gate_mode"] or ""
+                    ).strip().lower()
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("safeguard_challenge_gate_mode", raw_mode)
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",
@@ -1252,6 +1304,48 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         _set(
                             "warm_pool_target_size_by_project", normalized_targets
                         )
+                if "max_concurrent_tasks_by_project" in config_json:
+                    # Persisted per-project concurrent-VM cap. Normalize to a map of
+                    # trimmed, non-empty string project-id keys to ints clamped to
+                    # 1..50. Values of 0 or less mean "no cap" and are excluded so
+                    # resolve_project_concurrency_cap can treat a missing key as
+                    # "no cap" without distinguishing 0 from absent.
+                    raw_caps = config_json["max_concurrent_tasks_by_project"]
+                    if isinstance(raw_caps, dict):
+                        normalized_caps: dict[str, int] = {}
+                        for proj_key, proj_val in raw_caps.items():
+                            sid = str(proj_key).strip()
+                            if not sid:
+                                continue
+                            try:
+                                ival = int(proj_val)
+                            except (TypeError, ValueError):
+                                continue
+                            if ival > 0:
+                                normalized_caps[sid] = max(1, min(50, ival))
+                        _set("max_concurrent_tasks_by_project", normalized_caps)
+                if "max_concurrent_compute_jobs_by_project" in config_json:
+                    # Persisted per-project concurrent compute-job cap. Same
+                    # normalization as max_concurrent_tasks_by_project: keys are
+                    # trimmed non-empty project-id strings, values clamped to 1..50,
+                    # and 0-or-below entries are excluded (absent key = no cap).
+                    raw_job_caps = config_json["max_concurrent_compute_jobs_by_project"]
+                    if isinstance(raw_job_caps, dict):
+                        normalized_job_caps: dict[str, int] = {}
+                        for proj_key, proj_val in raw_job_caps.items():
+                            sid = str(proj_key).strip()
+                            if not sid:
+                                continue
+                            try:
+                                ival = int(proj_val)
+                            except (TypeError, ValueError):
+                                continue
+                            if ival > 0:
+                                normalized_job_caps[sid] = max(1, min(50, ival))
+                        _set(
+                            "max_concurrent_compute_jobs_by_project",
+                            normalized_job_caps,
+                        )
                 for int_key in (
                     "max_provision_retries",
                     "max_rollup_retries",
@@ -1301,6 +1395,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                 for float_key in (
                     "direction_churn_min_merge_rate",
                     "direction_lifetime_min_merge_rate",
+                    "repo_map_holdback_fraction",
                 ):
                     if float_key in config_json:
                         _set(float_key, float(config_json[float_key]))
@@ -1440,3 +1535,48 @@ def resolve_project_promotion_enabled(project_id) -> bool:
     if sid in per_project:
         return per_project[sid]
     return bool(runtime_config.get("promotion_enabled"))
+
+
+def resolve_project_concurrency_cap(project_id) -> int | None:
+    """Return the per-project concurrent-VM cap, or None if no cap is set.
+
+    Reads from ``max_concurrent_tasks_by_project`` in runtime_config.  An absent
+    or zero entry means no cap — returns None and the dispatch loop skips the
+    filter for that project (behavior-preserving for unconfigured projects).
+    Mirrors :func:`resolve_project_promotion_enabled` / the warm-pool resolver
+    pattern.
+    """
+    raw = runtime_config.get("max_concurrent_tasks_by_project") or {}
+    if not isinstance(raw, dict):
+        return None
+    sid = str(project_id)
+    val = raw.get(sid)
+    if val is None:
+        return None
+    try:
+        ival = int(val)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival > 0 else None
+
+
+def resolve_project_compute_job_concurrency_cap(project_id) -> int | None:
+    """Return the per-project concurrent compute-job cap, or None if no cap is set.
+
+    Reads from ``max_concurrent_compute_jobs_by_project`` in runtime_config.  An
+    absent or zero entry means no cap — returns None so create_compute_job skips
+    the check for unconfigured projects (behavior-preserving). Mirrors
+    :func:`resolve_project_concurrency_cap` for the compute-job lane.
+    """
+    raw = runtime_config.get("max_concurrent_compute_jobs_by_project") or {}
+    if not isinstance(raw, dict):
+        return None
+    sid = str(project_id)
+    val = raw.get(sid)
+    if val is None:
+        return None
+    try:
+        ival = int(val)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival > 0 else None

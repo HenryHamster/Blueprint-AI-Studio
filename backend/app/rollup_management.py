@@ -54,6 +54,7 @@ from app.rollup_pr_verification import (  # noqa: F401 — re-exported for calle
     _record_rollup_failure_signals,
     _review_respawn_count,
     _verify_pr_merged,
+    verify_rollup_merge_landed,
 )
 from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/tests
     _MERGE_QUEUE_UPDATE_AT_KEY,
@@ -351,6 +352,23 @@ async def _classify_merged_rollup_landing(
             merged_base_branch=target_branch,
             source=source,
         )
+    if landed:
+        # Branch-NAME equality above is necessary but NOT sufficient: confirm the
+        # rollup PR's merge commit actually reached the integration branch before
+        # the caller stamps the shipped badge. A DEFINITIVE negative strands the
+        # task (marker + operator alert recorded by the gate); indeterminate /
+        # missing-SHA / API-error preserves flag-trust so a transient outage
+        # never blocks completion.
+        verdict = await verify_rollup_merge_landed(
+            parent,
+            project,
+            session,
+            pr_number=pr_number,
+            integration_branch=integration_branch,
+            source=source,
+        )
+        if verdict == "stranded":
+            landed = False
     return landed, landed or promotion_landing
 
 
@@ -624,9 +642,12 @@ def _build_rollup_pr_body(
             prov_at = getattr(c, "vm_provisioned_at", None)
             stop_at = getattr(c, "vm_stopped_at", None)
             if prov_at and stop_at:
-                from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+                from app.vm_cost_rates import get_vm_rate_per_second
 
-                rate = SPOT_RATE if getattr(c, "vm_spot", False) else ON_DEMAND_RATE
+                rate = get_vm_rate_per_second(
+                    machine_type=getattr(c, "vm_machine_type", None),
+                    spot=getattr(c, "vm_spot", False),
+                )
                 total_cost += (stop_at - prov_at).total_seconds() * rate
                 has_cost = True
         if type_counts:
@@ -1612,6 +1633,7 @@ async def _check_and_trigger_rollup(
         from app.task_lifecycle_requeue import (
             _record_parent_failure,
             _resolve_terminal_parent_verdict,
+            _terminate_all_non_death_cancelled,
             _terminate_all_non_genuine_cancelled,
         )
 
@@ -1621,18 +1643,38 @@ async def _check_and_trigger_rollup(
 
         # Clear rollup transient deferral/retry counters before EITHER terminal
         # finalize commits so they don't leak into a future cycle. The shared
-        # ``_terminate_all_non_genuine_cancelled`` helper commits internally and
-        # does NOT clear rollup state or clean branches (the requeue path has no
-        # such state), so the rollup path owns both around the helper here.
+        # helpers commit internally and do NOT clear rollup state or clean branches
+        # (the requeue path has no such state), so the rollup path owns both
+        # around the helpers here.
         parent.context = _clear_rollup_transient_state(parent.context)
+
+        if verdict_reason == "all_non_death_cancelled":
+            # Every cancelled child is a non-death cancellation (co-deferred
+            # shelving, requeue replacement, scope-empty no-op): the work is
+            # recoverable or already-landed.  Finalize as CANCELLED with NO
+            # direction-health penalty and NO failure alert — byte-for-byte the
+            # requeue/reaper finalize.  Branch cleanup is still appropriate:
+            # co-deferred findings re-surface from the ledger (not the branch),
+            # replacement clones create their own branches, scope-empty tasks have
+            # nothing to keep.
+            await _terminate_all_non_death_cancelled(
+                parent, children, session, broadcast_to_project
+            )
+            await _cleanup_branches(parent, session)
+            logger.info(
+                f"[ROLLUP] Parent {parent.id} CANCELLED — all "
+                f"{len(children)} children non-death cancelled "
+                f"(co-deferred / superseded / scope-empty)"
+            )
+            return
 
         if verdict_reason == "all_non_genuine_cancelled":
             # Every cancel is non-genuine (superseded / replaced-by-retry /
-            # reassigned / scope-empty): the work may have landed elsewhere, so
-            # this is FAILED + SCOPE_EMPTY with NO direction-health penalty and
-            # NO failure alert — byte-for-byte the requeue/reaper finalize. The
-            # shared helper persists the category, commits, and broadcasts; we
-            # clean up the staging branches after.
+            # reassigned / scope-empty) but not all are non-death: the work may
+            # have landed elsewhere, so this is FAILED + SCOPE_EMPTY with NO
+            # direction-health penalty and NO failure alert — byte-for-byte the
+            # requeue/reaper finalize. The shared helper persists the category,
+            # commits, and broadcasts; we clean up the staging branches after.
             await _terminate_all_non_genuine_cancelled(
                 parent, children, session, broadcast_to_project
             )
@@ -1643,19 +1685,11 @@ async def _check_and_trigger_rollup(
             )
             return
 
-        # At least one GENUINE cancel (e.g. an operator manually cancelling
-        # every child, or a child cancelled under its own review/fix
-        # divergence). DECISION: finalize FAILED — NOT the previous quiet
-        # CANCELLED. The shared verdict counts a genuine cancel as a terminal
-        # failure, and the requeue/reaper path (locked by
-        # test_requeue_all_cancelled_children_marks_parent_failed) already
-        # finalizes this exact child set to FAILED + AGENT_TIMEOUT with a
-        # failure alert + a direction-health signal via ``_record_parent_failure``.
-        # Because the recovery sweep wins the race to this finalizer most of the
-        # time, it must produce the SAME terminal state and the SAME side effects
-        # (including the SAME ``_record_parent_failure`` ding the reaper path
-        # uses — this is what test_parent_terminal_parity asserts) rather than the
-        # quieter CANCELLED that silently disagreed with the reaper.
+        # At least one GENUINE death (e.g. an operator manually cancelling every
+        # child, or a child cancelled under its own review/fix divergence, with
+        # no non-death recovery marker). DECISION: finalize FAILED — the shared
+        # verdict counts a genuine death as a terminal failure, and both
+        # requeue/reaper and rollup paths must agree (test_parent_terminal_parity).
         from app.failure_classification import (
             AGENT_TIMEOUT,
             persist_failure_category,
@@ -1678,7 +1712,7 @@ async def _check_and_trigger_rollup(
         )
         logger.info(
             f"[ROLLUP] Parent {parent.id} FAILED — all {len(children)} children "
-            f"cancelled, genuine cancellation present (shared verdict)"
+            f"cancelled, genuine death present (shared verdict)"
         )
         return
 
@@ -2127,8 +2161,12 @@ async def _check_and_trigger_rollup(
                                 if _terminal_rollup_merge
                                 else TaskStatus.EVALUATING
                             )
+                            # Read the POST-classify context so the durable stranded
+                            # marker written by _classify_merged_rollup_landing (via
+                            # mark_stranded_non_landing) survives this reset; resetting
+                            # from the pre-classify parent_ctx snapshot would clobber it.
                             parent.context = {
-                                **_clear_rollup_transient_state(parent_ctx),
+                                **_clear_rollup_transient_state(parent.context),
                             }
                             if _landed:
                                 apply_merged_landed_signal(
@@ -2910,8 +2948,15 @@ async def _check_and_trigger_rollup(
                             if _terminal_rollup_merge
                             else TaskStatus.EVALUATING
                         )
+                        # Read the POST-classify context: _classify_merged_rollup_landing
+                        # may have written the durable stranded marker
+                        # (landed_on_integration=False + STRANDED_LANDING_REASON_KEY) into
+                        # parent.context via mark_stranded_non_landing. Resetting from the
+                        # pre-classify parent_ctx snapshot would clobber that marker before
+                        # the commit below. _clear_rollup_transient_state preserves the
+                        # landing/stranded keys (they are not transient).
                         parent.context = {
-                            **_clear_rollup_transient_state(parent_ctx),
+                            **_clear_rollup_transient_state(parent.context),
                             "rollup_pr_url": rollup_pr_url,
                         }
                         if _landed:

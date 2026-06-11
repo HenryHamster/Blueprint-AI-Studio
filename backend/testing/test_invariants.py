@@ -4500,6 +4500,7 @@ class TestFailureClassificationInvariants:
             AGENT_TIMEOUT,
             BLOCKED_PRECONDITION,
             BRANCH_GONE,
+            DEAD_AUTH,
             EXTERNAL_API,
             INFRA_CLASSES,
             NO_PROGRESS_TIMEOUT,
@@ -4530,6 +4531,9 @@ class TestFailureClassificationInvariants:
                 # not code defects. See feat: surface park/wake health.
                 PARK_WAKE_TIMEOUT,
                 PARK_WAKE_STRANDED,
+                # Dead OAuth/API session: permanent provider-infra failure,
+                # auto-disables account fleet-wide. Not a code defect.
+                DEAD_AUTH,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "

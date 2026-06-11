@@ -32,7 +32,8 @@ from app.models import (
     TaskStatus,
 )
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
-from app.release_promotion import _lts_branch_names
+from app.release_promotion import _lts_branch_names, _record_qualification_verdict
+from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -136,6 +137,7 @@ async def _spawn_release_audit_challenge_task(
     diff_range: str,
     candidate_sha: str,
     primary_audit_task_id: str | None = None,
+    primary_findings: list[dict[str, str]] | None = None,
 ) -> Task:
     """Create + queue a challenge task for the release-audit flow.
 
@@ -153,6 +155,8 @@ async def _spawn_release_audit_challenge_task(
     if primary_audit_task_id is not None:
         payload["primary_audit_task_id"] = primary_audit_task_id
         payload["primary_audit_report"] = None
+    if primary_findings is not None:
+        payload["primary_findings"] = primary_findings
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
         "release_audit_challenge"
     )
@@ -638,6 +642,94 @@ async def _handle_infra_failure(
         "status": "infra_failure",
         "error": infra_error,
         "consecutive_infra_errors": current_streak,
+    }
+
+
+async def _handle_independent_blocker(
+    session: AsyncSession,
+    version: ReleaseVersion,
+    qual: dict[str, Any],
+    independent_blocker_findings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Finalize a qualifier run blocked by a challenger-confirmed independent finding.
+
+    Unlike _handle_infra_failure, this IS a quality finding about the candidate.
+    It records a durable not_promoted verdict, does not increment the infra-error
+    streak, and does not raise an infra Alert.  The challenger-confirmed finding
+    details are persisted in last_qualification so the strategic loop can target
+    the actual issue.
+    """
+    finalized_at = _utcnow().isoformat()
+    record: dict[str, Any] = {
+        "candidate_sha": qual.get("candidate_sha"),
+        "ci_green": qual.get("ci_green"),
+        "smoketest_enabled": qual.get("smoketest_enabled", True),
+        "status": "not_promoted",
+        "blocker": "audit_challenge_independent_blocker",
+        "started_at": qual.get("started_at"),
+        "finalized_at": finalized_at,
+        "audit_task_id": qual.get("audit_task_id"),
+        "audit_challenge_task_id": qual.get("audit_challenge_task_id"),
+        "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
+        "smoketest_task_id": qual.get("smoketest_task_id"),
+        "audit_findings": independent_blocker_findings,
+    }
+    version.last_qualification = record
+    flag_modified(version, "last_qualification")
+    release_version.set_version_phase(
+        version,
+        "stabilize",
+        reasoning=(
+            f"qualification v{version.version_number}: challenger confirmed an "
+            f"independent >=HIGH severity issue — quality finding, returning to "
+            f"stabilize for re-qualification"
+        ),
+    )
+    session.add(version)
+
+    promotion_enabled = resolve_project_promotion_enabled(version.project_id)
+    await _record_qualification_verdict(
+        session,
+        version,
+        record,
+        terminal_status="not_promoted",
+        would_promote=False,
+        promotion_enabled=promotion_enabled,
+    )
+
+    blocker_detail = ""
+    if independent_blocker_findings:
+        f0 = independent_blocker_findings[0]
+        sev = str(f0.get("severity") or "high").upper()
+        summary = str(f0.get("summary") or "").strip()
+        blocker_detail = (
+            f" ({sev}: {summary[:120]})" if summary else f" ({sev})"
+        )
+    rq = _release_qualifier_module()
+    await rq._notify_operator(
+        session,
+        version,
+        "release_blocked",
+        (
+            f"v{version.version_number} blocked from promotion — audit challenger "
+            f"confirmed an independent >=HIGH severity issue not present in primary "
+            f"findings{blocker_detail}. Not promoted; staying in stabilize."
+        ),
+        extra={
+            "blocker": "audit_challenge_independent_blocker",
+            "audit_findings": independent_blocker_findings,
+        },
+    )
+    logger.warning(
+        "[RELEASE_QUALIFIER] v%d independent blocker: challenger confirmed >=HIGH "
+        "issue outside primary findings — verdict=not_promoted (quality finding, "
+        "not infra failure)",
+        version.version_number,
+    )
+    return {
+        "status": "not_promoted",
+        "blocker": "audit_challenge_independent_blocker",
+        "audit_findings": independent_blocker_findings,
     }
 
 

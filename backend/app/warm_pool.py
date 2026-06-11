@@ -492,7 +492,7 @@ async def lease_idle_pool_vm(
     # warm_pool <-> efficiency_snapshot import cycle.
     from app.efficiency_snapshot import settle_pool_vm_idle_cost
 
-    settle_pool_vm_idle_cost(member, now=now)
+    settle_pool_vm_idle_cost(member, now=now, session=session)
     member.idle_since = None
     session.add(member)
     logger.info(
@@ -626,7 +626,7 @@ async def mark_pool_vm_retiring(session, vm_instance_id: str) -> Optional[PoolVm
     # already None — teardown must never erase measured idle spend).
     from app.efficiency_snapshot import settle_pool_vm_idle_cost
 
-    settle_pool_vm_idle_cost(member)
+    settle_pool_vm_idle_cost(member, session=session)
     member.idle_since = None
     session.add(member)
     logger.info("[WARM-POOL] marked pool VM retiring vm_instance_id=%s", vm_instance_id)

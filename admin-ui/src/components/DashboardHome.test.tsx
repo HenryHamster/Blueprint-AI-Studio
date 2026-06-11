@@ -5,10 +5,12 @@ import { DashboardHome } from './DashboardHome';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
-const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, capturedProps } = vi.hoisted(() => ({
+const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, fetchFleetUtilizationMock, fetchAgentServingShasMock, capturedProps } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
   fetchQualificationVerdictsMock: vi.fn().mockResolvedValue({ verdicts: [], total: 0 }),
   fetchTaskMock: vi.fn(),
+  fetchFleetUtilizationMock: vi.fn(),
+  fetchAgentServingShasMock: vi.fn(),
   capturedProps: {
     prMonitor: null as Record<string, unknown> | null,
     remediationFunnel: null as Record<string, unknown> | null,
@@ -27,6 +29,8 @@ vi.mock('../api', () => ({
   apiFetch: (path: string, init?: RequestInit) => apiFetchMock(path, init),
   fetchQualificationVerdicts: (projectId: string, limit?: number) => fetchQualificationVerdictsMock(projectId, limit),
   fetchTask: (taskId: string) => fetchTaskMock(taskId),
+  fetchFleetUtilization: () => fetchFleetUtilizationMock(),
+  fetchAgentServingShas: (projectId: string) => fetchAgentServingShasMock(projectId),
   fetchSrUnhandledEdgesRetrospectives: vi.fn().mockResolvedValue({ tasks: [] }),
   fetchSrCatchRateHealth: vi.fn().mockResolvedValue({
     status: 'healthy',
@@ -246,7 +250,29 @@ describe('DashboardHome', () => {
     apiFetchMock.mockReset();
     fetchQualificationVerdictsMock.mockReset();
     fetchTaskMock.mockReset();
+    fetchFleetUtilizationMock.mockReset();
+    fetchAgentServingShasMock.mockReset();
     fetchQualificationVerdictsMock.mockResolvedValue({ verdicts: [], total: 0 });
+    fetchFleetUtilizationMock.mockResolvedValue({
+      active_now: 0,
+      nominal_capacity: null,
+      usable_capacity: null,
+      cooled_accounts: 0,
+      util_now: null,
+      util_avg: null,
+      window_hours: 24,
+      saturation: null,
+    });
+    fetchAgentServingShasMock.mockResolvedValue({
+      fleet: { total_observed: 0, unknown_count: 0, mixed: false, buckets: [] },
+      current_image: null,
+      backend_served_sha: null,
+      active_candidate_sha: null,
+      integration_branch: 'automain',
+      integration_head_sha: null,
+      promotion_target: 'main',
+      promotion_head_sha: null,
+    });
   });
 
   afterEach(() => {
@@ -297,6 +323,46 @@ describe('DashboardHome', () => {
     expect(screen.getByText('No recent activity')).toBeInTheDocument();
     expect(screen.getByText('Completed')).toBeInTheDocument();
     expect(screen.getAllByText('0').length).toBeGreaterThan(2);
+  });
+
+  it('fetches project-scoped agent serving SHA data', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(fetchAgentServingShasMock).toHaveBeenCalledWith('proj1');
+    });
+  });
+
+  it('keeps rendering when agent serving SHA fetch fails', async () => {
+    fetchAgentServingShasMock.mockRejectedValueOnce(new Error('boom'));
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Task Status')).toBeInTheDocument();
+    });
+    expect(fetchAgentServingShasMock).toHaveBeenCalledWith('proj1');
   });
 
   it('renders directions needing attention and opens the directions view when clicked', async () => {

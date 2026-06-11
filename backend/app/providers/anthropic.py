@@ -110,6 +110,19 @@ _QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
     "weekly limit reached",
 )
 
+# Substrings in Claude CLI stderr that prove the OAuth token is permanently
+# revoked (org policy disabled Claude Code OAuth, or credentials expired/rotated).
+# These differ from usage-limit strings above: they indicate the auth layer is
+# dead, not just the rate window exhausted. Matching any of these auto-disables
+# the account fleet-wide until an operator fixes the org policy / re-authenticates.
+_OAUTH_DEAD_AUTH_PATTERNS: tuple[str, ...] = (
+    "oauth_org_not_allowed",
+    # token_refresh_failed is intentionally excluded: a single refresh failure
+    # can be transient (network blip, temporary 5xx at the token endpoint) and
+    # must not hard-disable the account on one occurrence. Only unambiguous
+    # terminal signals (org policy blocked, session explicitly terminated) qualify.
+)
+
 _DEFAULT_TIER_MODELS = {
     "opus": "claude-opus-4-8",
     "sonnet": "claude-sonnet-4-6",
@@ -207,6 +220,12 @@ class AnthropicProvider(LLMProvider):
         # instead of the 5-hour exponential backoff.
         self.ensure_supported_auth_mode(auth_mode)
         return _QUOTA_EXHAUSTED_PATTERNS
+
+    def dead_auth_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
+        self.ensure_supported_auth_mode(auth_mode)
+        if auth_mode == LLMAuthMode.OAUTH:
+            return _OAUTH_DEAD_AUTH_PATTERNS
+        return ()
 
     def required_metadata_fields(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         self.ensure_supported_auth_mode(auth_mode)

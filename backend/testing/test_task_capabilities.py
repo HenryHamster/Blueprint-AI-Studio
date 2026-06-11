@@ -106,7 +106,7 @@ def test_recovery_paths_source_write_allowlist_from_registry():
 def test_completion_handler_declarations_match_legacy_dispatch():
     """The registry's completion-handler declarations must reproduce exactly the
     type→handler routing the old if/elif cascade encoded (plus the
-    compute_experiment terminal metric gate), so the registry-driven dispatch in
+    compute_experiment artifact-delivery gate), so the registry-driven dispatch in
     task_lifecycle is behaviour-preserving."""
     assert COMPLETION_HANDLER_BY_TASK_TYPE == {
         "plan": "plan",
@@ -121,6 +121,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "memo": "memo",
         "web_research": "web_research",
         "design": "design",
+        "repo_bootstrap": "repo_bootstrap",
     }
     # Only the two strategic completion handlers consume the pre-locked Project.
     needs_project = {
@@ -192,7 +193,7 @@ def test_every_capability_declares_a_valid_evaluation_strategy():
     """The additive `evaluation` field is present on every capability with a
     value from the closed strategy vocabulary, and the derived map covers all
     types. Selection of the forward gate is registry-driven via this field."""
-    valid = {"code-ci-review", "forward-quality", "metric", "none"}
+    valid = {"code-ci-review", "forward-quality", "metric", "artifact-delivery", "none"}
     valid.add("structured-verdict")
     for cap in TASK_CAPABILITIES:
         assert cap.evaluation in valid, (cap.id, cap.evaluation)
@@ -209,6 +210,7 @@ def test_code_pr_types_keep_code_ci_review_gate():
     for t in ("research", "memo", "security_audit", "self_audit", "investigate"):
         assert EVALUATION_STRATEGY_BY_TASK_TYPE[t] == "forward-quality"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["perf"] == "metric"
+    assert EVALUATION_STRATEGY_BY_TASK_TYPE["compute_experiment"] == "artifact-delivery"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["panel_review"] == "structured-verdict"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["plan"] == "none"
 
@@ -563,8 +565,8 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
     # Research is judged by forward quality, not a merged PR.
     assert by_id["research"]["run_shape"] == "single_agent"
     assert by_id["research"]["evaluation_strategy"] == "forward_quality"
-    # The reference compute-loop task is a compute-only verdict producer with a
-    # declared ceiling and metric-style evaluation metadata.
+    # The reference compute-loop task is a compute-only artifact producer with a
+    # declared ceiling and non-gating artifact-delivery metadata.
     assert by_id["compute_experiment"] == {
         "id": "compute_experiment",
         "label": "Compute Experiment",
@@ -575,11 +577,11 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "operator_contract_launchable": True,
         "provider_configurable": False,
         "filter_visible": True,
-        "output_kind": "verdict",
+        "output_kind": "artifact",
         "requires_code": False,
         "requires_web": False,
         "requires_compute": True,
-        "evaluation_strategy": "metric",
+        "evaluation_strategy": "none",
         "cost_ceiling_usd": 5.0,
         "run_shape": "experiment_loop",
     }

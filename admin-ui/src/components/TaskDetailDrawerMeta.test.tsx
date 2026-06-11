@@ -556,10 +556,51 @@ describe('DetailsTab — Merge Test Gate', () => {
     ]);
     const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
     render(<DetailsTab task={task} />);
+    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', undefined, 10_080);
     expect(await screen.findByRole('link', { name: /https:\/\/storage\.example\.com\/jobs\/job-1\/result\.json/i })).toHaveAttribute(
       'href',
       'https://storage.example.com/jobs/job-1/result.json',
     );
+  });
+
+  it('surfaces COMPUTE_RESULT artifact as the primary outcome with a resolvable reference', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({
+        artifact_id: 'artifact-xyz',
+        result_reference: 'https://storage.example.com/jobs/job-1/result.json',
+      }),
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    const artifact = await screen.findByText('COMPUTE_RESULT artifact');
+    expect(artifact.closest('a')).toHaveAttribute(
+      'href',
+      'https://storage.example.com/jobs/job-1/result.json',
+    );
+    // Raw storage URI demoted to a secondary technical detail row.
+    expect(screen.getByText('Result reference')).toBeInTheDocument();
+  });
+
+  it('surfaces COMPUTE_RESULT artifact even when result_reference is null (non-openable)', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ artifact_id: 'artifact-xyz', result_reference: null }),
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    const artifact = await screen.findByText('COMPUTE_RESULT artifact');
+    expect(artifact.closest('a')).toBeNull();
+    expect(artifact.closest('button')).toBeNull();
+    expect(screen.queryByText('Result reference')).toBeNull();
+  });
+
+  it('shows no artifact affordance when artifact_id is absent', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      makeComputeJob({ artifact_id: null, result_reference: null }),
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    await screen.findByText('gcp_compute_engine');
+    expect(screen.queryByText('COMPUTE_RESULT artifact')).toBeNull();
   });
 
   it('resolves a gs:// compute result through the admin API before opening', async () => {
@@ -584,6 +625,8 @@ describe('DetailsTab — Merge Test Gate', () => {
         last_polled_at: '2026-01-01T00:10:00Z',
         accrued_cost_usd: 1.5,
         final_cost_usd: 1.5,
+        artifact_id: null,
+        artifact: null,
         result_reference: 'gs://blueprint-agent-artifacts/tasks/task-verify-1/result.json',
         task_title: 'compute_experiment: run a budgeted job',
         task_type: 'compute_experiment',
@@ -599,6 +642,73 @@ describe('DetailsTab — Merge Test Gate', () => {
       'gs://blueprint-agent-artifacts/tasks/task-verify-1/result.json',
     );
     expect(openSpy).toHaveBeenCalled();
+  });
+
+  it('renders linked compute-result artifacts distinctly from raw result references', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      {
+        id: 'job-1',
+        project_id: 'proj-1',
+        task_id: 'task-verify-1',
+        backend: 'gcp_compute_engine',
+        external_compute_id: 'compute-job-vm-1',
+        machine_type: 'e2-standard-2',
+        status: 'SUCCEEDED',
+        terminal_reason: 'compute job finished',
+        outcome: 'SUCCESS',
+        spend_cap_usd: 4,
+        wall_clock_deadline: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:10:00Z',
+        started_at: '2026-01-01T00:00:00Z',
+        completed_at: '2026-01-01T00:10:00Z',
+        last_polled_at: '2026-01-01T00:10:00Z',
+        accrued_cost_usd: 1.5,
+        final_cost_usd: 1.5,
+        artifact_id: 'artifact-1',
+        artifact: {
+          id: 'artifact-1',
+          artifact_type: 'COMPUTE_RESULT',
+          storage_uri: 'gs://blueprint-agent-artifacts/tasks/task-verify-1/artifacts/result.json',
+          logical_key: 'tasks/task-verify-1/artifacts/result.json',
+          created_at: '2026-01-01T00:10:00Z',
+        },
+        result_reference: 'https://storage.example.com/jobs/job-1/result.json',
+        task_title: 'compute_experiment: run a budgeted job',
+        task_type: 'compute_experiment',
+      },
+      {
+        id: 'job-2',
+        project_id: 'proj-1',
+        task_id: 'task-verify-1',
+        backend: 'gcp_compute_engine',
+        external_compute_id: 'compute-job-vm-2',
+        machine_type: 'e2-standard-2',
+        status: 'SUCCEEDED',
+        terminal_reason: 'compute job finished',
+        outcome: 'SUCCESS',
+        spend_cap_usd: 4,
+        wall_clock_deadline: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:10:00Z',
+        started_at: '2026-01-01T00:00:00Z',
+        completed_at: '2026-01-01T00:10:00Z',
+        last_polled_at: '2026-01-01T00:10:00Z',
+        accrued_cost_usd: 1.5,
+        final_cost_usd: 1.5,
+        artifact_id: null,
+        artifact: null,
+        result_reference: 'https://storage.example.com/jobs/job-2/result.json',
+        task_title: 'compute_experiment: run a budgeted job',
+        task_type: 'compute_experiment',
+      },
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    expect(await screen.findByText('Compute Result Artifact')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /gs:\/\/blueprint-agent-artifacts\/tasks\/task-verify-1\/artifacts\/result\.json/i })).toBeInTheDocument();
+    expect(screen.getByText('Raw result reference')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /https:\/\/storage\.example\.com\/jobs\/job-2\/result\.json/i })).toBeInTheDocument();
   });
 
   it('renders storage-backed task artifacts through the signed download resolver', () => {
@@ -793,6 +903,39 @@ describe('DetailsTab — Knowledge Document', () => {
     screen.getByText('View document').click();
     expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-1');
     expect(await screen.findByText(/Detailed markdown/)).toBeInTheDocument();
+  });
+
+  it('surfaces live-proof release evidence (promoted SHA + serving status) after the full-doc fetch', async () => {
+    const { fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      id: 'doc-1',
+      body: '# Full body',
+      release_evidence: {
+        promoted_sha: 'abcdef1234567890deadbeef',
+        aggregate_serving_status: 'serving_confirmed',
+        release_version_number: 8,
+      },
+    } as never);
+    render(<DetailsTab task={knowledgeTask()} />);
+    screen.getByText('View document').click();
+    const chip = await screen.findByTestId('release-evidence-chip');
+    expect(chip).toBeInTheDocument();
+    expect(chip.textContent).toContain('v8');
+    expect(chip.textContent).toContain('abcdef12');
+    expect(chip.textContent).not.toContain('abcdef1234567890deadbeef');
+  });
+
+  it('shows no release-evidence chip when the document has none', async () => {
+    const { fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      id: 'doc-1',
+      body: '# Full body',
+      release_evidence: null,
+    } as never);
+    render(<DetailsTab task={knowledgeTask()} />);
+    screen.getByText('View document').click();
+    expect(await screen.findByText(/Full body/)).toBeInTheDocument();
+    expect(screen.queryByTestId('release-evidence-chip')).toBeNull();
   });
 });
 
@@ -1072,7 +1215,10 @@ function makeComputeJob(overrides: Partial<import('../api').ComputeJob> = {}): i
     last_polled_at: '2026-06-08T00:30:00Z',
     accrued_cost_usd: 3.5,
     final_cost_usd: 3.5,
+    artifact_id: null,
+    artifact: null,
     result_reference: null,
+    artifact_id: null,
     accelerator_type: null,
     accelerator_count: null,
     task_title: 'compute_experiment: benchmark run',
@@ -1288,13 +1434,60 @@ describe('DetailsTab — Compute Experiment Contract', () => {
           source_kind: 'compute_experiment',
           compute_acceptance_grade: 'measured_only',
           compute_acceptance_reason: 'analysis_mode_not_llm',
+          analysis_fallback_reason: 'precondition-not-met',
         },
       },
     });
     render(<DetailsTab task={task} />);
     const badge = screen.getByText('Measured only');
     expect(badge).toBeInTheDocument();
-    expect(badge.closest('[title]')?.getAttribute('title')).toContain('Deterministic fallback');
+    expect(badge.closest('[title]')?.getAttribute('title')).toContain('Missing credentials');
+    expect(screen.getByText('Missing credentials — analysis skipped')).toBeInTheDocument();
+  });
+
+  it('prefers unavailable_cause labels over fallback reasons', () => {
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      plan_output: {
+        knowledge_document: {
+          id: 'doc-compute-4',
+          title: 'Unavailable Analysis',
+          summary: 'Analysis could not run.',
+          citation_count: 0,
+          analysis_mode: 'unavailable',
+          unavailable_cause: 'analysis-disabled',
+          analysis_fallback_reason: 'precondition-not-met',
+          source_kind: 'compute_experiment',
+          compute_acceptance_grade: 'measured_only',
+          compute_acceptance_reason: 'analysis_mode_not_llm',
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Measured only')).toBeInTheDocument();
+    expect(screen.getByText('Analysis disabled')).toBeInTheDocument();
+    expect(screen.queryByText('Missing credentials — analysis skipped')).toBeNull();
+  });
+
+  it('renders legacy measured-only compute docs without cause fields', () => {
+    const task = makeTask({
+      task_type: 'compute_experiment',
+      plan_output: {
+        knowledge_document: {
+          id: 'doc-compute-5',
+          title: 'Legacy Measured Summary',
+          summary: 'Older backend response without cause metadata.',
+          citation_count: 1,
+          source_kind: 'compute_experiment',
+          compute_acceptance_grade: 'measured_only',
+          compute_acceptance_reason: 'analysis_mode_not_llm',
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Measured only')).toBeInTheDocument();
+    expect(screen.queryByText('Analysis disabled')).toBeNull();
+    expect(screen.queryByText('Missing credentials — analysis skipped')).toBeNull();
   });
 
   it('does not show acceptance grade badge for non-compute documents', () => {
@@ -1313,5 +1506,40 @@ describe('DetailsTab — Compute Experiment Contract', () => {
     expect(screen.getByText('Knowledge Document')).toBeInTheDocument();
     expect(screen.queryByText('Acceptance')).toBeNull();
     expect(screen.queryByText('Measured only')).toBeNull();
+  });
+});
+
+describe('DetailsTab — adversarial gate diagnostic', () => {
+  afterEach(() => cleanup());
+
+  it('renders parse state and runtime provenance fields', () => {
+    const vmImageBuildTs = 1749168000;
+    const vmRuntimeFingerprint = 'runtime-fingerprint-abcdef1234567890';
+    const task = makeTask({
+      context: {
+        adversarial_gate_diagnostic: {
+          challenger_task_id: 'grader-task-1',
+          completion_state: 'completed',
+          challenged_count: 2,
+          parse_state: 'no_hash_matches',
+          parse_cause: 'JSON array contained no known finding hashes',
+          parsed_verdict_count: 0,
+          unresolved_count: 2,
+          vm_image_name: 'blueprint/grader:2026-06-05',
+          vm_image_build_ts: vmImageBuildTs,
+          vm_runtime_fingerprint: vmRuntimeFingerprint,
+          vm_source_sha: '0123456789abcdef0123456789abcdef01234567',
+        },
+      },
+    });
+
+    render(<DetailsTab task={task} />);
+
+    expect(screen.getByText('Adversarial Gate Diagnostic')).toBeInTheDocument();
+    expect(screen.getByText('no hash matches')).toBeInTheDocument();
+    expect(screen.getByText('JSON array contained no known finding hashes')).toBeInTheDocument();
+    expect(screen.getByTitle(new Date(vmImageBuildTs * 1000).toISOString())).toBeInTheDocument();
+    expect(screen.getByTitle(vmRuntimeFingerprint)).toBeInTheDocument();
+    expect(screen.getByText('runtime-fing')).toBeInTheDocument();
   });
 });

@@ -9,8 +9,16 @@ vi.mock('../index.js', () => ({
   sendLog: vi.fn(),
 }));
 
+vi.mock('fs', () => ({
+  default: {
+    existsSync: vi.fn().mockReturnValue(true),
+    readFileSync: vi.fn().mockReturnValue(''),
+  },
+}));
+
 import { execFileSync } from 'child_process';
-import { countSourceFiles, detectGreenfield, isGreenfieldRepo, verifyCloneDelivered } from './discovery.js';
+import fs from 'fs';
+import { countSourceFiles, detectGreenfield, isGreenfieldRepo, verifyCloneDelivered, buildRepoMap } from './discovery.js';
 import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
 
 const setLsFiles = (files: string[]) =>
@@ -238,5 +246,148 @@ describe('verifyCloneDelivered', () => {
   it('skips the branch check when no branch is provided', () => {
     routeGit({ head: 'abc123', lsFiles: populatedTree });
     expect(() => { verifyCloneDelivered({ repo_is_empty: false }); }).not.toThrow();
+  });
+});
+
+describe('buildRepoMap', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns empty string on empty repo (no tracked files)', () => {
+    vi.mocked(execFileSync).mockReturnValue('' as never);
+    expect(buildRepoMap(null)).toBe('');
+  });
+
+  it('ranks most-imported module first', () => {
+    // hub.ts is imported by two files; other.ts only by one
+    vi.mocked(execFileSync).mockReturnValue(
+      ['src/hub.ts', 'src/other.ts', 'src/a.ts', 'src/b.ts'].join('\n') as never
+    );
+    vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
+      const p = path as string;
+      if (p.endsWith('hub.ts')) return "export function hubFn() {}\nexport function hubFn2() {}";
+      if (p.endsWith('other.ts')) return "export function otherFn() {}";
+      if (p.endsWith('a.ts')) return "import { hubFn } from './hub.js';\nimport { otherFn } from './other.js';";
+      if (p.endsWith('b.ts')) return "import { hubFn2 } from './hub.js';";
+      return '';
+    }) as never);
+
+    const result = buildRepoMap(null);
+    expect(result).toContain('## Repo Map');
+    // hub should appear before other since it has 2 importers vs 1
+    const hubIdx = result.indexOf('hub.ts');
+    const otherIdx = result.indexOf('other.ts');
+    expect(hubIdx).toBeGreaterThan(-1);
+    expect(hubIdx).toBeLessThan(otherIdx);
+    // hub must show its exports
+    expect(result).toContain('hubFn');
+  });
+
+  it('buildRepoMap does not collapse same-basename modules across monorepo packages', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      [
+        'packages/api/src/config.ts',
+        'packages/api/src/consumer-a.ts',
+        'packages/api/src/consumer-b.ts',
+        'packages/web/src/config.ts',
+        'packages/web/src/consumer.ts',
+      ].join('\n') as never
+    );
+    vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
+      const p = path as string;
+      if (p.endsWith('packages/api/src/config.ts')) return 'export function apiConfig() {}';
+      if (p.endsWith('packages/web/src/config.ts')) return 'export function webConfig() {}';
+      if (p.endsWith('consumer-a.ts')) return "import { apiConfig } from './config.js';";
+      if (p.endsWith('consumer-b.ts')) return "import { apiConfig } from './config.js';";
+      if (p.endsWith('consumer.ts')) return "import { webConfig } from './config.js';";
+      return '';
+    }) as never);
+
+    const result = buildRepoMap(null);
+    expect(result).toContain('**packages/api/src/config.ts** (imported by 2)');
+    expect(result).toContain('**packages/web/src/config.ts** (imported by 1)');
+    expect(result.indexOf('packages/api/src/config.ts')).toBeGreaterThan(-1);
+    expect(result.indexOf('packages/web/src/config.ts')).toBeGreaterThan(-1);
+    expect(result.indexOf('packages/api/src/config.ts')).toBeLessThan(result.indexOf('packages/web/src/config.ts'));
+  });
+
+  it('output is capped at 3000 chars', () => {
+    // Generate many files each exporting a long-named symbol
+    const files = Array.from({ length: 30 }, (_, i) => `src/mod${i}.ts`);
+    vi.mocked(execFileSync).mockReturnValue(files.join('\n') as never);
+    vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
+      const p = path as string;
+      const idx = files.findIndex(f => p.endsWith(f.replace('src/', '')));
+      if (idx >= 0) {
+        // Each file imports all others to boost in-degree, and exports a long symbol
+        const imports = files.filter((_, i) => i !== idx).map(f => {
+          const stem = f.replace('src/', '').replace('.ts', '');
+          return `import { fn } from './${stem}.js';`;
+        }).join('\n');
+        return `${imports}\nexport function ${'veryLongExportedSymbolName'.repeat(5)}_${idx}() {}`;
+      }
+      return '';
+    }) as never);
+
+    const result = buildRepoMap(null);
+    expect(result.length).toBeLessThanOrEqual(3000);
+  });
+
+  it('handles a mixed Python+TypeScript repo', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      ['backend/app/models.py', 'agent/src/prompt.ts', 'agent/src/index.ts'].join('\n') as never
+    );
+    vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
+      const p = path as string;
+      if (p.endsWith('models.py')) return "class Task:\n    pass\nclass Project:\n    pass\n";
+      if (p.endsWith('prompt.ts')) return "export function buildPrompt() {}\n";
+      // index.ts imports from both
+      if (p.endsWith('index.ts')) {
+        return "from models import Task\nimport { buildPrompt } from './prompt.js';\n";
+      }
+      return '';
+    }) as never);
+
+    const result = buildRepoMap(null);
+    // Should include at least one of the imported modules
+    expect(result === '' || result.includes('## Repo Map')).toBe(true);
+  });
+
+  it('is fail-soft when git ls-files throws', () => {
+    vi.mocked(execFileSync).mockImplementation(() => {
+      throw new Error('git not available');
+    });
+    expect(buildRepoMap(null)).toBe('');
+  });
+
+  it('does not attribute cross-package basename collisions to the wrong package', () => {
+    // Both agent/src/index.ts and admin-ui/src/index.ts exist.
+    // agent/src/a.ts imports from './index.js' (relative → resolves to agent/src/index.ts).
+    // admin-ui/src/index.ts must NOT receive any in-degree from that import.
+    vi.mocked(execFileSync).mockReturnValue(
+      ['admin-ui/src/index.ts', 'agent/src/index.ts', 'agent/src/a.ts'].join('\n') as never
+    );
+    vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
+      const p = path as string;
+      if (p.endsWith('admin-ui/src/index.ts')) return "export function adminFn() {}";
+      if (p.endsWith('agent/src/index.ts')) return "export function agentFn() {}";
+      if (p.endsWith('agent/src/a.ts')) return "import { agentFn } from './index.js';";
+      return '';
+    }) as never);
+
+    const result = buildRepoMap(null);
+    // agent/src/index.ts is the hub (1 relative importer), should appear
+    expect(result).toContain('agent/src/index.ts');
+    // admin-ui/src/index.ts should NOT appear — it has no importers
+    expect(result).not.toContain('admin-ui/src/index.ts');
+  });
+
+  it('is fail-soft when file reads throw', () => {
+    vi.mocked(execFileSync).mockReturnValue('src/a.ts\nsrc/b.ts' as never);
+    vi.mocked(fs.readFileSync).mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    expect(buildRepoMap(null)).toBe('');
   });
 });

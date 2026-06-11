@@ -14,10 +14,12 @@ from typing import Dict, Any
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
+from pydantic import ValidationError
 
 from app.database import get_session
 from app.models import (
@@ -28,6 +30,13 @@ from app.models import (
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
+from app.resource_envelope import (
+    get_project_recent_spend_usd,
+    resolve_project_spend_ceiling,
+    resolve_project_spend_window_days,
+    resolve_project_vm_cap,
+)
+from app.schemas import ResourceEnvelope as ResourceEnvelopeSchema
 from app.task_locking import lock_project_or_429, with_design_doc_locked
 from app.playbook_storage import archive_playbook_entry
 from app.shared_state import (
@@ -779,6 +788,32 @@ def _build_config_has_key(project, key: str) -> bool:
     return value not in (None, "")
 
 
+def _resource_envelope_response(
+    project,
+    *,
+    active_vm_count: int,
+    recent_spend_usd: float,
+) -> Dict[str, Any]:
+    return {
+        "project_id": str(project.id),
+        "max_concurrent_vms": resolve_project_vm_cap(project),
+        "spend_ceiling_usd": resolve_project_spend_ceiling(project),
+        "spend_window_days": resolve_project_spend_window_days(project),
+        "active_vm_count": active_vm_count,
+        "recent_spend_usd": float(recent_spend_usd),
+    }
+
+
+async def _get_project_active_vm_count(session: AsyncSession, project_id: uuid.UUID) -> int:
+    result = await session.execute(
+        select(func.count()).select_from(Task).where(
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        )
+    )
+    return int(result.scalar() or 0)
+
+
 @router.get("/projects/{project_id}/task-branch-namespace")
 async def get_task_branch_namespace_config(
     project_id: uuid.UUID,
@@ -1003,6 +1038,94 @@ async def update_staging_branch_prefixes_config(
         "staging_branch_prefixes": _get_staging_branch_prefixes(project),
         "is_default": not _build_config_has_key(project, "staging_branch_prefixes"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Resource-envelope config endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/resource-envelope")
+async def get_resource_envelope_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the project resource envelope and live usage snapshot."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    active_vm_count = await _get_project_active_vm_count(session, project_id)
+    recent_spend_usd = await get_project_recent_spend_usd(
+        session,
+        project_id=project_id,
+        window_days=resolve_project_spend_window_days(project),
+    )
+    return _resource_envelope_response(
+        project,
+        active_vm_count=active_vm_count,
+        recent_spend_usd=recent_spend_usd,
+    )
+
+
+@router.patch("/projects/{project_id}/resource-envelope")
+async def update_resource_envelope_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update the per-project resource envelope stored in build_config."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    allowed = {"max_concurrent_vms", "spend_ceiling_usd", "spend_window_days"}
+    if not body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include at least one resource envelope field",
+        )
+    unknown = set(body.keys()) - allowed
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown resource envelope fields: {sorted(unknown)}",
+        )
+    project = await lock_project_or_429(session, project_id)
+    existing_envelope = (project.build_config or {}).get("resource_envelope")
+    if not isinstance(existing_envelope, dict):
+        existing_envelope = {}
+
+    merged = dict(existing_envelope)
+    for key in allowed:
+        if key in body:
+            merged[key] = body[key]
+
+    try:
+        validated = ResourceEnvelopeSchema(**merged)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="Invalid resource envelope") from exc
+
+    build_config = dict(project.build_config or {})
+    build_config["resource_envelope"] = validated.model_dump(exclude_none=True)
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    active_vm_count = await _get_project_active_vm_count(session, project_id)
+    recent_spend_usd = await get_project_recent_spend_usd(
+        session,
+        project_id=project_id,
+        window_days=resolve_project_spend_window_days(project),
+    )
+    return _resource_envelope_response(
+        project,
+        active_vm_count=active_vm_count,
+        recent_spend_usd=recent_spend_usd,
+    )
 
 
 # ---------------------------------------------------------------------------

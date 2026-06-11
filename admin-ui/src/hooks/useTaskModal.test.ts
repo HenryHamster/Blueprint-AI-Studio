@@ -909,6 +909,47 @@ describe('useTaskModal', () => {
     expect(fetchTasksRef.current).toHaveBeenCalled();
   });
 
+  it('handleCreateComputeExperiment shows held-for-approval toast when requires_approval is true', async () => {
+    mockCreateComputeExperiment.mockResolvedValue({ id: 'ce-held', requires_approval: true, status: 'pending_approval' });
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setComputeExperiment(f => ({ ...f, command: 'python train.py', spendCapUsd: '5', deadlineSeconds: '1800' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith(
+      'Compute experiment held for approval — it will not run until an operator approves it',
+      'success',
+    );
+    expect(addToast).not.toHaveBeenCalledWith('Compute experiment launched', 'success');
+    expect(fetchTasksRef.current).toHaveBeenCalled();
+  });
+
+  it('handleCreateComputeExperiment shows duplicate toast when is_duplicate is true', async () => {
+    mockCreateComputeExperiment.mockResolvedValue({ id: 'ce-dup', is_duplicate: true, requires_approval: false, status: 'running' });
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setComputeExperiment(f => ({ ...f, command: 'python train.py', spendCapUsd: '5', deadlineSeconds: '1800' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('Reusing an existing matching compute experiment', 'success');
+    expect(addToast).not.toHaveBeenCalledWith('Compute experiment launched', 'success');
+    expect(fetchTasksRef.current).toHaveBeenCalled();
+  });
+
   it('handleCreateTask rejects a compute_experiment with an empty command', async () => {
     const addToast = vi.fn();
     const { result } = renderHook(() =>
@@ -957,6 +998,50 @@ describe('useTaskModal', () => {
     expect(mockCreateComputeExperiment).not.toHaveBeenCalled();
   });
 
+  it('handleCreateTask shows approval-hold toast for held compute_experiment responses', async () => {
+    mockCreateComputeExperiment.mockResolvedValue({ id: 'task-held-1', requires_approval: true });
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setComputeExperiment(f => ({ ...f, command: 'python train.py', spendCapUsd: '500', deadlineSeconds: '1800' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith(
+      'Compute experiment held for approval — it will not run until an operator approves it',
+      'success',
+    );
+    expect(addToast).not.toHaveBeenCalledWith('Compute experiment launched', 'success');
+    expect(result.current.showNewTaskModal).toBe(false);
+    expect(fetchTasksRef.current).toHaveBeenCalled();
+  });
+
+  it('handleCreateTask shows launched toast when requires_approval is false', async () => {
+    mockCreateComputeExperiment.mockResolvedValue({ id: 'task-run-1', requires_approval: false });
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setComputeExperiment(f => ({ ...f, command: 'python train.py', spendCapUsd: '5', deadlineSeconds: '1800' }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('Compute experiment launched', 'success');
+    expect(result.current.showNewTaskModal).toBe(false);
+    expect(fetchTasksRef.current).toHaveBeenCalled();
+  });
+
   it('handleCreateTask surfaces a backend rejection from the dedicated compute endpoint', async () => {
     mockCreateComputeExperiment.mockRejectedValue(new Error('spend cap exceeds approval threshold'));
     const addToast = vi.fn();
@@ -975,5 +1060,56 @@ describe('useTaskModal', () => {
       expect.stringContaining('spend cap exceeds approval threshold'),
       'error',
     );
+  });
+
+  it('handleCreateTask sends require_live_release when requireLiveRelease is set', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        requireLiveRelease: true,
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body.require_live_release).toBe(true);
+  });
+
+  it('handleCreateTask omits require_live_release when requireLiveRelease is false', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body).not.toHaveProperty('require_live_release');
   });
 });

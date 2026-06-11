@@ -31,6 +31,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
     buildFileTree: vi.fn().mockReturnValue(''),
     readClaudeMd: vi.fn().mockReturnValue(''),
     writePlaybookHelper: vi.fn(),
+    writeMessagesHelper: vi.fn(),
     configureAgentPermissions: vi.fn().mockReturnValue(['Write', 'Edit', 'NotebookEdit']),
   };
 });
@@ -79,7 +80,7 @@ vi.mock('../telemetry.js', async (importOriginal) => {
 import fs from 'fs';
 import { handleDesign, groundDesignCitations } from './design.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
-import { configureAgentPermissions } from '../prompt.js';
+import { configureAgentPermissions, writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
@@ -208,6 +209,20 @@ describe('handleDesign', () => {
     const disallowed = vi.mocked(runClaudeCode).mock.calls[0][5] as string[];
     expect(disallowed).toContain('Write');
     expect(disallowed).toContain('Edit');
+  });
+
+  it('provisions messages helper alongside playbook helper for the design workspace', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Both helpers must be provisioned so the agent can escalate blockers and
+    // persist collective memory during a codebase-grounded design session.
+    expectCalledWith(writePlaybookHelper, TASK_ID);
+    expectCalledWith(writeMessagesHelper, TASK_ID);
   });
 
   it('injects a Prior Knowledge section with prior-doc ids/titles/summaries when docs exist', async () => {

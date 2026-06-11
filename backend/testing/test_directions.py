@@ -119,6 +119,55 @@ async def test_get_directions_empty(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
+async def test_get_directions_includes_proof_enriched_problem_model(
+    client: AsyncClient, db_session, mocker
+):
+    """Directions payload carries proof annotations for the operator view."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project_id = await _deploy_project(client, mocker)
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    project.problem_model = {
+        "revision": 11,
+        "capabilities": [
+            {"name": "language-aware repo map", "status": "working"},
+            {"name": "claimed only capability", "status": "planned"},
+        ],
+    }
+    flag_modified(project, "problem_model")
+    project.capability_proof_records = {
+        "language-aware repo map": [
+            {
+                "task_id": "task-proof-2",
+                "proved_at": "2026-06-09T01:02:03Z",
+                "proof_kind": "downstream_artifact",
+                "proof_ref": "knowledge-document-123",
+                "commit_sha": "fedcba987654",
+            }
+        ]
+    }
+    flag_modified(project, "capability_proof_records")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    data = resp.json()
+    caps = data["problem_model"]["capabilities"]
+    assert caps[0]["proof_status"] == "proven"
+    assert caps[0]["proof_records"][0]["proof_kind"] == "downstream_artifact"
+    assert caps[0]["proof_records"][0]["proof_ref"] == "knowledge-document-123"
+    assert caps[0]["proof_records"][0]["commit_sha"] == "fedcba987654"
+    assert caps[0]["proof_records"][0]["proved_at"] == "2026-06-09T01:02:03Z"
+    assert caps[1]["proof_status"] == "unproven"
+    assert "proof_records" not in caps[1]
+
+
+@pytest.mark.asyncio
 async def test_create_direction(client: AsyncClient, mocker):
     """POST creates a direction with an auto-generated id and default active status."""
     project_id = await _deploy_project(client, mocker)

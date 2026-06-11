@@ -7,6 +7,7 @@ import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import { formatMergeGateSummary } from '../utils/mergeGateSummary';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
+import { BootstrapStatusPanel } from './BootstrapStatusPanel';
 import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, cancelProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
 
 export type { Project } from '../types/project';
@@ -23,6 +24,7 @@ interface ProjectDashboardProps {
   onNewProject?: () => void;
   onOpenSetupGuide?: (projectId: string) => void;
   onNavigateToTask?: (taskId: string) => void;
+  onLaunchCompute?: () => void;
   /** Called after a project is successfully deleted, so the parent can refetch
    *  the project list and clear any selection pointing at the removed project. */
   onProjectDeleted?: (projectId: string) => void;
@@ -131,7 +133,86 @@ function getMergeGateBadge(project: Project) {
   };
 }
 
-export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onNavigateToTask, onProjectDeleted, onProjectReset, onProjectCancelled, onProjectPaused, onProjectArchived, onProjectUnarchived, dataStale }: ProjectDashboardProps) {
+function formatEvidenceDate(value: string | undefined): string {
+  return value ? formatAbsolute(parseTimestamp(value).getTime()) : 'No proof timestamp';
+}
+
+function formatLift(lift: number | null | undefined): string {
+  if (lift == null) return 'Lift —';
+  return `Lift ${lift >= 0 ? '+' : ''}${lift.toFixed(3)}`;
+}
+
+function getVerdictClasses(verdict: string | undefined): string {
+  if (verdict === 'adopt') return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/20';
+  if (verdict === 'reject') return 'bg-red-500/15 text-red-300 border-red-500/20';
+  return 'bg-amber-500/15 text-amber-300 border-amber-500/20';
+}
+
+function renderThresholds(thresholds: NonNullable<Project['capability_adoption_verdicts']>[string]['thresholds'] | undefined): string {
+  if (!thresholds) return 'Thresholds —';
+  const parts = [
+    thresholds.min_n_per_arm != null ? `min n/arm ${thresholds.min_n_per_arm}` : null,
+    thresholds.adopt_lift != null ? `adopt ${thresholds.adopt_lift}` : null,
+    thresholds.reject_lift != null ? `reject ${thresholds.reject_lift}` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? `Thresholds: ${parts.join(' · ')}` : 'Thresholds —';
+}
+
+function CapabilityEvidencePanel({ project }: { project: Project }) {
+  const proofSummary = project.capability_proof_summary ?? {};
+  const verdicts = project.capability_adoption_verdicts ?? {};
+  const capabilities = Array.from(new Set([...Object.keys(proofSummary), ...Object.keys(verdicts)])).sort();
+
+  return (
+    <section className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
+      <h3 className="mb-3 text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Capability Evidence</h3>
+      {capabilities.length === 0 ? (
+        <div className="rounded-lg border border-neutral-800/70 bg-neutral-900/40 px-3 py-4 text-[11px] text-neutral-500">No capability proof or adoption evidence recorded for this project yet.</div>
+      ) : (
+        <div className="divide-y divide-neutral-800/60 rounded-lg border border-neutral-800/70 bg-neutral-900/40">
+          {capabilities.map(capability => {
+            const proof = proofSummary[capability];
+            const verdict = verdicts[capability];
+            return (
+              <div key={capability} className="grid gap-2 px-3 py-3 md:grid-cols-[minmax(0,1fr)_minmax(260px,auto)]">
+                <div className="min-w-0">
+                  <div className="font-mono text-xs text-neutral-200 break-words">{capability}</div>
+                  {proof ? (
+                    <div className="mt-1 text-[10px] text-neutral-400">
+                      <span className="tabular-nums text-neutral-300">{proof.proof_count} {proof.proof_count === 1 ? 'proof' : 'proofs'}</span>
+                      <span className="mx-1.5 text-neutral-700">·</span>Kind <span className="text-neutral-300">{proof.latest_proof_kind ?? 'unknown'}</span>
+                      <span className="mx-1.5 text-neutral-700">·</span><span className="text-neutral-300">{formatEvidenceDate(proof.latest_proved_at)}</span>
+                      <span className="mx-1.5 text-neutral-700">·</span>SHA <span className="font-mono text-neutral-300">{proof.latest_commit_sha ?? 'unknown'}</span>
+                    </div>
+                  ) : (
+                    <div className="mt-1 text-[10px] text-amber-300">no proof yet</div>
+                  )}
+                </div>
+                <div className="min-w-0 md:text-right">
+                  <span className={`inline-flex rounded border px-2 py-1 text-[10px] font-semibold ${getVerdictClasses(verdict?.verdict)}`}>
+                    {verdict?.verdict ?? 'no active/adjudicated trial'}
+                  </span>
+                  {verdict ? (
+                    <div className="mt-1 text-[10px] text-neutral-400">
+                      <span className="tabular-nums text-neutral-300">{formatLift(verdict.lift)}</span>
+                      <span className="mx-1.5 text-neutral-700">·</span><span className="tabular-nums text-neutral-300">Samples {verdict.n_with ?? 0} with / {verdict.n_without ?? 0} without</span>
+                      <span className="mx-1.5 text-neutral-700">·</span><span className="text-neutral-300">{renderThresholds(verdict.thresholds)}</span>
+                      {verdict.evaluated_at && <><span className="mx-1.5 text-neutral-700">·</span>Evaluated <span className="text-neutral-300">{formatEvidenceDate(verdict.evaluated_at)}</span></>}
+                    </div>
+                  ) : (
+                    <div className="mt-1 text-[10px] text-neutral-500">no active/adjudicated trial</div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onNavigateToTask, onLaunchCompute, onProjectDeleted, onProjectReset, onProjectCancelled, onProjectPaused, onProjectArchived, onProjectUnarchived, dataStale }: ProjectDashboardProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const stored = localStorage.getItem('projectDashboardCollapsed');
     return stored === null ? true : stored === 'true';
@@ -796,7 +877,9 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
               />
             </div>
           )}
-          {selectedProject && <ComputeJobsPanel projectId={selectedProject.id} onNavigateToTask={onNavigateToTask} />}
+          {selectedProject && <CapabilityEvidencePanel project={selectedProject} />}
+          {selectedProject && <BootstrapStatusPanel project={selectedProject} tasks={tasks} />}
+          {selectedProject && <ComputeJobsPanel projectId={selectedProject.id} onNavigateToTask={onNavigateToTask} onLaunchCompute={onLaunchCompute} />}
         </>
       )}
 

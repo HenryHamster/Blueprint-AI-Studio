@@ -8,9 +8,11 @@ import pytest
 from app.models import (
     TaskStatus,
     ReleaseVersion,
+    StrategicCycle,
 )
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
+    compute_problem_model_gc_health,
     _compute_first_attempt_breakdowns,
     _compute_first_review_approval_breakdowns,
     _compute_non_code_outcomes,
@@ -29,8 +31,11 @@ from app.digest_metrics import (
     compute_recurring_error_clusters,
     compute_release_qualifier_infra_metrics,
     compute_retry_analytics,
+    compute_research_output_quality,
+    compute_safeguard_shadow_metrics,
     compute_scope_mismatch_summary,
     compute_task_type_cost_adherence,
+    compute_trial_arm_accumulation,
 )
 from app.failure_classification import ALL_FAILURE_CLASSES
 from app.sr_review_quality_metrics import (
@@ -1436,6 +1441,32 @@ def test_compute_digest_cost_economics_includes_compute_job_spend():
     assert result["daily_vm_cost_usd"] == expected_vm
     assert result["daily_compute_cost_usd"] == 2.5
     assert result["daily_cost_usd"] == round(expected_vm + 2.5, 2)
+
+
+def test_compute_digest_cost_economics_includes_running_vm():
+    """An in-flight task (vm_stopped_at=None, vm_provisioned_at today) contributes
+    to daily_vm_cost_usd estimated to now rather than being treated as zero."""
+    now = _utcnow()
+    # Task provisioned 1 hour ago, still running (no vm_stopped_at)
+    running_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+        vm_spot=False,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=None,
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[running_task],
+        direction_progress_list=[],
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # 1 hour on-demand e2-standard-2 estimated to now ≈ $0.067
+    assert result["daily_vm_cost_usd"] > 0.0, (
+        "In-flight VM with vm_stopped_at=None should contribute to daily_vm_cost_usd"
+    )
+    assert result["daily_vm_cost_usd"] == pytest.approx(0.067, abs=0.005)
 
 
 def test_compute_digest_cost_economics_spot_on_demand_split():
@@ -4311,6 +4342,411 @@ def test_first_attempt_breakdowns_verified_overall_no_measured_is_none():
     assert result["verified_overall"] is None
 
 
+def test_first_attempt_breakdowns_playbook_lift():
+    """playbook and arch-context lifts are named, guarded deltas with trends."""
+    def mk(s, pb=None, arch=None):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_succeeded": s,
+                **({"_had_playbook": pb} if pb is not None else {}),
+                **({"_had_arch_context": arch} if arch is not None else {}),
+            },
+        )
+
+    def tasks(spec):
+        return [mk(s, **flags) for s, count, flags in spec for _ in range(count)]
+
+    result = _compute_first_attempt_breakdowns(
+        tasks(
+            [
+                (True, 8, {"pb": True}),
+                (False, 2, {"pb": True}),
+                (True, 5, {"pb": False}),
+                (False, 5, {"pb": False}),
+                (True, 7, {"arch": True}),
+                (False, 3, {"arch": True}),
+                (True, 4, {"arch": False}),
+                (False, 6, {"arch": False}),
+            ]
+        ),
+        prev_terminal_tasks=tasks(
+            [
+                (True, 6, {"pb": True}),
+                (False, 4, {"pb": True}),
+                (True, 5, {"pb": False}),
+                (False, 5, {"pb": False}),
+                (True, 5, {"arch": True}),
+                (False, 5, {"arch": True}),
+                (True, 4, {"arch": False}),
+                (False, 6, {"arch": False}),
+            ]
+        ),
+    )
+    assert result["playbook_lift"] == 0.3
+    assert result["playbook_lift_trend"] == "improving"
+    assert result["arch_context_lift"] == 0.3
+    assert result["arch_context_lift_trend"] == "improving"
+    assert (
+        _compute_first_attempt_breakdowns(
+            [mk(True, pb=True) for _ in range(9)]
+            + [mk(False, pb=False) for _ in range(9)]
+            + [mk(True, arch=True) for _ in range(10)]
+            + [mk(False, arch=False) for _ in range(9)]
+        )["playbook_lift"]
+        is None
+    )
+    assert (
+        _compute_first_attempt_breakdowns(
+            [mk(True, pb=True) for _ in range(9)]
+            + [mk(False, pb=False) for _ in range(9)]
+            + [mk(True, arch=True) for _ in range(10)]
+            + [mk(False, arch=False) for _ in range(9)]
+        )["arch_context_lift"]
+        is None
+    )
+
+# ── _compute_first_attempt_breakdowns: repo-map breakdowns ──────────────────
+
+
+def _fa_rm_task(*, succeeded: bool, had_repo_map: bool | None) -> object:
+    """Task fixture for repo-map breakdown tests."""
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if had_repo_map is not None:
+        ctx["_had_repo_map"] = had_repo_map
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_with_without_repo_map_rates():
+    """with_repo_map and without_repo_map rates are computed from _had_repo_map flag."""
+    tasks = [
+        _fa_rm_task(succeeded=True, had_repo_map=True),
+        _fa_rm_task(succeeded=True, had_repo_map=True),
+        _fa_rm_task(succeeded=False, had_repo_map=False),
+        _fa_rm_task(succeeded=False, had_repo_map=False),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_repo_map"] == 1.0
+    assert result["without_repo_map"] == 0.0
+    # Both arms have < 5 tasks, so lift should be None
+    assert result["repo_map_lift"] is None
+
+
+def test_first_attempt_breakdowns_repo_map_lift_computed_with_enough_samples():
+    """repo_map_lift is the difference when both arms have >= 5 samples."""
+    tasks = (
+        [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+        + [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_repo_map"] == 1.0
+    assert result["without_repo_map"] == 0.0
+    assert result["repo_map_lift"] == 1.0
+
+
+def test_first_attempt_breakdowns_repo_map_lift_none_when_one_arm_empty():
+    """repo_map_lift is None when one arm has no tasks."""
+    tasks = [_fa_rm_task(succeeded=True, had_repo_map=True)] * 6
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_repo_map"] == 1.0
+    assert result["without_repo_map"] is None
+    assert result["repo_map_lift"] is None
+
+
+def test_first_attempt_breakdowns_repo_map_no_flag_not_counted():
+    """Tasks without _had_repo_map do not appear in either arm."""
+    tasks = [
+        _fa_rm_task(succeeded=True, had_repo_map=None),
+        _fa_rm_task(succeeded=False, had_repo_map=None),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_repo_map"] is None
+    assert result["without_repo_map"] is None
+    assert result["repo_map_lift"] is None
+
+
+def _fa_section_task(*, succeeded: bool, flag_key: str, flag_val: bool | None) -> object:
+    """Task fixture for prompt-section breakdown tests."""
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if flag_val is not None:
+        ctx[flag_key] = flag_val
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_module_interfaces_rates():
+    """with/without_module_interfaces rates computed from _had_module_interfaces flag."""
+    tasks = [
+        _fa_section_task(succeeded=True, flag_key="_had_module_interfaces", flag_val=True),
+        _fa_section_task(succeeded=True, flag_key="_had_module_interfaces", flag_val=True),
+        _fa_section_task(succeeded=False, flag_key="_had_module_interfaces", flag_val=False),
+        _fa_section_task(succeeded=False, flag_key="_had_module_interfaces", flag_val=False),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_module_interfaces"] == 1.0
+    assert result["without_module_interfaces"] == 0.0
+
+
+def test_first_attempt_breakdowns_related_tests_rates():
+    """with/without_related_tests rates computed from _had_related_tests flag."""
+    tasks = [
+        _fa_section_task(succeeded=True, flag_key="_had_related_tests", flag_val=True),
+        _fa_section_task(succeeded=False, flag_key="_had_related_tests", flag_val=False),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_related_tests"] == 1.0
+    assert result["without_related_tests"] == 0.0
+
+
+def test_first_attempt_breakdowns_affected_consumers_rates():
+    """with/without_affected_consumers rates computed from _had_affected_consumers flag."""
+    tasks = [
+        _fa_section_task(succeeded=True, flag_key="_had_affected_consumers", flag_val=True),
+        _fa_section_task(succeeded=False, flag_key="_had_affected_consumers", flag_val=False),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_affected_consumers"] == 1.0
+    assert result["without_affected_consumers"] == 0.0
+
+
+def test_first_attempt_breakdowns_section_flags_no_flag_not_counted():
+    """Tasks without section flags do not appear in either arm."""
+    tasks = [
+        _fa_section_task(succeeded=True, flag_key="_had_module_interfaces", flag_val=None),
+        _fa_section_task(succeeded=False, flag_key="_had_related_tests", flag_val=None),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["with_module_interfaces"] is None
+    assert result["without_module_interfaces"] is None
+    assert result["with_related_tests"] is None
+    assert result["without_related_tests"] is None
+
+
+def test_first_attempt_breakdowns_repo_map_lift_computed_with_enough_samples_via_definitions():
+    """repo_map_lift is computed via the definition-driven path when both arms have >= 5 samples."""
+    tasks = (
+        [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+        + [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["trial_breakdowns"]["repo_map"]["lift"] == 1.0
+    assert result["trial_breakdowns"]["repo_map"]["with_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["without_n"] == 5
+    # Flat alias keys remain for backward compatibility.
+    assert result["repo_map_lift"] == 1.0
+    assert result["with_repo_map_n"] == 5
+    assert result["without_repo_map_n"] == 5
+
+
+def test_first_attempt_breakdowns_trial_breakdowns_key_present():
+    """trial_breakdowns sub-dict is present and contains per-cap keys."""
+    tasks = (
+        [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+        + [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert "trial_breakdowns" in result
+    bd = result["trial_breakdowns"]["repo_map"]
+    assert "lift" in bd
+    assert "with_n" in bd
+    assert "without_n" in bd
+    assert "with_rate" in bd
+    assert "without_rate" in bd
+
+
+def test_first_attempt_breakdowns_legacy_keys_still_present():
+    """Flat legacy keys repo_map_lift / with_repo_map_n / without_repo_map_n remain."""
+    tasks = [_fa_rm_task(succeeded=True, had_repo_map=True)] * 3
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert "repo_map_lift" in result
+    assert "with_repo_map_n" in result
+    assert "without_repo_map_n" in result
+    assert "with_repo_map" in result
+    assert "without_repo_map" in result
+
+
+def _fa_test_cap_task(*, succeeded: bool, had_test_cap: bool | None) -> object:
+    """Task fixture for synthetic test_cap trial definition tests."""
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if had_test_cap is not None:
+        ctx["_had_test_cap"] = had_test_cap
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_second_trial_definition_independent():
+    """A second trial definition produces its own lift keys without affecting repo_map."""
+    _test_cap_def = {
+        "cap_name": "test_cap",
+        "context_key": "_had_test_cap",
+        "thresholds": {"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03},
+    }
+    tasks = (
+        [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+        + [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+        + [_fa_test_cap_task(succeeded=True, had_test_cap=True)] * 5
+        + [_fa_test_cap_task(succeeded=False, had_test_cap=False)] * 5
+    )
+    from app.capability_trial_verdict import get_trial_definitions
+    combined_defs = get_trial_definitions() + [_test_cap_def]
+    result = _compute_first_attempt_breakdowns(tasks, trial_definitions=combined_defs)
+    # repo_map arm still correct
+    assert result["trial_breakdowns"]["repo_map"]["lift"] == 1.0
+    # test_cap arm independently computed — lift is None because < 5 pure test_cap tasks
+    # in each arm (mixed-context tasks don't contribute to both arms)
+    assert "test_cap" in result["trial_breakdowns"]
+    # Flat keys generated for test_cap
+    assert "test_cap_lift" in result
+    assert "with_test_cap_n" in result
+    assert "without_test_cap_n" in result
+
+
+def test_first_attempt_breakdowns_existing_playbook_keys_unaffected():
+    """Adding repo-map keys does not remove or alter the existing playbook keys."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_first_attempt_succeeded": True, "_had_playbook": True},
+        ),
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_first_attempt_succeeded": False, "_had_playbook": False},
+        ),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert "with_playbook" in result
+    assert "without_playbook" in result
+    assert result["with_playbook"] == 1.0
+    assert result["without_playbook"] == 0.0
+    # New keys present
+    assert "with_repo_map" in result
+    assert "without_repo_map" in result
+    assert "repo_map_lift" in result
+    assert "with_module_interfaces" in result
+    assert "without_module_interfaces" in result
+    assert "with_related_tests" in result
+    assert "without_related_tests" in result
+    assert "with_affected_consumers" in result
+    assert "without_affected_consumers" in result
+
+
+# ── _compute_first_attempt_breakdowns: repo-map assignment (intent-to-treat) ─
+
+
+def _fa_rm_arm_task(
+    *, succeeded: bool, repo_map_arm: bool | None, had_repo_map: bool | None
+) -> object:
+    """Task fixture for repo-map assignment-vs-receipt tests."""
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if repo_map_arm is not None:
+        ctx["_repo_map_arm"] = repo_map_arm
+    if had_repo_map is not None:
+        ctx["_had_repo_map"] = had_repo_map
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_repo_map_assignment_not_receipt():
+    """Intent-to-treat: treatment arm uses _repo_map_arm assignment, not _had_repo_map receipt.
+
+    A task assigned to treatment (_repo_map_arm=True) but with no actual map
+    (_had_repo_map=False) counts in the treatment arm for lift purposes.
+    """
+    # 5 treatment-assigned tasks: all succeeded, but only 4 actually got the map
+    treatment_tasks = (
+        [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=True)] * 4
+        + [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=False)] * 1
+    )
+    # 5 holdback-assigned tasks: none succeeded
+    holdback_tasks = [
+        _fa_rm_arm_task(succeeded=False, repo_map_arm=False, had_repo_map=False)
+    ] * 5
+    tasks = treatment_tasks + holdback_tasks
+    result = _compute_first_attempt_breakdowns(tasks)
+    # Treatment arm should have 5 (assigned), not 4 (received)
+    assert result["trial_breakdowns"]["repo_map"]["with_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["without_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["with_rate"] == 1.0
+    assert result["trial_breakdowns"]["repo_map"]["without_rate"] == 0.0
+    assert result["repo_map_lift"] == 1.0
+    # Flat alias keys preserved
+    assert result["with_repo_map_n"] == 5
+    assert result["without_repo_map_n"] == 5
+
+
+def test_first_attempt_breakdowns_repo_map_legacy_fallback():
+    """Legacy tasks without _repo_map_arm fall back to _had_repo_map for arm assignment."""
+    legacy_with = [_fa_rm_task(succeeded=True, had_repo_map=True)] * 5
+    legacy_without = [_fa_rm_task(succeeded=False, had_repo_map=False)] * 5
+    result = _compute_first_attempt_breakdowns(legacy_with + legacy_without)
+    assert result["trial_breakdowns"]["repo_map"]["with_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["without_n"] == 5
+    assert result["repo_map_lift"] == 1.0
+
+
+def test_first_attempt_breakdowns_repo_map_assignment_overrides_receipt():
+    """When _repo_map_arm is present it wins over _had_repo_map for arm assignment."""
+    # Task assigned to holdback (_repo_map_arm=False) but had a map anyway
+    # (could happen if the trial was reconfigured mid-run). Should count as holdback.
+    holdback_with_map = _fa_rm_arm_task(
+        succeeded=True, repo_map_arm=False, had_repo_map=True
+    )
+    # 5 treatment tasks + 5 holdback tasks to pass the min-sample gate
+    treatment_tasks = [
+        _fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=True)
+    ] * 5
+    holdback_tasks = [holdback_with_map] + [
+        _fa_rm_arm_task(succeeded=False, repo_map_arm=False, had_repo_map=False)
+    ] * 4
+    result = _compute_first_attempt_breakdowns(treatment_tasks + holdback_tasks)
+    assert result["trial_breakdowns"]["repo_map"]["with_n"] == 5
+    assert result["trial_breakdowns"]["repo_map"]["without_n"] == 5
+
+
+def test_first_attempt_breakdowns_repo_map_compliance_subdict_present():
+    """compliance sub-dict is present in trial_breakdowns['repo_map'] when assignment key differs."""
+    tasks = (
+        [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=True)] * 4
+        + [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=False)] * 1
+        + [_fa_rm_arm_task(succeeded=False, repo_map_arm=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    bd = result["trial_breakdowns"]["repo_map"]
+    assert "compliance" in bd
+    # 4 of 5 treatment tasks had the map → 80%
+    assert bd["compliance"]["with_rate"] == 0.8
+    # 1 of 5 treatment tasks did NOT have the map → 20%
+    assert bd["compliance"]["without_rate"] == 0.2
+
+
+def test_first_attempt_breakdowns_repo_map_compliance_all_compliant():
+    """compliance.with_rate is 1.0 when all treatment-arm tasks received the map."""
+    tasks = (
+        [_fa_rm_arm_task(succeeded=True, repo_map_arm=True, had_repo_map=True)] * 5
+        + [_fa_rm_arm_task(succeeded=False, repo_map_arm=False, had_repo_map=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    bd = result["trial_breakdowns"]["repo_map"]
+    assert bd["compliance"]["with_rate"] == 1.0
+    assert bd["compliance"]["without_rate"] == 0.0
+
+
 # ── Migration-serialization slot contention ─────────────────────────────────
 
 
@@ -4727,6 +5163,88 @@ def test_compute_format_compliance_metrics_by_type_trend():
     assert fix["trend"] is None
 
 
+def test_format_compliance_metrics_by_schema_aggregation():
+    """Tasks with per-schema maps produce correctly merged by_schema in the block."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 1,
+                "format_miss_by_schema": {"ResearchPlan": 1},
+                "format_repair_attempts_by_schema": {"ResearchPlan": 2},
+                "format_repair_successes_by_schema": {"ResearchPlan": 1},
+            },
+        ),
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 0,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+                "format_miss_by_schema": {"StructuredVerdict": 0},
+                "format_repair_attempts_by_schema": {"ResearchPlan": 1, "StructuredVerdict": 1},
+                "format_repair_successes_by_schema": {"ResearchPlan": 1, "StructuredVerdict": 1},
+            },
+        ),
+    ]
+    result = compute_format_compliance_metrics(tasks)
+    overall = result["overall"]
+
+    assert overall["tasks_measured"] == 2
+    by_schema = overall["by_schema"]
+
+    assert by_schema["ResearchPlan"]["format_miss"] == 1
+    assert by_schema["ResearchPlan"]["repair_attempts"] == 3
+    assert by_schema["ResearchPlan"]["repair_successes"] == 2
+
+    assert by_schema["StructuredVerdict"]["format_miss"] == 0
+    assert by_schema["StructuredVerdict"]["repair_attempts"] == 1
+    assert by_schema["StructuredVerdict"]["repair_successes"] == 1
+
+
+def test_format_compliance_metrics_mixed_old_new_agents():
+    """Tasks with and without by-schema maps both contribute to scalar totals
+    but only new-agent tasks contribute to by_schema."""
+    old_agent_task = _fc_task(
+        "create",
+        {
+            "format_error_total": 1,
+            "format_repair_attempts": 1,
+            "format_repair_successes": 0,
+            # No per-schema maps (old agent)
+        },
+    )
+    new_agent_task = _fc_task(
+        "create",
+        {
+            "format_error_total": 0,
+            "format_repair_attempts": 1,
+            "format_repair_successes": 1,
+            "format_miss_by_schema": {},
+            "format_repair_attempts_by_schema": {"ResearchPlan": 1},
+            "format_repair_successes_by_schema": {"ResearchPlan": 1},
+        },
+    )
+    result = compute_format_compliance_metrics([old_agent_task, new_agent_task])
+    overall = result["overall"]
+
+    # Both tasks contribute to scalar totals.
+    assert overall["tasks_measured"] == 2
+    assert overall["repair_attempts"] == 2
+    assert overall["repair_successes"] == 1
+
+    # Only new-agent task contributes to by_schema.
+    by_schema = overall["by_schema"]
+    assert "ResearchPlan" in by_schema
+    assert by_schema["ResearchPlan"]["repair_attempts"] == 1
+
+    # Empty by_schema when no tasks carry per-schema data.
+    result_old_only = compute_format_compliance_metrics([old_agent_task])
+    assert result_old_only["overall"]["by_schema"] == {}
+
+
 # ── Park/wake operational health (feat: surface park/wake health) ────────────
 
 
@@ -5018,3 +5536,427 @@ async def test_park_wake_health_timeout_by_cause_breakdown(db_session):
     # The non-park_wake_timeout task must not contribute to any cause bucket.
     total = sum(by_cause.values())
     assert total == 3, f"expected 3 total timeout tasks; got {total} in {by_cause}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# compute_safeguard_shadow_metrics
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _make_shadow_task(outcome: str | None) -> object:
+    """Return a minimal Task-like object with the given safeguard_observe_verdict."""
+    from app.task_evaluators import SAFEGUARD_OBSERVE_VERDICT_KEY
+
+    ctx: dict = {}
+    if outcome is not None:
+        ctx[SAFEGUARD_OBSERVE_VERDICT_KEY] = {"outcome": outcome, "reasoning": "test"}
+
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "security_audit", "base_branch": "main"}],
+        context=ctx,
+    )
+    return task
+
+
+def test_compute_safeguard_shadow_metrics_empty():
+    """No tasks → all zero counts and None rate."""
+    result = compute_safeguard_shadow_metrics([])
+    assert result["observed_blocks"] == 0
+    assert result["would_release"] == 0
+    assert result["confirmed"] == 0
+    assert result["unavailable"] == 0
+    assert result["false_positive_rate"] is None
+    assert result["cap_reached"] is False
+
+
+def test_compute_safeguard_shadow_metrics_no_shadow_verdicts():
+    """Tasks without a shadow verdict are ignored."""
+    tasks = [
+        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "security_audit"}]),
+        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "security_audit"}]),
+    ]
+    result = compute_safeguard_shadow_metrics(tasks)
+    assert result["observed_blocks"] == 0
+    assert result["false_positive_rate"] is None
+
+
+def test_compute_safeguard_shadow_metrics_counts_outcomes():
+    """Correctly tallies rejected/confirmed/unavailable shadow verdicts."""
+    tasks = [
+        _make_shadow_task("rejected"),
+        _make_shadow_task("downgraded"),
+        _make_shadow_task("confirmed"),
+        _make_shadow_task("unavailable"),
+        _make_shadow_task("rejected"),
+    ]
+    result = compute_safeguard_shadow_metrics(tasks)
+    assert result["observed_blocks"] == 5
+    assert result["would_release"] == 3, "rejected + downgraded + rejected"
+    assert result["confirmed"] == 1
+    assert result["unavailable"] == 1
+    assert result["false_positive_rate"] == round(3 / 5, 3)
+    assert result["cap_reached"] is False
+
+
+def test_compute_safeguard_shadow_metrics_false_positive_rate():
+    """false_positive_rate is would_release / observed_blocks."""
+    tasks = [_make_shadow_task("rejected"), _make_shadow_task("confirmed")]
+    result = compute_safeguard_shadow_metrics(tasks)
+    assert result["false_positive_rate"] == 0.5
+
+
+def test_compute_safeguard_shadow_metrics_cap_reached():
+    """When task count exceeds _SAFEGUARD_SHADOW_CAP the cap_reached flag is set."""
+    from app.digest_metrics import _SAFEGUARD_SHADOW_CAP
+
+    tasks = [_make_shadow_task("confirmed") for _ in range(_SAFEGUARD_SHADOW_CAP + 5)]
+    result = compute_safeguard_shadow_metrics(tasks)
+    assert result["cap_reached"] is True
+    assert result["observed_blocks"] == _SAFEGUARD_SHADOW_CAP
+
+
+# ---------------------------------------------------------------------------
+# compute_research_output_quality
+# ---------------------------------------------------------------------------
+
+def _make_research_task(
+    surviving: int | None = None,
+    findings: list | None = None,
+    challenge_records: list | None = None,
+) -> object:
+    """Build a minimal research Task fixture for output-quality tests."""
+    ctx = {}
+    if surviving is not None:
+        ctx["research_surviving_findings"] = surviving
+    if challenge_records is not None:
+        ctx["finding_challenge_records"] = challenge_records
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context=ctx,
+        plan_output=findings,
+    )
+
+
+def test_compute_research_output_quality_returns_none_no_research_tasks():
+    """No research tasks → None."""
+    tasks = [
+        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}]),
+        make_task(status=TaskStatus.FAILED, payloads=[{"type": "fix"}]),
+    ]
+    assert compute_research_output_quality(tasks) is None
+
+
+def test_compute_research_output_quality_returns_none_missing_survival_key():
+    """Research tasks without research_surviving_findings in context are skipped."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={},
+            plan_output=[{"title": "F1", "verification_basis": "deduced"}],
+        )
+    ]
+    assert compute_research_output_quality(tasks) is None
+
+
+def test_compute_research_output_quality_returns_none_empty_plan_output():
+    """Research tasks with empty plan_output are skipped."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"research_surviving_findings": 2},
+            plan_output=[],
+        )
+    ]
+    assert compute_research_output_quality(tasks) is None
+
+
+def test_compute_research_output_quality_surviving_rate():
+    """surviving_rate is the mean of per-task (surviving / total_findings) ratios."""
+    # task1: 2 surviving out of 4 findings → ratio 0.5
+    task1 = _make_research_task(
+        surviving=2,
+        findings=[
+            {"title": f"F{i}", "verification_basis": "deduced"} for i in range(4)
+        ],
+    )
+    # task2: 3 surviving out of 3 findings → ratio 1.0
+    task2 = _make_research_task(
+        surviving=3,
+        findings=[
+            {"title": f"G{i}", "verification_basis": "deduced"} for i in range(3)
+        ],
+    )
+    result = compute_research_output_quality([task1, task2])
+    assert result is not None
+    assert result["qualifying_task_count"] == 2
+    # mean(0.5, 1.0) = 0.75
+    assert result["surviving_rate"] == 0.75
+
+
+def test_compute_research_output_quality_challenge_agreement_rate():
+    """challenge_agreement_rate = agrees / (agrees + disagrees + indeterminate)."""
+    records = [
+        {"agreement": "agrees"},
+        {"agreement": "agrees"},
+        {"agreement": "disagrees"},
+        {"agreement": "indeterminate"},
+    ]
+    task = _make_research_task(
+        surviving=1,
+        findings=[{"title": "F1", "verification_basis": "deduced"}],
+        challenge_records=records,
+    )
+    result = compute_research_output_quality([task])
+    assert result is not None
+    assert result["challenge_agrees"] == 2
+    assert result["challenge_disagrees"] == 1
+    assert result["challenge_indeterminate"] == 1
+    assert result["challenge_total"] == 4
+    assert result["challenge_agreement_rate"] == round(2 / 4, 3)
+
+
+def test_compute_research_output_quality_challenge_agreement_rate_none_when_no_records():
+    """challenge_agreement_rate is None when no challenge records exist."""
+    task = _make_research_task(
+        surviving=1,
+        findings=[{"title": "F1", "verification_basis": "deduced"}],
+        challenge_records=[],
+    )
+    result = compute_research_output_quality([task])
+    assert result is not None
+    assert result["challenge_agreement_rate"] is None
+    assert result["challenge_total"] == 0
+
+
+def test_compute_research_output_quality_verification_basis_distribution():
+    """verification_basis_distribution counts each tier across all dispatched findings."""
+    findings = [
+        {"title": "A", "verification_basis": "code_verified"},
+        {"title": "B", "verification_basis": "path_verified"},
+        {"title": "C", "verification_basis": "pattern_inferred"},
+        {"title": "D", "verification_basis": "deduced"},
+        {"title": "E", "verification_basis": "deduced"},
+    ]
+    task = _make_research_task(surviving=3, findings=findings)
+    result = compute_research_output_quality([task])
+    assert result is not None
+    dist = result["verification_basis_distribution"]
+    assert dist["code_verified"] == 1
+    assert dist["path_verified"] == 1
+    assert dist["pattern_inferred"] == 1
+    assert dist["deduced"] == 2
+
+
+def test_compute_research_output_quality_skips_non_dict_findings_and_unknown_basis():
+    """Non-dict findings are skipped; unknown basis values don't appear in distribution."""
+    findings = [
+        "not-a-dict",
+        {"title": "X", "verification_basis": "unknown_tier"},
+        {"title": "Y", "verification_basis": "code_verified"},
+    ]
+    task = _make_research_task(surviving=1, findings=findings)
+    result = compute_research_output_quality([task])
+    assert result is not None
+    dist = result["verification_basis_distribution"]
+    assert dist["code_verified"] == 1
+    assert "unknown_tier" not in dist
+    # Only the one dict finding counts toward total
+    assert result["qualifying_task_count"] == 1
+
+
+# ── compute_trial_arm_accumulation: arm_composition basis tracking ────────────
+
+
+@pytest.mark.asyncio
+async def test_trial_accumulation_reports_basis_composition(db_session):
+    """arm_composition breaks down each arm into assignment-keyed vs receipt-fallback.
+
+    When assignment_key != context_key, the result carries arm_composition with four
+    counters: with_assigned, with_receipt, without_assigned, without_receipt. These
+    let the verdict layer distinguish confounded legacy evidence from clean
+    intent-to-treat evidence, ensuring a decided verdict cannot silently rest on
+    fallback-receipt tasks that pre-date the deterministic holdback rollout.
+    """
+    from app.models import TaskStatus
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = _utcnow() - timedelta(days=1)
+
+    def _task(context):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=created,
+            context=context,
+        )
+
+    tasks = [
+        # Assignment-keyed WITH arm (2 tasks)
+        _task({"_repo_map_arm": True, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        _task({"_repo_map_arm": True, "_had_repo_map": False, "_first_attempt_succeeded": False}),
+        # Assignment-keyed WITHOUT arm (1 task)
+        _task({"_repo_map_arm": False, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Receipt-fallback WITH arm — legacy, no assignment key (1 task)
+        _task({"_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Receipt-fallback WITHOUT arm — legacy, no assignment key (1 task)
+        _task({"_had_repo_map": False, "_first_attempt_succeeded": False}),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        assignment_key="_repo_map_arm",
+    )
+
+    # Totals are unchanged — COALESCE-based arm partitioning covers all tasks.
+    assert accum["with_n"] == 3   # 2 assigned + 1 legacy receipt
+    assert accum["without_n"] == 2  # 1 assigned + 1 legacy receipt
+
+    # Per-basis breakdown must be present and accurate.
+    comp = accum["arm_composition"]
+    assert comp["with_assigned"] == 2
+    assert comp["with_receipt"] == 1
+    assert comp["without_assigned"] == 1
+    assert comp["without_receipt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_trial_accumulation_no_composition_without_assignment_key(db_session):
+    """When no assignment_key is provided, arm_composition is absent (receipt-only trial)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=_utcnow() - timedelta(days=1),
+        context={"_had_repo_map": True, "_first_attempt_succeeded": True},
+    ))
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        # no assignment_key
+    )
+    assert "arm_composition" not in accum
+
+
+# ── compute_problem_model_gc_health ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_problem_model_gc_health_with_mixed_cycles(db_session):
+    """Aggregates correctly: 2 cycles with telemetry, 1 old cycle without."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    def _naive_utc():
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # Newest cycle: has telemetry with gap memory trim
+    cycle1 = StrategicCycle(
+        id=str(_uuid.uuid4()),
+        project_id=project.id,
+        outcome="completed",
+        phase1_started_at=_naive_utc(),
+        cycle_metadata={
+            "model_gc_telemetry": {
+                "model_bytes": 50000,
+                "capability_count": 12,
+                "gap_count": 8,
+                "model_size_status": "healthy",
+                "directions_dropped_count": 0,
+                "problem_model_truncated": False,
+                "gap_memory_trimmed_count": 2,
+                "gap_memory_hidden_entries": 10,
+            }
+        },
+    )
+    # Second cycle: has telemetry with truncation
+    cycle2 = StrategicCycle(
+        id=str(_uuid.uuid4()),
+        project_id=project.id,
+        outcome="completed",
+        phase1_started_at=_naive_utc(),
+        cycle_metadata={
+            "model_gc_telemetry": {
+                "model_bytes": 90000,
+                "capability_count": 20,
+                "gap_count": 14,
+                "model_size_status": "oversized",
+                "directions_dropped_count": 1,
+                "problem_model_truncated": True,
+                "gap_memory_trimmed_count": 0,
+                "gap_memory_hidden_entries": 0,
+            }
+        },
+    )
+    # Third cycle: old cycle without any telemetry
+    cycle3 = StrategicCycle(
+        id=str(_uuid.uuid4()),
+        project_id=project.id,
+        outcome="completed",
+        phase1_started_at=_naive_utc(),
+        cycle_metadata={},
+    )
+    db_session.add_all([cycle1, cycle2, cycle3])
+    await db_session.commit()
+
+    result = await compute_problem_model_gc_health(db_session, project.id, limit=10)
+
+    assert result["cycles_sampled"] == 3
+    assert result["cycles_with_telemetry"] == 2
+    # latest fields come from the first row returned (newest first); since all have
+    # the same phase1_started_at the DB may return any order — check both options
+    assert result["latest_model_bytes"] in (50000, 90000)
+    assert result["latest_model_size_status"] in ("healthy", "oversized")
+    assert result["latest_capability_count"] in (12, 20)
+    assert result["latest_gap_count"] in (8, 14)
+    assert result["problem_model_truncated_cycles"] == 1
+    assert result["directions_dropped_cycles"] == 1
+    assert result["gap_memory_trimmed_cycles"] == 1
+    assert result["trend"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_problem_model_gc_health_no_cycles(db_session):
+    """Returns valid zero dict when project has no terminal cycles."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await compute_problem_model_gc_health(db_session, project.id, limit=10)
+
+    assert result["cycles_sampled"] == 0
+    assert result["cycles_with_telemetry"] == 0
+    assert result["latest_model_bytes"] is None
+    assert result["latest_model_size_status"] is None
+    assert result["latest_capability_count"] is None
+    assert result["latest_gap_count"] is None
+    assert result["problem_model_truncated_cycles"] == 0
+    assert result["directions_dropped_cycles"] == 0
+    assert result["gap_memory_trimmed_cycles"] == 0
+    assert result["trend"] == "healthy"

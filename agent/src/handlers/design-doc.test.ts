@@ -81,7 +81,7 @@ describe('handleDesignDocUpdate', () => {
     );
 
     const helperCall = vi.mocked(fs.writeFileSync).mock.calls.find(
-      c => typeof c[0] === 'string' && c[0] === '/tmp/workspace/design-doc',
+      c => typeof c[0] === 'string' && c[0].endsWith('/design-doc'),
     );
     if (!helperCall) throw new Error('design-doc helper script was not written');
     const content = helperCall[1] as string;

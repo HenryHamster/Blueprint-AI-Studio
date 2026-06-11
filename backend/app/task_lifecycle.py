@@ -343,6 +343,36 @@ async def _mark_dependents_warm_claimable(landed_task: Task) -> None:
         )
 
 
+def _resolve_adversarial_challenged_hashes(source: Task, grader: Task) -> list[str]:
+    """Return the challenged hashes for an adversarial grader completion.
+
+    Prefer the hashes persisted on the source task at park time, then the
+    grader-side copy (for crash/recovery gaps), then the legacy plan_output
+    fallback for parked sources that predate the persistence fix.
+    """
+    from app.finding_deduplication import finding_hash as _fh
+
+    _stored_hashes = (source.context or {}).get("_adversarial_challenged_hashes")
+    if isinstance(_stored_hashes, list) and _stored_hashes:
+        return [h for h in _stored_hashes if isinstance(h, str)]
+
+    _grader_hashes = (grader.context or {}).get("_adversarial_challenged_hashes")
+    if isinstance(_grader_hashes, list) and _grader_hashes:
+        return [h for h in _grader_hashes if isinstance(h, str)]
+
+    stored_findings = source.plan_output or []
+    if isinstance(stored_findings, dict):
+        stored_findings = stored_findings.get("findings") or []
+    return [
+        _fh(
+            str(f.get("title", "")),
+            str(f.get("description", "") or f.get("prompt", "")),
+        )
+        for f in stored_findings
+        if isinstance(f, dict)
+    ]
+
+
 async def _resolve_quality_grader_completion(
     grader: Task, payload: AgentStatusPayload, session: AsyncSession
 ) -> None:
@@ -368,6 +398,12 @@ async def _resolve_quality_grader_completion(
     """
     from app.task_evaluators import (
         ADVERSARIAL_GATE_VERDICT_KEY,
+        ADVERSARIAL_PARSE_CHALLENGER_FAILED,
+        ADVERSARIAL_PARSE_EMPTY_LOGS,
+        ADVERSARIAL_PARSE_INVALID_JSON,
+        ADVERSARIAL_PARSE_NO_HASH_MATCHES,
+        ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+        ADVERSARIAL_PARSE_OK,
         QUALITY_GRADER_SOURCE_KEY,
         QUALITY_GRADER_VERDICT_KEY,
         parse_adversarial_finding_verdicts,
@@ -411,41 +447,88 @@ async def _resolve_quality_grader_completion(
 
     ctx = dict(source.context or {})
     if is_adversarial:
-        from app.finding_deduplication import finding_hash as _fh
-
-        # Prefer hashes persisted at park time: these include prior_deferred
-        # findings that were prepended AFTER plan_output was written. Without
-        # this, a verdict for a recovered deferred finding is silently ignored
-        # (unknown hash) and that finding gets a fail-open pass on re-entry.
-        _stored_hashes = (source.context or {}).get("_adversarial_challenged_hashes")
-        if isinstance(_stored_hashes, list) and _stored_hashes:
-            all_hashes = [h for h in _stored_hashes if isinstance(h, str)]
-        else:
-            # Second fallback: check the grader's own context — the manifest builder
-            # stamps finding_hashes there so completion routing can recover even when
-            # the source-side post-spawn context write was lost (e.g. a crash between
-            # spawn and the subsequent source.context commit).
-            _grader_hashes = (grader.context or {}).get("_adversarial_challenged_hashes")
-            if isinstance(_grader_hashes, list) and _grader_hashes:
-                all_hashes = [h for h in _grader_hashes if isinstance(h, str)]
-            else:
-                # Final fallback for tasks parked before this fix.
-                stored_findings = source.plan_output or []
-                if isinstance(stored_findings, dict):
-                    stored_findings = stored_findings.get("findings") or []
-                all_hashes = [
-                    _fh(str(f.get("title", "")), str(f.get("description", "") or f.get("prompt", "")))
-                    for f in stored_findings
-                    if isinstance(f, dict)
-                ]
-        finding_verdicts = parse_adversarial_finding_verdicts(
+        # Prefer the source-side persisted hashes, then the grader copy written
+        # at spawn time, then the legacy plan_output reconstruction.
+        all_hashes = _resolve_adversarial_challenged_hashes(source, grader)
+        finding_verdicts, parse_outcome = parse_adversarial_finding_verdicts(
             grader_logs, all_hashes, completed=completed
         )
         failed_count = sum(1 for v in finding_verdicts.values() if not v["passed"])
-        ctx[ADVERSARIAL_GATE_VERDICT_KEY] = {
+        gate_record = {
             "finding_verdicts": finding_verdicts,
             "grader_task_id": str(grader.id),
+            "parse_outcome": parse_outcome,
         }
+        try:
+            from app.compute import get_vm_runtime_fingerprint, get_vm_source_sha
+            from app.models import PoolVm
+
+            vm_id = grader.vm_instance_id
+            if vm_id:
+                gate_record["grader_vm_instance_id"] = vm_id
+                source_sha = get_vm_source_sha(vm_id)
+                runtime_fp = get_vm_runtime_fingerprint(vm_id)
+                pool_vm = (
+                    (
+                        await session.execute(
+                            select(PoolVm).where(PoolVm.vm_instance_id == vm_id)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if pool_vm is not None:
+                    source_sha = source_sha or pool_vm.agent_source_sha
+                    runtime_fp = runtime_fp or pool_vm.agent_runtime_fingerprint
+                    if pool_vm.agent_image_name:
+                        gate_record["grader_agent_image_name"] = pool_vm.agent_image_name
+                    if pool_vm.agent_image_build_ts is not None:
+                        gate_record["grader_agent_image_build_ts"] = (
+                            pool_vm.agent_image_build_ts
+                        )
+                if source_sha:
+                    gate_record["grader_agent_source_sha"] = source_sha
+                if runtime_fp:
+                    gate_record["grader_agent_runtime_fingerprint"] = runtime_fp
+        except Exception:
+            logger.debug(
+                "[GRADER] Failed to attach adversarial grader runtime provenance",
+                exc_info=True,
+            )
+        # Bounded operator diagnostic so absent verdicts can be root-caused
+        # (stale serving image vs malformed/no grader output) without reading
+        # raw logs. Written unconditionally so the parent task always carries
+        # challenger provenance after re-entry. Mirrors the provenance already
+        # attached to gate_record (None when the grader VM is unknown).
+        _parse_causes = {
+            ADVERSARIAL_PARSE_OK: "parsed explicit verdict(s) from grader output",
+            ADVERSARIAL_PARSE_CHALLENGER_FAILED: (
+                "challenger task failed before producing verdicts"
+            ),
+            ADVERSARIAL_PARSE_EMPTY_LOGS: "grader posted no output",
+            ADVERSARIAL_PARSE_NO_JSON_ARRAY: (
+                "no JSON array with hash/verdict found in grader output"
+            ),
+            ADVERSARIAL_PARSE_INVALID_JSON: "candidate JSON array failed to decode",
+            ADVERSARIAL_PARSE_NO_HASH_MATCHES: (
+                "JSON array contained no known finding hashes"
+            ),
+        }
+        _diag_explicit = sum(1 for v in finding_verdicts.values() if v.get("explicit"))
+        ctx["adversarial_gate_diagnostic"] = {
+            "challenger_task_id": str(grader.id),
+            "completion_state": "completed" if completed else "failed",
+            "challenged_count": len(all_hashes),
+            "parse_state": parse_outcome,
+            "parse_cause": _parse_causes.get(parse_outcome, parse_outcome),
+            "parsed_verdict_count": _diag_explicit,
+            "unresolved_count": len(finding_verdicts) - _diag_explicit,
+            "vm_image_name": gate_record.get("grader_agent_image_name"),
+            "vm_image_build_ts": gate_record.get("grader_agent_image_build_ts"),
+            "vm_runtime_fingerprint": gate_record.get("grader_agent_runtime_fingerprint"),
+            "vm_source_sha": gate_record.get("grader_agent_source_sha"),
+        }
+        ctx[ADVERSARIAL_GATE_VERDICT_KEY] = gate_record
         ctx.pop("awaiting_adversarial_grader", None)
         grader.latest_status_message = (
             f"Adversarial challenge: {failed_count}/{len(finding_verdicts)} "
@@ -946,6 +1029,49 @@ async def _resolve_finding_challenge_completion(
     except Exception:
         logger.debug("[CHALLENGE] broadcast after challenge failed", exc_info=True)
 
+
+async def trigger_stranded_sidecar_resolution(
+    sidecar: Task, session: AsyncSession
+) -> None:
+    """Invoke the appropriate lane resolver for a terminal side-car that never posted status.
+
+    Called by the stranded-sidecar recovery sweep when it detects a FAILED or
+    CANCELLED side-car whose source task is still EVALUATING.  Constructs a
+    synthetic ``AgentStatusPayload`` carrying the sidecar's terminal status and
+    last message, then dispatches to the resolver for the sidecar's lane
+    (identified by which SOURCE_KEY the sidecar carries in its context).
+
+    All four resolver functions already handle a FAILED payload fail-closed, so
+    no additional logic is needed here — this is purely a routing shim.
+    """
+    from app.task_evaluators import (
+        QUALITY_GRADER_SOURCE_KEY,
+        SAFEGUARD_CHALLENGE_SOURCE_KEY,
+        FINDING_CHALLENGE_SOURCE_KEY,
+        REVIEW_SECOND_OPINION_SOURCE_KEY,
+    )
+
+    synthetic = AgentStatusPayload(
+        task_id=sidecar.id,
+        status=sidecar.status,
+        logs=sidecar.latest_status_message or "",
+    )
+    ctx = sidecar.context or {}
+    if ctx.get(SAFEGUARD_CHALLENGE_SOURCE_KEY):
+        await _resolve_safeguard_challenge_completion(sidecar, synthetic, session)
+    elif ctx.get(QUALITY_GRADER_SOURCE_KEY):
+        await _resolve_quality_grader_completion(sidecar, synthetic, session)
+    elif ctx.get(FINDING_CHALLENGE_SOURCE_KEY):
+        await _resolve_finding_challenge_completion(sidecar, synthetic, session)
+    elif ctx.get(REVIEW_SECOND_OPINION_SOURCE_KEY):
+        await _resolve_review_second_opinion(sidecar, synthetic, session)
+    else:
+        logger.warning(
+            "[SIDECAR-RECOVERY] Sidecar %s has no recognised source key; cannot route",
+            sidecar.id,
+        )
+
+
 async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
@@ -980,6 +1106,7 @@ async def _process_post_commit(
         _handle_compute_experiment_completion,
         _handle_self_audit_completion,
         _handle_memo_completion,
+        _handle_repo_bootstrap_completion,
         _try_recover_memo_from_parse_failure,
         _record_remediation_if_terminal,
     )
@@ -2350,6 +2477,7 @@ async def _process_post_commit(
                 verdict_parsed = False
                 verdict_unparseable = False
                 review_was_parallelized = False
+                reviewed_head_sha: str = ""
 
                 # Method 1: verdict_json field (from /tmp/verdict.json on the agent)
                 if payload.verdict_json:
@@ -2372,6 +2500,9 @@ async def _process_post_commit(
                                 ][:25]
                             review_was_parallelized = bool(
                                 vj.get("review_was_parallelized", False)
+                            )
+                            reviewed_head_sha = str(
+                                vj.get("reviewed_head_sha") or ""
                             )
                             verdict_parsed = True
                             logger.info(
@@ -4431,6 +4562,7 @@ async def _process_post_commit(
 
                     ci_errors_text = ""
                     ci_check: dict | None = None
+                    head_sha = ""
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(
                             task.id, session
@@ -4452,6 +4584,72 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}",
                             exc_info=True,
                         )
+
+                    # Stale-head guard: the review ran against an older PR head than
+                    # the current one. Discard the verdict and respawn a fresh review
+                    # so the fix isn't guided by findings on code that's already changed.
+                    # Backward compat: old verdicts without reviewed_head_sha are treated
+                    # as current-head (no action).
+                    if reviewed_head_sha and head_sha and reviewed_head_sha != head_sha:
+                        _stale_discard_count = int(
+                            (task.context or {}).get("stale_head_consecutive_discards", 0)
+                        )
+                        if _stale_discard_count < 2:
+                            # Discard: mark this review as stale, respawn fresh review.
+                            # _review_stale_head: underscore-prefix so it is NOT propagated
+                            # to the fresh review task (only exempts THIS discarded review
+                            # from the iteration cap). stale_head_consecutive_discards has
+                            # no underscore so it IS propagated, letting the fresh review
+                            # inherit the running count and eventually accept on the 2nd hit.
+                            task.context = {
+                                **(task.context or {}),
+                                "stale_head_consecutive_discards": _stale_discard_count + 1,
+                                "_review_stale_head": True,
+                            }
+                            flag_modified(task, "context")
+                            task.status = TaskStatus.COMPLETED
+                            task.latest_status_message = (
+                                f"Stale-head review discarded for PR #{pr_number} "
+                                f"(reviewed {reviewed_head_sha[:8]}, "
+                                f"head is now {head_sha[:8]}) — respawning fresh review"
+                            )
+                            session.add(task)
+                            logger.warning(
+                                f"[REVIEW PIPELINE] PR #{pr_number}: stale-head verdict "
+                                f"discarded (reviewed={reviewed_head_sha[:8]}, "
+                                f"live={head_sha[:8]}) — respawning review "
+                                f"(discard #{_stale_discard_count + 1})"
+                            )
+                            fresh_review, _ = await _spawn_pipeline_task(
+                                task,
+                                "review",
+                                session,
+                                pr_number,
+                                branch,
+                                base_branch,
+                                original_task_id=original_task_id,
+                            )
+                            if fresh_review:
+                                logger.info(
+                                    f"[REVIEW PIPELINE] Spawned fresh review "
+                                    f"{fresh_review.id} for PR #{pr_number} "
+                                    f"after stale-head discard"
+                                )
+                            await session.commit()
+                            return {"status": "accepted"}
+                        else:
+                            # 2nd consecutive stale-head: accept verdict, annotate it.
+                            _stale_note = (
+                                f"_(Reviewer judged head {reviewed_head_sha[:8]}; "
+                                f"PR head is now {head_sha[:8]}.)_\n\n"
+                            )
+                            feedback = _stale_note + feedback
+                            logger.warning(
+                                f"[REVIEW PIPELINE] PR #{pr_number}: 2nd consecutive "
+                                f"stale-head discard — accepting verdict with annotation "
+                                f"(reviewed={reviewed_head_sha[:8]}, live={head_sha[:8]})"
+                            )
+
                     # CI vs reviewer build-gate disagreement detector. When the
                     # reviewer flags build/lint complaints but CI shows the
                     # corresponding job GREEN, the issue is almost always a
@@ -4980,6 +5178,7 @@ async def _process_post_commit(
                     "memo": _handle_memo_completion,
                     "web_research": _handle_web_research_completion,
                     "design": _handle_design_completion,
+                    "repo_bootstrap": _handle_repo_bootstrap_completion,
                 }
                 _capability = get_task_capability(task_type)
                 _handler_name = _capability.completion_handler if _capability else None
@@ -5056,6 +5255,28 @@ async def _process_post_commit(
                         "connection refused",
                     ]
                 )
+                # Research task interrupted mid-spawn: findings are already committed
+                # to task.plan_output and _research_spawn_pending is durable in context.
+                # Requeuing the agent would discard those findings and start a new
+                # research cycle. Instead raise PostCommitFinalCommitFailed — which
+                # preserves the post_commit_pending marker so the sweep retries just
+                # the spawn from stored plan_output without re-running the agent.
+                if (
+                    is_transient
+                    and task_type == "research"
+                    and bool((task.context or {}).get("_research_spawn_pending"))
+                ):
+                    logger.warning(
+                        "[HANDLER] Research task %s: transient error mid-spawn; "
+                        "preserving post_commit_pending for sweep to retry spawn "
+                        "from stored findings (handler_exc=%r)",
+                        task_id,
+                        handler_exc,
+                    )
+                    raise PostCommitFinalCommitFailed(
+                        f"research mid-spawn transient error for {task_id}; "
+                        f"sweep retries spawn: {handler_exc!r}"
+                    )
                 if is_transient and task.attempt_count < _runtime_config["max_retries"]:
                     task.status = TaskStatus.QUEUED
                     # The earlier COMPLETED/FAILED assignment fired the SQLAlchemy set
@@ -5095,6 +5316,30 @@ async def _process_post_commit(
                         task_type=(task.first_payload or {}).get("type", ""),
                     )
                 session.add(task)
+                # Commit QUEUED immediately — the subsequent helpers each call
+                # _rollback_and_refetch_task() on their own failures, which rolls
+                # back the whole transaction and discards any uncommitted status
+                # mutation, stranding the task as COMPLETED with work undispatched
+                # (prod incident 2026-05-29). Commit now so a later rollback cannot
+                # undo the requeue; then return early — all remaining helpers are
+                # terminal-only (COMPLETED/FAILED/CANCELLED) and are no-ops for a
+                # requeued task.
+                if task.status == TaskStatus.QUEUED:
+                    try:
+                        await session.commit()
+                    except Exception as _requeue_commit_exc:
+                        logger.error(
+                            "[HANDLER] Failed to commit QUEUED state for task %s: %r — "
+                            "preserving post_commit_pending for sweep retry",
+                            task_id,
+                            _requeue_commit_exc,
+                        )
+                        with contextlib.suppress(Exception):
+                            await session.rollback()
+                        raise PostCommitFinalCommitFailed(
+                            f"requeue commit failed for {task_id}: {_requeue_commit_exc!r}"
+                        ) from _requeue_commit_exc
+                    return {"status": "received"}
 
         # 6. Parent task rollup — delegated to shared function
         if task.parent_task_id and payload.status in [
@@ -5193,10 +5438,11 @@ async def _process_post_commit(
                 return {"status": "accepted"}
 
         # Release-qualifier finalization — fires from EVERY terminal path
-        # (COMPLETED / FAILED / CANCELLED) for BOTH a release_audit task and a
-        # qualifier-smoketest task. This deliberately lives in the terminal
-        # section (not the COMPLETED-only review-pipeline block above): a
-        # qualifier child that fails/cancels must still advance qualification,
+        # (COMPLETED / FAILED / CANCELLED / BLOCKED) for BOTH a release_audit
+        # task and a qualifier-smoketest task. This deliberately lives in the
+        # terminal section (not the COMPLETED-only review-pipeline block above):
+        # a qualifier child that fails/cancels/blocks must still advance
+        # qualification,
         # or the ReleaseVersion stays {status:"pending"} forever and the
         # version is wedged.
         #
@@ -5228,6 +5474,7 @@ async def _process_post_commit(
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
+            TaskStatus.BLOCKED,
         ):
             _qual_ctx = task.context or {}
             _qual_first_payload = task.first_payload or {}

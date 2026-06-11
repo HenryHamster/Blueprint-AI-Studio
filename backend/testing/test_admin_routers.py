@@ -28,6 +28,8 @@ from app.models import (
     Project,
     ProjectMember,
     ProjectStatus,
+    PoolVm,
+    PoolVmState,
     ReleaseVersion,
     Task,
     TaskStatus,
@@ -714,6 +716,51 @@ class TestGetProject:
         assert data["my_role"] == "member"
         assert "env_vars" not in data["build_config"]
         assert data["build_config"].get("node_version") == "20"
+
+    @pytest.mark.asyncio
+    async def test_detail_includes_capability_proof_annotations(
+        self, client: AsyncClient, db_session
+    ):
+        """Project detail returns proof-enriched capabilities without changing the stored model."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="Proof Detail")
+        project.problem_model = {
+            "revision": 3,
+            "capabilities": [
+                {"name": "language-aware repo map", "status": "working"},
+                {"name": "claimed only capability", "status": "partial"},
+            ],
+        }
+        flag_modified(project, "problem_model")
+        project.capability_proof_records = {
+            "language-aware repo map": [
+                {
+                    "task_id": "task-proof-1",
+                    "proved_at": "2026-06-09T12:34:56Z",
+                    "proof_kind": "named_test",
+                    "proof_ref": "backend/testing/test_capability_proof.py::test_proof_recorded_on_named_test_proven",
+                    "commit_sha": "abc123def456",
+                }
+            ]
+        }
+        flag_modified(project, "capability_proof_records")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        caps = data["problem_model"]["capabilities"]
+        assert caps[0]["proof_status"] == "proven"
+        assert caps[0]["proof_records"][0]["proof_kind"] == "named_test"
+        assert caps[0]["proof_records"][0]["proof_ref"].endswith(
+            "test_proof_recorded_on_named_test_proven"
+        )
+        assert caps[0]["proof_records"][0]["commit_sha"] == "abc123def456"
+        assert caps[0]["proof_records"][0]["proved_at"] == "2026-06-09T12:34:56Z"
+        assert caps[1]["proof_status"] == "unproven"
+        assert "proof_records" not in caps[1]
 
 
 class TestUpdateProject:
@@ -2489,8 +2536,21 @@ class TestAutonomousMode:
     async def test_get_autonomous_status(self, client: AsyncClient, db_session):
         """Returns autonomous status summary across all user projects."""
         from app.shared_state import runtime_config
+        from datetime import timedelta
+        from app.models import _utcnow
 
         project = await _make_project(db_session, name="Auto Project")
+
+        # Seed a non-research orchestrator task to confirm all ORCHESTRATOR tasks count.
+        non_research_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "plan"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=_utcnow() - timedelta(minutes=30),
+        )
+        db_session.add(non_research_task)
+        await db_session.commit()
 
         resp = await client.get("/api/admin/autonomous-status")
         assert resp.status_code == 200
@@ -2500,11 +2560,36 @@ class TestAutonomousMode:
         assert str(project.id) in by_id
         entry = by_id[str(project.id)]
         # Freshly created project: autonomous_enabled defaults True (model default),
-        # no failures and no autonomous tasks spawned yet, rate_limit mirrors config.
+        # no failures, rate_limit mirrors global config, source is fleet_default.
         assert entry["autonomous_enabled"] is True
         assert entry["consecutive_failures"] == 0
-        assert entry["tasks_spawned_last_hour"] == 0
+        # The non-research ORCHESTRATOR task counts toward the hour budget.
+        assert entry["tasks_spawned_last_hour"] == 1
         assert entry["rate_limit"] == runtime_config["max_autonomous_tasks_per_hour"]
+        assert entry["fleet_default_rate_limit"] == runtime_config["max_autonomous_tasks_per_hour"]
+        assert entry["rate_limit_source"] == "fleet_default"
+
+    @pytest.mark.asyncio
+    async def test_get_autonomous_status_project_override(self, client: AsyncClient, db_session):
+        """Project with build_config override reports the override cap and correct source."""
+        from app.shared_state import runtime_config
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="Override Project")
+        project.build_config = {"max_autonomous_tasks_per_hour": 5}
+        flag_modified(project, "build_config")
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        resp = await client.get("/api/admin/autonomous-status")
+        assert resp.status_code == 200
+        data = resp.json()
+        by_id = {p["project_id"]: p for p in data["projects"]}
+        assert str(project.id) in by_id
+        entry = by_id[str(project.id)]
+        assert entry["rate_limit"] == 5
+        assert entry["fleet_default_rate_limit"] == runtime_config["max_autonomous_tasks_per_hour"]
+        assert entry["rate_limit_source"] == "project_override"
 
     @pytest.mark.asyncio
     async def test_get_direction_task_counts(self, client: AsyncClient, db_session):
@@ -4784,6 +4869,32 @@ class TestNotificationConfigSettings:
             "/api/admin/settings", json={"max_pipeline_slots": "x"}
         )
         assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_deploy_repo_identity(self, client: AsyncClient):
+        """deploy_repo_identity accepts a normalized 'owner/repo', clears on null,
+        rejects malformed values, and round-trips on GET."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"deploy_repo_identity": " Acme/Widget "}
+        )
+        assert resp.status_code == 200, resp.text
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["deploy_repo_identity"] == "Acme/Widget"
+
+        # null clears it.
+        resp = await client.patch(
+            "/api/admin/settings", json={"deploy_repo_identity": None}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["deploy_repo_identity"] is None
+
+        # Malformed values are rejected (no slash / empty component / wrong type).
+        for bad_val in ["no-slash", "acme/", "/widget", 123]:
+            bad = await client.patch(
+                "/api/admin/settings", json={"deploy_repo_identity": bad_val}
+            )
+            assert bad.status_code == 400, f"{bad_val!r} should be rejected"
 
     @pytest.mark.asyncio
     async def test_patch_warm_continuity_enabled(self, client: AsyncClient):
@@ -7568,14 +7679,35 @@ class TestClearDeployFailed:
 
     @pytest.mark.asyncio
     async def test_verify_path_clears_when_sha_serving(
-        self, client: AsyncClient, db_session
+        self, client: AsyncClient, db_session, mocker
     ):
         """Promoted SHA genuinely observed serving → cleared without force."""
         from datetime import datetime, timezone
 
+        from app import release_artifacts as artifact_registry
         from app.models import DeploymentState, DeploymentStatus, QualificationVerdict
+        from app.release_artifacts import BACKEND_REVISION_ARTIFACT_KIND
+
+        # The backend_revision (Cloud Run) provider is observable only for the
+        # deploy-identity project; stamp the identity and scope the registry to
+        # backend so the deploy-health re-check drives the outcome without the
+        # merge/agent providers' GitHub lookups interfering.
+        mocker.patch.dict("os.environ", {"DEPLOY_REPO_IDENTITY": "acme/widget"})
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: artifact_registry._ARTIFACT_PROVIDERS[
+                    BACKEND_REVISION_ARTIFACT_KIND
+                ]
+            },
+            clear=True,
+        )
 
         project = await _make_project(db_session)
+        project.github_owner = "acme"
+        project.github_repo = "widget"
+        db_session.add(project)
+        await db_session.commit()
         version = await self._make_deploy_failed_version(
             db_session, project.id, promoted_sha="liveserving999"
         )
@@ -8023,7 +8155,7 @@ class TestClearDeployFailed:
 
     @pytest.mark.asyncio
     async def test_force_blocked_when_backend_reason_transitions_to_hard_failure(
-        self, client: AsyncClient, db_session
+        self, client: AsyncClient, db_session, mocker
     ):
         """Regression: version scalar latched serving_sha_unobservable but the
         backend artifact's freshly-rechecked reason_code is sha_mismatch (a hard
@@ -8035,9 +8167,29 @@ class TestClearDeployFailed:
         → correctly rejects."""
         from datetime import datetime, timezone
 
+        from app import release_artifacts as artifact_registry
         from app.models import DeploymentState, DeploymentStatus
+        from app.release_artifacts import BACKEND_REVISION_ARTIFACT_KIND
+
+        # backend_revision is observable only for the deploy identity; stamp it
+        # and scope the registry to backend so the fresh deploy-health re-check
+        # (sha_mismatch) drives the force-block decision.
+        mocker.patch.dict("os.environ", {"DEPLOY_REPO_IDENTITY": "acme/widget"})
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: artifact_registry._ARTIFACT_PROVIDERS[
+                    BACKEND_REVISION_ARTIFACT_KIND
+                ]
+            },
+            clear=True,
+        )
 
         project = await _make_project(db_session)
+        project.github_owner = "acme"
+        project.github_repo = "widget"
+        db_session.add(project)
+        await db_session.commit()
         # Stale version scalar: latched as serving_sha_unobservable.
         version = await self._make_deploy_failed_version(
             db_session,
@@ -8068,6 +8220,131 @@ class TestClearDeployFailed:
 
         await db_session.refresh(version)
         assert version.serving_status == "deploy_failed"
+
+
+class TestAgentServingShas:
+    """GET /agent-serving-shas exposes read-only agent image provenance."""
+
+    @pytest.mark.asyncio
+    async def test_viewer_can_read_agent_serving_shas_with_drift_context(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="Agent Serving SHAs")
+        project.github_owner = "owner"
+        project.github_repo = "repo"
+        db_session.add(project)
+
+        open_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            status="open",
+            last_qualification={"candidate_sha": "b" * 40},
+        )
+        served_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            status="promoted",
+            served_sha="a" * 40,
+            served_at=datetime.now(timezone.utc),
+        )
+        member = PoolVm(
+            vm_instance_id="agent-vm-serving-sha",
+            project_id=project.id,
+            state=PoolVmState.IDLE,
+            agent_source_sha="a" * 40,
+            agent_image_name="agent-image-a",
+            agent_image_build_ts=1781049600,
+        )
+        db_session.add(open_version)
+        db_session.add(served_version)
+        db_session.add(member)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="token",
+            ),
+            patch(
+                "app.github_refs.get_branch_sha",
+                new_callable=AsyncMock,
+                side_effect=["c" * 40, "d" * 40],
+            ),
+            patch(
+                "app.compute.get_current_agent_image",
+                return_value={
+                    "image_name": "agent-image-a",
+                    "source_git_sha": "a" * 40,
+                    "build_ts": 1781049600,
+                },
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/agent-serving-shas"
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["backend_served_sha"] == "a" * 40
+        assert data["active_candidate_sha"] == "b" * 40
+        assert data["integration_head_sha"] == "c" * 40
+        assert data["promotion_head_sha"] == "d" * 40
+        assert data["current_image"]["source_git_sha"] == "a" * 40
+        bucket = data["fleet"]["buckets"][0]
+        assert bucket["source_sha"] == "a" * 40
+        assert bucket["matches_backend_served"] is True
+        assert bucket["matches_current_image"] is True
+
+    @pytest.mark.asyncio
+    async def test_agent_serving_shas_degrades_when_external_context_unavailable(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="Agent Serving Graceful")
+        member = PoolVm(
+            vm_instance_id="agent-vm-serving-unknown",
+            project_id=project.id,
+            state=PoolVmState.IDLE,
+        )
+        db_session.add(member)
+        await db_session.commit()
+
+        with patch("app.compute.get_current_agent_image", return_value=None):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/agent-serving-shas"
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["current_image"] is None
+        assert data["integration_head_sha"] is None
+        assert data["fleet"]["unknown_count"] == 1
+        assert data["fleet"]["buckets"][0]["source_sha"] is None
+
+    @pytest.mark.asyncio
+    async def test_agent_serving_shas_requires_project_access(
+        self, override_get_session, db_session
+    ):
+        project = await _make_project(db_session, name="Agent Serving Private")
+
+        async def other_user():
+            return {
+                "user_id": "not-a-member",
+                "email": "other@example.com",
+                "role": "user",
+            }
+
+        app.dependency_overrides[get_current_user] = other_user
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    f"/api/admin/projects/{project.id}/agent-serving-shas"
+                )
+            assert resp.status_code == 404
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
 
 
 class TestVersionLifecycleInfraFailureFields:
@@ -13283,6 +13560,64 @@ class TestComputeExperimentTaskLaunch:
         ).scalar_one()
         assert task.requires_approval is False
         assert task.latest_status_message is None
+
+    @pytest.mark.asyncio
+    async def test_require_live_release_persists_live_proof_in_payload(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(require_live_release=True),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["live_proof"] is True
+
+    @pytest.mark.asyncio
+    async def test_require_live_release_default_omits_live_proof(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert "live_proof" not in payload
 
 
 class TestBugReportCitationGate:

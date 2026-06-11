@@ -3361,3 +3361,108 @@ class TestClassifyRepoEmptiness:
         """Below-threshold source + incomplete read => still not empty."""
         items = [{"name": "README.md", "type": "file"}]
         assert _classify_repo_emptiness(items, listing_complete=False) is False
+
+
+class TestOnboardRepoBootstrapSpawn:
+    """Verify that onboarding auto-spawns repo_bootstrap for eligible projects."""
+
+    @pytest.mark.asyncio
+    async def test_non_empty_external_repo_spawns_bootstrap(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-self-repo, non-empty project onboard spawns a repo_bootstrap task."""
+        from sqlalchemy import select as _select
+        from app.models import Task, TaskStatus
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python", "repo_is_empty": False},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "ext", "github_repo": "bootstrap-check"},
+            )
+
+        assert resp.status_code == 200
+        project_id = resp.json()["project_id"]
+        project = await db_session.get(Project, project_id)
+        assert project is not None
+
+        tasks = (
+            await db_session.execute(
+                _select(Task).where(
+                    Task.project_id == project.id,
+                )
+            )
+        ).scalars().all()
+        bootstrap_tasks = [
+            t for t in tasks
+            if (t.first_payload or {}).get("type") == "repo_bootstrap"
+        ]
+        assert len(bootstrap_tasks) == 1, (
+            f"Expected 1 repo_bootstrap task, got {len(bootstrap_tasks)}"
+        )
+        bt = bootstrap_tasks[0]
+        assert bt.status == TaskStatus.QUEUED
+        assert bt.first_payload["github_owner"] == "ext"
+        assert bt.first_payload["github_repo"] == "bootstrap-check"
+        assert bt.first_payload["integration_branch"] == "main"
+
+    @pytest.mark.asyncio
+    async def test_empty_repo_skips_bootstrap(
+        self, client: AsyncClient, db_session
+    ):
+        """A repo_is_empty=True project onboard does NOT spawn a repo_bootstrap task."""
+        from sqlalchemy import select as _select
+        from app.models import Task
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"repo_is_empty": True},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "ext", "github_repo": "empty-bootstrap"},
+            )
+
+        assert resp.status_code == 200
+        project_id = resp.json()["project_id"]
+        project = await db_session.get(Project, project_id)
+        tasks = (
+            await db_session.execute(
+                _select(Task).where(Task.project_id == project.id)
+            )
+        ).scalars().all()
+        bootstrap_tasks = [
+            t for t in tasks
+            if (t.first_payload or {}).get("type") == "repo_bootstrap"
+        ]
+        assert len(bootstrap_tasks) == 0, (
+            "repo_is_empty project must not spawn a repo_bootstrap task"
+        )

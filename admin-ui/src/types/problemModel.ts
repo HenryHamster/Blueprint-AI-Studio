@@ -35,12 +35,23 @@ export interface ProjectContext {
 }
 
 export type CapabilityStatus = 'working' | 'partial' | 'planned';
+export type CapabilityProofStatus = 'proven' | 'unproven';
+
+export interface CapabilityProofRecord {
+  task_id: string;
+  proved_at: string;
+  proof_kind: string;
+  proof_ref: string;
+  commit_sha: string;
+}
 
 export interface Capability {
   name: string;
   status: CapabilityStatus;
   notes?: string | null;
   source?: Source | null;
+  proof_status?: CapabilityProofStatus | null;
+  proof_records?: CapabilityProofRecord[] | null;
 }
 
 export type GapSize = 'small' | 'medium' | 'large';
@@ -126,6 +137,7 @@ export interface ProblemModel {
   friction?: Friction[];
   pending_user_confirmation?: PendingConfirmation[];
   revision_log?: RevisionLogEntry[];
+  capability_proof_records?: Record<string, CapabilityProofRecord[]> | null;
   _size_health?: ProblemModelSizeHealth;
 }
 

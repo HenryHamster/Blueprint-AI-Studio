@@ -42,6 +42,7 @@ from app.models import (
 from app.time_utils import _to_naive_utc
 from app.schemas import (
     ArtifactDownloadResponse,
+    BuildDiscoveryReport,
     UploadUrlRequest,
     HeartbeatRequest,
     SpawnTaskRequest,
@@ -86,6 +87,7 @@ from app.claim_task_helpers import (
     _build_direction_narrative,
     _build_problem_model_summary,
     _build_direction_contract,
+    annotate_stale_build_config_dirs,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,19 @@ def _truncate_vm_instance_id(vm_instance_id: object) -> str:
     if len(value) <= 12:
         return value
     return f"{value[:12]}..."
+
+
+def _effective_repo_map_holdback(project: object) -> float:
+    """Return the repo_map holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("repo_map_holdback_fraction", 0.0))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "repo_map", default)
 
 
 def _log_agent_auth_reject(
@@ -867,12 +882,13 @@ async def claim_task(
     # Add project metadata so agents can adapt to different project structures
     if project:
         _build_cfg = project.build_config or {}
+        _build_cfg_annotated = annotate_stale_build_config_dirs(_build_cfg)
         response["project_metadata"] = {
             "project_id": str(project.id),
             "project_name": project.name,
             "github_owner": project.github_owner,
             "github_repo": project.github_repo,
-            "build_config": _build_cfg,
+            "build_config": _build_cfg_annotated,
             "approval_gate_config": project.approval_gate_config or {},
             "enable_fresh_reviewer": _build_cfg.get("enable_fresh_reviewer", False),
             "enable_parallel_review": _build_cfg.get("enable_parallel_review", False),
@@ -880,6 +896,7 @@ async def claim_task(
             "enable_self_improvement": project.enable_self_improvement,
             "promotion_target": project_promotion_target,
             "integration_branch": project_integration_branch,
+            "repo_map_holdback_fraction": _effective_repo_map_holdback(project),
         }
 
     task_type = _claimed_first_payload.get("type", "")
@@ -2137,31 +2154,81 @@ async def claim_task(
                                 check_and_flag_stale_refs_branch_aware,
                                 ground_design_doc_systems_branch_aware,
                                 mark_branch_grounding_done,
+                                recover_grounding_downgrades_branch_aware,
+                            )
+                            from app.source_ref_validation import (
+                                resolve_branch_verification_context,
+                                resolve_head_commit,
                             )
 
+                            repo_root: str = (
+                                _shared_state.runtime_config.get(
+                                    "playbook_repo_root", ""
+                                )
+                                or ""
+                            )
+                            verification_kwargs = (
+                                await resolve_branch_verification_context(
+                                    session, _pb_proj
+                                )
+                            )
+                            grounding_kwargs = dict(verification_kwargs)
+                            if all(
+                                key in verification_kwargs
+                                for key in ("token", "owner", "repo", "branch")
+                            ):
+                                try:
+                                    resolved_sha = await resolve_head_commit(
+                                        **verification_kwargs
+                                    )
+                                except Exception:  # noqa: BLE001 — degrade, never block claim
+                                    logger.debug(
+                                        "[AGENT] Branch head SHA resolution skipped "
+                                        "(non-critical)",
+                                        exc_info=True,
+                                    )
+                                    resolved_sha = None
+                                if resolved_sha:
+                                    grounding_kwargs["sha"] = resolved_sha
+                            # Recovery runs unconditionally — only scans entries
+                            # already in the 'missing' state with a prior_status,
+                            # so its GitHub API cost is much lower than the full
+                            # downgrade sweep. False-missing markers should clear
+                            # on the next claim, not wait for the 6h cooldown.
+                            doc = await recover_grounding_downgrades_branch_aware(
+                                doc, repo_root=repo_root, **verification_kwargs
+                            )
                             if branch_grounding_due(doc):
-                                from app.source_ref_validation import (
-                                    resolve_branch_verification_context,
-                                )
-
-                                repo_root: str = (
-                                    _shared_state.runtime_config.get(
-                                        "playbook_repo_root", ""
-                                    )
-                                    or ""
-                                )
-                                verification_kwargs = (
-                                    await resolve_branch_verification_context(
-                                        session, _pb_proj
-                                    )
-                                )
                                 doc = await check_and_flag_stale_refs_branch_aware(
                                     doc, repo_root=repo_root, **verification_kwargs
                                 )
                                 doc = await ground_design_doc_systems_branch_aware(
-                                    doc, repo_root=repo_root, **verification_kwargs
+                                    doc, repo_root=repo_root, **grounding_kwargs
                                 )
-                                mark_branch_grounding_done(doc)
+                                meta = doc.get("_meta")
+                                grounding_diagnostic = None
+                                if isinstance(meta, dict):
+                                    grounding_diagnostic = meta.pop(
+                                        "grounding_diagnostic", None
+                                    )
+                                    if not meta:
+                                        doc.pop("_meta", None)
+                                if (
+                                    isinstance(grounding_diagnostic, dict)
+                                    and grounding_diagnostic.get("kind")
+                                    == "cap_breach"
+                                ):
+                                    logger.debug(
+                                        "[AGENT] Branch-aware design-doc grounding "
+                                        "cap breach: candidate_count=%s cap=%s "
+                                        "source=%s affected_keys=%s",
+                                        grounding_diagnostic.get("candidate_count"),
+                                        grounding_diagnostic.get("cap"),
+                                        grounding_diagnostic.get("source"),
+                                        grounding_diagnostic.get("affected_keys"),
+                                    )
+                                else:
+                                    mark_branch_grounding_done(doc)
                         except Exception:  # noqa: BLE001 — best-effort, never block claim
                             logger.debug(
                                 "[AGENT] Branch-aware design-doc grounding skipped "
@@ -3440,8 +3507,102 @@ async def claim_task(
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:
         response["build_config"] = project_for_playbook.build_config
+        if project_for_playbook.build_config.get("directories"):
+            response["build_config_writeback_endpoint"] = (
+                f"PATCH /api/agent/projects/{_claimed_project_id}/build-config/commands"
+            )
     else:
         response["build_config"] = {}
+
+    # Inject repo_overview for repo-reading code-change, review, and analysis
+    # tasks so agents know the tech stack and layout discovered during
+    # repo_bootstrap without re-discovering it from scratch. Omitted entirely
+    # when absent so the claim shape is byte-identical for projects that never
+    # ran bootstrap.
+    _REPO_OVERVIEW_TASK_TYPES = {
+        "create", "fix", "refactor", "migrate", "qa", "docs", "review",
+        "research", "plan", "design", "debug", "investigate",
+        "security_audit", "perf",
+        "self_audit", "release_audit", "release_audit_challenge",
+        "smoketest", "design_doc_update", "strategic_review",
+    }
+    if task_type in _REPO_OVERVIEW_TASK_TYPES and project_for_playbook:
+        _raw_overview = (project_for_playbook.design_doc or {}).get("repo_overview")
+        if (
+            isinstance(_raw_overview, dict)
+            and isinstance(_raw_overview.get("tech_stack"), str) and _raw_overview["tech_stack"]
+            and isinstance(_raw_overview.get("directory_layout"), str) and _raw_overview["directory_layout"]
+            and isinstance(_raw_overview.get("first_steps_summary"), str) and _raw_overview["first_steps_summary"]
+        ):
+            _repo_overview: dict = {
+                "tech_stack": _raw_overview["tech_stack"],
+                "directory_layout": _raw_overview["directory_layout"],
+                "first_steps_summary": _raw_overview["first_steps_summary"],
+            }
+            for _opt_field in (
+                "entry_points", "test_layout", "key_conventions", "environment_requirements"
+            ):
+                _opt_val = _raw_overview.get(_opt_field)
+                if isinstance(_opt_val, str) and _opt_val:
+                    _repo_overview[_opt_field] = _opt_val
+            _bootstrap_completed_at = (project_for_playbook.build_config or {}).get(
+                "bootstrap_completed_at"
+            )
+            if _bootstrap_completed_at:
+                _repo_overview["bootstrap_completed_at"] = _bootstrap_completed_at
+            _provenance = _raw_overview.get("provenance")
+            if isinstance(_provenance, dict):
+                _repo_provenance = {
+                    k: v
+                    for k, v in _provenance.items()
+                    if k in {"refreshed_at", "source_branch", "source_revision"}
+                    and isinstance(v, str)
+                    and v.strip()
+                }
+                if _repo_provenance:
+                    _repo_overview["provenance"] = _repo_provenance
+            response["repo_overview"] = _repo_overview
+
+    # Inject bootstrap_guidance for repo_bootstrap tasks: structured prompting
+    # for the agent to read README/manifests, produce a repo overview payload,
+    # and write back confirmed build/test commands.
+    # The overview is returned as repo_overview in the terminal completion payload
+    # and persisted server-side by the completion handler into design_doc["repo_overview"].
+    if task_type == "repo_bootstrap":
+        _bootstrap_payload = _claimed_first_payload or {}
+        response["bootstrap_guidance"] = {
+            "files_to_read": [
+                "README.md", "README.rst", "README",
+                "package.json", "yarn.lock", "pnpm-lock.yaml",
+                "Makefile", "makefile", "GNUmakefile",
+                "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+                ".github/workflows/*.yml",
+            ],
+            "design_doc_section": "repo_overview",
+            "design_doc_section_fields": [
+                "tech_stack",
+                "directory_layout",
+                "first_steps_summary",
+                "entry_points",
+                "test_layout",
+                "key_conventions",
+                "environment_requirements",
+            ],
+            "completion_payload_field": "repo_overview",
+            "build_config_writeback_endpoint": (
+                f"PATCH /api/agent/projects/{_claimed_project_id}/build-config/commands"
+            ),
+            "completion_steps": [
+                "Read listed files to understand project structure",
+                "Write /tmp/bootstrap_overview_<task_id>.json with tech_stack, directory_layout, first_steps_summary, entry_points (main runnable scripts/services and their purposes), test_layout (where tests live, unit/integration/e2e organization, and run commands), key_conventions (branch naming, commit style, required review steps), environment_requirements (required env vars, system deps, version constraints beyond install_cmd)",
+                "Confirm working build/test commands by running them",
+                "Write confirmed commands back via the build_config_writeback_endpoint",
+                "Post COMPLETED with repo_overview in the completion payload",
+            ],
+            "github_owner": _bootstrap_payload.get("github_owner", ""),
+            "github_repo": _bootstrap_payload.get("github_repo", ""),
+            "integration_branch": _bootstrap_payload.get("integration_branch", ""),
+        }
 
     # Fire-and-forget: create an in_progress Check Run for review tasks so the
     # Checks tab shows the review is underway.  Must not block the claim response.
@@ -3993,6 +4154,34 @@ async def agent_heartbeat(
             ctx["prompt_fingerprint"] = req.prompt_fingerprint
             task.context = ctx
 
+    # Write-once repo-map capability flag. Set on the first heartbeat that
+    # carries had_repo_map so that later heartbeats (which don't re-send it)
+    # cannot clear the flag; mirrors the _had_arch_context write-once pattern.
+    if req.had_repo_map is not None and (task.context or {}).get("_had_repo_map") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_repo_map"] = req.had_repo_map
+        task.context = ctx
+    if req.had_module_interfaces is not None and (task.context or {}).get("_had_module_interfaces") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_module_interfaces"] = req.had_module_interfaces
+        task.context = ctx
+    if req.had_related_tests is not None and (task.context or {}).get("_had_related_tests") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_related_tests"] = req.had_related_tests
+        task.context = ctx
+    if req.had_affected_consumers is not None and (task.context or {}).get("_had_affected_consumers") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_affected_consumers"] = req.had_affected_consumers
+        task.context = ctx
+
+    # Write-once repo-map arm-assignment flag. Records the deterministic
+    # holdback vs treatment assignment independently of receipt; used for
+    # intent-to-treat arm partitioning in digest_metrics.
+    if req.repo_map_arm is not None and (task.context or {}).get("_repo_map_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_repo_map_arm"] = req.repo_map_arm
+        task.context = ctx
+
     # Per-task LLM telemetry (efficiency direction d-91d8dede). Cumulative
     # counters posted on every heartbeat — last write wins. Backwards-
     # compatible: older agents that don't ship these fields leave the column
@@ -4019,6 +4208,9 @@ async def agent_heartbeat(
         or req.format_error_total is not None
         or req.format_repair_attempts is not None
         or req.format_repair_successes is not None
+        or req.format_miss_by_schema is not None
+        or req.format_repair_attempts_by_schema is not None
+        or req.format_repair_successes_by_schema is not None
     ):
         task.format_compliance_summary = {
             "format_miss_by_reason": {
@@ -4028,6 +4220,18 @@ async def agent_heartbeat(
             "format_error_total": int(req.format_error_total or 0),
             "format_repair_attempts": int(req.format_repair_attempts or 0),
             "format_repair_successes": int(req.format_repair_successes or 0),
+            "format_miss_by_schema": {
+                str(schema): int(count)
+                for schema, count in (req.format_miss_by_schema or {}).items()
+            },
+            "format_repair_attempts_by_schema": {
+                str(schema): int(count)
+                for schema, count in (req.format_repair_attempts_by_schema or {}).items()
+            },
+            "format_repair_successes_by_schema": {
+                str(schema): int(count)
+                for schema, count in (req.format_repair_successes_by_schema or {}).items()
+            },
             "last_updated_at": _utcnow().isoformat(),
         }
 
@@ -4441,3 +4645,161 @@ async def agent_get_knowledge_document(
     if doc is None:
         raise HTTPException(status_code=404, detail="Knowledge document not found")
     return serialize_knowledge_document(doc, include_body=True)
+
+
+# ---------------------------------------------------------------------------
+# Agent build-config command write-back
+# ---------------------------------------------------------------------------
+
+
+class _ConfirmedCommandEntry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    path: str = Field(..., min_length=1)
+    confirmed_lint_cmd: str | None = None
+    confirmed_test_cmd: str | None = None
+    confirmed_build_cmd: str | None = None
+    confirmed_install_cmd: str | None = None
+
+
+class _BuildConfigCommandsRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    task_id: uuid.UUID
+    entries: list[_ConfirmedCommandEntry]
+
+
+@router.patch("/projects/{project_id}/build-config/commands")
+@limiter.limit("30/minute")
+async def agent_write_back_build_config_commands(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: _BuildConfigCommandsRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Agent write-back endpoint for confirmed lint/build/test/install commands.
+
+    Merges agent-verified commands into the per-directory confirmed_* fields
+    without overwriting operator-set lint_cmd / test_cmd / build_cmd / install_cmd.
+    Sets commands_confirmed_at (UTC ISO) and confirming_task_id on each
+    updated entry.
+    """
+    if str(payload.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    task = await session.get(Task, payload.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    project = await session.get(Project, project_id)
+    if not project or str(project.id) != str(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    if str(task.project_id) != str(project_id):
+        raise HTTPException(status_code=403, detail="Task does not belong to project")
+
+    from app.build_config_detection import _normalize_dir_path
+
+    existing = dict(project.build_config or {})
+    directories = [dict(d) for d in (existing.get("directories") or [])]
+    index_by_path = {
+        _normalize_dir_path(d.get("path")): i for i, d in enumerate(directories)
+    }
+
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
+    task_id_str = str(payload.task_id)
+    updated_paths: list[str] = []
+
+    for entry in payload.entries:
+        norm = _normalize_dir_path(entry.path)
+        if norm not in index_by_path:
+            # Unknown path — create a new directory entry when the agent has
+            # confirmed a non-empty command.  This is the empty-detection case
+            # where bootstrap discovers a real test command but detection found
+            # no directories. Only confirmed_* fields are written; detected
+            # test_cmd/build_cmd/install_cmd stay absent on the new entry.
+            has_confirmed = any(
+                v is not None and str(v).strip()
+                for v in (
+                    entry.confirmed_lint_cmd,
+                    entry.confirmed_test_cmd,
+                    entry.confirmed_build_cmd,
+                    entry.confirmed_install_cmd,
+                )
+            )
+            if not has_confirmed:
+                continue
+            new_entry: dict = {"path": norm}
+            if entry.confirmed_lint_cmd is not None:
+                new_entry["confirmed_lint_cmd"] = entry.confirmed_lint_cmd
+            if entry.confirmed_test_cmd is not None:
+                new_entry["confirmed_test_cmd"] = entry.confirmed_test_cmd
+            if entry.confirmed_build_cmd is not None:
+                new_entry["confirmed_build_cmd"] = entry.confirmed_build_cmd
+            if entry.confirmed_install_cmd is not None:
+                new_entry["confirmed_install_cmd"] = entry.confirmed_install_cmd
+            new_entry["commands_confirmed_at"] = now_iso
+            new_entry["confirming_task_id"] = task_id_str
+            index_by_path[norm] = len(directories)
+            directories.append(new_entry)
+            updated_paths.append(norm)
+            continue
+        idx = index_by_path[norm]
+        dir_entry = directories[idx]
+        if entry.confirmed_lint_cmd is not None:
+            dir_entry["confirmed_lint_cmd"] = entry.confirmed_lint_cmd
+        if entry.confirmed_test_cmd is not None:
+            dir_entry["confirmed_test_cmd"] = entry.confirmed_test_cmd
+        if entry.confirmed_build_cmd is not None:
+            dir_entry["confirmed_build_cmd"] = entry.confirmed_build_cmd
+        if entry.confirmed_install_cmd is not None:
+            dir_entry["confirmed_install_cmd"] = entry.confirmed_install_cmd
+        dir_entry["commands_confirmed_at"] = now_iso
+        dir_entry["confirming_task_id"] = task_id_str
+        directories[idx] = dir_entry
+        updated_paths.append(norm)
+
+    existing["directories"] = directories
+    project.build_config = existing
+    flag_modified(project, "build_config")
+    await session.commit()
+
+    return {"updated_paths": updated_paths, "commands_confirmed_at": now_iso}
+
+
+@router.post("/build-config-discovery")
+@limiter.limit("30/minute")
+async def agent_build_config_discovery(
+    request: Request,
+    body: BuildDiscoveryReport,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Persist agent-discovered build commands into project build_config.
+
+    Called by the agent VM near task end when it has discovered runnable
+    test/lint/build/install commands from a full repo clone. Uses FILL-ONLY
+    semantics — never overwrites existing operator-set values. The call is
+    advisory: a malformed or no-evidence report produces a clean 200/no-op.
+    """
+    try:
+        project_id = await _resolve_token_project_id(session, token)
+        project = await session.get(Project, project_id)
+        if project is None:
+            return {"persisted": False}
+
+        from app.build_config_detection import persist_discovered_build_commands
+
+        persisted = await persist_discovered_build_commands(
+            project,
+            session,
+            [d.model_dump() for d in body.discovered_directories],
+        )
+        return {"persisted": persisted}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning(
+            "[BUILD_CONFIG] build-config-discovery endpoint error for token sub=%s",
+            token.get("sub"),
+            exc_info=True,
+        )
+        return {"persisted": False}

@@ -20,6 +20,49 @@ export interface DirectoryConfig {
   lint_cmd?: string;
   build_cmd?: string;
   test_cmd?: string;
+  /** Agent-confirmed commands (persisted by repo_bootstrap write-back). */
+  confirmed_test_cmd?: string;
+  confirmed_build_cmd?: string;
+  confirmed_install_cmd?: string;
+  confirmed_lint_cmd?: string;
+  /** True when the confirmed commands are stale (re-detection ran after confirmation). */
+  commands_stale?: boolean;
+}
+
+/**
+ * Returns the effective test command for a directory: the confirmed command when
+ * it is non-empty and not stale, otherwise the detected test_cmd.
+ */
+export function effectiveTestCmd(dir: DirectoryConfig): string | undefined {
+  if (dir.commands_stale !== true && dir.confirmed_test_cmd) return dir.confirmed_test_cmd;
+  return dir.test_cmd;
+}
+
+/**
+ * Returns the effective build command for a directory: the confirmed command when
+ * it is non-empty and not stale, otherwise the detected build_cmd.
+ */
+export function effectiveBuildCmd(dir: DirectoryConfig): string | undefined {
+  if (dir.commands_stale !== true && dir.confirmed_build_cmd) return dir.confirmed_build_cmd;
+  return dir.build_cmd;
+}
+
+/**
+ * Returns the effective install command for a directory: the confirmed command when
+ * it is non-empty and not stale, otherwise the detected install_cmd.
+ */
+export function effectiveInstallCmd(dir: DirectoryConfig): string | undefined {
+  if (dir.commands_stale !== true && dir.confirmed_install_cmd) return dir.confirmed_install_cmd;
+  return dir.install_cmd;
+}
+
+/**
+ * Returns the effective lint command for a directory: the confirmed command when
+ * it is non-empty and not stale, otherwise the detected lint_cmd.
+ */
+export function effectiveLintCmd(dir: DirectoryConfig): string | undefined {
+  if (dir.commands_stale !== true && dir.confirmed_lint_cmd) return dir.confirmed_lint_cmd;
+  return dir.lint_cmd;
 }
 /** Project-specific Alembic/SQLModel migration layout. Lets a non-Blueprint
  *  repo onboard the `migrate` handler without inheriting Blueprint's
@@ -194,12 +237,13 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   // --- BuildConfig-based detection (takes precedence over auto-detection) ---
   if (buildConfig?.directories) {
     for (const dir of buildConfig.directories) {
-      if (dir.test_cmd) {
+      const testCmd = effectiveTestCmd(dir);
+      if (testCmd) {
         const cwd = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
         runners.push({
-          ...runnerFromCommand(dir.test_cmd, cwd),
-          label: `${dir.test_cmd} (${dir.path || 'root'})`,
-          installCmd: dir.install_cmd,
+          ...runnerFromCommand(testCmd, cwd),
+          label: `${testCmd} (${dir.path || 'root'})`,
+          installCmd: effectiveInstallCmd(dir),
         });
       }
     }
@@ -1030,7 +1074,7 @@ export function detectAcceptanceProbes(buildConfig?: BuildConfig): AcceptancePro
   //    interpolation.
   if (buildConfig?.directories) {
     for (const dir of buildConfig.directories) {
-      const buildCmd = (dir.build_cmd || '').trim();
+      const buildCmd = (effectiveBuildCmd(dir) || '').trim();
       if (!buildCmd) continue;
       const abs = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
       const runner = runnerFromTestCmd(buildCmd, abs);

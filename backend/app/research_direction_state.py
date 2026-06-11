@@ -11,7 +11,7 @@ completion event.
 import contextlib
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from sqlalchemy.exc import IntegrityError
@@ -36,7 +36,7 @@ from app.research_context import (
     build_recent_findings_evidence,
     extract_diagnosis_from_context,
 )
-from app.shared_state import DEFAULT_TASK_SCOPE
+from app.shared_state import DEFAULT_TASK_SCOPE, runtime_config as _runtime_config
 from app.task_evaluators import (
     CHALLENGE_AGREES,
     CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
@@ -278,9 +278,16 @@ async def apply_post_spawn_state(
             directions = list(project.directions or [])
             _pending_archived_diagnoses: list[tuple] = []
             now_iso = _utcnow().isoformat()
+            _refractory_min = _runtime_config.get("direction_refractory_minutes", 360)
             for d in directions:
                 if d.get("id") in direction_ids_with_findings:
                     d["last_researched_at"] = now_iso
+                    # Stamp a refractory window so the direction is ineligible for
+                    # immediate re-research after this cycle completes.
+                    if isinstance(_refractory_min, (int, float)) and _refractory_min > 0:
+                        d["refractory_until"] = (
+                            _utcnow() + timedelta(minutes=float(_refractory_min))
+                        ).isoformat()
             # Append to research_history for each direction that produced findings
             finding_titles_by_dir: dict = {}
             finding_descriptions_by_dir: dict = {}
@@ -459,6 +466,16 @@ async def apply_post_spawn_state(
                         )
                     d["research_history"] = new_history[-10:]
                     d["possibly_saturated"] = _compute_saturation(d["research_history"])
+                    # Saturated directions get a longer refractory so the portfolio
+                    # is not immediately re-queued on a direction that has no work left.
+                    if d.get("possibly_saturated"):
+                        _sat_refractory_min = _runtime_config.get(
+                            "direction_saturation_refractory_minutes", 720
+                        )
+                        if isinstance(_sat_refractory_min, (int, float)) and _sat_refractory_min > 0:
+                            d["refractory_until"] = (
+                                _utcnow() + timedelta(minutes=float(_sat_refractory_min))
+                            ).isoformat()
 
                     # Deadlock detection: 3+ consecutive 0-task cycles driven by dedup
                     _deadlocked, _consec = _detect_dedup_deadlock(d["research_history"])

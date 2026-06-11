@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, PoolVmState, Task, TaskStatus
+from app.models import PoolIdleCostLedger, PoolIdleSpan, Project, PoolVmState, Task, TaskStatus
 from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.review_pipeline import _spawn_pipeline_task
 from testing.conftest import TestingSessionLocal
@@ -1029,8 +1029,9 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
     """A pool-origin warm start moves the efficiency axes: vm_reuse_rate rises to
     1.0 (the COMPLETED task's ``_timing.warm_start`` participates as a warm VM),
     and ``cost_per_merged_pr_incl_pool_idle`` strictly exceeds the pool-exclusive
-    ``cost_per_merged_pr`` because the member's banked idle spend is folded into
-    the net-cost numerator. This is the enablement-confidence assertion cluster 1
+    ``cost_per_merged_pr`` because in-window pool idle spend (a PoolIdleSpan row
+    whose ``settled_at`` falls inside the 7-day axis window) is folded into the
+    net-cost numerator. This is the enablement-confidence assertion cluster 1
     did not make: the measured lift is genuinely pool-origin AND the idle cost is
     accounted, not hidden."""
     from app.warm_pool import register_pool_vm
@@ -1043,8 +1044,11 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
         await db_session.refresh(project)
 
         # A pool member carrying banked idle spend (the IDLE->LEASED settle banked
-        # it in production; we set it directly to keep the cost delta deterministic
-        # and idle_since=None so no live accrual perturbs the exact comparison).
+        # it in production; we set it directly and idle_since=None so no live
+        # accrual perturbs the exact comparison). The windowed axis intentionally
+        # excludes timestampless ``idle_cost_banked``, so this member only feeds
+        # the all-time ``pool_idle_cost_usd`` metric — the axis delta below comes
+        # from the deterministic in-window span row instead.
         member = await register_pool_vm(
             db_session,
             vm_instance_id=f"agent-vm-axis-{uuid.uuid4().hex}",
@@ -1057,6 +1061,30 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
         member.idle_since = None
         member.idle_cost_banked = 0.02
         db_session.add(member)
+
+        # In-window idle spend: a settled PoolIdleSpan row whose settled_at falls
+        # inside the 7-day axis window. _compute_windowed_idle_cost sums exactly
+        # these rows into the pool-inclusive numerator, keeping the cost delta
+        # deterministic (no clock-dependent live accrual).
+        # The corresponding PoolIdleCostLedger row is also seeded so that the
+        # all-time pool_idle_cost_usd metric remains accurate.
+        db_session.add(
+            PoolIdleSpan(
+                project_id=project.id,
+                vm_instance_id="agent-vm-axis-retired",
+                started_at=datetime.utcnow() - timedelta(days=1, hours=1),
+                settled_at=datetime.utcnow() - timedelta(days=1),
+                cost_usd=0.02,
+            )
+        )
+        db_session.add(
+            PoolIdleCostLedger(
+                project_id=project.id,
+                vm_instance_id="agent-vm-axis-retired",
+                idle_cost_usd=0.02,
+                retired_at=datetime.utcnow() - timedelta(days=1),
+            )
+        )
 
         # A COMPLETED, merged task that was served WARM by the pool: it has a
         # provisioned->stopped VM interval (so cost_per_merged_pr is computable),
@@ -1088,7 +1116,7 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
         assert axes[AXIS_VM_REUSE_RATE] == 1.0
 
         # Pool-inclusive cost strictly exceeds pool-exclusive cost: the $0.02 of
-        # banked idle spend is folded into the net numerator (0.12 vs 0.10).
+        # in-window ledger idle spend is folded into the net numerator.
         cost_excl = axes["cost_per_merged_pr"]
         cost_incl = axes["cost_per_merged_pr_incl_pool_idle"]
         assert cost_excl is not None and cost_incl is not None
@@ -1457,3 +1485,63 @@ async def test_warm_pool_cost_guard_drains_and_blocks_lease(
         assert await get_pool_vm(db_session, pool_vm_id) is None
         cost = await compute_pool_idle_cost(db_session, project_id=project.id)
         assert cost["retired_idle_cost_usd"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_cost_guard_ignores_pre_window_idle_spend(db_session, mocker):
+    """Pre-window idle spend must NOT trip the cost guard's materiality floor.
+
+    Seeds only a PoolIdleCostLedger row retired BEFORE the guard's window, so
+    the windowed idle cost is $0. Even with dispatches below the min_hit_rate
+    and idle_cost_usd set to a tiny floor, the guard must NOT engage because
+    the windowed spend never crosses the floor. This regression-tests the fix
+    that switches evaluate_pool_cost_guard from compute_pool_idle_cost (all-time)
+    to _compute_windowed_idle_cost.
+    """
+    from app.warm_pool_maintainer import evaluate_pool_cost_guard
+    from app.warm_backlog_reuse import record_pool_lease_miss
+
+    project = Project(name="Cost Guard Window Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow()
+
+    # A ledger row retired BEFORE the 24h guard window (50 hours ago).
+    # All-time compute_pool_idle_cost would see this; windowed must not.
+    db_session.add(
+        PoolIdleCostLedger(
+            project_id=project.id,
+            vm_instance_id="vm-pre-window",
+            idle_cost_usd=100.0,
+            retired_at=now - timedelta(hours=50),
+        )
+    )
+    await db_session.commit()
+
+    # Seed a low eligible hit rate (3 misses, 0 hits) so the hit-rate condition
+    # is breached — only the idle-spend floor blocks engagement.
+    for _ in range(3):
+        record_pool_lease_miss("no_idle_member")
+
+    # Set a very low floor ($0.10) so even a tiny in-window spend would trip it.
+    # The pre-window ledger row is $100 — if it leaked through, the guard engages.
+    cfg_override = {
+        "warm_pool_cost_guard_enabled": True,
+        "warm_pool_cost_guard_min_hit_rate": 0.50,
+        "warm_pool_cost_guard_min_dispatches": 1,
+        "warm_pool_cost_guard_min_idle_cost_usd": 0.10,
+        "warm_pool_cost_guard_window_hours": 24,
+    }
+
+    guard = await evaluate_pool_cost_guard(db_session, runtime_config=cfg_override)
+
+    assert not guard["engaged"], (
+        "Cost guard must NOT engage when ALL idle spend is pre-window. "
+        f"idle_cost_usd={guard['idle_cost_usd']}, min_idle_cost_usd=0.10"
+    )
+    assert guard["idle_cost_usd"] < 0.10, (
+        f"Windowed idle_cost_usd={guard['idle_cost_usd']} should be < $0.10; "
+        "the pre-window $100 ledger row must not be counted"
+    )

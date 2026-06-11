@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Cpu, Square, AlertTriangle, Clock, ExternalLink } from 'lucide-react';
-import { fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
+import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package } from 'lucide-react';
+import { analyzeComputeJob, fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
+import { ReleaseEvidenceChip } from './ReleaseEvidence';
+import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
+import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   isComputeJobActive,
   computeJobTerminalLabel,
@@ -29,13 +32,16 @@ function budgetBarClass(pct: number): string {
 interface ComputeJobsPanelProps {
   projectId: string | null;
   onNavigateToTask?: (taskId: string) => void;
+  onLaunchCompute?: () => void;
 }
 
-export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPanelProps) {
+export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [killingId, setKillingId] = useState<string | null>(null);
+  const [analyzingId, setAnalyzingId] = useState<string | null>(null);
+  const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   const load = useCallback(
@@ -88,10 +94,48 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
     [],
   );
 
+  const handleAnalyze = useCallback(
+    async (job: ComputeJob) => {
+      setAnalyzingId(job.id);
+      setAnalysisFeedback((prev) => ({
+        ...prev,
+        [job.id]: { kind: 'running', message: 'Running analysis…' },
+      }));
+      try {
+        const result = await analyzeComputeJob(job.id);
+        if (result.status === 'analysis_unavailable') {
+          const causeLabel = formatComputeAnalysisCauseLabel({ unavailableCause: result.reason ?? null });
+          setAnalysisFeedback((prev) => ({
+            ...prev,
+            [job.id]: {
+              kind: 'analysis_unavailable',
+              message: causeLabel ? `Analysis unavailable: ${causeLabel}` : 'Analysis unavailable',
+            },
+          }));
+        } else {
+          setAnalysisFeedback((prev) => ({
+            ...prev,
+            [job.id]: { kind: 'upgraded', message: 'Analysis upgraded' },
+          }));
+        }
+      } catch (e) {
+        setAnalysisFeedback((prev) => ({
+          ...prev,
+          [job.id]: {
+            kind: 'error',
+            message: e instanceof Error ? e.message : 'Failed to analyze compute job',
+          },
+        }));
+      } finally {
+        setAnalyzingId(null);
+        await load();
+      }
+    },
+    [load],
+  );
+
   if (!projectId) return null;
-  // Hide the panel entirely once loaded with nothing to show — compute jobs are
-  // a rare task shape, so an empty card would just be noise on most projects.
-  if (loaded && !error && jobs.length === 0) return null;
+  const showEmptyState = loaded && !error && jobs.length === 0;
 
   return (
     <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
@@ -105,6 +149,28 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
           <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
           {error}
         </p>
+      )}
+
+      {showEmptyState && (
+        <div className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-xs font-semibold text-neutral-200">No compute jobs</div>
+              <div className="mt-0.5 text-[10px] text-neutral-500">
+                Launch a structured experiment for this project.
+              </div>
+            </div>
+            {onLaunchCompute && (
+              <button
+                type="button"
+                onClick={onLaunchCompute}
+                className="shrink-0 min-h-[36px] rounded bg-sky-500/20 px-3 text-[11px] font-semibold text-sky-200 transition-colors hover:bg-sky-500/30"
+              >
+                Launch compute experiment
+              </button>
+            )}
+          </div>
+        </div>
       )}
 
       <div className="flex flex-col gap-2">
@@ -137,6 +203,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                   </div>
+                  {(() => {
+                    const evidence = asLiveReleaseEvidence(job.polling_metadata?.live_release_evidence);
+                    if (!evidence) return null;
+                    return (
+                      <div className="mt-1">
+                        <ReleaseEvidenceChip evidence={evidence} />
+                      </div>
+                    );
+                  })()}
                 </div>
                 <span
                   className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${statusBadgeClass(job)}`}
@@ -169,21 +244,70 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
                     <span className="break-words">{job.terminal_reason ?? '—'}</span>
                   )}
                 </div>
-                {active && (
-                  <button
-                    onClick={() => void handleKill(job)}
-                    disabled={killingId === job.id}
-                    className="shrink-0 min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-red-500/20 text-red-200 hover:bg-red-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
-                    title="Kill this compute job"
-                  >
-                    <Square className="w-3 h-3" />
-                    {killingId === job.id ? 'Killing…' : 'Kill'}
-                  </button>
-                )}
+                <div className="flex items-center gap-2 shrink-0">
+                  {!active && (
+                    <button
+                      onClick={() => void handleAnalyze(job)}
+                      disabled={analyzingId === job.id}
+                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-violet-500/20 text-violet-200 hover:bg-violet-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
+                      title="Run analysis for this terminal compute job"
+                    >
+                      <Cpu className="w-3 h-3" />
+                      {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
+                    </button>
+                  )}
+                  {active && (
+                    <button
+                      onClick={() => void handleKill(job)}
+                      disabled={killingId === job.id}
+                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-red-500/20 text-red-200 hover:bg-red-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
+                      title="Kill this compute job"
+                    >
+                      <Square className="w-3 h-3" />
+                      {killingId === job.id ? 'Killing…' : 'Kill'}
+                    </button>
+                  )}
+                </div>
               </div>
+              {analysisFeedback[job.id] && (
+                <div
+                  className={`mt-1.5 rounded border px-2 py-1 text-[10px] ${
+                    analysisFeedback[job.id].kind === 'error'
+                      ? 'border-red-500/30 bg-red-500/10 text-red-200'
+                      : analysisFeedback[job.id].kind === 'analysis_unavailable'
+                        ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+                        : analysisFeedback[job.id].kind === 'upgraded'
+                          ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+                          : 'border-violet-500/30 bg-violet-500/10 text-violet-200'
+                  }`}
+                >
+                  {analysisFeedback[job.id].message}
+                </div>
+              )}
+              {job.artifact_id && (
+                <div className="mt-1.5 flex items-start gap-1.5 text-[10px]">
+                  <Package className="w-3 h-3 shrink-0 mt-px text-emerald-300" />
+                  <div className="min-w-0">
+                    {job.result_reference ? (
+                      <ResolvedReferenceLink
+                        projectId={projectId}
+                        reference={job.result_reference}
+                        className="inline-flex items-center gap-1 font-semibold text-emerald-300 hover:text-emerald-200 hover:underline break-words min-w-0 text-left disabled:opacity-70"
+                      >
+                        <span className="break-words">COMPUTE_RESULT artifact</span>
+                        <ExternalLink className="w-3 h-3 shrink-0" />
+                      </ResolvedReferenceLink>
+                    ) : (
+                      <span className="font-semibold text-emerald-300">
+                        COMPUTE_RESULT artifact
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
               {job.result_reference && (
                 <div className="mt-1.5 flex items-start gap-1.5 text-[10px] text-neutral-400 font-mono break-words">
-                  <span className="shrink-0 text-neutral-500">Result</span>
+                  <span className="shrink-0 text-neutral-500">Result reference</span>
                   <ResolvedReferenceLink
                     projectId={projectId}
                     reference={job.result_reference}

@@ -34,6 +34,7 @@ from app.models import (
     ProjectMessage,
     SystemMaturity,
 )
+from app.deploy_identity import project_matches_deploy_identity
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.release_artifacts import (
     summarize_release_artifacts,
@@ -43,7 +44,9 @@ from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
 )
+from app.capability_trial_verdict import get_trial_verdicts
 from app.capability_registry import (
+    annotate_capability_proof_status as _annotate_capability_proof_status,
     registry_capability_names,
     registry_capability_vocabulary,
 )
@@ -128,18 +131,21 @@ def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> Non
             )
 
 
-def _version_serving_summary(version) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _version_serving_summary(
+    version, project=None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     aggregate, artifacts = summarize_release_artifacts(
         version,
         getattr(version, "deploy_artifacts", None),
+        project=project,
     )
     return aggregate, artifacts
 
 
-def _strategic_recent_version_entry(version) -> dict[str, Any]:
+def _strategic_recent_version_entry(version, project=None) -> dict[str, Any]:
     from app.release_version import summarize_qualification_state as _summarize
 
-    aggregate, artifacts = _version_serving_summary(version)
+    aggregate, artifacts = _version_serving_summary(version, project)
     return {
         "version_number": version.version_number,
         "status": version.status,
@@ -230,6 +236,10 @@ def _agent_view_design_doc(doc: dict | None) -> dict:
 # the underlying design doc grows. The agent pulls full content on demand via
 # ``POST /api/agent/design-doc`` (op:get).
 _DESIGN_DOC_INDEX_SUMMARY_CHARS = 200
+# Per-field char cap for repo_overview inline fields (tech_stack,
+# directory_layout, first_steps_summary). Enough to orient the first strategic
+# cycle without unbounding the index on verbose bootstrap output.
+_REPO_OVERVIEW_INLINE_CHARS = 300
 # Cap on backing module paths carried per systems/capabilities entry so a
 # pathological entry with hundreds of modules cannot unbound the index. The
 # declared paths are kept (capped) so the agent-side reconciliation over the
@@ -320,6 +330,22 @@ def _design_doc_index(doc: dict | None) -> dict:
             warning = value.get("presence_warning")
             if isinstance(warning, str) and warning.strip():
                 entry["presence_warning"] = warning
+        elif isinstance(value, dict) and key == "repo_overview":
+            # repo_overview is a first-class bootstrap section: carry all overview
+            # fields inline so the first strategic cycle has actual repo context
+            # without a fetch round-trip. Optional fields are included when present.
+            for field in (
+                "tech_stack", "directory_layout", "first_steps_summary",
+                "entry_points", "test_layout", "key_conventions", "environment_requirements",
+            ):
+                raw = value.get(field)
+                if isinstance(raw, str) and raw.strip():
+                    collapsed = " ".join(raw.split())
+                    entry[field] = (
+                        collapsed[: _REPO_OVERVIEW_INLINE_CHARS - 1].rstrip() + "…"
+                        if len(collapsed) > _REPO_OVERVIEW_INLINE_CHARS
+                        else collapsed
+                    )
         entries.append(entry)
     return {"sections": entries}
 
@@ -781,6 +807,7 @@ def _build_operator_overrides_summary(project: Project) -> list[dict]:
     return entries[:_OPERATOR_OVERRIDES_MAX]
 
 
+
 async def _verify_capability_backing_paths(
     pm: dict | None,
     *,
@@ -925,7 +952,10 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
 
     Strips full history arrays down to a 3-point tail per axis so the agent
     can read a trend without dragging months of weekly history through the
-    payload budget.
+    payload budget. Also forwards format_compliance and agent_timeout_rate
+    blocks (current/baseline/drift_pct only, no history) so the strategist
+    can answer 'is self-repair working?' and 'is the timeout rate improving?'
+    without a separate fetch.
     """
     if not snapshot:
         return {}
@@ -936,17 +966,48 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
             trimmed_axes[axis] = data
             continue
         history = data.get("history") or []
+        seeded_at = data.get("baseline_seeded_at")
+        if seeded_at == snapshot.get("baseline_captured_at"):
+            seeded_at = None
         trimmed_axes[axis] = {
             "current": data.get("current"),
             "baseline": data.get("baseline"),
             "drift_pct": data.get("drift_pct"),
             "history_tail": history[-_EFFICIENCY_SNAPSHOT_HISTORY_TAIL:],
         }
-    return {
+        if seeded_at:
+            trimmed_axes[axis]["seeded_at"] = seeded_at
+    result: dict = {
         "axes": trimmed_axes,
         "baseline_captured_at": snapshot.get("baseline_captured_at"),
         "last_snapshot_at": snapshot.get("last_snapshot_at"),
     }
+    raw_fc = snapshot.get("format_compliance") or {}
+    if raw_fc:
+        fc_trimmed: dict = {}
+        for rate_key in ("format_compliance_rate", "self_repair_success_rate"):
+            rate_data = raw_fc.get(rate_key)
+            if isinstance(rate_data, dict):
+                fc_trimmed[rate_key] = {
+                    "current": rate_data.get("current"),
+                    "baseline": rate_data.get("baseline"),
+                    "drift_pct": rate_data.get("drift_pct"),
+                }
+        if fc_trimmed:
+            result["format_compliance"] = fc_trimmed
+    raw_atr = snapshot.get("agent_timeout_rate") or {}
+    if raw_atr:
+        overall = raw_atr.get("overall") or {}
+        result["agent_timeout_rate"] = {
+            "overall": {
+                "current": overall.get("current"),
+                "baseline": overall.get("baseline"),
+                "drift_pct": overall.get("drift_pct"),
+            },
+            "dominant_subtype": raw_atr.get("dominant_subtype"),
+            "dominant_share": raw_atr.get("dominant_share"),
+        }
+    return result
 
 
 def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
@@ -1238,6 +1299,22 @@ _RECON_LIST_CAP = 12
 _RECENT_MERGED_TITLES_CAP = 10
 # Char cap for any direction/gap/capability label echoed into the block.
 _RECON_LABEL_MAXLEN = 120
+# Name-length threshold for the long-name hygiene signal in prune candidates.
+# Capability/gap names longer than this are flagged as advisory cleanup targets.
+_CAPABILITY_LONG_NAME_THRESHOLD = 80
+# Salient keyword buckets for domain-based grouping of live capability names.
+# When 2+ capabilities share a bucket, they are advisory merge candidates.
+# Keys are human-readable bucket labels; values are lowercase substrings to
+# match against the capability name (first matching bucket wins).
+_CAPABILITY_DOMAIN_KEYWORD_BUCKETS: dict[str, list[str]] = {
+    "strategic": ["strategic"],
+    "task": ["task"],
+    "operator": ["operator"],
+    "research": ["research"],
+    "capability": ["capability"],
+    "compute": ["compute"],
+    "ci": ["pipeline", "release", "deploy"],
+}
 
 # GitHub-ancestry verification (in _build_recent_interventions) runs OUTSIDE any
 # DB transaction and is bounded so it can never approach the 60s
@@ -1724,7 +1801,98 @@ def _build_prune_candidates(
                 }
             )
 
-    if not resolved_gaps and not absent_capabilities and not expired_holds:
+    # 4. Ungroundable capabilities: no backing_paths, no source, no verification.
+    # These are unverifiable claims that have never been grounded — different from
+    # absent_capabilities which requires the grounded check to have run and found
+    # the code missing. Advisory: ground/consolidate or add backing_paths.
+    ungroundable_capabilities: list[dict] = []
+    for cap in pm.get("capabilities") or []:
+        if not isinstance(cap, dict):
+            continue
+        backing = cap.get("backing_paths")
+        if backing:  # non-empty list means grounded
+            continue
+        if cap.get("source"):  # claimed provenance present
+            continue
+        if cap.get("verification") is not None:  # already checked
+            continue
+        ungroundable_capabilities.append(
+            {"name": _label(cap.get("name")), "status": cap.get("status")}
+        )
+
+    # 5. Domain merge groups: keyword-bucket grouping of live capability names.
+    # Capabilities in the same bucket are advisory consolidation candidates.
+    _domain_buckets: dict[str, list[str]] = {}
+    for cap in pm.get("capabilities") or []:
+        if not isinstance(cap, dict):
+            continue
+        raw_name = str(cap.get("name") or "")
+        if not raw_name:
+            continue
+        lower_name = raw_name.lower()
+        for bucket, keywords in _CAPABILITY_DOMAIN_KEYWORD_BUCKETS.items():
+            if any(kw in lower_name for kw in keywords):
+                _domain_buckets.setdefault(bucket, []).append(_label(raw_name))
+                break  # first matching bucket wins
+    domain_merge_groups: list[dict] = [
+        {"bucket": bucket, "names": names}
+        for bucket, names in _domain_buckets.items()
+        if len(names) >= 2
+    ]
+
+    # 6. Heavy gaps: top-N active gaps by serialized history weight (compaction targets).
+    # Only gaps with non-empty history are included — empty-history gaps need no compaction.
+    _gap_sizes: list[tuple[int, dict]] = []
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") != "active":
+            continue
+        history = g.get("history") or []
+        if not isinstance(history, list) or len(history) == 0:
+            continue
+        approx_bytes = len(json.dumps(history))
+        _gap_sizes.append(
+            (
+                approx_bytes,
+                {
+                    "gap_id": str(g.get("id") or ""),
+                    "name": _label(g.get("name")),
+                    "history_entry_count": len(history),
+                    "approx_bytes": approx_bytes,
+                },
+            )
+        )
+    _gap_sizes.sort(key=lambda x: x[0], reverse=True)
+    heavy_gaps: list[dict] = [item for _, item in _gap_sizes[:_RECON_LIST_CAP]]
+
+    # 7. Long names: capabilities and gaps whose names exceed the threshold.
+    # Oversized names inflate every payload that ships the capability vocabulary.
+    long_names: list[dict] = []
+    for cap in pm.get("capabilities") or []:
+        if not isinstance(cap, dict):
+            continue
+        raw_name = str(cap.get("name") or "")
+        if len(raw_name) > _CAPABILITY_LONG_NAME_THRESHOLD:
+            long_names.append(
+                {"kind": "capability", "name": _label(raw_name), "length": len(raw_name)}
+            )
+    for g in gaps:
+        if not isinstance(g, dict):
+            continue
+        raw_name = str(g.get("name") or "")
+        if len(raw_name) > _CAPABILITY_LONG_NAME_THRESHOLD:
+            long_names.append(
+                {"kind": "gap", "name": _label(raw_name), "length": len(raw_name)}
+            )
+
+    if (
+        not resolved_gaps
+        and not absent_capabilities
+        and not expired_holds
+        and not ungroundable_capabilities
+        and not domain_merge_groups
+        and not heavy_gaps
+        and not long_names
+    ):
         return None
 
     def _cap(items: list) -> tuple[list, int]:
@@ -1735,17 +1903,27 @@ def _build_prune_candidates(
     capped_resolved, _ = _cap(resolved_gaps)
     capped_absent, _ = _cap(absent_capabilities)
     capped_holds, _ = _cap(expired_holds)
+    capped_ungroundable, _ = _cap(ungroundable_capabilities)
+    capped_long_names, _ = _cap(long_names)
 
     return {
         "model_size_status": status,
         "resolved_gaps": capped_resolved,
         "absent_capabilities": capped_absent,
         "expired_holds": capped_holds,
+        "ungroundable_capabilities": capped_ungroundable,
+        "domain_merge_groups": domain_merge_groups,
+        "heavy_gaps": heavy_gaps,
+        "long_names": capped_long_names,
         "counts": {
             # True totals (uncapped) so the renderer can say "+N more".
             "resolved_gaps": len(resolved_gaps),
             "absent_capabilities": len(absent_capabilities),
             "expired_holds": len(expired_holds),
+            "ungroundable_capabilities": len(ungroundable_capabilities),
+            "domain_merge_groups": len(domain_merge_groups),
+            "heavy_gaps": len(heavy_gaps),
+            "long_names": len(long_names),
         },
     }
 
@@ -2092,6 +2270,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "research_mode": {"priority": "critical"},
     "project_name": {"priority": "critical"},
     "base_branch": {"priority": "critical"},
+    "is_self_repo": {"priority": "critical"},
     "enable_self_improvement": {"priority": "critical"},
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
@@ -2154,9 +2333,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # no summarize_fn — it should only drop under genuine budget exhaustion.
     "model_health": {"priority": "high"},
     # Concrete cleanup candidates surfaced only when the model is large/oversized.
-    # Medium priority with no summarize_fn: already capped at build time, so the
-    # packer drops it whole under budget rather than trimming. Advisory.
-    "prune_candidates": {"priority": "medium"},
+    # High priority so the block survives the same payload pressure that triggered
+    # the large/oversized status — a medium-priority block would be dropped under
+    # the exact budget conditions where the candidates are most actionable.
+    "prune_candidates": {"priority": "high"},
     # Compact index of all playbook keys — survives budget pressure so the
     # strategist always knows what operational knowledge exists and can fetch
     # entries on demand via `./fetch playbook <key>`. High priority to persist
@@ -2175,6 +2355,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # drops it whole under budget rather than trimming — mirroring
     # staged_directions / operator_overrides. Full bodies fetched on demand.
     "knowledge_index": {"priority": "medium"},
+    "capability_trial_verdicts": {"priority": "medium"},
     "outcome_evaluation": {
         "priority": "medium",
         "summarize": _summarize_outcome_evaluation,
@@ -2296,7 +2477,7 @@ async def _build_shipped_changes_manifest(
     """Build a manifest of merged tasks since the last architecture review.
 
     Uses design_doc._meta.last_updated as the cutoff, falling back to the
-    most recent phase1_completed_at from vision._strategic_cycle_history.
+    most recent phase1_completed_at from the StrategicCycle table.
     Returns a list of direction-grouped dicts, capped at 50 merged tasks.
     """
 
@@ -3387,6 +3568,35 @@ async def _find_last_strategic_cycle_time(
     return task.updated_at or task.created_at
 
 
+async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
+    """Return True if a repo_bootstrap task is still in-flight for this project.
+
+    False for self-repo projects and for projects whose bootstrap has already
+    completed (``bootstrap_completed_at`` is set).  A terminal bootstrap
+    (FAILED / COMPLETED / …) also returns False so a permanently degraded
+    bootstrap never deadlocks autonomous spawning.
+    """
+    _build_cfg = project.build_config or {}
+    if _build_cfg.get("bootstrap_completed_at") or project.is_self_repo:
+        return False
+    pending = (
+        await session.execute(
+            select(Task.id)
+            .where(
+                Task.project_id == project.id,
+                Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                Task.status.in_([
+                    TaskStatus.QUEUED,
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                ]),
+            )
+            .limit(1)
+        )
+    ).first()
+    return pending is not None
+
+
 async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
@@ -3400,6 +3610,15 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     if await _has_active_strategic_task(project.id, session):
         logger.warning(
             f"[STRATEGIC] Skipping design doc update — strategic task already active for {project.id}"
+        )
+        return False
+
+    # Guard: defer architecture cycles until repo_bootstrap completes.
+    if await _bootstrap_pending(project, session):
+        logger.info(
+            "[STRATEGIC] Deferring design doc update for project %s — "
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+            project.id,
         )
         return False
 
@@ -3447,7 +3666,10 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         if _missing_demand_present
         else None
     )
-    _dd_available_capabilities = registry_capability_vocabulary(project.problem_model)
+    _dd_available_capabilities = _annotate_capability_proof_status(
+        registry_capability_vocabulary(project.problem_model),
+        getattr(project, "capability_proof_records", None),
+    )
     # Compact, body-omitted index of existing knowledge documents (web_research /
     # design output) so the strategist knows what knowledge already exists and
     # can fetch full bodies on demand — included only when documents exist.
@@ -3646,6 +3868,18 @@ async def _spawn_strategic_review(
     if await _has_active_strategic_task(project.id, session):
         logger.warning(
             f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}"
+        )
+        return False
+
+    # Guard: defer implementation spawning until repo_bootstrap completes.
+    # If bootstrap_completed_at is unset AND there is a pending bootstrap task,
+    # this project is still being onboarded — skip this cycle. If bootstrap has
+    # FAILED or is otherwise terminal, proceed gracefully (degraded path).
+    if await _bootstrap_pending(project, session):
+        logger.info(
+            "[STRATEGIC] Deferring strategic review for project %s — "
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+            project.id,
         )
         return False
 
@@ -3895,6 +4129,25 @@ async def _spawn_strategic_review(
         if mode_hint_lines
         else None
     )
+    spawn_gate_hint_lines = []
+    for stat_entry in direction_stats:
+        spawn_gate_metrics = stat_entry.get("spawn_gate_metrics") or {}
+        exhaustion_count = int(spawn_gate_metrics.get("exhaustion_count") or 0)
+        if exhaustion_count <= 0:
+            continue
+        direction_label = f"{stat_entry.get('id')}: {(stat_entry.get('text') or '')[:120]}".strip()
+        spawn_gate_hint_lines.append(
+            f"- {direction_label} — Spawn-gate grader note: wholesale retry exhausted {exhaustion_count} time(s); repeated grader non-response in this direction looks infrastructural rather than like a real finding refutation."
+        )
+    if spawn_gate_hint_lines:
+        spawn_gate_block = "\n".join(
+            ["Spawn-gate grader notes for this cycle:", *spawn_gate_hint_lines]
+        )
+        prompt_suffix = (
+            f"{prompt_suffix}\n{spawn_gate_block}"
+            if prompt_suffix
+            else spawn_gate_block
+        )
 
     # Recently rejected proposals (last 30 days) — surfaced so the strategic
     # agent avoids re-proposing similar work the user already declined.
@@ -4144,7 +4397,7 @@ async def _spawn_strategic_review(
                 )
             if _open_version is not None:
                 _open_aggregate, _open_artifacts = _version_serving_summary(
-                    _open_version
+                    _open_version, project
                 )
                 _tasks_merged = await count_merged_since(
                     session, project.id, _open_version.opened_at
@@ -4203,7 +4456,7 @@ async def _spawn_strategic_review(
                     if _version_phase_block is None:
                         _version_phase_block = {}
                     _version_phase_block["recent_versions"] = [
-                        _strategic_recent_version_entry(version)
+                        _strategic_recent_version_entry(version, project)
                         for version in _closed
                     ]
             except Exception:
@@ -4251,13 +4504,15 @@ async def _spawn_strategic_review(
                     "[STRATEGIC] promoted-version lookup failed; continuing"
                 )
             # Deployed SHA: the orchestrator's own DeploymentState tracks the live
-            # self-repo container. For a non-self-repo project it is meaningless,
-            # so fall back to the latest promoted SHA (their deploy follows
-            # promotion, not this orchestrator's container).
+            # container of the repo THIS deployment was built from. It is
+            # meaningful only for the project that IS the deploy identity
+            # (deploy-level observability) — for any other project it is
+            # meaningless, so fall back to the latest promoted SHA (their deploy
+            # follows promotion, not this orchestrator's container).
             _deployed_sha: str | None = None
             _deployed_revision: str | None = None
             _deploy_status: str | None = None
-            # Rollback provenance — only meaningful for the self-repo's own
+            # Rollback provenance — only meaningful for the deploy's own
             # DeploymentState. Surfaced so the strategist sees WHY the pipeline
             # rolled back (which SHA, how many consecutive rollbacks, the
             # reason) and can prioritize stabilization rather than spawn more
@@ -4265,7 +4520,10 @@ async def _spawn_strategic_review(
             _rolled_back_from_sha: str | None = None
             _rollback_count: int = 0
             _rollback_reason: str | None = None
-            if getattr(project, "is_self_repo", False):
+            # De-gated from project.is_self_repo to the deploy-level identity:
+            # the strategist gets positive serving evidence wherever the live
+            # DeploymentState actually corresponds to the project's repo.
+            if project_matches_deploy_identity(project):
                 try:
                     _ds = await session.get(DeploymentState, 1)
                     if _ds is not None:
@@ -4284,7 +4542,7 @@ async def _spawn_strategic_review(
             _promoted_gap: str | None = None
             if _promoted_v is not None:
                 _promoted_aggregate, _promoted_artifacts = _version_serving_summary(
-                    _promoted_v
+                    _promoted_v, project
                 )
                 _promoted_gap = summarize_required_artifact_gap(_promoted_artifacts)
             # Real serving SHA only — NEVER a promoted_sha stand-in. Fall back to
@@ -4621,7 +4879,9 @@ async def _spawn_strategic_review(
                     _conf = (_v.last_qualification or {}).get("confidence")
                     if _conf is not None:
                         _verdict_txt = f" (final qualification confidence {_conf})"
-                    _prior_aggregate, _prior_artifacts = _version_serving_summary(_v)
+                    _prior_aggregate, _prior_artifacts = _version_serving_summary(
+                        _v, project
+                    )
                     _prior_serving_status = _prior_aggregate["serving_status"]
                     _prior_deploy_reason = _prior_aggregate["reason_code"]
                     _prior_artifact_gap = summarize_required_artifact_gap(
@@ -4784,7 +5044,7 @@ async def _spawn_strategic_review(
             )
         if _latest_promoted_version is not None:
             _latest_promoted_aggregate, _latest_promoted_artifacts = (
-                _version_serving_summary(_latest_promoted_version)
+                _version_serving_summary(_latest_promoted_version, project)
             )
             _latest_artifact_gap = summarize_required_artifact_gap(
                 _latest_promoted_artifacts
@@ -5224,7 +5484,11 @@ async def _spawn_strategic_review(
     _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
     _missing_demand_present = bool(_missing_demand.get("demands"))
     _sr_registry_names = registry_capability_names(project.problem_model)
-    _sr_available_capabilities = registry_capability_vocabulary(project.problem_model)
+    _sr_available_capabilities = _annotate_capability_proof_status(
+        registry_capability_vocabulary(project.problem_model),
+        getattr(project, "capability_proof_records", None),
+    )
+    _sr_capability_trial_verdicts = get_trial_verdicts(project)
     if _missing_demand_present:
         _missing_demand_hint = missing_demand_prompt_hint(
             _missing_demand, registry_names=_sr_registry_names
@@ -5302,6 +5566,7 @@ async def _spawn_strategic_review(
             ),
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
+            "is_self_repo": bool(project.is_self_repo),
             "enable_self_improvement": project.enable_self_improvement,
             # Trim-proof authoritative direction counts + operator ceiling. Both
             # are ``critical`` so the agent's direction views always anchor on the
@@ -5411,6 +5676,11 @@ async def _spawn_strategic_review(
             **(
                 {"available_capabilities": _sr_available_capabilities}
                 if _sr_available_capabilities
+                else {}
+            ),
+            **(
+                {"capability_trial_verdicts": _sr_capability_trial_verdicts}
+                if _sr_capability_trial_verdicts
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),

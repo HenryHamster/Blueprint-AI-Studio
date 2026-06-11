@@ -2251,14 +2251,19 @@ async def test_build_knowledge_index_compact_fields_no_body(db_session):
         "topic",
         "direction_id",
         "source_kind",
+        "analysis_fallback_reason",
         "created_at",
         "knowledge_acceptance_evidence",
         "compute_acceptance_grade",
+        "compute_acceptance_reason",
+        "unavailable_cause",
         "origin_provenance",
     }
     assert "body" not in entry
     assert entry["knowledge_acceptance_evidence"] is True
     assert entry["compute_acceptance_grade"] is None  # non-compute doc
+    assert entry["compute_acceptance_reason"] == "non_compute_forward_quality_gate"
+    assert entry["unavailable_cause"] is None
     assert entry["origin_provenance"]["origin_state"] == "legacy_unknown"
     assert entry["origin_provenance"]["challenge_state"] == "legacy_unknown"
     assert entry["title"] == "Doc A"
@@ -2411,3 +2416,57 @@ async def test_build_knowledge_index_excludes_cross_project(db_session):
     )
     index_a = await build_knowledge_index(db_session, project_a.id)
     assert [e["title"] for e in index_a] == ["A doc"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_unavailable_stamps_cause_on_existing_doc(
+    db_session, _quiet_broadcast
+):
+    """analyze_compute_experiment_knowledge stamps unavailable_cause +
+    analysis_attempted_at on the stored doc when analysis is unavailable,
+    without touching analysis_mode."""
+    from unittest.mock import patch
+
+    from app.knowledge_completion import (
+        analyze_compute_experiment_knowledge,
+        persist_compute_experiment_knowledge,
+    )
+
+    _project, task = await _make_compute_task(db_session, project_name="AnalyzeUnavailable")
+
+    # First, persist the deterministic document (as completion would have done).
+    doc = await persist_compute_experiment_knowledge(
+        task,
+        outcome="SUCCESS",
+        cost=0.50,
+        criterion=None,
+        result_reference=None,
+        session=db_session,
+        logs=None,
+    )
+    assert doc is not None
+    assert doc.forward_quality_verdict.get("analysis_mode") == "deterministic"
+
+    # Trigger analysis with LLM disabled — analysis must end unavailable.
+    with patch.dict("os.environ", {"DISABLE_LLM_COMPUTE_ANALYSIS": "1"}):
+        result = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.50,
+            criterion=None,
+            result_reference=None,
+            session=db_session,
+            logs=None,
+        )
+
+    assert result["status"] == "analysis_unavailable"
+    assert result["reason"] == "analysis-disabled"
+    assert result.get("knowledge_document_id") == str(doc.id)
+
+    # The stored doc must carry the unavailable_cause stamp.
+    await db_session.refresh(doc)
+    verdict = doc.forward_quality_verdict
+    assert verdict.get("unavailable_cause") == "analysis-disabled"
+    assert verdict.get("analysis_attempted_at") is not None
+    # analysis_mode must NOT have changed (still deterministic).
+    assert verdict.get("analysis_mode") == "deterministic"

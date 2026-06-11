@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { AlertTriangle } from 'lucide-react';
-import { apiFetch, fetchTask, fetchFleetUtilization, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse, type SrReviewerDisagreementsEnvelope } from '../api';
+import { apiFetch, fetchTask, fetchFleetUtilization, fetchAgentServingShas, type AgentServingShasResponse, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse, type SrReviewerDisagreementsEnvelope } from '../api';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
@@ -17,6 +17,7 @@ import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSe
 import { ProviderCostPanel } from './ProviderCostPanel';
 import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 import { LlmCostBreakdownPanel } from './LlmCostBreakdownPanel';
+import { CapabilityTrialsPanel } from './CapabilityTrialsPanel';
 import { EffortEfficiencyPanel } from './EffortEfficiencyPanel';
 import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
@@ -127,6 +128,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [loading, setLoading] = useState(true);
   const [healthOverview, setHealthOverview] = useState<HealthOverviewResponse | null>(null);
   const [fleetUtilization, setFleetUtilization] = useState<FleetUtilizationResponse | null>(null);
+  const [agentServingShas, setAgentServingShas] = useState<AgentServingShasResponse | null>(null);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
@@ -163,6 +165,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     setFingerprintAnalytics(null);
     setHealthOverview(null);
     setFleetUtilization(null);
+    setAgentServingShas(null);
     setSparkData([]);
     sparkRef.current = [];
     setOpenPRsRefreshing(false);
@@ -366,6 +369,14 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             if (res.ok && requestId === dashboardRequestIdRef.current) setVersionLifecycle(await res.json());
           } catch { /* silent */ }
         })(),
+        (async () => {
+          try {
+            const data = await fetchAgentServingShas(selectedProjectId);
+            if (requestId === dashboardRequestIdRef.current) setAgentServingShas(data);
+          } catch {
+            if (requestId === dashboardRequestIdRef.current) setAgentServingShas(null);
+          }
+        })(),
       );
     }
 
@@ -545,7 +556,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       />
 
       {/* Fleet Capacity — global slot utilization and saturation */}
-      <FleetCapacityCard data={fleetUtilization} loading={loading} />
+      <FleetCapacityCard data={fleetUtilization} agentServingShas={agentServingShas} loading={loading} />
 
       {/* Viewport Debt */}
       {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
@@ -779,6 +790,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
           {/* Section 2g: LLM Cost by Model */}
           <LlmCostBreakdownPanel selectedProjectId={selectedProjectId} />
+
+          {/* Section 2g2: Capability Trials */}
+          {!loading && <CapabilityTrialsPanel digest={digest} />}
 
           {/* Section 2h: Effort-tier & actual-model efficiency (cost vs landed) */}
           {!loading && <EffortEfficiencyPanel data={digest?.effort_model_efficiency} />}

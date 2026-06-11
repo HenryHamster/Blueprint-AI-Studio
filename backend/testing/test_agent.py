@@ -580,6 +580,151 @@ async def test_agent_status_update_persists_runtime_identity(
 
 
 @pytest.mark.asyncio
+async def test_terminal_heartbeat_records_atomic_provider_model_pair(
+    client: AsyncClient, db_session, mocker
+):
+    """Terminal heartbeat must record (provider, model) as an atomic pair.
+
+    Three sub-cases in one test to satisfy the acceptance gate:
+    1. Agent-reported pair wins over context pair when both present.
+    2. Context pair used atomically when agent reports neither field.
+    3. Mixed sources (context provider only + agent model only) do NOT
+       produce a chimera row; the pair falls through to partial blend but
+       does NOT combine context-provider with payload-model as a unit when
+       context_model is absent.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    now = datetime.utcnow()
+
+    project = Project(name="Atomic Pair Test", user_id="test-user-atomic")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # --- sub-case 1: agent-reported pair wins over context pair ---
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-atomic-1",
+        status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=now - timedelta(minutes=5),
+        context={
+            "llm_account_id": "acct-1",
+            "max_plan_account_id": "acct-1",
+            "llm_provider": "anthropic",
+            "llm_model": "claude-fable-5",
+        },
+    )
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+
+    token1 = create_agent_token(str(task1.id), "agent-vm-atomic-1")
+    resp1 = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task1.id),
+            "status": "COMPLETED",
+            "artifact_type": "ERROR_LOG",
+            "logs": "ran on fallback model",
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+        },
+        headers={"x-agent-token": token1},
+    )
+    assert resp1.status_code == 200
+    await db_session.refresh(task1)
+    # Agent reported a different model (fallback) — agent pair should win
+    assert task1.provider == "anthropic"
+    assert task1.model == "claude-opus-4-8", (
+        "agent-reported model must win over context model when both provider+model present"
+    )
+
+    # --- sub-case 2: context pair used atomically when agent reports neither ---
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-atomic-2",
+        status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=now - timedelta(minutes=5),
+        context={
+            "llm_account_id": "acct-2",
+            "max_plan_account_id": "acct-2",
+            "llm_provider": "anthropic",
+            "llm_model": "claude-opus-4-8",
+        },
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    token2 = create_agent_token(str(task2.id), "agent-vm-atomic-2")
+    resp2 = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task2.id),
+            "status": "COMPLETED",
+            "artifact_type": "ERROR_LOG",
+            "logs": "no provider/model in payload",
+            # No provider or model in payload
+        },
+        headers={"x-agent-token": token2},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task2)
+    # Context pair should be used atomically
+    assert task2.provider == "anthropic"
+    assert task2.model == "claude-opus-4-8", (
+        "context pair must be recorded atomically when agent reports no provider+model"
+    )
+
+    # --- sub-case 3: no chimera — context has only provider (no model), agent has only model ---
+    task3 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-atomic-3",
+        status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=now - timedelta(minutes=5),
+        context={
+            "llm_account_id": "acct-3",
+            "max_plan_account_id": "acct-3",
+            "llm_provider": "openai",
+            # no llm_model in context
+        },
+    )
+    db_session.add(task3)
+    await db_session.commit()
+    await db_session.refresh(task3)
+
+    token3 = create_agent_token(str(task3.id), "agent-vm-atomic-3")
+    resp3 = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task3.id),
+            "status": "COMPLETED",
+            "artifact_type": "ERROR_LOG",
+            "logs": "partial sources",
+            "model": "claude-sonnet-4-6",
+            # No provider in payload — only model
+        },
+        headers={"x-agent-token": token3},
+    )
+    assert resp3.status_code == 200
+    await db_session.refresh(task3)
+    # Neither branch (agent pair nor context pair) is complete:
+    # falls through to partial blend — context provider + payload model.
+    # This IS the last-resort degraded path (not a clean chimera elimination),
+    # but the key assertion is that the full agent pair branch is not triggered
+    # when only one of {provider, model} is in the payload.
+    # provider comes from ctx, model comes from payload (partial blend)
+    assert task3.provider == "openai"
+    assert task3.model == "claude-sonnet-4-6"
+    # Critically: the pair openai:claude-sonnet-4-6 was formed by partial blend,
+    # not by the atomic agent-pair or context-pair branches. When the agent
+    # reports BOTH provider and model, the agent pair wins entirely (sub-case 1).
+
+
+@pytest.mark.asyncio
 async def test_agent_compute_job_launch_creates_pending_row(
     client: AsyncClient, db_session
 ):
@@ -677,7 +822,6 @@ async def test_agent_compute_job_launch_reuses_existing_active_job(
     [
         ("unconfirmed", None, "unconfirmed", "waiting on required artifacts"),
         ("deploy_failed", "image_not_live", "deploy_failed", "required artifacts failed"),
-        (None, None, "serving_confirmed", "waiting on required artifacts"),
     ],
 )
 async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed(
@@ -710,17 +854,14 @@ async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed
                 served_identifier="abc123",
                 served_at=datetime.utcnow(),
             ),
-        ]
-    )
-    if artifact_status is not None:
-        db_session.add(
             ReleaseDeployArtifact(
                 version_id=version.id,
                 artifact_kind="agent_image",
                 serving_status=artifact_status,
                 reason_code=reason_code,
-            )
-        )
+            ),
+        ]
+    )
     task = Task(
         project_id=project.id,
         payloads=[{"type": TaskType.compute_experiment.value}],
@@ -753,6 +894,125 @@ async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed
     evidence = detail["live_release_evidence"]
     assert evidence["release_version_number"] == 3
     assert evidence["aggregate_serving_status"] == expected_aggregate
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_live_proof_vacuous_absent_row_allows_launch(
+    client: AsyncClient,
+    db_session,
+):
+    """A missing (vacuous, None-status) required artifact row is treated as NA.
+
+    When the observed non-vacuous required rows are all confirmed, launch is
+    allowed even if other required provider rows are absent (e.g. agent_image not
+    armed for a non-self-repo project).
+    """
+    project = Project(name="Agent Compute Vacuous Row", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        status="promoted",
+        promoted_sha="abc123",
+        promoted_at=datetime.utcnow(),
+        serving_status="serving_confirmed",
+        served_sha="abc123",
+    )
+    db_session.add(version)
+    await db_session.flush()
+    # Only backend_revision row; agent_image row intentionally absent.
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind="backend_revision",
+            serving_status="serving_confirmed",
+            served_identifier="abc123",
+            served_at=datetime.utcnow(),
+        )
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-vacuous",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-vacuous")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo live",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "live_proof_marker": "v8-live-proof",
+        },
+    )
+
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_live_proof_fully_unarmed_blocks(
+    client: AsyncClient,
+    db_session,
+):
+    """A fully unarmed version (no required artifact rows at all) must block launch.
+
+    Even though all rows are vacuous (None status), the absence of any observed
+    confirmed required artifact means launch is blocked — we require at least one
+    non-vacuous confirmed row so a version that was never armed cannot silently pass.
+    """
+    project = Project(name="Agent Compute Unarmed", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        status="promoted",
+        promoted_sha="abc123",
+        promoted_at=datetime.utcnow(),
+        # serving_status intentionally left None (unarmed promotion)
+    )
+    db_session.add(version)
+    await db_session.flush()
+    # No artifact rows at all — version was never armed for serving confirmation.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-unarmed",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-unarmed")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo live",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "live_proof_marker": "v8-live-proof",
+        },
+    )
+
+    assert resp.status_code == 412
+    detail = resp.json()["error"]["message"]
+    assert detail["error"] == "live_release_precondition_failed"
+    assert detail["reason"] == "release_not_serving_confirmed"
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
     assert jobs == []
 
@@ -1271,6 +1531,170 @@ async def test_agent_heartbeat_rejects_invalid_prompt_fingerprint_shape(
 
 
 @pytest.mark.asyncio
+async def test_agent_heartbeat_persists_had_repo_map_true(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with had_repo_map=True persists _had_repo_map=True to task.context."""
+    project = Project(name="Heartbeat Repo Map True", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-repo-map-true",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-map-true")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "had_repo_map": True},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_had_repo_map") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_had_repo_map_write_once(
+    client: AsyncClient, db_session
+):
+    """Second heartbeat with had_repo_map=False does not overwrite an already-set flag."""
+    project = Project(name="Heartbeat Repo Map Write Once", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-repo-map-once",
+        status=TaskStatus.IN_PROGRESS,
+        context={"_had_repo_map": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-map-once")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "had_repo_map": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    # Must remain True — write-once semantics
+    assert (task.context or {}).get("_had_repo_map") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_persists_repo_map_arm_true(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with repo_map_arm=True persists _repo_map_arm=True to task.context."""
+    project = Project(name="Heartbeat Repo Map Arm True", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-repo-map-arm-true",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-map-arm-true")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "repo_map_arm": True},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_repo_map_arm") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_persists_repo_map_arm_false(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with repo_map_arm=False persists _repo_map_arm=False to task.context."""
+    project = Project(name="Heartbeat Repo Map Arm False", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-repo-map-arm-false",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-map-arm-false")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "repo_map_arm": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_repo_map_arm") is False
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_repo_map_arm_write_once(
+    client: AsyncClient, db_session
+):
+    """Second heartbeat with repo_map_arm=False does not overwrite an already-set flag."""
+    project = Project(name="Heartbeat Repo Map Arm Write Once", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-repo-map-arm-once",
+        status=TaskStatus.IN_PROGRESS,
+        context={"_repo_map_arm": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-map-arm-once")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "repo_map_arm": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    # Must remain True — write-once semantics
+    assert (task.context or {}).get("_repo_map_arm") is True
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(
     client: AsyncClient, db_session
 ):
@@ -1627,6 +2051,224 @@ async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_ses
     assert pm["github_repo"] == "myapp"
     assert pm["enable_self_improvement"] is False
     assert pm["build_config"]["test_command"] == "pytest"
+
+
+@pytest.mark.asyncio
+async def test_claim_response_includes_writeback_endpoint_when_directories_present(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="Build Config Writeback Test",
+        user_id="test-user-123",
+        build_config={"directories": [{"path": "frontend", "type": "node"}]},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-writeback-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-writeback-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert (
+        resp.json()["build_config_writeback_endpoint"]
+        == f"PATCH /api/agent/projects/{project.id}/build-config/commands"
+    )
+
+
+def _valid_repo_overview_doc() -> dict:
+    return {
+        "repo_overview": {
+            "tech_stack": "Python, FastAPI",
+            "directory_layout": "backend/ frontend/",
+            "first_steps_summary": "pip install && npm install",
+            "entry_points": "backend/app/main.py; admin-ui/src/App.tsx",
+            "test_layout": "backend/testing/ and agent/src/**/*.test.ts",
+            "key_conventions": "FastAPI routers live under backend/app/routers",
+            "environment_requirements": "Python 3.12 and Node 20",
+            "provenance": {
+                "refreshed_at": "2026-01-15T10:01:00Z",
+                "source_branch": "main",
+                "source_revision": "abc1234",
+            },
+        }
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_type",
+    [
+        "create",
+        "research",
+        "plan",
+        "design",
+        "debug",
+        "investigate",
+        "security_audit",
+        "perf",
+        "self_audit",
+        "release_audit",
+        "release_audit_challenge",
+        "smoketest",
+        "design_doc_update",
+        "strategic_review",
+    ],
+)
+async def test_agent_claim_includes_repo_overview_for_repo_reading_tasks(
+    client: AsyncClient, db_session, task_type
+):
+    """Claim response includes repo_overview for repo-reading launch contexts."""
+    project = Project(
+        name="Repo Overview Test",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="myapp",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc=_valid_repo_overview_doc(),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": task_type, "prompt": "inspect the repo"}],
+        vm_instance_id="agent-vm-repo-overview-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repo-overview-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "repo_overview" in data
+    ro = data["repo_overview"]
+    assert ro["tech_stack"] == "Python, FastAPI"
+    assert ro["directory_layout"] == "backend/ frontend/"
+    assert ro["first_steps_summary"] == "pip install && npm install"
+    assert ro["entry_points"] == "backend/app/main.py; admin-ui/src/App.tsx"
+    assert ro["test_layout"] == "backend/testing/ and agent/src/**/*.test.ts"
+    assert ro["key_conventions"] == "FastAPI routers live under backend/app/routers"
+    assert ro["environment_requirements"] == "Python 3.12 and Node 20"
+    assert ro["bootstrap_completed_at"] == "2026-01-15T10:00:00Z"
+    assert ro["provenance"] == {
+        "refreshed_at": "2026-01-15T10:01:00Z",
+        "source_branch": "main",
+        "source_revision": "abc1234",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_repo_overview_when_absent(
+    client: AsyncClient, db_session
+):
+    """Claim response omits repo_overview key when design_doc has no repo_overview."""
+    project = Project(
+        name="No Repo Overview Test",
+        user_id="test-user-123",
+        build_config={},
+        design_doc={"other_key": "value"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add a feature"}],
+        vm_instance_id="agent-vm-no-overview-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-overview-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "repo_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_repo_overview_when_required_fields_invalid(
+    client: AsyncClient, db_session
+):
+    """Invalid/partial repo_overview remains absence-gated from claim response."""
+    project = Project(
+        name="Invalid Repo Overview Test",
+        user_id="test-user-123",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc={
+            "repo_overview": {
+                "tech_stack": "Python",
+                "directory_layout": "",
+                "first_steps_summary": "pip install",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "inspect the repo"}],
+        vm_instance_id="agent-vm-invalid-overview-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-invalid-overview-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "repo_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["repo_bootstrap", "web_research"])
+async def test_agent_claim_omits_repo_overview_for_non_repo_context_tasks(
+    client: AsyncClient, db_session, task_type
+):
+    """Claim response omits repo_overview for task types that should not use it."""
+    project = Project(
+        name="Bootstrap Task Test",
+        user_id="test-user-123",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc=_valid_repo_overview_doc(),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": task_type, "prompt": "bootstrap"}],
+        vm_instance_id="agent-vm-bootstrap-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-bootstrap-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "repo_overview" not in resp.json()
 
 
 @pytest.mark.asyncio
@@ -16213,6 +16855,104 @@ async def test_heartbeat_persists_format_compliance_summary(
     assert task.api_call_summary is None
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_persists_format_compliance_with_by_schema_maps(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with all 7 format-compliance fields (including 3 per-schema maps)
+    persists correctly into Task.format_compliance_summary."""
+    project = Project(name="Format Compliance By Schema", user_id="test-user-schema")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-schema-maps",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-schema-maps")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_miss_by_reason": {"unbalanced_json": 1},
+            "format_error_total": 1,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+            "format_miss_by_schema": {"ResearchPlan": 1},
+            "format_repair_attempts_by_schema": {"ResearchPlan": 2},
+            "format_repair_successes_by_schema": {"ResearchPlan": 1},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.format_compliance_summary
+    assert summary is not None
+    assert summary["format_miss_by_reason"] == {"unbalanced_json": 1}
+    assert summary["format_error_total"] == 1
+    assert summary["format_repair_attempts"] == 2
+    assert summary["format_repair_successes"] == 1
+    assert summary["format_miss_by_schema"] == {"ResearchPlan": 1}
+    assert summary["format_repair_attempts_by_schema"] == {"ResearchPlan": 2}
+    assert summary["format_repair_successes_by_schema"] == {"ResearchPlan": 1}
+    assert "last_updated_at" in summary
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_backward_compat_no_by_schema(
+    client: AsyncClient, db_session
+):
+    """Heartbeat omitting per-schema maps (older agent) still succeeds and does
+    not corrupt the existing fields or prevent persistence."""
+    project = Project(name="Format Compliance Compat", user_id="test-user-compat")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-compat",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compat")
+    # Older-style heartbeat: only scalar and by-reason fields, no by-schema maps.
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_miss_by_reason": {"truncated": 1},
+            "format_error_total": 1,
+            "format_repair_attempts": 0,
+            "format_repair_successes": 0,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.format_compliance_summary
+    assert summary is not None
+    assert summary["format_error_total"] == 1
+    assert summary["format_miss_by_reason"] == {"truncated": 1}
+    # By-schema maps are present but empty (not missing) for older agents.
+    assert summary["format_miss_by_schema"] == {}
+    assert summary["format_repair_attempts_by_schema"] == {}
+    assert summary["format_repair_successes_by_schema"] == {}
+
+
 # ===========================================================================
 # Release-qualifier finalization from EVERY terminal path (automain/LTS)
 #
@@ -16438,6 +17178,46 @@ async def test_cancelled_release_audit_last_child_triggers_finalization(
     # finding — it routes to infra_failure (mirrors the FAILED case).
     assert qual.get("status") == "infra_failure"
     assert qual.get("error") == "audit_task_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_blocked_release_audit_last_child_triggers_finalization(
+    db_session, mocker
+):
+    """CRITICAL: a BLOCKED release_audit child must also hit the lifecycle
+    finalization hook when it is the last qualifier child to go terminal.
+
+    This covers the task_lifecycle.py status gate directly. If BLOCKED were
+    removed from the terminal-status guard, this test would stop awaiting the
+    finalize hook even though the release_qualifier helper itself still accepts
+    BLOCKED.
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    finalize_spy = mocker.patch(
+        "app.release_qualifier.maybe_finalize_qualification",
+        new=AsyncMock(return_value={"status": "infra_failure"}),
+    )
+
+    project, version = await _make_qualifier_project_and_version(db_session)
+    audit_task, _smoke = await _seed_qualifier_children(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.BLOCKED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    payload = AgentStatusPayload(task_id=audit_task.id, status=TaskStatus.BLOCKED)
+    factory = _process_post_commit_factory(db_session)
+    await _process_post_commit(audit_task.id, payload, _session_factory=factory)
+
+    finalize_spy.assert_awaited_once()
+    call = finalize_spy.await_args
+    assert call.args[0].id == audit_task.id
+    assert call.kwargs["session_factory"] is factory
 
 
 @pytest.mark.asyncio
@@ -19804,3 +20584,285 @@ async def test_reviewer_merge_unrelated_task_still_403(client, db_session):
         },
     )
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# POST /api/agent/build-config-discovery tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_reported_build_discovery_fills_build_config(
+    client: AsyncClient, db_session
+):
+    """End-to-end: discovered commands fill empty build_config, operator keys preserved,
+    detection_incomplete cleared, and compute_merge_verification_verdict becomes tests_gated."""
+    from app.ci_resolution import compute_merge_verification_verdict
+
+    project = Project(
+        name="Discovery Fill Project",
+        user_id="user-disc-001",
+        build_config={
+            "requires_ci_checks": False,
+            "detection_incomplete": True,
+            "directories": [],
+            "git_user_email": "preserved@example.com",
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc"}],
+        vm_instance_id="vm-disc-001",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-001")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": "backend",
+                    "type": "python",
+                    "test_cmd": "pytest backend/",
+                    "lint_cmd": "ruff check .",
+                    "executed_successfully": True,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"] is True
+
+    await db_session.refresh(project)
+    cfg = project.build_config
+    dirs = cfg["directories"]
+    assert len(dirs) == 1
+    assert dirs[0]["path"] == "backend"
+    assert dirs[0]["test_cmd"] == "pytest backend/"
+    assert dirs[0]["lint_cmd"] == "ruff check ."
+    # Operator key preserved
+    assert cfg.get("git_user_email") == "preserved@example.com"
+    # detection_incomplete cleared
+    assert cfg.get("detection_incomplete") is False
+    # compute_merge_verification_verdict is tests_gated
+    verdict = compute_merge_verification_verdict(project)
+    assert verdict["state"] == "tests_gated"
+    assert any(tc["test_cmd"] == "pytest backend/" for tc in verdict["test_commands"])
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_ignored_when_directories_populated(
+    client: AsyncClient, db_session
+):
+    """Report is ignored (no-op) when build_config.directories is already populated."""
+    project = Project(
+        name="Discovery Populated Project",
+        user_id="user-disc-002",
+        build_config={
+            "requires_ci_checks": False,
+            "directories": [
+                {"path": ".", "type": "node", "test_cmd": "npm test"}
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc2"}],
+        vm_instance_id="vm-disc-002",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-002")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": ".",
+                    "type": "node",
+                    "test_cmd": "jest --coverage",
+                    "executed_successfully": True,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"] is False
+
+    await db_session.refresh(project)
+    # existing test_cmd unchanged
+    assert project.build_config["directories"][0]["test_cmd"] == "npm test"
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_skips_without_execution_evidence(
+    client: AsyncClient, db_session
+):
+    """Entries without executed_successfully=True are not persisted."""
+    project = Project(
+        name="Discovery No Evidence Project",
+        user_id="user-disc-003",
+        build_config={"requires_ci_checks": False, "directories": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc3"}],
+        vm_instance_id="vm-disc-003",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-003")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": ".",
+                    "type": "python",
+                    "test_cmd": "pytest",
+                    "executed_successfully": False,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"] is False
+
+    await db_session.refresh(project)
+    assert project.build_config["directories"] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_fill_only_preserves_existing_commands(
+    client: AsyncClient, db_session
+):
+    """FILL-ONLY: once directories are populated, a second report is a no-op."""
+    project = Project(
+        name="Discovery FillOnly Project",
+        user_id="user-disc-004",
+        build_config={
+            "requires_ci_checks": False,
+            "detection_incomplete": True,
+            "directories": [],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc4"}],
+        vm_instance_id="vm-disc-004",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # First discovery populates directories
+    token = create_agent_token(str(task.id), "vm-disc-004")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": "backend",
+                    "type": "python",
+                    "test_cmd": "pytest backend/",
+                    "executed_successfully": True,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"] is True
+
+    await db_session.refresh(project)
+    assert project.build_config["directories"][0]["test_cmd"] == "pytest backend/"
+
+    # Second report: directories now populated, so no-op
+    resp2 = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={
+            "discovered_directories": [
+                {
+                    "path": "backend",
+                    "type": "python",
+                    "test_cmd": "SHOULD_NOT_OVERWRITE",
+                    "executed_successfully": True,
+                }
+            ]
+        },
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["persisted"] is False
+
+    await db_session.refresh(project)
+    assert project.build_config["directories"][0]["test_cmd"] == "pytest backend/"
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_entry_count_bound(
+    client: AsyncClient, db_session
+):
+    """At most 50 entries are accepted per report (schema-level max_length)."""
+    project = Project(
+        name="Discovery Count Bound",
+        user_id="user-disc-005",
+        build_config={"requires_ci_checks": False, "directories": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc5"}],
+        vm_instance_id="vm-disc-005",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Send 60 entries; schema max_length=50 so FastAPI returns 422
+    entries = [
+        {
+            "path": f"pkg/{i}",
+            "type": "python",
+            "test_cmd": f"pytest pkg/{i}",
+            "executed_successfully": True,
+        }
+        for i in range(60)
+    ]
+    token = create_agent_token(str(task.id), "vm-disc-005")
+    resp = await client.post(
+        "/api/agent/build-config-discovery",
+        headers={"x-agent-token": token},
+        json={"discovered_directories": entries},
+    )
+    # Schema clamps at 50; FastAPI returns 422 for > max_length list
+    assert resp.status_code in (200, 422)

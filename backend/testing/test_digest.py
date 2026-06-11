@@ -16,9 +16,11 @@ from app.models import (
     ReleaseVersion,
 )
 from app.routers.admin_analytics import _derive_completed_at
+from app.routers.admin_digest import _compute_digest
 from app.digest_metrics import (
     compute_remediation_and_patterns,
     compute_remediation_funnel,
+    compute_trial_arm_accumulation,
 )
 from app.sr_review_quality_metrics import (
     _stash_projected_task_fields,
@@ -4197,6 +4199,86 @@ async def test_digest_retry_recovery_cost_from_prior_attempts(
 
 
 @pytest.mark.asyncio
+async def test_compute_direction_progress_cost_by_provider_model_uses_attempt_history(
+    client: AsyncClient, db_session
+):
+    """cost_by_provider_model in direction_progress reflects attempt_history,
+    not a chimera key from independently-resolved Task.provider/Task.model columns.
+
+    Sets up two tasks:
+    - One with banked attempt_history entries (provider-switch retry) — no live span.
+    - One with only a live span (first attempt) under a distinct provider pair.
+
+    Asserts:
+    (a) No chimera key appears.
+    (b) Each attempt's cost lands under its OWN recorded pair.
+    (c) Banked earlier-attempt cost is NOT lost.
+    """
+    now = _utcnow()
+    project = make_project(
+        directions=[{"id": "dir-pm", "text": "D", "status": "active"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    attempt1_cost = 0.010
+
+    # Task that retried: attempt 1 (anthropic/claude-opus-4-7) banked in
+    # attempt_history, final attempt 2 (openai/gpt-5.4) still has a live span
+    # (banking only clears vm_provisioned_at/stopped_at for intermediate attempts).
+    retried = make_task(
+        project_id=project.id,
+        title="retried-pm",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "scope": "small"}],
+        context={"direction_id": "dir-pm"},
+        provider="openai",
+        model="gpt-5.4",
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=False,
+    )
+    retried.attempt_history = [
+        {
+            "vm_provisioned_at": (now - timedelta(hours=3)).isoformat(),
+            "vm_stopped_at": (now - timedelta(hours=2)).isoformat(),
+            "vm_spot": False,
+            "vm_machine_type": "e2-standard-2",
+            "provider": "anthropic",
+            "model": "claude-opus-4-7",
+            "vm_runtime_cost_usd": attempt1_cost,
+            "llm_input_tokens": 0,
+            "llm_output_tokens": 0,
+            "llm_call_count": 0,
+        },
+    ]
+    db_session.add(retried)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    body = response.json()
+    dp_list = body.get("direction_progress", [])
+    assert dp_list, "direction_progress must be present"
+    dp = dp_list[0]
+    by_pm = dp.get("cost_by_provider_model") or {}
+
+    # (a) No chimera keys
+    assert "anthropic|gpt-5.4" not in by_pm, "chimera key must not appear"
+    assert "openai|claude-opus-4-7" not in by_pm, "chimera key must not appear"
+
+    # (b) Each attempt's own pair present
+    assert "anthropic|claude-opus-4-7" in by_pm, "attempt-1 pair must appear"
+    assert "openai|gpt-5.4" in by_pm, "attempt-2 pair must appear"
+
+    # (c) Banked earlier-attempt cost not lost
+    assert by_pm["anthropic|claude-opus-4-7"] == pytest.approx(attempt1_cost, abs=1e-4)
+    # Live span for openai|gpt-5.4 computed by the helper; just verify it's > 0
+    assert by_pm["openai|gpt-5.4"] > 0
+
+
+@pytest.mark.asyncio
 async def test_digest_escalation_outcome_summary(client: AsyncClient, db_session):
     """escalation_outcome_summary aggregates escalation_outcomes across directions and recent history."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
@@ -6827,6 +6909,16 @@ async def test_digest_direction_progress_exposes_spawn_gate_block(
                         "research_spawn_gate_unchallenged_spawned": 3,
                         "research_spawn_gate_unchallenged_merged": 1,
                         "research_spawn_gate_unchallenged_merge_rate": 0.333,
+                        "research_spawn_gate_wholesale_retry_exhausted": True,
+                        "research_spawn_gate_parse_outcome": "no_hash_matches",
+                        "research_spawn_gate_manifest_excluded_fail_closed_count": 1,
+                        "research_spawn_gate_manifest_excluded_fail_closed_samples": [
+                            {
+                                "hash": "excluded-hash",
+                                "title": "Budget-excluded finding",
+                                "reason": "manifest cap",
+                            }
+                        ],
                     }
                 ],
             }
@@ -6856,8 +6948,110 @@ async def test_digest_direction_progress_exposes_spawn_gate_block(
     assert gate["challenged_count"] == 2
     assert gate["refuted_count"] == 1
     assert gate["survived_count"] == 1
+    assert gate["manifest_excluded_fail_closed_count"] == 1
+    assert gate["manifest_excluded_fail_closed_samples"] == [
+        {
+            "hash": "excluded-hash",
+            "title": "Budget-excluded finding",
+            "reason": "manifest cap",
+        }
+    ]
     assert gate["challenged_merge_rate"] == 0.5
     assert gate["unchallenged_merge_rate"] == 0.333
+    assert gate["exhaustion_count"] == 1
+    assert gate["parse_outcome_distribution"] == {"no_hash_matches": 1}
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_exposes_adversarial_give_up(
+    client: AsyncClient, db_session
+):
+    """Digest direction_progress includes adversarial give-up counts and samples."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-give-up",
+                "text": "Give-up direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": _utcnow().isoformat(),
+                        "task_id": "research-task-give-up-1",
+                        "tasks_created": 1,
+                        "research_spawn_gate_adversarial_give_up_count": 3,
+                        "research_spawn_gate_adversarial_give_up_samples": [
+                            {"title": "Abandoned finding A", "direction_id": "dir-give-up"},
+                            {"title": "Abandoned finding B"},
+                        ],
+                    },
+                    {
+                        "timestamp": _utcnow().isoformat(),
+                        "task_id": "research-task-give-up-2",
+                        "tasks_created": 1,
+                        "research_spawn_gate_adversarial_give_up_count": 1,
+                        "research_spawn_gate_adversarial_give_up_samples": [
+                            {"title": "Abandoned finding C"},
+                        ],
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research cycle",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-give-up"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp = next(d for d in data["direction_progress"] if d["direction_id"] == "dir-give-up")
+    gate = dp["research_spawn_gate"]
+    assert gate is not None
+    # Counts sum across both history entries.
+    assert gate["adversarial_give_up_count"] == 4
+    samples = gate["adversarial_give_up_samples"]
+    sample_titles = [s["title"] for s in samples]
+    assert "Abandoned finding A" in sample_titles
+    assert "Abandoned finding B" in sample_titles
+    assert "Abandoned finding C" in sample_titles
+    assert len(samples) == len({s["title"] for s in samples}), "samples must be deduped"
+
+
+@pytest.mark.asyncio
+async def test_digest_spawn_gate_aggregate_give_up_count_alone_produces_non_none(
+    client: AsyncClient, db_session
+):
+    """A direction with only adversarial give-up activity produces a non-None aggregate."""
+    from app.digest_direction_progress import compute_spawn_gate_aggregate
+
+    history = [
+        {
+            "research_spawn_gate_adversarial_give_up_count": 2,
+            "research_spawn_gate_adversarial_give_up_samples": [
+                {"title": "Discarded finding X"},
+            ],
+        }
+    ]
+    result = compute_spawn_gate_aggregate(history)
+    assert result is not None
+    assert result["adversarial_give_up_count"] == 2
+    assert result["adversarial_give_up_samples"] == [{"title": "Discarded finding X"}]
+    # Other counters are zero when no other spawn-gate activity occurred.
+    assert result["challenged"] == 0
+    assert result["refuted"] == 0
+    assert result["survived"] == 0
 
 
 @pytest.mark.asyncio
@@ -8683,3 +8877,327 @@ async def test_digest_includes_sr_false_attestation_trends_from_design_doc(
         ]["false_attestation_rate"]
         == 0.05
     )
+
+
+# ── Cumulative capability-trial accumulation ─────────────────────────────────
+
+
+def _arm_task(project_id, *, had_repo_map, first_attempt_succeeded, days_ago, idx):
+    """A terminal task carrying both trial-arm flags, backdated by ``days_ago``."""
+    created = _utcnow() - timedelta(days=days_ago)
+    return make_task(
+        project_id=project_id,
+        title=f"arm-task-{idx}",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=created,
+        context={
+            "_had_repo_map": had_repo_map,
+            # assignment key mirrors receipt — post-rollout tasks carry both.
+            "_repo_map_arm": had_repo_map,
+            "_first_attempt_succeeded": first_attempt_succeeded,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accumulation_counts_cumulatively(db_session):
+    """The aggregate counts every flagged terminal task regardless of age, and is
+    project-scoped + ignores tasks missing either arm flag."""
+    project = make_project()
+    other = make_project()
+    db_session.add_all([project, other])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other)
+
+    tasks = []
+    # WITH arm: 8 tasks, 6 first-attempt successes — spread across many days so no
+    # single 24h window could hold them.
+    for i in range(8):
+        tasks.append(
+            _arm_task(
+                project.id,
+                had_repo_map=True,
+                first_attempt_succeeded=(i < 6),
+                days_ago=i + 1,
+                idx=i,
+            )
+        )
+    # WITHOUT arm: 5 tasks, 1 first-attempt success.
+    for i in range(5):
+        tasks.append(
+            _arm_task(
+                project.id,
+                had_repo_map=False,
+                first_attempt_succeeded=(i < 1),
+                days_ago=i + 1,
+                idx=100 + i,
+            )
+        )
+    # Noise that must NOT be counted: a task missing the arm flag, and a task on a
+    # different project.
+    tasks.append(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},  # no _had_repo_map
+        )
+    )
+    tasks.append(
+        _arm_task(
+            other.id,
+            had_repo_map=True,
+            first_attempt_succeeded=True,
+            days_ago=1,
+            idx=999,
+        )
+    )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session, project_id=project.id, context_key="_had_repo_map"
+    )
+    assert accum["with_n"] == 8
+    assert accum["with_succ"] == 6
+    assert accum["without_n"] == 5
+    assert accum["without_succ"] == 1
+    assert accum["with_rate"] == 0.75
+    assert accum["without_rate"] == 0.2
+    assert accum["lift"] == 0.55
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accumulation_empty_arm_yields_none_rate(db_session):
+    """An empty arm reports a None rate and None lift (cannot decide)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # Only WITH-arm tasks present.
+    db_session.add_all(
+        [
+            _arm_task(
+                project.id, had_repo_map=True, first_attempt_succeeded=True,
+                days_ago=1, idx=i,
+            )
+            for i in range(3)
+        ]
+    )
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session, project_id=project.id, context_key="_had_repo_map"
+    )
+    assert accum["with_n"] == 3
+    assert accum["without_n"] == 0
+    assert accum["without_rate"] is None
+    assert accum["lift"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accumulation_intent_to_treat(db_session):
+    """When assignment_key is provided, partitioning uses COALESCE(assignment_key,
+    context_key) — a treatment-assigned task with no actual map still lands in WITH arm,
+    and legacy tasks (no assignment_key) fall back to the receipt key."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = _utcnow() - timedelta(days=1)
+
+    def _task(context):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=created,
+            context=context,
+        )
+
+    tasks = [
+        # Treatment-assigned, received map → WITH arm, success
+        _task({"_repo_map_arm": True, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Treatment-assigned, NO map (empty map case) → still WITH arm, failure
+        _task({"_repo_map_arm": True, "_had_repo_map": False, "_first_attempt_succeeded": False}),
+        # Holdback-assigned, had map anyway → WITHOUT arm, success
+        _task({"_repo_map_arm": False, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Legacy task (no assignment key) — falls back to receipt key, WITH arm
+        _task({"_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # Legacy task (no assignment key) — falls back to receipt key, WITHOUT arm
+        _task({"_had_repo_map": False, "_first_attempt_succeeded": False}),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        assignment_key="_repo_map_arm",
+    )
+    # WITH arm: 2 assigned + 1 legacy receipt = 3 tasks, 2 successes
+    assert accum["with_n"] == 3
+    assert accum["with_succ"] == 2
+    # WITHOUT arm: 1 assigned holdback + 1 legacy receipt = 2 tasks, 1 success
+    assert accum["without_n"] == 2
+    assert accum["without_succ"] == 1
+    assert accum["with_rate"] == round(2 / 3, 2)
+    assert accum["without_rate"] == 0.5
+    assert accum["lift"] == round(round(2 / 3, 2) - 0.5, 2)
+
+
+@pytest.mark.asyncio
+async def test_trial_verdict_accumulates_across_windows_to_decision(db_session):
+    """With per-arm tasks spread across MULTIPLE 24h windows (more than any single
+    window holds under the min-N=30 threshold), the verdict converges to a decided
+    adopt — driven by the cumulative basis, not the (empty) digest window — and the
+    recorded entry exposes that cumulative basis distinct from window_hours."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    tasks = []
+    # 35 WITH-arm successes and 35 WITHOUT-arm failures, every one backdated 2–8
+    # days so the 24h digest window sees NONE of them. No single window holds the
+    # 30-per-arm minimum, so a windowed decision basis would stay continue-trial.
+    for i in range(35):
+        tasks.append(
+            _arm_task(
+                project.id, had_repo_map=True, first_attempt_succeeded=True,
+                days_ago=2 + (i % 7), idx=i,
+            )
+        )
+    for i in range(35):
+        tasks.append(
+            _arm_task(
+                project.id, had_repo_map=False, first_attempt_succeeded=False,
+                days_ago=2 + (i % 7), idx=200 + i,
+            )
+        )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+
+    # Windowed breakdown is empty (all tasks are older than 24h) — proving the
+    # decision did NOT come from the window.
+    fasr = result["first_attempt_success_rate"]
+    assert fasr["with_repo_map_n"] == 0
+    assert fasr["without_repo_map_n"] == 0
+
+    await db_session.refresh(project)
+    verdict = project.capability_adoption_verdicts["repo_map"]
+    assert verdict["verdict"] == "adopt"
+    assert verdict["n_with"] == 35
+    assert verdict["n_without"] == 35
+    assert verdict["accumulation_basis"] == "cumulative_terminal_arm_tasks"
+    # window_hours still describes the dashboard window, NOT the decision basis.
+    assert verdict["window_hours"] == 24
+
+
+@pytest.mark.asyncio
+async def test_trial_verdict_insufficient_accumulation_stays_continue_trial(db_session):
+    """Below the min-N-per-arm threshold the cumulative verdict stays continue-trial
+    (insufficient_data) and still records the auditable accumulation basis."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    tasks = [
+        _arm_task(
+            project.id, had_repo_map=True, first_attempt_succeeded=True,
+            days_ago=2, idx=i,
+        )
+        for i in range(5)
+    ] + [
+        _arm_task(
+            project.id, had_repo_map=False, first_attempt_succeeded=False,
+            days_ago=2, idx=100 + i,
+        )
+        for i in range(2)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    await _compute_digest(hours=24, project_id=project.id, session=db_session)
+
+    await db_session.refresh(project)
+    verdict = project.capability_adoption_verdicts["repo_map"]
+    assert verdict["verdict"] == "continue-trial"
+    assert verdict["verdict_reason"] == "insufficient_data"
+    assert verdict["n_with"] == 5
+    assert verdict["n_without"] == 2
+    assert verdict["accumulation_basis"] == "cumulative_terminal_arm_tasks"
+
+
+@pytest.mark.asyncio
+async def test_digest_latest_cycle_from_table_no_jsonb_needed(
+    client: AsyncClient, db_session
+):
+    """digest.latest_cycle is populated from the StrategicCycle table directly —
+    no vision._strategic_cycle_history JSONB wiring required (retired migration 0047)."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create and complete a cycle without touching vision JSONB at all.
+    cycle = await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await _sc.mark_phase1_completed(db_session, cycle.id)
+    await db_session.commit()
+    await _sc.mark_phase2_completed(
+        db_session,
+        cycle.id,
+        directions_created=3,
+        directions_retired=1,
+        vision_updated=True,
+        summary_text="cycle summary",
+        memos_available=5,
+        memos_cited=2,
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    lc = response.json().get("latest_cycle")
+    assert lc is not None, "latest_cycle should be non-null when a completed cycle exists"
+    assert lc["cycle_id"] == cycle.id
+    assert lc["outcome"] == _sc.OUTCOME_COMPLETED
+    assert lc["directions_created"] == 3
+    assert lc["directions_retired"] == 1
+    assert lc["vision_updated"] is True
+    assert lc["summary_text"] == "cycle summary"
+    assert lc["memos_available"] == 5
+    assert lc["memos_cited"] == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_latest_cycle_null_when_no_completed_cycles(
+    client: AsyncClient, db_session
+):
+    """digest.latest_cycle is null when no terminal (non-active) cycles exist."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a cycle but leave it in an active (in-progress) state.
+    await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    lc = response.json().get("latest_cycle")
+    assert lc is None, "latest_cycle should be null when only active cycles exist"

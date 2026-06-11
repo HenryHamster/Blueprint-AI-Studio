@@ -3516,3 +3516,159 @@ async def _recover_orphaned_tasks():
                 )
     except Exception as e:
         logger.error(f"[RECOVERY] Orphaned task sweep failed: {e}", exc_info=True)
+
+
+# ── Stranded-sidecar recovery sweep ───────────────────────────────────────────
+_AWAITING_SIDECAR_KEYS = (
+    "awaiting_quality_grader",
+    "awaiting_adversarial_grader",
+    "awaiting_safeguard_challenge",
+    "awaiting_finding_challenge",
+    "awaiting_review_second_opinion",
+)
+
+
+async def _sweep_stranded_sidecar_sources() -> None:
+    """Unstrand EVALUATING source tasks whose side-car challenger died silently.
+
+    Side-car challengers (quality grader, safeguard challenge, finding challenge,
+    review second-opinion) normally resolve their source task by POSTing terminal
+    status to the agent status-update route.  A side-car that never posts — reaper
+    kill, VM death after retries exhausted, cancellation — leaves the source
+    parked EVALUATING indefinitely.
+
+    This sweep queries EVALUATING tasks whose awaiting_* key holds a UUID string
+    (post-spawn; initial value is ``True``), loads each referenced sidecar, and,
+    if the sidecar is terminal (FAILED/CANCELLED), calls the lane resolver via
+    ``trigger_stranded_sidecar_resolution``, which constructs a synthetic payload
+    and invokes the resolver with existing fail-closed semantics.
+    """
+    import uuid as _uuid
+
+    from app.task_lifecycle import trigger_stranded_sidecar_resolution
+
+    _TERMINAL = {TaskStatus.FAILED, TaskStatus.CANCELLED}
+
+    try:
+        async with services.AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Task).where(Task.status == TaskStatus.EVALUATING)
+            )
+            evaluating = result.scalars().all()
+
+            resolved = 0
+            for source in evaluating:
+                ctx = source.context or {}
+                for key in _AWAITING_SIDECAR_KEYS:
+                    ref = ctx.get(key)
+                    if not ref or ref is True:
+                        continue
+                    try:
+                        sidecar_uuid = _uuid.UUID(str(ref))
+                    except (ValueError, TypeError):
+                        continue
+                    sidecar = await session.get(Task, sidecar_uuid)
+                    if sidecar is None or sidecar.status not in _TERMINAL:
+                        continue
+                    logger.warning(
+                        "[SIDECAR-RECOVERY] Source %s stranded EVALUATING "
+                        "(key=%s sidecar=%s status=%s) — triggering fail-closed resolution",
+                        source.id,
+                        key,
+                        sidecar.id,
+                        sidecar.status,
+                    )
+                    try:
+                        await trigger_stranded_sidecar_resolution(sidecar, session)
+                        resolved += 1
+                    except Exception:
+                        logger.exception(
+                            "[SIDECAR-RECOVERY] Resolver failed for sidecar %s / source %s",
+                            sidecar.id,
+                            source.id,
+                        )
+                    break  # one sidecar per source per sweep pass
+            if resolved:
+                logger.info(
+                    "[SIDECAR-RECOVERY] Resolved %d stranded source task(s)", resolved
+                )
+    except Exception:
+        logger.exception("[SIDECAR-RECOVERY] Stranded-sidecar sweep failed")
+
+
+# ── Bootstrap recovery sweep ───────────────────────────────────────────────────
+
+_BOOTSTRAP_SWEEP_BATCH_SIZE = 20
+
+
+async def _sweep_bootstrap_recovery() -> None:
+    """Enqueue one repo_bootstrap task for each eligible unbootstrapped project.
+
+    Eligible projects are: external (not is_self_repo), non-empty
+    (repo_is_empty falsy), no bootstrap_completed_at, and no currently-active
+    (QUEUED/PROVISIONING/IN_PROGRESS) repo_bootstrap task.
+
+    The sweep is bounded and idempotent: the shared spawn_bootstrap_task helper
+    refuses to create a duplicate when one is already active, so repeated ticks
+    never pile up duplicate tasks.
+    """
+    from app.models import Project
+    from app.repo_bootstrap import spawn_bootstrap_task
+
+    try:
+        async with services.AsyncSessionLocal() as session:
+            # Filter ineligible projects IN the query so the LIMIT caps spawnable
+            # candidates, not the raw project set. Completed projects accumulate
+            # unboundedly over time; applying the limit before filtering them out
+            # would starve genuinely-eligible (degraded/failed/never-bootstrapped)
+            # projects as the completed set grows past the batch size.
+            #
+            # bootstrap_completed_at: absent key or null → IS NULL → eligible.
+            # repo_is_empty: absent key or 'false' → coalesce to 'false' → != 'true' → eligible.
+            # ORDER BY id gives consistent ordering so new projects aren't missed.
+            now_iso = _utcnow().isoformat()
+            result = await session.execute(
+                select(Project).where(
+                    Project.is_self_repo.is_(False),
+                    Project.archived.is_(False),
+                    Project.build_config['bootstrap_completed_at'].as_string().is_(None),
+                    func.coalesce(
+                        Project.build_config['repo_is_empty'].as_string(), 'false'
+                    ) != 'true',
+                    func.coalesce(
+                        Project.build_config['bootstrap_recovery_state'].as_string(), ''
+                    ) != 'exhausted',
+                    Project.build_config['bootstrap_recovery_exhausted_at']
+                    .as_string()
+                    .is_(None),
+                    or_(
+                        Project.build_config['bootstrap_recovery_next_at']
+                        .as_string()
+                        .is_(None),
+                        Project.build_config[
+                            'bootstrap_recovery_next_at'
+                        ].as_string() <= now_iso,
+                    ),
+                ).order_by(Project.id).limit(_BOOTSTRAP_SWEEP_BATCH_SIZE)
+            )
+            candidates = result.scalars().all()
+
+            spawned = 0
+            for project in candidates:
+                spawn_result = await spawn_bootstrap_task(
+                    project,
+                    session,
+                    is_first_bootstrap=False,
+                    spawn_reason="recovery_sweep",
+                    automatic_recovery=True,
+                )
+                if spawn_result.outcome == "spawned":
+                    spawned += 1
+
+            await session.commit()
+            if spawned:
+                logger.info(
+                    "[BOOTSTRAP-RECOVERY] Enqueued %d recovery bootstrap task(s)", spawned
+                )
+    except Exception:
+        logger.exception("[BOOTSTRAP-RECOVERY] Bootstrap recovery sweep failed")

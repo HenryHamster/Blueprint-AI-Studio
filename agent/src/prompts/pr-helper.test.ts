@@ -56,7 +56,7 @@ describePosix('writePrHelper', () => {
     script: string,
     args: string[],
     setup: (dir: string, realFs: typeof import('node:fs')) => void,
-  ): Promise<{ status: number; stdout: string }> => {
+  ): Promise<{ status: number; stdout: string; checkArgs?: string }> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
@@ -80,7 +80,14 @@ describePosix('writePrHelper', () => {
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],
         });
-        return { status: 0, stdout };
+        const checkArgsPath = realPath.join(dir, 'check.args');
+        let checkArgs: string | undefined;
+        try {
+          checkArgs = realFs.readFileSync(checkArgsPath, 'utf8').trim();
+        } catch {
+          // File may not exist
+        }
+        return { status: 0, stdout, checkArgs };
       } catch (err: unknown) {
         const e = err as { status?: number; stdout?: string };
         return { status: e.status ?? -1, stdout: e.stdout ?? '' };
@@ -146,10 +153,7 @@ esac
     const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
       const bin = `${dir}/bin`;
       realFs.mkdirSync(bin, { recursive: true });
-      // mkdir -p: /tmp/workspace exists on agent VMs (it IS the workspace) but
-      // not on CI runners — without it the redirection fails and the assertion
-      // below reads a file that was never written.
-      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nmkdir -p /tmp/workspace\necho "$*" > /tmp/workspace/check.args\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\necho "$*" > "$WORKSPACE/check.args"\nexit 0\n', { mode: 0o755 });
       realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
 case "$*" in
   *"rev-parse --verify origin/production"*) exit 0 ;;
@@ -183,9 +187,7 @@ esac
     });
 
     expect(result.status).toBe(0);
-    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
-    const checkArgs = realFs.readFileSync('/tmp/workspace/check.args', 'utf8').trim();
-    expect(checkArgs).toBe('test');
+    expect(result.checkArgs).toBe('test');
   });
 
   it('surfaces the GATE-ENVIRONMENT marker after a passing ./check test', async () => {

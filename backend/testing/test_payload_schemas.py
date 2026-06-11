@@ -107,6 +107,7 @@ EXPECTED_TYPES = {
     "compute_experiment",
     "web_research",
     "design",
+    "repo_bootstrap",
 }
 
 
@@ -255,6 +256,22 @@ def test_compute_experiment_payload_rejects_unknown_criterion_operator():
         },
     }
     _invalid(raw)
+
+
+def test_compute_experiment_require_durable_artifact_accepted():
+    raw = {
+        "type": "compute_experiment",
+        "command": "run-eval",
+        "require_durable_artifact": True,
+    }
+    result = _valid(raw)
+    assert result["require_durable_artifact"] is True
+
+
+def test_compute_experiment_require_durable_artifact_absent_is_compatible():
+    raw = {"type": "compute_experiment", "command": "run-eval"}
+    result = _valid(raw)
+    assert "require_durable_artifact" not in result
 
 
 def test_verify_tests_payload_with_branch_and_pr_number():
@@ -630,6 +647,7 @@ def test_strategic_review_optional_fields_accepted():
         "project_name": "MyProject",
         "research_mode": "strategic",
         "max_active_directions": 10,
+        "capability_trial_verdicts": {"cap-a": {"verdict": "adopt"}},
     }
     result = _valid(raw)
     assert result["design_doc"] == {"summary": "doc"}
@@ -640,6 +658,7 @@ def test_strategic_review_optional_fields_accepted():
     assert result["project_name"] == "MyProject"
     assert result["research_mode"] == "strategic"
     assert result["max_active_directions"] == 10
+    assert result["capability_trial_verdicts"] == {"cap-a": {"verdict": "adopt"}}
 
 
 def test_strategic_review_omit_optional_fields_passes():

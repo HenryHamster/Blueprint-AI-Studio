@@ -13,6 +13,7 @@ import { parseBackendTimestamp } from './utils/time.js';
 // './prompt.js' unchanged.
 export {
   buildFileTree,
+  buildRepoMap,
   countSourceFiles,
   detectGreenfield,
   isGreenfieldRepo,
@@ -59,6 +60,7 @@ export {
 } from './prompts/code-change-helpers.js';
 import { excludeAgentHelpers, isBlueprintSelfRepo } from './prompts/code-change-helpers.js';
 import { isPytestCmd } from './prompts/check-helper.js';
+import { effectiveTestCmd, effectiveBuildCmd, effectiveLintCmd } from './utils/test-runners.js';
 export { excludeAgentHelpers };
 
 // ── Agent Permission Enforcement ────────────────────────────────────────
@@ -181,6 +183,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'web_research',     // Uses web-research.ts bespoke prompt assembly (web-first knowledge doc)
   'design',           // Uses design.ts bespoke prompt assembly (codebase-grounded design doc)
   'release_audit_challenge', // Uses audit-challenge.ts bespoke prompt assembly (advisory second opinion)
+  'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
@@ -204,8 +207,10 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
   // 'create'/'refactor' hints: reference actual build/test commands
   const testCmds: string[] = [];
   for (const dir of dirs) {
-    if (dir.test_cmd) testCmds.push(`${dir.path}: \`${dir.test_cmd}\``);
-    else if (dir.build_cmd) testCmds.push(`${dir.path}: \`${dir.build_cmd}\``);
+    const testCmd = effectiveTestCmd(dir);
+    const buildCmd = effectiveBuildCmd(dir);
+    if (testCmd) testCmds.push(`${dir.path}: \`${testCmd}\``);
+    else if (buildCmd) testCmds.push(`${dir.path}: \`${buildCmd}\``);
   }
   if (testCmds.length > 0) {
     const cmdsText = testCmds.join(', ');
@@ -1267,20 +1272,22 @@ function buildConfigCheckIntro(buildConfig: BuildConfig): string {
   const dirs = buildConfig.directories ?? [];
   const dirParts = dirs.map(d => {
     const path = d.path.replace(/\/$/, '');
-    const cmds = [d.lint_cmd, d.build_cmd].filter((c): c is string => !!c);
+    const cmds = [effectiveLintCmd(d), effectiveBuildCmd(d)].filter((c): c is string => !!c);
     return cmds.length
       ? `\`${path}/\` (${cmds.map(c => `\`${c}\``).join(', ')})`
       : `\`${path}/\``;
   });
   const dirList = dirParts.length ? dirParts.join(', ') : 'the configured project directories';
   const testParts = dirs
-    .filter(d => d.test_cmd)
-    .map(d => `\`${d.path.replace(/\/$/, '')}/\` (\`${d.test_cmd}\`)`);
+    .map(d => ({ path: d.path, cmd: effectiveTestCmd(d) }))
+    .filter((x): x is { path: string; cmd: string } => !!x.cmd)
+    .map(x => `\`${x.path.replace(/\/$/, '')}/\` (\`${x.cmd}\`)`);
   const testList = testParts.length ? testParts.join(', ') : 'any configured test commands';
   // Mirrors buildPytestGateInner in prompts/check-helper.ts: a pytest-style
   // test command gets the honest gate (sanctioned-harness preference +
   // GATE-ENVIRONMENT fallback), so tell the agent what that note means.
-  const hasPytestGate = dirs.some(d => !!d.test_cmd && isPytestCmd(d.test_cmd));
+  const effectiveTestCmds = dirs.map(d => effectiveTestCmd(d)).filter((c): c is string => !!c);
+  const hasPytestGate = effectiveTestCmds.some(c => isPytestCmd(c));
   const pytestGateNote = hasPytestGate
     ? `  A pytest-style test command runs honestly: \`./check test\` prefers the
   project's Docker test harness (\`scripts/test-<dir>.sh\`) when Docker can
@@ -1397,7 +1404,7 @@ export const FIRST_TASK_GUIDANCE = `
 ## IMPORTANT: First Task on This Repository — Capture What You Learn
 
 This is the first agent task on this repository. There are no existing playbook entries.
-Everything you discover through trial and error is NEW knowledge that will benefit every future agent.
+Everything you discover through trial and error is NEW knowledge that will benefit every future agent, and verified build/test commands now also flow back into the backend automatically when you run them successfully.
 
 **Before you finish this task, use \`./playbook set\` to record:**
 - The exact build and test commands that worked (e.g. \`npm run build\`, \`pytest\`, \`make test\`)
@@ -1406,7 +1413,7 @@ Everything you discover through trial and error is NEW knowledge that will benef
 - Non-obvious directory structure or naming conventions
 - Any workarounds required to get things running
 
-These are high-value entries — saving even 2–3 facts now will save future agents hours of rediscovery.
+These are still high-value entries — the structured backend write is the durable path, and saving even 2–3 facts now will save future agents hours of rediscovery.
 
 \`\`\`bash
 ./playbook set "test-commands" "Run tests with: <command>"

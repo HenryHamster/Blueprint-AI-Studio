@@ -2,7 +2,13 @@ import { getIdToken } from './firebase';
 import type { SrMissedTask } from './components/SrRetrospectiveShared';
 import type { WarmPoolTargets, WarmPoolTargetSetResponse } from './types/warmVm';
 import type { ProblemModelPatch } from './types';
-import type { BuildConfig, MergeGateRuntime, MergeVerificationVerdict } from './types/project';
+import type {
+  BuildConfig,
+  MergeGateRuntime,
+  MergeVerificationVerdict,
+  ProjectResourceEnvelopeResponse,
+  ResourceEnvelopeConfig,
+} from './types/project';
 import type { WarmStartOriginBreakdown } from './hooks/useEfficiencySnapshot';
 
 /** Base URL for API requests to the Blueprint backend. Defaults to empty string for same-origin requests. */
@@ -210,15 +216,18 @@ export interface ComputeExperimentLaunchRequest {
   hypothesis?: string;
   metric?: string;
   success_criterion?: ComputeSuccessCriterion;
+  require_live_release?: boolean;
   model?: string;
   effort?: string;
 }
 
 /** Response from the dedicated compute_experiment launch endpoint — the created
- * task. Kept loose (only `id` is relied on) so additive backend fields don't
- * force a frontend change. */
+ * task. Kept loose so additive backend fields don't force a frontend change. */
 export interface ComputeExperimentLaunchResponse {
   id: string;
+  status?: string;
+  requires_approval?: boolean;
+  is_duplicate?: boolean;
   [key: string]: unknown;
 }
 
@@ -238,6 +247,41 @@ export async function createComputeExperiment(
     const data = await res.json().catch(() => ({}));
     const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
     throw new Error(msg);
+  }
+  return res.json();
+}
+
+export type ResourceEnvelopePatch = Partial<ResourceEnvelopeConfig>;
+
+export async function fetchProjectResourceEnvelope(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectResourceEnvelopeResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/resource-envelope`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) {
+    throw new Error(`Failed to fetch resource envelope: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function updateProjectResourceEnvelope(
+  projectId: string,
+  patch: ResourceEnvelopePatch,
+): Promise<ProjectResourceEnvelopeResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/resource-envelope`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to save resource envelope: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to save resource envelope: ${res.status}`);
   }
   return res.json();
 }
@@ -1021,6 +1065,7 @@ export async function previewOnboardProject(
 export interface EfficiencyHistoryPoint {
   captured_at: string | null;
   value: number | null;
+  def_version?: string | null;
 }
 
 export interface EfficiencyAxis {
@@ -1028,6 +1073,34 @@ export interface EfficiencyAxis {
   baseline: number | null;
   drift_pct: number | null;
   history: EfficiencyHistoryPoint[];
+}
+
+export interface EfficiencyDriftAxis {
+  current: number | null;
+  baseline: number | null;
+  drift_pct: number | null;
+  history?: EfficiencyHistoryPoint[];
+}
+
+export interface FormatComplianceResponse {
+  format_compliance_rate: EfficiencyDriftAxis;
+  self_repair_success_rate: EfficiencyDriftAxis;
+  tasks_measured: number | null;
+  well_formed_tasks: number | null;
+  format_error_total: number | null;
+  repair_attempts: number | null;
+  repair_successes: number | null;
+}
+
+export interface AgentTimeoutRateResponse {
+  overall: EfficiencyDriftAxis;
+  by_subtype: Record<string, { current: number | null; baseline: number | null; drift_pct: number | null }>;
+  dominant_subtype: string | null;
+  dominant_share: number | null;
+  denominator: number | null;
+  denominator_definition: string | null;
+  timeout_count: number | null;
+  window_days: number | null;
 }
 
 // Per-project warm-pool payoff verdict: a single synthesized answer to "did
@@ -1074,6 +1147,9 @@ export interface EfficiencyAxesResponse {
   // reuse number read. Optional/nullable — older backends omit it, and the
   // backend returns null when there were no warm starts to attribute.
   warm_start_origin_breakdown?: WarmStartOriginBreakdown | null;
+  // Optional nested blocks surfaced by the backend for the operator dashboard.
+  format_compliance?: FormatComplianceResponse;
+  agent_timeout_rate?: AgentTimeoutRateResponse;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
@@ -1112,11 +1188,30 @@ export interface LlmCostModelRow {
   cost_per_merge: number | null;
 }
 
+export interface LlmCostTaskTypeRow {
+  /** Task type from first_payload["type"], or "unspecified" when absent. */
+  task_type: string;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cost_usd: number;
+  llm_call_count: number;
+  task_count: number;
+  merged_count: number;
+  merge_rate: number | null;
+  verified_merged_count: number;
+  verified_merge_rate: number | null;
+  /** cost_usd / verified_merged_count, null when cost is zero or no verified merges. */
+  cost_per_merge: number | null;
+  share_of_total_cost: number | null;
+}
+
 export interface LlmCostBreakdownResponse {
   window_days: number;
   generated_at: string;
   by_provider: Array<Omit<LlmCostModelRow, 'model'>>;
   by_model: LlmCostModelRow[];
+  /** Per-task-type cost attribution — same pricing table as by_model, bucketed by first_payload["type"]. */
+  by_task_type: LlmCostTaskTypeRow[];
   totals: {
     total_input_tokens: number;
     total_output_tokens: number;
@@ -1446,6 +1541,52 @@ export interface VersionLifecycleResponse {
   staged_directions?: StagedDirection[];
   /** Challenged-vs-unchallenged decision-quality cohort comparison. Advisory/display only. */
   challenged_vs_unchallenged?: ChallengedVsUnchallengedTelemetry | null;
+}
+
+export interface AgentServingShaBucket {
+  source_sha: string | null;
+  count: number;
+  warm_pool_count: number;
+  task_vm_count: number;
+  image_names: string[];
+  latest_build_ts: number | null;
+  last_heartbeat_at: string | null;
+  matches_backend_served?: boolean;
+  matches_active_candidate?: boolean;
+  matches_integration_head?: boolean;
+  matches_current_image?: boolean;
+}
+
+export interface AgentServingShaFleet {
+  total_observed: number;
+  unknown_count: number;
+  mixed: boolean;
+  buckets: AgentServingShaBucket[];
+}
+
+export interface AgentCurrentImage {
+  image_name: string | null;
+  source_git_sha: string | null;
+  build_ts: number | null;
+}
+
+export interface AgentServingShasResponse {
+  fleet: AgentServingShaFleet;
+  current_image: AgentCurrentImage | null;
+  backend_served_sha: string | null;
+  active_candidate_sha: string | null;
+  integration_branch: string | null;
+  integration_head_sha: string | null;
+  promotion_target: string | null;
+  promotion_head_sha: string | null;
+}
+
+export async function fetchAgentServingShas(
+  projectId: string,
+): Promise<AgentServingShasResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/agent-serving-shas`);
+  if (!res.ok) throw new Error(`Failed to fetch agent serving SHAs: ${res.status}`);
+  return res.json();
 }
 
 export interface SetPromotionEnabledResponse {
@@ -1887,6 +2028,43 @@ export async function resetProject(
   return res.json();
 }
 
+export interface BootstrapRetryResponse {
+  state: 'spawned' | 'already_active' | 'already_completed' | 'not_eligible';
+  task_id?: string | null;
+  reason?: string | null;
+  [key: string]: unknown;
+}
+
+export async function retryProjectBootstrap(
+  projectId: string,
+): Promise<BootstrapRetryResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/bootstrap/retry`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to retry bootstrap: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to retry bootstrap: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function refreshProjectBootstrap(
+  projectId: string,
+): Promise<BootstrapRetryResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/bootstrap/refresh`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to refresh bootstrap: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to refresh bootstrap: ${res.status}`);
+  }
+  return res.json();
+}
+
 /**
  * Owner-only project cancel. Marks the project terminal, cancels all active
  * tasks, and tears down their VMs. Idempotent on the server: already-terminal
@@ -2157,6 +2335,18 @@ export interface ComputeJob {
   accrued_cost_usd: number | null;
   final_cost_usd: number | null;
   result_reference: string | null;
+  // Identifier of the durable COMPUTE_RESULT artifact the backend creates for
+  // every terminal compute job. This — not result_reference — is the primary,
+  // completion-defining outcome of a finished compute_experiment. Optional/null
+  // on legacy or in-flight rows that predate artifact creation.
+  artifact_id?: string | null;
+  artifact?: {
+    id: string;
+    artifact_type: string;
+    storage_uri: string | null;
+    logical_key?: string | null;
+    created_at?: string | null;
+  } | null;
   accelerator_type: string | null;
   accelerator_count: number | null;
   polling_metadata?: Record<string, unknown>;
@@ -2171,9 +2361,15 @@ export interface ComputeJob {
 export async function fetchComputeJobs(
   projectId: string,
   signal?: AbortSignal,
+  includeFinishedMinutes?: number,
 ): Promise<ComputeJob[]> {
+  const query = new URLSearchParams();
+  if (typeof includeFinishedMinutes === 'number') {
+    query.set('include_finished_minutes', String(includeFinishedMinutes));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : '';
   const res = await apiFetch(
-    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs`,
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs${suffix}`,
     undefined,
     2,
     30000,
@@ -2182,6 +2378,42 @@ export async function fetchComputeJobs(
   if (!res.ok) throw new Error(`Failed to fetch compute jobs: ${res.status}`);
   const data = await res.json();
   return Array.isArray(data.compute_jobs) ? data.compute_jobs : [];
+}
+
+export interface BuildConfigCommandEntry {
+  path: string | null;
+  type: string | null;
+  detected_test_cmd: string | null;
+  detected_build_cmd: string | null;
+  detected_install_cmd: string | null;
+  detected_lint_cmd: string | null;
+  confirmed_test_cmd: string | null;
+  confirmed_build_cmd: string | null;
+  confirmed_install_cmd: string | null;
+  confirmed_lint_cmd: string | null;
+  commands_confirmed_at: string | null;
+  confirming_task_id: string | null;
+  commands_stale: boolean;
+}
+
+export interface BuildConfigCommandsResponse {
+  project_id: string;
+  directories: BuildConfigCommandEntry[];
+}
+
+export async function fetchBuildConfigCommands(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<BuildConfigCommandsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/build-config/commands`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch build config commands: ${res.status}`);
+  return res.json() as Promise<BuildConfigCommandsResponse>;
 }
 
 export async function killComputeJob(jobId: string): Promise<ComputeJob> {
@@ -2196,6 +2428,34 @@ export async function killComputeJob(jobId: string): Promise<ComputeJob> {
   }
   const data = await res.json();
   return data.compute_job;
+}
+
+export type AnalyzeComputeJobStatus = 'upgraded' | 'analysis_unavailable';
+
+export interface AnalyzeComputeJobEnvelope {
+  status: AnalyzeComputeJobStatus;
+  reason?: string | null;
+  analysis_mode?: string | null;
+  knowledge_document_id?: string | null;
+  [key: string]: unknown;
+}
+
+export async function analyzeComputeJob(jobId: string): Promise<AnalyzeComputeJobEnvelope> {
+  const res = await apiFetch(
+    `/api/admin/compute-jobs/${encodeURIComponent(jobId)}/analyze`,
+    { method: 'POST' },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data?.error?.message || data?.detail || `Failed to analyze compute job: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to analyze compute job: ${res.status}`);
+  }
+  const status = data?.status === 'analysis_unavailable' ? 'analysis_unavailable' : 'upgraded';
+  return {
+    ...data,
+    status,
+    reason: typeof data?.reason === 'string' ? data.reason : data?.reason ?? null,
+  };
 }
 
 // --- Knowledge documents (durable, queryable home for web_research output) ---
@@ -2307,6 +2567,29 @@ export interface KnowledgeOriginProvenance {
   [key: string]: unknown;
 }
 
+/** Promoted-and-serving release evidence that authorized a live-release compute proof.
+ *  Surfaced as a top-level field on compute_experiment KnowledgeDocument responses
+ *  (backend `knowledge_query.serialize_knowledge_document`, sourced from the launching
+ *  ComputeJob's `polling_metadata.live_release_evidence`). Null/absent for non-live-proof
+ *  documents and non-compute documents. All fields optional/nullable to stay
+ *  back-compatible with evidence serialized before a field existed. */
+export interface LiveReleaseEvidence {
+  promoted_sha?: string | null;
+  promoted_at?: string | null;
+  aggregate_serving_status?: string | null;
+  aggregate_reason_code?: string | null;
+  release_version_id?: string | null;
+  release_version_number?: number | null;
+  required_artifacts?: Array<{
+    artifact_kind?: string;
+    required?: boolean;
+    serving_status?: string | null;
+    served_identifier?: string | null;
+    served_at?: string | null;
+    reason_code?: string | null;
+  }>;
+}
+
 export interface KnowledgeDocument {
   id: string;
   title: string;
@@ -2336,11 +2619,22 @@ export interface KnowledgeDocument {
   knowledge_acceptance_evidence?: boolean;
   compute_acceptance_grade?: 'acceptance' | 'measured_only' | null;
   compute_acceptance_reason?: string;
+  /** Mirror of the backend analysis mode for compute_experiment documents. */
+  analysis_mode?: string | null;
+  /** Concrete compute-analysis fallback cause mirrored from the backend verdict.
+   *  Present only for measured-only compute_experiment docs that fell back. */
+  analysis_fallback_reason?: string | null;
+  /** Explicit unavailable cause mirrored from the backend verdict. */
+  unavailable_cause?: string | null;
   /** Durable origin provenance (backend `serialize_origin_provenance`): whether the
    *  producing task came from a research finding, and the second-opinion decision that
    *  allowed or rejected its dispatch. Absent on older backend responses — treat a
    *  missing object as legacy/unknown. */
   origin_provenance?: KnowledgeOriginProvenance | null;
+  /** Promoted serving release evidence that authorized a live-release compute proof.
+   *  Present (non-null) only for compute_experiment documents whose launching job ran as
+   *  a live-release proof; null/absent otherwise. */
+  release_evidence?: LiveReleaseEvidence | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }

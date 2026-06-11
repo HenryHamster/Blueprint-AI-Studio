@@ -244,6 +244,109 @@ class TestTaskDurationStats:
         assert phase["execution"] == {"p50_seconds": 200.0, "sample_size": 3}
 
 
+class TestLaneDiag:
+    @staticmethod
+    def _add_review_loop_task(
+        db_session, project_id, pr_number, task_type, created_at, active_seconds, fix_reason=None
+    ) -> None:
+        context: dict = {}
+        if pr_number is not None:
+            review_loop = {"pr_number": pr_number}
+            if fix_reason:
+                review_loop["fix_reason"] = fix_reason
+            context["review_loop"] = review_loop
+        completed_at = created_at + timedelta(seconds=active_seconds)
+        db_session.add(
+            make_task(
+                project_id=project_id,
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": task_type, "prompt": "x"}],
+                context=context,
+                started_at=created_at,
+                created_at=created_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_aggregates_lane_distribution_phase_breakdown_and_relays(
+        self, client: AsyncClient, db_session
+    ):
+        project = make_project()
+        other_project = make_project(name="Other")
+        db_session.add_all([project, other_project])
+        await db_session.commit()
+
+        base = _utcnow() - timedelta(hours=3)
+        for pr, typ, mins, secs, reason in (
+            (101, "review", 0, 600, None),
+            (101, "create", 20, 1800, "code_review"),
+            (101, "review", 60, 300, None),
+            (101, "fix", 80, 1200, "ci_failure"),
+            (101, "panel_review", 110, 600, None),
+            (202, "review", 10, 120, None),
+            (202, "create", 15, 240, "merge_conflict"),
+            (303, "review", 130, 50, None),
+        ):
+            self._add_review_loop_task(
+                db_session,
+                project.id,
+                pr,
+                typ,
+                base + timedelta(minutes=mins),
+                secs,
+                reason,
+            )
+        self._add_review_loop_task(
+            db_session, project.id, None, "fix", base, 60, "merge_conflict"
+        )
+        self._add_review_loop_task(
+            db_session, other_project.id, 404, "fix", base, 60, "merge_conflict"
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/lane-diag?project_id={project.id}&pr_breakdown_limit=2"
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["project_id"] == str(project.id)
+        assert body["task_count"] == 8
+        assert body["pr_count"] == 3
+        assert body["pr_breakdown_truncated"] is True
+        assert body["relay_counts_by_lane"] == {
+            "conflict": 1,
+            "ci": 1,
+            "arbitration": 0,
+            "review_convergence": 1,
+        }
+
+        lanes = body["lane_iteration_distribution"]
+        assert lanes["review_convergence"] == {
+            "p50_iterations": 1.0,
+            "p90_iterations": 3.0,
+            "max_iterations": 3,
+            "task_count": 5,
+            "pr_count": 3,
+        }
+        assert lanes["conflict"]["task_count"] == 1
+        assert lanes["ci"]["task_count"] == 1
+        assert lanes["arbitration"]["task_count"] == 1
+
+        by_pr = {row["pr_number"]: row for row in body["per_pr_phase_breakdown"]}
+        assert list(by_pr.keys()) == ["101", "202"]
+        assert by_pr["101"]["review_seconds"] == 900.0
+        assert by_pr["101"]["fix_seconds"] == 3000.0
+        assert by_pr["101"]["gap_seconds"] == 3300.0
+        assert by_pr["101"]["total_seconds"] == 7200.0
+        assert by_pr["202"]["review_seconds"] == 120.0
+        assert by_pr["202"]["fix_seconds"] == 240.0
+        assert by_pr["202"]["gap_seconds"] == 180.0
+        assert by_pr["202"]["total_seconds"] == 540.0
+
+
 class TestTaskCostBreakdown:
     @pytest.mark.asyncio
     async def test_breakdown_filters_by_project_window_and_groups_costs(

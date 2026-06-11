@@ -24,7 +24,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Mapping
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -40,6 +40,7 @@ from app.landed_signal import (
 )
 from app.models import (
     PoolIdleCostLedger,
+    PoolIdleSpan,
     PoolVm,
     PoolVmState,
     Project,
@@ -89,6 +90,9 @@ AXIS_VM_REUSE_RATE = "vm_reuse_rate"
 AXIS_MEDIAN_API_CALLS_PER_TASK = "median_api_calls_per_task"
 AXIS_MEDIAN_REVIEW_ITERATIONS = "median_review_iterations"
 AXIS_LLM_COST_PER_MERGED_PR = "llm_cost_per_merged_pr"
+FORMAT_COMPLIANCE_KEY = "format_compliance"
+FORMAT_COMPLIANCE_RATE_KEY = "format_compliance_rate"
+SELF_REPAIR_SUCCESS_RATE_KEY = "self_repair_success_rate"
 
 ALL_AXES: tuple[str, ...] = (
     AXIS_COST_PER_MERGED_PR,
@@ -131,6 +135,17 @@ AXIS_CONSUMERS: dict[str, dict] = {
     },
     AXIS_LLM_COST_PER_MERGED_PR: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+}
+
+NESTED_METRIC_CONSUMERS: dict[str, dict] = {
+    "agent_timeout_rate": {
+        "ground_truth": "Task.context.failure_category + Task.context.timeout_subtype",
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)",
+    },
+    FORMAT_COMPLIANCE_KEY: {
+        "ground_truth": "Task.format_compliance_summary",
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)",
     },
 }
 
@@ -221,6 +236,15 @@ _AXIS_WINDOW_DAYS = 7
 # Cap snapshot history length (~1 year of daily snapshots).
 _SNAPSHOT_HISTORY_MAX = 365
 
+# Metric-definition version stamp applied to every new snapshot.  Increment
+# this whenever a metric's computation changes in a way that produces a
+# discontinuity in the persisted history series, so consumers (dashboard,
+# strategist) can annotate the boundary rather than treating it as real drift.
+#
+# v6: cost_per_merged_pr_incl_pool_idle switched from the all-time pool idle
+#     accumulator to a windowed figure matching the dispatch-funnel window.
+METRIC_DEF_VERSION = "v6"
+
 
 async def _load_recent_tasks(
     session: AsyncSession,
@@ -258,12 +282,24 @@ async def _load_recent_tasks(
                 Task.vm_machine_type,
                 Task.vm_provisioned_at,
                 Task.vm_stopped_at,
+                # Banked retry attribution must stay loaded so pricing and
+                # alerting see the full attempt history after projection.
+                Task.vm_runtime_cost_banked_db,
+                Task.llm_input_tokens_banked_db,
+                Task.llm_output_tokens_banked_db,
+                Task.llm_call_count_banked_db,
+                Task.attempt_history_db,
                 Task.vm_cold_start_ms,
                 Task.vm_warm_start,
                 Task.api_call_summary,
                 Task.vm_dispatched_at,
                 Task.provider,
                 Task.model,
+                Task.format_compliance_summary,
+                # payloads: required so task.first_payload can be read without
+                # triggering an async lazy-load (used by compute_llm_cost_by_task_type
+                # and compute_effort_model_efficiency when called from this path).
+                Task.payloads,
             )
         )
         .limit(5000)
@@ -309,7 +345,7 @@ def _compute_cost_per_merged_pr(tasks: list[Task]) -> float | None:
 
 
 def settle_pool_vm_idle_cost(
-    member: PoolVm, *, now: datetime | None = None
+    member: PoolVm, *, now: datetime | None = None, session=None
 ) -> float:
     """Bank elapsed idle cost onto ``member.idle_cost_banked``; return the amount.
 
@@ -318,17 +354,32 @@ def settle_pool_vm_idle_cost(
     ``idle_since`` to ``now`` so the same span is never billed twice. A no-op
     (returns 0.0) when the member is not currently idle or no time has elapsed.
     The caller owns the transaction (commit).
+
+    When ``session`` is provided, also appends a ``PoolIdleSpan`` row so the
+    windowed idle-cost query can filter on settled_at rather than on the
+    member's retirement timestamp, eliminating lump-attribution distortion.
     """
     if member.idle_since is None:
         return 0.0
     if now is None:
         now = _utcnow()
-    elapsed = (now - member.idle_since).total_seconds()
+    started_at = member.idle_since
+    elapsed = (now - started_at).total_seconds()
     if elapsed <= 0:
         return 0.0
     cost = idle_cost_usd(elapsed)
     member.idle_cost_banked = (member.idle_cost_banked or 0.0) + cost
     member.idle_since = now
+    if session is not None:
+        session.add(
+            PoolIdleSpan(
+                project_id=member.project_id,
+                vm_instance_id=member.vm_instance_id,
+                started_at=started_at,
+                settled_at=now,
+                cost_usd=cost,
+            )
+        )
     return cost
 
 
@@ -430,6 +481,68 @@ async def compute_pool_idle_cost(
         "total_idle_cost_usd": round(settled + live, 6),
         "by_account": by_account,
     }
+
+
+async def _compute_windowed_idle_cost(
+    session: AsyncSession,
+    project_id: uuid.UUID | None,
+    cutoff: datetime,
+) -> Dict[str, Any]:
+    """Sum pool idle cost scoped to a rolling window.
+
+    When ``project_id`` is ``None``, the query spans every pool member
+    (fleet-wide); otherwise it is scoped to the given project. Returns a dict
+    with ``total`` (the windowed idle cost in USD) and ``by_account`` (windowed
+    per-account idle cost from live IDLE members, as ``{label: {"total_idle_cost_usd":
+    float}}``). Ledger carry-forward of already-reaped members has no account
+    attribution and is therefore excluded from per-account totals (but included
+    in ``total``).
+
+    Span rows (settled spans): sum ``cost_usd`` where ``settled_at >= cutoff``
+    — each completed idle period has an exact settled_at timestamp, so only
+    spans that ended inside the window are counted; pre-window spans of
+    in-window retirees are excluded rather than lump-attributed.
+
+    Live IDLE members: accrue ``(now - max(idle_since, cutoff))`` seconds so
+    only the portion of the current in-progress idle period that falls inside
+    the window is counted. ``idle_cost_banked`` aggregates past idle periods
+    (already present in PoolIdleSpan rows) and is intentionally excluded here.
+    """
+    from app.warm_backlog_reuse import _account_label
+
+    now = _utcnow()
+
+    # Settled spans: only rows whose settlement timestamp falls within the window.
+    span_stmt = select(
+        func.coalesce(func.sum(PoolIdleSpan.cost_usd), 0.0)
+    ).where(PoolIdleSpan.settled_at >= cutoff)
+    if project_id is not None:
+        span_stmt = span_stmt.where(PoolIdleSpan.project_id == project_id)
+    windowed_retired = float(
+        (await session.execute(span_stmt)).scalar() or 0.0
+    )
+
+    # Live IDLE members: current idle period clamped to the window start.
+    member_stmt = select(PoolVm).where(
+        PoolVm.state == PoolVmState.IDLE,
+        PoolVm.idle_since.isnot(None),
+    )
+    if project_id is not None:
+        member_stmt = member_stmt.where(PoolVm.project_id == project_id)
+    members = list((await session.execute(member_stmt)).scalars().all())
+    windowed_live = 0.0
+    by_account: Dict[str, Any] = {}
+    for m in members:
+        effective_start = max(m.idle_since, cutoff)  # type: ignore[arg-type]
+        elapsed = (now - effective_start).total_seconds()
+        if elapsed > 0:
+            cost = idle_cost_usd(elapsed)
+            windowed_live += cost
+            label = _account_label(m.account_id)
+            acc = by_account.setdefault(label, {"total_idle_cost_usd": 0.0})
+            acc["total_idle_cost_usd"] = round(acc["total_idle_cost_usd"] + cost, 6)
+
+    return {"total": round(windowed_retired + windowed_live, 6), "by_account": by_account}
 
 
 def compute_pool_cost_amortization(
@@ -892,7 +1005,13 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> float | None:
     total_cost = 0.0
     merged = 0
     for t in tasks:
-        for provider, model, input_tokens, output_tokens, _call_count in _task_llm_attempts(t):
+        for (
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            _call_count,
+        ) in _task_llm_attempts(t):
             if provider and model:
                 pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
                 if pricing:
@@ -937,10 +1056,20 @@ def _task_llm_attempts(task: Task) -> list[tuple[str | None, str | None, int, in
             if input_tokens > 0 or output_tokens > 0
             else []
         )
+    def _resolve_pair(attempt: dict) -> tuple[str | None, str | None]:
+        ap = attempt.get("provider")
+        am = attempt.get("model")
+        if ap and am:
+            return ap, am
+        if not ap and not am:
+            return task.provider, task.model
+        # Half-filled row: one source has provider, another has model.
+        # Blending across sources manufactures chimera combos; degrade instead.
+        return None, None
+
     attempts = [
         (
-            attempt.get("provider") or task.provider,
-            attempt.get("model") or task.model,
+            *_resolve_pair(attempt),
             _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens")),
             _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens")),
             _llm_attempt_nonnegative_int(attempt.get("llm_call_count")),
@@ -1235,39 +1364,155 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     }
 
 
+def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
+    """Per-task-type LLM cost/token rollup over the given tasks.
+
+    Buckets each task by ``task.first_payload.get("type", "unspecified")`` and
+    accumulates the full attempt-history token cost (same pricing table and
+    same :func:`_task_llm_attempts` helper as :func:`compute_llm_cost_breakdown`
+    so totals reconcile). A task that has no payload or no type key is bucketed
+    as ``"unspecified"``.
+
+    Merge attribution is TASK-level: a merged task is credited once to its
+    type bucket (not once per attempt-row), so merge rates and cost-per-merge
+    are consistent with the per-model breakdown.
+
+    ``cost_per_merge`` is ``None`` for any bucket whose total cost is zero (no
+    priced tasks) or that has no verified merges — avoids divide-by-zero and
+    misleading zero-cost figures.
+
+    Returns a list sorted by ``total_cost_usd`` descending so the heaviest
+    spender is first.
+    """
+    from collections import defaultdict
+
+    buckets: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "llm_call_count": 0,
+            "task_count": 0,
+            "merged_count": 0,
+            "verified_merged_count": 0,
+            "cost_usd": 0.0,
+        }
+    )
+    total_cost = 0.0
+
+    for t in tasks:
+        task_type = (t.first_payload or {}).get("type") or "unspecified"
+        merged = is_merged_completion(t)
+        verified = is_verified_merge(t)
+
+        bucket = buckets[task_type]
+        bucket["task_count"] += 1
+        if merged:
+            bucket["merged_count"] += 1
+        if verified:
+            bucket["verified_merged_count"] += 1
+
+        task_cost = 0.0
+        for provider, model, input_tokens, output_tokens, call_count in _task_llm_attempts(t):
+            if input_tokens <= 0 and output_tokens <= 0:
+                continue
+            if not provider or not model:
+                provider, model = "unattributed", "unknown"
+            else:
+                provider, model = provider.lower(), model.lower()
+
+            pricing = LLM_TOKEN_PRICING.get((provider, model))
+            if pricing:
+                input_rate, output_rate = pricing
+                cost = input_tokens * input_rate + output_tokens * output_rate
+            else:
+                cost = 0.0
+
+            bucket["input_tokens"] += int(input_tokens)
+            bucket["output_tokens"] += int(output_tokens)
+            bucket["llm_call_count"] += call_count
+            bucket["cost_usd"] += cost
+            task_cost += cost
+
+        total_cost += task_cost
+
+    def _share(cost: float) -> float | None:
+        if total_cost <= 0:
+            return None
+        return round(cost / total_cost, 4)
+
+    def _merge_rate(merged: float, count: float) -> float | None:
+        if count <= 0:
+            return None
+        return round(merged / count, 4)
+
+    def _cost_per_merge(cost: float, verified_merged: float) -> float | None:
+        if cost <= 0 or verified_merged <= 0:
+            return None
+        return round(cost / verified_merged, 6)
+
+    rows = [
+        {
+            "task_type": task_type,
+            "total_input_tokens": int(b["input_tokens"]),
+            "total_output_tokens": int(b["output_tokens"]),
+            "total_cost_usd": round(b["cost_usd"], 6),
+            "llm_call_count": int(b["llm_call_count"]),
+            "task_count": int(b["task_count"]),
+            "merged_count": int(b["merged_count"]),
+            "merge_rate": _merge_rate(b["merged_count"], b["task_count"]),
+            "verified_merged_count": int(b["verified_merged_count"]),
+            "verified_merge_rate": _merge_rate(b["verified_merged_count"], b["task_count"]),
+            "cost_per_merge": _cost_per_merge(b["cost_usd"], b["verified_merged_count"]),
+            "share_of_total_cost": _share(b["cost_usd"]),
+        }
+        for task_type, b in sorted(
+            buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
+        )
+    ]
+    return rows
+
+
 def _compute_llm_cost_pricing_coverage(
     tasks: list[Task],
 ) -> Dict[str, Any]:
-    """Coverage diagnostic: how many token-bearing tasks have a pricing entry.
+    """Coverage diagnostic: how many token-bearing attempt rows have pricing.
 
-    A task is "priceable" when it has non-zero total tokens AND a non-null
-    (provider, model). A priceable task is "priced" when (provider, model) is
-    in LLM_TOKEN_PRICING; otherwise it is "unpriced" and silently contributes
-    zero to llm_cost_per_merged_pr.
+    An attempt is "priceable" when it has non-zero tokens AND a non-null
+    (provider, model). A priceable attempt is "priced" when (provider, model)
+    is in LLM_TOKEN_PRICING; otherwise it is "unpriced" and silently
+    contributes zero to llm_cost_per_merged_pr. Token-bearing attempts with
+    missing provider or model are counted explicitly as unattributed.
     """
     priced = 0
     unpriced = 0
     unattributed = 0
     unpriced_combos: list[str] = []
     for t in tasks:
-        input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
-        has_tokens = (input_tokens + output_tokens) > 0
-        if not has_tokens:
-            continue
-        if not t.provider or not t.model:
-            unattributed += 1
-            continue
-        key = (t.provider.lower(), t.model.lower())
-        if key in LLM_TOKEN_PRICING:
-            priced += 1
-        else:
-            unpriced += 1
-            combo = f"{t.provider.lower()}:{t.model.lower()}"
-            if (
-                combo not in unpriced_combos
-                and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
-            ):
-                unpriced_combos.append(combo)
+        for (
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            _call_count,
+        ) in _task_llm_attempts(t):
+            if input_tokens <= 0 and output_tokens <= 0:
+                continue
+            if not provider or not model:
+                unattributed += 1
+                continue
+            provider = provider.lower()
+            model = model.lower()
+            key = (provider, model)
+            if key in LLM_TOKEN_PRICING:
+                priced += 1
+            else:
+                unpriced += 1
+                combo = f"{provider}:{model}"
+                if (
+                    combo not in unpriced_combos
+                    and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
+                ):
+                    unpriced_combos.append(combo)
     priceable = priced + unpriced + unattributed
     coverage_fraction: float | None = (
         round(priced / priceable, 4) if priceable else None
@@ -1797,7 +2042,7 @@ async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
     """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
-    from app.digest_metrics import compute_timeout_rate
+    from app.digest_metrics import compute_format_compliance_metrics, compute_timeout_rate
     from app.warm_backlog_reuse import (
         compute_dominant_pool_miss,
         compute_dominant_reuse_dropout,
@@ -1810,9 +2055,17 @@ async def compute_current_axes(
     # cost_per_merged_pr numerator so pre-warming a pool can't make the headline
     # axis look better while real spend rises. Kept SEPARATE from the immutable
     # AXIS_COST_PER_MERGED_PR baseline (drift comparisons stay apples-to-apples).
+    #
+    # Use a windowed idle cost (same 7-day window as the task-cost numerator and
+    # merged-PR denominator) so the all-time monotonically-growing idle accumulator
+    # cannot ratchet the axis upward independently of current pool behavior.
+    # pool_metrics["total_idle_cost_usd"] is preserved in the snapshot payload as
+    # the durable all-time spend figure ("teardown never erases measured spend").
+    axis_cutoff = _utcnow() - timedelta(days=_AXIS_WINDOW_DAYS)
+    windowed_idle = await _compute_windowed_idle_cost(session, project_id, axis_cutoff)
     total_vm_cost, merged = _cost_and_merges(tasks)
     cost_incl_pool_idle: float | None = (
-        round((total_vm_cost + pool_metrics["total_idle_cost_usd"]) / merged, 4)
+        round((total_vm_cost + windowed_idle["total"]) / merged, 4)
         if merged
         else None
     )
@@ -1862,6 +2115,11 @@ async def compute_current_axes(
         # reached tasks (started_at present) so the rate is not gameable by raw
         # volume. See app.digest_metrics.compute_timeout_rate.
         "agent_timeout_rate": compute_timeout_rate(tasks),
+        # Durable structured-output format-compliance measure (v7 shared
+        # self-repair adoption): overall block only, read from persisted
+        # Task.format_compliance_summary. Per-task-type detail remains a live
+        # digest concern; the snapshot needs the durable baseline/trend.
+        FORMAT_COMPLIANCE_KEY: compute_format_compliance_metrics(tasks)["overall"],
     }
 
 
@@ -1877,7 +2135,11 @@ async def write_snapshot(
     # Compute axes before acquiring lock — reads only Task rows, not the project.
     axes = await compute_current_axes(session, project_id)
     captured_at = _utcnow().isoformat()
-    snapshot: Dict[str, Any] = {"captured_at": captured_at, **axes}
+    snapshot: Dict[str, Any] = {
+        "captured_at": captured_at,
+        "metric_def_version": METRIC_DEF_VERSION,
+        **axes,
+    }
 
     # Lock the project row for the read-modify-write so concurrent background
     # writers (e.g. sr_blind_spots, playbook_learning) cannot clobber each
@@ -1892,8 +2154,51 @@ async def write_snapshot(
 
         if not container.get("baseline"):
             container["baseline"] = dict(snapshot)
+            # Record per-member provenance for the initial seed so every
+            # member carries a durable "seeded from which snapshot" annotation.
+            _prov: Dict[str, Any] = {}
+            for _axis in ALL_AXES:
+                if snapshot.get(_axis) is not None:
+                    _prov[_axis] = {
+                        "seeded_at": captured_at,
+                        "snapshot_captured_at": captured_at,
+                    }
+            for _key in ("agent_timeout_rate", FORMAT_COMPLIANCE_KEY):
+                if snapshot.get(_key) is not None:
+                    _prov[_key] = {
+                        "seeded_at": captured_at,
+                        "snapshot_captured_at": captured_at,
+                    }
+            container["baseline"]["_member_provenance"] = _prov
         else:
             baseline = dict(container["baseline"])
+            # Per-member provenance: records when each baseline member was seeded
+            # (or re-seeded after a migration) and from which snapshot's data it
+            # came.  Missing on pre-provenance baselines — see retroactive
+            # inference below.
+            provenance: Dict[str, Any] = dict(
+                baseline.get("_member_provenance") or {}
+            )
+            # Retroactive annotation: if provenance is empty and snapshots already
+            # exist, scan the snapshot history to find the earliest snapshot whose
+            # value matches each current baseline member.  This annotates patchwork
+            # baselines (where individual members were re-seeded after the original
+            # capture date) without a separate migration.  Runs once; subsequent
+            # calls find provenance already populated and skip this block.
+            existing_snapshots = list(container.get("snapshots") or [])
+            if not provenance and existing_snapshots:
+                for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY]:
+                    _bval = baseline.get(_member)
+                    if _bval is None:
+                        continue
+                    for _snap in existing_snapshots:
+                        if _snap.get(_member) == _bval:
+                            provenance[_member] = {
+                                "seeded_at": _snap.get("captured_at"),
+                                "snapshot_captured_at": _snap.get("captured_at"),
+                                "_inferred": True,
+                            }
+                            break
             # One-time migration: baselines captured before the heartbeat-beacon fix
             # (schema_version 0) stored vm_cold_start_p50_ms from the first boot
             # beacon rather than true dispatch-to-claim latency. Clear it so the
@@ -1934,6 +2239,10 @@ async def write_snapshot(
             for axis in ALL_AXES:
                 if baseline.get(axis) is None and snapshot.get(axis) is not None:
                     baseline[axis] = snapshot[axis]
+                    provenance[axis] = {
+                        "seeded_at": captured_at,
+                        "snapshot_captured_at": captured_at,
+                    }
             # agent_timeout_rate is a nested block, not a member of ALL_AXES, so
             # the re-seed loop above never reaches it. Backfill it for baselines
             # that predate this measure (the live, daily-snapshotted Blueprint
@@ -1944,6 +2253,20 @@ async def write_snapshot(
                 and snapshot.get("agent_timeout_rate") is not None
             ):
                 baseline["agent_timeout_rate"] = snapshot["agent_timeout_rate"]
+                provenance["agent_timeout_rate"] = {
+                    "seeded_at": captured_at,
+                    "snapshot_captured_at": captured_at,
+                }
+            if (
+                baseline.get(FORMAT_COMPLIANCE_KEY) is None
+                and snapshot.get(FORMAT_COMPLIANCE_KEY) is not None
+            ):
+                baseline[FORMAT_COMPLIANCE_KEY] = snapshot[FORMAT_COMPLIANCE_KEY]
+                provenance[FORMAT_COMPLIANCE_KEY] = {
+                    "seeded_at": captured_at,
+                    "snapshot_captured_at": captured_at,
+                }
+            baseline["_member_provenance"] = provenance
             container["baseline"] = baseline
 
         snapshots = list(container.get("snapshots") or [])
@@ -2001,6 +2324,17 @@ async def read_baseline_with_drift(
 
     pool_funnel = get_pool_funnel_snapshot()
 
+    # Compute windowed idle cost over the SAME window as the pool dispatch
+    # funnel so cost_per_pool_hit_usd uses commensurable numerator and
+    # denominator. Pre-window all-time ledger carry-forward is excluded.
+    _amortization_window_hours = int(pool_funnel.get("window_hours") or 24)
+    _amortization_cutoff = _utcnow() - timedelta(hours=_amortization_window_hours)
+    _windowed_idle_result = await _compute_windowed_idle_cost(
+        session, project_id, _amortization_cutoff
+    )
+    _pool_amortization_windowed_idle_usd = _windowed_idle_result["total"]
+    _pool_amortization_windowed_by_account = _windowed_idle_result["by_account"]
+
     container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     baseline = container.get("baseline") or {}
     snapshots = container.get("snapshots") or []
@@ -2053,6 +2387,25 @@ async def read_baseline_with_drift(
         if snap.get("pool_dispatch_funnel")
     ]
 
+    # Per-member provenance: records when each baseline member was seeded and
+    # from which snapshot's window its value came.  For baselines that predate
+    # provenance recording, infer retroactively on the read path (not persisted
+    # here — the next write_snapshot will persist it inside the lock).
+    member_provenance: Dict[str, Any] = dict(baseline.get("_member_provenance") or {})
+    if not member_provenance and snapshots:
+        for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY]:
+            _bval = baseline.get(_member)
+            if _bval is None:
+                continue
+            for _snap in snapshots:
+                if _snap.get(_member) == _bval:
+                    member_provenance[_member] = {
+                        "seeded_at": _snap.get("captured_at"),
+                        "snapshot_captured_at": _snap.get("captured_at"),
+                        "_inferred": True,
+                    }
+                    break
+
     axes: Dict[str, Dict[str, Any]] = {}
     for axis in ALL_AXES:
         cur = latest.get(axis)
@@ -2069,14 +2422,21 @@ async def read_baseline_with_drift(
         else:
             drift_pct = round(((cur - base) / base) * 100.0, 2)
         history = [
-            {"captured_at": snap.get("captured_at"), "value": snap.get(axis)}
+            {
+                "captured_at": snap.get("captured_at"),
+                "value": snap.get(axis),
+                "def_version": snap.get("metric_def_version"),
+            }
             for snap in snapshots
         ]
+        _aprov = member_provenance.get(axis) or {}
         axes[axis] = {
             "current": cur,
             "baseline": base,
             "drift_pct": drift_pct,
             "history": history,
+            "baseline_seeded_at": _aprov.get("seeded_at"),
+            "baseline_seed_snapshot_at": _aprov.get("snapshot_captured_at"),
         }
 
     # Idle-inclusive cost-per-merged-PR as a companion trended axis. The
@@ -2112,6 +2472,7 @@ async def read_baseline_with_drift(
             {
                 "captured_at": snap.get("captured_at"),
                 "value": snap.get("cost_per_merged_pr_incl_pool_idle"),
+                "def_version": snap.get("metric_def_version"),
             }
             for snap in snapshots
         ],
@@ -2176,9 +2537,48 @@ async def read_baseline_with_drift(
         "window_days": latest_timeout.get("window_days"),
     }
 
+    latest_format = latest.get(FORMAT_COMPLIANCE_KEY) or {}
+    baseline_format = baseline.get(FORMAT_COMPLIANCE_KEY) or {}
+
+    def _format_rate_axis(rate_key: str) -> Dict[str, Any]:
+        return {
+            "current": latest_format.get(rate_key),
+            "baseline": baseline_format.get(rate_key),
+            "drift_pct": _rate_drift_pct(
+                latest_format.get(rate_key), baseline_format.get(rate_key)
+            ),
+            "history": [
+                {
+                    "captured_at": snap.get("captured_at"),
+                    "value": (snap.get(FORMAT_COMPLIANCE_KEY) or {}).get(rate_key),
+                }
+                for snap in snapshots
+                if snap.get(FORMAT_COMPLIANCE_KEY)
+            ],
+        }
+
+    format_compliance = {
+        FORMAT_COMPLIANCE_RATE_KEY: _format_rate_axis(FORMAT_COMPLIANCE_RATE_KEY),
+        SELF_REPAIR_SUCCESS_RATE_KEY: _format_rate_axis(SELF_REPAIR_SUCCESS_RATE_KEY),
+        "tasks_measured": latest_format.get("tasks_measured"),
+        "well_formed_tasks": latest_format.get("well_formed_tasks"),
+        "format_error_total": latest_format.get("format_error_total"),
+        "repair_attempts": latest_format.get("repair_attempts"),
+        "repair_successes": latest_format.get("repair_successes"),
+    }
+
     return {
         "axes": axes,
         "agent_timeout_rate": agent_timeout_rate,
+        FORMAT_COMPLIANCE_KEY: format_compliance,
+        # Per-member seed provenance: keyed by member name (ALL_AXES + nested
+        # blocks), each value carries seeded_at / snapshot_captured_at so every
+        # consumer can see which reference date each drift figure is measured from.
+        "baseline_provenance": {
+            k: v
+            for k, v in member_provenance.items()
+            if not str(k).startswith("_")
+        },
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
@@ -2214,21 +2614,24 @@ async def read_baseline_with_drift(
         # can confirm BOTH halves of the goal — reuse lift above the floor AND no
         # cost regression — from one place.
         "warm_start_origin_breakdown": latest.get("warm_start_origin_breakdown"),
-        # Cost-amortization companion: the latest snapshot's pool idle cost
-        # against the live (instance-local) pool dispatch funnel, so operators
-        # can see whether idle spend is being amortized by warm-start hits — the
-        # same signal the maintainer's cost-aware auto-drain guard acts on.
+        # Cost-amortization companion: windowed pool idle cost (same window as
+        # the pool dispatch funnel) against the live (instance-local) pool
+        # dispatch funnel, so operators can see whether idle spend is being
+        # amortized by warm-start hits — the same signal the maintainer's
+        # cost-aware auto-drain guard acts on. Uses _compute_windowed_idle_cost
+        # rather than the all-time snapshot field so lifetime idle spend from
+        # before the window does NOT inflate cost_per_pool_hit_usd.
         "pool_cost_amortization": compute_pool_cost_amortization(
-            latest.get("pool_idle_cost_usd") or 0.0,
+            _pool_amortization_windowed_idle_usd,
             pool_funnel,
         ),
-        # Per-account-mix view: joins the latest snapshot's per-account idle cost
-        # with the per-account dispatch funnel so an operator can answer, PER
-        # ACCOUNT, warm-vs-cold dispatch counts, hit rate, idle cost, and cost
-        # per warm start during a controlled enable — pool lift is read off the
-        # funnel hit rate, NOT the fix-loop-contaminated vm_reuse_rate.
+        # Per-account-mix view: joins windowed per-account idle cost with the
+        # per-account dispatch funnel so an operator can answer, PER ACCOUNT,
+        # warm-vs-cold dispatch counts, hit rate, idle cost, and cost per warm
+        # start during a controlled enable — pool lift is read off the funnel
+        # hit rate, NOT the fix-loop-contaminated vm_reuse_rate.
         "pool_cost_amortization_by_account": compute_pool_cost_amortization_by_account(
-            (latest.get("pool_metrics") or {}).get("by_account") or {},
+            _pool_amortization_windowed_by_account,
             pool_funnel,
         ),
         # Synthesized per-project warm-pool PAYOFF VERDICT: folds the LIFT half
@@ -2613,6 +3016,7 @@ async def get_llm_cost_breakdown(
         "window_days": window_days,
         "generated_at": _utcnow().isoformat(),
         **breakdown,
+        "by_task_type": compute_llm_cost_by_task_type(tasks),
     }
 
 
@@ -2670,3 +3074,79 @@ async def get_pool_hit_rate_estimate(
     return await estimate_pool_hit_rate(
         session, project_id, target_size=target_size, window_days=window_days
     )
+
+
+async def compute_project_window_spend_usd(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    window_hours: int = 24,
+) -> float:
+    """Total (VM + LLM) spend for a project over a rolling window.
+
+    Includes both terminal and in-flight tasks so the figure reflects
+    real recent spend. Primary use case: the per-project spend ceiling gate
+    in autonomous_research.
+
+    A task is counted when its VM span overlaps the window — i.e. the task
+    has a vm_provisioned_at AND is either still running (no vm_stopped_at) or
+    stopped after the window cutoff. Long-running tasks that started before the
+    window boundary but are still in-flight or only stopped inside the window
+    are therefore included, closing the bypass hole for the spend ceiling gate.
+    LLM-only tasks (no vm_provisioned_at) are captured via a fallback on
+    created_at so existing LLM token cost behaviour is preserved.
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            or_(
+                # VM span overlaps the window: has a VM and either still running
+                # or stopped after the window cutoff.
+                Task.vm_provisioned_at.isnot(None)
+                & (
+                    Task.vm_stopped_at.is_(None)
+                    | (Task.vm_stopped_at >= cutoff)
+                ),
+                # LLM-only tasks (no VM span): fall back to created_at so token
+                # cost is still captured for tasks that never provisioned a VM.
+                Task.vm_provisioned_at.is_(None) & (Task.created_at >= cutoff),
+            ),
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.context,
+                Task.vm_spot,
+                Task.vm_machine_type,
+                Task.vm_provisioned_at,
+                Task.vm_stopped_at,
+                Task.vm_runtime_cost_banked_db,
+                Task.attempt_history_db,
+                Task.api_call_summary,
+                Task.provider,
+                Task.model,
+                Task.llm_input_tokens_banked_db,
+                Task.llm_output_tokens_banked_db,
+                Task.llm_call_count_banked_db,
+            )
+        )
+    )
+    now = _utcnow()
+    tasks = list((await session.execute(stmt)).scalars().all())
+    total = 0.0
+    for t in tasks:
+        # In-flight tasks have no vm_stopped_at; estimate cost up to now so
+        # long-running tasks cannot bypass the spend ceiling.
+        stopped_at = now if (t.vm_provisioned_at and not t.vm_stopped_at) else None
+        total += get_task_total_vm_cost_usd(t, stopped_at=stopped_at)
+        input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
+        if input_tokens or output_tokens:
+            key = ((t.provider or "").lower(), (t.model or "").lower())
+            pricing = LLM_TOKEN_PRICING.get(key)
+            if pricing:
+                in_rate, out_rate = pricing
+                total += input_tokens * in_rate + output_tokens * out_rate
+    return round(total, 6)

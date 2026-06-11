@@ -34,12 +34,22 @@ from app.github import (
     submit_pr_review,
 )
 from app.models import (
+    Artifact,
     Project,
     Task,
     TaskHistory,
     TaskStatus,
 )
-from app.compute_jobs import stamp_compute_job_result_reference
+from app.repo_bootstrap import (
+    BOOTSTRAP_RECOVERY_MAX_ATTEMPTS,
+    coerce_recovery_attempts,
+    next_recovery_backoff,
+)
+from app.compute_jobs import (
+    _is_durable_artifact_uri,
+    get_compute_job_for_task,
+    stamp_compute_job_result_reference,
+)
 from app.artifact_prerequisites import (
     deliver_artifact_to_dependents,
     stamp_artifact_logical_key,
@@ -78,11 +88,11 @@ from app.shared_state import (
     get_project_integration_branch,
     runtime_config as _runtime_config,
 )
-from app.payload_schemas import validate_internal_payload
+from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
 from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
 from app.time_utils import _utcnow
-from app.task_locking import with_design_doc_locked, with_directions_locked
+from app.task_locking import project_lock, with_design_doc_locked, with_directions_locked
 from app.vm_cost_rates import get_vm_rate_per_second
 
 logger = logging.getLogger(__name__)
@@ -146,7 +156,7 @@ def _estimated_task_cost_usd(task: Task) -> Optional[float]:
     """Return the VM cost for a task, or None when timing data is incomplete."""
     if not task.vm_provisioned_at or not task.vm_stopped_at:
         return None
-    rate = get_vm_rate_per_second(spot=task.vm_spot)
+    rate = get_vm_rate_per_second(machine_type=task.vm_machine_type, spot=task.vm_spot)
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
 
@@ -162,6 +172,92 @@ def _extract_compute_result_reference(logs: str) -> Optional[str]:
         reference = reference.strip()
         return reference or None
     return None
+
+
+def _extract_compute_job_id(logs: str) -> Optional[uuid.UUID]:
+    try:
+        payload = json.loads(logs)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_job_id = payload.get("job_id")
+    if raw_job_id is None:
+        return None
+    try:
+        return uuid.UUID(str(raw_job_id))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _stamp_compute_result_resource(
+    session: AsyncSession, task: Task, logs: str
+) -> dict[str, Any]:
+    """Stamp and return durable resource identity for a compute result."""
+    resource: dict[str, Any] = {}
+    result_reference = _extract_compute_result_reference(logs)
+    if result_reference is not None:
+        resource["result_reference"] = result_reference
+    job_id = _extract_compute_job_id(logs)
+    if job_id is None:
+        return resource
+
+    if result_reference is not None:
+        job = await stamp_compute_job_result_reference(
+            session,
+            task_id=task.id,
+            job_id=job_id,
+            result_reference=result_reference,
+        )
+    else:
+        job = await get_compute_job_for_task(session, job_id=job_id, task_id=task.id)
+    if job is None:
+        return resource
+    if job.result_reference:
+        resource["result_reference"] = job.result_reference
+    if job.artifact_id is None:
+        return resource
+
+    artifact = await session.get(Artifact, job.artifact_id)
+    resource["artifact_id"] = str(job.artifact_id)
+    if artifact is not None and artifact.storage_uri:
+        resource["storage_uri"] = artifact.storage_uri
+    return resource
+
+
+def _derive_artifact_delivery_record(resource: dict) -> dict:
+    """Derive artifact delivery classification from a stamped compute resource dict.
+
+    Returns a dict with:
+      delivered: True iff a durable-class URI is present in storage_uri or result_reference
+      durability: 'durable' | 'transient' | 'none'
+      artifact_id: str | None
+      result_reference: str | None
+    """
+    storage_uri = resource.get("storage_uri")
+    result_reference = resource.get("result_reference")
+    artifact_id = resource.get("artifact_id")
+    # Both storage_uri and result_reference must be validated against the durable-URI
+    # predicate: Artifact.storage_uri can be https:// (agent-supplied signed URLs) and
+    # is not guaranteed durable.
+    if (
+        (storage_uri and _is_durable_artifact_uri(storage_uri))
+        or (result_reference and _is_durable_artifact_uri(result_reference))
+    ):
+        durability = "durable"
+        delivered = True
+    elif result_reference:
+        durability = "transient"
+        delivered = False
+    else:
+        durability = "none"
+        delivered = False
+    record: dict = {"delivered": delivered, "durability": durability}
+    if artifact_id is not None:
+        record["artifact_id"] = artifact_id
+    if result_reference is not None:
+        record["result_reference"] = result_reference
+    return record
 
 
 def build_blueprint_pr_footer(
@@ -1012,6 +1108,50 @@ def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
     return None
 
 
+def _extract_last_json_array(text: str, *required_keys: str) -> Optional[str]:
+    """Find the LAST JSON array in text containing objects with the required keys.
+
+    Identical scan logic to _extract_json_array but collects all matching spans
+    and returns the last one. Used by parse_adversarial_finding_verdicts so that
+    an echoed schema/example array that appears before the real final verdict
+    array does not shadow the intended output.
+    """
+    text = text[:500_000]
+    for key in required_keys:
+        if f'"{key}"' not in text:
+            return None
+    last_match: Optional[str] = None
+    start = text.find("[")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == "\\" and in_string:
+                escape_next = True
+                continue
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    if all(f'"{k}"' in candidate for k in required_keys):
+                        last_match = candidate
+                    break
+        start = text.find("[", start + 1)
+    return last_match
+
+
 def _normalize_findings_array(parsed: Any) -> list[dict]:
     """Filter a parsed findings array to dict-only elements, defensive normalization.
 
@@ -1307,6 +1447,7 @@ async def _maybe_release_safeguard_gate(
 
     from app.task_evaluators import (
         SAFEGUARD_CHALLENGE_VERDICT_KEY,
+        SAFEGUARD_OBSERVE_VERDICT_KEY,
         spawn_safeguard_challenge,
     )
 
@@ -1325,8 +1466,60 @@ async def _maybe_release_safeguard_gate(
             f"[SAFEGUARD] orig {safeguard_for_id[:8]} not found — gate not updated"
         )
         return
+
+    _gate_mode = str(
+        _runtime_config.get("safeguard_challenge_gate_mode", "observe") or "observe"
+    ).lower()
+
     if has_blocker:
         _challenge_verdict = (safeguard_task.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
+
+        if _gate_mode == "observe":
+            if _challenge_verdict is not None:
+                # Re-entry after challenge resolved in observe mode: record shadow
+                # verdict and clear the binding key so a later upgrade to enforce
+                # does not replay a stale shadow verdict.
+                from sqlalchemy.orm.attributes import flag_modified as _flag_modified  # noqa: PLC0415
+
+                outcome = (_challenge_verdict.get("outcome") or "unavailable").lower()
+                logger.info(
+                    "[SAFEGUARD] Observe mode — shadow verdict '%s' recorded on %s (gate unchanged)",
+                    outcome,
+                    safeguard_for_id[:8],
+                )
+                _sg_ctx = dict(safeguard_task.context or {})
+                _sg_ctx[SAFEGUARD_OBSERVE_VERDICT_KEY] = dict(_challenge_verdict)
+                del _sg_ctx[SAFEGUARD_CHALLENGE_VERDICT_KEY]
+                safeguard_task.context = _sg_ctx
+                _flag_modified(safeguard_task, "context")
+                session.add(safeguard_task)
+                await session.commit()
+                # Gate is NEVER released in observe mode.
+                logger.info(
+                    "[SAFEGUARD] Gate maintained on %s — observe mode, shadow verdict recorded",
+                    safeguard_for_id[:8],
+                )
+                return
+            else:
+                # First pass: spawn challenge identically to enforce, but it will
+                # be recorded as shadow on re-entry.
+                challenge = await spawn_safeguard_challenge(
+                    safeguard_task, json.dumps(findings), session
+                )
+                if challenge is not None:
+                    logger.info(
+                        "[SAFEGUARD] Observe mode — shadow challenge %s spawned for %s; gate held",
+                        challenge.id,
+                        safeguard_for_id[:8],
+                    )
+                    return
+                logger.info(
+                    "[SAFEGUARD] Gate maintained on %s — observe mode, critical/high findings "
+                    "(challenge already in flight)",
+                    safeguard_for_id[:8],
+                )
+                return
+
         if _challenge_verdict is not None:
             outcome = (_challenge_verdict.get("outcome") or "confirmed").lower()
             if outcome in ("rejected", "downgraded"):
@@ -1343,7 +1536,7 @@ async def _maybe_release_safeguard_gate(
                     safeguard_for_id[:8],
                 )
                 return
-        elif _runtime_config.get("safeguard_challenge_enabled", False):
+        elif _gate_mode == "enforce":
             challenge = await spawn_safeguard_challenge(
                 safeguard_task, json.dumps(findings), session
             )
@@ -1692,63 +1885,86 @@ async def _handle_security_audit_completion(
             )
             return
 
+    # Already-spawned guard: if a prior attempt committed children but died before
+    # flipping the parent to EVALUATING, a replay would re-parse the same findings
+    # and spawn duplicates. Detect that case and skip spawning.
+    existing_children = (
+        await session.execute(
+            select(Task).where(Task.parent_task_id == task.id)
+        )
+    ).scalars().all()
+    already_spawned = [
+        ct for ct in existing_children
+        if (ct.context or {}).get("security_audit_task_id") == str(task.id)
+    ]
+
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
     child_tasks = []
-    for i, finding in enumerate(actionable):
-        fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
-        if not fix_prompt:
-            continue
-        title = finding.get("title", f"Security fix #{i + 1}")
-        severity = finding.get("severity", "high")
-
-        new_task = Task(
-            project_id=task.project_id,
-            title=f"[{severity.upper()}] {title}",
-            description=finding.get("description", fix_prompt[:200]),
-            parent_task_id=task.id,
-            payloads=[
-                validate_internal_payload(
-                    {
-                        "type": "create",
-                        "prompt": fix_prompt,
-                        "base_branch": base_branch,
-                        **({"prompt_suffix": create_suffix} if create_suffix else {}),
-                    },
-                    "task_completion:security_finding",
-                )
-            ],
-            context={
-                "security_audit_task_id": str(task.id),
-                "finding_index": i,
-                "severity": severity,
-                "file_path": finding.get("file_path", ""),
-                "line_number": finding.get("line_number", 0),
-            },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-            status=TaskStatus.QUEUED,
-            created_by="ORCHESTRATOR",
-            requires_approval=False,  # review pipeline handles quality; only merge to main gates
-            depends_on=[],
+    if already_spawned:
+        # Replay path: children already committed in a prior attempt.
+        # Skip spawning; use existing children to complete remaining effects.
+        child_tasks = already_spawned
+        logger.info(
+            "[SECURITY AUDIT] Task %s replay: found %d already-spawned children, skipping re-spawn",
+            task.id,
+            len(child_tasks),
         )
-        session.add(new_task)
-        child_tasks.append(new_task)
+    else:
+        for i, finding in enumerate(actionable):
+            fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
+            if not fix_prompt:
+                continue
+            title = finding.get("title", f"Security fix #{i + 1}")
+            severity = finding.get("severity", "high")
 
-    await session.commit()
+            new_task = Task(
+                project_id=task.project_id,
+                title=f"[{severity.upper()}] {title}",
+                description=finding.get("description", fix_prompt[:200]),
+                parent_task_id=task.id,
+                payloads=[
+                    validate_internal_payload(
+                        {
+                            "type": "create",
+                            "prompt": fix_prompt,
+                            "base_branch": base_branch,
+                            **({"prompt_suffix": create_suffix} if create_suffix else {}),
+                        },
+                        "task_completion:security_finding",
+                    )
+                ],
+                context={
+                    "security_audit_task_id": str(task.id),
+                    "finding_index": i,
+                    "severity": severity,
+                    "file_path": finding.get("file_path", ""),
+                    "line_number": finding.get("line_number", 0),
+                },
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+                requires_approval=False,  # review pipeline handles quality; only merge to main gates
+                depends_on=[],
+            )
+            session.add(new_task)
+            child_tasks.append(new_task)
+
+        await session.flush()
+        for ct in child_tasks:
+            history = TaskHistory(
+                task_id=ct.id,
+                action="SPAWNED",
+                details={"spawned_by": "SECURITY_AUDIT", "parent_audit_id": str(task.id)},
+            )
+            session.add(history)
+
+    pending_broadcasts: list[tuple[str, str, dict]] = []
     for ct in child_tasks:
-        await session.refresh(ct)
-        history = TaskHistory(
-            task_id=ct.id,
-            action="SPAWNED",
-            details={"spawned_by": "SECURITY_AUDIT", "parent_audit_id": str(task.id)},
-        )
-        session.add(history)
-        await broadcast_to_project(
+        pending_broadcasts.append((
             str(task.project_id),
             "task_updated",
             {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
-        )
-
-    await session.commit()
+        ))
 
     # Post PR comment for medium/low findings that don't get auto-fixed
     informational = [f for f in findings if f.get("severity") in ("medium", "low")]
@@ -1800,7 +2016,19 @@ async def _handle_security_audit_completion(
         task.status = TaskStatus.COMPLETED
         task.latest_status_message = f"Security audit complete: no critical/high findings; {len(informational)} medium/low surfaced as PR comment"
     session.add(task)
+    # Single atomic commit: children INSERTs + parent status flip land together.
+    # A crash before this point leaves no children (nothing was committed), so
+    # the replay guard above fires only when children truly exist from a prior
+    # committed attempt — making replay safe either way.
     await session.commit()
+
+    for project_id, event_name, payload in pending_broadcasts:
+        try:
+            await broadcast_to_project(project_id, event_name, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[SECURITY AUDIT] Failed to broadcast {event_name} for {payload.get('task_id')}: {exc}"
+            )
 
     await broadcast_to_project(
         str(task.project_id),
@@ -2084,6 +2312,21 @@ async def _persist_compute_experiment_knowledge_best_effort(
             task.id,
             exc_info=True,
         )
+        # Record the failure on plan_output so the acceptance criterion
+        # (KnowledgeDocument must exist) is verifiable from the task record.
+        # A flush/commit failure inside persist_compute_experiment_knowledge
+        # leaves the session in pending-rollback state; roll back first so the
+        # fallback write starts from a clean transaction.
+        try:
+            await session.rollback()
+            plan_output = dict(task.plan_output or {})
+            plan_output["knowledge_document"] = {"persisted": False}
+            task.plan_output = plan_output
+            flag_modified(task, "plan_output")
+            session.add(task)
+            await session.commit()
+        except Exception:  # noqa: BLE001
+            pass
         return False
     return True
 
@@ -2213,6 +2456,9 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             "task_updated",
             {"task_id": str(task.id), "status": task.status},
         )
+        from app.cost_ceiling import check_daily_cost_ceiling
+
+        await check_daily_cost_ceiling(task, session)
         job = None
         if registration.wake_source_ref:
             with contextlib.suppress(ValueError, TypeError):
@@ -2309,6 +2555,14 @@ async def _handle_compute_experiment_completion(
         task.context = crit_context
         flag_modified(task, "context")
 
+    acceptance_evidence = read_acceptance_evidence(task.first_payload)
+    requires_durable_artifact = bool(
+        (task.first_payload or {}).get("require_durable_artifact")
+    ) or (
+        acceptance_evidence is not None
+        and acceptance_evidence.kind == "downstream_artifact"
+    )
+
     prerequisite_mode = (
         (task.context or {}).get(COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY)
         == COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
@@ -2339,32 +2593,46 @@ async def _handle_compute_experiment_completion(
         compute_result: dict[str, Any] = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
+        resource = await _stamp_compute_result_resource(session, task, logs)
+        compute_result.update(resource)
+        compute_result["artifact_delivery"] = _derive_artifact_delivery_record(resource)
         plan_output["compute_result"] = compute_result
         task.plan_output = plan_output
         flag_modified(task, "plan_output")
+        delivery = compute_result["artifact_delivery"]
+        # Tier-2 strict gate: explicit require_durable_artifact and
+        # downstream_artifact acceptance evidence both require a durable
+        # artifact delivery before the task may complete. Ordinary
+        # prerequisites (no flag, no downstream_artifact evidence) stay
+        # fail-soft and complete on measurement alone.
+        if requires_durable_artifact and not delivery["delivered"]:
+            miss_reason = (
+                f"require_durable_artifact: no durable artifact delivered "
+                f"(durability={delivery['durability']})"
+            )
+            record_failed_gate(
+                task,
+                EvaluationVerdict(False, miss_reason, "artifact-delivery"),
+            )
+            logger.info(
+                "[COMPUTE] Prerequisite-mode task %s failed Tier-2 "
+                "durable-artifact gate: %s",
+                task.id,
+                miss_reason,
+            )
+            await _finalize_compute_experiment(
+                session,
+                task,
+                TaskStatus.FAILED,
+                logs,
+                criterion,
+                owns_commit=owns_commit,
+            )
+            return
         task.latest_status_message = (
             f"Compute prerequisite measured: outcome={outcome}, final_cost=${cost}"
+            f", artifact_delivery={delivery['durability']}"
         )[:500]
-        result_reference = _extract_compute_result_reference(logs)
-        job_id = None
-        try:
-            payload = json.loads(logs)
-        except json.JSONDecodeError:
-            payload = None
-        if isinstance(payload, dict):
-            raw_job_id = payload.get("job_id")
-            if raw_job_id is not None:
-                try:
-                    job_id = uuid.UUID(str(raw_job_id))
-                except (TypeError, ValueError):
-                    job_id = None
-        if job_id is not None:
-            await stamp_compute_job_result_reference(
-                session,
-                task_id=task.id,
-                job_id=job_id,
-                result_reference=result_reference,
-            )
         task.status = TaskStatus.COMPLETED
         logger.info(
             "[COMPUTE] Prerequisite-mode task %s completed with measured verdict",
@@ -2383,14 +2651,10 @@ async def _handle_compute_experiment_completion(
     if not verdict.passed:
         record_failed_gate(task, verdict)
         logger.info(
-            "[COMPUTE] Task %s did not clear the metric gate: %s",
+            "[COMPUTE] Task %s did not clear the artifact-delivery gate: %s",
             task.id,
             verdict.reason,
         )
-        # Record an honest negative result: an experiment that produced a
-        # measurement but missed its declared criterion still becomes durable,
-        # queryable knowledge ("we tried X and it did NOT meet the bar"), so a
-        # later cycle does not re-pose the question and re-spend.
         await _finalize_compute_experiment(
             session,
             task,
@@ -2410,43 +2674,51 @@ async def _handle_compute_experiment_completion(
     if measurement is not None:
         outcome, cost = measurement
         compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
-        # The gate passed, so a declared success criterion (if any) was met —
-        # surface it on the durable result for the operator-visible summary.
-        # ``criterion`` was already computed above and recorded on task.context.
         if criterion is not None:
             compute_result["criterion"] = criterion
+        resource = await _stamp_compute_result_resource(session, task, logs)
+        compute_result.update(resource)
+        delivery = _derive_artifact_delivery_record(resource)
+        compute_result["artifact_delivery"] = delivery
         plan_output["compute_result"] = compute_result
+        task.plan_output = plan_output
+        flag_modified(task, "plan_output")
+        # Tier 2: strict gate — fail if the task declared it needs a durable
+        # artifact, either explicitly or via downstream_artifact evidence.
+        if requires_durable_artifact and not delivery["delivered"]:
+            miss_reason = (
+                f"require_durable_artifact: no durable artifact delivered "
+                f"(durability={delivery['durability']})"
+            )
+            record_failed_gate(
+                task,
+                EvaluationVerdict(False, miss_reason, "artifact-delivery"),
+            )
+            logger.info(
+                "[COMPUTE] Task %s failed Tier-2 durable-artifact gate: %s",
+                task.id,
+                miss_reason,
+            )
+            await _finalize_compute_experiment(
+                session,
+                task,
+                TaskStatus.FAILED,
+                logs,
+                criterion,
+                owns_commit=owns_commit,
+            )
+            return
         task.latest_status_message = (
             f"Compute experiment terminal: outcome={outcome}, "
-            f"final_cost=${cost}"
+            f"final_cost=${cost}, artifact_delivery={delivery['durability']}"
         )[:500]
     else:  # pragma: no cover - defensive; the gate guarantees a measurement
         task.latest_status_message = "Compute experiment completed"
-    result_reference = _extract_compute_result_reference(logs)
-    job_id = None
-    try:
-        payload = json.loads(logs)
-    except json.JSONDecodeError:
-        payload = None
-    if isinstance(payload, dict):
-        raw_job_id = payload.get("job_id")
-        if raw_job_id is not None:
-            try:
-                job_id = uuid.UUID(str(raw_job_id))
-            except (TypeError, ValueError):
-                job_id = None
-    if job_id is not None:
-        await stamp_compute_job_result_reference(
-            session,
-            task_id=task.id,
-            job_id=job_id,
-            result_reference=result_reference,
-        )
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
     task.status = TaskStatus.COMPLETED
     logger.info(
-        "[COMPUTE] Task %s passed the metric gate and completed", task.id
+        "[COMPUTE] Task %s delivered a compute artifact and completed", task.id
     )
     # Persist the measured verdict as durable, queryable knowledge so future
     # research/strategist cycles can discover that this experiment already ran
@@ -3492,16 +3764,13 @@ async def _handle_design_doc_completion(
             },
         }
         if cycle_id:
-            from app.research_completion import _update_cycle_history  # noqa: PLC0415
+            from app import strategic_cycle as _sc  # noqa: PLC0415
 
-            _update_cycle_history(
-                project,
+            await _sc.mark_failure(
+                session,
                 cycle_id,
-                {
-                    "phase1_completed_at": _utcnow().isoformat(),
-                    "outcome": "failed_phase2_spawn",
-                    "error": str(chain_exc)[:200],
-                },
+                phase="phase2_spawn",
+                reason=str(chain_exc)[:200],
             )
         flag_modified(project, "vision")
         session.add(project)
@@ -3527,6 +3796,164 @@ async def _handle_design_doc_completion(
                 "status_message": task.latest_status_message,
             },
         )
+
+
+async def _handle_repo_bootstrap_completion(
+    task: Task, logs: str, session: AsyncSession
+) -> None:
+    """Handle repo_bootstrap task completion: persist repo overview and stamp build_config.
+
+    Called when a repo_bootstrap task reaches a terminal COMPLETED state.
+
+    If the agent produced a repo overview JSON (tech_stack / directory_layout /
+    first_steps_summary) — delivered via the structured completion payload and
+    mirrored into task.context["repo_overview"] — it is persisted into
+    project.design_doc["repo_overview"] so the first strategic cycle can
+    consume it via _design_doc_index / _agent_view_design_doc. A clean success
+    also stamps bootstrap_completed_at on build_config.
+
+    If no parseable overview is present (degraded path), the handler records
+    bootstrap_degraded_reason in build_config instead of silently claiming
+    clean success. Either path marks the task terminal so the strategic spawn
+    gate can proceed (the gate only defers while bootstrap is IN_PROGRESS/QUEUED).
+    """
+    _OVERVIEW_KEYS = ("tech_stack", "directory_layout", "first_steps_summary")
+    _OVERVIEW_OPTIONAL_KEYS = (
+        "entry_points", "test_layout", "key_conventions", "environment_requirements"
+    )
+    _REVISION_KEYS = ("source_revision", "revision", "commit", "commit_sha")
+    overview: dict[str, str] | None = None
+    source_revision: str | None = None
+
+    def _extract_revision(src: dict[str, Any]) -> str | None:
+        for key in _REVISION_KEYS:
+            value = src.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _build_overview(src: dict[str, Any]) -> dict[str, str]:
+        result = {k: str(src.get(k, "")) for k in _OVERVIEW_KEYS}
+        for k in _OVERVIEW_OPTIONAL_KEYS:
+            v = src.get(k)
+            if isinstance(v, str) and v.strip():
+                result[k] = v
+        return result
+
+    def _is_overview_complete(src: dict[str, Any]) -> bool:
+        """Check if overview has all required fields present and non-empty."""
+        for key in _OVERVIEW_KEYS:
+            value = src.get(key)
+            if not isinstance(value, str) or not value.strip():
+                return False
+        return True
+
+    ctx_overview = (task.context or {}).get("repo_overview")
+    if isinstance(ctx_overview, dict) and _is_overview_complete(ctx_overview):
+        overview = _build_overview(ctx_overview)
+        source_revision = _extract_revision(ctx_overview)
+    elif logs:
+        try:
+            parsed = json.loads(logs)
+            if isinstance(parsed, dict) and _is_overview_complete(parsed):
+                overview = _build_overview(parsed)
+                source_revision = _extract_revision(parsed)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Provenance derives from the bootstrap task payload (branch) plus any
+    # revision the agent reported (optional). The branch the overview describes
+    # is the integration_branch the bootstrap ran against.
+    source_branch = (task.first_payload or {}).get("integration_branch") or None
+
+    async with project_lock(session, task.project_id, skip_locked=False) as project:
+        if project is None:
+            logger.warning(
+                "[BOOTSTRAP] Project %s not found for bootstrap task %s — skipping",
+                task.project_id,
+                task.id,
+            )
+            return
+
+        build_config = dict(project.build_config or {})
+
+        if overview:
+            now_iso = _utcnow().isoformat()
+            # Provenance carried alongside the overview so downstream agents see
+            # freshness (refreshed time + the branch/revision the overview
+            # describes). Nested under the repo_overview block so a refresh
+            # replaces both the content and its provenance atomically.
+            provenance: Dict[str, Any] = {
+                "refreshed_at": now_iso,
+                "source_branch": source_branch,
+                "source_revision": source_revision,
+            }
+            overview_block: Dict[str, Any] = {**overview, "provenance": provenance}
+
+            def _mutate_design_doc(doc: Dict[str, Any]) -> None:
+                existing_overview = doc.get("repo_overview")
+                if existing_overview != overview_block:
+                    meta = dict(doc.get("_meta") or {"revision": 0})
+                    doc["repo_overview"] = overview_block
+                    meta["revision"] = meta.get("revision", 0) + 1
+                    meta["last_updated"] = now_iso
+                    doc["_meta"] = meta
+
+            session.expire(project, ["design_doc"])
+            await with_design_doc_locked(session, task.project_id, _mutate_design_doc)
+
+            if not build_config.get("bootstrap_completed_at"):
+                build_config["bootstrap_completed_at"] = now_iso
+            # Mirror provenance into build_config so the admin UI (which reads
+            # project.build_config) can surface overview freshness.
+            build_config["bootstrap_overview_refreshed_at"] = now_iso
+            build_config["bootstrap_overview_source_branch"] = source_branch
+            build_config["bootstrap_overview_source_revision"] = source_revision
+            build_config.pop("bootstrap_degraded_reason", None)
+            build_config.pop("bootstrap_recovery_next_at", None)
+            build_config.pop("bootstrap_recovery_exhausted_at", None)
+            build_config.pop("bootstrap_recovery_last_degraded_at", None)
+            build_config["bootstrap_recovery_attempts"] = 0
+            build_config["bootstrap_recovery_state"] = "completed"
+            logger.info(
+                "[BOOTSTRAP] Persisted repo_overview and stamped bootstrap_completed_at "
+                "for project %s (task %s)",
+                task.project_id,
+                task.id,
+            )
+        else:
+            if not build_config.get("bootstrap_completed_at"):
+                now = _utcnow()
+                attempts = (
+                    coerce_recovery_attempts(
+                        build_config.get("bootstrap_recovery_attempts")
+                    )
+                    + 1
+                )
+                build_config["bootstrap_degraded_reason"] = "overview_missing"
+                build_config["bootstrap_recovery_attempts"] = attempts
+                build_config["bootstrap_recovery_last_degraded_at"] = now.isoformat()
+                if attempts >= BOOTSTRAP_RECOVERY_MAX_ATTEMPTS:
+                    build_config["bootstrap_recovery_state"] = "exhausted"
+                    build_config["bootstrap_recovery_exhausted_at"] = now.isoformat()
+                    build_config.pop("bootstrap_recovery_next_at", None)
+                else:
+                    build_config["bootstrap_recovery_state"] = "backoff"
+                    build_config["bootstrap_recovery_next_at"] = (
+                        now + next_recovery_backoff(attempts)
+                    ).isoformat()
+                    build_config.pop("bootstrap_recovery_exhausted_at", None)
+                logger.warning(
+                    "[BOOTSTRAP] No repo_overview in completion payload for project %s "
+                    "(task %s) — recording degraded marker",
+                    task.project_id,
+                    task.id,
+                )
+
+        project.build_config = build_config
+        flag_modified(project, "build_config")
+        session.add(project)
+        await session.commit()
 
 
 async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) -> None:

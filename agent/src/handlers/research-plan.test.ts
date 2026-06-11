@@ -1167,6 +1167,37 @@ describe('buildCapabilityVerificationSection', () => {
     expect(section).toContain('Verified');
     expect(section).toContain('**cap-verified**');
   });
+
+  it('renders provenance header when _computed_at and _branch_sha are present', () => {
+    const section = buildCapabilityVerificationSection({
+      '_computed_at': '2026-06-10T12:00:00',
+      '_branch_sha': 'abc1234567890',
+      'cap-verified': { status: 'verified', claimed_status: 'working', missing: [], present: ['a.py'] },
+    } as unknown as Record<string, Record<string, unknown>>);
+    expect(section).toContain('Verdicts computed 2026-06-10T12:00:00');
+    expect(section).toContain('abc123456789');
+    expect(section).not.toContain('STAMP MISSING');
+  });
+
+  it('warns STAMP MISSING for legacy payloads without provenance fields', () => {
+    const section = buildCapabilityVerificationSection({
+      'cap-absent': { status: 'claimed_absent', claimed_status: 'working', missing: ['a.py'], present: [] },
+    });
+    expect(section).toContain('STAMP MISSING');
+    expect(section).not.toContain('Verdicts computed');
+  });
+
+  it('skips provenance keys when iterating capability entries', () => {
+    const section = buildCapabilityVerificationSection({
+      '_computed_at': '2026-06-10T12:00:00',
+      '_branch_sha': 'abc123',
+      'cap-absent': { status: 'claimed_absent', claimed_status: 'working', missing: ['a.py'], present: [] },
+    } as unknown as Record<string, Record<string, unknown>>);
+    // _computed_at and _branch_sha should not appear as capability names
+    expect(section).not.toContain('**_computed_at**');
+    expect(section).not.toContain('**_branch_sha**');
+    expect(section).toContain('**cap-absent**');
+  });
 });
 
 describe('buildAvailableCapabilitiesSection (shared vocabulary)', () => {
@@ -1202,6 +1233,42 @@ describe('buildAvailableCapabilitiesSection (shared vocabulary)', () => {
     expect(section).toContain('`auth-core`');
     // No status parens for the status-less entry on its own line.
     expect(section).toMatch(/- `auth-core`\n/);
+  });
+
+  it('renders proof_status alongside status across proven / unproven / partial / planned', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'payment-core', status: 'working', proof_status: 'proven' },
+      { name: 'fraud-detect', status: 'working', proof_status: 'unproven' },
+      { name: 'risk-scoring', status: 'partial', proof_status: 'unproven' },
+      { name: 'seeded-eval-harness', status: 'planned', proof_status: 'unproven' },
+    ]);
+    // proven renders as the lone second qualifier next to its declared status.
+    expect(section).toContain('`payment-core` (working, proven)');
+    // working-but-unproven is visibly distinct from proven.
+    expect(section).toContain('`fraud-detect` (working, unproven)');
+    expect(section).toContain('`risk-scoring` (partial, unproven)');
+    expect(section).toContain('`seeded-eval-harness` (planned, unproven)');
+    // A one-line legend distinguishing the two axes is present.
+    expect(section).toContain('proof_status');
+    expect(section).toMatch(/evidence-grounded proof records exist/);
+  });
+
+  it('renders proof_status without a declared status as the sole qualifier', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'audit-gate', proof_status: 'proven' },
+    ]);
+    expect(section).toContain('`audit-gate` (proven)');
+  });
+
+  it('omits the proof legend and renders status-only when no entry carries proof_status', () => {
+    const section = buildAvailableCapabilitiesSection([
+      { name: 'payment-core', status: 'working' },
+      { name: 'seeded-eval-harness', status: 'planned' },
+    ]);
+    // Back-compat: status-only rendering is unchanged when proof_status is absent.
+    expect(section).toContain('`payment-core` (working)');
+    expect(section).toContain('`seeded-eval-harness` (planned)');
+    expect(section).not.toContain('proof_status');
   });
 });
 
@@ -2163,6 +2230,87 @@ describe('buildEfficiencySnapshotSection', () => {
     };
     const result = buildEfficiencySnapshotSection(snapshot);
     expect(result).not.toContain('throughput is being left on the table');
+  });
+
+  it('renders format_compliance block when present', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+      format_compliance: {
+        format_compliance_rate: { current: 0.92, baseline: 0.88, drift_pct: 4.5 },
+        self_repair_success_rate: { current: 0.75, baseline: 0.70, drift_pct: 7.1 },
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Format compliance');
+    expect(result).toContain('format_compliance_rate');
+    expect(result).toContain('0.92');
+    expect(result).toContain('baseline 0.88');
+    expect(result).toContain('+4.5%');
+    expect(result).toContain('self_repair_success_rate');
+    expect(result).toContain('0.75');
+    expect(result).toContain('+7.1%');
+  });
+
+  it('omits format_compliance block when absent', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).not.toContain('Format compliance');
+    expect(result).not.toContain('format_compliance_rate');
+  });
+
+  it('renders agent_timeout_rate block with dominant_subtype when present', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+      agent_timeout_rate: {
+        overall: { current: 0.08, baseline: 0.06, drift_pct: 33.3 },
+        dominant_subtype: 'context_limit',
+        dominant_share: '52%',
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Agent timeout rate');
+    expect(result).toContain('0.08');
+    expect(result).toContain('baseline 0.06');
+    expect(result).toContain('+33.3%');
+    expect(result).toContain('dominant: context_limit');
+    expect(result).toContain('52%');
+  });
+
+  it('omits agent_timeout_rate block when absent', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).not.toContain('Agent timeout rate');
+  });
+
+  it('renders agent_timeout_rate without dominant subtype when dominant_subtype is null', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+      agent_timeout_rate: {
+        overall: { current: 0.05, baseline: 0.05, drift_pct: 0.0 },
+        dominant_subtype: null,
+        dominant_share: null,
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Agent timeout rate');
+    expect(result).toContain('0.05');
+    expect(result).not.toContain('dominant:');
+  });
+
+  it('renders llm_cost_per_merged_pr with a proper label', () => {
+    const snapshot = {
+      axes: {
+        llm_cost_per_merged_pr: { current: 0.85, baseline: 0.66, drift_pct: 28.8 },
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('LLM cost/merged PR');
+    expect(result).toContain('0.85');
+    expect(result).toContain('+28.8%');
   });
 });
 
@@ -3139,10 +3287,10 @@ describe('normalizePlanSubtaskTypes', () => {
       ],
     };
     const logs: string[] = [];
-    const out = JSON.parse(normalizePlanSubtaskTypes(JSON.stringify(plan), (m) => logs.push(m)));
-    expect(out.subtasks[0].type).toBe('create');
-    expect(out.subtasks[0].title).toBe('fix: glob refs read as indeterminate not absent');
-    expect(out.subtasks[0].related_files).toEqual(['backend/app/design_docs.py']);
+    const out = JSON.parse(normalizePlanSubtaskTypes(JSON.stringify(plan), (m) => logs.push(m))) as { subtasks: Array<Record<string, unknown>> };
+    expect(out.subtasks[0]['type']).toBe('create');
+    expect(out.subtasks[0]['title']).toBe('fix: glob refs read as indeterminate not absent');
+    expect(out.subtasks[0]['related_files']).toEqual(['backend/app/design_docs.py']);
     expect(out.subtasks[1]).toEqual(plan.subtasks[1]);
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain('"fix"');
@@ -3176,8 +3324,8 @@ describe('normalizePlanSubtaskTypes', () => {
   it('coerces a non-string type value to "create"', () => {
     const out = JSON.parse(
       normalizePlanSubtaskTypes(JSON.stringify({ subtasks: [{ title: 't', type: 7 }] }))
-    );
-    expect(out.subtasks[0].type).toBe('create');
+    ) as { subtasks: Array<Record<string, unknown>> };
+    expect(out.subtasks[0]['type']).toBe('create');
   });
 
   it('passes non-JSON input through untouched (raw-output fallback path)', () => {

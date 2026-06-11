@@ -1033,6 +1033,8 @@ export function resolveMemoHandles(
 export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): string {
   const AXIS_LABELS: Record<string, string> = {
     cost_per_merged_pr: 'Cost/merged PR (USD)',
+    llm_cost_per_merged_pr: 'LLM cost/merged PR (USD)',
+    agent_timeout_rate: 'Agent timeout rate',
     vm_cold_start_p50_ms: 'VM cold-start p50 (ms)',
     vm_reuse_rate: 'VM reuse rate',
     median_api_calls_per_task: 'Median API calls/task',
@@ -1085,6 +1087,43 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
       '_Fleet slot utilization is the share of max-plan account slots in use (now + short trailing average) across the whole fleet. Chronically low utilization WITH verified non-clashing backlog means throughput is being left on the table — parallelize existing work or open more non-clashing directions. But distinguish idle headroom from cooled accounts (shown only when present): cooldowns are a rate-limit problem, not a reason to manufacture work. Near capacity is healthy, not a deficit._',
     );
   }
+
+  const fc = snap.format_compliance && typeof snap.format_compliance === 'object'
+    ? snap.format_compliance as Record<string, unknown>
+    : null;
+  if (fc) {
+    const fmtRate = (key: string): string => {
+      const r = fc[key] as Record<string, unknown> | undefined;
+      if (!r || typeof r !== 'object') return 'n/a';
+      return `${fmt(r.current)} (baseline ${fmt(r.baseline)}, drift ${fmtDrift(r.drift_pct)})`;
+    };
+    lines.push('');
+    lines.push('**Format compliance:**');
+    lines.push(`  format_compliance_rate: ${fmtRate('format_compliance_rate')}`);
+    lines.push(`  self_repair_success_rate: ${fmtRate('self_repair_success_rate')}`);
+  }
+
+  const atr = snap.agent_timeout_rate && typeof snap.agent_timeout_rate === 'object'
+    ? snap.agent_timeout_rate as Record<string, unknown>
+    : null;
+  if (atr) {
+    const overall = atr.overall && typeof atr.overall === 'object'
+      ? atr.overall as Record<string, unknown>
+      : null;
+    const overallStr = overall
+      ? `${fmt(overall.current)} (baseline ${fmt(overall.baseline)}, drift ${fmtDrift(overall.drift_pct)})`
+      : 'n/a';
+    const rawSubtype = atr.dominant_subtype;
+    const dominantSubtype = typeof rawSubtype === 'string' || typeof rawSubtype === 'number' ? String(rawSubtype) : null;
+    const rawShare = atr.dominant_share;
+    const dominantShare = typeof rawShare === 'string' || typeof rawShare === 'number' ? String(rawShare) : null;
+    const dominantStr = dominantSubtype
+      ? ` — dominant: ${dominantSubtype}${dominantShare != null ? ` (${dominantShare})` : ''}`
+      : '';
+    lines.push('');
+    lines.push(`**Agent timeout rate:** ${overallStr}${dominantStr}`);
+  }
+
   return lines.join('\n') + '\n';
 }
 
@@ -1249,10 +1288,14 @@ export function buildCapabilityVerificationSection(
   capVerif: Record<string, Record<string, unknown>> | undefined,
 ): string {
   if (!capVerif || typeof capVerif !== 'object' || Object.keys(capVerif).length === 0) return '';
+  const _pm = capVerif as Record<string, unknown>;
+  const computedAt = typeof _pm['_computed_at'] === 'string' ? _pm['_computed_at'] : null;
+  const branchSha = typeof _pm['_branch_sha'] === 'string' ? _pm['_branch_sha'] : null;
   const absent: string[] = [];
   const partial: string[] = [];
   const verified: string[] = [];
   for (const capName of Object.keys(capVerif).sort()) {
+    if (capName.startsWith('_')) continue;
     const v = capVerif[capName];
     const status = strVal(v.status as string);
     const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
@@ -1269,6 +1312,12 @@ export function buildCapabilityVerificationSection(
   }
   if (absent.length === 0 && partial.length === 0 && verified.length === 0) return '';
   const vlines: string[] = ['# CAPABILITY VERIFICATION (code existence vs. design-doc claims)'];
+  if (computedAt) {
+    const shaNote = branchSha ? ` against ${branchSha.slice(0, 12)}` : '';
+    vlines.push(`_Verdicts computed ${computedAt}${shaNote}. If this task was retried after a delay, the branch may have changed — treat older stamps as advisory._`);
+  } else {
+    vlines.push('_⚠️ STAMP MISSING — verdicts may be from an earlier run and could reflect a stale branch state._');
+  }
   vlines.push('The backend verified each design-doc capability\'s declared backing paths against the integration-branch file tree. Do NOT trust a capability\'s status over this evidence — if a capability is flagged below, treat its claimed status (working/partial) as unreliable, design from what actually exists, and do NOT propose improvements to behavior that is not built.');
   if (absent.length > 0) {
     vlines.push('\n## ⚠️ Claimed-but-absent (effectively missing — backing code does not exist)');
@@ -1302,18 +1351,31 @@ export function buildCapabilityVerificationSection(
 export function buildAvailableCapabilitiesSection(caps: unknown): string {
   if (!Array.isArray(caps) || caps.length === 0) return '';
   const lines: string[] = [];
+  let anyProofStatus = false;
   for (const c of caps) {
     if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
     const rec = c as Record<string, unknown>;
     const name = strVal(rec.name);
     if (!name) continue;
     const status = strVal(rec.status);
-    lines.push(status ? `- \`${name}\` (${status})` : `- \`${name}\``);
+    // proof_status is the SECOND, durable axis (proven / unproven) the strategist
+    // records at merge time — independent of the declared status. Render it
+    // alongside status when present so a working-but-unproven capability reads
+    // differently from a proven one. Absent-field callers render exactly as
+    // before (back-compat: `(working)` / `(planned)` / bare name).
+    const proofStatus = strVal(rec.proof_status);
+    if (proofStatus) anyProofStatus = true;
+    const qualifiers = [status, proofStatus].filter(Boolean);
+    lines.push(qualifiers.length ? `- \`${name}\` (${qualifiers.join(', ')})` : `- \`${name}\``);
   }
   if (lines.length === 0) return '';
+  const legend = anyProofStatus
+    ? 'Each entry shows its declared `status` (working / partial / planned) and, when known, its durable `proof_status` (proven / unproven). `proven` means evidence-grounded proof records exist; `working, unproven` means the registry declares it working but no proof has been recorded yet — prefer proven capabilities when a prerequisite must be reliable, and treat unproven ones as claims still awaiting verification.'
+    : null;
   return [
     '# AVAILABLE CAPABILITIES (shared vocabulary)',
     'These are the project\'s canonical capability names — the strategist-curated registry (`problem_model.capabilities`). It is the SHARED VOCABULARY for cross-lane prerequisites: when you declare a `prerequisite` capability ref OR a `provides_capability` stamp, DRAW THE NAME FROM THIS LIST so producers and consumers converge on the SAME string (the matcher is EXACT, never fuzzy). Propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed here.',
+    ...(legend ? [legend] : []),
     ...lines,
   ].join('\n') + '\n\n';
 }
@@ -1362,7 +1424,8 @@ export function normalizePlanSubtaskTypes(planJson: string, log?: (msg: string) 
     const rawType = subtask.type;
     if (rawType === undefined || rawType === null) continue; // backend defaults to "create"
     if (typeof rawType === 'string' && PLAN_CHILD_TYPE_VOCABULARY.has(rawType)) continue;
-    log?.(`[PLAN] Subtask ${JSON.stringify(String(subtask.title ?? ''))} requested off-vocabulary type ${JSON.stringify(rawType)} — coercing to "create" so the plan stays spawnable\n`);
+    const titleStr = typeof subtask.title === 'string' ? subtask.title : '';
+    log?.(`[PLAN] Subtask ${JSON.stringify(titleStr)} requested off-vocabulary type ${JSON.stringify(rawType)} — coercing to "create" so the plan stays spawnable\n`);
     subtask.type = 'create';
     changed = true;
   }
@@ -1562,7 +1625,7 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
   // Coerce off-vocabulary subtask types (notably "fix") to "create" before the
   // backend parses the plan — see normalizePlanSubtaskTypes for why.
-  logs = normalizePlanSubtaskTypes(logs, (m) => sendLog(ws, m));
+  logs = normalizePlanSubtaskTypes(logs, (m) => { sendLog(ws, m); });
 
   // Backend's _handle_plan_completion parses `logs` on COMPLETED and creates
   // children with the correct plan branch. No agent-side spawn is needed —
@@ -1880,10 +1943,14 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
   let systemVerificationSection = '';
   const sysVerif = payload.system_verification as Record<string, Record<string, unknown>> | undefined;
   if (sysVerif && Object.keys(sysVerif).length > 0) {
+    const _syspm = sysVerif as Record<string, unknown>;
+    const sysComputedAt = typeof _syspm['_computed_at'] === 'string' ? _syspm['_computed_at'] : null;
+    const sysBranchSha = typeof _syspm['_branch_sha'] === 'string' ? _syspm['_branch_sha'] : null;
     const absent: string[] = [];
     const partial: string[] = [];
     const verified: string[] = [];
     for (const sysId of Object.keys(sysVerif).sort()) {
+      if (sysId.startsWith('_')) continue;
       const v = sysVerif[sysId];
       const status = strVal(v.status as string);
       const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
@@ -1900,6 +1967,12 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
     }
     if (absent.length > 0 || partial.length > 0 || verified.length > 0) {
       const vlines: string[] = ['# SYSTEM VERIFICATION (code existence vs. design-doc claims)'];
+      if (sysComputedAt) {
+        const shaNote = sysBranchSha ? ` against ${sysBranchSha.slice(0, 12)}` : '';
+        vlines.push(`_Verdicts computed ${sysComputedAt}${shaNote}. If this task was retried after a delay, the branch may have changed — treat older stamps as advisory._`);
+      } else {
+        vlines.push('_⚠️ STAMP MISSING — verdicts may be from an earlier run and could reflect a stale branch state._');
+      }
       vlines.push('The backend verified each design-doc system\'s declared module paths against the integration-branch file tree. Do NOT trust a system\'s status over this evidence — if a system is flagged below, treat its claimed status as unreliable and design from what actually exists.');
       if (absent.length > 0) {
         vlines.push('\n## ⚠️ Claimed-but-absent (effectively missing — backing code does not exist)');

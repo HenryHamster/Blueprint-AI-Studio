@@ -173,6 +173,29 @@ async def _spawn_residual_fingerprint_remediation(
     if not fingerprints:
         return 0
 
+    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
+    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
+    if spend_ceiling_usd:
+        from app.efficiency_snapshot import compute_project_window_spend_usd
+        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+
+        window_spend = await compute_project_window_spend_usd(session, project.id)
+        if window_spend >= spend_ceiling_usd:
+            logger.info(
+                "[AUTO REMEDIATION] Spend ceiling reached for project %s: "
+                "$%.4f >= $%.4f — skipping remediation spawn",
+                project.id,
+                window_spend,
+                spend_ceiling_usd,
+            )
+            await _maybe_create_spend_ceiling_alert(
+                project.id,
+                session,
+                window_spend_usd=window_spend,
+                ceiling_usd=spend_ceiling_usd,
+            )
+            return 0
+
     # Load case rows we need for spawn-side filters in one query:
     # IGNORED + SUSPENDED block re-spawn; REMEDIATING + last_spawned_at
     # drive the per-fingerprint cooldown. Row count for REMEDIATING

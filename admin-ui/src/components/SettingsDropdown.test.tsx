@@ -149,6 +149,10 @@ function makeProps(overrides: Record<string, unknown> = {}) {
     onUpdateIssueImplementationConfig: vi.fn(),
     autoReviewConfig: null,
     onUpdateAutoReviewConfig: vi.fn(),
+    resourceEnvelopeData: null,
+    resourceEnvelopeLoading: false,
+    resourceEnvelopeError: null,
+    onUpdateResourceEnvelope: vi.fn(),
     ...overrides,
   };
 }

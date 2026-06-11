@@ -24,6 +24,8 @@ vi.mock('../prompt.js', async (importOriginal) => {
     buildRetryContext: vi.fn().mockReturnValue(''),
     readClaudeMd: vi.fn().mockReturnValue(''),
     configureAgentPermissions: vi.fn().mockReturnValue(['Write', 'Edit', 'NotebookEdit']),
+    writePlaybookHelper: vi.fn(),
+    writeMessagesHelper: vi.fn(),
   };
 });
 
@@ -41,6 +43,8 @@ vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),
     existsSync: vi.fn().mockReturnValue(false),
+    writeFileSync: vi.fn(),
+    appendFileSync: vi.fn(),
   },
 }));
 
@@ -54,7 +58,7 @@ vi.mock('child_process', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleWebResearch, groundWebCitations } from './web-research.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
-import { configureAgentPermissions } from '../prompt.js';
+import { configureAgentPermissions, writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 
@@ -231,6 +235,20 @@ describe('handleWebResearch', () => {
     const disallowed = vi.mocked(runClaudeCode).mock.calls[0][5] as string[];
     expect(disallowed).toContain('Write');
     expect(disallowed).toContain('Edit');
+  });
+
+  it('provisions messages and playbook helpers for the web_research workspace', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Both helper scripts must be provisioned so the agent can escalate
+    // blockers and persist collective memory during a web research session.
+    expectCalledWith(writePlaybookHelper, TASK_ID);
+    expectCalledWith(writeMessagesHelper, TASK_ID);
   });
 
   it('injects a Prior Knowledge section with prior-doc titles/ids and the build-on/cite instruction', async () => {

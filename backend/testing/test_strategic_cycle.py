@@ -685,3 +685,67 @@ async def test_ever_cited_memo_citation_outside_recent_window(db_session):
     result = await strategic_cycle.ever_cited_memo(db_session, project.id)
     assert result["ever_cited"] is True
     assert result["first_cycle_id"] == first_cycle_id
+
+
+@pytest.mark.asyncio
+async def test_mark_failure_phase2_spawn_records_outcome(db_session):
+    """mark_failure(phase='phase2_spawn') records OUTCOME_FAILED_PHASE2_SPAWN on the row.
+
+    This is the outcome the task_completion exception handler writes when the
+    Phase-2 strategic_review spawn raises (migration 0047: was a dead JSONB write).
+    """
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    # Simulate phase1 completing before spawn attempt
+    await strategic_cycle.mark_phase1_completed(db_session, cycle.id)
+    await db_session.commit()
+
+    updated = await strategic_cycle.mark_failure(
+        db_session,
+        cycle.id,
+        phase="phase2_spawn",
+        reason="spawn raised: VM limit reached",
+    )
+    await db_session.commit()
+
+    assert updated is not None
+    assert updated.outcome == strategic_cycle.OUTCOME_FAILED_PHASE2_SPAWN
+    assert updated.failure_reason == "spawn raised: VM limit reached"
+    assert updated.phase1_completed_at is not None
+    assert updated.outcome not in strategic_cycle.ACTIVE_OUTCOMES
+
+
+@pytest.mark.asyncio
+async def test_strategic_debug_recent_cycles_from_table(client, db_session):
+    """GET /strategic-debug returns recent_cycles and last_cycle from the
+    StrategicCycle table, not the retired vision._strategic_cycle_history JSONB."""
+    from testing.factories import make_membership
+
+    project = await _make_project(db_session)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create two completed cycles — table is the only source of truth.
+    for i in range(2):
+        c = await strategic_cycle.create(db_session, project_id=project.id)
+        await db_session.commit()
+        await strategic_cycle.mark_phase1_completed(db_session, c.id)
+        await db_session.commit()
+        await strategic_cycle.mark_phase2_completed(
+            db_session, c.id, directions_created=i + 1
+        )
+        await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-debug")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Both cycles should appear in recent_cycles (capped at 3).
+    assert len(data["recent_cycles"]) == 2
+    last = data["last_cycle"]
+    assert last is not None
+    assert last["outcome"] == strategic_cycle.OUTCOME_COMPLETED
+    # Newest first — directions_created on the second cycle is 2.
+    assert last["directions_created"] == 2

@@ -12,11 +12,13 @@ import type { ComputeRpcDiagnostic } from '../api';
 
 const fetchComputeJobs = vi.fn();
 const killComputeJob = vi.fn();
+const analyzeComputeJob = vi.fn();
 const resolveArtifactDownloadUrl = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
   killComputeJob: (...args: unknown[]) => killComputeJob(...args),
+  analyzeComputeJob: (...args: unknown[]) => analyzeComputeJob(...args),
   resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
 }));
 
@@ -41,6 +43,7 @@ function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
     accrued_cost_usd: 1.0,
     final_cost_usd: null,
     result_reference: null,
+    artifact_id: null,
     accelerator_type: null,
     accelerator_count: null,
     task_title: 'compute_experiment: sweep',
@@ -109,6 +112,7 @@ describe('ComputeJobsPanel render + kill', () => {
   afterEach(() => {
     fetchComputeJobs.mockReset();
     killComputeJob.mockReset();
+    analyzeComputeJob.mockReset();
     resolveArtifactDownloadUrl.mockReset();
     vi.restoreAllMocks();
   });
@@ -121,6 +125,33 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(container.textContent).toContain('$2.00 / $4.00');
     // Active job exposes a Kill control.
     expect(await findByText('Kill')).toBeTruthy();
+  });
+
+  test('shows a live-proof indicator when polling_metadata carries live_release_evidence', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        polling_metadata: {
+          live_release_evidence: {
+            release_version_number: 8,
+            promoted_sha: 'abcdef1234567890deadbeef',
+            aggregate_serving_status: 'serving_confirmed',
+          },
+        },
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const chip = await findByTestId('release-evidence-chip');
+    expect(chip.textContent).toContain('Live proof of v8');
+    // Short SHA only — first 8 chars, not the full hash.
+    expect(chip.textContent).toContain('abcdef12');
+    expect(chip.textContent).not.toContain('abcdef1234567890deadbeef');
+  });
+
+  test('shows no live-proof indicator when live_release_evidence is absent', async () => {
+    fetchComputeJobs.mockResolvedValue([makeJob()]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('release-evidence-chip')).toBeNull();
   });
 
   test('calls onNavigateToTask when task title is clicked', async () => {
@@ -145,6 +176,38 @@ describe('ComputeJobsPanel render + kill', () => {
     await waitFor(() => expect(killComputeJob).toHaveBeenCalledWith('job-1'));
     await findByText('Killed by operator');
     expect(queryByText('Kill')).toBeNull();
+  });
+
+  test('run analysis shows upgraded feedback and refreshes the job list', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockResolvedValue({ status: 'upgraded', analysis_mode: 'llm' });
+    const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    await findByText('Analysis upgraded');
+    await waitFor(() => expect(analyzeComputeJob).toHaveBeenCalledWith('job-1'));
+    await waitFor(() => expect(fetchComputeJobs).toHaveBeenCalledTimes(2));
+  });
+
+  test('run analysis surfaces unavailable cause labels', async () => {
+    const terminal = makeJob({ status: 'FAILED', outcome: 'FAILURE', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockResolvedValue({ status: 'analysis_unavailable', reason: 'analysis-disabled' });
+    const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    await findByText('Analysis unavailable: Analysis disabled');
+  });
+
+  test('run analysis surfaces backend errors inline', async () => {
+    const terminal = makeJob({ status: 'FAILED', outcome: 'FAILURE', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockRejectedValue(new Error('analysis endpoint failed: upstream 503'));
+    const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    await findByText('analysis endpoint failed: upstream 503');
   });
 
   test('renders a safe terminal result link', async () => {
@@ -181,6 +244,54 @@ describe('ComputeJobsPanel render + kill', () => {
       'gs://blueprint-agent-artifacts/tasks/task-1/result.json',
     ));
     expect(openSpy).toHaveBeenCalled();
+  });
+
+  test('surfaces COMPUTE_RESULT artifact with a resolvable reference link', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        artifact_id: 'artifact-abc',
+        result_reference: 'https://storage.example.com/jobs/job-1/result.json',
+      }),
+    ]);
+    const { findByText, getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Primary artifact affordance is an openable link.
+    const artifactLink = await findByText('COMPUTE_RESULT artifact');
+    expect(artifactLink.closest('a')).toHaveAttribute(
+      'href',
+      'https://storage.example.com/jobs/job-1/result.json',
+    );
+    // Raw storage URI demoted to secondary technical detail.
+    expect(getByText('Result reference')).toBeInTheDocument();
+  });
+
+  test('surfaces COMPUTE_RESULT artifact even when result_reference is null (non-openable)', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        artifact_id: 'artifact-abc',
+        result_reference: null,
+      }),
+    ]);
+    const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const artifact = await findByText('COMPUTE_RESULT artifact');
+    // Present but not an openable link (no reference to resolve).
+    expect(artifact.closest('a')).toBeNull();
+    expect(artifact.closest('button')).toBeNull();
+    expect(queryByText('Result reference')).toBeNull();
+  });
+
+  test('shows no artifact affordance for jobs without artifact_id', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
+    ]);
+    const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText(/compute_experiment: sweep/i);
+    expect(queryByText('COMPUTE_RESULT artifact')).toBeNull();
   });
 
   test('GPU job shows accelerator label alongside machine type', async () => {
@@ -323,10 +434,26 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByText('compute job already terminal: cannot kill');
   });
 
-  test('renders nothing when there are no jobs', async () => {
+  test('renders an empty compute workbench when there are no jobs', async () => {
     fetchComputeJobs.mockResolvedValue([]);
-    const { container } = render(<ComputeJobsPanel projectId="proj-1" />);
-    await waitFor(() => expect(fetchComputeJobs).toHaveBeenCalled());
-    await waitFor(() => expect(container.textContent).not.toContain('Compute jobs'));
+    const { findByText, queryByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('No compute jobs');
+    expect(queryByRole('button', { name: 'Launch compute experiment' })).toBeNull();
+  });
+
+  test('renders a launch action in the empty compute workbench when provided', async () => {
+    fetchComputeJobs.mockResolvedValue([]);
+    const { findByText, findByRole } = render(<ComputeJobsPanel projectId="proj-1" onLaunchCompute={vi.fn()} />);
+    await findByText('No compute jobs');
+    expect(await findByRole('button', { name: 'Launch compute experiment' })).toBeTruthy();
+  });
+
+  test('launch action calls onLaunchCompute from the empty compute workbench', async () => {
+    const onLaunchCompute = vi.fn();
+    fetchComputeJobs.mockResolvedValue([]);
+    const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" onLaunchCompute={onLaunchCompute} />);
+    const launchButton = await findByRole('button', { name: 'Launch compute experiment' });
+    await act(async () => { launchButton.click(); });
+    expect(onLaunchCompute).toHaveBeenCalledTimes(1);
   });
 });

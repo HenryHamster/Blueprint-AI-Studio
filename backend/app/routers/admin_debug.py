@@ -529,6 +529,25 @@ def _build_problem_model_trim_verdict(payload: dict) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Strategic cycle history helper (shared by autonomy-debug + strategic-debug)
+# ---------------------------------------------------------------------------
+
+
+async def _get_cycle_history_for_debug(
+    session: AsyncSession, project_id: uuid.UUID
+) -> list[dict]:
+    """Return all cycles for a project from the StrategicCycle table in legacy
+    dict shape, newest-first.
+
+    Replaces dead reads of vision._strategic_cycle_history (retired migration 0047).
+    """
+    from app import strategic_cycle as _sc
+
+    rows = await _sc.all_for_project(session, project_id)
+    return [_sc._to_legacy_dict(c) for c in rows]
+
+
+# ---------------------------------------------------------------------------
 # GET /api/admin/projects/{project_id}/autonomy-debug
 # ---------------------------------------------------------------------------
 
@@ -848,8 +867,8 @@ async def get_autonomy_debug(
         },
         "directions": directions_info,
         "next_check_at": next_check_at,
-        "strategic_cycle_history": (project.vision or {}).get(
-            "_strategic_cycle_history", []
+        "strategic_cycle_history": await _get_cycle_history_for_debug(
+            session, project_id
         ),
     }
 
@@ -1020,9 +1039,11 @@ async def get_strategic_debug(
 
     has_purpose = project_has_purpose(project)
 
-    # Recent cycle history (last 3, most recent first)
-    cycle_history = list(vision.get("_strategic_cycle_history") or [])
-    recent_cycles = list(reversed(cycle_history[-3:]))
+    # Recent cycle history (last 3, most recent first) from StrategicCycle table.
+    # vision._strategic_cycle_history was retired in migration 0047.
+    from app import strategic_cycle as _sc
+
+    recent_cycles = await _sc.recent_for_agent_context(session, project_id, limit=3)
     last_cycle = recent_cycles[0] if recent_cycles else None
 
     # Determine phase

@@ -35,6 +35,8 @@ from app.models import (
     DeploymentState,
     ComputeJob,
     ComputeJobStatus,
+    PoolVm,
+    PoolVmState,
 )
 from app.routers.agent_status import _check_daily_cost_ceiling
 from app.services import (
@@ -935,14 +937,14 @@ async def test_gcp_cleanup_handles_timeout_gracefully(gcp_db, mocker):
 
 @pytest.mark.asyncio
 async def test_gcp_cleanup_updates_vm_count_cache(gcp_db, mocker):
-    """When cleanup returns total_gcp_vms, the global VM count cache should be updated."""
+    """When cleanup returns agent_vm_count, the global VM count cache should be updated."""
     project = await _make_project(gcp_db)
     await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-1")
 
     mock_result = MagicMock()
     mock_result.deleted = ["agent-vm-orphan"]
     mock_result.failed = []
-    mock_result.total_gcp_vms = 5
+    mock_result.agent_vm_count = 5
     mocker.patch(
         "app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result)
     )
@@ -968,6 +970,7 @@ async def test_gcp_cleanup_logs_partial_failures(gcp_db, mocker):
     mock_result.deleted = []
     mock_result.failed = ["agent-vm-bad-1", "agent-vm-bad-2"]
     mock_result.total_gcp_vms = 3
+    mock_result.agent_vm_count = 3
     mocker.patch(
         "app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result)
     )
@@ -1057,9 +1060,9 @@ async def cost_db(mocker):
         expire_on_commit=False,
     )
 
-    # Suppress broadcasts
+    # Suppress broadcasts (patched at cost_ceiling where the call actually happens)
     mocker.patch(
-        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+        "app.cost_ceiling.broadcast_to_project", new_callable=AsyncMock
     )
     # Suppress external notification dispatch (patching where defined so ensure_future gets a real coroutine)
     mocker.patch(
@@ -1363,13 +1366,13 @@ async def test_cost_ceiling_alert_when_compute_spend_pushes_over(cost_db, mocker
     cost_db.add(task)
     # Terminal compute-job spend today: $0.60 pushes total over $0.50.
     cost_db.add(_make_terminal_compute_job(project.id, 0.60))
-    # A still-running job must NOT count toward the ceiling.
+    # A still-running job with zero accrued cost must not affect the total.
     running = ComputeJob(
         project_id=project.id,
         backend="local",
         machine_type="e2-standard-2",
         status=ComputeJobStatus.RUNNING,
-        accrued_cost_usd=99.0,
+        accrued_cost_usd=0.0,
         final_cost_usd=None,
         completed_at=None,
     )
@@ -1399,11 +1402,17 @@ async def test_cost_ceiling_alert_when_compute_spend_pushes_over(cost_db, mocker
         await asyncio.sleep(0)
     assert dispatch_mock.call_count >= 1
     payload = dispatch_mock.call_args[0][2]
-    # Additive split keys present; total = VM + compute.
+    # Additive split keys present; total = VM + settled compute + inflight + pool idle.
     assert payload["daily_compute_cost_usd"] == pytest.approx(0.60, abs=0.01)
     assert 0.06 < payload["daily_vm_cost_usd"] < 0.08
+    assert "daily_inflight_compute_cost_usd" in payload
+    assert "daily_pool_idle_cost_usd" in payload
     assert payload["daily_total_usd"] == pytest.approx(
-        payload["daily_vm_cost_usd"] + payload["daily_compute_cost_usd"], abs=0.01
+        payload["daily_vm_cost_usd"]
+        + payload["daily_compute_cost_usd"]
+        + payload["daily_inflight_compute_cost_usd"]
+        + payload["daily_pool_idle_cost_usd"],
+        abs=0.01,
     )
 
 
@@ -1428,6 +1437,228 @@ async def test_cost_ceiling_disabled_ignores_compute_spend(cost_db, mocker):
         .all()
     )
     assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_alert_when_pool_idle_pushes_over(cost_db, mocker):
+    """Pool idle cost alone is enough to breach the ceiling if VM and compute are under."""
+    from app.vm_cost_rates import idle_cost_usd
+
+    project = await _make_project(cost_db)
+
+    dispatch_mock = AsyncMock()
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        dispatch_mock,
+    )
+
+    # VM cost only: 5 minutes on-demand ≈ $0.006 — under a $0.10 ceiling.
+    task = _make_cost_task(project.id, vm_secs=300, is_spot=False)
+    cost_db.add(task)
+
+    # Pool VM that has been IDLE since midnight today (1 hour = 3600s idle).
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    idle_seconds = 3600.0
+    idle_since = now - timedelta(seconds=idle_seconds)
+    # Ensure idle_since is within today (not before midnight).
+    if idle_since < today_start:
+        idle_since = today_start + timedelta(seconds=1)
+        idle_seconds = (now - idle_since).total_seconds()
+
+    pool_vm = PoolVm(
+        project_id=project.id,
+        state=PoolVmState.IDLE,
+        idle_since=idle_since,
+        vm_instance_id="pool-vm-test-idle",
+        machine_type="e2-standard-2",
+    )
+    cost_db.add(pool_vm)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    # idle_cost_usd for idle_seconds (1h ≈ $0.067) must exceed our chosen ceiling.
+    expected_idle = idle_cost_usd(idle_seconds)
+    assert expected_idle > 0.05, f"Expected pool idle cost > $0.05, got {expected_idle}"
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.05}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    await cost_db.flush()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].title == "Daily cost ceiling exceeded"
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert dispatch_mock.call_count >= 1
+    payload = dispatch_mock.call_args[0][2]
+    assert payload["daily_pool_idle_cost_usd"] > 0.0
+    assert payload["daily_total_usd"] == pytest.approx(
+        payload["daily_vm_cost_usd"]
+        + payload["daily_compute_cost_usd"]
+        + payload["daily_inflight_compute_cost_usd"]
+        + payload["daily_pool_idle_cost_usd"],
+        abs=0.01,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_inflight_compute_job_counted(cost_db, mocker):
+    """An active (non-terminal) compute job's accrued cost is included in the daily total."""
+    project = await _make_project(cost_db)
+
+    dispatch_mock = AsyncMock()
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        dispatch_mock,
+    )
+
+    # VM cost only: 5 minutes on-demand ≈ $0.006 — under a $0.50 ceiling.
+    task = _make_cost_task(project.id, vm_secs=300, is_spot=False)
+    cost_db.add(task)
+
+    # In-flight RUNNING compute job with substantial accrued cost — no final_cost_usd yet.
+    running_job = ComputeJob(
+        project_id=project.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.RUNNING,
+        accrued_cost_usd=0.60,
+        final_cost_usd=None,
+        completed_at=None,
+    )
+    cost_db.add(running_job)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.50}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    await cost_db.flush()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].title == "Daily cost ceiling exceeded"
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert dispatch_mock.call_count >= 1
+    payload = dispatch_mock.call_args[0][2]
+    assert payload["daily_inflight_compute_cost_usd"] == pytest.approx(0.60, abs=0.01)
+    assert payload["daily_compute_cost_usd"] == pytest.approx(0.0, abs=0.01)
+    assert payload["daily_total_usd"] == pytest.approx(
+        payload["daily_vm_cost_usd"]
+        + payload["daily_compute_cost_usd"]
+        + payload["daily_inflight_compute_cost_usd"]
+        + payload["daily_pool_idle_cost_usd"],
+        abs=0.01,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_pool_idle_uses_windowed_not_alltime(cost_db, mocker):
+    """Pool idle cost check uses today's window only, not all-time accumulated cost.
+
+    Seeds a PoolVm with large historical idle_cost_banked (simulating weeks of
+    accumulated cost) but no current idle activity (state=LEASED, no idle_since).
+    The daily ceiling is above today's VM spend but well below the historical banked cost.
+
+    With the (buggy) all-time compute_pool_idle_cost():
+      total_idle_cost_usd includes idle_cost_banked → huge total → alert fires (wrong).
+    With the correct _compute_windowed_idle_cost():
+      windowed total excludes pre-today banked cost → no alert (correct).
+    """
+    project = await _make_project(cost_db)
+
+    # VM task: 5 minutes on-demand ≈ $0.006, well under a $1.00 ceiling.
+    task = _make_cost_task(project.id, vm_secs=300, is_spot=False)
+    cost_db.add(task)
+
+    # Pool VM with large historical banked cost but NOT currently idle (LEASED).
+    # idle_cost_banked=$50 represents weeks of past idle accumulation — should
+    # NOT count toward today's daily ceiling check.
+    pool_vm = PoolVm(
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        idle_since=None,
+        idle_cost_banked=50.0,  # large all-time historical banked cost
+        vm_instance_id="pool-vm-historical-banked",
+        machine_type="e2-standard-2",
+    )
+    cost_db.add(pool_vm)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    # Ceiling of $1.00: above today's VM cost (~$0.006) but below historical banked cost ($50).
+    # Correct windowed behavior: no alert (today's pool idle = $0, total ≈ $0.006 < $1.00).
+    # Buggy all-time behavior: alert fires ($50 banked makes total >> $1.00).
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 1.0}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    await cost_db.flush()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0, (
+        "No alert should fire: today's pool idle cost is $0 (VM is LEASED, not IDLE). "
+        "If this fails, the ceiling check is using all-time banked cost instead of windowed cost."
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_includes_running_vm_cost(cost_db, mocker):
+    """An in-flight VM (vm_stopped_at=None) on a larger machine type is estimated to
+    now and included in the daily total. Proves both live-VM inclusion and
+    machine-type-correct pricing: e2-standard-8 2-hour on-demand cost (~$0.536) crosses
+    a $0.20 ceiling that e2-standard-2 2-hour pricing (~$0.134) would miss."""
+    project = await _make_project(cost_db)
+
+    # Background in-flight task: e2-standard-8, running for 2+ hours, still running.
+    # e2-standard-8 on-demand = $0.268/hr → ~2h ≈ $0.536 >> $0.20 ceiling.
+    # e2-standard-2 on-demand = $0.067/hr → ~2h ≈ $0.134 < $0.20 (old code would miss it).
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    running_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=None,
+        vm_spot=False,
+        vm_machine_type="e2-standard-8",
+    )
+    cost_db.add(running_task)
+    await cost_db.commit()
+
+    # Current task (the trigger): minimal cost on its own, just finished.
+    current_task = _make_cost_task(project.id, vm_secs=60, is_spot=False)
+    cost_db.add(current_task)
+    await cost_db.commit()
+    await cost_db.refresh(current_task)
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.20}):
+        await _check_daily_cost_ceiling(current_task, cost_db)
+
+    await cost_db.flush()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, (
+        "Expected alert: e2-standard-8 2-hour in-flight cost should exceed $0.20 ceiling"
+    )
+    assert alerts[0].title == "Daily cost ceiling exceeded"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

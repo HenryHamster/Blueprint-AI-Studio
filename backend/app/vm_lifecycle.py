@@ -493,7 +493,9 @@ def schedule_deferred_backlog_teardown(
 async def _get_actual_gcp_vm_count() -> int:
     """Count actual agent-vm-* instances across all GCP zones.
     Cached for _GCP_VM_CHECK_INTERVAL seconds to avoid API spam.
-    Updated passively by the cleanup service, with active refresh as fallback."""
+    Updated passively by the cleanup service, with active refresh as fallback.
+    Compute-job VMs (compute-job-vm-*) are excluded — they do not consume
+    agent dispatch slots."""
     global _last_gcp_vm_count, _last_gcp_vm_check
 
     now = time.time()
@@ -521,7 +523,7 @@ async def _get_actual_gcp_vm_count() -> int:
         total = 0
         for zr in zone_results:
             if isinstance(zr, list):
-                total += len(zr)
+                total += sum(1 for name, _, _ in zr if name.startswith("agent-vm-"))
         _last_gcp_vm_count = total
         _last_gcp_vm_check = now
         return total

@@ -48,6 +48,7 @@ from app.models import (
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
+    Project,
     ReleaseVersion,
     Task,
     TaskStatus,
@@ -255,6 +256,15 @@ async def create_compute_job(
                 await session.refresh(existing)
             return existing
         raise ValueError("task already has an active compute job")
+    await _check_project_compute_job_concurrency_cap(
+        session,
+        project_id=locked_task.project_id,
+    )
+    await _check_project_spend_ceiling(
+        session,
+        project_id=locked_task.project_id,
+        requested_cap_usd=capped_spend,
+    )
     deadline_at = _utcnow() + timedelta(seconds=capped_deadline)
     # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
     # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
@@ -380,16 +390,29 @@ async def _resolve_live_release_evidence(
                 "live_proof": requirement,
             }
         )
+    project = await session.get(Project, project_id)
     aggregate, artifacts = summarize_release_artifacts(
         version,
         version.deploy_artifacts,
+        project=project,
     )
     required_artifacts = [
         artifact for artifact in artifacts if artifact.get("required")
     ]
-    required_artifacts_confirmed = all(
-        artifact.get("serving_status") == "serving_confirmed"
+    # Skip vacuous (serving_status None) required rows — an absent/legacy
+    # provider row is NA, not pending (mirrors summarize_required_artifact_gap
+    # and the aggregate projection, which exclude None-status evidence). A
+    # genuinely pending row carries a real status ("unconfirmed"/"deploy_failed"),
+    # not None, so it still blocks. Require at least one non-vacuous required
+    # artifact confirmed so a fully un-armed version never passes as "serving".
+    _observed_required = [
+        artifact
         for artifact in required_artifacts
+        if artifact.get("serving_status") is not None
+    ]
+    required_artifacts_confirmed = bool(_observed_required) and all(
+        artifact.get("serving_status") == "serving_confirmed"
+        for artifact in _observed_required
     )
     evidence = {
         "live_proof": requirement,
@@ -418,6 +441,101 @@ async def _resolve_live_release_evidence(
             }
         )
     return evidence
+
+
+async def _check_project_spend_ceiling(
+    session,
+    *,
+    project_id: uuid.UUID,
+    requested_cap_usd: float,
+) -> None:
+    """Raise ComputeLaunchPreconditionFailed when launching would breach the project ceiling.
+
+    Computes total 24h spend as: settled terminal-job costs + in-flight accrued
+    compute costs + agent-VM/LLM task spend (via compute_project_window_spend_usd).
+    If that total plus the requested cap would exceed the configured
+    ``daily_spend_ceiling_usd``, the launch is rejected before any row is written.
+    The check is skipped when no ceiling is configured.
+    """
+    project = await session.get(Project, project_id)
+    ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd") if project else None
+    if not ceiling_usd:
+        return
+    ceiling_usd = float(ceiling_usd)
+    since = _utcnow() - timedelta(hours=24)
+    settled = await get_recent_terminal_compute_spend_usd(
+        session, project_id=project_id, since=since
+    )
+    inflight_result = await session.execute(
+        select(func.coalesce(func.sum(ComputeJob.accrued_cost_usd), 0.0)).where(
+            ComputeJob.project_id == project_id,
+            ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES),
+        )
+    )
+    inflight = float(inflight_result.scalar_one() or 0.0)
+    compute_rolling = settled + inflight
+    # Add agent-VM + LLM spend to get total cross-lane project spend. This helper
+    # covers Task-based costs only and does NOT include ComputeJob spend, so there
+    # is no double-counting with compute_rolling above.
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    task_spend = await compute_project_window_spend_usd(session, project_id)
+    rolling = compute_rolling + task_spend
+    if rolling + requested_cap_usd > ceiling_usd:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "project_spend_ceiling_exceeded",
+                "message": (
+                    f"project rolling 24h total spend ${rolling:.4f} (compute: "
+                    f"${compute_rolling:.4f}, agent VM+LLM: ${task_spend:.4f}) plus "
+                    f"requested cap ${requested_cap_usd:.4f} would exceed configured "
+                    f"ceiling ${ceiling_usd:.4f}"
+                ),
+                "rolling_spend_usd": rolling,
+                "compute_spend_usd": compute_rolling,
+                "task_spend_usd": task_spend,
+                "requested_cap_usd": requested_cap_usd,
+                "ceiling_usd": ceiling_usd,
+            }
+        )
+
+
+async def _check_project_compute_job_concurrency_cap(
+    session,
+    *,
+    project_id: uuid.UUID,
+) -> None:
+    """Raise ComputeLaunchPreconditionFailed when the project is at its compute-job cap.
+
+    Counts active ComputeJob rows for the project and rejects a new launch when
+    the count is at or above the configured cap. The check is skipped when no cap
+    is configured for the project (absent or zero in
+    ``max_concurrent_compute_jobs_by_project``).
+    """
+    from app.runtime_config_state import resolve_project_compute_job_concurrency_cap
+
+    cap = resolve_project_compute_job_concurrency_cap(project_id)
+    if cap is None:
+        return
+    count_result = await session.execute(
+        select(func.count()).where(
+            ComputeJob.project_id == project_id,
+            ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES),
+        )
+    )
+    active_count = int(count_result.scalar_one() or 0)
+    if active_count >= cap:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "compute_job_concurrency_limit_exceeded",
+                "message": (
+                    f"project already has {active_count} active compute job(s); "
+                    f"configured cap is {cap}"
+                ),
+                "active_count": active_count,
+                "cap": cap,
+            }
+        )
 
 
 async def _lock_task_for_compute_job(session, task_id: uuid.UUID | None) -> Task | None:
@@ -780,6 +898,28 @@ async def get_recent_terminal_compute_spend_usd(
     result = await session.execute(
         select(func.coalesce(func.sum(ComputeJob.final_cost_usd), 0.0)).where(
             *conditions
+        )
+    )
+    return float(result.scalar_one() or 0.0)
+
+
+async def get_active_compute_job_accrued_spend_usd(
+    session,
+    *,
+    project_id: uuid.UUID,
+) -> float:
+    """Sum ``accrued_cost_usd`` over active (non-terminal) compute jobs for a project.
+
+    In-flight jobs accumulate real spend before reaching a terminal status and
+    recording ``final_cost_usd``.  Including them closes the gap between
+    money-spent and money-reported in the daily cost ceiling check.  No date
+    filter: a job that started yesterday is still spending today, so its full
+    accrued cost belongs in today's ceiling total.
+    """
+    result = await session.execute(
+        select(func.coalesce(func.sum(ComputeJob.accrued_cost_usd), 0.0)).where(
+            ComputeJob.project_id == project_id,
+            ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES),
         )
     )
     return float(result.scalar_one() or 0.0)

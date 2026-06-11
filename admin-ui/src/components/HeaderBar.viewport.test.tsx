@@ -197,6 +197,10 @@ function makeProps() {
     onUpdateIssueImplementationConfig: noopAsync,
     autoReviewConfig: null,
     onUpdateAutoReviewConfig: noopAsync,
+    resourceEnvelopeData: null,
+    resourceEnvelopeLoading: false,
+    resourceEnvelopeError: null,
+    onUpdateResourceEnvelope: noopAsync,
   };
 }
 

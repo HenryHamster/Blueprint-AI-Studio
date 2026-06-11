@@ -394,6 +394,11 @@ async def get_check_runs(
                             setup_phase_failure = True
                     if run_has_failed_job:
                         failed_run_ids.append(wf_run["id"])
+            else:
+                logger.warning(
+                    f"[CI LOGS] workflow runs fetch for {ref[:8] if ref else ref} returned "
+                    f"{runs_resp.status_code} — job-id resolution unavailable"
+                )
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[GITHUB] Workflow runs pre-fetch failed for {ref}: {exc}")
 
@@ -451,6 +456,12 @@ async def get_check_runs(
                         log_lines.append("\n".join(block))
                         got_logs = True
                         break
+                    else:
+                        logger.warning(
+                            f"[CI LOGS] job logs fetch for {name} returned "
+                            f"{log_response.status_code} — selectors unavailable; "
+                            f"falling back to annotations"
+                        )
                 except Exception:  # noqa: BLE001
                     logger.exception(
                         f"[CI LOGS] Failed to fetch logs for check-run {name}"

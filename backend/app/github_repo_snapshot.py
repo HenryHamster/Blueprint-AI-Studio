@@ -37,6 +37,7 @@ minutes; the pipeline keeps merging.
 
 import asyncio
 import base64
+import fnmatch
 import logging
 import time
 from collections import OrderedDict
@@ -343,6 +344,31 @@ async def path_exists_on_branch(
         return None
     paths, truncated = snapshot
     if path in paths:
+        return True
+    return None if truncated else False
+
+
+async def glob_exists_on_branch(
+    pattern: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> bool | None:
+    """Whether *pattern* matches any file on ``owner/repo@branch``. Tri-state.
+
+    True when the cached branch tree contains at least one matching blob path.
+    False only when the tree is complete and no path matches. None means the
+    snapshot is unavailable or truncated with no visible match, so absence
+    cannot be proven.
+    """
+    snapshot = await _get_snapshot(token, owner, repo, branch, project_id)
+    if snapshot is None:
+        return None
+    paths, truncated = snapshot
+    if fnmatch.filter(list(paths.keys()), pattern):
         return True
     return None if truncated else False
 

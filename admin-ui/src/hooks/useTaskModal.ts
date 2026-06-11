@@ -33,6 +33,7 @@ export interface ComputeExperimentForm {
   successMetric: string;
   successOperator: ComputeSuccessOperator;
   successThreshold: string;
+  requireLiveRelease: boolean;
 }
 
 export function defaultComputeExperimentForm(): ComputeExperimentForm {
@@ -49,6 +50,7 @@ export function defaultComputeExperimentForm(): ComputeExperimentForm {
     successMetric: '',
     successOperator: '>=',
     successThreshold: '',
+    requireLiveRelease: false,
   };
 }
 
@@ -341,17 +343,24 @@ export function useTaskModal(
       ...(hypothesis ? { hypothesis } : {}),
       ...(metric ? { metric } : {}),
       ...(successCriterion ? { success_criterion: successCriterion } : {}),
+      ...(computeExperiment.requireLiveRelease ? { require_live_release: true } : {}),
       ...(newTaskModel ? { model: newTaskModel } : {}),
       ...(newTaskEffort ? { effort: newTaskEffort } : {}),
     };
     try {
-      await createComputeExperiment(body);
+      const response = await createComputeExperiment(body);
       setShowNewTaskModal(false);
       setNewTaskTitle('');
       setNewTaskPrompt('');
       setComputeExperiment(defaultComputeExperimentForm());
       clearDraft();
-      addToast('Compute experiment launched', 'success');
+      if (response.requires_approval) {
+        addToast('Compute experiment held for approval — it will not run until an operator approves it', 'success');
+      } else if (response.is_duplicate) {
+        addToast('Reusing an existing matching compute experiment', 'success');
+      } else {
+        addToast('Compute experiment launched', 'success');
+      }
       fetchTasksRef.current();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';

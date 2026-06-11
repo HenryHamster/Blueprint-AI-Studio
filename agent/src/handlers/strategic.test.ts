@@ -246,6 +246,26 @@ describe('renderDesignDocIndexOverview', () => {
     expect(out).toContain('`systems/ghost`');
     expect(out).toContain('all referenced module file(s) are absent');
   });
+
+  it('renders repo_overview inline bootstrap fields (tech_stack, directory_layout, first_steps)', () => {
+    const out = renderDesignDocIndexOverview({
+      sections: [
+        {
+          key: 'repo_overview',
+          tech_stack: 'TypeScript, Node.js, Vitest',
+          directory_layout: 'agent/ — worker; backend/ — API',
+          first_steps_summary: 'cd agent && npm install && npm test',
+        },
+      ],
+    });
+    expect(out).toContain('`repo_overview`');
+    expect(out).toContain('tech_stack: TypeScript, Node.js, Vitest');
+    expect(out).toContain('directory_layout: agent/ — worker; backend/ — API');
+    expect(out).toContain('first_steps: cd agent && npm install && npm test');
+    // Should appear under Other sections (not systems/capabilities).
+    expect(out).toContain('### Other sections');
+    expect(out).not.toContain('### Systems');
+  });
 });
 
 describe('renderStrategicPromptSuffix', () => {
@@ -338,6 +358,60 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).toContain('```json');
     expect(section).not.toContain('this is the first cycle');
     expect(section).not.toContain('EXISTS but was not shipped in full');
+  });
+});
+
+describe('handleStrategic self-repo prompt framing', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('external_project_enable_self_improvement_does_not_render_self_repo_wording', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'External Project',
+      is_self_repo: false,
+      enable_self_improvement: true,
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-ext-improve', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.isSelfRepo).toBe(false);
+    const block = String(capturedThinkerParams?.selfImprovementBlock);
+    expect(block).toContain('# Project improvement');
+    expect(block).toContain('eligible for agent-proposed improvement work');
+    expect(block).not.toContain('# Self-improvement');
+    expect(block).not.toContain('your own prompts, schemas, tools, and');
+    expect(block).not.toContain('point of self-repo');
+  });
+
+  it('true self-repo preserves self-improvement wording', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      is_self_repo: true,
+      enable_self_improvement: true,
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-self-improve', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.isSelfRepo).toBe(true);
+    const block = String(capturedThinkerParams?.selfImprovementBlock);
+    expect(block).toContain('# Self-improvement');
+    expect(block).toContain('your own prompts, schemas, tools, and');
+    expect(block).toContain('point of self-repo');
+    expect(block).not.toContain('# Project improvement');
+  });
+
+  it('self-repo identity does not enable improvement mode by itself', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      is_self_repo: true,
+      enable_self_improvement: false,
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-self-no-improve', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.isSelfRepo).toBe(true);
+    expect(capturedThinkerParams?.selfImprovementBlock).toBe('');
   });
 });
 

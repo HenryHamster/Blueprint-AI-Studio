@@ -3611,3 +3611,270 @@ async def test_clean_migration_pr_merges(db_session, mocker):
     assert result is True, "A clean chain extension must merge"
     merge_mock.assert_called_once()
     assert task.status == TaskStatus.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# Rollup-orig ancestry gate before stamping the shipped badge
+# (verify_rollup_merge_landed integrated into the original-merge-success path)
+# ---------------------------------------------------------------------------
+
+
+def _patch_ancestry_gate_deps(mocker, *, is_ancestor, merge_commit_sha="deadbeefcafe1234"):
+    """Patch the GitHub seams the orig ancestry gate consults.
+
+    The gate resolves project GitHub creds, fetches the merged PR for its
+    ``merge_commit_sha``, then calls ``is_ancestor_of``. Returns the
+    ``is_ancestor_of`` mock so callers can assert it ran.
+    """
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "merge_commit_sha": merge_commit_sha},
+    )
+    return mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=is_ancestor,
+    )
+
+
+async def _run_orig_merge_with_gate(db_session, mocker, *, is_ancestor):
+    """Drive the merge-success path for a rollup-orig with the ancestry gate
+    armed to return ``is_ancestor``. Returns the refreshed orig task plus its
+    alerts."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+    ancestry_mock = _patch_ancestry_gate_deps(mocker, is_ancestor=is_ancestor)
+
+    project = Project(name="Orig ancestry gate", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Original create task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        context={},
+        vm_instance_id="agent-vm-orig-gate",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+    assert result is True
+
+    await db_session.refresh(orig_task)
+    alerts = (
+        (await db_session.execute(_select(Alert).where(Alert.task_id == orig_task.id)))
+        .scalars()
+        .all()
+    )
+    return orig_task, alerts, ancestry_mock
+
+
+@pytest.mark.asyncio
+async def test_orig_not_stamped_when_merge_commit_not_ancestor(db_session, mocker):
+    """is_ancestor_of -> False: the rollup merge commit never reached the
+    integration branch, so pr_merged/shipped must NOT be stamped on the orig; a
+    durable stranded marker is recorded and an operator alert fires."""
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+
+    # Let _maybe_create_failure_alert actually create the alert; silence its
+    # broadcast / external-notification side effects.
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    orig_task, alerts, ancestry_mock = await _run_orig_merge_with_gate(
+        db_session, mocker, is_ancestor=False
+    )
+
+    ancestry_mock.assert_awaited()
+    ctx = orig_task.context or {}
+    assert ctx.get("pr_merged") is None, (
+        "a non-ancestor merge commit must NOT stamp the shipped badge"
+    )
+    assert ctx.get("landed_on_integration") is False
+    assert STRANDED_LANDING_REASON_KEY in ctx
+    assert len(alerts) == 1, "a stranded rollup landing must raise one operator alert"
+
+
+@pytest.mark.asyncio
+async def test_orig_indeterminate_ancestry_preserves_flag_trust(db_session, mocker):
+    """is_ancestor_of -> None: a transient/indeterminate ancestry result must
+    PRESERVE the current flag-trust stamping (pr_merged=True) and NOT strand or
+    alert, so a GitHub outage never blocks rollup completion."""
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    orig_task, alerts, ancestry_mock = await _run_orig_merge_with_gate(
+        db_session, mocker, is_ancestor=None
+    )
+
+    ancestry_mock.assert_awaited()
+    ctx = orig_task.context or {}
+    assert ctx.get("pr_merged") is True, (
+        "indeterminate ancestry must preserve flag-trust stamping"
+    )
+    assert STRANDED_LANDING_REASON_KEY not in ctx
+    assert alerts == []
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_orig_positive_ancestry_stamps_as_before(db_session, mocker):
+    """is_ancestor_of -> True: a confirmed integration landing stamps pr_merged
+    exactly as before the gate existed, with no stranded marker or alert."""
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    orig_task, alerts, ancestry_mock = await _run_orig_merge_with_gate(
+        db_session, mocker, is_ancestor=True
+    )
+
+    ancestry_mock.assert_awaited()
+    ctx = orig_task.context or {}
+    assert ctx.get("pr_merged") is True
+    assert ctx.get("landed_on_integration") is True
+    assert STRANDED_LANDING_REASON_KEY not in ctx
+    assert alerts == []
+    alert_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Guard: ci_errors must never produce an empty code block in the PR comment
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_comment_never_has_empty_code_block(db_session, mocker):
+    """Regression for CI poll path posting empty ``` code blocks.
+
+    Before the fix, the orchestrator hardcoded failed_logs='' in the ci_result
+    for the red path, which caused handle_ci_completion to post:
+        **Blueprint CI**: Checks failed.
+
+        ```
+
+        ```
+
+    Fix agents had no failing-test selectors so they pushed blind guesses and
+    burned the review-fix iteration cap (incident 2026-06-10, PRs #9308/#9353).
+
+    The guard in handle_ci_completion must substitute failing check names (or a
+    fallback message) whenever failed_logs is blank, ensuring the code block is
+    never empty.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    comment_mock = mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="CI failure comment fallback", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cases = [
+        (
+            {
+                "failed_logs": "",
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "ci-build", "conclusion": "failure"}],
+            },
+            "CI checks failed: ci-build",
+        ),
+        (
+            {
+                "failed_logs": None,
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [],
+            },
+            "no detail available",
+        ),
+        (
+            {
+                "failed_logs": "   ",
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [],
+            },
+            "no detail available",
+        ),
+        (
+            {
+                "failed_logs": "",
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {"name": "backend", "conclusion": "failure"},
+                    {"name": "frontend", "conclusion": "failure"},
+                    {"name": "lint", "conclusion": "success"},  # non-failure excluded
+                ],
+            },
+            "CI checks failed: backend, frontend",
+        ),
+    ]
+    for index, (ci_result, expected_substring) in enumerate(cases, start=1):
+        task = _make_task(db_session, project, pr_number=8000 + index)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await handle_ci_completion(
+            task=task,
+            ci_result=ci_result,
+            gh_token="fake-token",
+            owner="owner",
+            repo="repo",
+            session=db_session,
+            source="poll",
+        )
+
+        comment_body = comment_mock.call_args_list[-1].args[4]
+        assert "```\n\n```" not in comment_body, (
+            f"Empty code block for ci_result={ci_result!r}: {comment_body!r}"
+        )
+        assert expected_substring in comment_body, (
+            f"Expected {expected_substring!r} in comment for ci_result={ci_result!r}: {comment_body!r}"
+        )

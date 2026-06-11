@@ -97,6 +97,40 @@ def apply_operator_build_config_overrides(
     ):
         if _cap_key in existing:
             detected[_cap_key] = existing[_cap_key]
+    # Per-project resource envelope (concurrent-VM caps and spend ceilings) is
+    # operator-owned and never emitted by repo detection; carry it forward so
+    # re-detect does not silently drop an operator-set envelope.
+    if "resource_envelope" in existing:
+        detected["resource_envelope"] = existing["resource_envelope"]
+
+    # Merge per-directory agent-confirmed command fields back onto re-detected
+    # directories.  These are written by the agent write-back endpoint and are
+    # NOT derivable from repo contents, so they must survive re-detection.
+    _CONFIRMED_DIR_KEYS = (
+        "confirmed_lint_cmd",
+        "confirmed_test_cmd",
+        "confirmed_build_cmd",
+        "confirmed_install_cmd",
+        "commands_confirmed_at",
+        "confirming_task_id",
+    )
+    existing_dirs = existing.get("directories") or []
+    existing_by_path: Dict[str, Dict[str, Any]] = {}
+    for _d in existing_dirs:
+        if isinstance(_d, dict):
+            _norm = _normalize_dir_path(_d.get("path"))
+            existing_by_path[_norm] = _d
+    if existing_by_path:
+        detected_dirs = detected.get("directories") or []
+        for _entry in detected_dirs:
+            if not isinstance(_entry, dict):
+                continue
+            _norm = _normalize_dir_path(_entry.get("path"))
+            _ex = existing_by_path.get(_norm)
+            if _ex:
+                for _k in _CONFIRMED_DIR_KEYS:
+                    if _k in _ex and _ex[_k] is not None:
+                        _entry[_k] = _ex[_k]
 
     return detected
 
@@ -198,6 +232,136 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
     except Exception:  # noqa: BLE001 — best-effort, must never break landing
         logger.warning(
             "[BUILD_CONFIG] Auto-refresh of empty build_config failed for "
+            "project %s; leaving config unchanged",
+            getattr(project, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 — keep the caller's session usable
+            pass
+        return False
+
+
+_MAX_DISCOVERED_ENTRIES = 50
+_MAX_CMD_LENGTH = 500
+
+
+async def persist_discovered_build_commands(
+    project, session, discovered_directories: List[Dict[str, Any]]
+) -> bool:
+    """Persist agent-discovered build commands into ``build_config`` using FILL-ONLY semantics.
+
+    When an agent VM discovers runnable test/lint/build/install commands during a task
+    run (full repo clone, real test-runner detection), this helper folds those
+    commands back into ``project.build_config.directories`` so future runs benefit
+    from the agent's first-hand knowledge. It is the complement of
+    :func:`persist_recovered_test_command` and generalises to all four command
+    fields (lint_cmd, build_cmd, test_cmd, install_cmd).
+
+    Merge semantics:
+
+    - FILL-ONLY: only write a field when the stored entry does NOT already have a
+      truthy value for it. An existing non-empty command is NEVER overwritten.
+    - JUNK GUARDS: only entries flagged with ``executed_successfully=True`` are
+      persisted; per-command strings are truncated to ``_MAX_CMD_LENGTH``; at most
+      ``_MAX_DISCOVERED_ENTRIES`` entries are accepted; if ``build_config.directories``
+      is already non-empty the report is ignored entirely (this path fills missing
+      detection, not configured repos).
+    - Clears ``detection_incomplete`` when at least one real command is persisted.
+    - Validates the merged dict against BuildConfig before persisting; on
+      ValidationError falls back to storing the raw dict (mirrors the existing
+      raw-store fallback in :func:`maybe_refresh_empty_build_config`).
+    - BEST-EFFORT: never raises into the caller; logs, rolls back the session on
+      failure, and returns a bool indicating whether a change was persisted.
+    """
+    try:
+        if not discovered_directories:
+            return False
+
+        from pydantic import ValidationError
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.schemas import BuildConfig as BuildConfigSchema
+
+        existing = dict(project.build_config or {})
+        directories = [dict(d) for d in (existing.get("directories") or [])]
+
+        # JUNK GUARD: ignore the report entirely when build_config already has
+        # populated directories — this path is only for filling incomplete detection.
+        if directories:
+            return False
+
+        index_by_path = {
+            _normalize_dir_path(d.get("path")): i for i, d in enumerate(directories)
+        }
+
+        _CMD_FIELDS = ("lint_cmd", "build_cmd", "test_cmd", "install_cmd")
+        changed = False
+
+        for raw in discovered_directories[:_MAX_DISCOVERED_ENTRIES]:
+            if not isinstance(raw, dict):
+                continue
+            # JUNK GUARD: only persist entries with explicit execution evidence.
+            if not raw.get("executed_successfully"):
+                continue
+
+            norm = _normalize_dir_path(raw.get("path"))
+            rec_type = raw.get("type")
+
+            if norm in index_by_path:
+                entry = directories[index_by_path[norm]]
+                # FILL-ONLY for type
+                if rec_type and not entry.get("type"):
+                    entry["type"] = rec_type
+                    changed = True
+                # FILL-ONLY for each command field
+                for field in _CMD_FIELDS:
+                    raw_val = str(raw.get(field) or "").strip()
+                    if raw_val and not entry.get(field):
+                        entry[field] = raw_val[:_MAX_CMD_LENGTH]
+                        changed = True
+            else:
+                new_entry: Dict[str, Any] = {"path": norm}
+                if rec_type:
+                    new_entry["type"] = rec_type
+                for field in _CMD_FIELDS:
+                    raw_val = str(raw.get(field) or "").strip()
+                    if raw_val:
+                        new_entry[field] = raw_val[:_MAX_CMD_LENGTH]
+                has_any_cmd = any(new_entry.get(f) for f in _CMD_FIELDS)
+                if has_any_cmd:
+                    directories.append(new_entry)
+                    index_by_path[norm] = len(directories) - 1
+                    changed = True
+
+        if not changed:
+            return False
+
+        existing["directories"] = directories
+        # Clear detection_incomplete so the auto-refresh path stops re-running.
+        existing.pop("detection_incomplete", None)
+        existing["detection_incomplete"] = False
+
+        try:
+            validated = BuildConfigSchema(**existing)
+            project.build_config = validated.model_dump(exclude_none=True)
+        except ValidationError:
+            # A discovered entry produced a shape the schema rejects — store raw
+            # so the commands still take effect and the operator can fix in the UI.
+            project.build_config = existing
+        flag_modified(project, "build_config")
+        await session.commit()
+        logger.info(
+            "[BUILD_CONFIG] Persisted agent-discovered build commands for "
+            "project %s: %s dirs filled",
+            getattr(project, "id", None),
+            len(directories),
+        )
+        return True
+    except Exception:  # noqa: BLE001 — best-effort, must never fail the agent run
+        logger.warning(
+            "[BUILD_CONFIG] Persisting agent-discovered build commands failed for "
             "project %s; leaving config unchanged",
             getattr(project, "id", None),
             exc_info=True,

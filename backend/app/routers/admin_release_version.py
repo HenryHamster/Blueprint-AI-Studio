@@ -1,5 +1,6 @@
 """Release version lifecycle endpoints."""
 
+import asyncio
 import uuid
 from typing import Any, Dict, Optional
 
@@ -12,6 +13,7 @@ from sqlmodel import select
 from app.database import get_session
 from app.models import (
     ReleaseVersion,
+    Project,
     StrategicCycle,
     QualificationVerdict,
 )
@@ -24,6 +26,7 @@ from app.shared_state import (
 )
 from app.release_artifacts import summarize_release_artifacts
 from app import release_version as _release_version
+from app import compute as _compute
 
 router = APIRouter()
 
@@ -179,6 +182,119 @@ def _serialize_version_history_entry(version: ReleaseVersion) -> dict[str, Any]:
             if version.status == "abandoned"
             else None
         ),
+    }
+
+
+async def _best_effort_branch_sha(
+    project: Project | None,
+    branch: str | None,
+) -> str | None:
+    if not project or not branch or not project.github_owner or not project.github_repo:
+        return None
+    try:
+        from app.github import get_repo_installation_token  # noqa: PLC0415
+        from app.github_refs import get_branch_sha  # noqa: PLC0415
+
+        token = await get_repo_installation_token(
+            project.github_owner,
+            project.github_repo,
+        )
+        if not token:
+            return None
+        return await get_branch_sha(
+            token,
+            project.github_owner,
+            project.github_repo,
+            branch,
+            project_id=str(project.id),
+        )
+    except Exception:
+        return None
+
+
+@router.get("/projects/{project_id}/agent-serving-shas")
+async def get_agent_serving_shas(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return observed agent-image source SHAs and release drift context.
+
+    Read-only operator provenance: combines durable warm-pool heartbeat rows
+    with in-memory task-VM heartbeat caches, plus best-effort current image and
+    branch metadata. Missing external data degrades to ``null`` fields.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+
+    open_row = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    served_row = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.served_sha.isnot(None),
+                )
+                .order_by(ReleaseVersion.served_at.desc().nullslast())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    from app.branch_resolution import (  # noqa: PLC0415
+        get_project_integration_branch,
+        get_project_promotion_target,
+    )
+
+    integration_branch = get_project_integration_branch(project)
+    promotion_target = get_project_promotion_target(project)
+    integration_head_sha, promotion_head_sha, current_image = await asyncio.gather(
+        _best_effort_branch_sha(project, integration_branch),
+        _best_effort_branch_sha(project, promotion_target),
+        asyncio.to_thread(_compute.get_current_agent_image),
+    )
+    fleet = await _compute.agent_fleet_source_sha_snapshot(session, project_id)
+
+    active_candidate_sha = None
+    if open_row is not None and isinstance(open_row.last_qualification, dict):
+        active_candidate_sha = open_row.last_qualification.get("candidate_sha")
+
+    backend_served_sha = served_row.served_sha if served_row is not None else None
+    current_image_sha = current_image.get("source_git_sha") if current_image else None
+    for bucket in fleet["buckets"]:
+        sha = bucket.get("source_sha")
+        bucket["matches_backend_served"] = bool(sha and sha == backend_served_sha)
+        bucket["matches_active_candidate"] = bool(sha and sha == active_candidate_sha)
+        bucket["matches_integration_head"] = bool(sha and sha == integration_head_sha)
+        bucket["matches_current_image"] = bool(sha and sha == current_image_sha)
+
+    return {
+        "fleet": fleet,
+        "current_image": current_image,
+        "backend_served_sha": backend_served_sha,
+        "active_candidate_sha": active_candidate_sha,
+        "integration_branch": integration_branch,
+        "integration_head_sha": integration_head_sha,
+        "promotion_target": promotion_target,
+        "promotion_head_sha": promotion_head_sha,
     }
 
 

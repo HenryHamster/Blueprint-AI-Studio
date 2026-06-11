@@ -26,6 +26,7 @@ from fastapi import HTTPException
 from app.task_completion import (
     _parse_plan_output,
     _extract_json_array,
+    _extract_last_json_array,
     _inject_build_on_deps,
     _inject_file_overlap_deps,
     _log_file_overlaps,
@@ -283,6 +284,52 @@ class TestExtractJsonArray:
         """An empty array [] doesn't contain the required key — returns None."""
         result = _extract_json_array("[]", "severity")
         assert result is None
+
+
+# ── _extract_last_json_array ─────────────────────────────────────────────────
+
+
+class TestExtractLastJsonArray:
+    def test_single_array_returns_it(self):
+        text = json.dumps([{"hash": "abc", "verdict": "pass"}])
+        result = _extract_last_json_array(text, "hash", "verdict")
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed[0]["hash"] == "abc"
+
+    def test_two_arrays_returns_last(self):
+        first = json.dumps([{"hash": "template", "verdict": "pass | fail"}])
+        second = json.dumps([{"hash": "real_hash", "verdict": "fail"}])
+        result = _extract_last_json_array(first + "\n\n" + second, "hash", "verdict")
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed[0]["hash"] == "real_hash"
+
+    def test_only_first_matches_required_keys(self):
+        """When only the first array has the required keys, return it (only match)."""
+        first = json.dumps([{"hash": "abc", "verdict": "pass"}])
+        second = json.dumps([{"unrelated": "data"}])
+        result = _extract_last_json_array(first + " " + second, "hash", "verdict")
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed[0]["hash"] == "abc"
+
+    def test_returns_none_when_required_key_absent(self):
+        text = json.dumps([{"title": "no hash key here"}])
+        result = _extract_last_json_array(text, "hash", "verdict")
+        assert result is None
+
+    def test_three_arrays_returns_third(self):
+        a1 = json.dumps([{"hash": "h1", "verdict": "pass"}])
+        a2 = json.dumps([{"hash": "h2", "verdict": "fail"}])
+        a3 = json.dumps([{"hash": "h3", "verdict": "pass"}])
+        result = _extract_last_json_array(a1 + " " + a2 + " " + a3, "hash", "verdict")
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed[0]["hash"] == "h3"
+
+    def test_empty_input_returns_none(self):
+        assert _extract_last_json_array("", "hash") is None
 
 
 # ── _inject_file_overlap_deps ────────────────────────────────────────────────
@@ -3045,6 +3092,7 @@ class TestSafeguardMergeGateChallenge:
         self, db_session
     ):
         """A high finding rejected by the challenge releases the merge gate."""
+        import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
         from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
 
@@ -3072,6 +3120,7 @@ class TestSafeguardMergeGateChallenge:
                 "line_number": 7,
             }
         ]
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
         await _maybe_release_safeguard_gate(safeguard, findings, db_session)
 
         await db_session.refresh(orig)
@@ -3119,10 +3168,11 @@ class TestSafeguardMergeGateChallenge:
         )
 
     @pytest.mark.asyncio
-    async def test_safeguard_gate_maintained_when_flag_disabled(
+    async def test_safeguard_gate_maintained_when_mode_off(
         self, db_session
     ):
-        """With safeguard_challenge_enabled=False, gate is maintained unconditionally."""
+        """With safeguard_challenge_gate_mode='off', gate is maintained unconditionally."""
+        import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
 
         orig, safeguard = await self._make_safeguard_pair(db_session)
@@ -3138,12 +3188,13 @@ class TestSafeguardMergeGateChallenge:
             }
         ]
 
-        # Flag OFF (default) — no challenge spawned, gate maintained.
+        # Mode OFF (default) — no challenge spawned, gate maintained.
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "off"
         await _maybe_release_safeguard_gate(safeguard, findings, db_session)
 
         await db_session.refresh(orig)
         assert orig.requires_approval is True, (
-            "Gate should stay closed when safeguard_challenge_enabled is False"
+            "Gate should stay closed when safeguard_challenge_gate_mode is 'off'"
         )
 
     @pytest.mark.asyncio
@@ -3151,6 +3202,7 @@ class TestSafeguardMergeGateChallenge:
         self, db_session
     ):
         """A finding downgraded below critical/high by the challenge releases the gate."""
+        import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
         from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
 
@@ -3178,6 +3230,7 @@ class TestSafeguardMergeGateChallenge:
             }
         ]
 
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
         await _maybe_release_safeguard_gate(safeguard, findings, db_session)
 
         await db_session.refresh(orig)
@@ -3186,11 +3239,11 @@ class TestSafeguardMergeGateChallenge:
         )
 
     @pytest.mark.asyncio
-    async def test_maybe_release_safeguard_gate_spawns_challenge_when_enabled(
+    async def test_maybe_release_safeguard_gate_spawns_challenge_when_enforce(
         self, db_session
     ):
-        """When safeguard_challenge_enabled=True and no verdict exists, a challenge
-        task is created, the safeguard is parked EVALUATING with
+        """When safeguard_challenge_gate_mode='enforce' and no verdict exists, a
+        challenge task is created, the safeguard is parked EVALUATING with
         awaiting_safeguard_challenge set, and the gate remains held."""
         import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
@@ -3209,7 +3262,7 @@ class TestSafeguardMergeGateChallenge:
             }
         ]
 
-        shared_state.runtime_config["safeguard_challenge_enabled"] = True
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
         await _maybe_release_safeguard_gate(safeguard, findings, db_session)
 
         await db_session.refresh(orig)
@@ -3238,6 +3291,170 @@ class TestSafeguardMergeGateChallenge:
             if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY) == str(safeguard.id)
         ]
         assert challenge_tasks, "A challenge task pointing to the safeguard must have been created"
+
+    @pytest.mark.asyncio
+    async def test_safeguard_observe_mode_spawns_challenge_but_maintains_gate(
+        self, db_session
+    ):
+        """In observe mode, a shadow challenge is spawned for a critical/high finding
+        but the gate is NOT released (requires_approval stays True)."""
+        import app.shared_state as shared_state
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+        from sqlmodel import select
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+        findings = [
+            {
+                "severity": "critical",
+                "title": "SQL injection",
+                "description": "Raw query in handler.",
+                "fix_prompt": "Parameterize query.",
+                "file_path": "app/db.py",
+                "line_number": 42,
+            }
+        ]
+
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "observe"
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        await db_session.refresh(safeguard)
+
+        # Gate must NOT be released in observe mode.
+        assert orig.requires_approval is True, (
+            "Gate must stay closed in observe mode even when shadow challenge is spawned"
+        )
+        # Safeguard is parked EVALUATING awaiting shadow challenge.
+        assert safeguard.status == TaskStatus.EVALUATING, (
+            "Safeguard should be parked EVALUATING while shadow challenge is in flight"
+        )
+        # awaiting_safeguard_challenge is set.
+        assert (safeguard.context or {}).get("awaiting_safeguard_challenge"), (
+            "awaiting_safeguard_challenge must be set after shadow challenge spawn"
+        )
+        # A challenge task with SAFEGUARD_CHALLENGE_SOURCE_KEY must have been created.
+        all_tasks = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == safeguard.project_id)
+            )
+        ).scalars().all()
+        challenge_tasks = [
+            t for t in all_tasks
+            if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY) == str(safeguard.id)
+        ]
+        assert challenge_tasks, "A shadow challenge task must have been created in observe mode"
+
+    @pytest.mark.asyncio
+    async def test_safeguard_observe_mode_records_shadow_verdict_on_reentry(
+        self, db_session
+    ):
+        """In observe mode, when re-entered with a challenge verdict already present,
+        the verdict is copied to safeguard_observe_verdict, SAFEGUARD_CHALLENGE_VERDICT_KEY
+        is cleared, and the gate stays held."""
+        import app.shared_state as shared_state
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import (
+            SAFEGUARD_CHALLENGE_VERDICT_KEY,
+            SAFEGUARD_OBSERVE_VERDICT_KEY,
+        )
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+        findings = [
+            {
+                "severity": "high",
+                "title": "Missing CSRF protection",
+                "description": "Form handler missing CSRF token.",
+                "fix_prompt": "Add CSRF middleware.",
+                "file_path": "app/routers/admin.py",
+                "line_number": 10,
+            }
+        ]
+        # Pre-stamp the binding verdict key — simulates the challenge having returned.
+        safeguard.context = {
+            **(safeguard.context or {}),
+            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
+                "outcome": "rejected",
+                "reasoning": "the cited route is internal-only, not user-facing",
+                "challenge_task_id": str(_uuid_mod.uuid4()),
+            },
+        }
+        db_session.add(safeguard)
+        await db_session.commit()
+
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "observe"
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        await db_session.refresh(safeguard)
+
+        # Gate must NOT be released even though the shadow verdict is "rejected".
+        assert orig.requires_approval is True, (
+            "Gate must stay closed in observe mode regardless of shadow verdict outcome"
+        )
+        # Shadow verdict is recorded under SAFEGUARD_OBSERVE_VERDICT_KEY.
+        observe_verdict = (safeguard.context or {}).get(SAFEGUARD_OBSERVE_VERDICT_KEY)
+        assert observe_verdict is not None, (
+            "safeguard_observe_verdict must be recorded after shadow challenge resolves"
+        )
+        assert observe_verdict.get("outcome") == "rejected", (
+            "safeguard_observe_verdict outcome must match the original challenge outcome"
+        )
+        # Binding key is cleared so a later upgrade to enforce does not replay a stale verdict.
+        assert SAFEGUARD_CHALLENGE_VERDICT_KEY not in (safeguard.context or {}), (
+            "SAFEGUARD_CHALLENGE_VERDICT_KEY must be cleared after shadow recording"
+        )
+
+    @pytest.mark.asyncio
+    async def test_safeguard_observe_mode_shadow_confirmed_also_maintains_gate(
+        self, db_session
+    ):
+        """In observe mode, even a 'confirmed' shadow verdict keeps the gate held and
+        records the shadow outcome."""
+        import app.shared_state as shared_state
+        from app.task_completion import _maybe_release_safeguard_gate
+        from app.task_evaluators import (
+            SAFEGUARD_CHALLENGE_VERDICT_KEY,
+            SAFEGUARD_OBSERVE_VERDICT_KEY,
+        )
+
+        orig, safeguard = await self._make_safeguard_pair(db_session)
+        findings = [
+            {
+                "severity": "critical",
+                "title": "RCE via deserialization",
+                "description": "Unsafe pickle load.",
+                "fix_prompt": "Replace with json.loads.",
+                "file_path": "app/utils.py",
+                "line_number": 5,
+            }
+        ]
+        safeguard.context = {
+            **(safeguard.context or {}),
+            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
+                "outcome": "confirmed",
+                "reasoning": "vulnerability is real and exploitable",
+                "challenge_task_id": str(_uuid_mod.uuid4()),
+            },
+        }
+        db_session.add(safeguard)
+        await db_session.commit()
+
+        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "observe"
+        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+        await db_session.refresh(orig)
+        await db_session.refresh(safeguard)
+
+        assert orig.requires_approval is True, (
+            "Gate must stay closed in observe mode for confirmed findings too"
+        )
+        observe_verdict = (safeguard.context or {}).get(SAFEGUARD_OBSERVE_VERDICT_KEY)
+        assert observe_verdict is not None, "Shadow verdict must be recorded"
+        assert observe_verdict.get("outcome") == "confirmed"
+        assert SAFEGUARD_CHALLENGE_VERDICT_KEY not in (safeguard.context or {}), (
+            "SAFEGUARD_CHALLENGE_VERDICT_KEY must be cleared after shadow recording"
+        )
 
     @pytest.mark.asyncio
     async def test_spawn_safeguard_challenge_returns_none_when_verdict_exists(
@@ -3393,3 +3610,214 @@ def test_reconcile_revised_falls_back_to_challenge_issues_when_no_overlap():
     rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
     assert rec["state"] == "challenged_revised"
     assert rec["surviving_issues"] == chal_issues
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Security audit completion handler — idempotency under replay
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+_SECURITY_AUDIT_FINDINGS_JSON = json.dumps([
+    {
+        "severity": "critical",
+        "title": "SQL Injection in login endpoint",
+        "description": "User input is interpolated directly into SQL queries.",
+        "fix_prompt": "Parameterize all SQL queries in backend/app/routers/auth.py.",
+        "file_path": "backend/app/routers/auth.py",
+        "line_number": 42,
+    },
+    {
+        "severity": "high",
+        "title": "Missing auth check on admin endpoint",
+        "description": "The /admin/reset endpoint has no @require_role decorator.",
+        "fix_prompt": "Add @require_role decorator to the reset endpoint.",
+        "file_path": "backend/app/routers/admin.py",
+        "line_number": 87,
+    },
+])
+
+
+class TestHandleSecurityAuditCompletion:
+    """Tests for _handle_security_audit_completion focusing on idempotency."""
+
+    async def _run(self, db_session, mocker, task, logs=None):
+        from app.task_completion import _handle_security_audit_completion
+
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_open_pull_requests",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        mocker.patch("app.task_completion._runtime_config", {})
+        mocker.patch(
+            "app.task_completion._maybe_release_safeguard_gate",
+            new_callable=AsyncMock,
+        )
+        if logs is None:
+            logs = _SECURITY_AUDIT_FINDINGS_JSON
+        await _handle_security_audit_completion(task, logs, db_session)
+
+    @pytest.mark.asyncio
+    async def test_security_audit_completion_replay_spawns_no_duplicate_children(
+        self, db_session, mocker
+    ):
+        """Replaying _handle_security_audit_completion when children already exist
+        must not spawn duplicates — the already-spawned guard must fire."""
+        from sqlmodel import select as sqlmodel_select
+        from app.models import Task as TaskModel
+
+        project = make_project(name="SecurityAuditIdempotencyProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        audit_task = make_task(
+            project_id=project.id,
+            title="security_audit: main",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "security_audit", "prompt": "audit", "base_branch": "main"}],
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        # Simulate prior attempt: pre-commit children with the security_audit_task_id
+        # context key (as if the first attempt committed children but crashed before
+        # flipping the parent to EVALUATING).
+        prior_child = make_task(
+            project_id=project.id,
+            title="[CRITICAL] SQL Injection fix",
+            status=TaskStatus.QUEUED,
+            parent_task_id=audit_task.id,
+            context={"security_audit_task_id": str(audit_task.id), "finding_index": 0},
+            payloads=[{"type": "create", "prompt": "fix sql injection", "base_branch": "main"}],
+        )
+        db_session.add(prior_child)
+        await db_session.commit()
+        await db_session.refresh(prior_child)
+
+        # Invoke the handler a second time (replay)
+        await self._run(db_session, mocker, audit_task)
+
+        # Exactly one child should exist — the pre-existing one; no new ones spawned
+        children = (
+            await db_session.execute(
+                sqlmodel_select(TaskModel).where(TaskModel.parent_task_id == audit_task.id)
+            )
+        ).scalars().all()
+        assert len(children) == 1, (
+            f"Expected 1 child (pre-existing), got {len(children)} — duplicate children spawned on replay"
+        )
+
+        # Parent must be EVALUATING after the replay completes remaining effects
+        await db_session.refresh(audit_task)
+        assert audit_task.status == TaskStatus.EVALUATING, (
+            f"Expected parent EVALUATING after replay, got {audit_task.status}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_security_audit_children_and_evaluating_committed_atomically(
+        self, db_session, mocker
+    ):
+        """Children and parent EVALUATING flip must land in a single commit so a crash
+        between commits cannot leave COMPLETED parent with committed children."""
+        from sqlmodel import select as sqlmodel_select
+        from app.models import Task as TaskModel
+
+        project = make_project(name="SecurityAuditAtomicCommitProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        audit_task = make_task(
+            project_id=project.id,
+            title="security_audit: atomic",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "security_audit", "prompt": "audit", "base_branch": "main"}],
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        commit_count = 0
+        original_commit = db_session.commit
+
+        async def counting_commit():
+            nonlocal commit_count
+            commit_count += 1
+            await original_commit()
+
+        mocker.patch.object(db_session, "commit", side_effect=counting_commit)
+
+        await self._run(db_session, mocker, audit_task)
+
+        await db_session.refresh(audit_task)
+        children = (
+            await db_session.execute(
+                sqlmodel_select(TaskModel).where(TaskModel.parent_task_id == audit_task.id)
+            )
+        ).scalars().all()
+
+        # When children exist, parent must be EVALUATING — proved by one commit only
+        # in the spawn+flip path (the plan_output save at top + one final commit)
+        assert audit_task.status == TaskStatus.EVALUATING
+        assert len(children) == 2  # 2 actionable findings (critical + high)
+        # The critical constraint: at most 2 commits total (plan_output save + spawn+flip)
+        # NOT 3 separate commits (children, history, parent flip separately)
+        assert commit_count <= 2, (
+            f"Expected ≤2 commits (plan_output + atomic spawn+flip), got {commit_count}. "
+            "A COMPLETED parent with committed children is a race window for duplicate spawns."
+        )
+
+    @pytest.mark.asyncio
+    async def test_security_audit_no_children_when_no_actionable_findings(
+        self, db_session, mocker
+    ):
+        """When findings contain no critical/high items, no children are spawned and
+        the parent is marked COMPLETED directly (not EVALUATING)."""
+        from sqlmodel import select as sqlmodel_select
+        from app.models import Task as TaskModel
+
+        project = make_project(name="SecurityAuditNoActionableProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        audit_task = make_task(
+            project_id=project.id,
+            title="security_audit: low only",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "security_audit", "prompt": "audit", "base_branch": "main"}],
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        low_only_logs = json.dumps([
+            {
+                "severity": "low",
+                "title": "Minor logging issue",
+                "description": "Log level inconsistency.",
+                "fix_prompt": "Fix logging levels.",
+                "file_path": "backend/app/main.py",
+                "line_number": 10,
+            }
+        ])
+
+        await self._run(db_session, mocker, audit_task, logs=low_only_logs)
+
+        await db_session.refresh(audit_task)
+        children = (
+            await db_session.execute(
+                sqlmodel_select(TaskModel).where(TaskModel.parent_task_id == audit_task.id)
+            )
+        ).scalars().all()
+
+        assert len(children) == 0
+        assert audit_task.status == TaskStatus.COMPLETED

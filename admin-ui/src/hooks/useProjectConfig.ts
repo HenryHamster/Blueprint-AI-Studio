@@ -6,11 +6,15 @@ import type {
   IssueImplementationConfig,
   IssueImplementationConfigUpdate,
   AutoReviewConfig,
+  ProjectResourceEnvelopeResponse,
 } from '../types/project';
 import {
   API_BASE_URL,
   authHeaders,
   authGet,
+  fetchProjectResourceEnvelope,
+  updateProjectResourceEnvelope,
+  type ResourceEnvelopePatch,
 } from '../api';
 
 /**
@@ -107,6 +111,10 @@ export function useProjectConfig(
 
   // ── Auto-review config (project-scoped) ─────────────────────────────────
   const [autoReviewConfig, setAutoReviewConfig] = useState<AutoReviewConfig | null>(null);
+  // ── Resource envelope config (project-scoped) ───────────────────────────
+  const [resourceEnvelopeData, setResourceEnvelopeData] = useState<ProjectResourceEnvelopeResponse | null>(null);
+  const [resourceEnvelopeLoading, setResourceEnvelopeLoading] = useState(false);
+  const [resourceEnvelopeError, setResourceEnvelopeError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -117,6 +125,27 @@ export function useProjectConfig(
       .then(res => res.ok ? res.json() : null)
       .then(data => { if (data?.config) setAutoReviewConfig(data.config); })
       .catch(() => {});
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setResourceEnvelopeData(null);
+      setResourceEnvelopeLoading(false);
+      setResourceEnvelopeError(null);
+      return;
+    }
+    setResourceEnvelopeLoading(true);
+    fetchProjectResourceEnvelope(selectedProjectId)
+      .then(data => {
+        setResourceEnvelopeData(data);
+        setResourceEnvelopeError(null);
+      })
+      .catch(() => {
+        setResourceEnvelopeError('Failed to load resource envelope');
+      })
+      .finally(() => {
+        setResourceEnvelopeLoading(false);
+      });
   }, [selectedProjectId]);
 
   const handleUpdateAutoReviewConfig = async (patch: Partial<AutoReviewConfig>) => {
@@ -136,6 +165,21 @@ export function useProjectConfig(
     } catch {
       setAutoReviewConfig(prev);
       addToast('Failed to save auto-review config', 'error');
+    }
+  };
+
+  const handleUpdateResourceEnvelope = async (patch: ResourceEnvelopePatch) => {
+    if (!selectedProjectId) return;
+    const prev = resourceEnvelopeData;
+    if (prev) setResourceEnvelopeData({ ...prev, ...patch });
+    try {
+      const data = await updateProjectResourceEnvelope(selectedProjectId, patch);
+      setResourceEnvelopeData(data);
+      setResourceEnvelopeError(null);
+      addToast('Resource envelope saved', 'success');
+    } catch {
+      setResourceEnvelopeData(prev);
+      addToast('Failed to save resource envelope', 'error');
     }
   };
 
@@ -272,6 +316,7 @@ export function useProjectConfig(
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
     autoReviewConfig, handleUpdateAutoReviewConfig,
+    resourceEnvelopeData, resourceEnvelopeLoading, resourceEnvelopeError, handleUpdateResourceEnvelope,
     integrationBranchData, handleUpdateIntegrationBranch,
     promotionTargetData, handleUpdatePromotionTarget,
     taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,

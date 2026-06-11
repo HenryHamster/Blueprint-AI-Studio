@@ -1,9 +1,15 @@
 import uuid
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
 from app.models import Task, TaskStatus, _utcnow
+from app.playbook_storage import (
+    ground_design_doc_systems,
+    recover_grounding_downgrades,
+    recover_grounding_downgrades_branch_aware,
+)
 from testing._playbook_test_helpers import _make_project
 
 
@@ -311,3 +317,281 @@ async def test_finalize_pending_playbook_entries_promotes_on_success(db_session)
         "Successful task's pending flag must be cleared"
     )
     assert entry["content"] == "Real finding from completed task"
+
+
+def test_grounding_sweep_restores_falsely_downgraded_entry(tmp_path):
+    """Self-healing recovery: downgrade then restore when the path returns.
+
+    Simulates a false downgrade (path temporarily absent from checkout) followed
+    by the path being restored. recover_grounding_downgrades must reinstate the
+    prior status, clear presence_warning and grounding_prior_status, and strip
+    the [reconciled: ...] marker from the text field.
+    """
+    # Phase 1: path absent → downgrade.
+    repo_root = str(tmp_path)
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "description": "Auth subsystem.",
+            "modules": ["backend/app/auth.py"],
+        }
+    }
+    doc = ground_design_doc_systems(doc, repo_root)
+    entry = doc["systems/auth"]
+    assert entry["status"] == "missing", "Sanity: path absent triggers downgrade"
+    assert entry.get("grounding_prior_status") == "mature"
+    assert "presence_warning" in entry
+    assert "[reconciled:" in entry.get("description", "")
+
+    # Phase 2: path returns → recovery restores.
+    auth_path = tmp_path / "backend" / "app" / "auth.py"
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text("# restored")
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    recovered = doc["systems/auth"]
+    assert recovered["status"] == "mature", "Recovery must reinstate original status"
+    assert "presence_warning" not in recovered, "presence_warning must be cleared"
+    assert "grounding_prior_status" not in recovered, "grounding_prior_status must be cleared"
+    assert "[reconciled:" not in recovered.get("description", ""), "Marker must be stripped"
+    assert "Auth subsystem." in recovered.get("description", ""), "Original text must survive"
+    assert doc["_meta"]["updated_by"] == "design-doc-grounding-recovery"
+
+
+def test_grounding_ignores_glob_only_modules(tmp_path):
+    """Literal glob pointers do not count as confirmed absence in local mode."""
+    repo_root = str(tmp_path)
+    repo_file = tmp_path / "backend" / "app" / "routers" / "admin.py"
+    repo_file.parent.mkdir(parents=True, exist_ok=True)
+    repo_file.write_text("# exists")
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/routers/*.py"],
+        }
+    }
+
+    result = ground_design_doc_systems(doc, repo_root)
+    assert result["systems/auth"]["status"] == "mature"
+    assert "presence_warning" not in result["systems/auth"]
+    assert "_meta" not in result
+
+
+def test_grounding_recovery_no_op_when_path_still_absent(tmp_path):
+    """Recovery is a no-op when the referenced path is still absent on disk."""
+    repo_root = str(tmp_path)
+    doc = {
+        "systems/billing": {
+            "status": "functional",
+            "modules": ["backend/app/billing.py"],
+        }
+    }
+    doc = ground_design_doc_systems(doc, repo_root)
+    rev_after_downgrade = doc["_meta"]["revision"]
+
+    doc = recover_grounding_downgrades(doc, repo_root)
+    # Path still absent → no recovery, revision unchanged.
+    assert doc["systems/billing"]["status"] == "missing"
+    assert doc["_meta"]["revision"] == rev_after_downgrade
+
+
+def test_grounding_recovery_symbol_present_restores(tmp_path):
+    """Symbol-level recovery restores when the cited symbol is confirmed."""
+    repo_root = str(tmp_path)
+    symbol_path = tmp_path / "backend" / "app" / "facade.py"
+    symbol_path.parent.mkdir(parents=True, exist_ok=True)
+    symbol_path.write_text("def restored_symbol():\n    return 1\n")
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/facade.py:restored_symbol"],
+            "presence_warning": "claimed mature but cited symbol 'backend/app/facade.py:restored_symbol' is absent on the integration branch though its file exists — treat as missing",
+            "grounding_prior_status": "mature",
+        }
+    }
+
+    recovered = recover_grounding_downgrades(doc, repo_root)
+    entry = recovered["systems/auth"]
+    assert entry["status"] == "mature"
+    assert "presence_warning" not in entry
+    assert "grounding_prior_status" not in entry
+
+
+def test_grounding_recovery_symbol_indeterminate_leaves_untouched(
+    tmp_path, mocker
+):
+    """Unreadable symbol reads stay indeterminate and must not restore entries."""
+    repo_root = str(tmp_path)
+    symbol_path = tmp_path / "backend" / "app" / "facade.py"
+    symbol_path.parent.mkdir(parents=True, exist_ok=True)
+    symbol_path.write_text("def restored_symbol():\n    return 1\n")
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/facade.py:restored_symbol"],
+            "presence_warning": "claimed mature but cited symbol 'backend/app/facade.py:restored_symbol' is absent on the integration branch though its file exists — treat as missing",
+            "grounding_prior_status": "mature",
+        }
+    }
+
+    mocker.patch("builtins.open", side_effect=OSError("denied"))
+    recovered = recover_grounding_downgrades(doc, repo_root)
+    assert recovered["systems/auth"]["status"] == "missing"
+    assert "presence_warning" in recovered["systems/auth"]
+
+
+def test_grounding_recovery_no_op_for_authored_missing(tmp_path):
+    """Authored-missing entries (no presence_warning) are never touched by recovery."""
+    repo_root = str(tmp_path)
+    billing_path = tmp_path / "backend" / "app" / "billing.py"
+    billing_path.parent.mkdir(parents=True, exist_ok=True)
+    billing_path.write_text("# exists")
+    doc = {
+        "systems/billing": {
+            "status": "missing",
+            "modules": ["backend/app/billing.py"],
+        }
+    }
+    # File present but entry is authored-missing (no presence_warning).
+    doc = recover_grounding_downgrades(doc, repo_root)
+    assert doc["systems/billing"]["status"] == "missing", "Must not touch authored-missing"
+    assert "_meta" not in doc
+
+
+def test_grounding_recovery_branch_aware_restores(monkeypatch):
+    """Branch-aware recovery restores when _file_exists_in_repo_branch returns True."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        AsyncMock(return_value=True),
+    )
+    doc = {
+        "systems/payments": {
+            "status": "missing",
+            "modules": ["backend/app/payments.py"],
+            "presence_warning": "claimed functional but all referenced module file(s) are absent on the integration branch — treat as missing",
+            "grounding_prior_status": "functional",
+        }
+    }
+    result = asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+    recovered = result["systems/payments"]
+    assert recovered["status"] == "functional"
+    assert "presence_warning" not in recovered
+    assert result["_meta"]["updated_by"] == "design-doc-grounding-recovery"
+
+
+def test_grounding_recovery_branch_aware_indeterminate_leaves_untouched(monkeypatch):
+    """Recovery is a no-op when _file_exists_in_repo_branch returns None (indeterminate)."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        AsyncMock(return_value=None),
+    )
+    doc = {
+        "systems/payments": {
+            "status": "missing",
+            "modules": ["backend/app/payments.py"],
+            "presence_warning": "claimed functional but all referenced module file(s) are absent on the integration branch — treat as missing",
+            "grounding_prior_status": "functional",
+        }
+    }
+    result = asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+    assert result["systems/payments"]["status"] == "missing", "Indeterminate must leave untouched"
+    assert "_meta" not in result
+
+
+def test_grounding_recovery_branch_aware_symbol_restores(mocker):
+    """Branch-aware symbol recovery restores only on confirmed symbol presence."""
+    import asyncio
+
+    mocker.patch(
+        "app.playbook_storage._present_symbol_in_repo_branch",
+        new=AsyncMock(return_value=True),
+    )
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/facade.py:restored_symbol"],
+            "presence_warning": "claimed mature but cited symbol 'backend/app/facade.py:restored_symbol' is absent on the integration branch though its file exists — treat as missing",
+            "grounding_prior_status": "mature",
+        }
+    }
+    result = asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+    assert result["systems/auth"]["status"] == "mature"
+    assert "presence_warning" not in result["systems/auth"]
+
+
+def test_grounding_recovery_branch_aware_symbol_indeterminate_leaves_untouched(
+    mocker,
+):
+    """Indeterminate branch symbol reads must not be misread as recovery."""
+    import asyncio
+
+    mocker.patch(
+        "app.playbook_storage._present_symbol_in_repo_branch",
+        new=AsyncMock(return_value=None),
+    )
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/facade.py:restored_symbol"],
+            "presence_warning": "claimed mature but cited symbol 'backend/app/facade.py:restored_symbol' is absent on the integration branch though its file exists — treat as missing",
+            "grounding_prior_status": "mature",
+        }
+    }
+    result = asyncio.run(
+        recover_grounding_downgrades_branch_aware(
+            doc,
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+    assert result["systems/auth"]["status"] == "missing"
+    assert "presence_warning" in result["systems/auth"]
+
+
+def test_grounding_recovery_legacy_warning_text(tmp_path):
+    """Legacy entries (no grounding_prior_status) are recovered by parsing the warning text."""
+    repo_root = str(tmp_path)
+    auth_path = tmp_path / "backend" / "app" / "auth.py"
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text("# restored")
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "modules": ["backend/app/auth.py"],
+            "presence_warning": "claimed mature but all referenced module file(s) are absent on the integration branch — treat as missing",
+        }
+    }
+    doc = recover_grounding_downgrades(doc, repo_root)
+    assert doc["systems/auth"]["status"] == "mature", "Legacy warning text must yield prior status"

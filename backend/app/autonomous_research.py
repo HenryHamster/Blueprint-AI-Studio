@@ -28,6 +28,7 @@ from app.payload_schemas import (
     PayloadTooLargeError,
     _MAX_PAYLOAD_BYTES,
 )
+from app.routers.admin_analytics import _derive_completed_at
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
@@ -54,14 +55,21 @@ from app.source_ref_validation import (
     classify_paths_tristate,
     detect_absent_symbols,
     resolve_branch_verification_context,
+    resolve_head_commit,
 )
 from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
 )
 from app.capability_registry import (
+    annotate_capability_proof_status as _annotate_capability_proof_status,
     registry_capability_names,
     registry_capability_vocabulary,
+)
+from app.resource_envelope import (
+    get_project_recent_spend_usd,
+    resolve_project_spend_ceiling,
+    resolve_project_spend_window_days,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +104,38 @@ def project_parallelism_cap(
     if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
         return raw
     return _runtime_config.get(runtime_key, default)
+
+
+def _direction_in_refractory(d: dict, now: datetime) -> bool:
+    """Return True if the direction's refractory_until window is still active."""
+    refractory_until = d.get("refractory_until")
+    if not refractory_until:
+        return False
+    try:
+        return datetime.fromisoformat(refractory_until) > now
+    except (ValueError, TypeError):
+        return False
+
+
+async def _project_spend_ceiling_spawn_defer_reason(
+    project: Project, session: AsyncSession
+) -> str | None:
+    """Return a spawn deferral reason when the project spend ceiling is reached."""
+    spend_ceiling = resolve_project_spend_ceiling(project)
+    if spend_ceiling is None:
+        return None
+    spend_window_days = resolve_project_spend_window_days(project)
+    recent_spend = await get_project_recent_spend_usd(
+        session,
+        project_id=project.id,
+        window_days=spend_window_days,
+    )
+    if recent_spend >= spend_ceiling:
+        return (
+            f"project spend ceiling reached: ${recent_spend:.2f}/${spend_ceiling:.2f} "
+            f"in the last {spend_window_days} day(s)"
+        )
+    return None
 
 
 # Sentinel segment for undirected (cross-cutting) research claims — undirected
@@ -226,6 +266,43 @@ async def _undirected_research_recently_active(project_id, session) -> bool:
         )
     ).scalar() or 0
     return recent > 0
+
+
+async def _directed_research_recently_completed(
+    project_id, direction_id: str, session
+) -> bool:
+    """True when a directed research task for this direction COMPLETED within the
+    cooldown window.
+
+    Protects against re-commissioning when ``_handle_research_completion`` dies
+    before it can update ``last_researched_at`` on the direction — the
+    direction-level cooldown guard then sees no cooldown and allows a re-spawn
+    (incident 2026-06-10: tasks 55ed71f5 / 32758199 both completed childless
+    within 80 min of the successful cycle 63231d77 on the same direction).
+
+    Mirrors ``_undirected_research_recently_active`` for the directed case; the
+    undirected guard already covers all statuses, so this companion only checks
+    COMPLETED.  Set ``completed_research_cooldown_minutes`` <= 0 to disable.
+    """
+    cooldown_minutes = _runtime_config.get("completed_research_cooldown_minutes", 120)
+    if cooldown_minutes <= 0:
+        return False
+    cutoff = _utcnow() - timedelta(minutes=cooldown_minutes)
+    completed = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.status == TaskStatus.COMPLETED,
+                Task.payloads[0]["type"].as_string() == "research",
+                Task.payloads[0]["current_direction_id"].as_string()
+                == str(direction_id),
+            )
+        )
+    ).scalars()
+    for task in completed:
+        if _derive_completed_at(task) >= cutoff:
+            return True
+    return False
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -411,6 +488,26 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if not project.autonomous_enabled or project.archived:
         return
 
+    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
+    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
+    if spend_ceiling_usd:
+        from app.efficiency_snapshot import compute_project_window_spend_usd
+        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+
+        window_spend = await compute_project_window_spend_usd(session, project.id)
+        if window_spend >= spend_ceiling_usd:
+            logger.info(
+                f"[AUTONOMOUS] Spend ceiling reached for project {project.id}: "
+                f"${window_spend:.4f} >= ${spend_ceiling_usd:.4f} — pausing spawning"
+            )
+            await _maybe_create_spend_ceiling_alert(
+                project.id,
+                session,
+                window_spend_usd=window_spend,
+                ceiling_usd=spend_ceiling_usd,
+            )
+            return
+
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
     # Blueprint pipeline repo and polluted new projects with wrong build/test
     # instructions. Agents discover the correct playbook entries by exploring
@@ -431,6 +528,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # the steering is still delivered on a later tick once accounts recover.
         await _maybe_notify_operator_refresh_deferred(
             project, session, "paused while no model accounts are available"
+        )
+        return
+    spend_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
+        project, session
+    )
+    if spend_defer_reason:
+        logger.info(
+            "[AUTONOMOUS] Skipping research spawn for project %s — %s",
+            project.id,
+            spend_defer_reason,
+        )
+        await _maybe_notify_operator_refresh_deferred(
+            project, session, "paused while the project spend ceiling is reached"
         )
         return
     # Guard: circuit breaker must allow spawning
@@ -515,6 +625,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     "paused while the research circuit breaker is open",
                 )
                 return  # Back to cooldown
+    # Guard: defer autonomous research until repo_bootstrap completes for external-repo
+    # projects. Strategic cycles already defer this way; keeping research consistent
+    # prevents ungrounded findings against a half-onboarded repo. Terminal bootstraps
+    # (FAILED/COMPLETED) proceed gracefully so a degraded bootstrap never deadlocks.
+    from app.strategic_spawning import _bootstrap_pending
+    if await _bootstrap_pending(project, session):
+        logger.info(
+            "[AUTONOMOUS] Deferring research spawn for project %s — "
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+            project.id,
+        )
+        return
+
     # Guard: must have active directions that aren't in cooldown or mid-cycle
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     now = _utcnow()
@@ -782,11 +905,29 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # _strategic_failures breaker is bypassed for operator intent.
     from app.strategic_trigger import (
         ORIGIN_OPERATOR as _ORIGIN_OPERATOR,
+        refresh_breaker_applies,
+        strategic_refresh_due,
         strategic_refresh_origin as _strategic_refresh_origin,
     )
 
     if _strategic_refresh_origin(vision_data) == _ORIGIN_OPERATOR:
         force_strategic = True
+    elif not force_strategic:
+        _refresh_min_interval = _runtime_config.get(
+            "strategic_refresh_min_interval_seconds", 120
+        )
+        # Operator steering bypasses the _strategic_failures breaker — an
+        # explicit human request is exactly when an operator needs to
+        # intervene (and exactly when the breaker is likely tripped).
+        # Automated qualification refreshes still park under the breaker.
+        _breaker_gate_ok = (
+            not refresh_breaker_applies(project.vision)
+            or strategic_failures < 3
+        )
+        if _breaker_gate_ok and strategic_refresh_due(
+            project.vision, now, min_interval_seconds=_refresh_min_interval
+        ):
+            force_strategic = True
     # Wall-clock backstop: must drive force_strategic so it bypasses the
     # `not active_directions` early return below. Without this promotion, when
     # every active direction has an in-flight child (busy_direction_ids),
@@ -825,7 +966,35 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     )
                     force_strategic = True
     if not active_directions and not force_strategic:
-        return
+        # When every active direction is held in refractory (none eligible this
+        # cycle), fire a coalesced strategic refresh so the strategist can
+        # replenish the portfolio or explicitly re-open a held direction.
+        # The strategist may clear refractory_until on a direction to bypass.
+        # The 180-min wall-clock backstop above remains the safety net.
+        _any_refractory = any(
+            _direction_in_refractory(d, now)
+            for d in (project.directions or [])
+            if d.get("status") == "active"
+        )
+        if _any_refractory:
+            from app.strategic_trigger import (
+                ORIGIN_QUALIFICATION as _OQ,
+                request_strategic_refresh as _req_strat,
+            )
+            await _req_strat(
+                session,
+                project.id,
+                reason="all active directions in refractory — strategist replenishment needed",
+                origin=_OQ,
+            )
+            force_strategic = True
+            logger.info(
+                "[AUTONOMOUS] All active directions in refractory for project %s; "
+                "fired strategic refresh trigger",
+                project.id,
+            )
+        else:
+            return
     # Pick up to N non-conflicting directions for parallel research.
     # active_directions preserves UI drag-order (index 0 = highest priority).
     # Build vision priority lookup: directions tagged with a system_id that appears
@@ -1181,18 +1350,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 # guards against. Gated by the _strategic_failures breaker (< 3)
                 # and a min-interval floor, so a broken request that keeps
                 # failing stops bypassing instead of looping.
-                from app.strategic_trigger import (
-                    refresh_breaker_applies,
-                    strategic_refresh_due,
-                )
-
                 _refresh_min_interval = _runtime_config.get(
                     "strategic_refresh_min_interval_seconds", 120
                 )
-                # Operator steering bypasses the _strategic_failures breaker — an
-                # explicit human request is exactly when an operator needs to
-                # intervene (and exactly when the breaker is likely tripped).
-                # Automated qualification refreshes still park under the breaker.
                 _breaker_gate_ok = (
                     not refresh_breaker_applies(project.vision)
                     or strategic_failures < 3
@@ -1229,13 +1389,26 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if is_strategic:
         # Determine if this strategic cycle should also include architecture review.
         # Architecture stabilizes faster than strategy, so it runs less frequently.
+        # Additionally, if the design_doc is empty (no architecture content), force
+        # an architecture cycle to establish the baseline before strategy reasons
+        # about an unfamiliar codebase.
         strategic_cycle_count = (project.vision or {}).get(
             "_strategic_cycle_count", 0
         ) + 1
         arch_frequency = _runtime_config.get("architecture_review_frequency", 3)
+        # Architecture cycle triggers on the modulo counter OR when this is the first
+        # strategic cycle and design_doc is empty (no systems), ensuring newly-onboarded
+        # projects build architectural context on their first strategic pass rather than
+        # spending cycles on undirected research. Design_doc stores systems as keys
+        # like "systems/sys-id" (not under a "systems" key).
+        design_doc = project.design_doc or {}
+        has_design_doc_systems = any(
+            k.startswith("systems/") for k in design_doc if isinstance(k, str)
+        )
+        is_first_cycle = strategic_cycle_count == 1
         is_architecture_cycle = (
             arch_frequency > 0 and strategic_cycle_count % arch_frequency == 0
-        )
+        ) or (is_first_cycle and not has_design_doc_systems)
 
         spawned = False
         try:
@@ -1641,6 +1814,22 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         current_dir_id = (
             None if chosen_direction is None else chosen_direction.get("id")
         )
+        # Guard: skip directed research that recently COMPLETED — covers the gap
+        # when _handle_research_completion fails before updating last_researched_at
+        # on the direction (incident 2026-06-10: 3x same-direction re-runs within
+        # 80 min). Undirected research is already covered by
+        # _undirected_research_recently_active above.
+        if current_dir_id is not None and await _directed_research_recently_completed(
+            project.id, current_dir_id, session
+        ):
+            logger.info(
+                "[AUTONOMOUS] Skipping research for project %s direction %s "
+                "— a research task on this direction completed within the "
+                "cooldown window.",
+                project.id,
+                current_dir_id,
+            )
+            continue
         direction_summaries = []
         for d in all_active_directions:
             summary: dict = {
@@ -1835,6 +2024,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 **({"absent_symbols": absent_symbols} if absent_symbols else {}),
             }
 
+        # Stamp verification provenance — when and against which branch tip
+        # the verdicts were computed.  The agent surfaces these so an old stamp
+        # (from a task spawned hours or days ago and now being retried) is
+        # visibly discountable.  Resolved once; shared by both maps.
+        _v_computed_at = _utcnow().isoformat()
+        _v_branch_sha = await resolve_head_commit(**verification_kwargs)
+        if system_verification:
+            system_verification["_computed_at"] = _v_computed_at
+            system_verification["_branch_sha"] = _v_branch_sha
+        if capability_verification:
+            capability_verification["_computed_at"] = _v_computed_at
+            capability_verification["_branch_sha"] = _v_branch_sha
+
         research_payload: dict = {
             "type": "research",
             "directions": direction_summaries,
@@ -1856,8 +2058,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # refs from the SAME shared namespace consumers draw from. Additive and
         # optional: omitted on the empty path, older agents ignore it and still
         # validate.
-        _available_capabilities = registry_capability_vocabulary(
-            project.problem_model
+        _available_capabilities = _annotate_capability_proof_status(
+            registry_capability_vocabulary(project.problem_model),
+            getattr(project, "capability_proof_records", None),
         )
         if _available_capabilities:
             research_payload["available_capabilities"] = _available_capabilities
@@ -2239,6 +2442,17 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
             f"[AUTONOMOUS] Unknown task_type '{task_type}' in _spawn_periodic_task, skipping"
         )
         return
+    spend_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
+        project, session
+    )
+    if spend_defer_reason:
+        logger.info(
+            "[AUTONOMOUS] Skipping periodic task spawn (type=%s) for project %s — %s",
+            task_type,
+            project.id,
+            spend_defer_reason,
+        )
+        return
 
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
@@ -2280,6 +2494,26 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
                     f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
                 )
                 return
+
+    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
+    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
+    if spend_ceiling_usd:
+        from app.efficiency_snapshot import compute_project_window_spend_usd
+        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+
+        window_spend = await compute_project_window_spend_usd(session, project.id)
+        if window_spend >= spend_ceiling_usd:
+            logger.info(
+                f"[AUTONOMOUS] Spend ceiling reached for project {project.id}: "
+                f"${window_spend:.4f} >= ${spend_ceiling_usd:.4f} — skipping periodic spawn (type={task_type})"
+            )
+            await _maybe_create_spend_ceiling_alert(
+                project.id,
+                session,
+                window_spend_usd=window_spend,
+                ceiling_usd=spend_ceiling_usd,
+            )
+            return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(
         task_type, {}
@@ -2591,7 +2825,151 @@ async def _check_idle_research():
 
                 # Spawn the working residual-fingerprint create-fix lane for any
                 # recurring failure pattern that warrants a targeted fix.
-                await _spawn_residual_fingerprint_remediation(project, session)
+                # Guard with the same spend-ceiling check used by _spawn_research_task
+                # and _spawn_periodic_task so an over-budget project cannot spawn new
+                # work through this lane either.
+                _residual_defer_reason = (
+                    await _project_spend_ceiling_spawn_defer_reason(project, session)
+                )
+                if _residual_defer_reason:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping residual remediation spawn for project %s — %s",
+                        project.id,
+                        _residual_defer_reason,
+                    )
+                else:
+                    await _spawn_residual_fingerprint_remediation(project, session)
                 await session.commit()
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
+
+
+async def refresh_research_task_verification(
+    task: "Task",
+    project: "Project",
+    session: "AsyncSession",
+) -> None:
+    """Re-run the verification loops and stamp fresh provenance onto the task's payload.
+
+    Called by the reaper when retrying a research task so the agent never
+    executes stale spawn-time verdicts.  Mutates ``task.payloads[0]`` in-place
+    using ``flag_modified``; the caller's transaction owns the eventual commit.
+    No-ops when the task has no research payload or when verification context
+    cannot be resolved.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.playbook_lifecycle import _extract_file_paths
+
+    payloads = task.payloads
+    if not payloads or not isinstance(payloads, list):
+        return
+    payload = payloads[0]
+    if not isinstance(payload, dict) or payload.get("type") != "research":
+        return
+
+    doc = project.design_doc or {}
+    verification_kwargs = await resolve_branch_verification_context(session, project)
+
+    system_verification: dict = {}
+    for dkey in sorted(k for k in doc if isinstance(k, str) and k.startswith("systems/")):
+        dval = doc[dkey]
+        if not isinstance(dval, dict):
+            continue
+        modules = [m for m in (dval.get("modules") or []) if isinstance(m, str)]
+        if not modules:
+            continue
+        present, missing, indeterminate = await classify_paths_tristate(
+            modules, **verification_kwargs
+        )
+        if not missing and not indeterminate:
+            status = "verified"
+        elif not missing:
+            status = "unverified"
+        elif present or indeterminate:
+            status = "partial"
+        else:
+            status = "claimed_absent"
+        absent_symbols = await detect_absent_symbols(
+            dval.get("modules"),
+            [dval.get("description"), dval.get("notes")],
+            **verification_kwargs,
+        )
+        if absent_symbols and status != "claimed_absent":
+            status = "claimed_absent"
+        system_verification[dkey[len("systems/"):]] = {
+            "status": status,
+            "claimed_status": str(dval.get("status", "")),
+            "present": present,
+            "missing": missing,
+            **({"indeterminate": indeterminate} if indeterminate else {}),
+            **({"absent_symbols": absent_symbols} if absent_symbols else {}),
+        }
+
+    _present_cap_statuses = {"working", "partial"}
+    capability_verification: dict = {}
+    for dkey in sorted(
+        k for k in doc if isinstance(k, str) and k.startswith("capabilities/")
+    ):
+        dval = doc[dkey]
+        if not isinstance(dval, dict):
+            continue
+        claimed = str(dval.get("status", "")).lower()
+        if claimed not in _present_cap_statuses:
+            continue
+        cap_paths = [m for m in (dval.get("modules") or []) if isinstance(m, str)]
+        for _field in ("notes", "description"):
+            _txt = dval.get(_field)
+            if isinstance(_txt, str) and _txt:
+                cap_paths.extend(_extract_file_paths(_txt))
+        cap_paths = list(dict.fromkeys(cap_paths))
+        if not cap_paths:
+            continue
+        present, missing, indeterminate = await classify_paths_tristate(
+            cap_paths, **verification_kwargs
+        )
+        if not missing and not indeterminate:
+            status = "verified"
+        elif not missing:
+            status = "unverified"
+        elif present or indeterminate:
+            status = "partial"
+        else:
+            status = "claimed_absent"
+        absent_symbols = await detect_absent_symbols(
+            dval.get("modules"),
+            [dval.get("notes"), dval.get("description")],
+            **verification_kwargs,
+        )
+        if absent_symbols and status != "claimed_absent":
+            status = "claimed_absent"
+        capability_verification[dkey[len("capabilities/"):]] = {
+            "status": status,
+            "claimed_status": str(dval.get("status", "")),
+            "present": present,
+            "missing": missing,
+            **({"indeterminate": indeterminate} if indeterminate else {}),
+            **({"absent_symbols": absent_symbols} if absent_symbols else {}),
+        }
+
+    _v_computed_at = _utcnow().isoformat()
+    _v_branch_sha = await resolve_head_commit(**verification_kwargs)
+    if system_verification:
+        system_verification["_computed_at"] = _v_computed_at
+        system_verification["_branch_sha"] = _v_branch_sha
+        payload["system_verification"] = system_verification
+    else:
+        payload.pop("system_verification", None)
+
+    if capability_verification:
+        capability_verification["_computed_at"] = _v_computed_at
+        capability_verification["_branch_sha"] = _v_branch_sha
+        payload["capability_verification"] = capability_verification
+    else:
+        payload.pop("capability_verification", None)
+
+    flag_modified(task, "payloads")
+    logger.info(
+        "[AUTONOMOUS] Refreshed verification provenance for task %s (branch_sha=%s)",
+        task.id,
+        _v_branch_sha,
+    )

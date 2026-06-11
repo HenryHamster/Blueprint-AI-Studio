@@ -3,7 +3,7 @@
 import time
 import uuid
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
@@ -380,7 +380,7 @@ async def _compute_health_overview(
     # Zone health (needed for remediation hints)
     try:
         zone_summary = get_zone_health_summary()
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort hint input, never fail the overview
         zone_summary = {"available": 0, "exhausted": []}
 
     stuck_tasks = await _build_stuck_tasks(active_tasks, now, session)
@@ -524,86 +524,89 @@ async def _compute_health_overview(
         )
 
     # --- 4b. Warm-VM continuity circuit breaker ---
-    if _shared_state.runtime_config.get("warm_continuity_enabled", False):
-        if _shared_state.is_warm_continuity_suppressed():
-            sup_until = _shared_state.warm_continuity_suppressed_until
-            clears = _shared_state.count_recent_warm_pin_clears(3600)
-            threshold = _shared_state.runtime_config.get(
-                "warm_pin_clear_rate_threshold", 10
+    if _shared_state.runtime_config.get(
+        "warm_continuity_enabled", False
+    ) and _shared_state.is_warm_continuity_suppressed():
+        sup_until = _shared_state.warm_continuity_suppressed_until
+        clears = _shared_state.count_recent_warm_pin_clears(3600)
+        threshold = _shared_state.runtime_config.get(
+            "warm_pin_clear_rate_threshold", 10
+        )
+        cooldown_min = (
+            _shared_state.runtime_config.get(
+                "warm_continuity_cooldown_seconds", 1800
             )
-            cooldown_min = (
-                _shared_state.runtime_config.get(
-                    "warm_continuity_cooldown_seconds", 1800
-                )
-                // 60
-            )
-            sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
-            actionable_issues.append(
-                {
-                    "severity": "warning",
-                    "title": "Warm-VM continuity circuit breaker open — falling back to cold provisioning",
-                    "hint": (
-                        f"{clears} pin-clear events in last hour exceeded threshold ({threshold}). "
-                        f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
-                    ),
-                    "task_ids": [],
-                    "category": "warm_vm_circuit_breaker",
-                }
-            )
+            // 60
+        )
+        sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
+        actionable_issues.append(
+            {
+                "severity": "warning",
+                "title": "Warm-VM continuity circuit breaker open — falling back to cold provisioning",
+                "hint": (
+                    f"{clears} pin-clear events in last hour exceeded threshold ({threshold}). "
+                    f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
+                ),
+                "task_ids": [],
+                "category": "warm_vm_circuit_breaker",
+            }
+        )
 
     # --- 4c. Warm-backlog reuse circuit breaker ---
-    if _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False):
-        if _shared_state.is_warm_backlog_reuse_suppressed():
-            sup_until = _shared_state.warm_backlog_reuse_suppressed_until
-            failures = _shared_state.count_recent_backlog_reuse_failures(3600)
-            threshold = _shared_state.runtime_config.get(
-                "warm_backlog_reuse_failure_rate_threshold", 5
+    if _shared_state.runtime_config.get(
+        "warm_backlog_reuse_enabled", False
+    ) and _shared_state.is_warm_backlog_reuse_suppressed():
+        sup_until = _shared_state.warm_backlog_reuse_suppressed_until
+        failures = _shared_state.count_recent_backlog_reuse_failures(3600)
+        threshold = _shared_state.runtime_config.get(
+            "warm_backlog_reuse_failure_rate_threshold", 5
+        )
+        cooldown_min = (
+            _shared_state.runtime_config.get(
+                "warm_backlog_reuse_cooldown_seconds", 1800
             )
-            cooldown_min = (
-                _shared_state.runtime_config.get(
-                    "warm_backlog_reuse_cooldown_seconds", 1800
-                )
-                // 60
-            )
-            sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
-            actionable_issues.append(
-                {
-                    "severity": "warning",
-                    "title": "Warm-backlog reuse circuit breaker open — falling back to cold provisioning",
-                    "hint": (
-                        f"{failures} backlog-reuse failure events in last hour exceeded threshold ({threshold}). "
-                        f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
-                    ),
-                    "task_ids": [],
-                    "category": "warm_backlog_reuse_circuit_breaker",
-                }
-            )
+            // 60
+        )
+        sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
+        actionable_issues.append(
+            {
+                "severity": "warning",
+                "title": "Warm-backlog reuse circuit breaker open — falling back to cold provisioning",
+                "hint": (
+                    f"{failures} backlog-reuse failure events in last hour exceeded threshold ({threshold}). "
+                    f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
+                ),
+                "task_ids": [],
+                "category": "warm_backlog_reuse_circuit_breaker",
+            }
+        )
 
     # --- 4d. Warm-pool claim circuit breaker ---
-    if _shared_state.runtime_config.get("warm_pool_enabled", False):
-        if _shared_state.is_warm_pool_suppressed():
-            sup_until = _shared_state.warm_pool_suppressed_until
-            failures = _shared_state.count_recent_pool_claim_failures(3600)
-            threshold = _shared_state.runtime_config.get(
-                "warm_pool_failure_rate_threshold", 5
-            )
-            cooldown_min = (
-                _shared_state.runtime_config.get("warm_pool_cooldown_seconds", 1800)
-                // 60
-            )
-            sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
-            actionable_issues.append(
-                {
-                    "severity": "warning",
-                    "title": "Warm-pool claim circuit breaker open — maintainer paused, dispatch falling back to cold provisioning",
-                    "hint": (
-                        f"{failures} pool-claim failure events in last hour exceeded threshold ({threshold}). "
-                        f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
-                    ),
-                    "task_ids": [],
-                    "category": "warm_pool_circuit_breaker",
-                }
-            )
+    if _shared_state.runtime_config.get(
+        "warm_pool_enabled", False
+    ) and _shared_state.is_warm_pool_suppressed():
+        sup_until = _shared_state.warm_pool_suppressed_until
+        failures = _shared_state.count_recent_pool_claim_failures(3600)
+        threshold = _shared_state.runtime_config.get(
+            "warm_pool_failure_rate_threshold", 5
+        )
+        cooldown_min = (
+            _shared_state.runtime_config.get("warm_pool_cooldown_seconds", 1800)
+            // 60
+        )
+        sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
+        actionable_issues.append(
+            {
+                "severity": "warning",
+                "title": "Warm-pool claim circuit breaker open — maintainer paused, dispatch falling back to cold provisioning",
+                "hint": (
+                    f"{failures} pool-claim failure events in last hour exceeded threshold ({threshold}). "
+                    f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
+                ),
+                "task_ids": [],
+                "category": "warm_pool_circuit_breaker",
+            }
+        )
 
     # --- 5. External dependency health ---
     failed_deps = external_health.get("failed_deps", [])
@@ -907,7 +910,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             payloads = t.payloads or []
             if payloads and isinstance(payloads[0], dict):
                 return str(payloads[0].get("type") or "")
-        except Exception:  # noqa: BLE001 — best-effort metadata
+        except Exception:  # noqa: BLE001, S110 — best-effort metadata
             pass
         return ""
 
@@ -918,7 +921,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 pr = payloads[0].get("pr_number")
                 if isinstance(pr, int):
                     return pr
-        except Exception:  # noqa: BLE001 — best-effort metadata
+        except Exception:  # noqa: BLE001, S110 — best-effort metadata
             pass
         ctx_pr = (t.context or {}).get("warm_target_pr")
         if isinstance(ctx_pr, int):
@@ -964,20 +967,19 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 }
             )
 
-        recent_out = []
-        for t in completed_by_vm.get(vm_id, []):
-            recent_out.append(
-                {
-                    "id": str(t.id),
-                    "task_type": _payload_type(t),
-                    "completed_at": t.last_heartbeat.isoformat()
-                    if t.last_heartbeat
-                    else None,
-                    "status": t.status.value
-                    if hasattr(t.status, "value")
-                    else str(t.status),
-                }
-            )
+        recent_out = [
+            {
+                "id": str(t.id),
+                "task_type": _payload_type(t),
+                "completed_at": t.last_heartbeat.isoformat()
+                if t.last_heartbeat
+                else None,
+                "status": t.status.value
+                if hasattr(t.status, "value")
+                else str(t.status),
+            }
+            for t in completed_by_vm.get(vm_id, [])
+        ]
 
         active_vms_out.append(
             {
@@ -1140,7 +1142,8 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
             compute_pool_idle_cost,
         )
         from app.warm_backlog_reuse import get_pool_funnel_snapshot
-        from app.warm_pool import warm_pool_project_scope
+        from app.warm_pool import LIVE_POOL_STATES, warm_pool_project_scope
+        from app.models import PoolVm
 
         cost = await compute_pool_idle_cost(session)
         funnel = get_pool_funnel_snapshot()
@@ -1159,6 +1162,32 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
             )
         except Exception:  # noqa: BLE001 — best-effort diagnostic, never blank panel
             cost_guard = None
+        cost_guard_by_project = {}
+        project_ids: list[uuid.UUID] = list(
+            (
+                await session.execute(
+                    select(PoolVm.project_id)
+                    .where(PoolVm.state.in_(LIVE_POOL_STATES))
+                    .distinct()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if project_ids:
+            try:
+                from app.warm_pool_maintainer import evaluate_project_pool_cost_guard
+
+                for pid in project_ids:
+                    cost_guard_by_project[str(pid)] = (
+                        await evaluate_project_pool_cost_guard(
+                            session,
+                            pid,
+                            runtime_config=_shared_state.runtime_config,
+                        )
+                    )
+            except Exception:  # noqa: BLE001 — best-effort diagnostic, never blank panel
+                cost_guard_by_project = {}
         return {
             "enabled": bool(
                 _shared_state.runtime_config.get("warm_pool_enabled", False)
@@ -1185,6 +1214,7 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
                 idle_by_account, funnel
             ),
             "cost_guard": cost_guard,
+            "cost_guard_by_project": cost_guard_by_project,
         }
     except Exception:  # noqa: BLE001 — best-effort metric, never blank the panel
         return {}
@@ -1195,7 +1225,7 @@ def _get_chain_continuity_funnel() -> dict:
         from app.warm_backlog_reuse import get_chain_continuity_funnel_snapshot
 
         return get_chain_continuity_funnel_snapshot()
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort metric, never blank the panel
         return {}
 
 
@@ -1204,7 +1234,7 @@ def _get_spawn_pin_funnel() -> dict:
         from app.warm_backlog_reuse import get_spawn_pin_funnel_snapshot
 
         return get_spawn_pin_funnel_snapshot()
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort metric, never blank the panel
         return {}
 
 
@@ -1240,14 +1270,14 @@ async def _get_backlog_reuse_funnel(session: AsyncSession) -> dict:
                 )
         snap["trend"] = {"buckets": buckets[-90:]}
         return snap
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort metric, never blank the panel
         return {}
 
 
 def _derive_saturation(
-    util_avg: Optional[float],
-    util_now: Optional[float],
-) -> Optional[str]:
+    util_avg: float | None,
+    util_now: float | None,
+) -> str | None:
     """Derive a saturation label from utilization ratios.
 
     Thresholds (kept here — the only place — so backend tests can pin them):

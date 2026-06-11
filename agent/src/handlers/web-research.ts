@@ -9,7 +9,7 @@ import {
 import {
   configureAgentPermissions, computePromptFingerprint,
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
-  formatPlaybook, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
@@ -229,6 +229,8 @@ export async function handleWebResearch(
   // .git dir) so the Write/Edit/NotebookEdit tools stay disallowed and the
   // permission stance is consistent with other read-only handlers.
   const disallowedTools = configureAgentPermissions('web_research');
+  writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
 
   const contextPrefix = buildContextPrefix(task);
   const retryContext = buildRetryContext(task);

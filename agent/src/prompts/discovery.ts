@@ -42,6 +42,7 @@ export function buildFileTree(ws: WebSocket | null): string {
   }
 }
 
+
 // ── Greenfield (empty / near-empty repo) detection ──────────────────────────
 // Config/scaffolding files that do NOT count as real source. A repo containing
 // only these (plus dotfiles) is a fresh project to bootstrap, not a codebase to
@@ -607,6 +608,119 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
     return body.slice(0, CAP);
   } catch (e) {
     sendLog(ws, `Warning: module interface extraction failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
+/**
+ * Scans all tracked Python/TypeScript source files to build a language-aware
+ * repo map: ranks modules by import-graph centrality (in-degree — how many
+ * other tracked files import them), lists each hub's exported symbols, and
+ * returns a compact markdown section capped at 3 000 chars.
+ *
+ * Fail-soft: returns '' on any error so the caller never blocks on missing
+ * tooling. The natural stdlib/third-party filter comes for free — only modules
+ * whose basename matches a tracked file appear in the output.
+ */
+export function buildRepoMap(ws: WebSocket | null): string {
+  const CAP = 3000;
+  try {
+    const allFiles = execFileSync('git', ['ls-files'], { cwd: WORKSPACE, encoding: 'utf-8' })
+      .split('\n')
+      .filter(f => f &&
+        /\.(py|ts|tsx|js|jsx|mjs)$/.test(f) &&
+        !f.includes('node_modules/') &&
+        !f.includes('/dist/') &&
+        !f.includes('.test.') &&
+        !f.includes('.spec.') &&
+        !f.includes('/test_') &&
+        !f.includes('/testing/') &&
+        !f.includes('/tests/')
+      );
+
+    if (allFiles.length === 0) return '';
+
+    const fileSet = new Set(allFiles);
+
+    // inDegree is keyed on full file paths to avoid cross-package basename collisions
+    const inDegree = new Map<string, number>();
+
+    for (const file of allFiles) {
+      let lines: string[];
+      try {
+        lines = fs.readFileSync(`${WORKSPACE}/${file}`, 'utf-8').split('\n').slice(0, 100);
+      } catch { continue; }
+
+      const isPython = file.endsWith('.py');
+      const fileDir = file.split('/').slice(0, -1).join('/');
+      for (const line of lines) {
+        let resolved: string | null = null;
+
+        if (!isPython) {
+          // Only resolve relative imports — package imports are not tracked files
+          const m = line.match(/from\s+['"]([^'"]+)['"]/);
+          if (m && m[1].startsWith('.')) {
+            const spec = m[1].replace(/\.(js|ts|tsx|jsx|mjs)$/, '');
+            const joined = fileDir ? fileDir + '/' + spec : spec;
+            const segments = joined.split('/');
+            const normalized: string[] = [];
+            for (const seg of segments) {
+              if (seg === '..') normalized.pop();
+              else if (seg !== '.') normalized.push(seg);
+            }
+            const candidateStem = normalized.join('/');
+            for (const ext of ['.ts', '.tsx', '.js', '.jsx']) {
+              if (fileSet.has(candidateStem + ext)) { resolved = candidateStem + ext; break; }
+            }
+            if (!resolved && fileSet.has(candidateStem)) resolved = candidateStem;
+          }
+        } else {
+          // Python: resolve dotted module path to a unique tracked file
+          let dotted: string | null = null;
+          const m1 = line.match(/^from\s+\.*([\w.]+)\s+import\s+/);
+          if (m1) dotted = m1[1];
+          else { const m2 = line.match(/^import\s+([\w.]+)/); if (m2) dotted = m2[1]; }
+          if (dotted) {
+            const asPath = dotted.split('.').join('/') + '.py';
+            const matches = allFiles.filter(f => f === asPath || f.endsWith('/' + asPath));
+            // Drop ambiguous matches — only attribute when exactly one file matches
+            if (matches.length === 1) resolved = matches[0];
+          }
+        }
+
+        if (resolved) inDegree.set(resolved, (inDegree.get(resolved) ?? 0) + 1);
+      }
+    }
+
+    if (inDegree.size === 0) return '';
+
+    const hubs = [...inDegree.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 20)
+      .map(([file]) => file);
+
+    const sections: string[] = [];
+    for (const relFile of hubs) {
+      let content: string;
+      try {
+        content = fs.readFileSync(`${WORKSPACE}/${relFile}`, 'utf-8');
+      } catch { continue; }
+
+      const exports = relFile.endsWith('.py')
+        ? extractPythonExports(content)
+        : extractTypeScriptExports(content);
+      if (exports.length === 0) continue;
+
+      const count = inDegree.get(relFile) ?? 0;
+      sections.push(`**${relFile}** (imported by ${count}): ${exports.slice(0, 10).join(', ')}`);
+    }
+
+    if (sections.length === 0) return '';
+
+    const body = `## Repo Map (most-imported modules)\n${sections.join('\n')}\n\n`;
+    return body.slice(0, CAP);
+  } catch (e) {
+    sendLog(ws, `Warning: repo map generation failed: ${String(e)}\n`);
     return '';
   }
 }

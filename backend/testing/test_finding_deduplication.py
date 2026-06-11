@@ -528,6 +528,38 @@ def test_deduplicate_findings_records_word_overlap_matched_title():
     assert len(rec["reason"]) <= 80
 
 
+def test_compute_finding_word_overlap_respects_active_task_type_metadata():
+    finding = {
+        "title": "measure live release proof acceptance evidence",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-1",
+        "type": "compute_experiment",
+    }
+    cases = [
+        ("research", "research measure live release proof acceptance evidence", 1, 0),
+        (
+            "compute_experiment",
+            "compute measure live release proof acceptance evidence",
+            0,
+            1,
+        ),
+    ]
+    for task_type, active_title, expected_kept, expected_overlap in cases:
+        outcome = deduplicate_findings(
+            [finding],
+            task_context=None,
+            recent_finding_hashes=set(),
+            failed_hashes={},
+            existing_tasks_with_dirs=[
+                ("dir-1", active_title, task_type),
+            ],
+            open_pr_files=set(),
+        )
+        assert len(outcome.deduplicated) == expected_kept
+        assert outcome.word_overlap_count == expected_overlap
+
+
 def test_deduplicate_findings_records_file_overlap_reason():
     finding = {
         "title": "cover already-shipped files",

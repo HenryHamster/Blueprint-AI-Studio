@@ -37,7 +37,14 @@ from app.acceptance_gate import (
     classify_merged_acceptance,
 )
 from app.landed_signal import is_merged_completion
-from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+from app.models import (
+    Artifact,
+    ArtifactType,
+    Project,
+    Task,
+    TaskStatus,
+    get_task_cost_by_provider_model,
+)
 from app.task_capabilities import PRODUCT_TASK_TYPES, WRITE_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
@@ -638,8 +645,26 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "research_spawn_gate_unresolved_count": {
         "consumer": "digest_direction_progress.py, strategic_spawning.py (decision-quality breakdown: unresolved/no-verdict slice of refuted)"
     },
+    "research_spawn_gate_wholesale_retry_exhausted": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (wholesale grader retry-exhaustion count / infrastructure-failure signal)"
+    },
     "research_spawn_gate_refuted_reasons": {
         "consumer": "digest_direction_progress.py, strategic_spawning.py (compact deduped sample of refuted/unresolved challenger reasons for a degraded-gate signal)"
+    },
+    "research_spawn_gate_parse_outcome": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (machine-readable adversarial parse classification for unresolved cycles)"
+    },
+    "research_spawn_gate_manifest_excluded_fail_closed_count": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (manifest-excluded high-stakes fail-closed deferral count)"
+    },
+    "research_spawn_gate_manifest_excluded_fail_closed_samples": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (compact samples of high-stakes findings excluded from the bounded adversarial manifest)"
+    },
+    "research_spawn_gate_adversarial_give_up_count": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (count of findings permanently discarded after 3 consecutive adversarial-gate deferrals)"
+    },
+    "research_spawn_gate_adversarial_give_up_samples": {
+        "consumer": "digest_direction_progress.py, strategic_spawning.py (compact samples of finding titles permanently discarded by adversarial-gate give-up)"
     },
     "research_spawn_gate_challenged_spawned": {
         "consumer": "digest_direction_progress.py (challenged-vs-unchallenged merge-rate rollup)"
@@ -773,6 +798,42 @@ async def _update_direction_research_outcomes(
     spawn_gate_unresolved_count = int(
         research_task_ctx.get("research_spawn_gate_unresolved_count") or 0
     )
+    spawn_gate_wholesale_retry_exhausted = bool(
+        research_task_ctx.get("research_spawn_gate_wholesale_retry_exhausted")
+    )
+    spawn_gate_parse_outcome = research_task_ctx.get("research_spawn_gate_parse_outcome")
+    spawn_gate_manifest_excluded_count = int(
+        research_task_ctx.get(
+            "research_spawn_gate_manifest_excluded_fail_closed_count"
+        )
+        or 0
+    )
+    spawn_gate_manifest_excluded_samples: list[dict] = []
+    _seen_spawn_gate_manifest_excluded: set[tuple[str, str]] = set()
+    for _sg_sample in (
+        research_task_ctx.get(
+            "research_spawn_gate_manifest_excluded_fail_closed_samples"
+        )
+        or []
+    ):
+        if not isinstance(_sg_sample, dict):
+            continue
+        _sample = {
+            "hash": str(_sg_sample.get("hash") or "")[:80],
+            "title": str(_sg_sample.get("title") or "")[:120],
+            "reason": str(_sg_sample.get("reason") or "")[
+                :_SPAWN_GATE_REASON_MAX_LEN
+            ],
+        }
+        _sample_key = (_sample["hash"], _sample["title"])
+        if (
+            (_sample["hash"] or _sample["title"])
+            and _sample_key not in _seen_spawn_gate_manifest_excluded
+            and len(spawn_gate_manifest_excluded_samples)
+            < _SPAWN_GATE_REASONS_SAMPLE_CAP
+        ):
+            _seen_spawn_gate_manifest_excluded.add(_sample_key)
+            spawn_gate_manifest_excluded_samples.append(_sample)
     # Compact, deduped, capped sample of refuted/unresolved challenger reasons.
     spawn_gate_refuted_reasons: list[str] = []
     _seen_spawn_gate_reasons: set[str] = set()
@@ -785,6 +846,31 @@ async def _update_direction_research_outcomes(
         ):
             _seen_spawn_gate_reasons.add(_sg_reason)
             spawn_gate_refuted_reasons.append(_sg_reason)
+    # Adversarial give-up: findings permanently discarded after 3 consecutive
+    # adversarial-gate deferrals (finding_structural_give_up.by_reason.adversarial_gate).
+    _give_up = research_task_ctx.get("finding_structural_give_up") or {}
+    spawn_gate_adversarial_give_up_count = int(
+        (_give_up.get("by_reason") or {}).get("adversarial_gate", 0)
+    )
+    spawn_gate_adversarial_give_up_samples: list[dict] = []
+    _seen_adversarial_give_up: set[str] = set()
+    for _gu_sample in _give_up.get("sample") or []:
+        if not isinstance(_gu_sample, dict):
+            continue
+        if _gu_sample.get("reason") != "adversarial_gate":
+            continue
+        _title = str(_gu_sample.get("title") or "")[:120]
+        if (
+            _title
+            and _title not in _seen_adversarial_give_up
+            and len(spawn_gate_adversarial_give_up_samples) < _SPAWN_GATE_REASONS_SAMPLE_CAP
+        ):
+            _seen_adversarial_give_up.add(_title)
+            _gu_entry: dict = {"title": _title}
+            _dir_id = _gu_sample.get("direction_id")
+            if _dir_id:
+                _gu_entry["direction_id"] = str(_dir_id)
+            spawn_gate_adversarial_give_up_samples.append(_gu_entry)
 
     def _apply_spawn_gate_parent_metrics() -> None:
         # Keep these as direct entry[...] writes so the manifest guard can
@@ -803,8 +889,29 @@ async def _update_direction_research_outcomes(
         entry["research_spawn_gate_unresolved_count"] = (
             spawn_gate_unresolved_count
         )
+        entry["research_spawn_gate_wholesale_retry_exhausted"] = (
+            spawn_gate_wholesale_retry_exhausted
+        )
         if spawn_gate_refuted_reasons:
             entry["research_spawn_gate_refuted_reasons"] = spawn_gate_refuted_reasons
+        if spawn_gate_parse_outcome:
+            entry["research_spawn_gate_parse_outcome"] = spawn_gate_parse_outcome
+        if spawn_gate_manifest_excluded_count:
+            entry["research_spawn_gate_manifest_excluded_fail_closed_count"] = (
+                spawn_gate_manifest_excluded_count
+            )
+            entry["research_spawn_gate_manifest_excluded_fail_closed_samples"] = (
+                spawn_gate_manifest_excluded_samples
+            )
+        # Adversarial give-up: permanently discarded findings (separate bucket
+        # from regular refuted/survived; additive, does not change legacy counters).
+        entry["research_spawn_gate_adversarial_give_up_count"] = (
+            spawn_gate_adversarial_give_up_count
+        )
+        if spawn_gate_adversarial_give_up_samples:
+            entry["research_spawn_gate_adversarial_give_up_samples"] = (
+                spawn_gate_adversarial_give_up_samples
+            )
 
     child_tasks_stmt = select(Task).where(Task.parent_task_id == research_task_uuid)
     child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()
@@ -859,29 +966,21 @@ async def _update_direction_research_outcomes(
         if ctx_.get("pr_number") or ctx_.get("rollup_pr_number"):
             return True
         return bool((ct.first_payload or {}).get("pr_number"))
-    # Per-(provider, model) cost rollup: keyed by f"{provider}|{model}", values
-    # in USD. Uses VM-runtime × spot/on-demand rate (matching admin_digest math)
-    # so values are consistent even when Task.estimated_cost_usd is unbackfilled
-    # for older rows. Tasks missing both provider and model bucket under
-    # "unknown|unknown" so legacy entries degrade without dropping cost.
-    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE  # noqa: PLC0415
-
+    # Per-(provider, model) cost rollup using the shared pair-atomic helper so
+    # both this path and the digest path stay consistent and cannot produce
+    # chimera keys (e.g. openai|claude-opus-4-8 from independently-resolved
+    # columns). Banked attempt_history costs are included; the live span is
+    # included when it exists. Both cost axes (breakdown + total) are derived
+    # from the same helper output so estimated_cost_usd == sum(breakdown).
     cost_by_provider_model: dict[str, float] = {}
     cycle_cost_total = 0.0
     for ct in child_tasks_rows:
-        if not (ct.vm_provisioned_at and ct.vm_stopped_at):
-            continue
-        rate = SPOT_RATE if ct.vm_spot else ON_DEMAND_RATE
-        t_cost = rate * (ct.vm_stopped_at - ct.vm_provisioned_at).total_seconds()
-        if t_cost <= 0:
-            continue
-        provider_key = ct.provider or "unknown"
-        model_key = ct.model or "unknown"
-        bucket_key = f"{provider_key}|{model_key}"
-        cost_by_provider_model[bucket_key] = (
-            cost_by_provider_model.get(bucket_key, 0.0) + t_cost
-        )
-        cycle_cost_total += t_cost
+        ct_costs = get_task_cost_by_provider_model(ct)
+        for bucket_key, t_cost in ct_costs.items():
+            cost_by_provider_model[bucket_key] = (
+                cost_by_provider_model.get(bucket_key, 0.0) + t_cost
+            )
+            cycle_cost_total += t_cost
     if cost_by_provider_model:
         entry["cost_by_provider_model"] = {
             k: round(v, 4) for k, v in cost_by_provider_model.items()

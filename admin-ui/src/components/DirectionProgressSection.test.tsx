@@ -164,6 +164,14 @@ describe('DirectionProgressSection spawn gate', () => {
             explicit_pass_count: 2,
             fail_open_count: 1,
             unresolved_count: 1,
+            manifest_excluded_fail_closed_count: 1,
+            manifest_excluded_fail_closed_samples: [
+              {
+                hash: 'excluded-hash',
+                title: 'Budget-excluded finding',
+                reason: 'manifest cap',
+              },
+            ],
             challenged_spawned: 3,
             challenged_merged: 2,
             challenged_merge_rate: 0.67,
@@ -171,6 +179,10 @@ describe('DirectionProgressSection spawn gate', () => {
             unchallenged_merged: 4,
             unchallenged_merge_rate: 0.40,
             refuted_reasons: ['stale: defect absent on HEAD', 'over-claimed impact'],
+            parse_outcome_distribution: {
+              challenger_failed: 1,
+              no_hash_matches: 2,
+            },
           },
         })]}
       />,
@@ -186,6 +198,7 @@ describe('DirectionProgressSection spawn gate', () => {
     expect(row.textContent).toContain('2 explicit-pass');
     expect(row.textContent).toContain('1 fail-open');
     expect(row.textContent).toContain('1 unresolved');
+    expect(row.textContent).toContain('1 manifest-excluded fail-closed');
     // Merge-rate denominators (sample sizes) surfaced beside each percentage.
     expect(row.textContent).toContain('67% challenged (2/3)');
     expect(row.textContent).toContain('40% unchallenged (4/10)');
@@ -193,6 +206,11 @@ describe('DirectionProgressSection spawn gate', () => {
     const reasons = screen.getByText(/refuted\/unresolved reasons:/);
     expect(reasons.textContent).toContain('stale: defect absent on HEAD');
     expect(reasons.textContent).toContain('over-claimed impact');
+    const excluded = screen.getByText(/manifest-excluded samples:/);
+    expect(excluded.textContent).toContain('Budget-excluded finding');
+    const parseOutcomes = screen.getByText(/parse outcomes:/);
+    expect(parseOutcomes.textContent).toContain('no_hash_matches 2');
+    expect(parseOutcomes.textContent).toContain('challenger_failed 1');
   });
 
   it('renders the strategist (bare-key) aggregate spelling as well', () => {

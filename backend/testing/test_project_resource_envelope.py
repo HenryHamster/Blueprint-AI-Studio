@@ -1,0 +1,467 @@
+"""Tests for per-project resource envelope: schema validation, resolvers, and spend helpers."""
+
+from datetime import timedelta
+
+import pytest
+
+from pydantic import ValidationError
+
+from app.schemas import BuildConfig, ResourceEnvelope
+from app.resource_envelope import (
+    resolve_project_vm_cap,
+    resolve_project_spend_ceiling,
+    resolve_project_spend_window_days,
+    get_project_recent_spend_usd,
+)
+from testing.factories import make_project, make_task, _utcnow
+
+
+# ---------------------------------------------------------------------------
+# ResourceEnvelope schema validation
+# ---------------------------------------------------------------------------
+
+
+def test_resource_envelope_valid_full():
+    env = ResourceEnvelope(max_concurrent_vms=5, spend_ceiling_usd=100.0, spend_window_days=7)
+    assert env.max_concurrent_vms == 5
+    assert env.spend_ceiling_usd == 100.0
+    assert env.spend_window_days == 7
+
+
+def test_resource_envelope_defaults():
+    env = ResourceEnvelope()
+    assert env.max_concurrent_vms is None
+    assert env.spend_ceiling_usd is None
+    assert env.spend_window_days == 30
+
+
+def test_resource_envelope_null_fields():
+    env = ResourceEnvelope(max_concurrent_vms=None, spend_ceiling_usd=None)
+    assert env.max_concurrent_vms is None
+    assert env.spend_ceiling_usd is None
+
+
+def test_resource_envelope_rejects_zero_max_concurrent_vms():
+    with pytest.raises(ValidationError):
+        ResourceEnvelope(max_concurrent_vms=0)
+
+
+def test_resource_envelope_rejects_negative_max_concurrent_vms():
+    with pytest.raises(ValidationError):
+        ResourceEnvelope(max_concurrent_vms=-1)
+
+
+def test_resource_envelope_rejects_zero_spend_ceiling():
+    with pytest.raises(ValidationError):
+        ResourceEnvelope(spend_ceiling_usd=0.0)
+
+
+def test_resource_envelope_rejects_negative_spend_ceiling():
+    with pytest.raises(ValidationError):
+        ResourceEnvelope(spend_ceiling_usd=-5.0)
+
+
+def test_resource_envelope_rejects_zero_spend_window_days():
+    with pytest.raises(ValidationError):
+        ResourceEnvelope(spend_window_days=0)
+
+
+def test_resource_envelope_rejects_negative_spend_window_days():
+    with pytest.raises(ValidationError):
+        ResourceEnvelope(spend_window_days=-1)
+
+
+def test_resource_envelope_rejects_non_numeric_max_concurrent_vms():
+    with pytest.raises(ValidationError):
+        ResourceEnvelope(max_concurrent_vms="five")
+
+
+def test_resource_envelope_rejects_unknown_fields():
+    with pytest.raises(ValidationError):
+        ResourceEnvelope(unknown_field=42)
+
+
+# ---------------------------------------------------------------------------
+# BuildConfig round-trips with resource_envelope
+# ---------------------------------------------------------------------------
+
+
+def test_build_config_without_resource_envelope_unchanged():
+    bc = BuildConfig(language="python")
+    assert bc.resource_envelope is None
+    dumped = bc.model_dump(exclude_none=True)
+    assert "resource_envelope" not in dumped
+
+
+def test_build_config_with_resource_envelope_round_trips():
+    bc = BuildConfig(
+        language="python",
+        resource_envelope=ResourceEnvelope(
+            max_concurrent_vms=3, spend_ceiling_usd=50.0, spend_window_days=14
+        ),
+    )
+    assert bc.resource_envelope is not None
+    assert bc.resource_envelope.max_concurrent_vms == 3
+    dumped = bc.model_dump(exclude_none=True)
+    assert "resource_envelope" in dumped
+    assert dumped["resource_envelope"]["max_concurrent_vms"] == 3
+    assert dumped["resource_envelope"]["spend_ceiling_usd"] == 50.0
+
+
+def test_build_config_resource_envelope_all_none_excluded():
+    """A ResourceEnvelope with all-None fields should be excluded by exclude_none=True on BuildConfig."""
+    bc = BuildConfig(resource_envelope=ResourceEnvelope())
+    dumped = bc.model_dump(exclude_none=True)
+    # The nested envelope object itself is non-None, so it appears, but its
+    # None sub-fields are stripped.
+    if "resource_envelope" in dumped:
+        assert "max_concurrent_vms" not in dumped["resource_envelope"]
+        assert "spend_ceiling_usd" not in dumped["resource_envelope"]
+
+
+def test_build_config_resource_envelope_from_dict():
+    """Validate that BuildConfig accepts resource_envelope as a nested dict (JSON deserialization path)."""
+    bc = BuildConfig.model_validate(
+        {"language": "python", "resource_envelope": {"max_concurrent_vms": 2, "spend_window_days": 30}}
+    )
+    assert bc.resource_envelope is not None
+    assert bc.resource_envelope.max_concurrent_vms == 2
+
+
+def test_build_config_resource_envelope_rejects_invalid_nested():
+    with pytest.raises(ValidationError):
+        BuildConfig(resource_envelope={"max_concurrent_vms": 0})
+
+
+# ---------------------------------------------------------------------------
+# apply_operator_build_config_overrides carry-forward
+# ---------------------------------------------------------------------------
+
+
+def test_apply_operator_overrides_carries_resource_envelope():
+    """resource_envelope is preserved across re-detect."""
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    existing = {"resource_envelope": {"max_concurrent_vms": 5, "spend_ceiling_usd": 200.0}}
+    detected = {"language": "python"}
+    result = apply_operator_build_config_overrides(detected, existing)
+    assert result["resource_envelope"] == {"max_concurrent_vms": 5, "spend_ceiling_usd": 200.0}
+
+
+def test_apply_operator_overrides_no_envelope_when_absent():
+    """resource_envelope is not injected when absent from existing config."""
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    existing = {"max_parallel_research": 3}
+    detected = {"language": "python"}
+    result = apply_operator_build_config_overrides(detected, existing)
+    assert "resource_envelope" not in result
+
+
+# ---------------------------------------------------------------------------
+# resolve_project_vm_cap
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_project_vm_cap_returns_configured_value():
+    project = make_project(build_config={"resource_envelope": {"max_concurrent_vms": 4}})
+    assert resolve_project_vm_cap(project) == 4
+
+
+def test_resolve_project_vm_cap_returns_none_when_absent():
+    project = make_project(build_config={})
+    assert resolve_project_vm_cap(project) is None
+
+
+def test_resolve_project_vm_cap_returns_none_when_null():
+    project = make_project(build_config={"resource_envelope": {"max_concurrent_vms": None}})
+    assert resolve_project_vm_cap(project) is None
+
+
+def test_resolve_project_vm_cap_returns_none_no_build_config():
+    project = make_project(build_config=None)
+    assert resolve_project_vm_cap(project) is None
+
+
+def test_resolve_project_vm_cap_tolerates_junk_string():
+    project = make_project(build_config={"resource_envelope": {"max_concurrent_vms": "ten"}})
+    assert resolve_project_vm_cap(project) is None
+
+
+def test_resolve_project_vm_cap_tolerates_junk_zero():
+    project = make_project(build_config={"resource_envelope": {"max_concurrent_vms": 0}})
+    assert resolve_project_vm_cap(project) is None
+
+
+def test_resolve_project_vm_cap_tolerates_junk_negative():
+    project = make_project(build_config={"resource_envelope": {"max_concurrent_vms": -3}})
+    assert resolve_project_vm_cap(project) is None
+
+
+def test_resolve_project_vm_cap_tolerates_bool():
+    project = make_project(build_config={"resource_envelope": {"max_concurrent_vms": True}})
+    assert resolve_project_vm_cap(project) is None
+
+
+def test_resolve_project_vm_cap_tolerates_non_dict_envelope():
+    project = make_project(build_config={"resource_envelope": "bad-value"})
+    assert resolve_project_vm_cap(project) is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_project_spend_ceiling
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_project_spend_ceiling_returns_configured_value():
+    project = make_project(build_config={"resource_envelope": {"spend_ceiling_usd": 100.0}})
+    assert resolve_project_spend_ceiling(project) == 100.0
+
+
+def test_resolve_project_spend_ceiling_returns_none_when_absent():
+    project = make_project(build_config={})
+    assert resolve_project_spend_ceiling(project) is None
+
+
+def test_resolve_project_spend_ceiling_returns_none_when_null():
+    project = make_project(build_config={"resource_envelope": {"spend_ceiling_usd": None}})
+    assert resolve_project_spend_ceiling(project) is None
+
+
+def test_resolve_project_spend_ceiling_returns_none_no_build_config():
+    project = make_project(build_config=None)
+    assert resolve_project_spend_ceiling(project) is None
+
+
+def test_resolve_project_spend_ceiling_tolerates_zero():
+    project = make_project(build_config={"resource_envelope": {"spend_ceiling_usd": 0.0}})
+    assert resolve_project_spend_ceiling(project) is None
+
+
+def test_resolve_project_spend_ceiling_tolerates_negative():
+    project = make_project(build_config={"resource_envelope": {"spend_ceiling_usd": -10.0}})
+    assert resolve_project_spend_ceiling(project) is None
+
+
+def test_resolve_project_spend_ceiling_tolerates_string():
+    project = make_project(build_config={"resource_envelope": {"spend_ceiling_usd": "fifty"}})
+    assert resolve_project_spend_ceiling(project) is None
+
+
+def test_resolve_project_spend_ceiling_accepts_int():
+    """Integer spend ceiling is coerced to float."""
+    project = make_project(build_config={"resource_envelope": {"spend_ceiling_usd": 75}})
+    result = resolve_project_spend_ceiling(project)
+    assert result == 75.0
+    assert isinstance(result, float)
+
+
+# ---------------------------------------------------------------------------
+# resolve_project_spend_window_days
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_project_spend_window_days_returns_configured_value():
+    project = make_project(build_config={"resource_envelope": {"spend_window_days": 14}})
+    assert resolve_project_spend_window_days(project) == 14
+
+
+def test_resolve_project_spend_window_days_defaults_when_absent():
+    project = make_project(build_config={})
+    assert resolve_project_spend_window_days(project) == 30
+
+
+def test_resolve_project_spend_window_days_tolerates_junk():
+    project = make_project(build_config={"resource_envelope": {"spend_window_days": "bad"}})
+    assert resolve_project_spend_window_days(project) == 30
+
+
+# ---------------------------------------------------------------------------
+# get_project_recent_spend_usd — DB-backed tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_project_recent_spend_usd_empty(db_session):
+    """Returns 0.0 when there are no jobs or tasks."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project.id, window_days=30
+    )
+    assert result == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_project_recent_spend_usd_sums_task_vm_cost(db_session):
+    """Includes banked VM cost from tasks updated within the window."""
+    from app.models import TaskStatus
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_runtime_cost_banked_db=1.5,
+        updated_at=now - timedelta(days=1),
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project.id, window_days=30
+    )
+    assert result == pytest.approx(1.5, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_get_project_recent_spend_usd_excludes_old_tasks(db_session):
+    """Tasks updated outside the window do not contribute to spend."""
+    from app.models import TaskStatus
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    old_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_runtime_cost_banked_db=9.99,
+        updated_at=now - timedelta(days=60),
+        created_at=now - timedelta(days=60),
+    )
+    db_session.add(old_task)
+    await db_session.commit()
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project.id, window_days=30
+    )
+    assert result == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_project_recent_spend_usd_sums_compute_job_cost(db_session):
+    """Includes final_cost_usd from terminal compute jobs within the window."""
+    from app.models import ComputeJob, ComputeJobStatus, ComputeJobOutcome, TaskStatus
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        spend_cap_usd=10.0,
+        final_cost_usd=2.5,
+        completed_at=now - timedelta(days=2),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project.id, window_days=30
+    )
+    assert result == pytest.approx(2.5, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_get_project_recent_spend_usd_combines_both_sources(db_session):
+    """Sums compute-job spend and task VM cost together."""
+    from app.models import ComputeJob, ComputeJobStatus, ComputeJobOutcome, TaskStatus
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_runtime_cost_banked_db=1.25,
+        updated_at=now - timedelta(days=1),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        spend_cap_usd=10.0,
+        final_cost_usd=3.75,
+        completed_at=now - timedelta(days=2),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project.id, window_days=30
+    )
+    assert result == pytest.approx(5.0, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_get_project_recent_spend_usd_scoped_to_project(db_session):
+    """Spend from a different project does not leak into the result."""
+    from app.models import ComputeJob, ComputeJobStatus, ComputeJobOutcome, TaskStatus
+
+    project_a = make_project(name="Project A")
+    project_b = make_project(name="Project B")
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    now = _utcnow()
+    task_b = make_task(
+        project_id=project_b.id,
+        status=TaskStatus.COMPLETED,
+        vm_runtime_cost_banked_db=50.0,
+        updated_at=now - timedelta(days=1),
+    )
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_b)
+
+    job_b = ComputeJob(
+        project_id=project_b.id,
+        task_id=task_b.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        spend_cap_usd=100.0,
+        final_cost_usd=20.0,
+        completed_at=now - timedelta(days=1),
+    )
+    db_session.add(job_b)
+    await db_session.commit()
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project_a.id, window_days=30
+    )
+    assert result == 0.0

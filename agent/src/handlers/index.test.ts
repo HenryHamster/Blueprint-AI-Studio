@@ -102,13 +102,13 @@ import { handleReleaseAuditChallenge } from './audit-challenge.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  // 26 BESPOKE handlers are hand-registered today. This is no longer the
+  // 27 BESPOKE handlers are hand-registered today. This is no longer the
   // launchability gate — dispatch falls back to contract-driven GENERIC runners
   // for registered types with no bespoke handler (see the contract-driven
   // dispatch suite below). The count still documents the bespoke set so a
   // dropped/duplicated bespoke entry is caught.
-  it('has exactly 26 bespoke handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(26);
+  it('has exactly 27 bespoke handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(27);
   });
 
   it.each(EXPECTED_TYPES)('contains bespoke handler for task type "%s"', (taskType) => {
@@ -413,6 +413,7 @@ const TASK_CLASS_MAP = {
   investigate:       'read-only',
   verify_tests:      'read-only',
   compute_experiment:'read-only',
+  repo_bootstrap:    'read-only',
   // Research / planning (7): read-heavy, no code shipped
   plan:              'research',
   research:          'research',
@@ -437,11 +438,11 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 7 code-change + 12 read-only + 7 research = 26 total', () => {
+  it('class distribution is 7 code-change + 13 read-only + 7 research = 27 total', () => {
     const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
     for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
     expect(counts['code-change']).toBe(7);
-    expect(counts['read-only']).toBe(12);
+    expect(counts['read-only']).toBe(13);
     expect(counts['research']).toBe(7);
   });
 

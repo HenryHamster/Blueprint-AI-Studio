@@ -138,6 +138,7 @@ def _strategic_event_completion_summary(
         or getattr(cycle, "tasks_spawned", 0)
         or 0
     )
+    adoption_declared = int(ctx.get("_strategic_adoption_declared") or 0)
     pm_changed = (
         bool(ctx.get("_strategic_problem_model_set"))
         if problem_model_changed is None
@@ -172,6 +173,8 @@ def _strategic_event_completion_summary(
             if d.get("status") == "active"
         ),
     }
+    if adoption_declared > 0:
+        summary["adoption_declared_count"] = adoption_declared
     # Compact strategic-judgment-challenge summary: rides the completion dict into
     # the websocket payload and digest. The full bounded record stays in
     # cycle_metadata for drill-down; only {mode, verdict, warned/blocked counts}
@@ -2868,6 +2871,84 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
     return applied
 
 
+def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
+    """Compute per-cycle model-size and payload-truncation telemetry for cycle_metadata.
+
+    Reads from project.problem_model (durable, not the trimmed agent view) and
+    from the assembled payload's _packer_meta so the retirement monitor can verify
+    size thresholds and payload coverage without querying the task payload directly.
+    """
+    from app.problem_model import ProblemModel, compute_model_size_signal
+
+    raw_pm = project.problem_model or {}
+    try:
+        pm = ProblemModel.model_validate(raw_pm)
+        size_signal = compute_model_size_signal(pm)
+        model_bytes: int = size_signal["serialized_bytes"]
+        capability_count: int = size_signal["capability_count"]
+        gap_count: int = size_signal["active_gap_count"]
+        model_size_status: str = size_signal["model_size_status"]
+    except Exception:
+        model_bytes = len(json.dumps(raw_pm, default=str).encode())
+        capability_count = len(raw_pm.get("capabilities") or [])
+        gap_count = len([g for g in (raw_pm.get("gaps") or []) if isinstance(g, dict) and g.get("status") == "active"])
+        model_size_status = "unknown"
+
+    packer_meta: dict = {}
+    try:
+        first_payload = task.first_payload or {}
+        packer_meta = first_payload.get("_packer_meta") or {}
+    except Exception:
+        pass
+
+    dropped: list = packer_meta.get("dropped") or []
+    trimmed: list = packer_meta.get("trimmed") or []
+
+    directions_dropped_count: int = sum(
+        1 for e in dropped
+        if isinstance(e, dict) and "direction" in str(e.get("key", "")).lower()
+    )
+    problem_model_truncated: bool = any(
+        isinstance(e, dict) and "problem_model" in str(e.get("key", "")).lower()
+        for e in (dropped + trimmed)
+    )
+
+    gap_memory_trimmed: list = packer_meta.get("gap_memory_trimmed") or []
+    gap_memory_trimmed_count: int = sum(
+        len(entry.get("gaps") or [])
+        for entry in gap_memory_trimmed
+        if isinstance(entry, dict)
+    )
+    gap_memory_hidden_entries: int = 0
+    for entry in gap_memory_trimmed:
+        if not isinstance(entry, dict):
+            continue
+        for gap in entry.get("gaps") or []:
+            if not isinstance(gap, dict):
+                continue
+            fields = gap.get("fields") or {}
+            if not isinstance(fields, dict):
+                continue
+            for field_val in fields.values():
+                if not isinstance(field_val, dict):
+                    continue
+                total = field_val.get("total") or 0
+                shown = field_val.get("shown") or 0
+                if isinstance(total, int) and isinstance(shown, int):
+                    gap_memory_hidden_entries += max(0, total - shown)
+
+    return {
+        "model_bytes": model_bytes,
+        "capability_count": capability_count,
+        "gap_count": gap_count,
+        "model_size_status": model_size_status,
+        "directions_dropped_count": directions_dropped_count,
+        "problem_model_truncated": problem_model_truncated,
+        "gap_memory_trimmed_count": gap_memory_trimmed_count,
+        "gap_memory_hidden_entries": gap_memory_hidden_entries,
+    }
+
+
 async def _handle_strategic_completion(
     task: Task,
     logs: str,
@@ -2912,6 +2993,7 @@ async def _handle_strategic_completion(
     task_payload = task.first_payload
     spawned_vision_rev = (task_payload.get("vision") or {}).get("revision", 0)
     tasks_spawned = (task.context or {}).get("_strategic_tasks_spawned", 0)
+    adoption_declared = int((task.context or {}).get("_strategic_adoption_declared", 0))
     api_was_used = (
         (task.context or {}).get("_strategic_vision_set", False)
         or vision_rev > spawned_vision_rev
@@ -2929,6 +3011,7 @@ async def _handle_strategic_completion(
         cycle_id = (task.context or {}).get("strategic_cycle_id")
         dirs_created = (task.context or {}).get("_strategic_dirs_created", 0)
         dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
+        adoption_declared = int(adoption_declared or 0)
         created_ids = list((task.context or {}).get("_strategic_created_ids", []))
         retired_ids = list((task.context or {}).get("_strategic_retired_ids", []))
         # Collect rationales regardless of cycle_id so synthesized memos always
@@ -2940,8 +3023,16 @@ async def _handle_strategic_completion(
             _vision_updated = (task.context or {}).get(
                 "_strategic_vision_set", False
             ) or vision_rev > spawned_vision_rev
+            _adoption_suffix = (
+                f", {adoption_declared} capability adoption decision(s) declared"
+                if adoption_declared
+                else ""
+            )
             _spawn_suffix = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
-            _summary = f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, {dirs_retired} retired{_spawn_suffix}"
+            _summary = (
+                f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, "
+                f"{dirs_retired} retired{_adoption_suffix}{_spawn_suffix}"
+            )
             created_rationales = _collect_rationales(
                 project, created_ids, _CREATED_NOTE_PREFIX
             )
@@ -2967,6 +3058,15 @@ async def _handle_strategic_completion(
                 "created_predictions": created_predictions,
                 "retired_final_metrics": retired_final_metrics,
             }
+            try:
+                _extra["model_gc_telemetry"] = _compute_model_gc_telemetry(
+                    project, task
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: failed to compute model_gc_telemetry (non-fatal)",
+                    exc_info=True,
+                )
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
             if _retirement_gate_verdicts is not None:
@@ -3085,8 +3185,17 @@ async def _handle_strategic_completion(
                 f"on successful cycle (project {project.id})"
             )
         session.add(project)
+        _adoption_suffix_msg = (
+            f", {adoption_declared} capability adoption decision(s) declared"
+            if adoption_declared
+            else ""
+        )
         _spawn_suffix_msg = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
-        task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions, {dirs_created} created, {dirs_retired} retired{_spawn_suffix_msg}"
+        task.latest_status_message = (
+            f"Strategic review complete — vision rev {vision_rev}, {active_dirs} "
+            f"active directions, {dirs_created} created, {dirs_retired} retired"
+            f"{_adoption_suffix_msg}{_spawn_suffix_msg}"
+        )
         session.add(task)
         # Audit: check for unaddressed FEEDBACK messages
         remaining_feedback_result = await session.execute(
@@ -3151,6 +3260,7 @@ async def _handle_strategic_completion(
         )
         logger.info(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
+            f"{_adoption_suffix_msg}{_spawn_suffix_msg}"
         )
         return
 
@@ -3397,6 +3507,25 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Updated problem_model for project {project.id} "
                     f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
                 )
+                # Carry proof records and adoption verdicts onto survivor keys
+                # when a capability consolidation occurred in this write.
+                _consolidated = pm_diff.get("capabilities_consolidated") if pm_diff else None
+                if _consolidated:
+                    from app.capability_proof import carry_proof_records_for_consolidation
+                    from app.capability_trial_verdict import carry_adoption_verdicts_for_consolidation
+
+                    if not isinstance(getattr(project, "capability_proof_records", None), dict):
+                        project.capability_proof_records = {}
+                    project.capability_proof_records = carry_proof_records_for_consolidation(
+                        _consolidated, project.capability_proof_records
+                    )
+                    flag_modified(project, "capability_proof_records")
+                    if not isinstance(getattr(project, "capability_adoption_verdicts", None), dict):
+                        project.capability_adoption_verdicts = {}
+                    project.capability_adoption_verdicts = carry_adoption_verdicts_for_consolidation(
+                        _consolidated, project.capability_adoption_verdicts
+                    )
+                    flag_modified(project, "capability_adoption_verdicts")
                 try:
                     from app import release_version as _rv
 

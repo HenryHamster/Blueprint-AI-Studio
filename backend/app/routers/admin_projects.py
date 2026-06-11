@@ -38,7 +38,9 @@ from app.ci_resolution import (
     compute_merge_verification_verdict,
     merge_gate_runtime_block,
 )
+from app.capability_proof import enrich_problem_model_capability_proofs
 from app.problem_model import compute_model_size_signal, ProblemModel
+from app.capability_trial_verdict import get_trial_verdicts
 
 router = APIRouter(
     prefix="/api/admin",
@@ -58,6 +60,28 @@ def _redact_build_config(build_config: dict, role: str) -> dict:
     result = dict(build_config)
     result.pop("env_vars", None)
     return result
+
+
+def _build_capability_proof_summary(proof_records: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert capability_proof_records into a summary per capability.
+
+    For each capability, returns: proof_count, latest proof_kind, latest proved_at,
+    latest commit_sha (from the most recent proof entry in the list).
+    """
+    summary = {}
+    if not proof_records:
+        return summary
+    for cap_name, entries in proof_records.items():
+        if not isinstance(entries, list) or not entries:
+            continue
+        latest = entries[-1]  # Most recent entry is last
+        summary[cap_name] = {
+            "proof_count": len(entries),
+            "latest_proof_kind": latest.get("proof_kind"),
+            "latest_proved_at": latest.get("proved_at"),
+            "latest_commit_sha": latest.get("commit_sha"),
+        }
+    return summary
 
 
 @router.get("/projects")
@@ -181,6 +205,10 @@ async def get_project(
         raise HTTPException(status_code=404, detail="Project not found")
     project, role = row
     problem_model_dict = project.problem_model or {}
+    proof_problem_model = enrich_problem_model_capability_proofs(
+        problem_model_dict,
+        getattr(project, "capability_proof_records", None),
+    )
     size_health = None
     if problem_model_dict:
         try:
@@ -199,7 +227,7 @@ async def get_project(
         "directions": project.directions,
         "vision": project.vision or {},
         "design_doc": project.design_doc or {},
-        "problem_model": problem_model_dict,
+        "problem_model": proof_problem_model,
         "problem_model_size_health": size_health,
         "running_update": project.running_update,
         "running_update_acknowledged_at": (
@@ -217,6 +245,10 @@ async def get_project(
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
         "approval_gate_config": project.approval_gate_config or {},
+        "capability_proof_summary": _build_capability_proof_summary(
+            project.capability_proof_records or {}
+        ),
+        "capability_adoption_verdicts": get_trial_verdicts(project),
         "my_role": role,
     }
 
@@ -1266,6 +1298,7 @@ async def get_autonomous_status(
     current_user: dict = Depends(get_current_user),
 ):
     from app.shared_state import autonomous_failure_counts, runtime_config
+    from app.autonomous_research import project_parallelism_cap
 
     projects = (
         (
@@ -1281,21 +1314,21 @@ async def get_autonomous_status(
 
     one_hour_ago = _utcnow() - timedelta(hours=1)
 
-    # Count autonomous RESEARCH tasks per project in the last hour (matches rate limit guard)
+    # Count ALL orchestrator tasks per project in the last hour (mirrors the per-project
+    # rate guard in autonomous_research.py which counts all ORCHESTRATOR-created tasks).
     user_pids = _user_project_ids(current_user["user_id"])
-    research_count_rows = (
+    orch_count_rows = (
         await session.execute(
             select(Task.project_id, func.count().label("cnt"))
             .where(
                 Task.project_id.in_(user_pids),
                 Task.created_by == "ORCHESTRATOR",
                 Task.created_at >= one_hour_ago,
-                Task.payloads[0]["type"].astext == "research",
             )
             .group_by(Task.project_id)
         )
     ).all()
-    tasks_per_project: dict = {row.project_id: row.cnt for row in research_count_rows}
+    tasks_per_project: dict = {row.project_id: row.cnt for row in orch_count_rows}
 
     # Batch query: most recent autonomous task per project
     last_research_subq = (
@@ -1316,9 +1349,23 @@ async def get_autonomous_status(
         row.project_id: row.max_created_at for row in last_research_rows
     }
 
+    fleet_default = runtime_config["max_autonomous_tasks_per_hour"]
     result = []
     for project in projects:
         project_id_str = str(project.id)
+        effective_cap = project_parallelism_cap(
+            project,
+            "max_autonomous_tasks_per_hour",
+            "max_autonomous_tasks_per_hour",
+            12,
+        )
+        bc = getattr(project, "build_config", None) or {}
+        override_val = bc.get("max_autonomous_tasks_per_hour")
+        has_override = (
+            isinstance(override_val, int)
+            and not isinstance(override_val, bool)
+            and override_val >= 1
+        )
         result.append(
             {
                 "project_id": project_id_str,
@@ -1331,8 +1378,90 @@ async def get_autonomous_status(
                 if last_research_map.get(project.id)
                 else None,
                 "tasks_spawned_last_hour": tasks_per_project.get(project.id, 0),
-                "rate_limit": runtime_config["max_autonomous_tasks_per_hour"],
+                "rate_limit": effective_cap,
+                "fleet_default_rate_limit": fleet_default,
+                "rate_limit_source": "project_override" if has_override else "fleet_default",
             }
         )
 
     return {"projects": result}
+
+
+@router.post("/projects/{project_id}/bootstrap/retry")
+@limiter.limit("5/minute")
+async def retry_project_bootstrap(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Enqueue a recovery repo_bootstrap task for a degraded or never-bootstrapped project.
+
+    Returns a JSON body with ``state`` describing the outcome:
+    - ``spawned`` — a new task was created; ``task_id`` is present.
+    - ``already_active`` — a bootstrap task is already running; no duplicate created.
+    - ``already_completed`` — bootstrap_completed_at is set; no task created.
+    - ``not_eligible`` — project is a self-repo or empty-repo; not bootstrappable.
+    """
+    from app.repo_bootstrap import spawn_bootstrap_task
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    result = await spawn_bootstrap_task(
+        project,
+        session,
+        is_first_bootstrap=False,
+        spawn_reason="operator_retry",
+    )
+    if result.outcome == "spawned":
+        await session.commit()
+
+    return {
+        "state": result.outcome,
+        "task_id": result.task_id,
+        "reason": result.reason,
+    }
+
+
+@router.post("/projects/{project_id}/bootstrap/refresh")
+@limiter.limit("5/minute")
+async def refresh_project_bootstrap(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Re-run repo_bootstrap for an already-COMPLETED project to refresh its overview.
+
+    Unlike ``/bootstrap/retry`` (which serves degraded/never-run projects), this
+    bypasses the ``bootstrap_completed_at`` not-eligible gate so an operator can
+    request a fresh overview for a healthy project. It is a one-shot action: it
+    does NOT clear ``bootstrap_completed_at`` and does NOT arm automatic retries.
+
+    Returns a JSON body with ``state`` describing the outcome:
+    - ``spawned`` — a new bootstrap task was created; ``task_id`` is present.
+    - ``already_active`` — a bootstrap task is already running; no duplicate created.
+    - ``not_eligible`` — project is a self-repo or empty-repo; not bootstrappable.
+    """
+    from app.repo_bootstrap import REFRESH_SPAWN_REASON, spawn_bootstrap_task
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    result = await spawn_bootstrap_task(
+        project,
+        session,
+        is_first_bootstrap=False,
+        spawn_reason=REFRESH_SPAWN_REASON,
+    )
+    if result.outcome == "spawned":
+        await session.commit()
+
+    return {
+        "state": result.outcome,
+        "task_id": result.task_id,
+        "reason": result.reason,
+    }

@@ -44,9 +44,15 @@ function failMsg(
   );
 }
 
+// Shared isolated workspace for subprocesses that reach configureAgentPermissions.
+// Without this, those subprocesses write exit-1 git hooks into the real VM workspace.
+const smokeTmpDir = mkdtempSync(path.join(tmpdir(), 'bake-smoke-'));
 let lifecycleTmpDir: string | null = null;
 
 afterAll(() => {
+  try {
+    rmSync(smokeTmpDir, { recursive: true, force: true });
+  } catch { /* ignore */ }
   if (lifecycleTmpDir) {
     try {
       rmSync(lifecycleTmpDir, { recursive: true, force: true });
@@ -61,7 +67,9 @@ describe('memo bake-smoke scripts execute with PACKER sentinel and exit 0', { ti
   });
 
   it('memo-bake-smoke-codex.ts exits 0 and emits PACKER_MEMO_CLAUDE_PATH_OK', () => {
-    const result = runSmoke('memo-bake-smoke-codex.ts');
+    const result = runSmoke('memo-bake-smoke-codex.ts', {
+      AGENT_WORKSPACE: smokeTmpDir,
+    });
     expect(result.status, failMsg('memo-bake-smoke-codex.ts', result)).toBe(0);
     expect(
       String(result.stdout),
@@ -70,7 +78,9 @@ describe('memo bake-smoke scripts execute with PACKER sentinel and exit 0', { ti
   });
 
   it('memo-bake-smoke-primary.ts exits 0 and emits PACKER_MEMO_PRIMARY_PATH_OK', () => {
-    const result = runSmoke('memo-bake-smoke-primary.ts');
+    const result = runSmoke('memo-bake-smoke-primary.ts', {
+      AGENT_WORKSPACE: smokeTmpDir,
+    });
     expect(result.status, failMsg('memo-bake-smoke-primary.ts', result)).toBe(0);
     expect(
       String(result.stdout),
@@ -79,7 +89,9 @@ describe('memo bake-smoke scripts execute with PACKER sentinel and exit 0', { ti
   });
 
   it('memo-bake-smoke-reopen.ts exits 0 and emits PACKER_MEMO_REOPEN_RETRY_OK', () => {
-    const result = runSmoke('memo-bake-smoke-reopen.ts');
+    const result = runSmoke('memo-bake-smoke-reopen.ts', {
+      AGENT_WORKSPACE: smokeTmpDir,
+    });
     expect(result.status, failMsg('memo-bake-smoke-reopen.ts', result)).toBe(0);
     expect(
       String(result.stdout),

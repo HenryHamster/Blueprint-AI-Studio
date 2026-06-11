@@ -254,6 +254,53 @@ async def test_research_payload_includes_knowledge_index_scoped_to_direction(
 
 
 @pytest.mark.asyncio
+async def test_research_payload_annotations_include_capability_proof_status(
+    db_session,
+):
+    """Spawned research payloads expose proof-annotated capability vocabulary."""
+    project = Project(
+        name="Capability Proof Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-proof-vocab")],
+        vision={"purpose": "test"},
+        problem_model={
+            "capabilities": [
+                {"name": "Repo Map", "status": "working"},
+                {"name": "Prompt Repair", "status": "planned"},
+            ]
+        },
+        capability_proof_records={
+            "repo-map": [
+                {
+                    "task_id": "task-proof-1",
+                    "proved_at": "2026-06-09T00:00:00",
+                    "proof_kind": "named_test",
+                    "proof_ref": "backend/testing/test_capability_proof.py::test_repo_map",
+                    "commit_sha": "abc123",
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    capabilities = research[0].first_payload["available_capabilities"]
+    assert capabilities == [
+        {"name": "repo-map", "status": "working", "proof_status": "proven"},
+        {"name": "prompt-repair", "status": "planned", "proof_status": "unproven"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_autonomous_research_stamps_idempotency_key(db_session):
     """A spawned directed research task carries the shared direction-scoped
     idempotency key; an undirected (cross-cutting) cycle carries the undirected
@@ -486,6 +533,133 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
     assert len(result.scalars().all()) == 0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. _spawn_research_task — Bootstrap-Pending Guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _active_direction_with_cooldown_elapsed(direction_id: str, text: str = "Research direction") -> dict:
+    """Return an active direction whose last_researched_at is well past cooldown."""
+    return {
+        **_active_direction(direction_id, text),
+        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_research_spawn_defers_while_external_repo_bootstrap_pending(db_session):
+    """_spawn_research_task defers (no task created) while a repo_bootstrap is in-flight.
+
+    This is the acceptance test for the bootstrap-pending guard added to
+    _spawn_research_task_inner.  An external-repo project whose
+    build_config.bootstrap_completed_at is unset and has an active
+    repo_bootstrap task must not spawn research work.
+    """
+    direction = _active_direction_with_cooldown_elapsed("d-bootstrap-defer", "Ungrounded research")
+    project = Project(
+        name="Bootstrap Pending Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_strategic_failures": 3},
+        build_config={},  # bootstrap_completed_at not set
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Simulate an in-flight repo_bootstrap task
+    bootstrap_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "repo_bootstrap"}],
+    )
+    db_session.add(bootstrap_task)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    assert result.scalars().first() is None, (
+        "No research task should be created while repo_bootstrap is in-flight"
+    )
+
+
+@pytest.mark.asyncio
+async def test_research_spawn_proceeds_when_external_repo_bootstrap_completed(db_session):
+    """_spawn_research_task proceeds normally once bootstrap_completed_at is set."""
+    direction = _active_direction_with_cooldown_elapsed("d-bootstrap-ok", "Grounded research")
+    project = Project(
+        name="Bootstrap Complete Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_strategic_failures": 3},
+        build_config={"bootstrap_completed_at": "2026-01-01T00:00:00"},
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    assert result.scalars().first() is not None, (
+        "A research task should be created once bootstrap is complete"
+    )
+
+
+@pytest.mark.asyncio
+async def test_research_spawn_proceeds_for_self_repo_regardless_of_bootstrap(db_session):
+    """_spawn_research_task is not gated on bootstrap for self-repo projects."""
+    direction = _active_direction_with_cooldown_elapsed("d-self-repo", "Self-repo research")
+    project = Project(
+        name="Self Repo Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_strategic_failures": 3},
+        build_config={},  # bootstrap_completed_at not set
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Even with an active repo_bootstrap task, self-repo projects are unaffected
+    bootstrap_task = Task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "repo_bootstrap"}],
+    )
+    db_session.add(bootstrap_task)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    assert result.scalars().first() is not None, (
+        "Self-repo projects should not be gated on bootstrap completion"
+    )
+
+
 @pytest.mark.asyncio
 async def test_blocked_research_lane_keeps_direction_out_of_respawn(db_session):
     """A direction whose prior research task is BLOCKED on an upstream
@@ -646,6 +820,64 @@ async def test_strategic_spawn_skipped_when_advisory_lock_held(db_session, mocke
 
 
 @pytest.mark.asyncio
+async def test_architecture_cycle_triggers_on_first_cycle_with_empty_design_doc(
+    db_session, mocker
+):
+    """Architecture cycle should trigger on the first strategic cycle when the
+    design_doc is empty (has no systems), ensuring newly-onboarded projects create
+    architectural context before spending cycles on undirected research.
+
+    Regression check: with default arch_frequency=3, cycle 1 normally satisfies
+    (1 % 3 == 1 != 0), so is_architecture_cycle would be False. The empty-design_doc
+    override ensures the architecture phase runs despite the modulo check, giving
+    fresh projects a design_doc to anchor subsequent research."""
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Empty Design Doc Architecture Trigger",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-arch01", "Test direction")],
+        vision={"purpose": "test"},
+        design_doc={},  # Empty: no systems key, should trigger architecture
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A prior strategic task older than strategic_max_interval (180min) so the
+    # wall-clock backstop promotes force_strategic=True, which triggers the strategic
+    # spawn regardless of the modulo counter.
+    stale_strategic = Task(
+        project_id=project.id,
+        title="Old strategic cycle",
+        payloads=[{"type": "design_doc_update", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(minutes=200),
+    )
+    db_session.add(stale_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert design_doc_mock.called, (
+        "architecture cycle must trigger on first strategic cycle when design_doc "
+        "is empty (has no systems)"
+    )
+    # When architecture cycle triggers, it calls _spawn_design_doc_update, not
+    # _spawn_strategic_review. Strategic review comes as a completion-chain task
+    # after design_doc_update completes.
+    assert not strategic_review_mock.called
+
+
+@pytest.mark.asyncio
 async def test_all_paused_directions_skip_when_backstop_not_due(db_session, mocker):
     """Companion: with no strategic cycle due (backstop not firing, force_strategic
     stays False), an all-paused direction set is correctly skipped — the guard only
@@ -719,6 +951,7 @@ async def test_refresh_marker_bypasses_spawn_cooldown_and_clears(db_session, moc
                 "count": 1,
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -859,6 +1092,7 @@ async def test_operator_refresh_fires_despite_tripped_breaker(db_session, mocker
                 "origin": "operator",
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1049,6 +1283,7 @@ async def test_operator_steering_consumed_posts_acted_confirmation(db_session, m
                 "excerpt": "Please refocus on the auth bug.",
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1117,6 +1352,7 @@ async def test_operator_marker_without_excerpt_posts_no_acted_confirmation(
                 # no excerpt — no message text was preserved
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1175,6 +1411,7 @@ async def test_qualification_consumed_posts_no_acted_confirmation(db_session, mo
                 # no origin → legacy qualification
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1305,6 +1542,7 @@ async def test_operator_refresh_deferred_on_payload_too_large_posts_once(
                 "origin": "operator",
             },
         },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -11297,6 +11535,7 @@ async def test_strategic_max_interval_backstop_fires_when_stale(db_session, mock
         directions=[_active_direction("d-backstop01", "Test direction")],
         # purpose set → not force_strategic; count=1 → 1 % 6 != 0 → modulo inactive
         vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -11388,6 +11627,7 @@ async def test_strategic_max_interval_backstop_fires_when_all_directions_busy(
         autonomous_enabled=True,
         directions=[_active_direction(dir_id, "Busy direction")],
         vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -12242,6 +12482,406 @@ async def test_undirected_guard_scoped_per_project(db_session):
     assert await _undirected_research_recently_active(p2.id, db_session) is True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# _directed_research_recently_completed unit tests
+# (mirrors the undirected guard test block above)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _add_directed_research(
+    session, project_id, direction_id, *, status, age_minutes=0, status_log=None
+):
+    """Insert a directed research task for the given direction."""
+    t = Task(
+        project_id=project_id,
+        title=f"Research: direction-{direction_id}",
+        description="x",
+        payloads=[
+            {
+                "type": "research",
+                "current_direction_id": direction_id,
+                "directions": [],
+                "base_branch": "main",
+            }
+        ],
+        status_log=status_log or [],
+        status=status,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    session.add(t)
+    await session.commit()
+    if age_minutes:
+        t.created_at = datetime.utcnow() - timedelta(minutes=age_minutes)
+        session.add(t)
+        await session.commit()
+    return t
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_false_when_none_exist(db_session):
+    """Returns False when no research tasks for the direction exist at all."""
+    from app.autonomous_research import _directed_research_recently_completed
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await _directed_research_recently_completed(
+        project.id, "d-abc123", db_session
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_true_within_cooldown(db_session):
+    """Returns True when a COMPLETED research task exists within the cooldown window."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["completed_research_cooldown_minutes"] = 120
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-dir001",
+            status=TaskStatus.COMPLETED,
+            age_minutes=30,  # within 120-min window
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-dir001", db_session
+        )
+        assert result is True
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_true_when_completion_recent_but_created_old(
+    db_session,
+):
+    """Uses the terminal timestamp, not created_at, for completed research cooldowns."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["completed_research_cooldown_minutes"] = 60
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        completed_at = datetime.utcnow() - timedelta(minutes=15)
+        old_created = datetime.utcnow() - timedelta(hours=4)
+        task = Task(
+            project_id=project.id,
+            title="Research: direction-d-dir-old",
+            description="x",
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": "d-dir-old",
+                    "directions": [],
+                    "base_branch": "main",
+                }
+            ],
+            status_log=[{"t": completed_at.isoformat(), "s": "COMPLETED"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            created_at=old_created,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        result = await _directed_research_recently_completed(
+            project.id, "d-dir-old", db_session
+        )
+        assert result is True
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_false_after_cooldown(db_session):
+    """Returns False when the COMPLETED task is older than the cooldown window."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["completed_research_cooldown_minutes"] = 60
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-dir002",
+            status=TaskStatus.COMPLETED,
+            age_minutes=120,  # older than 60-min window
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-dir002", db_session
+        )
+        assert result is False
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_false_for_different_direction(db_session):
+    """Returns False when the COMPLETED task is on a different direction."""
+    from app.autonomous_research import _directed_research_recently_completed
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _add_directed_research(
+        db_session,
+        project.id,
+        "d-dir-A",
+        status=TaskStatus.COMPLETED,
+        age_minutes=10,
+    )
+    # Guard for a different direction should not be triggered.
+    result = await _directed_research_recently_completed(
+        project.id, "d-dir-B", db_session
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_false_active_not_completed(db_session):
+    """Returns False when only ACTIVE (non-COMPLETED) research exists — that path
+    is handled by the active-tasks lock, not this guard."""
+    from app.autonomous_research import _directed_research_recently_completed
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _add_directed_research(
+        db_session,
+        project.id,
+        "d-dir003",
+        status=TaskStatus.IN_PROGRESS,
+        age_minutes=5,
+    )
+    result = await _directed_research_recently_completed(
+        project.id, "d-dir003", db_session
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_scoped_per_project(db_session):
+    """A COMPLETED task in another project does not block this one."""
+    from app.autonomous_research import _directed_research_recently_completed
+
+    p1 = Project(name="P1", user_id="test-user-123")
+    p2 = Project(name="P2", user_id="test-user-123")
+    db_session.add_all([p1, p2])
+    await db_session.commit()
+    await db_session.refresh(p1)
+    await db_session.refresh(p2)
+
+    await _add_directed_research(
+        db_session,
+        p2.id,
+        "d-shared",
+        status=TaskStatus.COMPLETED,
+        age_minutes=10,
+    )
+    assert (
+        await _directed_research_recently_completed(p1.id, "d-shared", db_session)
+        is False
+    )
+    assert (
+        await _directed_research_recently_completed(p2.id, "d-shared", db_session)
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_disabled_by_zero_cooldown(db_session):
+    """Setting completed_research_cooldown_minutes <= 0 disables the guard."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["completed_research_cooldown_minutes"] = 0
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-dir004",
+            status=TaskStatus.COMPLETED,
+            age_minutes=5,
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-dir004", db_session
+        )
+        assert result is False
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_spawn_skipped_when_completed_directed_research_within_cooldown(
+    db_session, mocker
+):
+    """_spawn_research_task skips a direction when a COMPLETED research task for
+    that direction exists within the completed_research_cooldown_minutes window.
+    This covers the gap where _handle_research_completion dies before setting
+    last_researched_at (incident 2026-06-10: 3x same-direction re-runs in 80 min)."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    direction_id = "d-dedup01"
+    _runtime_config["completed_research_cooldown_minutes"] = 120
+
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new_callable=AsyncMock,
+        return_value={"action": "none"},
+    )
+
+    try:
+        project = Project(
+            name="Dedup Completed",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction(direction_id)],
+            vision={"purpose": "test", "_research_spawn_count": 1},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Simulate a recently-completed research task for this direction
+        completed = Task(
+            project_id=project.id,
+            title=f"Research: direction-{direction_id}",
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": direction_id,
+                    "directions": [],
+                    "base_branch": "main",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(completed)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.status == TaskStatus.QUEUED,
+            )
+        )
+        queued = result.scalars().all()
+        assert len(queued) == 0, (
+            "Must not spawn a new research task when a COMPLETED one exists "
+            "within the cooldown window"
+        )
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_spawn_allowed_when_completed_directed_research_outside_cooldown(
+    db_session, mocker
+):
+    """_spawn_research_task allows a new spawn when the previous COMPLETED research
+    is older than the cooldown window."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    direction_id = "d-dedup02"
+    _runtime_config["completed_research_cooldown_minutes"] = 60
+
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new_callable=AsyncMock,
+        return_value={"action": "none"},
+    )
+
+    try:
+        project = Project(
+            name="Dedup Outside Window",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction(direction_id)],
+            vision={"purpose": "test", "_research_spawn_count": 1},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Old completed task — outside the 60-min window
+        old_completed = Task(
+            project_id=project.id,
+            title=f"Research: direction-{direction_id}",
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": direction_id,
+                    "directions": [],
+                    "base_branch": "main",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(old_completed)
+        await db_session.commit()
+        old_completed.created_at = datetime.utcnow() - timedelta(minutes=90)
+        db_session.add(old_completed)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.status == TaskStatus.QUEUED,
+            )
+        )
+        queued = result.scalars().all()
+        assert len(queued) == 1, (
+            "Should spawn a new research task when the completed one is outside "
+            "the cooldown window"
+        )
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
 @pytest.mark.asyncio
 async def test_idle_research_skips_paused_project(db_session, mocker):
     """`_check_idle_research` must not spawn work for a paused project even when
@@ -12561,6 +13201,179 @@ async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_ses
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Qualification-origin refresh must force a strategic tick when due
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_qualification_refresh_forces_strategic_tick_when_due_and_modulo_idle(
+    db_session, mocker
+):
+    """A due qualification-origin refresh must promote the tick into the
+    strategic path even when the modulo cadence would not fire."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    now = datetime.utcnow()
+    project = Project(
+        name="Qualification refresh forces strategic",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-qualforce1", "Active research lane")],
+        vision={
+            "purpose": "test",
+            "_research_spawn_count": 1,  # 1 % 6 != 0, so modulo stays idle
+            "_strategic_refresh_last_fired_at": (now - timedelta(minutes=5)).isoformat(),
+            "_strategic_refresh": {
+                "requested_at": now.isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+                "origin": "qualification",
+            },
+        },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    recent_strategic = Task(
+        project_id=project.id,
+        title="Recent strategic cycle",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(minutes=5),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(recent_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, (
+        "Due qualification-origin refresh must force a strategic tick even when "
+        "the modulo cadence is idle"
+    )
+
+
+@pytest.mark.asyncio
+async def test_qualification_refresh_parks_at_breaker_threshold(
+    db_session, mocker
+):
+    """A qualification-origin refresh must still park when the breaker is tripped."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    now = datetime.utcnow()
+    project = Project(
+        name="Qualification refresh parks at breaker",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_failures": 3,
+            "_research_spawn_count": 1,
+            "_strategic_refresh_last_fired_at": (now - timedelta(minutes=5)).isoformat(),
+            "_strategic_refresh": {
+                "requested_at": now.isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+                "origin": "qualification",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    recent_strategic = Task(
+        project_id=project.id,
+        title="Recent strategic cycle",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(minutes=5),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(recent_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert not strategic_review_mock.called, (
+        "Qualification-origin refresh must stay parked when the failure breaker is tripped"
+    )
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_strategic_refresh") is not None
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_still_forces_strategic_tick_when_due(db_session, mocker):
+    """Operator-origin refreshes must keep bypassing the breaker when due."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    now = datetime.utcnow()
+    project = Project(
+        name="Operator refresh forces strategic",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_failures": 3,
+            "_research_spawn_count": 1,
+            "_strategic_refresh_last_fired_at": (now - timedelta(minutes=5)).isoformat(),
+            "_strategic_refresh": {
+                "requested_at": now.isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    recent_strategic = Task(
+        project_id=project.id,
+        title="Recent strategic cycle",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(minutes=5),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(recent_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, (
+        "Operator-origin refresh must continue to bypass the breaker when due"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Missing-foundation demand injected into the research spawn payload
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -12668,3 +13481,900 @@ async def test_research_payload_omits_demand_when_none(db_session):
     assert "missing_capability_demand" not in payload
     assert "Missing-foundation demand" not in (payload.get("prompt_suffix") or "")
     validate_internal_payload(dict(payload), "test_research_no_demand")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-project spend ceiling gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mocker):
+    """Spend ceiling gate blocks spawning when window spend >= ceiling, allows when below,
+    deduplicates alerts, and is a no-op when no ceiling is set.
+
+    Covers: tactical-research gate (end-to-end), alert deduplication, and the
+    unset-ceiling path. The acceptance selector for this task.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    # ── Part 1: ceiling exceeded → no spawn, alert created ──
+    project = Project(
+        name="Spend Ceiling Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-spend01")],
+        build_config={"daily_spend_ceiling_usd": 1.0},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mock_spend = mocker.patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=AsyncMock(return_value=1.5),
+    )
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(tasks) == 0, "No task should be spawned when spend ceiling is exceeded"
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    ceiling_alerts = [a for a in alerts if "Spend ceiling" in a.title]
+    assert len(ceiling_alerts) == 1, "Exactly one spend-ceiling alert should be created"
+    assert "1.5000" in ceiling_alerts[0].message
+    assert "1.0000" in ceiling_alerts[0].message
+
+    # ── Part 2: alert deduplication — second call must not create a second alert ──
+    await _spawn_research_task(project, db_session)
+    alerts2 = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    ceiling_alerts2 = [a for a in alerts2 if "Spend ceiling" in a.title]
+    assert len(ceiling_alerts2) == 1, "Alert must be deduplicated — still exactly one"
+
+    assert mock_spend.call_count >= 2, "Spend function should be called each gate evaluation"
+
+    # ── Part 3: spend below ceiling → task spawned ──
+    project2 = Project(
+        name="Spend Below Ceiling",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-spend02")],
+        build_config={"daily_spend_ceiling_usd": 10.0},
+        vision={"purpose": "test"},
+    )
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    mocker.patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=AsyncMock(return_value=2.0),
+    )
+
+    await _spawn_research_task(project2, db_session)
+
+    result2 = await db_session.execute(
+        select(Task).where(Task.project_id == project2.id)
+    )
+    tasks2 = [t for t in result2.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(tasks2) >= 1, "Task should be spawned when spend is below ceiling"
+
+    # ── Part 4: no ceiling set → today's behavior, no alert, no spend query ──
+    project3 = Project(
+        name="No Ceiling",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-spend03")],
+        build_config={},  # no daily_spend_ceiling_usd
+        vision={"purpose": "test"},
+    )
+    db_session.add(project3)
+    await db_session.commit()
+    await db_session.refresh(project3)
+
+    # Re-patch to count calls cleanly for the no-ceiling assertion
+    no_ceiling_mock = mocker.patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=AsyncMock(return_value=999.0),
+    )
+    await _spawn_research_task(project3, db_session)
+
+    assert no_ceiling_mock.call_count == 0, (
+        "compute_project_window_spend_usd must NOT be called when no ceiling is set"
+    )
+    # Also assert no spend-ceiling alerts for project3
+    alerts3 = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project3.id))
+    ).scalars().all()
+    ceiling_alerts3 = [a for a in alerts3 if "Spend ceiling" in a.title]
+    assert len(ceiling_alerts3) == 0, "No alert when no ceiling is configured"
+
+
+@pytest.mark.asyncio
+async def test_research_payload_available_capabilities_carry_proof_status(db_session):
+    """The research payload's available_capabilities entries carry the durable
+    proof_status axis (proven vs unproven) so the research agent can distinguish
+    proven from working-but-unproven capabilities when declaring refs."""
+    project = await _spawn_tactical_research(
+        db_session, [_active_direction("d-research3", "Active research lane")]
+    )
+    # Registry declares two capabilities; only one has a durable proof record.
+    project.problem_model = {
+        "intent": {"purpose": "test"},
+        "capabilities": [
+            {"name": "auth-core", "status": "working"},
+            {"name": "fraud-detect", "status": "working"},
+        ],
+    }
+    project.capability_proof_records = {
+        "auth-core": [{"proof_kind": "named_test", "commit_sha": "abc123"}],
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    payload = research[0].first_payload
+
+    caps = payload.get("available_capabilities")
+    assert isinstance(caps, list) and caps, "available_capabilities should be present"
+    by_name = {c["name"]: c for c in caps}
+    assert by_name["auth-core"]["proof_status"] == "proven"
+    assert by_name["fraud-detect"]["proof_status"] == "unproven"
+    validate_internal_payload(dict(payload), "test_research_proof_status")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Verification provenance — _computed_at / _branch_sha stamps
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_system_verification_carries_branch_sha_and_computed_at(
+    db_session, mocker
+):
+    """system_verification map carries _computed_at and _branch_sha provenance stamps."""
+    direction = _active_direction("d-prov-sys", "Improve real system")
+    project = Project(
+        name="ProvStamp Systems",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/real": {
+                "status": "mature",
+                "modules": ["backend/app/a.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/a.py"})
+    mocker.patch(
+        "app.autonomous_research.resolve_head_commit",
+        new=AsyncMock(return_value="abc1234567890abc"),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    sv = payload.get("system_verification")
+    assert sv is not None, "system_verification should be present"
+    assert sv["real"]["status"] == "verified"
+    assert "_computed_at" in sv, "_computed_at provenance stamp must be present"
+    assert sv["_branch_sha"] == "abc1234567890abc", "_branch_sha must match resolved SHA"
+    # Provenance keys are metadata, not system entries
+    assert "real" in sv
+    assert "_computed_at" not in sv["real"]
+
+
+@pytest.mark.asyncio
+async def test_system_verification_branch_sha_none_when_indeterminate(
+    db_session, mocker
+):
+    """When resolve_head_commit returns None, _branch_sha is None (not absent)."""
+    direction = _active_direction("d-prov-nosha", "Improve system")
+    project = Project(
+        name="ProvStamp NoSha",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/x": {
+                "status": "mature",
+                "modules": ["backend/app/x.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/x.py"})
+    mocker.patch(
+        "app.autonomous_research.resolve_head_commit",
+        new=AsyncMock(return_value=None),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    sv = payload.get("system_verification")
+    assert sv is not None
+    assert "_computed_at" in sv
+    assert sv["_branch_sha"] is None
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_carries_branch_sha_and_computed_at(
+    db_session, mocker
+):
+    """capability_verification map carries _computed_at and _branch_sha stamps."""
+    direction = _active_direction("d-prov-cap", "Improve capability")
+    project = Project(
+        name="ProvStamp Caps",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/auth": {
+                "status": "working",
+                "modules": ["backend/app/auth.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/auth.py"})
+    mocker.patch(
+        "app.autonomous_research.resolve_head_commit",
+        new=AsyncMock(return_value="deadbeef1234"),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None, "capability_verification should be present"
+    assert cv["auth"]["status"] == "verified"
+    assert "_computed_at" in cv
+    assert cv["_branch_sha"] == "deadbeef1234"
+
+
+@pytest.mark.asyncio
+async def test_refresh_research_task_verification_overwrites_stale_stamp(
+    db_session, mocker
+):
+    """refresh_research_task_verification replaces stale provenance with a fresh stamp."""
+    from app.autonomous_research import refresh_research_task_verification
+
+    direction = _active_direction("d-refresh", "Refresh verification")
+    project = Project(
+        name="Refresh Verification",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        design_doc={
+            "systems/api": {
+                "status": "mature",
+                "modules": ["backend/app/api.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with stale spawn-time verification (old stamp, old SHA)
+    stale_sv = {
+        "api": {"status": "claimed_absent", "claimed_status": "mature", "present": [], "missing": ["backend/app/api.py"]},
+        "_computed_at": "2020-01-01T00:00:00",
+        "_branch_sha": "oldsha",
+    }
+    task = Task(
+        project_id=project.id,
+        title="Research: Refresh verification",
+        payloads=[{
+            "type": "research",
+            "base_branch": "main",
+            "directions": [direction],
+            "system_verification": stale_sv,
+        }],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_classify(mocker, present_paths={"backend/app/api.py"})
+    mocker.patch(
+        "app.autonomous_research.resolve_head_commit",
+        new=AsyncMock(return_value="newsha123"),
+    )
+
+    await refresh_research_task_verification(task, project, db_session)
+
+    sv = task.first_payload.get("system_verification")
+    assert sv is not None
+    assert sv["api"]["status"] == "verified", "verification status should be refreshed"
+    assert sv["_branch_sha"] == "newsha123", "_branch_sha should be updated"
+    assert sv["_computed_at"] != "2020-01-01T00:00:00", "_computed_at should be updated"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direction Refractory: prevents immediate re-research after terminal state
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_refractory_blocks_immediate_respawn_after_terminal(db_session):
+    """A direction with refractory_until in the future must be excluded from
+    active_directions so no new research cycle spawns before the window elapses.
+
+    This is the primary fix for the 2026-06-10 incident where direction
+    'd-65919a0d' spawned 10 sequential research cycles in 9.5h — each new
+    cycle fired 20s-5min after the previous parent went terminal because
+    last_researched_at was never set for no-findings completions.
+    """
+    future = (datetime.utcnow() + timedelta(hours=4)).isoformat()
+    direction = {
+        **_active_direction("d-refract1", "Direction in refractory"),
+        "refractory_until": future,
+        # last_researched_at absent to isolate the refractory check
+    }
+    project = Project(
+        name="Refractory Block Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 0, (
+        "No research should spawn while the direction's refractory_until is in the future"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refractory_expired_allows_respawn(db_session):
+    """A direction whose refractory_until is in the PAST (or absent) must be
+    eligible for re-research — operator/strategist clear the refractory by
+    removing or back-dating the field.
+    """
+    past = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    direction = {
+        **_active_direction("d-refract2", "Direction past refractory"),
+        "refractory_until": past,
+    }
+    project = Project(
+        name="Refractory Expired Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) >= 1, (
+        "Research should spawn when refractory_until is in the past (expired)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_findings_completion_stamps_saturation_and_refractory(
+    db_session, mocker
+):
+    """When a research task completes with no actionable findings, the direction
+    must be marked possibly_saturated=True and stamped with refractory_until so
+    it cannot be immediately re-selected.
+
+    This closes the blind spot where the early-return gate in
+    _handle_research_completion skipped _apply_direction_state_updates entirely,
+    leaving last_researched_at unset and the direction immediately re-eligible.
+    """
+    direction_id = "d-nofindings1"
+    direction = _active_direction(direction_id, "Direction yielding no findings")
+    project = Project(
+        name="No Findings Refractory",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: no findings direction",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "current_direction_id": direction_id,
+                "base_branch": "main",
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Patch externals and make the research agent return NO findings
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.research_completion._ensure_branch",
+        new=AsyncMock(side_effect=lambda t, *a, **kw: t),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    # Reload the project to inspect the direction state
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    target = next((d for d in dirs if d.get("id") == direction_id), None)
+    assert target is not None, "Direction must still exist"
+    assert target.get("possibly_saturated") is True, (
+        "Direction must be marked saturated after no-findings completion"
+    )
+    assert target.get("last_researched_at") is not None, (
+        "last_researched_at must be set so the cooldown applies"
+    )
+    assert target.get("refractory_until") is not None, (
+        "refractory_until must be stamped to prevent immediate re-selection"
+    )
+    # The refractory must be in the future
+    refractory_dt = datetime.fromisoformat(target["refractory_until"])
+    assert refractory_dt > datetime.utcnow(), (
+        "refractory_until must be in the future after a no-findings completion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_eligible_directions_triggers_strategic_refresh(db_session, mocker):
+    """When ALL active directions are in refractory (no eligible directions this
+    cycle), the spawn loop must fire request_strategic_refresh exactly once via
+    the coalescing mechanism so the strategist can replenish the portfolio.
+
+    The strategist may explicitly re-open held directions by clearing
+    refractory_until; the 180-min wall-clock backstop remains the safety net.
+    """
+    request_strategic_refresh_mock = mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
+    )
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    future = (datetime.utcnow() + timedelta(hours=6)).isoformat()
+    direction = {
+        **_active_direction("d-zeroelig1", "All-refractory direction"),
+        "refractory_until": future,
+    }
+    project = Project(
+        name="Zero Eligible — Strategic Trigger",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # The coalescing trigger must have been called (once per spawn tick)
+    assert request_strategic_refresh_mock.called, (
+        "request_strategic_refresh must be called when all active directions are in refractory"
+    )
+    call_count = request_strategic_refresh_mock.call_count
+    assert call_count == 1, (
+        f"request_strategic_refresh should be called exactly once per tick, got {call_count}"
+    )
+    # A strategic spawn should have fired because force_strategic was set
+    assert design_doc_mock.called or strategic_review_mock.called, (
+        "A strategic cycle must spawn when all directions are in refractory and "
+        "force_strategic is set"
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_design_doc_forces_architecture_first_cycle(
+    db_session, mocker
+) -> None:
+    """When a project's design_doc has no architecture content (cycle 1), the
+    strategic spawn runs the full architecture-first pipeline (design_doc_update
+    -> strategic_review) regardless of the cycle-count modulus."""
+    mocker.patch("app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", new_callable=AsyncMock, return_value=True)
+
+    # Create a project with an empty design_doc (only config blocks, no architecture)
+    project = Project(
+        name="Empty Design Doc Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-arch-test-1")],
+        vision={"purpose": "test architecture bootstrapping", "_research_spawn_count": 6},
+        design_doc={
+            # Only config blocks (underscore-prefixed) — no real architecture content
+            "_auto_remediation": {"enabled": False},
+            "_issue_implementation": {"enabled": False},
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Mock tactical research selection to avoid side effects
+    mocker.patch(
+        "app.direction_outcomes._update_direction_research_outcomes",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.anomaly_detection._compute_research_anomalies",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new_callable=AsyncMock,
+        return_value={"action": "none"},
+    )
+
+    # Spawn on cycle 1 (modulus would normally NOT trigger architecture)
+    await _spawn_research_task(project, db_session)
+
+    # Verify design_doc_update was called (architecture-first pipeline)
+    from app.strategic_spawning import _spawn_design_doc_update
+    assert _spawn_design_doc_update.called, "design_doc_update should spawn on empty design_doc"
+
+    # Verify strategic_review was NOT called directly (it's spawned by design_doc_update completion)
+    from app.strategic_spawning import _spawn_strategic_review
+    assert not _spawn_strategic_review.called, "strategic_review should be deferred to design_doc_update completion"
+
+
+@pytest.mark.asyncio
+async def test_populated_design_doc_respects_architecture_cadence(
+    db_session, mocker
+) -> None:
+    """When a project's design_doc has architecture content, the modulus cadence
+    schedule continues unchanged (cycle 1 runs strategy-only, cycle 3 runs architecture)."""
+    mocker.patch("app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", new_callable=AsyncMock, return_value=True)
+
+    # Create a project with populated design_doc (has systems/* entries)
+    project = Project(
+        name="Populated Design Doc Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-arch-test-2")],
+        vision={"purpose": "test architecture cadence", "_strategic_cycle_count": 0, "_research_spawn_count": 6},
+        design_doc={
+            # Has real architecture content
+            "systems/auth": {
+                "description": "Authentication system",
+                "modules": ["app/auth.py"],
+                "status": "working",
+            },
+            "summary": {"architecture": "Core architecture overview"},
+            # Config blocks are OK alongside content
+            "_auto_remediation": {"enabled": False},
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Mock tactical research selection
+    mocker.patch(
+        "app.direction_outcomes._update_direction_research_outcomes",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.anomaly_detection._compute_research_anomalies",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new_callable=AsyncMock,
+        return_value={"action": "none"},
+    )
+
+    # Spawn on cycle 1 with architecture_review_frequency=3 (modulus 1 % 3 != 0)
+    await _spawn_research_task(project, db_session)
+
+    # Verify strategic_review was called (strategy-only, no architecture)
+    from app.strategic_spawning import _spawn_strategic_review
+    assert _spawn_strategic_review.called, "strategic_review should spawn on cycle 1 when design_doc is populated"
+
+    # Verify design_doc_update was NOT called (no architecture on cycle 1)
+    from app.strategic_spawning import _spawn_design_doc_update
+    assert not _spawn_design_doc_update.called, "design_doc_update should not spawn on cycle 1 with populated design_doc"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spawn-pending idempotency — lock-timeout resilience
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_pending_resume_uses_stored_plan_output(db_session, mocker):
+    """When _research_spawn_pending is set and logs produce no findings,
+    the handler falls back to task.plan_output so the interrupted spawn can finish."""
+    direction = _active_direction("d-spawn-res1", "Resume direction")
+    project = Project(
+        name="Spawn Pending Resume",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    finding = _make_finding(title="Stored finding", direction_id=direction["id"])
+
+    # Task already in post-_ensure_branch-commit state: marker and plan_output durable.
+    task = Task(
+        project_id=project.id,
+        title="Research: resume test",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction["id"],
+            }
+        ],
+        context={
+            "research_depth": 0,
+            "_research_spawn_pending": True,
+        },
+        plan_output=[finding],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[])
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "Stored finding should be spawned via spawn-pending resume path"
+
+    await db_session.refresh(task)
+    assert not (task.context or {}).get("_research_spawn_pending"), (
+        "_research_spawn_pending must be cleared after successful spawn"
+    )
+    assert task.status == TaskStatus.EVALUATING, (
+        "Task must be EVALUATING after spawning children — not COMPLETED with zero children"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_pending_marker_stamped_before_ensure_branch(db_session, mocker):
+    """_research_spawn_pending is set in task.context before _ensure_branch is called,
+    so _ensure_branch's internal commit makes it durable regardless of what follows."""
+    direction = _active_direction("d-spawn-stamp1", "Stamp direction")
+    project = Project(
+        name="Spawn Pending Stamp",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    captured_context: list[dict] = []
+
+    async def _capture_and_passthrough(task_obj, *_a, **_kw):
+        captured_context.append(dict(task_obj.context or {}))
+        return task_obj
+
+    mocker.patch("app.research_completion._ensure_branch", new=_capture_and_passthrough)
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
+    mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
+    mocker.patch("app.research_completion._is_high_stakes_finding", return_value=False)
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+
+    await _handle_research_completion(task, "", db_session)
+
+    assert captured_context, "_ensure_branch should have been called"
+    assert captured_context[0].get("_research_spawn_pending") is True, (
+        "_research_spawn_pending must be True in task.context when _ensure_branch is called"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_pending_marker_cleared_after_successful_spawn(db_session, mocker):
+    """_research_spawn_pending is absent from task.context after a successful spawn."""
+    direction = _active_direction("d-spawn-clr1", "Clear direction")
+    project = Project(
+        name="Spawn Pending Clear",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(task)
+    assert not (task.context or {}).get("_research_spawn_pending"), (
+        "_research_spawn_pending must be absent after a successful spawn"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mid_spawn_lock_timeout_replay_completes_spawn_exactly_once(db_session, mocker):
+    """Simulate a lock timeout inside _ensure_branch on the first pass.
+
+    _ensure_branch's internal commit makes _research_spawn_pending and plan_output
+    durable before the error. A sweep retry (second call with empty logs) uses the
+    stored findings and completes the spawn, leaving exactly one child and the task
+    in EVALUATING — never COMPLETED with zero children.
+    """
+    direction = _active_direction("d-midspawn1", "Mid-spawn direction")
+    project = Project(
+        name="Mid-Spawn Replay",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    finding = _make_finding(title="Mid-spawn finding", direction_id=direction["id"])
+    task = await _make_research_task(project, direction, db_session)
+
+    # Common patches (same as _patch_research_externals but without _ensure_branch).
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
+    mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
+    mocker.patch("app.research_completion._is_high_stakes_finding", return_value=False)
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+
+    call_count = [0]
+
+    async def _ensure_branch_fail_then_pass(task_obj, *_a, **_kw):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # Simulate _ensure_branch committing the spawn-pending marker
+            # (task.context mutation already applied by the stamp code above it)
+            # then failing on the row-lock re-acquisition.
+            await db_session.commit()
+            raise RuntimeError("lock timeout: simulated LockNotAvailableError mid-spawn")
+        return task_obj
+
+    mocker.patch("app.research_completion._ensure_branch", new=_ensure_branch_fail_then_pass)
+
+    # Pass 1: handler commits plan_output + _research_spawn_pending, then _ensure_branch fails.
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    with pytest.raises(RuntimeError, match="lock timeout"):
+        await _handle_research_completion(task, "", db_session)
+
+    # Verify durable state after pass 1.
+    await db_session.refresh(task)
+    assert isinstance(task.plan_output, list) and len(task.plan_output) > 0, (
+        "plan_output must be committed before _ensure_branch"
+    )
+    assert (task.context or {}).get("_research_spawn_pending") is True, (
+        "_research_spawn_pending must be durable after _ensure_branch's internal commit"
+    )
+
+    # Pass 2: sweep retry with empty logs — resume path uses stored plan_output.
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[])
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "Exactly one child spawned on replay — not zero, not two"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING, (
+        "Task must be EVALUATING after successful replay — no childless-COMPLETED strand"
+    )
+    assert not (task.context or {}).get("_research_spawn_pending"), (
+        "_research_spawn_pending cleared after successful replay"
+    )

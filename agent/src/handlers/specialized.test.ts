@@ -129,13 +129,15 @@ import {
   handleDebug,
   handlePerf,
   handleInvestigate,
+  handleRepoBootstrap,
   handleMigrate,
   handleSelfAudit,
   resolveMigrationLayout,
+  isRepoBootstrapOverview,
 } from './specialized.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
-  git, listOpenPullRequestsForBranch,
+  git, listOpenPullRequestsForBranch, sendLog,
 } from '../index.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -143,6 +145,7 @@ import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { PARALLEL_AUDIT_GUIDANCE } from '../prompt.js';
 import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -617,6 +620,286 @@ describe('handleInvestigate — report reading and status mapping', () => {
         GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
       ),
     ).rejects.toThrow(/No prompt found/);
+  });
+});
+
+// ── handleInvestigate — adversarial spawn-gate grader branch ──────────────────
+describe('handleInvestigate — adversarial grader', () => {
+  // The adversarial challenge prompt already carries its own output contract:
+  // a JSON array of [{hash, verdict, reason}] objects the backend parser anchors
+  // on. The handler must bypass the investigation template entirely and emit the
+  // raw challenger output as logs.
+  const ADVERSARIAL_TASK = {
+    ...BASE_TASK,
+    context: { adversarial_grader: true, _adversarial_challenged_hashes: ['abc123'] },
+  };
+  const VERDICT_ARRAY = '[{"hash": "abc123", "verdict": "fail", "reason": "premise no longer holds at HEAD"}]';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('runs the raw payload prompt and persists the verdict array verbatim as logs', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // The prompt passed to Claude is the raw payload prompt (no investigation
+    // template wrapping) — it must NOT instruct writing the summary/root_cause
+    // schema to /tmp/investigation_report_*.json.
+    const runPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(runPrompt).toContain('investigate the issue');
+    expect(runPrompt).not.toContain('You are an investigation agent');
+    expect(runPrompt).not.toContain('investigation_report_');
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    // logs carry the raw [{hash, verdict, reason}] array, not a JSON.stringify of
+    // a summary/root_cause investigation object.
+    expect(call.logs).toContain('"hash"');
+    expect(call.logs).toContain('"verdict"');
+    expect(call.logs).toBe(VERDICT_ARRAY);
+  });
+
+  it('does NOT consult readHandlerOutput on the adversarial branch', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(readHandlerOutput)).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the transcript tail when no final text is surfaced', async () => {
+    const prose = `Challenged each finding.\n${VERDICT_ARRAY}`;
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: prose, lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toBe(prose);
+  });
+
+  it('sets status FAILED with claude_code_failed on non-zero exitCode', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'crashed', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('claude_code_failed');
+  });
+
+  it('regression guard: a non-adversarial task still uses the investigation template', async () => {
+    const investigationResult = {
+      summary: 'Found issue', root_cause: 'cause', affected_files: [],
+      recommended_fix: 'fix', severity: 'low', confidence: 'high',
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(investigationResult);
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const runPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(runPrompt).toContain('You are an investigation agent');
+    expect(vi.mocked(readHandlerOutput)).toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    expect(call.logs).toBe(JSON.stringify(investigationResult));
+  });
+});
+
+// ── handleInvestigate — adversarial grader self-repair ────────────────────────
+describe('handleInvestigate — adversarial grader self-repair', () => {
+  const ADVERSARIAL_TASK_WITH_HASHES = {
+    ...BASE_TASK,
+    context: { adversarial_grader: true, _adversarial_challenged_hashes: ['abc123', 'def456'] },
+  };
+  const VERDICT_ARRAY = '[{"hash":"abc123","verdict":"pass","reason":"still holds at HEAD"},{"hash":"def456","verdict":"fail","reason":"premise no longer present"}]';
+  const VERDICT_ARRAY_PARSED: unknown[] = JSON.parse(VERDICT_ARRAY) as unknown[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('repairs a malformed challenger response into a [{hash, verdict, reason}] array via focused re-ask', async () => {
+    // First call: clean exit but only prose — no JSON array.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'I reviewed the findings. abc123 still holds, def456 is not present anymore.', lastResultText: '' });
+    // Second call (repair re-ask): valid verdict array in lastResultText.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Repair should have triggered exactly one re-ask.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    // logs carry the repaired [{hash, verdict, reason}] array.
+    expect(JSON.parse(call.logs as string)).toEqual(VERDICT_ARRAY_PARSED);
+  });
+
+  it('includes the challenged hashes from context in the re-ask prompt', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'no JSON here', lastResultText: '' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // The repair re-ask (second call) must mention each challenged hash so the
+    // model can re-emit a complete array.
+    const reaskPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(reaskPrompt).toContain('abc123');
+    expect(reaskPrompt).toContain('def456');
+  });
+
+  it('posts COMPLETED with raw output when repair also fails to produce a parseable array', async () => {
+    const prose = 'abc123 is still valid, def456 is not present.';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: prose, lastResultText: '' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'Still no JSON array.', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    // Raw output preserved — backend parser will fail-close findings gracefully.
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toContain(prose);
+  });
+
+  it('skips repair and posts FAILED when exitCode is non-zero', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 1, allOutput: 'crashed', lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // A CLI crash should not trigger a repair re-ask.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('claude_code_failed');
+  });
+
+  it('records research_spawn_adversarial_challenge schema label on format miss, repair attempt, and repair success', async () => {
+    // First call: clean exit but only prose — triggers repair.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'no json array here', lastResultText: '' });
+    // Second call (repair): valid verdict array.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // All three telemetry calls must carry the research-spawn-specific schema label,
+    // not the release-audit 'audit_challenge' label.
+    expectCalledWith(recordFormatMiss, expect.any(String), 'research_spawn_adversarial_challenge');
+    expectCalledWith(recordFormatRepairAttempt, 'research_spawn_adversarial_challenge');
+    expectCalledWith(recordFormatRepairSuccess, 'research_spawn_adversarial_challenge');
+    // Confirm the repair path succeeded and the result was posted.
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+  });
+
+  it('repair re-ask prompt constrains verdict vocabulary to "pass" or "fail"', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'no JSON here', lastResultText: '' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // The repair re-ask (second call) must explicitly name "pass" and "fail" as
+    // the only accepted verdict values so the model emits backend-recognized tokens.
+    const reaskPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(reaskPrompt).toContain('"pass"');
+    expect(reaskPrompt).toContain('"fail"');
+  });
+
+  it('repairs adversarial challenge verdicts with backend-recognized pass-fail tokens', async () => {
+    // Verifies the full round-trip: malformed first attempt, repaired with "pass"/"fail"
+    // vocabulary, and the posted logs parse as the correct recognized verdicts.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'I reviewed the findings but returned no JSON.', lastResultText: '' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    const posted = JSON.parse(call.logs as string) as Array<{hash: string; verdict: string; reason: string}>;
+    // Every verdict in the posted array must be a backend-recognized token.
+    const recognized = new Set(['pass', 'passed', 'approve', 'approved', 'fail', 'failed', 'reject', 'rejected']);
+    for (const item of posted) {
+      expect(recognized.has(item.verdict.toLowerCase())).toBe(true);
+    }
+    // Both hashes must be present with appropriate verdicts.
+    expect(posted.find(i => i.hash === 'abc123')?.verdict).toBe('pass');
+    expect(posted.find(i => i.hash === 'def456')?.verdict).toBe('fail');
+  });
+
+  it('repaired array with unrecognized verdicts ("agree"/"disagree") falls through to raw output', async () => {
+    const BAD_VERDICT_ARRAY = '[{"hash":"abc123","verdict":"agree","reason":"still holds"},{"hash":"def456","verdict":"disagree","reason":"not present"}]';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'no JSON here', lastResultText: '' });
+    // Repair re-ask returns unrecognized vocabulary.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: BAD_VERDICT_ARRAY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    // The repaired array with unrecognized verdicts must NOT be posted as the
+    // successful-repair result — the raw repair output is passed through instead.
+    expect(call.logs).not.toBe(JSON.stringify(JSON.parse(BAD_VERDICT_ARRAY)));
+    // The status must still be COMPLETED (exitCode was 0).
+    expect(call.status).toBe('COMPLETED');
+  });
+
+  it('adversarial_grader unrecognized verdict on first attempt triggers re-ask (not silent fail)', async () => {
+    // First attempt returns parseable JSON but with an unrecognized verdict string.
+    // The validateParsedValue hook rejects it, triggering a bounded re-ask.
+    // The re-ask here also returns unrecognized vocab, so the raw first output is passed through.
+    const UNRECOGNIZED_FIRST = '[{"hash":"abc123","verdict":"agree","reason":"still holds at HEAD"}]';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: UNRECOGNIZED_FIRST });
+    // Re-ask also returns unrecognized vocab → raw passthrough (first run's lastResultText).
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: UNRECOGNIZED_FIRST });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Vocab miss now triggers a re-ask — two calls expected.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+
+    // The helper emits a schema-validation warning via validateParsedValue.
+    const warnCall = vi.mocked(sendLog).mock.calls.find(
+      ([, msg]) => typeof msg === 'string' && msg.includes('[WARNING]') && msg.includes('unrecognized'),
+    );
+    expect(warnCall).toBeDefined();
+
+    // Status is COMPLETED (exitCode was 0) and the raw output is passed through.
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toContain('agree');
+  });
+
+  it('first attempt unrecognized vocab triggers re-ask; re-ask with recognized verdicts posts repaired array', async () => {
+    const UNRECOGNIZED_FIRST = '[{"hash":"abc123","verdict":"agree","reason":"looks good"},{"hash":"def456","verdict":"disagree","reason":"not present"}]';
+    const RECOGNIZED_RETRY = '[{"hash":"abc123","verdict":"pass","reason":"still holds at HEAD"},{"hash":"def456","verdict":"fail","reason":"premise no longer present"}]';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: UNRECOGNIZED_FIRST });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: RECOGNIZED_RETRY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Vocab miss on first attempt must trigger exactly one re-ask.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    // The repaired recognized array must be posted, not the unrecognized first attempt.
+    const posted = JSON.parse(call.logs as string) as Array<{hash: string; verdict: string}>;
+    const recognized = new Set(['pass', 'passed', 'approve', 'approved', 'fail', 'failed', 'reject', 'rejected']);
+    for (const item of posted) {
+      expect(recognized.has(item.verdict.toLowerCase())).toBe(true);
+    }
+    expect(call.logs).not.toContain('agree');
+    expect(call.logs).not.toContain('disagree');
   });
 });
 
@@ -1470,6 +1753,97 @@ describe('specialized handler task-specific content contracts', () => {
       await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
       const p = vi.mocked(runClaudeCode).mock.calls[0][0];
       expect(p).not.toContain('Citation-provenance notice');
+    });
+  });
+
+  // ── handleRepoBootstrap contract ────────────────────────────────────────
+  describe('handleRepoBootstrap', () => {
+    it('accepts a repo overview with all seven fields', () => {
+      const repoOverview = {
+        tech_stack: 'TypeScript, FastAPI, Postgres',
+        directory_layout: 'agent/ for the runner, backend/ for the API',
+        first_steps_summary: 'Install deps, run the build, then run tests',
+        entry_points: 'agent/src/index.ts and backend/app/main.py',
+        test_layout: 'backend/testing for pytest; agent/src/*.test.ts for vitest',
+        key_conventions: 'Conventional commits and feature branches',
+        environment_requirements: 'Node 22, Python 3.12, DATABASE_URL in .env',
+      };
+
+      expect(isRepoBootstrapOverview(repoOverview)).toBe(true);
+      if (!isRepoBootstrapOverview(repoOverview)) throw new Error('expected repo overview');
+      expect(repoOverview.entry_points).toBe('agent/src/index.ts and backend/app/main.py');
+      expect(repoOverview.test_layout).toBe('backend/testing for pytest; agent/src/*.test.ts for vitest');
+      expect(repoOverview.key_conventions).toBe('Conventional commits and feature branches');
+      expect(repoOverview.environment_requirements).toBe('Node 22, Python 3.12, DATABASE_URL in .env');
+    });
+
+    it('persists a valid repo overview unchanged', async () => {
+      const repoOverview = {
+        tech_stack: 'TypeScript, FastAPI, Postgres',
+        directory_layout: 'agent/ for the runner, backend/ for the API',
+        first_steps_summary: 'Install deps, run the build, then run tests',
+        entry_points: 'agent/src/index.ts and backend/app/main.py',
+        test_layout: 'backend/testing for pytest; agent/src/*.test.ts for vitest',
+        key_conventions: 'Conventional commits and feature branches',
+        environment_requirements: 'Node 22, Python 3.12, DATABASE_URL in .env',
+      };
+      vi.mocked(readHandlerOutput).mockReturnValue(repoOverview);
+      vi.mocked(runClaudeCode).mockResolvedValue({
+        exitCode: 0,
+        allOutput: 'bootstrap transcript tail',
+        lastResultText: '',
+      });
+
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(call.status).toBe('COMPLETED');
+      expect(call.repo_overview).toEqual(repoOverview);
+      expect(call.logs).toBe(JSON.stringify(repoOverview));
+    });
+
+    it('repo_bootstrap prompt requests all seven repo overview fields', async () => {
+      vi.mocked(readHandlerOutput).mockReturnValue(null);
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain('"tech_stack"');
+      expect(p).toContain('"directory_layout"');
+      expect(p).toContain('"first_steps_summary"');
+      expect(p).toContain('"entry_points"');
+      expect(p).toContain('if discoverable: main executable(s) or server entry files');
+      expect(p).toContain('"test_layout"');
+      expect(p).toContain('if discoverable: test directory structure and how to run subsets');
+      expect(p).toContain('"key_conventions"');
+      expect(p).toContain('if discoverable: branch naming, commit style, PR conventions');
+      expect(p).toContain('"environment_requirements"');
+      expect(p).toContain('if discoverable: required env vars, runtime versions, .env.example notes');
+    });
+
+    it('repo_bootstrap prompt includes playbook seeding guidance', async () => {
+      vi.mocked(readHandlerOutput).mockReturnValue(null);
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain('./playbook set');    // PLAYBOOK_GUIDANCE present
+      expect(p).toContain('environment setup'); // bootstrap-specific save note
+    });
+
+    it.each([
+      ['partial object', { tech_stack: 'TypeScript', directory_layout: 'agent/' }],
+      ['array output', ['TypeScript', 'agent/', 'tests']],
+    ] as const)('drops invalid bootstrap overview %s', async (_label, invalidOverview) => {
+      vi.mocked(readHandlerOutput).mockReturnValue(invalidOverview as never);
+      vi.mocked(runClaudeCode).mockResolvedValue({
+        exitCode: 0,
+        allOutput: 'bootstrap transcript tail',
+        lastResultText: '',
+      });
+
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(call.status).toBe('COMPLETED');
+      expect(call.repo_overview).toBeUndefined();
+      expect(call.logs).toBe('bootstrap transcript tail');
     });
   });
 

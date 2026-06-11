@@ -278,7 +278,19 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
     ? prune.absent_capabilities as Array<Record<string, unknown>> : [];
   const expiredHolds = Array.isArray(prune.expired_holds)
     ? prune.expired_holds as Array<Record<string, unknown>> : [];
-  if (resolvedGaps.length === 0 && absentCaps.length === 0 && expiredHolds.length === 0) return '';
+  const ungroundableCaps = Array.isArray(prune.ungroundable_capabilities)
+    ? prune.ungroundable_capabilities as Array<Record<string, unknown>> : [];
+  const domainMergeGroups = Array.isArray(prune.domain_merge_groups)
+    ? prune.domain_merge_groups as Array<Record<string, unknown>> : [];
+  const heavyGaps = Array.isArray(prune.heavy_gaps)
+    ? prune.heavy_gaps as Array<Record<string, unknown>> : [];
+  const longNames = Array.isArray(prune.long_names)
+    ? prune.long_names as Array<Record<string, unknown>> : [];
+  if (
+    resolvedGaps.length === 0 && absentCaps.length === 0 && expiredHolds.length === 0 &&
+    ungroundableCaps.length === 0 && domainMergeGroups.length === 0 &&
+    heavyGaps.length === 0 && longNames.length === 0
+  ) return '';
 
   const counts = (prune.counts && typeof prune.counts === 'object')
     ? prune.counts as Record<string, unknown> : {};
@@ -336,6 +348,59 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
     }
     if (countOrLocal(counts.expired_holds, expiredHolds.length) > expiredHolds.length) {
       lines.push(`- +${countOrLocal(counts.expired_holds, expiredHolds.length) - expiredHolds.length} more not shown`);
+    }
+  }
+
+  // Capabilities with no backing_paths, no source, and no verification — unverifiable claims.
+  if (ungroundableCaps.length > 0) {
+    lines.push(`\n### Ungroundable capabilities — no backing paths, no source, no verification (${fmtScalar(counts.ungroundable_capabilities, String(ungroundableCaps.length))})`);
+    lines.push('These capabilities have never been grounded: no file-tree backing paths, no source provenance, and no verification check has run. They are unverifiable claims. Ground them by adding backing_paths or a source, consolidate them into a grounded capability, or drop them.');
+    for (const c of ungroundableCaps) {
+      const name = strVal(c.name as string, 'Unnamed capability');
+      const capStatus = strVal(c.status as string, '?');
+      lines.push(`- **${name}** (status=${capStatus})`);
+    }
+    if (countOrLocal(counts.ungroundable_capabilities, ungroundableCaps.length) > ungroundableCaps.length) {
+      lines.push(`- +${countOrLocal(counts.ungroundable_capabilities, ungroundableCaps.length) - ungroundableCaps.length} more not shown`);
+    }
+  }
+
+  // Advisory merge groups: capabilities sharing a domain keyword bucket.
+  if (domainMergeGroups.length > 0) {
+    lines.push(`\n### Advisory capability merge groups — shared domain keyword (${fmtScalar(counts.domain_merge_groups, String(domainMergeGroups.length))} group(s))`);
+    lines.push('Live capabilities that share a domain keyword and may overlap in scope. These are advisory consolidation candidates — review whether they describe the same underlying capability or can be merged.');
+    for (const g of domainMergeGroups) {
+      const bucket = strVal(g.bucket as string, '?');
+      const names = Array.isArray(g.names) ? (g.names as string[]).join(', ') : '?';
+      lines.push(`- **${bucket}**: ${names}`);
+    }
+  }
+
+  // Heaviest active gaps by serialized history size — compaction targets.
+  if (heavyGaps.length > 0) {
+    lines.push(`\n### Heaviest active gap histories — compaction targets (${fmtScalar(counts.heavy_gaps, String(heavyGaps.length))})`);
+    lines.push('Active gaps with the largest serialized history logs. Long histories inflate every strategic payload. Consider compacting old history entries for these gaps.');
+    for (const g of heavyGaps) {
+      const name = strVal(g.name as string, 'Unnamed gap');
+      const gid = strVal(g.gap_id as string, '?');
+      const entries = fmtScalar(g.history_entry_count);
+      const bytes = fmtScalar(g.approx_bytes);
+      lines.push(`- **${name}** (gap ${gid}) — ${entries} history entries, ~${bytes} bytes`);
+    }
+  }
+
+  // Long-name hygiene: capabilities and gaps with names exceeding the threshold.
+  if (longNames.length > 0) {
+    lines.push(`\n### Long-name hygiene — names exceeding 80 chars (${fmtScalar(counts.long_names, String(longNames.length))})`);
+    lines.push('Capability and gap names longer than 80 characters inflate every payload that ships the capability vocabulary. Rename to shorter, equally descriptive identifiers.');
+    for (const e of longNames) {
+      const name = strVal(e.name as string, '?');
+      const kind = strVal(e.kind as string, '?');
+      const length = fmtScalar(e.length);
+      lines.push(`- **${name}** (${kind}, ${length} chars)`);
+    }
+    if (countOrLocal(counts.long_names, longNames.length) > longNames.length) {
+      lines.push(`- +${countOrLocal(counts.long_names, longNames.length) - longNames.length} more not shown`);
     }
   }
 
@@ -690,6 +755,7 @@ export function buildDirSummaryText(
       const explicitPass = Number(sgm.explicit_pass_count ?? 0);
       const failOpen = Number(sgm.fail_open_count ?? 0);
       const unresolved = Number(sgm.unresolved_count ?? 0);
+      const manifestExcluded = Number(sgm.manifest_excluded_fail_closed_count ?? 0);
       const cmr = sgm.challenged_merge_rate != null ? `${Math.round(Number(sgm.challenged_merge_rate) * 100)}%` : 'n/a';
       const umr = sgm.unchallenged_merge_rate != null ? `${Math.round(Number(sgm.unchallenged_merge_rate) * 100)}%` : 'n/a';
       // Preserve the merge-rate sample sizes so each percentage travels with its
@@ -702,7 +768,20 @@ export function buildDirSummaryText(
       const reasonsPart = reasons.length > 0
         ? `; refuted/unresolved reasons: ${reasons.slice(0, 3).join('; ')}${reasons.length > 3 ? ` (+${reasons.length - 3} more)` : ''}`
         : '';
-      spawnGateSection = `\n   Research spawn-gate: ${challenged} challenged → ${survived} survived (${explicitPass} explicit-pass, ${failOpen} fail-open) · ${refuted} refuted (${unresolved} unresolved) — merge rate: ${cmr} challenged (${cDenom}) vs ${umr} unchallenged (${uDenom})${reasonsPart}`;
+      const excludedSamples = Array.isArray(sgm.manifest_excluded_fail_closed_samples)
+        ? (sgm.manifest_excluded_fail_closed_samples as Array<Record<string, unknown>>)
+          .map(sample => {
+            if (typeof sample.title === 'string') return sample.title;
+            if (typeof sample.reason === 'string') return sample.reason;
+            if (typeof sample.hash === 'string') return sample.hash;
+            return '';
+          })
+          .filter(Boolean)
+        : [];
+      const excludedPart = manifestExcluded > 0
+        ? ` · ${manifestExcluded} manifest-excluded fail-closed${excludedSamples.length > 0 ? ` (${excludedSamples.slice(0, 3).join('; ')}${excludedSamples.length > 3 ? ` +${excludedSamples.length - 3} more` : ''})` : ''}`
+        : '';
+      spawnGateSection = `\n   Research spawn-gate: ${challenged} challenged → ${survived} survived (${explicitPass} explicit-pass, ${failOpen} fail-open) · ${refuted} refuted (${unresolved} unresolved)${excludedPart} — merge rate: ${cmr} challenged (${cDenom}) vs ${umr} unchallenged (${uDenom})${reasonsPart}`;
     }
 
     return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}`;

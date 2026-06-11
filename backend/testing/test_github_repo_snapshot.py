@@ -17,6 +17,7 @@ import app.github_repo_snapshot as snapshot
 import app.shared_state as shared_state
 from app.github_repo_snapshot import (
     file_text_on_branch,
+    glob_exists_on_branch,
     path_exists_on_branch,
 )
 
@@ -174,6 +175,47 @@ async def test_truncated_tree_never_reports_absence(mocker):
     assert await path_exists_on_branch("backend/app/x.py", **CTX) is True
     assert await path_exists_on_branch("backend/app/invisible.py", **CTX) is None
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_glob_exists_on_branch_matches_cached_tree(mocker):
+    calls = _patch_requests(
+        mocker,
+        [
+            _ref_response(),
+            _tree_response(paths=("backend/app/routers/admin.py", "package.json")),
+        ],
+    )
+    assert await glob_exists_on_branch("backend/app/routers/*.py", **CTX) is True
+    assert await glob_exists_on_branch("*.json", **CTX) is True
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_glob_exists_on_branch_complete_miss_false(mocker):
+    _patch_requests(
+        mocker,
+        [_ref_response(), _tree_response(paths=("backend/app/models.py",))],
+    )
+    assert await glob_exists_on_branch("backend/app/routers/*.py", **CTX) is False
+
+
+@pytest.mark.asyncio
+async def test_glob_exists_on_branch_truncated_miss_indeterminate(mocker):
+    _patch_requests(
+        mocker,
+        [
+            _ref_response(),
+            _tree_response(paths=("backend/app/models.py",), truncated=True),
+        ],
+    )
+    assert await glob_exists_on_branch("backend/app/routers/*.py", **CTX) is None
+
+
+@pytest.mark.asyncio
+async def test_glob_exists_on_branch_unavailable_snapshot_indeterminate(mocker):
+    _patch_requests(mocker, [_FakeResponse(403)])
+    assert await glob_exists_on_branch("backend/app/routers/*.py", **CTX) is None
 
 
 @pytest.mark.asyncio

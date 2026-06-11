@@ -14,11 +14,10 @@ import logging
 import random
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from sqlalchemy.exc import IntegrityError, InterfaceError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session, resolve_async_engine
@@ -91,13 +90,13 @@ from app.artifact_prerequisites import (
 )
 from app.landed_signal import merge_verification_status as _merge_verification_status
 from app.acceptance_gate import record_artifact_consumptions_for_task
-from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from app.time_utils import _utcnow, set_retry_after
 from app.agent_status_spawn import (
     _recover_poisoned_session,
     maybe_spawn_smoketest_fix,
     maybe_spawn_debug_create,
 )
+from app.cost_ceiling import check_daily_cost_ceiling as _check_daily_cost_ceiling
 
 logger = logging.getLogger(__name__)
 
@@ -189,176 +188,6 @@ def _task_pr_number(task: Task) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
-    """Create a WARNING alert if the daily VM cost total exceeds the configured ceiling.
-
-    Runs at most once per task completion. The alert is deduplicated — only one
-    undismissed 'Daily cost ceiling exceeded' alert per project is created.
-    """
-    ceiling = float(_runtime_config.get("daily_cost_ceiling_usd", 0))
-    if ceiling <= 0:
-        return
-
-    today_start = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-    )
-    # Exclude current task from DB query to avoid double-counting (its vm_stopped_at
-    # was just set in-memory and may be flushed before the query runs).
-    rows = (
-        await session.execute(
-            select(Task.vm_provisioned_at, Task.vm_stopped_at, Task.vm_spot).where(
-                Task.project_id == task.project_id,
-                Task.id != task.id,
-                Task.vm_stopped_at >= today_start,
-                Task.vm_provisioned_at.is_not(None),
-            )
-        )
-    ).all()
-
-    daily_total = 0.0
-    for prov_at, stop_at, is_spot in rows:
-        if prov_at and stop_at:
-            secs = (stop_at - prov_at).total_seconds()
-            rate = SPOT_RATE if is_spot else ON_DEMAND_RATE
-            daily_total += secs * rate
-
-    # Always include the current task's cost explicitly (it is in-memory, not yet committed).
-    if (
-        task.vm_provisioned_at
-        and task.vm_stopped_at
-        and task.vm_stopped_at >= today_start
-    ):
-        secs = (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
-        daily_total += secs * (SPOT_RATE if task.vm_spot else ON_DEMAND_RATE)
-
-    vm_total = daily_total
-
-    # Off-VM compute jobs accrue their own durable spend ledger. Fold today's
-    # settled (terminal, costed) compute-job spend into the daily total so the
-    # ceiling reflects total project spend, not just agent-VM runtime.
-    from app.compute_jobs import get_recent_terminal_compute_spend_usd
-
-    compute_total = await get_recent_terminal_compute_spend_usd(
-        session, project_id=task.project_id, since=today_start
-    )
-    daily_total = vm_total + compute_total
-
-    if daily_total <= ceiling:
-        return
-
-    alert_title = "Daily cost ceiling exceeded"
-    existing = (
-        (
-            await session.execute(
-                select(Alert).where(
-                    Alert.project_id == task.project_id,
-                    Alert.task_id.is_(None),
-                    Alert.severity == AlertSeverity.WARNING,
-                    Alert.dismissed_at.is_(None),
-                    Alert.title == alert_title,
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if existing is not None:
-        return
-
-    alert = Alert(
-        project_id=task.project_id,
-        severity=AlertSeverity.WARNING,
-        title=alert_title,
-        message=(
-            f"Daily total spend ${daily_total:.2f} exceeds ceiling ${ceiling:.2f} "
-            f"(VM ${vm_total:.2f} + compute ${compute_total:.2f})."
-        ),
-    )
-    session.add(alert)
-    await broadcast_to_project(
-        str(task.project_id),
-        "alert_created",
-        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert_title},
-    )
-    logger.warning(
-        f"[COST] Daily cost ceiling exceeded for project {task.project_id}: "
-        f"total ${daily_total:.2f} > ${ceiling:.2f} "
-        f"(VM ${vm_total:.2f} + compute ${compute_total:.2f})"
-    )
-    try:
-        from app.notification_dispatch import dispatch_external_notification
-        from app.failure_classification import classify_failure
-
-        ctx = task.context or {}
-        first_payload = task.first_payload or {}
-        direction_text = (
-            ctx.get("direction_text") or first_payload.get("direction_text") or ""
-        )
-        # Aggregate today's cost by failure class across this project's tasks.
-        # Exclude current task (added explicitly below) to avoid double-counting via identity map.
-        cost_rows = (
-            (
-                await session.execute(
-                    select(Task)
-                    .options(
-                        load_only(
-                            Task.vm_provisioned_at,
-                            Task.vm_stopped_at,
-                            Task.vm_spot,
-                            Task.status,
-                            Task.id,
-                            Task.context,
-                            Task.latest_status_message,
-                        )
-                    )
-                    .where(
-                        Task.project_id == task.project_id,
-                        Task.id != task.id,
-                        Task.vm_stopped_at >= today_start,
-                        Task.vm_provisioned_at.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        cost_by_failure_class: dict[str, float] = {}
-        for t in [*list(cost_rows), task]:
-            if not (t.vm_provisioned_at and t.vm_stopped_at):
-                continue
-            secs = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            status_val = getattr(t.status, "value", None) or (
-                t.status if isinstance(t.status, str) else "UNKNOWN"
-            )
-            bucket = (
-                classify_failure(t, at_time=t.last_heartbeat or t.started_at)
-                if status_val == TaskStatus.FAILED.value
-                else status_val
-            )
-            cost_by_failure_class[bucket] = round(
-                cost_by_failure_class.get(bucket, 0.0) + secs * rate, 4
-            )
-        _budget_future = asyncio.ensure_future(
-            dispatch_external_notification(
-                task.project_id,
-                "BUDGET_EXCEEDED",
-                {
-                    "task_id": str(task.id),
-                    "daily_total_usd": round(daily_total, 2),
-                    "daily_vm_cost_usd": round(vm_total, 2),
-                    "daily_compute_cost_usd": round(compute_total, 2),
-                    "ceiling_usd": round(ceiling, 2),
-                    "direction_text": direction_text[:200],
-                    "cost_by_failure_class": cost_by_failure_class,
-                },
-            )
-        )
-        del _budget_future  # fire-and-forget; stored to satisfy RUF006
-    except Exception as _ne:
-        logger.warning(f"[NOTIFY] BUDGET_EXCEEDED dispatch setup failed: {_ne}")
 
 
 _STOPWORDS = frozenset(
@@ -1285,6 +1114,14 @@ async def update_agent_status(
         ctx["reproduce_verdict"] = payload.reproduce_verdict.model_dump()
         task.context = ctx
         flag_modified(task, "context")
+    if (task.first_payload or {}).get("type") == "repo_bootstrap":
+        ctx = dict(task.context or {})
+        if payload.repo_overview is not None:
+            ctx["repo_overview"] = payload.repo_overview.model_dump()
+        else:
+            ctx.pop("repo_overview", None)
+        task.context = ctx
+        flag_modified(task, "context")
     if payload.file_change_details:
         ctx = dict(task.context or {})
         ctx["_file_change_details"] = payload.file_change_details[:50]
@@ -1690,6 +1527,7 @@ async def update_agent_status(
                     return {"status": "blocked", "task_id": str(task.id)}
 
                 from app.failure_classification import (
+                    DEAD_AUTH,
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
                     EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
                     NO_PROGRESS_TIMEOUT,
@@ -2132,6 +1970,98 @@ async def update_agent_status(
                             old_vm_id_rl, reason="rate_limit_requeue"
                         )
                         return {"status": "accepted"}
+                elif failure_class == DEAD_AUTH:
+                    # Dead OAuth/API session: permanently disable the account fleet-wide
+                    # and requeue once onto a different account without burning the retry
+                    # budget (DEAD_AUTH is in INFRA_CLASSES — a provider-infra event, not
+                    # a code defect). The operator must re-authenticate to re-enable.
+                    da_acct_id = get_task_llm_account_id(task)
+                    if da_acct_id:
+                        await release_max_plan_account(da_acct_id)
+                        task.context = {**(task.context or {}), "_slot_released": True}
+
+                    _da_pattern = (task.context or {}).get(
+                        "dead_auth_matched_pattern", "dead_oauth_session"
+                    )
+                    _da_reason = f"dead-auth: {_da_pattern}"
+                    logger.warning(
+                        "[AGENT STATUS] Task %s DEAD_AUTH (account=%s pattern=%r) — "
+                        "hard-disabling account fleet-wide; requeuing onto different account",
+                        task.id,
+                        da_acct_id,
+                        _da_pattern,
+                    )
+                    if da_acct_id:
+                        try:
+                            newly_disabled = await disable_account_for_auth(
+                                da_acct_id, _da_reason
+                            )
+                        except Exception as _da_err:
+                            newly_disabled = False
+                            logger.warning(
+                                "[AGENT STATUS] disable_account_for_auth failed for %s: %s",
+                                da_acct_id,
+                                _da_err,
+                            )
+                        if newly_disabled:
+                            try:
+                                from app.notification_dispatch import (
+                                    post_failure_alert_message,
+                                )
+
+                                await post_failure_alert_message(
+                                    session,
+                                    task.project_id,
+                                    "LLM account auto-disabled: dead auth session "
+                                    f"({_da_pattern}). Re-authenticate and re-enable the account.",
+                                    task.id,
+                                )
+                            except Exception as _notify_err:
+                                logger.warning(
+                                    "[NOTIFY] Failed to post dead-auth alert: %s",
+                                    _notify_err,
+                                )
+                                with contextlib.suppress(Exception):
+                                    await session.rollback()
+
+                    # Blacklist the disabled account so this task's next attempt
+                    # picks a different account.
+                    ctx = dict(task.context or {})
+                    if da_acct_id:
+                        blacklisted = list(ctx.get("blacklisted_accounts") or [])
+                        if da_acct_id not in blacklisted:
+                            blacklisted.append(da_acct_id)
+                        ctx["blacklisted_accounts"] = blacklisted
+
+                    old_vm_id_da = task.vm_instance_id
+                    now_da = _utcnow()
+                    bank_task_current_attempt(task, stopped_at=now_da)
+                    ctx = with_task_attempt_banking(task, ctx)
+                    ctx.pop("_slot_released", None)
+                    ctx.pop("provision_failures", None)
+                    task.context = ctx
+                    task.status = TaskStatus.QUEUED
+                    task.retry_after_until = None
+                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                    task.last_heartbeat = None
+                    task.started_at = None
+                    task.latest_status_message = "Dead auth session — requeued onto different account"
+                    from app.routers.agent import _terminated_task_ids
+
+                    _terminated_task_ids.pop(str(task.id), None)
+                    session.add(task)
+                    await session.commit()
+                    await broadcast_to_project(
+                        str(task.project_id),
+                        "task_updated",
+                        {"task_id": str(task.id), "status": TaskStatus.QUEUED},
+                    )
+                    logger.info(
+                        "[AGENT STATUS] Task %s DEAD_AUTH — requeued without burning retry",
+                        task.id,
+                    )
+                    await _ensure_vm_deleted(old_vm_id_da, reason="dead_auth_requeue")
+                    return {"status": "accepted"}
         except Exception as e:
             logger.error(
                 f"[STATUS] Exception during result recording for task {_task_id_str}: {e!r}",
@@ -2217,9 +2147,22 @@ async def update_agent_status(
             await session.flush()
 
         # Persist runtime LLM telemetry on Task for durable analytics.
+        # Resolve (provider, model) as an atomic pair to prevent chimera rows
+        # (e.g. openai:claude-opus-4-8) where sources are blended per-field.
+        # Priority: agent-reported pair (what actually ran, including CLI fallbacks)
+        # > dispatch-time context pair > partial blend as last-resort degradation.
         _ctx_terminal = dict(task.context or {})
-        _provider = _ctx_terminal.get("llm_provider") or payload.provider
-        _model = _ctx_terminal.get("llm_model") or payload.model
+        _ctx_provider = _ctx_terminal.get("llm_provider")
+        _ctx_model = _ctx_terminal.get("llm_model")
+        if payload.provider and payload.model:
+            _provider, _model = payload.provider, payload.model
+        elif _ctx_provider and _ctx_model:
+            _provider, _model = _ctx_provider, _ctx_model
+        else:
+            # No complete pair from either source — do not blend halves across
+            # sources; that manufactures chimera (provider, model) combos that
+            # poison cost attribution.  Degrade to (None, None) instead.
+            _provider, _model = None, None
         task.provider = str(_provider) if _provider else None
         task.account_id = str(acct_id) if acct_id else None
         task.model = str(_model) if _model else None
@@ -2267,17 +2210,22 @@ async def update_agent_status(
                 # Provider-aware teardown defer: a reused VM is locked to the
                 # LLM provider/account/model frozen into its boot manifest (the
                 # warm claim only mints a fresh JWT — it never re-materializes
-                # credentials). The completing task ran on that boot identity, so
-                # task.provider/account_id/model (set just above) ARE the VM's
-                # boot identity. Pass it through so we only hold the VM for
-                # backlog work it can actually run warm — a task pinned/recorded
-                # to a different provider cold-dispatches instead. NO-OP for
+                # credentials). The completing task ran on that boot identity.
+                # Resolve each boot field independently here: the persisted
+                # task.provider/model pair above is atomic (a half-known pair
+                # degrades to None/None to keep cost buckets honest), but the
+                # compatibility gate checks provider and model separately, so a
+                # truthful single field (e.g. agent reported a provider with no
+                # model) must still filter backlog — None would disable the
+                # gate and hold the VM for work it cannot run warm. NO-OP for
                 # single-provider projects (the dominant case): their queued
                 # tasks carry no divergent constraint, so nothing is filtered.
+                _boot_provider = task.provider or _ctx_provider or payload.provider
+                _boot_model = task.model or _ctx_model or payload.model
                 vm_boot = {
-                    "provider": task.provider,
+                    "provider": str(_boot_provider) if _boot_provider else None,
                     "account_id": task.account_id,
-                    "model": task.model,
+                    "model": str(_boot_model) if _boot_model else None,
                 }
                 if await has_eligible_backlog_task(
                     session, task.project_id, old_vm_id, vm_boot=vm_boot

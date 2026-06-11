@@ -15,10 +15,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.capability_trial_verdict import get_trial_definitions
 from app.database import resolve_dialect_name
 from app.landed_signal import has_landed_signal, merge_verification_status
 from app.models import (
@@ -29,6 +30,7 @@ from app.models import (
     TaskWakeRegistration,
     WakeDeliveryState,
     ReleaseVersion,
+    get_task_total_vm_cost_usd,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
 # Remediation funnel + recurring-failure-pattern helpers relocated to their own
@@ -76,6 +78,7 @@ from app.failure_classification import (
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
     CODE_ERROR,
+    DEAD_AUTH,
     EXTERNAL_API,
     MIGRATION_ERROR,
     NO_PROGRESS_TIMEOUT,
@@ -106,6 +109,7 @@ _FAILURE_CLASS_LABELS = {
     AGENT_TIMEOUT: "Agent Timeout",
     EXTERNAL_API: "External API",
     RATE_LIMIT: "Rate Limit",
+    DEAD_AUTH: "Dead Auth — account disabled (re-authenticate to restore)",
     SCOPE_OVERFLOW: "Scope Overflow",
     MIGRATION_ERROR: "Migration Error",
     VIEWPORT_REGRESSION: "Viewport Regression",
@@ -125,6 +129,8 @@ _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5
 def _compute_first_attempt_breakdowns(
     terminal_tasks: List[Task],
     prev_terminal_tasks: List[Task] | None = None,
+    *,
+    trial_definitions: list | None = None,
 ) -> Dict[str, Any]:
     """Compute overall first-attempt success rate plus playbook and arch-context
     effectiveness comparisons from a list of terminal tasks."""
@@ -150,6 +156,77 @@ def _compute_first_attempt_breakdowns(
         t for t in measured if (t.context or {}).get("_had_arch_context") is False
     ]
     sample_size = len(measured)
+
+    _defs = trial_definitions if trial_definitions is not None else get_trial_definitions()
+    _min_lift_sample = 5
+    trial_breakdowns: Dict[str, Any] = {}
+    for _td in _defs:
+        _cap = _td["cap_name"]
+        _ctx_key = _td["context_key"]
+        # Intent-to-treat: when an assignment key is present, partition on
+        # assignment; fall back to the receipt key for legacy tasks that
+        # pre-date the assignment field (i.e. _assign_key is absent).
+        _assign_key = _td.get("assignment_key", _ctx_key)
+        _with_arm = [
+            t for t in measured
+            if (t.context or {}).get(_assign_key) is True
+            or (
+                (t.context or {}).get(_assign_key) is None
+                and (t.context or {}).get(_ctx_key) is True
+            )
+        ]
+        _without_arm = [
+            t for t in measured
+            if (t.context or {}).get(_assign_key) is False
+            or (
+                (t.context or {}).get(_assign_key) is None
+                and (t.context or {}).get(_ctx_key) is False
+            )
+        ]
+        _with_rate = _fa_rate(_with_arm)
+        _without_rate = _fa_rate(_without_arm)
+        _lift_val: float | None = (
+            round(_with_rate - _without_rate, 2)
+            if (
+                _with_rate is not None
+                and _without_rate is not None
+                and len(_with_arm) >= _min_lift_sample
+                and len(_without_arm) >= _min_lift_sample
+            )
+            else None
+        )
+        _trial_entry: Dict[str, Any] = {
+            "lift": _lift_val,
+            "with_n": len(_with_arm),
+            "without_n": len(_without_arm),
+            "with_rate": _with_rate,
+            "without_rate": _without_rate,
+        }
+        # Compliance sub-dict: among treatment-arm tasks, what fraction actually
+        # received the capability (receipt key True). Only present when assignment
+        # and receipt keys differ, so adding it does not break consumers that only
+        # check the existing flat keys.
+        if _assign_key != _ctx_key:
+            _receipt_n = len(_with_arm)
+            _receipt_true = sum(
+                1 for t in _with_arm if (t.context or {}).get(_ctx_key) is True
+            )
+            _trial_entry["compliance"] = {
+                "with_rate": round(_receipt_true / _receipt_n, 2) if _receipt_n else None,
+                "without_rate": round((_receipt_n - _receipt_true) / _receipt_n, 2)
+                if _receipt_n
+                else None,
+            }
+        trial_breakdowns[_cap] = _trial_entry
+
+    def _lift(flag, tasks):
+        tasks = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        a = [t for t in tasks if (t.context or {}).get(flag) is True]
+        b = [t for t in tasks if (t.context or {}).get(flag) is False]
+        return round(_fa_rate(a) - _fa_rate(b), 2) if len(a) >= 10 and len(b) >= 10 else None
+
+    playbook_lift = _lift("_had_playbook", measured)
+    arch_context_lift = _lift("_had_arch_context", measured)
 
     by_type_groups: Dict[str, list] = {}
     for t in terminal_tasks:
@@ -183,6 +260,15 @@ def _compute_first_attempt_breakdowns(
                 trend = "declining"
             else:
                 trend = "stable"
+    playbook_lift_trend: str | None = None
+    arch_context_lift_trend: str | None = None
+    if prev_terminal_tasks is not None:
+        prev_playbook_lift = _lift("_had_playbook", prev_terminal_tasks)
+        prev_arch_context_lift = _lift("_had_arch_context", prev_terminal_tasks)
+        playbook_lift_trend = _format_compliance_trend(playbook_lift, prev_playbook_lift)
+        arch_context_lift_trend = _format_compliance_trend(
+            arch_context_lift, prev_arch_context_lift
+        )
 
     first_attempt_by_review_category: Dict[str, float] | None = None
     failed_with_cats = [
@@ -220,19 +306,188 @@ def _compute_first_attempt_breakdowns(
         )
         return round(succ / len(measured), 2)
 
+    # Build flat alias keys from trial_breakdowns for backward compatibility.
+    _flat_trial: Dict[str, Any] = {}
+    for _cap, _bd in trial_breakdowns.items():
+        _flat_trial[f"{_cap}_lift"] = _bd["lift"]
+        _flat_trial[f"with_{_cap}_n"] = _bd["with_n"]
+        _flat_trial[f"without_{_cap}_n"] = _bd["without_n"]
+        _flat_trial[f"with_{_cap}"] = _bd["with_rate"]
+        _flat_trial[f"without_{_cap}"] = _bd["without_rate"]
+
     return {
         "overall": overall,
         "verified_overall": _fa_verified_rate(terminal_tasks),
         "with_playbook": _fa_rate(with_pb),
         "without_playbook": _fa_rate(without_pb),
+        "playbook_lift": playbook_lift,
+        "playbook_lift_trend": playbook_lift_trend,
         "with_arch_context": _fa_rate(with_arch),
         "without_arch_context": _fa_rate(without_arch),
+        "arch_context_lift": arch_context_lift,
+        "arch_context_lift_trend": arch_context_lift_trend,
+        **_flat_trial,
+        "trial_breakdowns": trial_breakdowns,
         "sample_size": sample_size,
         "by_type": by_type,
         "by_scope": by_scope,
         "trend": trend,
         "first_attempt_by_review_category": first_attempt_by_review_category,
     }
+
+
+def _json_truthy(value: Any) -> bool:
+    """Normalize a JSON-extracted boolean across dialects.
+
+    SQLite ``json_extract`` returns integer 1/0 for JSON true/false; PostgreSQL
+    ``->>`` (``.astext``) returns the strings ``'true'``/``'false'``. ORM-loaded
+    values may also arrive as native ``bool``. Treat all truthy encodings the same.
+    """
+    return value in (True, 1, "true", "1")
+
+
+async def compute_trial_arm_accumulation(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID | None",
+    context_key: str,
+    assignment_key: "str | None" = None,
+) -> Dict[str, Any]:
+    """Cumulative per-arm first-attempt-success counts over a trial's whole life.
+
+    The capability-trial verdict must accumulate evidence over the life of the
+    trial rather than re-deriving arms from a single sliding digest window — at
+    realistic task volume the without-arm never reaches the min-N threshold inside
+    any one window, so a windowed basis can never decide.
+
+    Intent-to-treat partitioning: when ``assignment_key`` is provided (e.g.
+    ``_repo_map_arm``), arm membership uses COALESCE(assignment_key, context_key),
+    matching the windowed ``_compute_first_attempt_breakdowns`` path.  Tasks that
+    carry the assignment key are partitioned by it; legacy tasks that pre-date the
+    assignment field fall back to the receipt key (``context_key``).  This ensures
+    a treatment-assigned task with an empty map (_repo_map_arm=true,
+    _had_repo_map=false) lands in the WITH arm, not the WITHOUT arm.
+
+    This runs a dialect-aware SQL AGGREGATE (``func.count()`` GROUP BY the arm-flag
+    value and the first-attempt-success value, project-filtered, over terminal
+    COMPLETED/FAILED tasks that carry at least one arm indicator and
+    ``_first_attempt_succeeded``).  An aggregate count never materializes
+    JSONB-heavy rows, so scanning the full trial history is bounded and safe — it
+    does NOT widen the digest's own capped terminal-task scan.
+
+    Returns a dict with cumulative ``with_n``, ``without_n``, ``with_succ``,
+    ``without_succ``, ``with_rate``, ``without_rate`` and ``lift``
+    (with-arm rate − without-arm rate), where rates are ``None`` for an empty arm.
+    """
+    _assign_key = assignment_key if assignment_key else context_key
+    _has_assignment = _assign_key != context_key
+    if resolve_dialect_name(session) == "sqlite":
+        _primary_expr = func.json_extract(Task.context, f"$.{_assign_key}")
+        _fallback_expr = func.json_extract(Task.context, f"$.{context_key}")
+        arm_expr = (
+            func.coalesce(_primary_expr, _fallback_expr)
+            if _has_assignment
+            else _primary_expr
+        )
+        succ_expr = func.json_extract(Task.context, "$._first_attempt_succeeded")
+        _assign_flag_expr = (
+            case((_primary_expr.is_not(None), 1), else_=0)
+            if _has_assignment
+            else None
+        )
+    else:
+        _primary_expr = Task.context[_assign_key].astext
+        _fallback_expr = Task.context[context_key].astext
+        arm_expr = (
+            func.coalesce(_primary_expr, _fallback_expr)
+            if _has_assignment
+            else _primary_expr
+        )
+        succ_expr = Task.context["_first_attempt_succeeded"].astext
+        _assign_flag_expr = (
+            case((_primary_expr.is_not(None), 1), else_=0)
+            if _has_assignment
+            else None
+        )
+
+    filters = [
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        arm_expr.is_not(None),
+        succ_expr.is_not(None),
+    ]
+    if project_id is not None:
+        filters.append(Task.project_id == project_id)
+
+    with_n = with_succ = without_n = without_succ = 0
+    if _has_assignment:
+        stmt = (
+            select(arm_expr, succ_expr, _assign_flag_expr, func.count())
+            .where(*filters)
+            .group_by(arm_expr, succ_expr, _assign_flag_expr)
+        )
+        rows = (await session.execute(stmt)).all()
+        with_assigned = with_receipt = without_assigned = without_receipt = 0
+        for arm_val, succ_val, is_assigned_val, cnt in rows:
+            cnt = int(cnt)
+            is_assigned = bool(is_assigned_val)
+            if _json_truthy(arm_val):
+                with_n += cnt
+                if _json_truthy(succ_val):
+                    with_succ += cnt
+                if is_assigned:
+                    with_assigned += cnt
+                else:
+                    with_receipt += cnt
+            else:
+                without_n += cnt
+                if _json_truthy(succ_val):
+                    without_succ += cnt
+                if is_assigned:
+                    without_assigned += cnt
+                else:
+                    without_receipt += cnt
+    else:
+        stmt = (
+            select(arm_expr, succ_expr, func.count())
+            .where(*filters)
+            .group_by(arm_expr, succ_expr)
+        )
+        rows = (await session.execute(stmt)).all()
+        for arm_val, succ_val, cnt in rows:
+            cnt = int(cnt)
+            if _json_truthy(arm_val):
+                with_n += cnt
+                if _json_truthy(succ_val):
+                    with_succ += cnt
+            else:
+                without_n += cnt
+                if _json_truthy(succ_val):
+                    without_succ += cnt
+
+    with_rate = round(with_succ / with_n, 2) if with_n else None
+    without_rate = round(without_succ / without_n, 2) if without_n else None
+    lift = (
+        round(with_rate - without_rate, 2)
+        if with_rate is not None and without_rate is not None
+        else None
+    )
+    result: Dict[str, Any] = {
+        "with_n": with_n,
+        "without_n": without_n,
+        "with_succ": with_succ,
+        "without_succ": without_succ,
+        "with_rate": with_rate,
+        "without_rate": without_rate,
+        "lift": lift,
+    }
+    if _has_assignment:
+        result["arm_composition"] = {
+            "with_assigned": with_assigned,
+            "with_receipt": with_receipt,
+            "without_assigned": without_assigned,
+            "without_receipt": without_receipt,
+        }
+    return result
 
 
 def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
@@ -243,12 +498,19 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     is the extraction layer's count of unparseable FINAL outputs (a "format miss");
     a task is *well-formed* when that count is zero. Self-repair counts are the
     focused re-ask attempts after a miss and how many of them parsed.
+
+    ``by_schema`` in the returned block aggregates per-schema repair attempts and
+    successes across tasks. Tasks from older agents that lack per-schema maps
+    contribute to the scalar totals but not to ``by_schema``.
     """
     measured = 0
     well_formed = 0
     error_total = 0
     repair_attempts = 0
     repair_successes = 0
+    miss_by_schema: defaultdict[str, int] = defaultdict(int)
+    repair_attempts_by_schema: defaultdict[str, int] = defaultdict(int)
+    repair_successes_by_schema: defaultdict[str, int] = defaultdict(int)
     for t in tasks:
         summary = getattr(t, "format_compliance_summary", None)
         if not isinstance(summary, dict):
@@ -262,6 +524,21 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         repair_successes += s
         if e == 0:
             well_formed += 1
+        for schema, count in (summary.get("format_miss_by_schema") or {}).items():
+            miss_by_schema[str(schema)] += int(count)
+        for schema, count in (summary.get("format_repair_attempts_by_schema") or {}).items():
+            repair_attempts_by_schema[str(schema)] += int(count)
+        for schema, count in (summary.get("format_repair_successes_by_schema") or {}).items():
+            repair_successes_by_schema[str(schema)] += int(count)
+    all_schemas = set(miss_by_schema) | set(repair_attempts_by_schema) | set(repair_successes_by_schema)
+    by_schema = {
+        schema: {
+            "format_miss": miss_by_schema.get(schema, 0),
+            "repair_attempts": repair_attempts_by_schema.get(schema, 0),
+            "repair_successes": repair_successes_by_schema.get(schema, 0),
+        }
+        for schema in sorted(all_schemas)
+    }
     return {
         "tasks_measured": measured,
         "well_formed_tasks": well_formed,
@@ -278,6 +555,7 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         "self_repair_success_rate": round(repair_successes / repair_attempts, 3)
         if repair_attempts
         else None,
+        "by_schema": by_schema,
     }
 
 
@@ -3022,18 +3300,22 @@ def compute_digest_cost_economics(
     )
 
     # Compute today's cost for cost ceiling warning. The VM figure comes from
-    # task VM-runtime; off-VM compute-job spend is passed in pre-aggregated by
+    # task VM-runtime (using the machine-type-aware helper so larger instances are
+    # costed correctly); off-VM compute-job spend is passed in pre-aggregated by
     # the caller (admin_digest) from the ComputeJob ledger so daily_cost_usd
     # means total spend, not just VM runtime.
+    # In-flight tasks (vm_stopped_at IS NULL) are estimated to now so the figure
+    # is current rather than lagging until the task eventually stops.
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     daily_vm_cost_usd = round(
         sum(
-            ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
-            * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            get_task_total_vm_cost_usd(
+                t,
+                stopped_at=now if t.vm_stopped_at is None else None,
+            )
             for t in all_tasks
-            if t.vm_provisioned_at
-            and t.vm_stopped_at
-            and t.vm_stopped_at >= today_start
+            if t.vm_provisioned_at is not None
+            and (t.vm_stopped_at is None or t.vm_stopped_at >= today_start)
         ),
         2,
     )
@@ -4158,3 +4440,240 @@ def compute_task_type_cost_adherence(
             }
         )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Safeguard merge-gate shadow (observe-mode) telemetry
+# ---------------------------------------------------------------------------
+
+# Hard cap on shadow-verdict rows returned per call, to bound memory usage
+# when querying across many tasks.
+_SAFEGUARD_SHADOW_CAP = 200
+
+
+def compute_safeguard_shadow_metrics(
+    security_audit_tasks: "List[Task]",
+) -> Dict[str, Any]:
+    """Compact per-cycle safeguard shadow-challenge telemetry for the strategist.
+
+    Scans ``security_audit_tasks`` (caller supplies the window-filtered rows) for
+    tasks carrying ``safeguard_observe_verdict`` (written in observe mode by
+    ``_maybe_release_safeguard_gate`` after a shadow challenge resolves).  Returns
+    a summary dict so the strategist can measure the false-positive-block rate
+    before enabling enforce mode.
+
+    Fields returned:
+        observed_blocks     — total shadow-challenge verdicts found (capped at
+                              _SAFEGUARD_SHADOW_CAP to bound the scan).
+        would_release       — count whose outcome was "rejected" or "downgraded"
+                              (the gate WOULD have been released in enforce mode).
+        confirmed           — count confirmed as a real critical/high finding.
+        unavailable         — count where the challenge errored/timed out.
+        false_positive_rate — would_release / observed_blocks, or None if zero.
+        cap_reached         — True when the scan hit the hard cap.
+    """
+    from app.task_evaluators import SAFEGUARD_OBSERVE_VERDICT_KEY  # noqa: PLC0415
+
+    observed_blocks = 0
+    would_release = 0
+    confirmed = 0
+    unavailable = 0
+    cap_reached = False
+
+    for task in security_audit_tasks:
+        if observed_blocks >= _SAFEGUARD_SHADOW_CAP:
+            cap_reached = True
+            break
+        ctx = task.context or {}
+        verdict = ctx.get(SAFEGUARD_OBSERVE_VERDICT_KEY)
+        if not isinstance(verdict, dict):
+            continue
+        observed_blocks += 1
+        outcome = str(verdict.get("outcome") or "unavailable").lower()
+        if outcome in ("rejected", "downgraded"):
+            would_release += 1
+        elif outcome == "confirmed":
+            confirmed += 1
+        else:
+            unavailable += 1
+
+    false_positive_rate = (
+        round(would_release / observed_blocks, 3) if observed_blocks > 0 else None
+    )
+    return {
+        "observed_blocks": observed_blocks,
+        "would_release": would_release,
+        "confirmed": confirmed,
+        "unavailable": unavailable,
+        "false_positive_rate": false_positive_rate,
+        "cap_reached": cap_reached,
+    }
+
+
+# Keys written by research_completion._record_research_survival_signal /
+# _attach_challenge_record — mirrored here to avoid a circular import.
+_RESEARCH_SURVIVING_KEY = "research_surviving_findings"
+_RESEARCH_CHALLENGE_HISTORY_KEY = "finding_challenge_records"
+_RESEARCH_VERIFICATION_BASIS_TIERS = (
+    "code_verified",
+    "path_verified",
+    "pattern_inferred",
+    "deduced",
+)
+
+
+def compute_research_output_quality(tasks: List[Task]) -> Optional[Dict[str, Any]]:
+    """Aggregate research output-quality signals across the digest window.
+
+    Aggregates three complementary signals from the per-task JSONB that
+    research_completion writes at cycle end:
+
+    * ``surviving_rate`` — mean(research_surviving_findings / findings_dispatched)
+      per research task where both values are present (plan_output non-empty).
+    * ``challenge_agreement_rate`` — agrees / (agrees + disagrees + indeterminate)
+      accumulated across all finding_challenge_records entries in the window.
+    * ``verification_basis_distribution`` — count by basis tier across all
+      dispatched findings in qualifying tasks.
+
+    Tasks without ``research_surviving_findings`` in context OR with an empty/
+    missing ``plan_output`` are skipped (nil-safe). Returns ``None`` when no
+    qualifying tasks exist.
+    """
+    surviving_ratios: List[float] = []
+    agrees = disagrees = indeterminate = 0
+    basis_counts: Dict[str, int] = {tier: 0 for tier in _RESEARCH_VERIFICATION_BASIS_TIERS}
+
+    for task in tasks:
+        payload_type = (task.first_payload or {}).get("type")
+        if payload_type != "research":
+            continue
+        ctx = task.context or {}
+        if _RESEARCH_SURVIVING_KEY not in ctx:
+            continue
+        findings = [
+            f for f in (task.plan_output or []) if isinstance(f, dict)
+        ]
+        if not findings:
+            continue
+
+        surviving = ctx[_RESEARCH_SURVIVING_KEY]
+        total = len(findings)
+        try:
+            surviving_ratios.append(float(surviving) / float(total))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+        for record in (ctx.get(_RESEARCH_CHALLENGE_HISTORY_KEY) or []):
+            if not isinstance(record, dict):
+                continue
+            agreement = str(record.get("agreement") or "").lower()
+            if agreement == "agrees":
+                agrees += 1
+            elif agreement == "disagrees":
+                disagrees += 1
+            elif agreement == "indeterminate":
+                indeterminate += 1
+
+        for finding in findings:
+            basis = finding.get("verification_basis")
+            if basis in basis_counts:
+                basis_counts[basis] += 1
+
+    if not surviving_ratios:
+        return None
+
+    challenge_total = agrees + disagrees + indeterminate
+    challenge_agreement_rate = (
+        round(agrees / challenge_total, 3) if challenge_total > 0 else None
+    )
+
+    return {
+        "qualifying_task_count": len(surviving_ratios),
+        "surviving_rate": round(statistics.mean(surviving_ratios), 3),
+        "challenge_agreement_rate": challenge_agreement_rate,
+        "challenge_total": challenge_total,
+        "challenge_agrees": agrees,
+        "challenge_disagrees": disagrees,
+        "challenge_indeterminate": indeterminate,
+        "verification_basis_distribution": dict(basis_counts),
+    }
+
+
+async def compute_problem_model_gc_health(
+    session: AsyncSession,
+    project_id,
+    *,
+    limit: int = 10,
+) -> dict:
+    """Summarise per-cycle problem-model GC telemetry over the most recent cycles.
+
+    Queries the most recent ``limit`` terminal StrategicCycle rows for the project
+    and aggregates the ``model_gc_telemetry`` field stored in cycle_metadata.
+    Cycles without telemetry (old cycles predating the feature) are excluded from
+    aggregates but counted in ``cycles_sampled``.
+    """
+    from app.models import StrategicCycle
+    from app import strategic_cycle as _strategic_cycle
+    from sqlalchemy import desc
+
+    stmt = (
+        select(StrategicCycle)
+        .where(
+            StrategicCycle.project_id == project_id,
+            StrategicCycle.outcome.not_in(list(_strategic_cycle.ACTIVE_OUTCOMES)),
+        )
+        .order_by(desc(StrategicCycle.phase1_started_at))
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    cycles_sampled = len(rows)
+    cycles_with_telemetry = 0
+    latest_model_bytes = None
+    latest_model_size_status = None
+    latest_capability_count = None
+    latest_gap_count = None
+    problem_model_truncated_cycles = 0
+    directions_dropped_cycles = 0
+    gap_memory_trimmed_cycles = 0
+    any_truncated = False
+    any_gap_trim = False
+
+    for row in rows:
+        telem = (row.cycle_metadata or {}).get("model_gc_telemetry")
+        if telem is None:
+            continue
+        cycles_with_telemetry += 1
+        if cycles_with_telemetry == 1:
+            latest_model_bytes = telem.get("model_bytes")
+            latest_model_size_status = telem.get("model_size_status")
+            latest_capability_count = telem.get("capability_count")
+            latest_gap_count = telem.get("gap_count")
+        if telem.get("problem_model_truncated"):
+            problem_model_truncated_cycles += 1
+            any_truncated = True
+        if (telem.get("directions_dropped_count") or 0) > 0:
+            directions_dropped_cycles += 1
+        if (telem.get("gap_memory_trimmed_count") or 0) > 0:
+            gap_memory_trimmed_cycles += 1
+            any_gap_trim = True
+
+    if any_truncated:
+        trend = "degraded"
+    elif any_gap_trim:
+        trend = "trimming"
+    else:
+        trend = "healthy"
+
+    return {
+        "cycles_sampled": cycles_sampled,
+        "cycles_with_telemetry": cycles_with_telemetry,
+        "latest_model_bytes": latest_model_bytes,
+        "latest_model_size_status": latest_model_size_status,
+        "latest_capability_count": latest_capability_count,
+        "latest_gap_count": latest_gap_count,
+        "problem_model_truncated_cycles": problem_model_truncated_cycles,
+        "directions_dropped_cycles": directions_dropped_cycles,
+        "gap_memory_trimmed_cycles": gap_memory_trimmed_cycles,
+        "trend": trend,
+    }

@@ -550,6 +550,25 @@ class Project(SQLModel, table=True):
         default=None,
         sa_column=Column(String, nullable=True),
     )
+    # Durable evidence-grounded capability proof records.
+    # Shape: {normalized_cap_name: [{task_id, proved_at, proof_kind,
+    #   proof_ref, commit_sha}]} (capped at 10 entries per capability).
+    # Written by capability_proof.record_capability_proof when a task that
+    # advertises provides_capability completes with verified acceptance evidence
+    # (named_test proven=True or downstream_artifact consumed=True).
+    # NULL / absent key = capability is claimed but never proven.
+    capability_proof_records: Dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSONB, nullable=True, default={})
+    )
+    # Durable adopt-or-reject verdicts for capability trials.
+    # Shape: {normalized_cap_name: {verdict, lift, n_with, n_without, window_hours,
+    # evaluated_at, thresholds}} — newest verdict supersedes the prior one.
+    # Written by capability_trial_verdict.record_trial_verdict during digest
+    # computation when a trial has accumulated enough measurement data.
+    # NULL / absent key = trial still running or not yet measured.
+    capability_adoption_verdicts: Dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSONB, nullable=True, default={})
+    )
     # Per-project promotion (LTS) branch. NULL means fall back to 'main' —
     # identical semantics to integration_branch.
     # Like integration_branch, this is operator-managed and preserved once set.
@@ -1549,6 +1568,63 @@ def get_task_total_vm_cost_usd(
     ) + get_task_current_attempt_vm_cost_usd(task, stopped_at=stopped_at)
 
 
+def get_task_cost_by_provider_model(
+    task: Task,
+    *,
+    window_start: datetime | None = None,
+) -> dict[str, float]:
+    """Return per-(provider, model) VM cost breakdown for a task.
+
+    Iterates attempt_history for banked attempts and the live span for the
+    current attempt. Provider/model pairs are resolved atomically per attempt
+    (both from the same source), so impossible 'chimera' buckets like
+    openai|claude-opus-4-8 cannot appear. An unresolvable pair degrades to
+    'unknown|unknown' as a whole, never a half-resolved key.
+
+    When window_start is provided, banked attempts whose recorded vm_stopped_at
+    falls before window_start are excluded. The live span is always included when
+    it exists (digest callers filter tasks by vm_stopped_at before calling).
+    """
+    result: dict[str, float] = {}
+
+    for attempt in task.attempt_history or []:
+        cost = float(attempt.get("vm_runtime_cost_usd") or 0.0)
+        if cost <= 0:
+            continue
+        if window_start is not None:
+            stopped_at_str = attempt.get("vm_stopped_at")
+            if stopped_at_str:
+                try:
+                    stopped_dt = datetime.fromisoformat(stopped_at_str)
+                    # Strip tz if present (stored timestamps are naive UTC)
+                    if stopped_dt.tzinfo is not None:
+                        stopped_dt = stopped_dt.replace(tzinfo=None)
+                    if stopped_dt < window_start:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+        provider = attempt.get("provider")
+        model = attempt.get("model")
+        if provider and model:
+            bucket = f"{provider}|{model}"
+        else:
+            bucket = "unknown|unknown"
+        result[bucket] = result.get(bucket, 0.0) + cost
+
+    # Live (un-banked) current attempt
+    live_cost = get_task_current_attempt_vm_cost_usd(task)
+    if live_cost > 0:
+        provider = task.provider
+        model = task.model
+        if provider and model:
+            bucket = f"{provider}|{model}"
+        else:
+            bucket = "unknown|unknown"
+        result[bucket] = result.get(bucket, 0.0) + live_cost
+
+    return result
+
+
 def get_task_total_vm_cost_usd_or_none(
     task: Task, *, stopped_at: datetime | None = None
 ) -> float | None:
@@ -1954,6 +2030,30 @@ class PoolIdleCostLedger(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
+
+
+class PoolIdleSpan(SQLModel, table=True):
+    """Durable per-settled-idle-span log for windowed pool idle cost attribution.
+
+    Written by settle_pool_vm_idle_cost (when a session is provided) each time
+    an idle span is banked onto PoolVm.idle_cost_banked, and by
+    retire_and_delete_pool_vm for the final idle span at teardown.  Enables
+    _compute_windowed_idle_cost to filter on settled_at (exact span end) rather
+    than on PoolIdleCostLedger.retired_at (member teardown time), eliminating
+    lump-attribution distortion for long-lived members with multiple idle cycles.
+    Append-only INSERT is concurrency-safe (no accumulator contention).
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    vm_instance_id: str = Field(sa_column=Column(String, nullable=False))
+    # Exact start/end of this idle span.
+    started_at: datetime = Field(sa_column=Column(NaiveUTCDateTime, nullable=False))
+    settled_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False, index=True)
+    )
+    cost_usd: float = Field(sa_column=Column(Float, nullable=False))
+    reason: str | None = Field(default=None, sa_column=Column(String, nullable=True))
 
 
 class TaskHistory(SQLModel, table=True):

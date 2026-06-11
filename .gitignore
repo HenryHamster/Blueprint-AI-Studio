@@ -33,12 +33,10 @@ backend/.testmondata*
 /blocked
 /gh-token
 /check
-/check.args
 /pr
 /done
 /fail
 /fetch
-self_review_*.json
 research-*.md
 *.bak
 # Repo-root self-review JSON output (agents write to /tmp; strays at the root

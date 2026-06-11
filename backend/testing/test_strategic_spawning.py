@@ -474,6 +474,40 @@ async def test_spawn_review_includes_operator_overrides_when_present(db_session)
 
 
 @pytest.mark.asyncio
+async def test_spawn_review_includes_capability_trial_verdicts(db_session):
+    """The strategic_review payload carries durable capability trial verdicts."""
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        capability_adoption_verdicts={
+            "language-aware-repo-navigation": {
+                "verdict": "adopt",
+                "lift": 0.12,
+                "n_with": 42,
+                "n_without": 41,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert payload["capability_trial_verdicts"] == {
+        "language-aware-repo-navigation": {
+            "verdict": "adopt",
+            "lift": 0.12,
+            "n_with": 42,
+            "n_without": 41,
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_spawn_review_includes_model_health_signal(db_session):
     """The strategic_review payload carries the soft model size/health signal
     computed from the DURABLE problem_model (honest pre-trim counts)."""
@@ -600,9 +634,12 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "topic",
         "direction_id",
         "source_kind",
+        "analysis_fallback_reason",
         "created_at",
         "knowledge_acceptance_evidence",
         "compute_acceptance_grade",
+        "compute_acceptance_reason",
+        "unavailable_cause",
         "origin_provenance",
     }
 
@@ -1562,14 +1599,70 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
     assert tasks[0].status == TaskStatus.QUEUED
 
 
+# ── Bootstrap-pending guard in _spawn_design_doc_update ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_defers_while_bootstrap_pending(db_session):
+    """_spawn_design_doc_update returns False while a repo_bootstrap task is in-flight."""
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        build_config={},  # bootstrap_completed_at not set
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a pending repo_bootstrap task for this project
+    bootstrap_task = Task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "repo_bootstrap"}],
+    )
+    db_session.add(bootstrap_task)
+    await db_session.commit()
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+
+    assert spawned is False
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "design_doc_update",
+        )
+    )
+    assert result.scalars().first() is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_proceeds_when_bootstrap_completed(db_session):
+    """_spawn_design_doc_update proceeds normally when bootstrap_completed_at is set."""
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        build_config={"bootstrap_completed_at": "2026-01-01T00:00:00"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    assert tasks[0].payloads[0]["type"] == "design_doc_update"
+    assert tasks[0].status == TaskStatus.QUEUED
+
+
 @pytest.mark.asyncio
 async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_self_repo(
     db_session,
 ):
-    """enable_self_improvement in the strategic payload is driven by build_config, not is_self_repo.
+    """Strategic payload ships repo identity separately from improvement mode.
 
-    is_self_repo=True without the explicit flag → False.
-    build_config={"enable_self_improvement": True} regardless of is_self_repo → True.
+    is_self_repo is the actual project identity. enable_self_improvement is
+    driven by build_config and may be true for an external project.
     """
     # Self-repo without explicit flag → False
     project_self_no_flag = _make_project(
@@ -1588,6 +1681,7 @@ async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_
         select(Task).where(Task.project_id == project_self_no_flag.id)
     )
     task_self = result.scalars().one()
+    assert task_self.payloads[0]["is_self_repo"] is True
     assert task_self.payloads[0]["enable_self_improvement"] is False
 
     # Non-self-repo with explicit flag → True
@@ -1607,6 +1701,7 @@ async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_
         select(Task).where(Task.project_id == project_flag.id)
     )
     task_flag = result2.scalars().one()
+    assert task_flag.payloads[0]["is_self_repo"] is False
     assert task_flag.payloads[0]["enable_self_improvement"] is True
 
 
@@ -1904,10 +1999,19 @@ async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
                         "research_spawn_gate_challenged_count": 5,
                         "research_spawn_gate_refuted_count": 2,
                         "research_spawn_gate_survived_count": 3,
+                        "research_spawn_gate_manifest_excluded_fail_closed_count": 1,
+                        "research_spawn_gate_manifest_excluded_fail_closed_samples": [
+                            {
+                                "hash": "excluded-hash",
+                                "title": "Budget-excluded finding",
+                                "reason": "manifest cap",
+                            }
+                        ],
                         "research_spawn_gate_challenged_spawned": 3,
                         "research_spawn_gate_challenged_merged": 2,
                         "research_spawn_gate_unchallenged_spawned": 4,
                         "research_spawn_gate_unchallenged_merged": 3,
+                        "research_spawn_gate_wholesale_retry_exhausted": True,
                     }
                 ],
             }
@@ -1932,8 +2036,21 @@ async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
     assert sgm["challenged"] == 5
     assert sgm["refuted"] == 2
     assert sgm["survived"] == 3
+    assert sgm["manifest_excluded_fail_closed_count"] == 1
+    assert sgm["manifest_excluded_fail_closed_samples"] == [
+        {
+            "hash": "excluded-hash",
+            "title": "Budget-excluded finding",
+            "reason": "manifest cap",
+        }
+    ]
+    assert sgm["exhaustion_count"] == 1
     assert sgm["challenged_merge_rate"] == round(2 / 3, 3)
     assert sgm["unchallenged_merge_rate"] == round(3 / 4, 3)
+    suffix = payload.get("prompt_suffix", "")
+    assert "Spawn-gate grader notes for this cycle:" in suffix
+    assert "wholesale retry exhausted 1 time(s)" in suffix
+    assert "repeated grader non-response" in suffix
 
 
 @pytest.mark.asyncio
@@ -4832,6 +4949,7 @@ async def test_direction_counts_survive_problem_model_floor_pressure(db_session)
         "research_mode": "strategic",
         "project_name": "P",
         "base_branch": "main",
+        "is_self_repo": False,
         "enable_self_improvement": False,
         "vision": {"purpose": "x"},
         "problem_model": {"gaps": [{"id": f"g{i}", "d": "y" * 200} for i in range(40)]},
@@ -4846,6 +4964,7 @@ async def test_direction_counts_survive_problem_model_floor_pressure(db_session)
     assert packed["direction_counts"]["active"] == 7, (
         "direction_counts must ship verbatim under maximum budget pressure"
     )
+    assert packed["is_self_repo"] is False
     assert packed["max_active_directions"] == 15
     meta = packed["_packer_meta"]
     affected = {e["key"] for e in meta["trimmed"]} | {e["key"] for e in meta["dropped"]}
@@ -7173,9 +7292,15 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
 
     await _ensure_releaseversion_table(db_session)
     _patch_spawning_deps(mocker)
+    # The DeploymentState read is now gated on the deploy-level identity (not
+    # is_self_repo): make this project the deploy identity so its live container
+    # SHA/status is observable to the strategist.
+    mocker.patch.dict("os.environ", {"DEPLOY_REPO_IDENTITY": "acme/widget"})
 
     project = _make_project(
         is_self_repo=True,
+        github_owner="acme",
+        github_repo="widget",
         integration_branch="automain",
         promotion_target="main",
         vision={"purpose": "test purpose"},
@@ -7402,9 +7527,15 @@ async def _spawn_self_repo_with_deployment_state(
 
     await _ensure_releaseversion_table(db_session)
     _patch_spawning_deps(mocker)
+    # The DeploymentState read is now gated on the deploy-level identity (not
+    # is_self_repo): make this project the deploy identity so its live container
+    # state is observable to the strategist.
+    mocker.patch.dict("os.environ", {"DEPLOY_REPO_IDENTITY": "acme/widget"})
 
     project = _make_project(
         is_self_repo=True,
+        github_owner="acme",
+        github_repo="widget",
         integration_branch="automain",
         promotion_target="main",
         vision={"purpose": "test purpose"},
@@ -8283,6 +8414,101 @@ class TestGetProjectIntegrationBranch:
         assert _shared_state.get_project_integration_branch(project) == "release"
 
 
+# ── _annotate_capability_proof_status: proof status annotation ────────────────
+
+
+class TestAnnotateCapabilityProofStatus:
+    """_annotate_capability_proof_status decorates the vocab list with
+    ``proof_status: 'proven'`` when the project has a proof record for that
+    capability and ``'unproven'`` when it does not.
+
+    This is the production code path exercised when a task with
+    ``provides_capability`` lands a verified acceptance-evidence verdict and
+    ``record_capability_proof`` stamps a durable entry on
+    ``project.capability_proof_records``.
+    """
+
+    def test_proven_capability_gets_proven_status(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [{"name": "language-aware-repo-map", "status": "working"}]
+        proof_records = {
+            "language-aware-repo-map": [
+                {
+                    "task_id": "task-abc",
+                    "proved_at": "2026-06-09T00:00:00",
+                    "proof_kind": "named_test",
+                    "proof_ref": "testing/test_prompt.py::test_map",
+                    "commit_sha": "abc123",
+                }
+            ]
+        }
+        out = _annotate_capability_proof_status(vocab, proof_records)
+        assert out[0]["proof_status"] == "proven"
+        assert out[0]["name"] == "language-aware-repo-map"
+
+    def test_unproven_capability_gets_unproven_status(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [{"name": "language-aware-repo-map", "status": "working"}]
+        out = _annotate_capability_proof_status(vocab, {})
+        assert out[0]["proof_status"] == "unproven"
+
+    def test_none_proof_records_yields_unproven(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [{"name": "cap-a", "status": "planned"}]
+        out = _annotate_capability_proof_status(vocab, None)
+        assert out[0]["proof_status"] == "unproven"
+
+    def test_does_not_mutate_input(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        original = [{"name": "cap-a", "status": "working"}]
+        proof_records = {"cap-a": [{"task_id": "t1", "proved_at": "", "proof_kind": "named_test", "proof_ref": "", "commit_sha": ""}]}
+        out = _annotate_capability_proof_status(original, proof_records)
+        # Input dict must not have been mutated.
+        assert "proof_status" not in original[0]
+        assert out[0]["proof_status"] == "proven"
+
+    def test_empty_proof_list_is_unproven(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [{"name": "cap-a", "status": "working"}]
+        out = _annotate_capability_proof_status(vocab, {"cap-a": []})
+        # An empty list means the key exists but has no proof entries.
+        assert out[0]["proof_status"] == "unproven"
+
+    def test_multiple_capabilities_mixed_proof(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [
+            {"name": "cap-proven", "status": "working"},
+            {"name": "cap-claimed", "status": "partial"},
+        ]
+        proof_records = {
+            "cap-proven": [{"task_id": "t1", "proved_at": "", "proof_kind": "named_test", "proof_ref": "", "commit_sha": ""}]
+        }
+        out = _annotate_capability_proof_status(vocab, proof_records)
+        assert out[0]["proof_status"] == "proven"
+        assert out[1]["proof_status"] == "unproven"
+
+    def test_non_list_passthrough(self):
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        assert _annotate_capability_proof_status(None, {}) is None  # type: ignore[arg-type]
+        assert _annotate_capability_proof_status("invalid", {}) == "invalid"  # type: ignore[arg-type]
+
+    def test_alias_is_shared_registry_public_fn(self):
+        # The annotation body now lives in the IO-free capability_registry leaf
+        # so every spawn path (strategic, design, research, plan) can call it;
+        # the module-local name is a back-compat alias for the same function.
+        from app.capability_registry import annotate_capability_proof_status
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        assert _annotate_capability_proof_status is annotate_capability_proof_status
+
+
 # ── _verify_capability_backing_paths: advisory capability verification ────────
 
 
@@ -8998,6 +9224,197 @@ class TestBuildPruneCandidates:
         )
         assert len(out["resolved_gaps"]) == _RECON_LIST_CAP
         assert out["counts"]["resolved_gaps"] == _RECON_LIST_CAP + 4
+
+    def test_surfaces_ungroundable_capabilities(self):
+        """Capabilities with no backing_paths, no source, no verification appear
+        in ungroundable_capabilities; a capability with backing_paths is excluded."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                # No backing_paths, no source, no verification → ungroundable.
+                {"name": "ungrounded-cap", "status": "planned"},
+                # Has backing_paths → NOT ungroundable.
+                {"name": "grounded-cap", "status": "working",
+                 "backing_paths": ["backend/app/foo.py"]},
+                # Has source → NOT ungroundable (even without backing_paths).
+                {"name": "sourced-cap", "status": "working",
+                 "source": "documentation"},
+                # Has verification → NOT ungroundable.
+                {"name": "verified-cap", "status": "working",
+                 "verification": {"effective_status": "working"}},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        names = [c["name"] for c in out["ungroundable_capabilities"]]
+        assert names == ["ungrounded-cap"]
+        assert out["counts"]["ungroundable_capabilities"] == 1
+
+    def test_prune_candidates_names_ungrounded_capabilities(self):
+        """Acceptance gate: ungroundable caps surface and counts are correct."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                {"name": "no-ground-cap", "status": "working"},
+                {"name": "another-no-ground", "status": "planned"},
+                # excluded
+                {"name": "grounded", "status": "working",
+                 "backing_paths": ["path/to/file.py"]},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        names = [c["name"] for c in out["ungroundable_capabilities"]]
+        assert "no-ground-cap" in names
+        assert "another-no-ground" in names
+        assert "grounded" not in names
+        assert out["counts"]["ungroundable_capabilities"] == 2
+
+    def test_does_not_surface_cap_with_source_as_ungroundable(self):
+        """A capability with a source field is NOT ungroundable even without
+        backing_paths or verification."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                {"name": "cap-with-source", "status": "working",
+                 "source": "design_doc"},
+            ],
+        }
+        # source is present → not in ungroundable_capabilities → only candidate class
+        # available is none → returns None.
+        assert _build_prune_candidates(
+            pm, [], self._LARGE, "2026-06-04T00:00:00+00:00"
+        ) is None
+
+    def test_domain_merge_groups_keyword_bucketing(self):
+        """Capabilities sharing a keyword bucket form a merge group."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                {"name": "strategic-planning-cap", "status": "working"},
+                {"name": "strategic-review-cap", "status": "working"},
+                {"name": "strategic-spawning-cap", "status": "working"},
+                # different bucket — no match
+                {"name": "compute-scheduler", "status": "working"},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        groups = {g["bucket"]: g["names"] for g in out["domain_merge_groups"]}
+        assert "strategic" in groups
+        assert len(groups["strategic"]) == 3
+        # compute bucket: only one entry → no group
+        assert "compute" not in groups
+
+    def test_domain_merge_groups_no_groups_when_singletons(self):
+        """When each keyword bucket has at most one capability, no merge groups are emitted."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                {"name": "strategic-review-cap", "status": "working"},
+                {"name": "task-runner", "status": "working"},
+                {"name": "operator-admin", "status": "working"},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        # Each bucket has exactly one entry → no domain_merge_groups.
+        # But long_names/ungroundable/heavy may fire — check domain_merge_groups specifically.
+        if out is not None:
+            assert out["domain_merge_groups"] == []
+            assert out["counts"]["domain_merge_groups"] == 0
+
+    def test_heavy_gaps_ranked_by_history_size(self):
+        """Active gaps are ranked largest-first by serialized history weight."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        def _history(n: int) -> list:
+            return [{"event": f"entry-{i}", "ts": f"2026-0{i+1}-01"} for i in range(n)]
+
+        pm = {
+            "gaps": [
+                {"id": "g-small", "name": "small gap", "status": "active",
+                 "history": _history(2)},
+                {"id": "g-large", "name": "large gap", "status": "active",
+                 "history": _history(10)},
+                {"id": "g-medium", "name": "medium gap", "status": "active",
+                 "history": _history(5)},
+                # archived gap — not included in heavy_gaps
+                {"id": "g-arch", "name": "archived gap", "status": "archived",
+                 "history": _history(20)},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        ids = [g["gap_id"] for g in out["heavy_gaps"]]
+        assert ids[0] == "g-large"
+        assert ids[1] == "g-medium"
+        assert ids[2] == "g-small"
+        assert "g-arch" not in ids
+        assert out["counts"]["heavy_gaps"] == 3
+
+    def test_long_names_capabilities_and_gaps(self):
+        """Names exceeding 80 chars appear in long_names; shorter names are excluded."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        long_cap = "a" * 81
+        long_gap = "b" * 90
+        short_cap = "short-cap"
+        short_gap = "short-gap"
+
+        pm = {
+            "capabilities": [
+                {"name": long_cap, "status": "working"},
+                {"name": short_cap, "status": "working"},
+            ],
+            "gaps": [
+                {"id": "g-long", "name": long_gap, "status": "active"},
+                {"id": "g-short", "name": short_gap, "status": "active"},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        kinds_and_names = [(e["kind"], e["name"]) for e in out["long_names"]]
+        long_entries = {name for _, name in kinds_and_names}
+        assert long_cap[:120] in long_entries
+        assert long_gap[:120] in long_entries
+        assert short_cap not in long_entries
+        assert short_gap not in long_entries
+        assert out["counts"]["long_names"] == 2
+        for e in out["long_names"]:
+            assert e["length"] > 80
+
+    def test_counts_includes_new_candidate_classes(self):
+        """counts dict carries totals for all 7 candidate classes."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                # ungroundable
+                {"name": "no-ground", "status": "planned"},
+                # absent
+                {"name": "ghost", "status": "working",
+                 "verification": {"effective_status": "absent"}},
+            ],
+            "gaps": [
+                # resolved
+                {"id": "g1", "name": "g1", "status": "active",
+                 "active_moves": ["d-ret"]},
+            ],
+        }
+        directions = [{"id": "d-ret", "status": "retired"}]
+        out = _build_prune_candidates(pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert out is not None
+        for key in (
+            "resolved_gaps", "absent_capabilities", "expired_holds",
+            "ungroundable_capabilities", "domain_merge_groups",
+            "heavy_gaps", "long_names",
+        ):
+            assert key in out["counts"], f"counts missing key: {key}"
 
 
 # ── Onboarding goal reaches the first strategic cycle's payload ─────────────────
@@ -11593,3 +12010,113 @@ def test_summarize_memo_citations_non_dict_entries_preserved():
     memos = [{"task_id": "t1", "summary_excerpt": "ok"}, "not-a-dict"]
     result = _summarize_memo_citations(memos)
     assert result[1] == "not-a-dict"
+
+
+# ---------------------------------------------------------------------------
+# _summarize_efficiency_snapshot — format_compliance and agent_timeout_rate
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_efficiency_snapshot_includes_format_compliance():
+    """format_compliance is forwarded with current/baseline/drift_pct only (no history)."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {"cost_per_merged_pr": {"current": 1.5, "baseline": 2.0, "drift_pct": -25.0, "history": []}},
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "last_snapshot_at": "2026-05-01T00:00:00",
+        "format_compliance": {
+            "format_compliance_rate": {
+                "current": 0.92,
+                "baseline": 0.88,
+                "drift_pct": 4.5,
+                "history": [{"captured_at": "2026-04-01", "value": 0.85}],
+            },
+            "self_repair_success_rate": {
+                "current": 0.75,
+                "baseline": 0.70,
+                "drift_pct": 7.1,
+                "history": [],
+            },
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "format_compliance" in result
+    fc = result["format_compliance"]
+    assert "format_compliance_rate" in fc
+    assert fc["format_compliance_rate"] == {"current": 0.92, "baseline": 0.88, "drift_pct": 4.5}
+    assert "history" not in fc["format_compliance_rate"]
+    assert "self_repair_success_rate" in fc
+    assert fc["self_repair_success_rate"]["current"] == 0.75
+
+
+def test_summarize_efficiency_snapshot_includes_agent_timeout_rate():
+    """agent_timeout_rate overall + dominant fields are forwarded (no history)."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {"cost_per_merged_pr": {"current": 1.5, "baseline": 2.0, "drift_pct": -25.0, "history": []}},
+        "agent_timeout_rate": {
+            "overall": {
+                "current": 0.08,
+                "baseline": 0.06,
+                "drift_pct": 33.3,
+                "history": [{"captured_at": "2026-04-01", "value": 0.07}],
+            },
+            "by_subtype": {"context_limit": {"current": 0.05}},
+            "dominant_subtype": "context_limit",
+            "dominant_share": "62%",
+            "denominator": 100,
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "agent_timeout_rate" in result
+    atr = result["agent_timeout_rate"]
+    assert atr["overall"] == {"current": 0.08, "baseline": 0.06, "drift_pct": 33.3}
+    assert "history" not in atr["overall"]
+    assert atr["dominant_subtype"] == "context_limit"
+    assert atr["dominant_share"] == "62%"
+    assert "by_subtype" not in atr
+    assert "denominator" not in atr
+
+
+def test_summarize_efficiency_snapshot_forwards_axis_seed_provenance():
+    """Axis provenance is preserved when it differs from baseline_captured_at."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "axes": {
+            "llm_cost_per_merged_pr": {
+                "current": 1.2,
+                "baseline": 0.9,
+                "drift_pct": 33.3,
+                "baseline_seeded_at": "2026-04-12T00:00:00",
+                "history": [],
+            }
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    axis = result["axes"]["llm_cost_per_merged_pr"]
+    assert axis["seeded_at"] == "2026-04-12T00:00:00"
+    assert "baseline_seeded_at" not in axis
+
+
+def test_summarize_efficiency_snapshot_omits_blocks_when_absent():
+    """format_compliance and agent_timeout_rate keys are absent when raw snapshot lacks them."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {"cost_per_merged_pr": {"current": 1.5, "baseline": 2.0, "drift_pct": -25.0, "history": []}},
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "format_compliance" not in result
+    assert "agent_timeout_rate" not in result
+
+
+def test_summarize_efficiency_snapshot_empty_returns_empty():
+    """Empty/None snapshot returns empty dict."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    assert _summarize_efficiency_snapshot({}) == {}
+    assert _summarize_efficiency_snapshot(None) == {}  # type: ignore[arg-type]

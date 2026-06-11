@@ -86,7 +86,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0207"
+EXPECTED_SCHEMA_REVISION = "0222"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1300,6 +1300,21 @@ async def resolve_artifact_download_url(
             raise HTTPException(status_code=404, detail="Artifact not found")
         await _get_user_project(job.project_id, current_user["user_id"], session)
         if job.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+
+        # Project membership is necessary but not sufficient for compute-job
+        # URIs. Only the recorded terminal outputs are allowed; unknown siblings
+        # under the same prefix are indistinguishable from "not found".
+        allowed_uris: set[str] = set()
+        if job.result_reference:
+            allowed_uris.add(job.result_reference)
+        if job.artifact_id is not None:
+            from app.models import Artifact  # noqa: PLC0415
+
+            artifact = await session.get(Artifact, job.artifact_id)
+            if artifact is not None and artifact.storage_uri:
+                allowed_uris.add(artifact.storage_uri)
+        if storage_uri not in allowed_uris:
             raise HTTPException(status_code=404, detail="Artifact not found")
 
     # 3. Sign. Validation already passed, so any failure here is a storage

@@ -61,6 +61,7 @@ from app.strategic_completion import (
     spawn_title_is_redundant,
     _spawn_retirement_memos,
     _strategic_event_completion_summary,
+    _compute_model_gc_telemetry,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -5378,7 +5379,7 @@ async def test_set_strategic_challenge_copied_into_cycle_metadata(
 
 
 @pytest.mark.asyncio
-async def test_staged_only_completion_uses_api_path(db_session, mocker):
+async def test_staged_only_completion_uses_api_path(db_session, mocker, caplog):
     from unittest.mock import AsyncMock
     from app import strategic_cycle
     from app.models import Project, Task
@@ -5406,6 +5407,7 @@ async def test_staged_only_completion_uses_api_path(db_session, mocker):
             "strategic_cycle_id": cycle.id,
             "_strategic_dirs_staged": 1,
             "_strategic_staged_ids": ["d-next"],
+            "_strategic_adoption_declared": 2,
         },
         strategic_cycle_id=cycle.id,
     )
@@ -5436,12 +5438,18 @@ async def test_staged_only_completion_uses_api_path(db_session, mocker):
     emit = AsyncMock()
     mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
 
-    await _handle_strategic_completion(task, "", db_session)
+    with caplog.at_level("INFO", logger="app.strategic_completion"):
+        await _handle_strategic_completion(task, "", db_session)
 
     strategic_cycle.mark_phase2_completed.assert_awaited_once()
     emit.assert_awaited_once()
     assert emit.await_args.kwargs["completion"]["staged_count"] == 1
+    assert emit.await_args.kwargs["completion"]["adoption_declared_count"] == 2
     assert emit.await_args.kwargs["completion"]["status"] == "completed"
+    assert any(
+        "2 capability adoption decision(s) declared" in record.message
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -5461,6 +5469,98 @@ async def test_set_evidence_progress_non_list_returns_400(client, db_session):
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_declare_capability_adoption_via_http(client, db_session):
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="CAP-HTTP", vm="vm-cap")
+    token = create_agent_token(str(task.id), "vm-cap", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "declare_capability_adoption",
+            "data": {
+                "cap_name": "repo_map",
+                "verdict": "adopt",
+                "rationale": "stable trial results",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "declare_capability_adoption"
+    assert body["cap_name"] == "repo_map"
+    assert body["verdict"] == "adopt"
+
+    await db_session.refresh(task)
+    project = await db_session.get(Project, task.project_id)
+    assert project is not None
+    await db_session.refresh(project)
+    stored = project.capability_adoption_verdicts["repo_map"]
+    assert stored["verdict"] == "adopt"
+    assert stored["evidence_source"] == "strategic_review"
+    assert stored["rationale"] == "stable trial results"
+    assert "evaluated_at" in stored
+    assert (task.context or {}).get("_strategic_adoption_declared") == 1
+    assert (task.context or {}).get("_strategic_api_called") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "data, detail",
+    [
+        (
+            {"cap_name": "", "verdict": "adopt"},
+            "cap_name must be a non-empty string",
+        ),
+        (
+            {"cap_name": "repo_map", "verdict": "maybe"},
+            "verdict must be one of",
+        ),
+    ],
+)
+async def test_declare_capability_adoption_invalid_payload_returns_400(
+    client, db_session, data, detail
+):
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="CAP-BAD", vm="vm-cap-bad")
+    token = create_agent_token(str(task.id), "vm-cap-bad", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "declare_capability_adoption",
+            "data": data,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+    assert detail in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_declare_capability_adoption_non_strategic_review_returns_403(
+    client, db_session
+):
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="CAP-403", vm="vm-cap-403")
+    token = create_agent_token(str(task.id), "vm-cap-403", task_type="standard")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "declare_capability_adoption",
+            "data": {"cap_name": "repo_map", "verdict": "reject"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403, resp.text
 
 
 @pytest.mark.asyncio
@@ -13508,3 +13608,201 @@ async def test_post_promotion_focus_rewrite_refreshes_auto_derived_version_goal(
         f"Operator goal must not be clobbered; got {version2.goal!r}"
     )
     assert version2.goal_editor_info == "[operator:op@example.com]"
+
+
+# ── _compute_model_gc_telemetry ───────────────────────────────────────────────
+
+
+def test_compute_model_gc_telemetry_basic_fields():
+    """cycle_metadata model_gc_telemetry has all required fields with non-None values."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": "testing"},
+            "capabilities": [
+                {"name": "cap1", "status": "working"},
+                {"name": "cap2", "status": "working"},
+            ],
+            "gaps": [
+                {"id": "g1", "name": "gap1", "description": "d", "evidence": "", "status": "active"},
+            ],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 80000,
+                "trimmed": [],
+                "dropped": [],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["model_bytes"] is not None
+    assert result["model_bytes"] > 0
+    assert result["capability_count"] == 2
+    assert result["gap_count"] == 1
+    assert result["model_size_status"] in ("healthy", "growing", "large", "oversized")
+    assert result["directions_dropped_count"] == 0
+    assert result["problem_model_truncated"] is False
+
+
+def test_compute_model_gc_telemetry_detects_directions_dropped():
+    """directions_dropped_count > 0 when directions_summary appears in dropped."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 119000,
+                "trimmed": [],
+                "dropped": [{"key": "directions_summary", "reason": "exceeds remaining budget"}],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["directions_dropped_count"] == 1
+    assert result["problem_model_truncated"] is False
+
+
+def test_compute_model_gc_telemetry_detects_problem_model_truncated():
+    """problem_model_truncated is True when problem_model appears in trimmed."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 100000,
+                "trimmed": [{"key": "problem_model", "kind": "floored"}],
+                "dropped": [],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["problem_model_truncated"] is True
+    assert result["directions_dropped_count"] == 0
+
+
+def test_compute_model_gc_telemetry_gap_memory_trimmed_present():
+    """gap_memory_trimmed_count and gap_memory_hidden_entries reflect trimmed gap memory."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [
+                {"id": "g1", "name": "gap1", "description": "d", "evidence": "", "status": "active"},
+                {"id": "g2", "name": "gap2", "description": "d", "evidence": "", "status": "active"},
+            ],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 100000,
+                "trimmed": [],
+                "dropped": [],
+                "gap_memory_trimmed": [
+                    {
+                        "key": "problem_model",
+                        "gaps": [
+                            {
+                                "gap_id": "g1",
+                                "fields": {
+                                    "history": {"shown": 3, "total": 8},
+                                    "past_moves": {"shown": 1, "total": 4},
+                                },
+                            },
+                            {
+                                "gap_id": "g2",
+                                "fields": {
+                                    "history": {"shown": 2, "total": 5},
+                                    "past_moves": {"shown": 0, "total": 3},
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["gap_memory_trimmed_count"] == 2
+    # hidden = (8-3) + (4-1) + (5-2) + (3-0) = 5 + 3 + 3 + 3 = 14
+    assert result["gap_memory_hidden_entries"] == 14
+
+
+def test_compute_model_gc_telemetry_gap_memory_absent():
+    """gap_memory_trimmed_count and gap_memory_hidden_entries default to 0 when absent."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{
+            "type": "strategic_review",
+            "_packer_meta": {
+                "budget_total": 120000,
+                "budget_used": 80000,
+                "trimmed": [],
+                "dropped": [],
+            },
+        }],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    assert result["gap_memory_trimmed_count"] == 0
+    assert result["gap_memory_hidden_entries"] == 0

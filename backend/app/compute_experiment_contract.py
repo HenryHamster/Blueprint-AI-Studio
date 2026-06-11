@@ -45,6 +45,7 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "experiment",
         "benchmark",
         "metric",
+        "hypothesis",
         "cwd",
         "env",
         "accelerator",
@@ -54,6 +55,7 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "live_release_proof",
         "live_release_proof_marker",
         "requires_live_release",
+        "require_durable_artifact",
     ):
         val = _pick(opt_key)
         if val is not None:
