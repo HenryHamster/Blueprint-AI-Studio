@@ -106,6 +106,7 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
     _compute_saturation,
     _detect_dedup_deadlock,
     apply_post_spawn_state,
+    direction_saturation_refractory_minutes,
 )
 from app.source_ref_validation import (
     validate_source_refs,
@@ -1202,7 +1203,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     if not direction_id or task.project_id is None:
         return
     now_iso = _utcnow().isoformat()
-    sat_refractory_min = _runtime_config.get("direction_saturation_refractory_minutes", 720)
+    sat_refractory_min = direction_saturation_refractory_minutes()
 
     def _apply_no_findings_refractory(dirs: list) -> None:
         target = next((d for d in dirs if d.get("id") == direction_id), None)

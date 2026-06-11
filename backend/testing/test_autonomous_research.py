@@ -14378,3 +14378,61 @@ async def test_mid_spawn_lock_timeout_replay_completes_spawn_exactly_once(db_ses
     assert not (task.context or {}).get("_research_spawn_pending"), (
         "_research_spawn_pending cleared after successful replay"
     )
+
+
+# ---------------------------------------------------------------------------
+# Refractory window derives from the operator cooldown (one knob)
+# ---------------------------------------------------------------------------
+
+
+def test_refractory_defaults_to_operator_cooldown():
+    """With no explicit refractory key, the post-cycle refractory must equal the
+    operator-tuned autonomous_direction_cooldown_minutes — a hardcoded longer
+    refractory would silently override operator throttling intent."""
+    from app.shared_state import runtime_config as _runtime_config
+    from app.research_direction_state import direction_refractory_minutes
+
+    _runtime_config.pop("direction_refractory_minutes", None)
+    _runtime_config["autonomous_direction_cooldown_minutes"] = 60
+    assert direction_refractory_minutes() == 60.0
+
+
+def test_refractory_falls_back_to_cooldown_default_when_neither_set():
+    from app.shared_state import runtime_config as _runtime_config
+    from app.research_direction_state import direction_refractory_minutes
+
+    _runtime_config.pop("direction_refractory_minutes", None)
+    _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+    assert direction_refractory_minutes() == 240.0
+
+
+def test_explicit_refractory_key_decouples_from_cooldown():
+    from app.shared_state import runtime_config as _runtime_config
+    from app.research_direction_state import direction_refractory_minutes
+
+    _runtime_config["autonomous_direction_cooldown_minutes"] = 60
+    _runtime_config["direction_refractory_minutes"] = 360
+    assert direction_refractory_minutes() == 360.0
+
+
+def test_saturation_refractory_is_double_the_standard_window():
+    from app.shared_state import runtime_config as _runtime_config
+    from app.research_direction_state import (
+        direction_saturation_refractory_minutes,
+    )
+
+    _runtime_config.pop("direction_refractory_minutes", None)
+    _runtime_config.pop("direction_saturation_refractory_minutes", None)
+    _runtime_config["autonomous_direction_cooldown_minutes"] = 60
+    assert direction_saturation_refractory_minutes() == 120.0
+
+
+def test_explicit_saturation_refractory_key_wins():
+    from app.shared_state import runtime_config as _runtime_config
+    from app.research_direction_state import (
+        direction_saturation_refractory_minutes,
+    )
+
+    _runtime_config["autonomous_direction_cooldown_minutes"] = 60
+    _runtime_config["direction_saturation_refractory_minutes"] = 720
+    assert direction_saturation_refractory_minutes() == 720.0
