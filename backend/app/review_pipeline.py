@@ -2892,7 +2892,7 @@ async def _spawn_pipeline_task(
         checkpoint_and_reserve_on_phase_complete,
         ensure_chain_lane,
         get_chain_lane,
-        is_review_fix_lane_pilot_enabled,
+        is_review_fix_lane_pilot_active_for_project,
         lane_arm_of,
         record_lane_arm_assignment,
         strip_transient_lane_context,
@@ -2903,8 +2903,11 @@ async def _spawn_pipeline_task(
     lane_review_force_cold = False
     lane_fix_task_id: uuid.UUID | None = None
     lane_fix_to_activate = None
-    if is_review_fix_lane_pilot_enabled():
-        _pilot_project = await session.get(_Project, source_task.project_id)
+    # Fetch the project for the project-aware pilot gate. The gate consults both
+    # the runtime flag AND the durable persisted KILL/ADOPT verdict so a KILL
+    # that survived a runtime_config reload is still honored.
+    _pilot_project = await session.get(_Project, source_task.project_id)
+    if is_review_fix_lane_pilot_active_for_project(_pilot_project):
         # Record the intent-to-treat arm ONCE for the chain (BOTH arms), keyed on
         # the immutable original create-task id, so arm membership is decided
         # before any fix-side treatment. Persisted on the source task (durable,

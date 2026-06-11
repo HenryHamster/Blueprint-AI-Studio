@@ -142,14 +142,35 @@ export interface DirectionFindingChallengeSummary {
 }
 
 export interface CapabilityTrialVerdict {
-  verdict: 'adopt' | 'reject' | 'continue-trial';
-  lift: number | null;
-  n_with: number;
-  n_without: number;
+  verdict: 'adopt' | 'reject' | 'continue-trial' | 'ADOPT' | 'KILL' | 'CONTINUE';
+  lift?: number | null;
+  n_with?: number;
+  n_without?: number;
+  n_lane?: number;
+  n_control?: number;
+  lane_merge_rate?: number | null;
+  control_merge_rate?: number | null;
+  lane_cost_per_merged?: number | null;
+  control_cost_per_merged?: number | null;
+  gate_integrity_violations?: number;
+  checkpoint_loss_rate?: number | null;
+  immediate_alert?: boolean;
   evaluated_at?: string;
   window_hours?: number | null;
   verdict_reason?: string;
-  thresholds?: { min_n_per_arm?: number; adopt_lift?: number; reject_lift?: number; futility_n?: number };
+  thresholds?: {
+    min_n_per_arm?: number;
+    adopt_lift?: number;
+    reject_lift?: number;
+    futility_n?: number;
+    min_n?: number;
+    kill_merge_rate_floor?: number;
+    kill_cost_ceiling?: number;
+    kill_gate_violations_max?: number;
+    kill_checkpoint_loss_ceiling?: number;
+    adopt_merge_lift_floor?: number;
+    adopt_cost_improvement?: number;
+  };
   accumulation_basis?: string;
   arm_composition?: { with_assigned?: number; with_receipt?: number; without_assigned?: number; without_receipt?: number };
   accrual_projection?: { with_7d?: number; without_7d?: number; window_days?: number; holdback_fraction?: number; days_to_min_n?: number | null };

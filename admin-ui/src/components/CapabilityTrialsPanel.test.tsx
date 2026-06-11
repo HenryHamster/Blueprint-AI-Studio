@@ -43,6 +43,60 @@ describe('CapabilityTrialsPanel', () => {
     expect(screen.getAllByText(/est\. 12\.5d to threshold at 10% holdback/)[0]).toBeTruthy();
   });
 
+  it('renders lane pilot verdict metrics without generic arms', () => {
+    render(<CapabilityTrialsPanel digest={{ capability_adoption_verdicts: {
+      review_fix_lane: {
+        verdict: 'ADOPT',
+        n_lane: 42,
+        n_control: 40,
+        lane_merge_rate: 0.45,
+        control_merge_rate: 0.375,
+        lane_cost_per_merged: 12.5,
+        control_cost_per_merged: 15,
+        checkpoint_loss_rate: 0.025,
+        gate_integrity_violations: 0,
+        immediate_alert: false,
+        evaluated_at: '2026-06-10T10:00:00Z',
+        verdict_reason: 'adopt_criteria_met',
+        thresholds: { min_n: 30, kill_merge_rate_floor: -0.03, kill_cost_ceiling: 0.1, kill_gate_violations_max: 3, kill_checkpoint_loss_ceiling: 0.05, futility_n: 90, adopt_merge_lift_floor: -0.01, adopt_cost_improvement: 0.05 },
+      },
+    } } as never} />);
+    expect(screen.getAllByText('review_fix_lane')[0]).toBeTruthy();
+    expect(screen.getAllByText('ADOPT')[0]).toBeTruthy();
+    expect(screen.getAllByText('adopt_criteria_met')[0]).toBeTruthy();
+    expect(screen.getAllByText('42')[0]).toBeTruthy();
+    expect(screen.getAllByText('40')[0]).toBeTruthy();
+    expect(screen.getAllByText('45.0%')[0]).toBeTruthy();
+    expect(screen.getAllByText('37.5%')[0]).toBeTruthy();
+    expect(screen.getAllByText('$12.50')[0]).toBeTruthy();
+    expect(screen.getAllByText('$15.00')[0]).toBeTruthy();
+    expect(screen.getAllByText('2.5%')[0]).toBeTruthy();
+    expect(screen.getAllByText('0')[0]).toBeTruthy();
+    expect(screen.queryByText('No capability trials are currently running.')).toBeNull();
+  });
+
+  it('renders lane pilot alert verdicts without n_with or n_without', () => {
+    render(<CapabilityTrialsPanel digest={{ capability_adoption_verdicts: {
+      review_fix_lane: {
+        verdict: 'KILL',
+        n_lane: 2,
+        n_control: 1,
+        lane_merge_rate: null,
+        control_merge_rate: null,
+        lane_cost_per_merged: null,
+        control_cost_per_merged: null,
+        checkpoint_loss_rate: null,
+        gate_integrity_violations: 3,
+        immediate_alert: true,
+        verdict_reason: 'gate_integrity_violations_exceeded',
+      },
+    } } as never} />);
+    expect(screen.getAllByText('KILL')[0]).toBeTruthy();
+    expect(screen.getAllByText('Immediate alert')[0]).toBeTruthy();
+    expect(screen.getAllByText('gate_integrity_violations_exceeded')[0]).toBeTruthy();
+    expect(screen.queryByText('No capability trials are currently running.')).toBeNull();
+  });
+
   it('shows an em dash for days_to_min_n when null', () => {
     render(<CapabilityTrialsPanel digest={{ capability_adoption_verdicts: {
       'repo-map-navigation': {

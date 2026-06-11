@@ -1510,7 +1510,7 @@ async def _compute_digest(
         }
         for _td in get_trial_definitions():
             _assignment_key = _td.get("assignment_key")
-            if not _assignment_key:
+            if not _assignment_key or _td["cap_name"] == LANE_PILOT_CAP_NAME:
                 continue
             _cap = _td["cap_name"]
             _verdict_entry = _augmented_verdicts.get(_cap)

@@ -141,15 +141,27 @@ def record_lane_arm_assignment(
 ) -> str | None:
     """Record the intent-to-treat arm ONCE on *ctx*; return the arm or None.
 
-    No-op (returns None, writes nothing) when the pilot is disabled or the
-    project is out of scope — this is the flag-off purity guarantee. When an
-    assignment is already present it is returned unchanged (recorded once).
+    No-op (returns None, writes nothing) when the pilot is disabled, the project
+    is out of scope, or a durable KILL verdict is recorded — this is the flag-off
+    and KILL-durability purity guarantee. When an assignment is already present it
+    is returned unchanged (recorded once). When a durable ADOPT verdict is
+    recorded, all newly-assigned chains are forced to the 'lane' arm (holdback
+    drops to 0, matching get_effective_holdback_fraction adopt->0.0 semantics).
     """
     if not is_review_fix_lane_pilot_enabled() or not is_pilot_eligible_project(project):
+        return None
+    # KILL short-circuit: a durable KILL verdict suppresses all new assignments
+    # regardless of whether the runtime flag is still True (reload survival).
+    if is_review_fix_lane_killed(project):
         return None
     existing = lane_arm_of(ctx)
     if existing is not None:
         return existing
+    # ADOPT override: route every new eligible chain to the lane arm so no chain
+    # stays in the control arm permanently after the trial decision.
+    if is_review_fix_lane_adopted(project):
+        ctx[LANE_PILOT_ASSIGNMENT_KEY] = "lane"
+        return "lane"
     arm = assign_lane_arm(str(seed_task_id))
     ctx[LANE_PILOT_ASSIGNMENT_KEY] = arm
     return arm
@@ -475,6 +487,29 @@ def is_review_fix_lane_killed(project: Any) -> bool:
         return False
     entry = verdicts.get(LANE_PILOT_CAP_NAME)
     return isinstance(entry, dict) and entry.get("verdict") == "KILL"
+
+
+def is_review_fix_lane_adopted(project: Any) -> bool:
+    """True when a durable ADOPT verdict is recorded for the pilot capability."""
+    verdicts = getattr(project, "capability_adoption_verdicts", None)
+    if not isinstance(verdicts, dict):
+        return False
+    entry = verdicts.get(LANE_PILOT_CAP_NAME)
+    return isinstance(entry, dict) and entry.get("verdict") == "ADOPT"
+
+
+def is_review_fix_lane_pilot_active_for_project(project: Any) -> bool:
+    """True when the pilot is active for *project*: enabled, eligible, and not killed.
+
+    This is the spawn-time gate that consults BOTH the runtime flag AND the durable
+    persisted verdict — so a KILL that survived a runtime_config reload is still
+    honored even when ``review_fix_lane_pilot_enabled`` is still True.
+    """
+    return (
+        is_review_fix_lane_pilot_enabled()
+        and is_pilot_eligible_project(project)
+        and not is_review_fix_lane_killed(project)
+    )
 
 
 # ── TrialDefinition aggregate wiring (feeds evaluate_lane_pilot_verdict) ───────

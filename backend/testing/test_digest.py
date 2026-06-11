@@ -9189,9 +9189,8 @@ async def test_compute_trial_arm_accrual_window_days_param_respected(db_session)
 
 @pytest.mark.asyncio
 async def test_digest_exposes_accrual_projection_for_assignment_trial(db_session):
-    """The digest attaches accrual_projection to every assignment-based trial.
-    All five current trials have holdback arms, so all five verdicts get a projection
-    in the response. The projection is ephemeral and must NOT be persisted."""
+    """The digest attaches accrual_projection to assignment-based trials except the lane pilot.
+    The projection is ephemeral and must NOT be persisted."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -9223,8 +9222,9 @@ async def test_digest_exposes_accrual_projection_for_assignment_trial(db_session
     assert "holdback_fraction" in proj
     assert "days_to_min_n" in proj
 
-    # All five trials now have holdback arms — each gets an accrual projection.
+    # Generic assignment-based trials get a projection; the lane pilot is excluded.
     assert "accrual_projection" in verdicts["module_interfaces"]
+    assert "accrual_projection" not in verdicts["review_fix_lane"]
 
     # The ephemeral projection is NOT persisted back to the DB entry.
     await db_session.refresh(project)

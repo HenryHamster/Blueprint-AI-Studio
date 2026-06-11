@@ -714,6 +714,68 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts["repo_map"]["evidence_source"] == "strategic_review"
         mock_flag.assert_called_once()
 
+    def test_decided_lane_verdict_survives_insufficient_data_continue(self):
+        continue_entry = evaluate_lane_pilot_verdict({"n_lane": 1, "n_control": 1})
+        assert (continue_entry["verdict"], continue_entry["verdict_reason"]) == ("CONTINUE", "insufficient_data")
+        lane_kill = evaluate_lane_pilot_verdict({"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.60, "control_merge_rate": 0.70})
+        lane_adopt = evaluate_lane_pilot_verdict(
+            {"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.75, "control_merge_rate": 0.70,
+             "lane_cost_per_merged": 90.0, "control_cost_per_merged": 100.0}
+        )
+        assert (lane_kill["verdict"], lane_adopt["verdict"]) == ("KILL", "ADOPT")
+
+        for decided in (lane_kill, lane_adopt):
+            project = _make_project()
+            project.capability_adoption_verdicts = {LANE_PILOT_CAP_NAME: decided}
+            with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+                record_trial_verdict(project, LANE_PILOT_CAP_NAME, continue_entry)
+
+            assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == decided
+            mock_flag.assert_not_called()
+
+    def test_decided_lane_verdict_survives_accumulating_data_continue(self):
+        # n between min_n (30) and futility_n (90), no kill/adopt criteria → accumulating_data
+        accumulating_entry = evaluate_lane_pilot_verdict({"n_lane": 50, "n_control": 50})
+        assert (accumulating_entry["verdict"], accumulating_entry["verdict_reason"]) == ("CONTINUE", "accumulating_data")
+
+        lane_kill = evaluate_lane_pilot_verdict({"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.60, "control_merge_rate": 0.70})
+        lane_adopt = evaluate_lane_pilot_verdict(
+            {"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.75, "control_merge_rate": 0.70,
+             "lane_cost_per_merged": 90.0, "control_cost_per_merged": 100.0}
+        )
+        assert (lane_kill["verdict"], lane_adopt["verdict"]) == ("KILL", "ADOPT")
+
+        for decided in (lane_kill, lane_adopt):
+            project = _make_project()
+            project.capability_adoption_verdicts = {LANE_PILOT_CAP_NAME: decided}
+            with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+                record_trial_verdict(project, LANE_PILOT_CAP_NAME, accumulating_entry)
+
+            assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == decided
+            mock_flag.assert_not_called()
+
+    def test_lane_kill_survives_automated_adopt_and_strategic_verdicts_still_supersede(self):
+        project = _make_project()
+        kill_entry = evaluate_lane_pilot_verdict({"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.60, "control_merge_rate": 0.70})
+        adopt_entry = evaluate_lane_pilot_verdict(
+            {"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.75, "control_merge_rate": 0.70,
+             "lane_cost_per_merged": 90.0, "control_cost_per_merged": 100.0}
+        )
+        project.capability_adoption_verdicts = {LANE_PILOT_CAP_NAME: kill_entry}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, LANE_PILOT_CAP_NAME, adopt_entry)
+
+        assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == kill_entry
+        mock_flag.assert_not_called()
+
+        strategic_reopen = {"verdict": "CONTINUE", "verdict_reason": "insufficient_data", "evidence_source": "strategic_review"}
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, LANE_PILOT_CAP_NAME, strategic_reopen)
+
+        assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == strategic_reopen
+        mock_flag.assert_called_once()
+
 
 # ── get_trial_verdicts ────────────────────────────────────────────────────────
 

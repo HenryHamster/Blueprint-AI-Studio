@@ -164,10 +164,19 @@ export interface CapabilityProofSummary {
 }
 
 export interface CapabilityAdoptionVerdict {
-  verdict?: 'adopt' | 'reject' | 'continue-trial';
+  verdict?: 'adopt' | 'reject' | 'continue-trial' | 'ADOPT' | 'KILL' | 'CONTINUE';
   lift?: number | null;
   n_with?: number;
   n_without?: number;
+  n_lane?: number;
+  n_control?: number;
+  lane_merge_rate?: number | null;
+  control_merge_rate?: number | null;
+  lane_cost_per_merged?: number | null;
+  control_cost_per_merged?: number | null;
+  gate_integrity_violations?: number;
+  checkpoint_loss_rate?: number | null;
+  immediate_alert?: boolean;
   window_hours?: number | null;
   evaluated_at?: string;
   thresholds?: {
@@ -175,6 +184,13 @@ export interface CapabilityAdoptionVerdict {
     adopt_lift?: number;
     reject_lift?: number;
     futility_n?: number;
+    min_n?: number;
+    kill_merge_rate_floor?: number;
+    kill_cost_ceiling?: number;
+    kill_gate_violations_max?: number;
+    kill_checkpoint_loss_ceiling?: number;
+    adopt_merge_lift_floor?: number;
+    adopt_cost_improvement?: number;
   };
   verdict_reason?: string;
   accumulation_basis?: string;

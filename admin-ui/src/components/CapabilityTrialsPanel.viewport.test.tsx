@@ -20,6 +20,20 @@ const sampleDigest = {
       n_without: 12,
       evaluated_at: '2026-06-08T08:00:00Z',
     },
+    review_fix_lane: {
+      verdict: 'CONTINUE',
+      n_lane: 28,
+      n_control: 26,
+      lane_merge_rate: 0.32,
+      control_merge_rate: 0.29,
+      lane_cost_per_merged: 18.25,
+      control_cost_per_merged: 20.1,
+      checkpoint_loss_rate: 0.01,
+      gate_integrity_violations: 0,
+      immediate_alert: false,
+      verdict_reason: 'accumulating_data',
+      evaluated_at: '2026-06-10T08:00:00Z',
+    },
   },
 } as never;
 

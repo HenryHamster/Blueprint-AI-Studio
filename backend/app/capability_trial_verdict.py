@@ -73,6 +73,10 @@ LANE_PILOT_ASSIGNMENT_KEY = "_review_fix_lane_arm"        # intent-to-treat arm 
 LANE_PILOT_WARM_RESUME_RECEIPT_KEY = "_review_fix_warm_resume"
 LANE_PILOT_CHECKPOINT_RECEIPT_KEY = "_review_fix_checkpoint"
 
+_DECIDED_VERDICTS = frozenset({"adopt", "reject", "ADOPT", "KILL"})
+_CONTINUE_VERDICTS = frozenset({"continue-trial", "CONTINUE"})
+_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset({"ambiguous_lift", "receipt_only_trial"})
+
 
 class LanePilotAggregates(TypedDict, total=False):
     """Per-arm aggregate statistics consumed by evaluate_lane_pilot_verdict."""
@@ -423,10 +427,24 @@ def record_trial_verdict(
     new_reason = entry.get("verdict_reason")
 
     if (
-        new_verdict == "continue-trial"
+        cap_name == LANE_PILOT_CAP_NAME
+        and prior_verdict == "KILL"
         and entry.get("evidence_source") != "strategic_review"
-        and (prior_verdict in ("adopt", "reject") or prior_source == "strategic_review")
-        and new_reason not in ("ambiguous_lift", "receipt_only_trial")
+        and new_verdict != "KILL"
+    ):
+        logger.info(
+            "[CAPABILITY_TRIAL] skipping non-strategic write for %s — "
+            "durable KILL must survive later automated verdicts until an "
+            "explicit strategist re-declaration arrives",
+            cap_name,
+        )
+        return
+
+    if (
+        new_verdict in _CONTINUE_VERDICTS
+        and entry.get("evidence_source") != "strategic_review"
+        and (prior_verdict in _DECIDED_VERDICTS or prior_source == "strategic_review")
+        and new_reason not in _SUFFICIENT_DATA_CONTINUE_REASONS
     ):
         logger.info(
             "[CAPABILITY_TRIAL] skipping continue-trial write for %s — "

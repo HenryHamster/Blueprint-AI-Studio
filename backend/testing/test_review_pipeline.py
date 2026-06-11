@@ -13410,3 +13410,256 @@ async def test_lane_pilot_aggregates_gate_integrity_violations(db_session):
 
     agg_after_fix = await compute_lane_pilot_aggregates(db_session, project.id)
     assert agg_after_fix["gate_integrity_violations"] == agg_with["gate_integrity_violations"]
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_durable_kill_survives_enabled_flag_reload(db_session, mocker):
+    """A durable KILL verdict suppresses lane mechanics even when the runtime
+    config flag is still True (simulating a config reload that re-enables the flag
+    after apply_lane_pilot_kill flipped it off)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_pilot_on(mocker)
+
+    from app.models import ImprovementLane
+    from app.review_fix_lane_pilot import (
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_PILOT_CAP_NAME,
+        is_review_fix_lane_pilot_active_for_project,
+    )
+    from app.shared_state import runtime_config
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+
+    # Simulate a durable KILL verdict recorded on the project (e.g. by a prior
+    # apply_lane_pilot_kill cycle), while the in-memory flag is still True
+    # (as it would be after a runtime_config reload from persisted state).
+    project.capability_adoption_verdicts = {
+        LANE_PILOT_CAP_NAME: {
+            "verdict": "KILL",
+            "verdict_reason": "lane_merge_rate_below_floor",
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Confirm the flag is enabled in-memory but the project-aware gate returns False.
+    assert runtime_config.get("review_fix_lane_pilot_enabled") is True
+    assert not is_review_fix_lane_pilot_active_for_project(project)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # A would-be lane-arm source task (has the assignment key set).
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id="vm-kill-reload-1",
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 501,
+                "branch": "feat/kill-reload",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "abc1234def5678",
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=501,
+        branch="feat/kill-reload",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    rctx = review.context or {}
+    # KILL is durable: no lane dispatch context on the spawned review.
+    assert "improvement_lane_id" not in rctx
+    assert rctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in rctx
+    # No lane rows created.
+    lanes = (
+        await db_session.execute(
+            select(ImprovementLane).where(ImprovementLane.project_id == project.id)
+        )
+    ).scalars().all()
+    assert lanes == []
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_adopt_forces_lane_arm_for_new_chains(db_session, mocker):
+    """A durable ADOPT verdict routes every newly-eligible chain to the 'lane'
+    arm, even for a seed that would hash to 'control' under normal 50/50 split."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_pilot_on(mocker)
+
+    from app.review_fix_lane_pilot import (
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_PILOT_CAP_NAME,
+        assign_lane_arm,
+        record_lane_arm_assignment,
+        is_review_fix_lane_adopted,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+
+    # Record a durable ADOPT verdict on the project.
+    project.capability_adoption_verdicts = {
+        LANE_PILOT_CAP_NAME: {
+            "verdict": "ADOPT",
+            "verdict_reason": "lane_cost_improvement_met",
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert is_review_fix_lane_adopted(project)
+
+    # Use a seed that normally hashes to 'control'.
+    control_seed = "task-ctrl-0"
+    assert assign_lane_arm(control_seed) == "control"
+
+    # record_lane_arm_assignment must override to 'lane' under ADOPT.
+    ctx: dict = {}
+    arm = record_lane_arm_assignment(ctx, control_seed, project)
+    assert arm == "lane"
+    assert ctx[LANE_PILOT_ASSIGNMENT_KEY] == "lane"
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_adopt_gate_integrity_preserved(db_session, mocker):
+    """Under ADOPT routing, review/audit tasks still never carry lane dispatch
+    context (gate integrity invariant)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_pilot_on(mocker)
+
+    from app.review_fix_lane_pilot import (
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_PILOT_CAP_NAME,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    project.capability_adoption_verdicts = {
+        LANE_PILOT_CAP_NAME: {
+            "verdict": "ADOPT",
+            "verdict_reason": "lane_cost_improvement_met",
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id="vm-adopt-gate-1",
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 502,
+                "branch": "feat/adopt-gate",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "abc1234def5678",
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=502,
+        branch="feat/adopt-gate",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    rctx = review.context or {}
+    # Gate integrity: reviewer NEVER carries lane dispatch context, even under ADOPT.
+    assert "improvement_lane_id" not in rctx
+    assert rctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in rctx
+    # The arm assignment is still propagated forward (for measurement).
+    assert rctx.get(LANE_PILOT_ASSIGNMENT_KEY) == "lane"
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_is_review_fix_lane_pilot_active_for_project():
+    """is_review_fix_lane_pilot_active_for_project returns False when KILL is
+    present, and True for an eligible project without a KILL verdict."""
+    from app.review_fix_lane_pilot import (
+        LANE_PILOT_CAP_NAME,
+        is_review_fix_lane_pilot_active_for_project,
+    )
+    from unittest.mock import MagicMock, patch
+
+    def _make_mock_project(verdicts=None, is_self_repo=True):
+        p = MagicMock()
+        p.capability_adoption_verdicts = verdicts or {}
+        return p
+
+    with patch(
+        "app.review_fix_lane_pilot.is_review_fix_lane_pilot_enabled", return_value=True
+    ), patch(
+        "app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True
+    ):
+        # No verdict → active.
+        assert is_review_fix_lane_pilot_active_for_project(_make_mock_project()) is True
+
+        # KILL verdict → inactive.
+        assert is_review_fix_lane_pilot_active_for_project(
+            _make_mock_project({LANE_PILOT_CAP_NAME: {"verdict": "KILL"}})
+        ) is False
+
+        # ADOPT verdict → active (ADOPT does not suppress the gate).
+        assert is_review_fix_lane_pilot_active_for_project(
+            _make_mock_project({LANE_PILOT_CAP_NAME: {"verdict": "ADOPT"}})
+        ) is True
+
+    # Flag off → inactive regardless of project state.
+    with patch(
+        "app.review_fix_lane_pilot.is_review_fix_lane_pilot_enabled", return_value=False
+    ), patch(
+        "app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True
+    ):
+        assert is_review_fix_lane_pilot_active_for_project(_make_mock_project()) is False
