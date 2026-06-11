@@ -209,6 +209,66 @@ async def test_cas_transition_active_to_killed(db: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_cas_transition_proposed_to_killed(db: AsyncSession):
+    """PROPOSED -> KILLED should succeed (stale/failed-activation aging) and
+    stamp retired_at while clearing any current_task_id binding."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/t3k",
+        base_branch="main",
+    )
+    # A PROPOSED lane that briefly bound a task during a failed activation.
+    lane.current_task_id = uuid.uuid4()
+    await db.commit()
+
+    updated = await cas_transition(
+        db,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.KILLED,
+    )
+    await db.commit()
+
+    assert updated.status == ImprovementLaneStatus.KILLED.value
+    assert updated.retired_at is not None
+    assert updated.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_cas_transition_proposed_to_retired(db: AsyncSession):
+    """PROPOSED -> RETIRED should succeed (chain merged/closed before the lane
+    ever activated)."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/t3r",
+        base_branch="main",
+    )
+    await db.commit()
+
+    updated = await cas_transition(
+        db,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.RETIRED,
+    )
+    await db.commit()
+
+    assert updated.status == ImprovementLaneStatus.RETIRED.value
+    assert updated.retired_at is not None
+    assert updated.current_task_id is None
+
+
+@pytest.mark.asyncio
 async def test_cas_transition_parked_to_active(db: AsyncSession):
     """PARKED -> ACTIVE should succeed (resume path)."""
     project_id = await _make_project(db)

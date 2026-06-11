@@ -1211,13 +1211,17 @@ async def sweep_exhausted_lane_budgets(session) -> int:
         return 0
 
     exhausted = (
-        await session.execute(
-            select(ImprovementLane).where(
-                ImprovementLane.status == ImprovementLaneStatus.ACTIVE.value,
-                ImprovementLane.phase_requeues > _LANE_MAX_PHASE_REQUEUES,
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.status == ImprovementLaneStatus.ACTIVE.value,
+                    ImprovementLane.phase_requeues > _LANE_MAX_PHASE_REQUEUES,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     killed = 0
     for lane in exhausted:
@@ -1243,6 +1247,182 @@ async def sweep_exhausted_lane_budgets(session) -> int:
     return killed
 
 
+# Default age, in seconds, after which a still-PROPOSED lane is treated as a
+# failed/abandoned activation and aged to a terminal state. A lane is created
+# PROPOSED and advanced to ACTIVE essentially immediately on dispatch, so a row
+# lingering in PROPOSED past this window means activation never completed.
+# Overridable via runtime_config["improvement_lane_proposed_stale_seconds"].
+_PROPOSED_STALE_SECONDS_DEFAULT = 1800
+
+# Task statuses that mean a lane's bound phase task is finished (or void) and the
+# lane is therefore stranded if it is still ACTIVE — no checkpoint will ever land
+# from this task. Mirrors the terminal set the pool lease-orphan reclaim uses,
+# minus EVALUATING: an EVALUATING lane task is still legitimately in flight
+# (waiting on its own children), so it must NOT be reconciled as stranded.
+_LANE_TERMINAL_TASK_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+)
+
+
+async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int:
+    """Reconcile improvement lanes stranded OUTSIDE the pilot's checkpoint seam.
+
+    Two strand classes that no other code path observes:
+
+    1. An ACTIVE lane whose ``current_task_id`` references a TERMINAL task
+       (COMPLETED / FAILED / CANCELLED), whose task row no longer exists
+       (vanished), or that has no bound task at all. The phase task died outside
+       the pilot's checkpoint handling — operator/admin cancel, reaper kill, or
+       an agent crash before any checkpoint attempt — so ``mark_checkpoint_missing``
+       never fired and ``phase_requeues`` never incremented. Route each through
+       the lane's BOUNDED recovery: reuse ``mark_checkpoint_missing`` to bump the
+       requeue counter and decide. While UNDER budget, requeue-from-checkpoint by
+       clearing the stale binding (CAS ACTIVE -> PARKED, ``clear_task=True``) so
+       the next resume re-dispatches the phase from durable checkpoint context;
+       once the budget is exhausted, CAS ACTIVE -> KILLED.
+
+    2. A PROPOSED lane whose ``created_at`` is older than the staleness threshold
+       — activation never completed. CAS PROPOSED -> KILLED (abandoned/
+       failed-activation semantics; the edge added alongside this sweep).
+
+    Detection uses the ``ix_improvementlane_project_status`` index path (a
+    status-filtered scan — the model's documented "scan ACTIVE lanes looking for
+    stuck tasks" hot path). EVERY mutation goes through ``cas_transition`` (SELECT
+    … FOR UPDATE), so concurrent maintainer/sweep ticks and stale reads safely
+    no-op: the CAS loser logs and continues, never double-killing.
+
+    Inert when ``improvement_lanes_enabled`` is False. Runs independently of
+    ``warm_pool_enabled`` (called from :func:`sweep_idle_pool_vms` before the
+    warm-pool gate) so shadow-lane mode still reconciles. Returns the count of
+    lanes transitioned.
+    """
+    from app.improvement_lane_ops import (
+        LaneCASError,
+        cas_transition,
+        mark_checkpoint_missing,
+    )
+    from app.models import ImprovementLaneStatus
+    from app.runtime_config_state import is_improvement_lanes_enabled
+
+    if not is_improvement_lanes_enabled():
+        return 0
+
+    transitioned = 0
+
+    # --- Class 1: ACTIVE lanes whose bound phase task is terminal/vanished ---
+    active_lanes = (
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.status == ImprovementLaneStatus.ACTIVE.value
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for lane in active_lanes:
+        stranded = False
+        if lane.current_task_id is None:
+            stranded = True
+        else:
+            task = await session.get(Task, lane.current_task_id)
+            if task is None or task.status in _LANE_TERMINAL_TASK_STATUSES:
+                stranded = True
+        if not stranded:
+            continue
+
+        # Bounded recovery: increment the requeue counter via the shared
+        # primitive, then either requeue-from-checkpoint (park, clearing the
+        # stale binding) while under budget or terminate once exhausted.
+        try:
+            _, should_requeue = await mark_checkpoint_missing(
+                session, lane.id, reason="stranded_terminal_task"
+            )
+            if should_requeue:
+                await cas_transition(
+                    session,
+                    lane.id,
+                    ImprovementLaneStatus.ACTIVE,
+                    ImprovementLaneStatus.PARKED,
+                    clear_task=True,
+                )
+                logger.info(
+                    "[WARM-POOL] reconciled stranded ACTIVE lane %s -> PARKED "
+                    "(requeue-from-checkpoint; phase_requeues=%d)",
+                    lane.id,
+                    lane.phase_requeues,
+                )
+            else:
+                await cas_transition(
+                    session,
+                    lane.id,
+                    ImprovementLaneStatus.ACTIVE,
+                    ImprovementLaneStatus.KILLED,
+                )
+                logger.info(
+                    "[WARM-POOL] reconciled stranded ACTIVE lane %s -> KILLED "
+                    "(requeue budget exhausted; phase_requeues=%d)",
+                    lane.id,
+                    lane.phase_requeues,
+                )
+            transitioned += 1
+        except LaneCASError as exc:
+            # Concurrent maintainer/sweep tick already transitioned this lane —
+            # the loser no-ops rather than double-killing.
+            logger.debug("[WARM-POOL] stranded-lane CAS miss lane=%s: %s", lane.id, exc)
+
+    # --- Class 2: stale PROPOSED lanes whose activation never completed ---
+    stale_seconds = int(
+        runtime_config.get(
+            "improvement_lane_proposed_stale_seconds",
+            _PROPOSED_STALE_SECONDS_DEFAULT,
+        )
+        or _PROPOSED_STALE_SECONDS_DEFAULT
+    )
+    proposed_cutoff = now - timedelta(seconds=stale_seconds)
+    stale_proposed = (
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.status == ImprovementLaneStatus.PROPOSED.value,
+                    ImprovementLane.created_at < proposed_cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for lane in stale_proposed:
+        try:
+            await cas_transition(
+                session,
+                lane.id,
+                ImprovementLaneStatus.PROPOSED,
+                ImprovementLaneStatus.KILLED,
+            )
+            transitioned += 1
+            logger.info(
+                "[WARM-POOL] aged stale PROPOSED lane %s -> KILLED "
+                "(created_at=%s, threshold=%ds)",
+                lane.id,
+                lane.created_at,
+                stale_seconds,
+            )
+        except LaneCASError as exc:  # noqa: PERF203 — CAS miss per lane is intentional
+            logger.debug(
+                "[WARM-POOL] stale-PROPOSED CAS miss lane=%s: %s", lane.id, exc
+            )
+
+    if transitioned:
+        await session.commit()
+    return transitioned
+
+
 async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     """Reaper pass: retire over-TTL / zombie / stale-image / stuck-RETIRING pool VMs.
 
@@ -1261,10 +1441,14 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     sweep or the maintainer) wins the claim is the only one that tears the member
     down; the loser no-ops.
     """
-    # Lane-budget sweep runs independently of warm_pool_enabled so that
+    # Lane reconciliation sweeps run independently of warm_pool_enabled so that
     # shadow-lane mode (improvement_lanes_enabled=True, warm_pool_enabled=False)
-    # still closes over-budget lanes instead of leaving them ACTIVE forever.
+    # still closes stranded/over-budget lanes instead of leaving them ACTIVE or
+    # PROPOSED forever. The budget sweep runs first so any ACTIVE lane already
+    # over its phase_requeues budget is KILLED before the stranded-lane sweep
+    # scans ACTIVE rows (avoiding a redundant second look at the same lane).
     await sweep_exhausted_lane_budgets(session)
+    await sweep_stranded_lanes(session, now, runtime_config=runtime_config)
 
     if not is_warm_pool_enabled():
         return 0

@@ -4177,6 +4177,10 @@ class ImprovementLaneStatus(str, Enum):
     PARKED -> ACTIVE (next phase dispatched; current_task_id bound)
     ACTIVE | PARKED -> RETIRED (goal met / version closed; terminal)
     ACTIVE | PARKED -> KILLED (pilot kill or operator action; terminal)
+    PROPOSED -> KILLED (failed/abandoned activation aged out by the
+        reconciliation sweep; terminal)
+    PROPOSED -> RETIRED (chain merged/closed before the lane ever activated;
+        terminal)
     """
 
     PROPOSED = "PROPOSED"
@@ -4195,6 +4199,15 @@ _IMPROVEMENT_LANE_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
         ("PARKED", "RETIRED"),
         ("ACTIVE", "KILLED"),
         ("PARKED", "KILLED"),
+        # A PROPOSED lane whose activation never completed (failed/abandoned
+        # dispatch, or an operator/admin close before the first phase ran) had
+        # no permitted terminal exit, so it could strand forever holding its
+        # direction scope. These two edges let the reconciliation sweep and the
+        # pilot closers age such a lane to a terminal state. KILLED carries the
+        # abandoned/failed-activation semantics the sweep uses; RETIRED covers a
+        # chain that merged/closed before the lane ever activated.
+        ("PROPOSED", "KILLED"),
+        ("PROPOSED", "RETIRED"),
     }
 )
 

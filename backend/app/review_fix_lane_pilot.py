@@ -688,10 +688,10 @@ async def retire_chain_lane(
 ) -> bool:
     """CAS the chain's lane to RETIRED if it is not already terminal.
 
-    Transitions ACTIVE or PARKED lanes to RETIRED.  If the lane happens to be
-    PROPOSED (non-terminal but PROPOSED->RETIRED is not a valid transition),
-    the CAS raises LaneCASError and is silently swallowed — PROPOSED is
-    transient and is advanced to ACTIVE immediately on creation.
+    Transitions ACTIVE, PARKED, or PROPOSED lanes to RETIRED.  PROPOSED->RETIRED
+    is now a valid transition (added alongside the stranded-lane reconciliation
+    sweep), so a chain whose PR merges/closes before the lane ever activated is
+    closed cleanly instead of the CAS being swallowed.
 
     Called when a chain's PR merges or closes so the lane row reaches a
     terminal state promptly.  Best-effort: LaneCASError (concurrent retirement
@@ -732,10 +732,10 @@ async def kill_project_lanes(
 ) -> int:
     """CAS non-terminal ImprovementLane rows for *project_id* to KILLED.
 
-    Transitions ACTIVE and PARKED lanes to KILLED.  PROPOSED lanes are
-    technically non-terminal but PROPOSED->KILLED is not a valid transition;
-    any PROPOSED row encountered raises LaneCASError and is silently skipped
-    (PROPOSED is transient and is advanced to ACTIVE immediately on creation).
+    Transitions ACTIVE, PARKED, and PROPOSED lanes to KILLED.  PROPOSED->KILLED
+    is now a valid transition (added alongside the stranded-lane reconciliation
+    sweep), so a PROPOSED row whose activation never completed is closed by the
+    KILL operation instead of being silently skipped on a CAS miss.
 
     Returns the count of lanes successfully transitioned.  Called from
     apply_lane_pilot_kill so the KILL operation closes all lane rows rather

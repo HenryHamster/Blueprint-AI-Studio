@@ -24,6 +24,7 @@ import app.shared_state as _shared_state
 import app.warm_pool_maintainer as _wpm
 from app.models import (
     ImprovementLane,
+    ImprovementLaneStatus,
     PoolIdleCostLedger,
     PoolIdleSpan,
     PoolVm,
@@ -31,6 +32,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    _LANE_MAX_PHASE_REQUEUES,
 )
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -51,6 +53,7 @@ from app.warm_pool_maintainer import (
     retire_and_delete_pool_vm,
     run_pool_maintainer_cycle,
     sweep_idle_pool_vms,
+    sweep_stranded_lanes,
 )
 from testing.conftest import TestingSessionLocal
 
@@ -2250,6 +2253,321 @@ async def test_maintainer_clears_expired_reservation_banks_lane_cost(
             _runtime_config.pop("improvement_lanes_enabled", None)
         else:
             _runtime_config["improvement_lanes_enabled"] = prior_lanes
+
+
+# ---------------------------------------------------------------------------
+# Stranded / stuck improvement-lane reconciliation (sweep_stranded_lanes).
+#
+# Detection for lane strands that NEVER reach the pilot's checkpoint seam:
+#   * an ACTIVE lane whose bound phase task is terminal / vanished / unbound
+#     (operator/admin cancel, reaper kill, agent crash before any checkpoint),
+#     routed through the lane's BOUNDED recovery (mark_checkpoint_missing ->
+#     requeue-from-checkpoint while under budget, KILLED once exhausted);
+#   * a stale PROPOSED lane whose activation never completed, aged to KILLED.
+# Sibling of the in-seam "recover checkpoint-missing lanes" work — this owns
+# DETECTION for the out-of-seam cases.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def lanes_on():
+    """Enable improvement_lanes_enabled for the test and restore prior state."""
+    prior = _runtime_config.get("improvement_lanes_enabled")
+    prior_stale = _runtime_config.get("improvement_lane_proposed_stale_seconds")
+    _runtime_config["improvement_lanes_enabled"] = True
+    try:
+        yield
+    finally:
+        if prior is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior
+        if prior_stale is None:
+            _runtime_config.pop("improvement_lane_proposed_stale_seconds", None)
+        else:
+            _runtime_config["improvement_lane_proposed_stale_seconds"] = prior_stale
+
+
+async def _make_lane(
+    db_session,
+    project,
+    *,
+    status=ImprovementLaneStatus.ACTIVE,
+    current_task_id=None,
+    phase_requeues=0,
+    created_at=None,
+    name="lane",
+):
+    lane = ImprovementLane(
+        project_id=project.id,
+        title=f"{name} title",
+        goal=f"{name} goal",
+        branch_name=f"lane/{name}",
+        base_branch="automain",
+        status=status.value,
+        current_task_id=current_task_id,
+        phase_requeues=phase_requeues,
+    )
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
+    if created_at is not None:
+        # created_at has a server_default; override after insert for age tests.
+        lane.created_at = created_at
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+    return lane
+
+
+@pytest.mark.asyncio
+async def test_sweep_reconciles_stranded_active_lane_and_ages_stale_proposed(
+    db_session, lanes_on
+):
+    """Acceptance seam: the sweep reconciles an ACTIVE lane whose bound task was
+    cancelled externally (requeue-from-checkpoint -> PARKED, stale binding
+    cleared) AND ages a stale PROPOSED lane to KILLED, while leaving a fresh
+    PROPOSED lane untouched — and a re-run (concurrent tick) is a safe no-op."""
+    project = await _make_project(db_session, name="Strand Recon")
+
+    cancelled = await _make_task(db_session, project, TaskStatus.CANCELLED)
+    active_lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=cancelled.id,
+        name="active-cancelled",
+    )
+    stale_proposed = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.PROPOSED,
+        created_at=_utcnow() - timedelta(seconds=4000),
+        name="stale-proposed",
+    )
+    fresh_proposed = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.PROPOSED,
+        created_at=_utcnow() - timedelta(seconds=10),
+        name="fresh-proposed",
+    )
+
+    now = _utcnow()
+    transitioned = await sweep_stranded_lanes(
+        db_session, now, runtime_config=_runtime_config
+    )
+    assert transitioned == 2, "one stranded ACTIVE + one stale PROPOSED"
+
+    await db_session.refresh(active_lane)
+    assert active_lane.status == ImprovementLaneStatus.PARKED.value, (
+        "under-budget stranded lane requeues-from-checkpoint (PARKED)"
+    )
+    assert active_lane.current_task_id is None, "stale task binding must be cleared"
+    assert active_lane.phase_requeues == 1, "mark_checkpoint_missing bumped the counter"
+
+    await db_session.refresh(stale_proposed)
+    assert stale_proposed.status == ImprovementLaneStatus.KILLED.value
+    assert stale_proposed.retired_at is not None
+
+    await db_session.refresh(fresh_proposed)
+    assert fresh_proposed.status == ImprovementLaneStatus.PROPOSED.value, (
+        "a PROPOSED lane inside the staleness window must be left untouched"
+    )
+
+    # Concurrent / repeated tick: the lanes are no longer ACTIVE/stale-PROPOSED,
+    # so every CAS misses and the second pass is a no-op (loser never re-kills).
+    second = await sweep_stranded_lanes(db_session, now, runtime_config=_runtime_config)
+    assert second == 0, "re-run finds nothing reconcilable — exactly one transition won"
+
+
+@pytest.mark.asyncio
+async def test_sweep_kills_stranded_active_lane_when_budget_exhausted(
+    db_session, lanes_on
+):
+    """An ACTIVE lane whose bound task is FAILED and whose phase_requeues budget
+    is already at the cap is KILLED (not requeued) — bounded recovery terminates."""
+    project = await _make_project(db_session, name="Strand Exhausted")
+    failed = await _make_task(db_session, project, TaskStatus.FAILED)
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=failed.id,
+        phase_requeues=_LANE_MAX_PHASE_REQUEUES,
+        name="exhausted",
+    )
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 1
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.KILLED.value
+    assert lane.current_task_id is None
+    assert lane.retired_at is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_reconciles_vanished_and_unbound_active_lanes(db_session, lanes_on):
+    """An ACTIVE lane whose current_task_id points at a deleted Task (vanished),
+    and one with no bound task at all, are both reconciled (PARKED under budget)."""
+    project = await _make_project(db_session, name="Strand Vanished")
+
+    vanished_lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=uuid.uuid4(),  # references a Task row that never existed
+        name="vanished",
+    )
+    unbound_lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=None,
+        name="unbound",
+    )
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 2
+
+    for lane in (vanished_lane, unbound_lane):
+        await db_session.refresh(lane)
+        assert lane.status == ImprovementLaneStatus.PARKED.value
+        assert lane.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_spares_active_lane_with_live_task(db_session, lanes_on):
+    """An ACTIVE lane whose bound task is still in flight (IN_PROGRESS or the
+    children-waiting EVALUATING state) must NOT be reconciled as stranded."""
+    project = await _make_project(db_session, name="Strand Live")
+
+    in_progress = await _make_task(db_session, project, TaskStatus.IN_PROGRESS)
+    live_lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=in_progress.id,
+        name="live",
+    )
+    evaluating = await _make_task(db_session, project, TaskStatus.EVALUATING)
+    eval_lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=evaluating.id,
+        name="evaluating",
+    )
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 0
+
+    for lane in (live_lane, eval_lane):
+        await db_session.refresh(lane)
+        assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert live_lane.current_task_id == in_progress.id
+    assert eval_lane.current_task_id == evaluating.id
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_already_parked_lane_checkpoint_won_the_race(
+    db_session, lanes_on
+):
+    """External cancel racing a checkpoint write: if the checkpoint already moved
+    the lane ACTIVE->PARKED, the sweep's ACTIVE-expected CAS misses and no-ops —
+    the lane is NOT double-handled even though its (now-historical) task is
+    terminal."""
+    project = await _make_project(db_session, name="Strand Race")
+    cancelled = await _make_task(db_session, project, TaskStatus.CANCELLED)
+    parked_lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.PARKED,
+        current_task_id=cancelled.id,
+        name="checkpoint-won",
+    )
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 0
+
+    await db_session.refresh(parked_lane)
+    assert parked_lane.status == ImprovementLaneStatus.PARKED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_inert_when_disabled(db_session):
+    """With improvement_lanes_enabled False the sweep is fully inert — a stranded
+    ACTIVE lane and a stale PROPOSED lane are both left untouched."""
+    prior = _runtime_config.get("improvement_lanes_enabled")
+    _runtime_config["improvement_lanes_enabled"] = False
+    try:
+        project = await _make_project(db_session, name="Strand Disabled")
+        cancelled = await _make_task(db_session, project, TaskStatus.CANCELLED)
+        active_lane = await _make_lane(
+            db_session,
+            project,
+            status=ImprovementLaneStatus.ACTIVE,
+            current_task_id=cancelled.id,
+            name="disabled-active",
+        )
+        stale_proposed = await _make_lane(
+            db_session,
+            project,
+            status=ImprovementLaneStatus.PROPOSED,
+            created_at=_utcnow() - timedelta(seconds=4000),
+            name="disabled-proposed",
+        )
+
+        transitioned = await sweep_stranded_lanes(
+            db_session, _utcnow(), runtime_config=_runtime_config
+        )
+        assert transitioned == 0
+
+        await db_session.refresh(active_lane)
+        assert active_lane.status == ImprovementLaneStatus.ACTIVE.value
+        await db_session.refresh(stale_proposed)
+        assert stale_proposed.status == ImprovementLaneStatus.PROPOSED.value
+    finally:
+        if prior is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior
+
+
+@pytest.mark.asyncio
+async def test_sweep_idle_pool_vms_invokes_stranded_lane_sweep(
+    db_session, lanes_on, mocker
+):
+    """sweep_idle_pool_vms drives the stranded-lane reconciliation independently
+    of warm_pool_enabled (shadow-lane mode still reconciles)."""
+    spy = mocker.spy(_wpm, "sweep_stranded_lanes")
+    # warm_pool_enabled stays False (no warm_pool_on fixture) — sweep must still run.
+    project = await _make_project(db_session, name="Strand Wired")
+    cancelled = await _make_task(db_session, project, TaskStatus.CANCELLED)
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=cancelled.id,
+        name="wired",
+    )
+
+    await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+
+    assert spy.call_count == 1, "sweep_idle_pool_vms must invoke sweep_stranded_lanes"
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.PARKED.value, (
+        "the wired sweep actually reconciled the stranded lane"
+    )
 
 
 @pytest.mark.asyncio
