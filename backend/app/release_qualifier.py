@@ -3006,11 +3006,19 @@ async def _maybe_reconcile_after_promotion_conflict(
 
 
 # Qualification outcomes after which the strategic agent should re-plan: a
-# RESOLVED verdict (a promote, or any flavour of miss). Excludes the in-flight
-# (``pending_auto_merge``), transient (``audit_rate_limit_respawned``) and
-# read-only no-op (``None``) states, which do not represent a settled cut.
+# settled verdict (a promote, any flavour of miss, or a terminal infra
+# failure). Excludes the in-flight (``pending_auto_merge``), transient
+# (``audit_rate_limit_respawned``) and read-only no-op (``None``) states,
+# which do not represent a settled cut.
 _STRATEGIC_RETRIGGER_STATUSES: frozenset[str] = frozenset(
-    {"promoted", "promotion_failed", "not_promoted", "dry_run", "error"}
+    {
+        "promoted",
+        "promotion_failed",
+        "not_promoted",
+        "dry_run",
+        "error",
+        "infra_failure",
+    }
 )
 
 

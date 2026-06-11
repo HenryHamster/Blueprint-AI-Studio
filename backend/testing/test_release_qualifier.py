@@ -11782,14 +11782,17 @@ async def test_finalize_in_dedicated_session_reconciles_on_promotion_conflict(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["not_promoted", "dry_run", "promoted", "error"])
+@pytest.mark.parametrize(
+    "status",
+    ["not_promoted", "dry_run", "promoted", "error", "infra_failure"],
+)
 async def test_resolved_qualification_triggers_strategic_review(
     db_session, mocker, status
 ):
-    """Every RESOLVED qualification verdict — a promote or any flavour of miss —
-    re-triggers the strategic agent so it re-plans (opens the next wave on a
-    promote, works the blocker on a miss) instead of leaving a dry frontier
-    idle until the wall-clock backstop fires."""
+    """Every settled qualification verdict — a promote, any flavour of miss,
+    or a terminal infra failure — re-triggers the strategic agent so it
+    re-plans instead of leaving a dry frontier idle until the wall-clock
+    backstop fires."""
     project, version = await _make_project_and_version(db_session)
     spawn_mock = mocker.patch(
         "app.strategic_spawning._spawn_strategic_review",
@@ -11905,18 +11908,23 @@ async def test_strategic_trigger_queues_refresh_when_cycle_active(db_session, mo
 
 
 @pytest.mark.asyncio
-async def test_finalize_in_dedicated_session_triggers_strategic_on_miss(
-    db_session, mocker
+@pytest.mark.parametrize(
+    "finalize_result",
+    [
+        {"status": "not_promoted", "blocker": "below_threshold"},
+        {"status": "infra_failure"},
+    ],
+)
+async def test_finalize_in_dedicated_session_triggers_strategic_on_settled_outcome(
+    db_session, mocker, finalize_result
 ):
-    """End-to-end wiring: a finalize that resolves to a miss drives
+    """End-to-end wiring: a finalize that resolves to a settled outcome drives
     _finalize_in_dedicated_session to re-trigger a strategic review after its
     dedicated session has committed and closed."""
     _project, version = await _make_project_and_version(db_session)
     mocker.patch(
         "app.release_qualifier._finalize_locked_version",
-        new=AsyncMock(
-            return_value={"status": "not_promoted", "blocker": "below_threshold"}
-        ),
+        new=AsyncMock(return_value=finalize_result),
     )
     spawn_mock = mocker.patch(
         "app.strategic_spawning._spawn_strategic_review",
@@ -11927,7 +11935,7 @@ async def test_finalize_in_dedicated_session_triggers_strategic_on_miss(
         version.id, session_factory=_shared_session_factory(db_session)
     )
 
-    assert result is not None and result["status"] == "not_promoted"
+    assert result is not None and result["status"] == finalize_result["status"]
     spawn_mock.assert_awaited_once()
 
 
