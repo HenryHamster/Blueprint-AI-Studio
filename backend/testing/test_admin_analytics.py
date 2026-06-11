@@ -592,6 +592,61 @@ class TestLaneDiag:
         # No version key injected
         assert "version" not in body
 
+    @pytest.mark.asyncio
+    async def test_version_scoped_window_survives_newer_task_displacement(
+        self, client: AsyncClient, db_session
+    ):
+        """Closed-version aggregates are correct even when newer tasks exceed max_tasks.
+
+        When more out-of-window tasks exist than max_tasks, a lower-bound-only SQL
+        query would fill the cap with out-of-window rows and return empty aggregates
+        for the closed version. The upper-bound SQL fix must prevent this.
+        """
+        from app.models import ReleaseVersion
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        v9_opened = _utcnow() - timedelta(days=10)
+        v9_promoted = _utcnow() - timedelta(days=3)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=9,
+            phase="build",
+            status="promoted",
+            opened_at=v9_opened,
+            promoted_at=v9_promoted,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        # One in-window task for the closed version
+        self._add_review_loop_task(
+            db_session, project.id, 901, "fix",
+            v9_opened + timedelta(days=1), 600, "ci_failure",
+        )
+
+        # Newer out-of-window tasks that would fill a small max_tasks cap
+        for i in range(5):
+            self._add_review_loop_task(
+                db_session, project.id, 999 + i, "fix",
+                v9_promoted + timedelta(days=i + 1), 300, "ci_failure",
+            )
+        await db_session.commit()
+
+        # Use max_tasks=3 so out-of-window tasks would displace the in-window one
+        # if the upper bound were not pushed into SQL.
+        resp = await client.get(
+            f"/api/admin/lane-diag?project_id={project.id}&version_number=9&max_tasks=3"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # The in-window task must still be counted despite the smaller cap
+        assert body["pr_count"] == 1
+        assert body["task_count"] == 1
+
 
 class TestLaneWasteDiag:
     """Chain-complete review/fix waste diagnostics (the additive ``lane_waste``)."""

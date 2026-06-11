@@ -656,6 +656,12 @@ async def get_lane_diag(
     if version_number is not None:
         completed_filters.append(Task.created_at >= cutoff)
         terminal_filters.append(Task.created_at >= cutoff)
+        # For closed versions push the upper bound into SQL so that out-of-window
+        # rows created after promoted_at cannot consume the max_tasks cap before
+        # any in-window row is fetched.
+        if window_end is not None and window_end != now:
+            completed_filters.append(Task.created_at < window_end)
+            terminal_filters.append(Task.created_at < window_end)
 
     completed_tasks = (
         (
@@ -744,6 +750,30 @@ async def get_lane_diag(
         extra["window_days"] = 7
     if version_meta is not None:
         extra["version"] = version_meta
+    # For closed versions, include the persisted lane baseline if available.
+    # A closed version's tasks may age past the rolling query cap; the stored
+    # baseline remains reliably accessible even after tasks are archived.
+    if version_meta is not None and rv.status != "open":
+        try:
+            from app.lane_baseline_snapshot import DESIGN_DOC_KEY
+
+            _proj_doc = (
+                await session.execute(
+                    select(Project.design_doc).where(Project.id == rv.project_id)
+                )
+            ).scalar_one_or_none()
+            if isinstance(_proj_doc, dict):
+                _stored = (_proj_doc.get(DESIGN_DOC_KEY) or {}).get(
+                    str(rv.version_number)
+                )
+                if _stored is not None:
+                    extra["lane_baseline"] = _stored
+                    extra["lane_baseline_source"] = "persisted"
+        except Exception:
+            logger.exception(
+                "[LANE_DIAG] failed to load persisted baseline for v%d",
+                rv.version_number,
+            )
     diag.update(extra)
     return diag
 

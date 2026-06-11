@@ -1767,6 +1767,34 @@ async def _record_promotion_success(
             "next_version_number": next_version.version_number,
         },
     )
+
+    # Best-effort: snapshot the lane baseline for the just-promoted version.
+    # Runs in its OWN session so a failure here can never abort or fail the
+    # promotion — exactly mirroring the staged-direction activation pattern.
+    try:
+        from app.database import AsyncSessionLocal
+        from app.lane_baseline_snapshot import persist_version_lane_baseline
+
+        _v_opened = version.opened_at
+        _v_closed = now  # version.promoted_at was set to `now` above
+        async with AsyncSessionLocal() as _snap_session:
+            await persist_version_lane_baseline(
+                _snap_session,
+                project_id=version.project_id,
+                version_number=version.version_number,
+                opened_at=_v_opened,
+                closed_at=_v_closed,
+                terminal_status="promoted",
+            )
+            await _snap_session.commit()
+    except Exception as exc:  # noqa: BLE001 — baseline snapshot must not abort promotion
+        logger.warning(
+            "[RELEASE_QUALIFIER] lane baseline persistence failed after v%d "
+            "promotion (non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
     return {
         "status": "promoted",
         "promoted_sha": effective_sha,

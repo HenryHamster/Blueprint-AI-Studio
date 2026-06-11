@@ -1314,4 +1314,29 @@ async def abandon_current_version(
             exc,
         )
 
+    # Best-effort: snapshot the lane baseline for the just-abandoned version.
+    # Isolated in its OWN session so a failure here can never abort the cut —
+    # exactly mirroring the staged-direction activation / notification pattern.
+    try:
+        from app.database import AsyncSessionLocal
+        from app.lane_baseline_snapshot import persist_version_lane_baseline
+
+        async with AsyncSessionLocal() as _snap_session:
+            await persist_version_lane_baseline(
+                _snap_session,
+                project_id=project_id,
+                version_number=locked.version_number,
+                opened_at=locked.opened_at,
+                closed_at=now,
+                terminal_status="abandoned",
+            )
+            await _snap_session.commit()
+    except Exception as exc:  # noqa: BLE001 — baseline snapshot must not abort the cut
+        logger.warning(
+            "[RELEASE_VERSION] abandon: lane baseline persistence failed after "
+            "v%d cut (non-fatal): %s",
+            locked.version_number,
+            exc,
+        )
+
     return locked, next_version

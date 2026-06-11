@@ -1,0 +1,258 @@
+"""Lane-baseline snapshot persistence.
+
+When a ReleaseVersion reaches a terminal status (promoted or abandoned), this
+module captures the version's lane-diagnostic aggregates and persists them
+durably under ``project.design_doc["lane_baselines"][str(version_number)]``.
+
+Uses the same JSONB round-trip pattern as ``efficiency_snapshot`` — no
+migration is required.  The stored blob is a subset of the lane-diag response
+plus per-PR relay medians for the v10 lane-pilot comparison.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from datetime import datetime
+from typing import Any, Dict, List
+
+from sqlalchemy.orm import load_only
+from sqlmodel import select
+
+from app.digest_metrics import compute_lane_waste_diagnostics
+from app.models import Project, Task, TaskStatus, _utcnow
+from app.task_locking import with_design_doc_locked
+from app.routers.admin_analytics import (
+    _compute_lane_diag,
+    _review_loop_pr_number,
+)
+from app.routers.admin_pipeline_observability import (
+    _load_escalation_alerts,
+    _load_outer_loop_original_tasks,
+)
+
+logger = logging.getLogger(__name__)
+
+DESIGN_DOC_KEY = "lane_baselines"
+BASELINE_DEF_VERSION = "v1"
+_SNAPSHOT_PR_BREAKDOWN_LIMIT = 100
+_MAX_TASKS_PER_SNAPSHOT = 5000
+_MAX_BASELINES_STORED = 20
+
+_TASK_SNAPSHOT_COLUMNS = (
+    Task.id,
+    Task.project_id,
+    Task.status,
+    Task.created_at,
+    Task.started_at,
+    Task.updated_at,
+    Task.status_log,
+    Task.payloads,
+    Task.context,
+    Task.fix_loop_history,
+    Task.archived,
+    Task.vm_dispatched_at,
+    Task.vm_provisioned_at,
+    Task.vm_started_at,
+    Task.vm_stopped_at,
+)
+
+
+def _compute_relay_medians(per_pr_breakdown: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Derive per-PR relay-baseline medians from lane-diag phase breakdown rows."""
+    if not per_pr_breakdown:
+        return {
+            "wall_clock_seconds": None,
+            "active_seconds": None,
+            "gap_seconds": None,
+            "task_count": None,
+            "pr_count": 0,
+        }
+
+    def _median(vals: List[float]) -> float | None:
+        if not vals:
+            return None
+        s = sorted(vals)
+        n = len(s)
+        mid = n // 2
+        return s[mid] if n % 2 == 1 else (s[mid - 1] + s[mid]) / 2.0
+
+    return {
+        "wall_clock_seconds": _median([r["total_seconds"] for r in per_pr_breakdown]),
+        "active_seconds": _median(
+            [r["review_seconds"] + r["fix_seconds"] for r in per_pr_breakdown]
+        ),
+        "gap_seconds": _median([r["gap_seconds"] for r in per_pr_breakdown]),
+        "task_count": _median([float(r["task_count"]) for r in per_pr_breakdown]),
+        "pr_count": len(per_pr_breakdown),
+    }
+
+
+async def persist_version_lane_baseline(
+    session: Any,
+    *,
+    project_id: uuid.UUID,
+    version_number: int,
+    opened_at: datetime,
+    closed_at: datetime,
+    terminal_status: str,
+) -> Dict[str, Any] | None:
+    """Compute and store the lane baseline for a just-closed ReleaseVersion.
+
+    Queries the version's task window, computes full lane-diag aggregates plus
+    per-PR relay medians, and persists the result under
+    ``project.design_doc["lane_baselines"][str(version_number)]``.
+
+    First-write-wins: a second call for the same version is a no-op.  Always
+    called from a separate ``AsyncSessionLocal`` so a failure here never aborts
+    promotion or abandonment.  Caller must ``await session.commit()``.
+
+    Returns the baseline dict that was (or was already) persisted, or None on
+    error.
+    """
+
+    def _strip_tz(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+    t_opened = _strip_tz(opened_at)
+    t_closed = _strip_tz(closed_at)
+
+    _opts = load_only(*_TASK_SNAPSHOT_COLUMNS)
+    _proj_filter = [Task.project_id == project_id]
+
+    completed_tasks = list(
+        (
+            await session.execute(
+                select(Task)
+                .options(_opts)
+                .where(
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.created_at >= t_opened,
+                    Task.created_at < t_closed,
+                    *_proj_filter,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(_MAX_TASKS_PER_SNAPSHOT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    all_terminal_tasks = list(
+        (
+            await session.execute(
+                select(Task)
+                .options(_opts)
+                .where(
+                    Task.status.in_(
+                        [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                    ),
+                    Task.created_at >= t_opened,
+                    Task.created_at < t_closed,
+                    *_proj_filter,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(_MAX_TASKS_PER_SNAPSHOT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    scoped = [t for t in completed_tasks if _review_loop_pr_number(t)]
+    diag = _compute_lane_diag(scoped, _SNAPSHOT_PR_BREAKDOWN_LIMIT)
+
+    original_tasks = await _load_outer_loop_original_tasks(
+        session, all_terminal_tasks, project_id=project_id
+    )
+    alerts = await _load_escalation_alerts(
+        session, cutoff=t_opened, project_id=project_id
+    )
+    diag["lane_waste"] = compute_lane_waste_diagnostics(
+        [
+            *all_terminal_tasks,
+            *[
+                task
+                for oid, task in original_tasks.items()
+                if oid not in {str(t.id) for t in all_terminal_tasks}
+            ],
+        ],
+        t_opened,
+        chain_limit=_SNAPSHOT_PR_BREAKDOWN_LIMIT,
+        escalation_alerts=alerts,
+    )
+    diag["relay_medians"] = _compute_relay_medians(diag["per_pr_phase_breakdown"])
+
+    now = _utcnow()
+    baseline: Dict[str, Any] = {
+        "captured_at": now.isoformat(),
+        "baseline_def_version": BASELINE_DEF_VERSION,
+        "version_number": version_number,
+        "terminal_status": terminal_status,
+        "opened_at": t_opened.isoformat(),
+        "closed_at": t_closed.isoformat(),
+        **diag,
+    }
+
+    result: Dict[str, Any] = {"stored": None, "skipped": False}
+    version_key = str(version_number)
+
+    def _store_baseline(doc: dict) -> None:
+        baselines = dict(doc.get(DESIGN_DOC_KEY) or {})
+        if version_key in baselines:
+            result["skipped"] = True
+            result["stored"] = baselines[version_key]
+            return
+        baselines[version_key] = baseline
+        if len(baselines) > _MAX_BASELINES_STORED:
+            sorted_keys = sorted(baselines, key=lambda k: int(k))
+            for old_key in sorted_keys[: len(baselines) - _MAX_BASELINES_STORED]:
+                del baselines[old_key]
+        doc[DESIGN_DOC_KEY] = baselines
+        result["stored"] = baseline
+
+    applied = await with_design_doc_locked(session, project_id, _store_baseline)
+    if not applied:
+        logger.warning(
+            "[LANE_BASELINE] project %s not found; v%d baseline not persisted",
+            project_id,
+            version_number,
+        )
+        return None
+
+    if result["skipped"]:
+        logger.info(
+            "[LANE_BASELINE] v%d baseline already stored for project=%s "
+            "(first-write-wins, skip)",
+            version_number,
+            project_id,
+        )
+        return result["stored"]
+
+    logger.info(
+        "[LANE_BASELINE] persisted v%d lane baseline for project=%s "
+        "(status=%s, pr_count=%d, task_count=%d)",
+        version_number,
+        project_id,
+        terminal_status,
+        diag.get("pr_count", 0),
+        diag.get("task_count", 0),
+    )
+    return result["stored"]
+
+
+def read_version_lane_baseline(
+    project: "Project",
+    version_number: int,
+) -> Dict[str, Any] | None:
+    """Return the persisted lane baseline for the given version, or None.
+
+    Zero DB queries — the ``project`` row must already be loaded by the caller.
+    """
+    if not project.design_doc:
+        return None
+    baselines = project.design_doc.get(DESIGN_DOC_KEY)
+    if not baselines:
+        return None
+    return baselines.get(str(version_number))
