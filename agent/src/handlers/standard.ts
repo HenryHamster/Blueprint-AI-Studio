@@ -35,6 +35,8 @@ import { resolveMigrationLayout } from './specialized.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { runCodeChangeTask } from './code-change.js';
+import { isBlueprintSelfRepo } from '../prompts/code-change-helpers.js';
+import { writeDiagnosticsAfterEditHook } from '../prompts/diagnostics-after-edit-hook.js';
 import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from '../prompts/self-review.js';
 import {
   runFreshReviewerPass,
@@ -116,6 +118,14 @@ function resolvePrTitlePrefix(task: Record<string, unknown>): string {
   return typeof prefix === 'string' ? prefix.trim() : '';
 }
 
+function stableTaskHashFraction(taskId: string): number {
+  let h = 5381;
+  for (let i = 0; i < taskId.length; i++) {
+    h = ((h << 5) + h + taskId.charCodeAt(i)) >>> 0;
+  }
+  return h / 0xffffffff;
+}
+
 export interface StandardHandlerOpts {
   taskId: string;
   payload: Record<string, unknown>;
@@ -146,7 +156,44 @@ export interface StandardHandlerOpts {
     hadModuleInterfaces?: boolean;
     hadRelatedTests?: boolean;
     hadAffectedConsumers?: boolean;
+    moduleInterfacesArm?: boolean;
+    relatedTestsArm?: boolean;
+    affectedConsumersArm?: boolean;
   };
+}
+
+type CapabilityHoldbackName = 'module_interfaces' | 'related_tests' | 'affected_consumers';
+
+function holdbackFraction(meta: Record<string, unknown> | undefined, capability: CapabilityHoldbackName): number {
+  const value = meta?.[`${capability}_holdback_fraction`];
+  return typeof value === 'number' ? value : 0.0;
+}
+
+/**
+ * Deterministically assigns a task to an independent per-capability trial arm.
+ * `true` means treatment (section injected); `false` means holdback.
+ */
+export function assignCapabilityHoldbackArm(
+  taskId: string,
+  capability: CapabilityHoldbackName,
+  fraction: number,
+): boolean | undefined {
+  if (fraction <= 0) return undefined;
+  let h = 5381;
+  const salted = `${capability}:${taskId}`;
+  for (let i = 0; i < salted.length; i++) {
+    h = ((h << 5) + h + salted.charCodeAt(i)) >>> 0;
+  }
+  return (h / 0xffffffff) >= fraction;
+}
+
+function logCapabilityHoldback(
+  ws: WebSocket | null,
+  taskId: string,
+  capability: CapabilityHoldbackName,
+  fraction: number,
+): void {
+  sendLog(ws, `[CapabilityTrial] ${capability} holdback arm for task ${taskId} (fraction=${fraction}) — suppressing section\n`);
 }
 
 /**
@@ -206,6 +253,39 @@ export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
   if (!anyFindings) return '';
   lines.push('Preserve these exports and update any callers you change.');
   return lines.join('\n');
+}
+
+/** Extract a `visual` acceptance-evidence declaration (component + viewport
+ *  width) from a task's payload or context, for threading into the generated
+ *  ./check success-path capture+upload (see writeCheckHelper / buildVisualCaptureBlock).
+ *  Returns undefined when no well-formed visual declaration is present. Two
+ *  channels carry it, and a single planned declaration lands on exactly one of
+ *  them depending on which vocabulary the planner used:
+ *    - payload AcceptanceEvidence: {kind:"visual", component, viewport_width}
+ *    - context PlanAcceptanceEvidence: {kind:"visual", descriptor=component, selector=width}
+ *  The component is restricted to the backend's safe object-key character class
+ *  (also the shell-safe set) and width to 1–4096, so it can be interpolated into
+ *  the generated bash; anything else is skipped (best-effort — this never blocks). */
+export function resolveVisualAcceptance(
+  payload: Record<string, unknown>,
+  ctx: Record<string, unknown>,
+): { component: string; width: number } | undefined {
+  const SAFE_COMPONENT = /^[A-Za-z0-9._-]{1,100}$/;
+  const fromPayload = payload.acceptance_evidence as Record<string, unknown> | undefined;
+  const fromCtx = ctx.acceptance_evidence as Record<string, unknown> | undefined;
+  let component: string | undefined;
+  let width = NaN;
+  if (fromPayload && typeof fromPayload === 'object' && strVal(fromPayload.kind) === 'visual') {
+    component = strVal(fromPayload.component);
+    width = Number(fromPayload.viewport_width);
+  } else if (fromCtx && typeof fromCtx === 'object' && strVal(fromCtx.kind) === 'visual') {
+    // Context channel (PlanAcceptanceEvidence): descriptor=component, selector=width-string.
+    component = strVal(fromCtx.descriptor);
+    width = Number(strVal(fromCtx.selector));
+  }
+  if (!component || !SAFE_COMPONENT.test(component)) return undefined;
+  if (!Number.isInteger(width) || width < 1 || width > 4096) return undefined;
+  return { component, width };
 }
 
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
@@ -393,6 +473,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const fileTree = buildFileTree(ws);
   let repoMap = buildRepoMap(ws);
+  const providerRunner = getProviderRunner();
 
   // ── Deterministic repo-map holdback arm ──────────────────────────────────
   // A fraction of tasks (configurable via runtime_config.repo_map_holdback_fraction,
@@ -407,16 +488,38 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     : 0.0;
   let repoMapArm: boolean | null = null;
   if (holdbackFraction > 0) {
-    // djb2 hash of the taskId string → stable float in [0, 1)
-    let h = 5381;
-    for (let i = 0; i < taskId.length; i++) {
-      h = ((h << 5) + h + taskId.charCodeAt(i)) >>> 0;
-    }
-    const taskHash = h / 0xffffffff;
+    // djb2 hash of the taskId string -> stable float in [0, 1)
+    const taskHash = stableTaskHashFraction(taskId);
     repoMapArm = taskHash >= holdbackFraction; // true = treatment, false = holdback
     if (!repoMapArm) {
       sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (hash=${taskHash.toFixed(4)}, fraction=${holdbackFraction}) — suppressing repo map\n`);
       repoMap = '';
+    }
+  }
+
+  // ── Deterministic diagnostics-after-edit holdback arm ───────────────────
+  // Claude-Code-only, Blueprint self-repo-only trial. Codex/foreign repos are
+  // capability-not-applicable and intentionally receive no arm or receipt keys.
+  const diagnosticsHoldbackFraction = typeof projectMetaForHoldback?.diagnostics_after_edit_holdback_fraction === 'number'
+    ? projectMetaForHoldback.diagnostics_after_edit_holdback_fraction
+    : 0.0;
+  const diagnosticsEnabled = projectMetaForHoldback?.diagnostics_after_edit_enabled === true;
+  const diagnosticsEligible = providerRunner.provider === 'anthropic' && isBlueprintSelfRepo(owner, repo);
+  let diagnosticsAfterEditArm: boolean | null = null;
+  let hadDiagnosticsAfterEdit: boolean | undefined;
+  if (diagnosticsEligible && diagnosticsHoldbackFraction > 0) {
+    const taskHash = stableTaskHashFraction(taskId);
+    diagnosticsAfterEditArm = taskHash >= diagnosticsHoldbackFraction;
+    if (!diagnosticsAfterEditArm) {
+      sendLog(ws, `[DiagnosticsAfterEdit] holdback arm for task ${taskId} (hash=${taskHash.toFixed(4)}, fraction=${diagnosticsHoldbackFraction}) - not writing Claude hook\n`);
+    } else if (diagnosticsEnabled) {
+      hadDiagnosticsAfterEdit = writeDiagnosticsAfterEditHook();
+      if (!hadDiagnosticsAfterEdit) {
+        sendLog(ws, '[DiagnosticsAfterEdit] hook materialization failed; continuing without post-edit diagnostics\n');
+      }
+    } else {
+      hadDiagnosticsAfterEdit = false;
+      sendLog(ws, '[DiagnosticsAfterEdit] treatment arm assigned but kill switch is disabled; continuing without post-edit diagnostics\n');
     }
   }
 
@@ -626,7 +729,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
   });
 
-  statusRef.value = `Running ${getProviderRunner().displayName}...`;
+  statusRef.value = `Running ${providerRunner.displayName}...`;
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before Claude starts so short code-change tasks persist the
   // fingerprint even if they finish before the next periodic heartbeat.
@@ -637,9 +740,18 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     ...(promptSectionFlags?.hadModuleInterfaces !== undefined && { had_module_interfaces: promptSectionFlags.hadModuleInterfaces }),
     ...(promptSectionFlags?.hadRelatedTests !== undefined && { had_related_tests: promptSectionFlags.hadRelatedTests }),
     ...(promptSectionFlags?.hadAffectedConsumers !== undefined && { had_affected_consumers: promptSectionFlags.hadAffectedConsumers }),
+    ...(promptSectionFlags?.moduleInterfacesArm !== undefined && { module_interfaces_arm: promptSectionFlags.moduleInterfacesArm }),
+    ...(promptSectionFlags?.relatedTestsArm !== undefined && { related_tests_arm: promptSectionFlags.relatedTestsArm }),
+    ...(promptSectionFlags?.affectedConsumersArm !== undefined && { affected_consumers_arm: promptSectionFlags.affectedConsumersArm }),
   };
   if (repoMapArm !== null) {
     _heartbeatOpts.repo_map_arm = repoMapArm;
+  }
+  if (diagnosticsAfterEditArm !== null) {
+    _heartbeatOpts.diagnostics_after_edit_arm = diagnosticsAfterEditArm;
+  }
+  if (hadDiagnosticsAfterEdit !== undefined) {
+    _heartbeatOpts.had_diagnostics_after_edit = hadDiagnosticsAfterEdit;
   }
   sendHeartbeatSync(taskId, statusRef.value, _heartbeatOpts);
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
@@ -669,6 +781,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     analysisContext,
     regressingCategories: reasoningGateCats.length > 0 ? reasoningGateCats : undefined,
     buildConfig,
+    visualAcceptance: resolveVisualAcceptance(payload, ctx),
   });
 
   // Fresh reviewer pass: read-only second session to catch what the implementing
@@ -870,16 +983,35 @@ export async function handleCreate(
     return;
   }
 
-  const createBuildConfig = resolveBuildConfig(task);
-  const relatedTestContext = discoverRelatedTests(ws, relatedFiles, createBuildConfig);
   const createScope = taskCtx?.scope as string | undefined;
   const isMediumOrLargeScope = createScope === 'medium' || createScope === 'large';
-  const moduleInterfaceContext = isMediumOrLargeScope
-    ? extractModuleInterfaces(ws, relatedFiles)
-    : '';
-  const affectedConsumersContext = isMediumOrLargeScope
-    ? discoverAffectedConsumers(ws, relatedFiles)
-    : '';
+  const createProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
+  const moduleInterfacesFraction = holdbackFraction(createProjectMeta, 'module_interfaces');
+  const relatedTestsFraction = holdbackFraction(createProjectMeta, 'related_tests');
+  const affectedConsumersFraction = holdbackFraction(createProjectMeta, 'affected_consumers');
+  const moduleInterfacesArm = isMediumOrLargeScope
+    ? assignCapabilityHoldbackArm(taskId, 'module_interfaces', moduleInterfacesFraction)
+    : undefined;
+  const relatedTestsArm = assignCapabilityHoldbackArm(taskId, 'related_tests', relatedTestsFraction);
+  const affectedConsumersArm = isMediumOrLargeScope
+    ? assignCapabilityHoldbackArm(taskId, 'affected_consumers', affectedConsumersFraction)
+    : undefined;
+
+  const createBuildConfig = resolveBuildConfig(task);
+  const relatedTestContext = relatedTestsArm === false
+    ? ''
+    : discoverRelatedTests(ws, relatedFiles, createBuildConfig);
+  let moduleInterfaceContext = '';
+  if (isMediumOrLargeScope && moduleInterfacesArm !== false) {
+    moduleInterfaceContext = extractModuleInterfaces(ws, relatedFiles);
+  }
+  let affectedConsumersContext = '';
+  if (isMediumOrLargeScope && affectedConsumersArm !== false) {
+    affectedConsumersContext = discoverAffectedConsumers(ws, relatedFiles);
+  }
+  if (moduleInterfacesArm === false) logCapabilityHoldback(ws, taskId, 'module_interfaces', moduleInterfacesFraction);
+  if (relatedTestsArm === false) logCapabilityHoldback(ws, taskId, 'related_tests', relatedTestsFraction);
+  if (affectedConsumersArm === false) logCapabilityHoldback(ws, taskId, 'affected_consumers', affectedConsumersFraction);
   const mediumScopePlanningNote = isMediumOrLargeScope
     ? '\n\n## Pre-Execution Planning\n\nBefore writing any code: (1) Identify which files need to change and why. (2) Consider dependency order — make foundational changes first (e.g., models before services, shared types before consumers). (3) Run the relevant test suite to establish a baseline. (4) Execute changes methodically, verifying each step builds/compiles before moving on.\n'
     : '';
@@ -906,9 +1038,12 @@ export async function handleCreate(
     relatedFiles,
     runMigrationCheck: true,
     promptSectionFlags: {
-      hadModuleInterfaces: moduleInterfaceContext !== '',
+      hadModuleInterfaces: isMediumOrLargeScope ? moduleInterfaceContext !== '' : undefined,
       hadRelatedTests: relatedTestContext !== '',
-      hadAffectedConsumers: affectedConsumersContext !== '',
+      hadAffectedConsumers: isMediumOrLargeScope ? affectedConsumersContext !== '' : undefined,
+      moduleInterfacesArm,
+      relatedTestsArm,
+      affectedConsumersArm,
     },
   });
 }
@@ -953,15 +1088,35 @@ export async function handleRefactor(
     ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
     []
   );
-  const refactorBuildConfig = resolveBuildConfig(task);
-  const refactorRelatedTestContext = discoverRelatedTests(ws, refactorRelatedFiles, refactorBuildConfig);
   const refactorScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
-  const refactorModuleInterfaceContext = (refactorScope === 'medium' || refactorScope === 'large')
-    ? extractModuleInterfaces(ws, refactorRelatedFiles)
-    : '';
-  const refactorAffectedConsumersContext = (refactorScope === 'medium' || refactorScope === 'large')
-    ? discoverAffectedConsumers(ws, refactorRelatedFiles)
-    : '';
+  const refactorIsMediumOrLargeScope = refactorScope === 'medium' || refactorScope === 'large';
+  const refactorProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
+  const refactorModuleInterfacesFraction = holdbackFraction(refactorProjectMeta, 'module_interfaces');
+  const refactorRelatedTestsFraction = holdbackFraction(refactorProjectMeta, 'related_tests');
+  const refactorAffectedConsumersFraction = holdbackFraction(refactorProjectMeta, 'affected_consumers');
+  const refactorModuleInterfacesArm = refactorIsMediumOrLargeScope
+    ? assignCapabilityHoldbackArm(taskId, 'module_interfaces', refactorModuleInterfacesFraction)
+    : undefined;
+  const refactorRelatedTestsArm = assignCapabilityHoldbackArm(taskId, 'related_tests', refactorRelatedTestsFraction);
+  const refactorAffectedConsumersArm = refactorIsMediumOrLargeScope
+    ? assignCapabilityHoldbackArm(taskId, 'affected_consumers', refactorAffectedConsumersFraction)
+    : undefined;
+
+  const refactorBuildConfig = resolveBuildConfig(task);
+  const refactorRelatedTestContext = refactorRelatedTestsArm === false
+    ? ''
+    : discoverRelatedTests(ws, refactorRelatedFiles, refactorBuildConfig);
+  let refactorModuleInterfaceContext = '';
+  if (refactorIsMediumOrLargeScope && refactorModuleInterfacesArm !== false) {
+    refactorModuleInterfaceContext = extractModuleInterfaces(ws, refactorRelatedFiles);
+  }
+  let refactorAffectedConsumersContext = '';
+  if (refactorIsMediumOrLargeScope && refactorAffectedConsumersArm !== false) {
+    refactorAffectedConsumersContext = discoverAffectedConsumers(ws, refactorRelatedFiles);
+  }
+  if (refactorModuleInterfacesArm === false) logCapabilityHoldback(ws, taskId, 'module_interfaces', refactorModuleInterfacesFraction);
+  if (refactorRelatedTestsArm === false) logCapabilityHoldback(ws, taskId, 'related_tests', refactorRelatedTestsFraction);
+  if (refactorAffectedConsumersArm === false) logCapabilityHoldback(ws, taskId, 'affected_consumers', refactorAffectedConsumersFraction);
   const refactorBudget = refactorScope ? SCOPE_OVERFLOW_THRESHOLDS[refactorScope] : undefined;
   const refactorScopeBudgetNote = refactorBudget
     ? `\n\n## Scope File Budget\n\nYour scope budget allows at most ${refactorBudget} non-test production files. If your changes would exceed this, focus on the single most critical subset and note what was deferred.\n`
@@ -972,9 +1127,12 @@ export async function handleRefactor(
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     promptSectionFlags: {
-      hadModuleInterfaces: refactorModuleInterfaceContext !== '',
+      hadModuleInterfaces: refactorIsMediumOrLargeScope ? refactorModuleInterfaceContext !== '' : undefined,
       hadRelatedTests: refactorRelatedTestContext !== '',
-      hadAffectedConsumers: refactorAffectedConsumersContext !== '',
+      hadAffectedConsumers: refactorIsMediumOrLargeScope ? refactorAffectedConsumersContext !== '' : undefined,
+      moduleInterfacesArm: refactorModuleInterfacesArm,
+      relatedTestsArm: refactorRelatedTestsArm,
+      affectedConsumersArm: refactorAffectedConsumersArm,
     },
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
       `${contextPrefix}${refactorModuleInterfaceContext}${refactorAffectedConsumersContext}${refactorRelatedTestContext}${refactorOverlapWarningText}${refactorScopeBudgetNote}REFACTOR TASK — STRICT CONSTRAINTS:

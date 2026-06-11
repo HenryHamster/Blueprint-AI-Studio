@@ -70,6 +70,16 @@ export interface PrepareWorkspaceOptions {
    * present. Shallow (depth > 0) requests never trigger the unshallow.
    */
   depth?: number;
+  /**
+   * Review-fix lane pilot, gate-integrity guard. Lane warm-resume
+   * (hard-reset to BLUEPRINT_LANE_CHECKPOINT_SHA) lane-izes ONLY the FIX
+   * side of the review loop. A reviewer/auditor must NEVER resume onto the
+   * implementer's lane workspace — that would destroy review independence.
+   * Defaults to `true` (env-driven, unchanged behavior); the review/audit
+   * handlers pass `false` to hard-disable lane reset regardless of any env
+   * the backend should never have set on a cold claim. Defense in depth.
+   */
+  allowLaneResume?: boolean;
 }
 
 /**
@@ -151,9 +161,28 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
           encoding: 'utf-8', timeout: 30_000,
         });
       }
-      execFileSync('git', ['-C', workspace, 'reset', '--hard', `origin/${branch}`], {
-        encoding: 'utf-8', timeout: 30_000,
-      });
+      // Lane workspace-mode: treat the checkpoint SHA as source of truth rather
+      // than resetting to origin/<branch>. The checkpoint is the last verified
+      // commit; origin/<branch> may be ahead (another phase pushed). Any mismatch
+      // (external push, leftover residue, divergent HEAD) is fixed by hard-reset to
+      // the checkpoint SHA. If the SHA is unreachable (force-push or orphaned ref)
+      // the reset throws and the outer catch falls back to a full cold clone.
+      // allowLaneResume defaults true (env-driven). A reviewer/auditor passes
+      // false so lane reset can never engage even if a lane env leaked onto a
+      // cold claim — the cold, independent review path is non-negotiable.
+      const allowLaneResume = opts.allowLaneResume !== false;
+      const laneMode = allowLaneResume && process.env.BLUEPRINT_LANE_MODE === '1';
+      const laneCheckpointSha = laneMode ? (process.env.BLUEPRINT_LANE_CHECKPOINT_SHA ?? '') : '';
+      if (laneMode && laneCheckpointSha) {
+        execFileSync('git', ['-C', workspace, 'reset', '--hard', laneCheckpointSha], {
+          encoding: 'utf-8', timeout: 30_000,
+        });
+        log(`prepareWorkspaceForRole: lane-mode reset to checkpoint ${laneCheckpointSha} (branch=${branch})`);
+      } else {
+        execFileSync('git', ['-C', workspace, 'reset', '--hard', `origin/${branch}`], {
+          encoding: 'utf-8', timeout: 30_000,
+        });
+      }
       execFileSync(
         'git',
         [

@@ -18,7 +18,7 @@ const STATUS_STALE_AFTER_SECONDS = 90;
 // How often the component re-renders purely to re-evaluate staleness. A stalled
 // poll loop produces no re-render on its own, so without this tick the stale
 // flag would never flip until the next successful fetch. Clears naturally when
-// fetchStatus sets a fresh lastUpdated.
+// fetchSummary sets a fresh lastUpdated.
 const STALE_TICK_MS = 15_000;
 
 // Tailwind classes applied when the reading is stale — desaturate + dim (same
@@ -686,8 +686,16 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
   // loop has stalled (no fetch -> no re-render of its own).
   const [, setStaleTick] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
+  // Ref so fetchDebug can access the current project list without becoming a
+  // dep of the poller (avoids re-subscribing on every projects state update).
+  const projectsRef = useRef<ProjectAutonomousStatus[]>([]);
+  // Ref so the WS handler can check whether the panel is open without
+  // capturing a stale closure over `expanded`.
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
 
-  const fetchStatus = useCallback(async () => {
+  // Lightweight summary fetch — always runs at the default cadence.
+  const fetchSummary = useCallback(async () => {
     try {
       const headers = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/autonomous-status`, {
@@ -697,9 +705,19 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
       const data = await res.json();
       const fetched: ProjectAutonomousStatus[] = data.projects || [];
       setProjects(fetched);
+      projectsRef.current = fetched;
+      setLastUpdated(new Date());
+    } catch {
+      // silent
+    }
+  }, []);
 
-      // Fetch both autonomy-debug and strategic-debug for each project in parallel.
-      // Results are interleaved then split back into two maps by project_id.
+  // Per-project debug fetch — only runs when the dropdown is expanded (N×2
+  // HTTP calls per tick, one autonomy-debug + one strategic-debug per project).
+  const fetchDebug = useCallback(async () => {
+    const fetched = projectsRef.current;
+    if (fetched.length === 0) return;
+    try {
       const settled = await Promise.allSettled(
         fetched.flatMap(p => [
           apiFetch(`/api/admin/projects/${p.project_id}/autonomy-debug`)
@@ -722,13 +740,17 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
       }
       setDebugData(newAutonomy);
       setStrategicData(newStrategic);
-      setLastUpdated(new Date());
     } catch {
       // silent
     }
   }, []);
 
-  usePoller(fetchStatus, { intervalMs: DEFAULT_POLL_MS, deps: [fetchStatus] });
+  // Summary always polls at the default cadence regardless of panel state.
+  usePoller(fetchSummary, { intervalMs: DEFAULT_POLL_MS, deps: [fetchSummary] });
+  // Debug data is only fetched when the panel is open; the leading call fires
+  // immediately on expand so the operator sees data without waiting for the
+  // next 60s tick.
+  usePoller(fetchDebug, { intervalMs: 60_000, enabled: expanded, deps: [fetchDebug, expanded] });
 
   // Keep the staleness flag honest even when the poll loop has gone quiet: a
   // stalled/paused poll produces no re-render, so without this the indicator
@@ -759,7 +781,8 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
       try {
         const msg = JSON.parse(event.data);
         if (msg.event === 'autonomous_activity' || msg.event === 'autonomous_paused') {
-          fetchStatus();
+          fetchSummary();
+          if (expandedRef.current) fetchDebug();
         }
       } catch {
         // ignore parse errors
@@ -780,14 +803,15 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
       clearInterval(interval);
       if (attachedWs) attachedWs.removeEventListener('message', handleMessage);
     };
-  }, [wsRef, fetchStatus]);
+  }, [wsRef, fetchSummary, fetchDebug]);
 
   const resetCircuitBreaker = async (projectId: string) => {
     setResettingBreaker(projectId);
     try {
       const res = await apiFetch(`/api/admin/projects/${projectId}/circuit-breaker/reset`, { method: 'POST' });
       if (res.ok) {
-        await fetchStatus();
+        await fetchSummary();
+        await fetchDebug();
       }
     } catch {
       // silent
@@ -805,7 +829,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
         headers: { ...headers, 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
       });
-      await fetchStatus();
+      await fetchSummary();
       onRefreshTasks?.();
     } catch {
       // silent
@@ -882,7 +906,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                   {stale && ' · stale'}
                 </span>
               )}
-              <button onClick={fetchStatus} className="text-neutral-500 hover:text-neutral-300 transition-colors">
+              <button onClick={() => { fetchSummary(); fetchDebug(); }} className="text-neutral-500 hover:text-neutral-300 transition-colors">
                 <RefreshCw className="w-3 h-3" />
               </button>
             </span>

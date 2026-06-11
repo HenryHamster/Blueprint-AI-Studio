@@ -103,7 +103,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
   const fetchCostData = useCallback(async () => {
     try {
-      const res = await apiFetch('/api/admin/digest?hours=1');
+      const res = await apiFetch('/api/admin/digest?hours=24');
       if (res.ok) {
         const data = await res.json();
         if (data?.daily_cost_usd != null) setDailyCostUsd(data.daily_cost_usd);

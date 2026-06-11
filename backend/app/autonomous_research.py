@@ -66,6 +66,7 @@ from app.capability_registry import (
     registry_capability_names,
     registry_capability_vocabulary,
 )
+from app.direction_refractory import get_direction_refractory_info
 from app.resource_envelope import (
     get_project_recent_spend_usd,
     resolve_project_spend_ceiling,
@@ -108,13 +109,9 @@ def project_parallelism_cap(
 
 def _direction_in_refractory(d: dict, now: datetime) -> bool:
     """Return True if the direction's refractory_until window is still active."""
-    refractory_until = d.get("refractory_until")
-    if not refractory_until:
-        return False
-    try:
-        return datetime.fromisoformat(refractory_until) > now
-    except (ValueError, TypeError):
-        return False
+    refractory_info = get_direction_refractory_info(d, now=now)
+    remaining = refractory_info["refractory_remaining_minutes"]
+    return bool(remaining is not None and remaining > 0)
 
 
 async def _project_spend_ceiling_spawn_defer_reason(

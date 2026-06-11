@@ -1,0 +1,188 @@
+import { useState, useEffect, useCallback } from 'react';
+import { apiFetch, type LaneDiagResponse, type LaneWasteTaxonomy, type PerPrPhaseRow } from '../api';
+
+const WASTE_CATEGORIES: { key: keyof LaneWasteTaxonomy; label: string; color: string }[] = [
+  { key: 'infra', label: 'Infra', color: 'bg-red-500' },
+  { key: 'merge_conflict', label: 'Merge Conflict', color: 'bg-orange-500' },
+  { key: 'ci_churn', label: 'CI Churn', color: 'bg-yellow-500' },
+  { key: 'review_ambiguity', label: 'Review Ambiguity', color: 'bg-blue-500' },
+  { key: 'lost_reasoning', label: 'Lost Reasoning', color: 'bg-purple-500' },
+  { key: 'unknown', label: 'Unknown', color: 'bg-neutral-500' },
+];
+
+function fmt(s: number): string {
+  if (s >= 3600) return `${(s / 3600).toFixed(1)}h`;
+  if (s >= 60) return `${Math.round(s / 60)}m`;
+  return `${Math.round(s)}s`;
+}
+
+function WasteTaxonomyTable({ taxonomy }: { taxonomy: LaneWasteTaxonomy }) {
+  const total = Object.values(taxonomy).reduce((a, b) => a + b, 0);
+  if (total === 0) return <p className="text-xs text-neutral-500">No waste data available.</p>;
+
+  return (
+    <div className="space-y-1">
+      {WASTE_CATEGORIES.map(({ key, label, color }) => {
+        const count = taxonomy[key] ?? 0;
+        const pct = total > 0 ? (count / total) * 100 : 0;
+        return (
+          <div key={key} className="flex items-center gap-2 text-xs">
+            <span className="w-32 text-neutral-300 shrink-0">{label}</span>
+            <div className="flex-1 bg-neutral-800 rounded h-2 overflow-hidden">
+              <div className={`${color} h-full rounded`} style={{ width: `${pct}%` }} />
+            </div>
+            <span className="w-8 text-right text-neutral-400">{count}</span>
+            <span className="w-10 text-right text-neutral-500">{pct.toFixed(0)}%</span>
+          </div>
+        );
+      })}
+      <p className="text-xs text-neutral-500 pt-1">Total waste tasks: {total}</p>
+    </div>
+  );
+}
+
+function RelayCountsTable({ counts }: { counts: Record<string, number> }) {
+  const entries = Object.entries(counts).filter(([, v]) => v > 0);
+  if (entries.length === 0) return <p className="text-xs text-neutral-500">No relay data available.</p>;
+
+  return (
+    <table className="w-full text-xs">
+      <thead>
+        <tr className="text-neutral-500 border-b border-neutral-800">
+          <th className="text-left py-1 font-normal">Lane</th>
+          <th className="text-right py-1 font-normal">Fix Relays</th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.sort(([, a], [, b]) => b - a).map(([lane, count]) => (
+          <tr key={lane} className="border-b border-neutral-800/50">
+            <td className="py-1 text-neutral-300 font-mono">{lane}</td>
+            <td className="py-1 text-right text-neutral-200">{count}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function PhaseBreakdownTable({ rows, truncated }: { rows: PerPrPhaseRow[]; truncated: boolean }) {
+  if (rows.length === 0) return <p className="text-xs text-neutral-500">No phase breakdown data available.</p>;
+
+  return (
+    <div className="overflow-x-auto" data-viewport-allow-overflow data-viewport-allow-truncation>
+      {/* eslint-disable-next-line viewport/no-fixed-width */}
+      <table className="w-full text-xs min-w-[640px]">
+        <thead>
+          <tr className="text-neutral-500 border-b border-neutral-800">
+            <th className="text-left py-1 font-normal">PR</th>
+            <th className="text-right py-1 font-normal">Tasks</th>
+            <th className="text-right py-1 font-normal">Review</th>
+            <th className="text-right py-1 font-normal">Fix</th>
+            <th className="text-right py-1 font-normal">Queue</th>
+            <th className="text-right py-1 font-normal">Provision</th>
+            <th className="text-right py-1 font-normal">Gap</th>
+            <th className="text-right py-1 font-normal">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.pr_number} className="border-b border-neutral-800/50 hover:bg-neutral-800/30">
+              <td className="py-1 text-neutral-300 font-mono">#{row.pr_number}</td>
+              <td className="py-1 text-right text-neutral-400">{row.task_count}</td>
+              <td className="py-1 text-right text-neutral-300">{fmt(row.review_seconds)}</td>
+              <td className="py-1 text-right text-neutral-300">{fmt(row.fix_seconds)}</td>
+              <td className="py-1 text-right text-neutral-400">{fmt(row.queue_seconds)}</td>
+              <td className="py-1 text-right text-neutral-400">{fmt(row.provision_seconds)}</td>
+              <td className="py-1 text-right text-neutral-400">{fmt(row.gap_seconds)}</td>
+              <td className="py-1 text-right text-neutral-200 font-medium">{fmt(row.total_seconds)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {truncated && (
+        <p className="text-xs text-neutral-500 pt-1">Showing top {rows.length} PRs by total time.</p>
+      )}
+    </div>
+  );
+}
+
+interface LaneDiagPanelProps {
+  projectId?: string;
+}
+
+export function LaneDiagPanel({ projectId }: LaneDiagPanelProps) {
+  const [data, setData] = useState<LaneDiagResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      if (projectId) params.set('project_id', projectId);
+      const query = params.toString() ? `?${params.toString()}` : '';
+      const res = await apiFetch(`/api/admin/lane-diag${query}`, undefined, 2, 30000);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json() as LaneDiagResponse;
+      setData(json);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load lane diagnostics');
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  if (loading) {
+    return <p className="text-xs text-neutral-500">Loading lane diagnostics…</p>;
+  }
+
+  if (error) {
+    return <p className="text-xs text-red-400">Error: {error}</p>;
+  }
+
+  if (!data) return null;
+
+  const windowLabel = data.version
+    ? `v${data.version.version_number}`
+    : data.window_days != null
+      ? `${data.window_days}d window`
+      : 'rolling window';
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center gap-2 text-xs text-neutral-500">
+        <span>{data.pr_count} PRs · {data.task_count} tasks · {windowLabel}</span>
+        {data.truncated && <span className="text-amber-400">(truncated)</span>}
+      </div>
+
+      <div>
+        <h4 className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">
+          Waste Taxonomy
+        </h4>
+        <WasteTaxonomyTable taxonomy={data.lane_waste.waste_taxonomy} />
+      </div>
+
+      <div>
+        <h4 className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">
+          Relay Counts by Lane
+        </h4>
+        <RelayCountsTable counts={data.relay_counts_by_lane} />
+      </div>
+
+      <div>
+        <h4 className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">
+          Per-PR Phase Breakdown
+        </h4>
+        <PhaseBreakdownTable
+          rows={data.per_pr_phase_breakdown}
+          truncated={data.pr_breakdown_truncated}
+        />
+      </div>
+    </div>
+  );
+}

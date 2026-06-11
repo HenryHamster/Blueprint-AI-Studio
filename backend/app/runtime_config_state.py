@@ -641,6 +641,19 @@ runtime_config: Dict = {
     # sibling tasks) lands and the flag is flipped. Independently switchable from
     # warm_continuity_enabled / warm_backlog_reuse_enabled.
     "warm_pool_enabled": False,
+    # Master switch for the v10 persistent improvement lane substrate (knowledge
+    # doc 18840e55). Default False so ALL lane code is INERT until the full
+    # substrate lands and the flag is flipped. First enabled mode is SHADOW:
+    # lanes attach to eligible create-chains and checkpoint enforcement runs,
+    # but no workspace reservations and no prompt changes — validating the
+    # checkpoint contract with zero pool impact.
+    "improvement_lanes_enabled": False,
+    # Review-fix lane pilot (knowledge doc 18840e55, pilot/matched-control/kill
+    # sections). Lane-izes ONLY the fix side of the review -> fix -> re-review
+    # loop for the Blueprint self-repo. Requires improvement_lanes_enabled too;
+    # a KILL verdict flips this back to False so every chain degrades to classic.
+    # Default False — fully inert (classic spawn path byte-for-byte unchanged).
+    "review_fix_lane_pilot_enabled": False,
     # Account-agnostic lease: when True, a same-tenant IDLE pool member may be
     # leased for a task whose resolved account (and model) differ from the
     # member's frozen boot account, and the warm-claim path re-materializes the
@@ -725,6 +738,13 @@ runtime_config: Dict = {
     # project (no recent demand, no members) is never seeded. Read by
     # warm_pool_maintainer._demand_active_projects.
     "warm_pool_demand_window_minutes": 30,
+    # TTL (seconds) for a lane-scoped workspace reservation set on pool member
+    # release. A member returned to IDLE with a lane id is held for the matching
+    # lane's next phase for this window; after expiry it becomes generally
+    # claimable by any request. Defaults to 15 min — enough to span the gap
+    # between a phase completing (lane parks) and the next phase being dispatched.
+    # Inert when improvement_lanes_enabled is False.
+    "warm_pool_lane_reservation_ttl_seconds": 900,
     # Circuit-breaker thresholds for POOL-served claims. When pool leases or
     # pool-leased tasks fail (lease/finalize error, a leased VM found tearing
     # down, or a FAILED pool task) more than the threshold within a 1h rolling
@@ -838,6 +858,24 @@ runtime_config: Dict = {
     # gets a durable verdict. Operators can still dial it to 0.0 to disable the
     # trial or override it per deployment via runtime_config_json.
     "repo_map_holdback_fraction": 0.1,
+    # Deterministic holdback fractions for the three newly-assignment-based
+    # capability trials (module_interfaces, related_tests, affected_consumers).
+    # Conservative 0.1 default keeps a small holdback arm alive so trials can
+    # accumulate intent-to-treat evidence. Operators can dial up/down via
+    # runtime_config_json or PATCH /api/admin/settings once adoption signals
+    # are visible in the digest.
+    "module_interfaces_holdback_fraction": 0.1,
+    "related_tests_holdback_fraction": 0.1,
+    "affected_consumers_holdback_fraction": 0.1,
+    # Deterministic holdback fraction for the diagnostics-after-edit trial.
+    # Mirrors repo_map_holdback_fraction semantics: tasks hashed below this
+    # threshold run WITHOUT the post-edit diagnostics hook, populating the
+    # without-arm for intent-to-treat analysis. Default 10% holdback.
+    "diagnostics_after_edit_holdback_fraction": 0.1,
+    # Kill switch for the diagnostics-after-edit capability trial. When False,
+    # the agent must not arm the post-edit diagnostics hook regardless of arm
+    # assignment. Default True (trial active).
+    "diagnostics_after_edit_enabled": True,
 }
 
 # Promotion-policy key set — the rubric controls that live in runtime_config.
@@ -1140,9 +1178,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         int(config_json["strategic_max_interval_minutes"]),
                     )
                 if "strategic_challenge_gate_mode" in config_json:
-                    raw_mode = str(
-                        config_json["strategic_challenge_gate_mode"]
-                    ).strip().lower()
+                    raw_mode = (
+                        str(config_json["strategic_challenge_gate_mode"])
+                        .strip()
+                        .lower()
+                    )
                     if raw_mode in {"observe", "advisory", "enforce"}:
                         _set("strategic_challenge_gate_mode", raw_mode)
                 if "require_approval_gates" in config_json:
@@ -1191,15 +1231,22 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         bool(config_json["review_second_opinion_gate_enabled"]),
                     )
                 if "strategic_retirement_challenge_gate_mode" in config_json:
-                    raw_mode = str(
-                        config_json["strategic_retirement_challenge_gate_mode"] or ""
-                    ).strip().lower()
+                    raw_mode = (
+                        str(
+                            config_json["strategic_retirement_challenge_gate_mode"]
+                            or ""
+                        )
+                        .strip()
+                        .lower()
+                    )
                     if raw_mode in ("observe", "advisory", "enforce"):
                         _set("strategic_retirement_challenge_gate_mode", raw_mode)
                 if "safeguard_challenge_gate_mode" in config_json:
-                    raw_mode = str(
-                        config_json["safeguard_challenge_gate_mode"] or ""
-                    ).strip().lower()
+                    raw_mode = (
+                        str(config_json["safeguard_challenge_gate_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("safeguard_challenge_gate_mode", raw_mode)
                 if "cochange_decomposition_enabled" in config_json:
@@ -1249,6 +1296,16 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                                 {str(t).strip() for t in raw_types if str(t).strip()}
                             ),
                         )
+                if "improvement_lanes_enabled" in config_json:
+                    _set(
+                        "improvement_lanes_enabled",
+                        bool(config_json["improvement_lanes_enabled"]),
+                    )
+                if "review_fix_lane_pilot_enabled" in config_json:
+                    _set(
+                        "review_fix_lane_pilot_enabled",
+                        bool(config_json["review_fix_lane_pilot_enabled"]),
+                    )
                 if "warm_pool_enabled" in config_json:
                     _set(
                         "warm_pool_enabled",
@@ -1262,9 +1319,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                 if "warm_pool_cross_provider_retarget_enabled" in config_json:
                     _set(
                         "warm_pool_cross_provider_retarget_enabled",
-                        bool(
-                            config_json["warm_pool_cross_provider_retarget_enabled"]
-                        ),
+                        bool(config_json["warm_pool_cross_provider_retarget_enabled"]),
                     )
                 if "warm_pool_project_allowlist" in config_json:
                     # Persisted per-project enablement scope. Normalize to a
@@ -1301,9 +1356,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                             except (TypeError, ValueError):
                                 continue
                             normalized_targets[sid] = max(0, min(50, ival))
-                        _set(
-                            "warm_pool_target_size_by_project", normalized_targets
-                        )
+                        _set("warm_pool_target_size_by_project", normalized_targets)
                 if "max_concurrent_tasks_by_project" in config_json:
                     # Persisted per-project concurrent-VM cap. Normalize to a map of
                     # trimmed, non-empty string project-id keys to ints clamped to
@@ -1346,6 +1399,26 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                             "max_concurrent_compute_jobs_by_project",
                             normalized_job_caps,
                         )
+                for key in (
+                    "direction_refractory_minutes",
+                    "direction_saturation_refractory_minutes",
+                ):
+                    if key in config_json:
+                        raw_val = config_json[key]
+                        if raw_val is None:
+                            if key in runtime_config:
+                                runtime_config.pop(key, None)
+                                changed.append(key)
+                            continue
+                        try:
+                            _set(key, int(raw_val))
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                f"[CONFIG-SYNC] Ignoring invalid {key} value: {raw_val!r}"
+                            )
+                    elif key in runtime_config:
+                        runtime_config.pop(key, None)
+                        changed.append(key)
                 for int_key in (
                     "max_provision_retries",
                     "max_rollup_retries",
@@ -1396,6 +1469,10 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "direction_churn_min_merge_rate",
                     "direction_lifetime_min_merge_rate",
                     "repo_map_holdback_fraction",
+                    "module_interfaces_holdback_fraction",
+                    "related_tests_holdback_fraction",
+                    "affected_consumers_holdback_fraction",
+                    "diagnostics_after_edit_holdback_fraction",
                 ):
                     if float_key in config_json:
                         _set(float_key, float(config_json[float_key]))
@@ -1413,6 +1490,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "smoketest_enabled",
                         bool(config_json["smoketest_enabled"]),
+                    )
+                if "diagnostics_after_edit_enabled" in config_json:
+                    _set(
+                        "diagnostics_after_edit_enabled",
+                        bool(config_json["diagnostics_after_edit_enabled"]),
                     )
                 if "promotion_enabled_by_project" in config_json:
                     # Persisted per-project live-promotion overrides. Normalize to
@@ -1580,3 +1662,26 @@ def resolve_project_compute_job_concurrency_cap(project_id) -> int | None:
     except (TypeError, ValueError):
         return None
     return ival if ival > 0 else None
+
+
+def is_improvement_lanes_enabled() -> bool:
+    """Return True when the v10 persistent improvement lane substrate is active.
+
+    Default False (master kill-switch). When False, all lane code is INERT and
+    no existing code path changes. Mirrors ``warm_pool_enabled`` gating style.
+    """
+    return bool(runtime_config.get("improvement_lanes_enabled", False))
+
+
+def is_review_fix_lane_pilot_enabled() -> bool:
+    """Return True when the review-fix lane pilot is active.
+
+    Requires BOTH the substrate master switch (``improvement_lanes_enabled``)
+    and the pilot flag (``review_fix_lane_pilot_enabled``). A KILL verdict flips
+    the pilot flag to False, degrading every chain to classic spawning. Mirrors
+    the canonical gate in ``app.review_fix_lane_pilot`` so callers that only
+    need the flag check can avoid importing the pilot module.
+    """
+    if not is_improvement_lanes_enabled():
+        return False
+    return bool(runtime_config.get("review_fix_lane_pilot_enabled", False))

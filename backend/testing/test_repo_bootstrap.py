@@ -468,6 +468,87 @@ class TestRepoBootstrapCompletionStamp:
             "Existing bootstrap_completed_at must not be overwritten"
         )
 
+    @pytest.mark.asyncio
+    async def test_bootstrap_completion_stamps_task_completed_at(self, db_session):
+        """_handle_repo_bootstrap_completion stamps task.completed_at when null.
+
+        repo_bootstrap tasks reach COMPLETED status via the agent status path but
+        that path never stamped task.completed_at, leaving rows with
+        status=COMPLETED and completed_at=null. The completion handler must stamp it.
+        """
+        import json as _json
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project = Project(
+            name="acme/task-completed-at",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="task-completed-at",
+            build_config={"language": "python"},
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/task-completed-at",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        assert bootstrap_task.completed_at is None, "Pre-condition: no completed_at yet"
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(bootstrap_task)
+
+        overview_logs = _json.dumps({
+            "tech_stack": "Python, FastAPI",
+            "directory_layout": "backend/ — FastAPI app",
+            "first_steps_summary": "pytest",
+        })
+        await _handle_repo_bootstrap_completion(bootstrap_task, overview_logs, db_session)
+        await db_session.refresh(bootstrap_task)
+
+        assert bootstrap_task.completed_at is not None, (
+            "task.completed_at must be stamped by _handle_repo_bootstrap_completion"
+        )
+
+
+class TestBootstrapSpawnAdvisoryLock:
+    """Tests for the advisory lock that prevents double-spawn in _sweep_bootstrap_recovery."""
+
+    @pytest.mark.asyncio
+    async def test_advisory_lock_key_is_stable_across_calls(self):
+        """Bootstrap spawn advisory lock key is deterministic — same project_id
+        always yields the same key (uses SHA-256, not salted Python hash)."""
+        # app.services must be imported first to prime the circular import chain
+        # (recovery_sweeps → services → recovery_sweeps). Without this, importing
+        # recovery_sweeps directly in a test that doesn't go through app.main would
+        # hit a partially-initialized module error.
+        import app.services  # noqa: F401
+        from app.recovery_sweeps import _bootstrap_spawn_lock_key
+
+        project_id = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+        key1 = _bootstrap_spawn_lock_key(project_id)
+        key2 = _bootstrap_spawn_lock_key(project_id)
+        assert key1 == key2, "Lock key must be deterministic"
+        assert 0 <= key1 < 2**31, "Lock key must be a valid 31-bit Postgres advisory lock key"
+
+    @pytest.mark.asyncio
+    async def test_advisory_lock_keys_differ_per_project(self):
+        """Different project ids produce different advisory lock keys."""
+        import app.services  # noqa: F401  — prime circular import chain (see above)
+        from app.recovery_sweeps import _bootstrap_spawn_lock_key
+
+        key_a = _bootstrap_spawn_lock_key("aaaabbbb-cccc-dddd-eeee-ffffffffffff")
+        key_b = _bootstrap_spawn_lock_key("11112222-3333-4444-5555-666677778888")
+        assert key_a != key_b, "Different projects must get different advisory lock keys"
+
 
 class TestRepoBootstrapDesignDocPersistence:
     """Tests for design_doc persistence via the completion handler."""

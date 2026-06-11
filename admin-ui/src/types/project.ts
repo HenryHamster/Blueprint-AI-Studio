@@ -6,6 +6,9 @@ export interface Direction {
   status: 'active' | 'completed' | 'paused' | 'proposed';
   paths?: string[];
   last_researched_at?: string | null;
+  refractory_until?: string | null;
+  refractory_reason?: 'standard' | 'saturation' | null;
+  refractory_remaining_minutes?: number | null;
   proposed_by?: string;
   proposal_rationale?: string;
   proposed_at?: string;
@@ -161,17 +164,37 @@ export interface CapabilityProofSummary {
 }
 
 export interface CapabilityAdoptionVerdict {
-  verdict?: 'adopt' | 'reject' | 'continue-trial';
+  verdict?: 'adopt' | 'reject' | 'continue-trial' | 'ADOPT' | 'KILL' | 'CONTINUE';
   lift?: number | null;
   n_with?: number;
   n_without?: number;
+  n_lane?: number;
+  n_control?: number;
+  lane_merge_rate?: number | null;
+  control_merge_rate?: number | null;
+  lane_cost_per_merged?: number | null;
+  control_cost_per_merged?: number | null;
+  gate_integrity_violations?: number;
+  checkpoint_loss_rate?: number | null;
+  immediate_alert?: boolean;
   window_hours?: number | null;
   evaluated_at?: string;
   thresholds?: {
     min_n_per_arm?: number;
     adopt_lift?: number;
     reject_lift?: number;
+    futility_n?: number;
+    min_n?: number;
+    kill_merge_rate_floor?: number;
+    kill_cost_ceiling?: number;
+    kill_gate_violations_max?: number;
+    kill_checkpoint_loss_ceiling?: number;
+    adopt_merge_lift_floor?: number;
+    adopt_cost_improvement?: number;
   };
+  verdict_reason?: string;
+  accumulation_basis?: string;
+  arm_composition?: { with_assigned?: number; with_receipt?: number; without_assigned?: number; without_receipt?: number };
 }
 
 export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig {

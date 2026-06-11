@@ -433,9 +433,10 @@ export async function runThinkerWithGate(
         'Your previous analysis output is reproduced verbatim below.',
         'Find the problem_model JSON in it and output ONLY that JSON object now — no markdown, no explanation, no code fences.',
         'Do NOT use placeholder or template values. Extract the real content from the analysis below.',
+        'CRITICAL: Do NOT blank operator-owned fields. If intent.purpose, intent.user_purpose, or constraints appear in the prior analysis with real content, preserve them exactly — do not substitute schema template text, "...", or empty values.',
         `Write the JSON for ${problemModelPath}.`,
-        'Schema reminder:',
-        '{"intent":{"purpose":"...","current_focus":"..."},"context":{},"constraints":[],"capabilities":[],"gaps":[],"archived_gaps":[],"friction":[],"pending_user_confirmation":[],"revision_log":[],"rejected_agent_edits":[]}',
+        'Schema reminder (use this for structure only — fill with REAL values from the analysis, not these placeholders):',
+        '{"intent":{"purpose":"<from analysis>","current_focus":"<from analysis>","user_purpose":"<from analysis>"},"context":{},"constraints":[],"capabilities":[],"gaps":[],"archived_gaps":[],"friction":[],"pending_user_confirmation":[],"revision_log":[],"rejected_agent_edits":[]}',
         '',
         '===== YOUR PREVIOUS ANALYSIS OUTPUT (verbatim) =====',
         priorAnalysis,
@@ -450,11 +451,28 @@ export async function runThinkerWithGate(
       retryStatus: 'Repairing strategic problem-model JSON...',
     });
     if (problemModelRepair.value !== null) {
-      try {
-        fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelRepair.value, null, 2)}\n`);
-        sendLog(ws, `[INFO] Recovered strategic problem-model JSON via bounded repair and wrote ${problemModelPath}\n`);
-      } catch (e) {
-        sendLog(ws, `[WARNING] Recovered strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
+      // Validate the repaired output is not a schema-template echo — the root cause
+      // of BUG_REPORT 8154c2d3 / PR #7435. A repair session with insufficient context
+      // may echo back the schema reminder text as actual values (e.g. purpose="<from
+      // analysis>" or purpose="..." or empty strings). Detect and discard such outputs
+      // rather than persisting garbage that would later get protected as operator intent.
+      const repairIntent = (problemModelRepair.value as Record<string, unknown>).intent as Record<string, unknown> | undefined; // eslint-disable-line @typescript-eslint/no-unnecessary-type-assertion
+      const repairPurpose = typeof repairIntent?.purpose === 'string' ? repairIntent.purpose.trim() : '';
+      // Placeholder detection: reject empty-string purpose, '...', or an entire
+      // XML/schema-tag value like '<from analysis>' (angle-bracket wraps the whole
+      // string).  A legitimate purpose that merely starts with '<' (e.g. "<Your
+      // startup here>") would be caught by startsWith — use the full-tag regex
+      // instead so real purposes aren't silently discarded.
+      const isSchemaPlaceholder = repairPurpose === '' || repairPurpose === '...' || /^<[^>]+>$/.test(repairPurpose);
+      if (isSchemaPlaceholder) {
+        sendLog(ws, `[WARNING] Repair produced blank/schema-template placeholder in intent.purpose ("${repairPurpose}") — discarding repair output to prevent operator-intent clobber\n`);
+      } else {
+        try {
+          fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelRepair.value, null, 2)}\n`);
+          sendLog(ws, `[INFO] Recovered strategic problem-model JSON via bounded repair and wrote ${problemModelPath}\n`);
+        } catch (e) {
+          sendLog(ws, `[WARNING] Recovered strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
+        }
       }
     }
   }

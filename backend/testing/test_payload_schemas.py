@@ -1103,6 +1103,11 @@ _VALID_EVIDENCE = {
         "kind": "downstream_artifact",
         "artifact_id": "COMPUTE_RESULT:accuracy",
     },
+    "visual": {
+        "kind": "visual",
+        "component": "MetricsDashboard",
+        "viewport_width": 1280,
+    },
 }
 
 
@@ -1211,3 +1216,164 @@ def test_acceptance_evidence_round_trips_through_model_instance():
 
     ev = AcceptanceEvidence(kind="downstream_artifact", artifact_id="KNOWLEDGE_DOC:42")
     assert read_acceptance_evidence({"acceptance_evidence": ev}) is ev
+
+
+# ---------------------------------------------------------------------------
+# visual kind — first-class viewport screenshot acceptance evidence
+# ---------------------------------------------------------------------------
+
+
+def test_visual_evidence_kind_validates_and_rejects_placeholder():
+    """Visual acceptance_evidence validates substantive declarations and rejects
+    empty/placeholder component names and missing/out-of-range widths.
+
+    Also verifies that the component-key derivation round-trips through the
+    shared viewport_object_name helper — the same function used by the agent
+    upload endpoint and the admin download endpoint — so a declared
+    (component, width) pair uniquely identifies a GCS object with no ambiguity
+    and no risk of the upload/download key-mismatch bug from PR #9522.
+    """
+    from app.payload_schemas import AcceptanceEvidence
+    from app.viewport_evidence import viewport_object_name
+
+    # ── valid declaration validates and round-trips ────────────────────────
+    ev = AcceptanceEvidence(
+        kind="visual", component="MetricsDashboard", viewport_width=1280
+    )
+    assert ev.kind == "visual"
+    assert ev.component == "MetricsDashboard"
+    assert ev.viewport_width == 1280
+    assert ev.assertion_type is None  # optional, absent by default
+
+    # Optional assertion_type is accepted when supplied.
+    ev2 = AcceptanceEvidence(
+        kind="visual",
+        component="ProjectDashboard",
+        viewport_width=800,
+        assertion_type="chart colours match design",
+    )
+    assert ev2.assertion_type == "chart colours match design"
+
+    # ── shared helper produces the same key the endpoints use ─────────────
+    # Upload and download endpoints were previously duplicating this logic;
+    # they now both call viewport_object_name.  Anchor the derivation to verify
+    # byte-for-byte consistency with what the agent would upload and what the
+    # admin panel would download.
+    project_id = "proj-abc123"
+    assert viewport_object_name(project_id, "MetricsDashboard", 1280) == (
+        f"viewport-failures/{project_id}/MetricsDashboard-1280.png"
+    )
+    # Characters outside [A-Za-z0-9._-] are sanitised to underscores, same as
+    # the regex previously inlined in agent.py and main.py.
+    assert viewport_object_name(project_id, "My Component!", 800) == (
+        f"viewport-failures/{project_id}/My_Component_-800.png"
+    )
+    # Component truncated at 100 chars.
+    long_name = "A" * 150
+    obj = viewport_object_name(project_id, long_name, 1024)
+    assert obj == f"viewport-failures/{project_id}/{'A' * 100}-1024.png"
+
+    # ── placeholder / empty component rejected ────────────────────────────
+    for bad_component in ("", "   ", "placeholder", "test", "todo", "none", "n/a"):
+        with pytest.raises(Exception):
+            AcceptanceEvidence(
+                kind="visual", component=bad_component, viewport_width=1280
+            )
+
+    # ── missing viewport_width rejected ──────────────────────────────────
+    with pytest.raises(Exception):
+        AcceptanceEvidence(kind="visual", component="MetricsDashboard")
+
+    # ── out-of-range viewport_width rejected (same bounds as upload endpoint)
+    with pytest.raises(Exception):
+        AcceptanceEvidence(
+            kind="visual", component="MetricsDashboard", viewport_width=0
+        )
+    with pytest.raises(Exception):
+        AcceptanceEvidence(
+            kind="visual", component="MetricsDashboard", viewport_width=5000
+        )
+
+    # ── extra='forbid' discipline preserved ──────────────────────────────
+    raw_extra = {
+        "type": "create",
+        "prompt": "add the component",
+        "acceptance_evidence": {
+            "kind": "visual",
+            "component": "MetricsDashboard",
+            "viewport_width": 1280,
+            "unexpected_field": "x",
+        },
+    }
+    _invalid(raw_extra)
+
+    # ── full validate_task_payload round-trip ─────────────────────────────
+    raw = {
+        "type": "create",
+        "prompt": "implement the component",
+        "acceptance_evidence": {
+            "kind": "visual",
+            "component": "MetricsDashboard",
+            "viewport_width": 1280,
+        },
+    }
+    result = _valid(raw)
+    assert result["acceptance_evidence"]["kind"] == "visual"
+    assert result["acceptance_evidence"]["component"] == "MetricsDashboard"
+    assert result["acceptance_evidence"]["viewport_width"] == 1280
+
+
+def test_visual_evidence_parse_acceptance_evidence_context_channel():
+    """The lighter PlanAcceptanceEvidence context-channel accepts kind='visual'
+    (descriptor = component name, selector = viewport width string)."""
+    raw = {
+        "kind": "visual",
+        "descriptor": "MetricsDashboard",
+        "selector": "1280",
+    }
+    result = parse_acceptance_evidence(raw)
+    assert result is not None
+    assert result["kind"] == "visual"
+    assert result["descriptor"] == "MetricsDashboard"
+    assert result["selector"] == "1280"
+
+
+def test_visual_evidence_resolve_found_and_missing():
+    """resolve_visual_evidence returns verified when the context URI matches and
+    unverified when absent — never silently counts as verified."""
+    from app.viewport_evidence import resolve_visual_evidence, viewport_object_name
+
+    project_id = "proj-xyz"
+    component = "MetricsDashboard"
+    width = 1280
+    expected_obj = viewport_object_name(project_id, component, width)
+
+    # URI present and matching → verified.
+    ctx_match = {
+        "viewport_failure_screenshot_uri": f"gs://my-bucket/{expected_obj}"
+    }
+    result = resolve_visual_evidence(project_id, component, width, ctx_match)
+    assert result["resolved"] is True
+    assert result["status"] == "verified"
+    assert result["object_name"] == expected_obj
+
+    # URI absent → unverified.
+    result_missing = resolve_visual_evidence(project_id, component, width, {})
+    assert result_missing["resolved"] is False
+    assert result_missing["status"] == "unverified"
+    assert result_missing["uri"] is None
+
+    # URI for a different component → unverified (no partial match).
+    ctx_other = {
+        "viewport_failure_screenshot_uri": (
+            f"gs://my-bucket/{viewport_object_name(project_id, 'OtherComponent', width)}"
+        )
+    }
+    result_other = resolve_visual_evidence(project_id, component, width, ctx_other)
+    assert result_other["resolved"] is False
+    assert result_other["status"] == "unverified"
+
+    # None context → unverified (graceful degradation).
+    result_none = resolve_visual_evidence(project_id, component, width, None)
+    assert result_none["resolved"] is False
+    assert result_none["status"] == "unverified"

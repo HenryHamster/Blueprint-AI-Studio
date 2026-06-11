@@ -8259,6 +8259,117 @@ async def test_second_opinion_replayed_challenger_status_does_not_clobber(
 
 
 @pytest.mark.asyncio
+async def test_second_opinion_replay_commits_before_post_commit(tl_db, mocker):
+    """Regression (v10 release-audit HIGH): the pending_application REPLAY path of
+    _resolve_review_second_opinion must COMMIT (release the review row's FOR UPDATE
+    lock acquired at the top) BEFORE calling _process_post_commit, which re-acquires
+    FOR UPDATE SKIP LOCKED on the SAME review row in a separate session. Pre-fix the
+    releasing commit lived inside `if not pending_application:` and was skipped on
+    replay, so the inner acquire deadlocked (PostCommitLocked on PostgreSQL), the
+    marker cleanup was never reached, and the reconciled verdict was permanently
+    unapplied.
+
+    SQLite (tl_db) does not implement FOR UPDATE SKIP LOCKED, so the live deadlock is
+    not reproducible here; this asserts the commit-before-call ORDERING invariant the
+    fix establishes, and that the pending-application marker clears after the replay."""
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+    from app.task_evaluators import (
+        REVIEW_SECOND_OPINION_AWAITING_KEY,
+        REVIEW_SECOND_OPINION_PARKED_KEY,
+        REVIEW_SECOND_OPINION_SOURCE_KEY,
+    )
+    from app.task_lifecycle import (
+        _resolve_review_second_opinion,
+        _set_sidecar_application_pending,
+        _sidecar_application_pending,
+    )
+
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=9301)
+
+    challenger = Task(
+        project_id=project.id,
+        payloads=[{"type": "panel_review", "pr_number": 9301}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={REVIEW_SECOND_OPINION_SOURCE_KEY: str(review_task.id)},
+    )
+    session.add(challenger)
+    await session.commit()
+    await session.refresh(challenger)
+
+    # Put the review into the "pending application" REPLAY state: reconciliation
+    # record persisted + the application-pending marker set + still parked — i.e. the
+    # first pass committed the marker, then its _process_post_commit died before
+    # clearing it.
+    ctx = dict(review_task.context or {})
+    ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = {
+        "state": "challenged_confirmed",
+        "reconciled_verdict": "APPROVE",
+        "surviving_issues": [],
+        "challenger_task_id": str(challenger.id),
+        "review_task_id": str(review_task.id),
+    }
+    ctx[REVIEW_SECOND_OPINION_AWAITING_KEY] = str(challenger.id)
+    ctx[REVIEW_SECOND_OPINION_PARKED_KEY] = {
+        "verdict": "APPROVE",
+        "issues": [],
+        "original_task_id": str(original.id),
+    }
+    _set_sidecar_application_pending(
+        ctx,
+        lane="review_second_opinion",
+        sidecar_id=challenger.id,
+        verdict_key=REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+    )
+    review_task.context = ctx
+    session.add(review_task)
+    await session.commit()
+
+    # Record the relative order of session.commit vs the inner _process_post_commit.
+    order = []
+    real_commit = session.commit
+
+    async def _spy_commit(*a, **k):
+        order.append("commit")
+        return await real_commit(*a, **k)
+
+    mocker.patch.object(session, "commit", new_callable=AsyncMock, side_effect=_spy_commit)
+
+    async def _spy_ppc(task_id, payload, *a, **k):
+        order.append("post_commit")
+
+    mocker.patch(
+        "app.task_lifecycle._process_post_commit",
+        new_callable=AsyncMock,
+        side_effect=_spy_ppc,
+    )
+
+    payload = AgentStatusPayload(task_id=challenger.id, status=TaskStatus.COMPLETED)
+    await _resolve_review_second_opinion(challenger, payload, session)
+
+    assert "post_commit" in order, "replay must re-dispatch the reconciled review"
+    assert order.index("commit") < order.index("post_commit"), (
+        "the review row FOR UPDATE lock must be released (committed) BEFORE "
+        "_process_post_commit on the replay path — else PostCommitLocked deadlock"
+    )
+
+    await session.refresh(review_task)
+    assert not _sidecar_application_pending(
+        dict(review_task.context or {}),
+        lane="review_second_opinion",
+        sidecar_id=challenger.id,
+    ), "the pending-application marker must clear after a successful replay"
+
+
+@pytest.mark.asyncio
 async def test_second_opinion_gate_off_restores_synchronous_merge(tl_db, mocker):
     """Gate disabled → today's synchronous behavior, recorded as unchallenged."""
     mocker.patch.dict(
@@ -8412,6 +8523,114 @@ async def _make_research_source_and_grader(session, *, terminal_status=TaskStatu
     await session.commit()
     await session.refresh(source)
     return project, source, grader
+
+
+@pytest.mark.asyncio
+async def test_grader_verdict_handler_crash_is_recoverable(tl_db, mocker):
+    """A crash after verdict-record commit must leave a marker the sweep can recover."""
+    from app.schemas import AgentStatusPayload
+    from app.services import _sweep_stranded_sidecar_sources
+    from app.task_evaluators import (
+        ADVERSARIAL_GATE_VERDICT_KEY,
+        SIDECAR_VERDICT_APPLICATION_PENDING_KEY,
+    )
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    session, Session = tl_db
+    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    handler = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(side_effect=[RuntimeError("handler crashed"), None]),
+    )
+
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+    source.plan_output = []
+    source.context = {"awaiting_adversarial_grader": str(grader.id)}
+    grader.context = {
+        **(grader.context or {}),
+        "_adversarial_challenged_hashes": ["finding-hash-recoverable"],
+    }
+    session.add(source)
+    session.add(grader)
+    await session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='[{"hash": "finding-hash-recoverable", "verdict": "pass", "reason": "valid"}]',
+    )
+    with pytest.raises(RuntimeError, match="handler crashed"):
+        await _resolve_quality_grader_completion(grader, payload, session)
+
+    await session.refresh(source)
+    ctx = source.context or {}
+    assert source.status == TaskStatus.COMPLETED
+    assert ctx.get(ADVERSARIAL_GATE_VERDICT_KEY, {}).get("parse_outcome") == "ok"
+    assert ctx.get(SIDECAR_VERDICT_APPLICATION_PENDING_KEY) == {
+        "lane": "adversarial_grader",
+        "sidecar_task_id": str(grader.id),
+        "verdict_key": ADVERSARIAL_GATE_VERDICT_KEY,
+    }
+
+    await _sweep_stranded_sidecar_sources()
+
+    await session.refresh(source)
+    assert handler.await_count == 2
+    assert SIDECAR_VERDICT_APPLICATION_PENDING_KEY not in (source.context or {})
+    assert (source.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY, {}).get(
+        "finding_verdicts", {}
+    ).get("finding-hash-recoverable", {}).get("passed") is True
+
+
+@pytest.mark.asyncio
+async def test_duplicate_grader_resolution_after_application_is_noop(tl_db, mocker):
+    """A duplicate terminal status post after application must not re-dispatch."""
+    from app.schemas import AgentStatusPayload
+    from app.task_evaluators import ADVERSARIAL_GATE_VERDICT_KEY
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    session, _ = tl_db
+    handler = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+    source.plan_output = []
+    source.context = {"awaiting_adversarial_grader": str(grader.id)}
+    grader.context = {
+        **(grader.context or {}),
+        "_adversarial_challenged_hashes": ["finding-hash-once"],
+    }
+    session.add(source)
+    session.add(grader)
+    await session.commit()
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='[{"hash": "finding-hash-once", "verdict": "pass", "reason": "valid"}]',
+    )
+    await _resolve_quality_grader_completion(grader, payload, session)
+    await session.refresh(source)
+    first_record = (source.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
+
+    replay_payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='[{"hash": "finding-hash-once", "verdict": "fail", "reason": "stale replay"}]',
+    )
+    await _resolve_quality_grader_completion(grader, replay_payload, session)
+    await session.refresh(source)
+
+    assert handler.await_count == 1
+    assert (source.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY) == first_record
 
 
 @pytest.mark.asyncio

@@ -202,6 +202,11 @@ class AcceptanceEvidence(BaseModel):
       * ``observable_behavior`` — a concise ``description`` of a behavior that
         should be exercised.
       * ``downstream_artifact`` — an ``artifact_id`` a later task consumes.
+      * ``visual`` — a before/after viewport screenshot pair that proves a
+        frontend change looks correct.  ``component`` identifies the UI
+        component under test; ``viewport_width`` is the capture width in pixels
+        (same bounds as the upload endpoint: 1–4096).  ``assertion_type`` is an
+        optional human-readable description of what to look for.
 
     Deliberately minimal — no expression framework, mirroring
     ``ComputeSuccessCriterion``'s extra-field discipline (``extra='forbid'``).
@@ -215,7 +220,7 @@ class AcceptanceEvidence(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["named_test", "observable_behavior", "downstream_artifact"]
+    kind: Literal["named_test", "observable_behavior", "downstream_artifact", "visual"]
     # named_test
     test_path: str | None = None
     test_id: str | None = None
@@ -223,6 +228,10 @@ class AcceptanceEvidence(BaseModel):
     description: str | None = None
     # downstream_artifact
     artifact_id: str | None = None
+    # visual — width bounds mirror the upload endpoint (Field(ge=1, le=4096))
+    component: str | None = None
+    viewport_width: int | None = Field(default=None, ge=1, le=4096)
+    assertion_type: str | None = None
 
     @model_validator(mode="after")
     def _check_kind_shape(self) -> AcceptanceEvidence:
@@ -256,6 +265,18 @@ class AcceptanceEvidence(BaseModel):
                 raise ValueError(
                     "downstream_artifact acceptance_evidence requires a "
                     f"non-trivial artifact_id; got {self.artifact_id!r}"
+                )
+        elif self.kind == "visual":
+            component = (self.component or "").strip()
+            if not component or _is_trivial_evidence(component):
+                raise ValueError(
+                    "visual acceptance_evidence requires a non-trivial component "
+                    f"name; got {self.component!r}"
+                )
+            if self.viewport_width is None:
+                raise ValueError(
+                    "visual acceptance_evidence requires viewport_width to be set "
+                    "(must be an integer in 1–4096)"
                 )
         return self
 
@@ -620,6 +641,8 @@ class PlanAcceptanceEvidence(BaseModel):
         end-to-end.
       * ``kind="behavior"`` — an observable runtime behavior.
       * ``kind="artifact"`` — an artifact a downstream task consumes.
+      * ``kind="visual"`` — a before/after viewport screenshot pair (descriptor
+        = component name, selector = viewport width as a string).
 
     Purely additive: it establishes/propagates/records a contract and never
     blocks a merge. ``extra='forbid'`` (mirroring :class:`ComputeSuccessCriterion`)
@@ -629,7 +652,7 @@ class PlanAcceptanceEvidence(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["test", "behavior", "artifact"]
+    kind: Literal["test", "behavior", "artifact", "visual"]
     descriptor: str
     selector: str | None = None
 
@@ -760,6 +783,47 @@ class RepoBootstrapPayload(BasePayload):
     github_repo: str = ""
     integration_branch: str = ""
     is_first_bootstrap: bool = True
+
+
+class LaneCheckpointValidated(BaseModel):
+    """Validated test/lint state carried by a lane checkpoint."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    lint: bool = True
+    tests: str = Field(default="green", pattern=r"^(green|red|skipped)$")
+
+
+class LaneCheckpointPayload(BaseModel):
+    """Lane checkpoint submitted by a completing lane-phase task.
+
+    Validated at task completion; the backend verifies the sha against the
+    lane branch via the GitHub client before appending the checkpoint record.
+    A missing or unverifiable checkpoint degrades completion to
+    ``failure_category='checkpoint_missing'``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    sha: str = Field(min_length=7, max_length=64)
+    summary: str = Field(max_length=1024)
+    validated: LaneCheckpointValidated = Field(default_factory=LaneCheckpointValidated)
+    wip_failing: list[str] = Field(default_factory=list, max_length=50)
+    manifest_patch: dict[str, Any] = Field(default_factory=dict)
+    tokens_in: int = Field(default=0, ge=0)
+    tokens_out: int = Field(default=0, ge=0)
+    vm_cost_usd: float = Field(default=0.0, ge=0.0)
+    warm_resume: bool = False
+
+    @field_validator("manifest_patch")
+    @classmethod
+    def _check_manifest_patch_size(cls, v: dict) -> dict:
+        import json as _json
+
+        size = len(_json.dumps(v, default=str).encode())
+        if size > 8192:
+            raise ValueError(f"manifest_patch exceeds 8KB limit ({size} bytes)")
+        return v
 
 
 class RepoBootstrapOverview(BaseModel):

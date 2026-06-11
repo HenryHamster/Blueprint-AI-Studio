@@ -451,6 +451,38 @@ INFRA_CLASSES: frozenset[str] = frozenset(
     }
 )
 
+# Cause frozensets for adversarial grader non-response routing.  Each set
+# names the cause categories (from classify_grader_nonresponse_cause) that
+# map to a specific retry strategy.  Defined here so research_completion.py
+# can route without duplicating the failure-taxonomy vocabulary.
+
+# Time-based failures: the grader ran out of time.  Retry strategy: reduce the
+# challenge manifest so the next grader fits within the time budget.  Findings
+# excluded from the reduced manifest fail closed via the manifest-exclusion path.
+GRADER_TIMEOUT_CAUSES: frozenset[str] = frozenset(
+    {
+        AGENT_TIMEOUT,
+        NO_PROGRESS_TIMEOUT,
+        PARK_WAKE_TIMEOUT,
+        PARK_WAKE_STRANDED,
+    }
+)
+
+# Transient infra failures: the grader failed for a reason unrelated to the
+# challenge content (rate-limit, provisioning failure, external API, etc.).
+# Retry strategy: identical manifest on a fresh grader (existing wholesale
+# retry), counted against the wholesale budget rather than adding a new slot.
+GRADER_TRANSIENT_INFRA_CAUSES: frozenset[str] = frozenset(
+    {
+        RATE_LIMIT,
+        PROVISION_FAILURE,
+        EXTERNAL_API,
+        REASSIGNED,
+        DEAD_AUTH,
+        AGENT_STALLED,
+    }
+)
+
 # Ordered tuple of all canonical failure classes for per-account health panel display.
 ALL_FAILURE_CLASSES: tuple[str, ...] = (
     CODE_ERROR,
@@ -2434,4 +2466,272 @@ def escalated_effort_for_execution_timeout(task: "Task") -> str | None:
         payload, ctx, task_type, runtime_config
     )
     return escalate_effort(current_effort)
+
+
+# ── Spawn-gate / forward-quality grader non-response cause (observability) ────
+# When the research spawn-gate's adversarial grader (or the dark forward-quality
+# grader) resolves through task_lifecycle._resolve_quality_grader_completion, the
+# parse-level outcome (challenger_failed / empty_logs / no_json_array /
+# invalid_json / no_hash_matches) answers WHAT failed at parse level but never
+# WHY. These helpers turn the boundary's already-present material — the resolved
+# grader's failure taxonomy, the parse_outcome, the grader's output, and the
+# per-grader VM provenance — into a small machine-readable cause object. Pure
+# observability: NO fail-open/fail-closed decision, retry count, or deferral
+# behavior reads any of this.
+
+# For a COMPLETED-but-unparseable grader, distinguish a model refusal (prose that
+# declines to answer, no verdict structure) from a format miss (output present
+# but not in the expected verdict shape, or empty/garbled). A FAILED grader does
+# not use these — its cause is drawn from the existing failure taxonomy.
+GRADER_CAUSE_REFUSAL = "grader_refusal"
+GRADER_CAUSE_FORMAT_MISS = "grader_format_miss"
+# The grader DID respond with a parseable verdict — any individual finding left
+# unresolved is a per-finding gap, not a grader-level non-response.
+GRADER_CAUSE_RESPONSIVE = "grader_responsive"
+
+# Bounded per-attempt grader-resolution audit trail. Each resolution appends one
+# entry instead of overwriting the single legacy ``adversarial_gate_diagnostic``
+# record, so the bounded wholesale-retry sequence is visible after the fact.
+GRADER_DIAGNOSTIC_TRAIL_KEY = "grader_diagnostic_trail"
+_GRADER_DIAGNOSTIC_TRAIL_MAX = 5
+
+# Lowercased prose markers of a model refusal. Kept narrow so an ordinary
+# analytical sentence ("I cannot find a backend reference") does not over-match a
+# genuine refusal; matched only on the no-verdict-array path.
+_GRADER_REFUSAL_MARKERS: tuple[str, ...] = (
+    "i cannot comply",
+    "i can't comply",
+    "i cannot assist",
+    "i can't assist",
+    "i cannot help with",
+    "i can't help with",
+    "i will not",
+    "i won't",
+    "i must decline",
+    "i refuse",
+    "unable to provide",
+    "cannot provide this",
+    "i'm not able to",
+    "i am not able to",
+)
+
+
+def _refusal_or_format_miss(parse_outcome: str | None, logs: str | None) -> str:
+    """Bounded refusal-vs-format-miss distinction for a completed-but-unparseable
+    grader, keyed off the existing ``parse_outcome`` plus a light log inspection.
+
+    * structurally empty output → format miss (nothing to refuse with)
+    * garbled JSON / wrong-hash JSON → format miss (tried in-format, missed schema)
+    * prose with no verdict array → refusal iff the prose reads as a refusal,
+      else a format miss (the model talked but never produced the verdict shape)
+    """
+    from app.task_evaluators import (
+        ADVERSARIAL_PARSE_EMPTY_LOGS,
+        ADVERSARIAL_PARSE_INVALID_JSON,
+        ADVERSARIAL_PARSE_NO_HASH_MATCHES,
+    )
+
+    text = (logs or "").strip()
+    if not text or parse_outcome == ADVERSARIAL_PARSE_EMPTY_LOGS:
+        return GRADER_CAUSE_FORMAT_MISS
+    if parse_outcome in (
+        ADVERSARIAL_PARSE_INVALID_JSON,
+        ADVERSARIAL_PARSE_NO_HASH_MATCHES,
+    ):
+        return GRADER_CAUSE_FORMAT_MISS
+    low = text.lower()
+    if any(marker in low for marker in _GRADER_REFUSAL_MARKERS):
+        return GRADER_CAUSE_REFUSAL
+    return GRADER_CAUSE_FORMAT_MISS
+
+
+async def _grader_image_stale_tag(
+    grader_source_sha: str | None,
+    session,
+    project_id,
+) -> bool | None:
+    """Best-effort staleness verdict for a grader VM's baked source SHA.
+
+    Returns ``True`` when ``grader_source_sha`` predates (is a strict ancestor
+    of) the SHA the live fleet is currently serving, ``False`` when it matches or
+    descends, and ``None`` when undeterminable. The expected-serving SHA read and
+    the ancestry comparison are async/GitHub-aware, so the whole body is wrapped:
+    any error, missing credential, or unknown SHA yields ``None`` so the caller
+    OMITS the tag. NEVER raises and NEVER blocks or alters grader resolution.
+    """
+    try:
+        if not grader_source_sha or session is None or project_id is None:
+            return None
+        from app.compute import expected_serving_source_sha
+
+        expected_sha = await expected_serving_source_sha(
+            session, project_id=project_id
+        )
+        if not expected_sha:
+            return None
+        if str(grader_source_sha) == str(expected_sha):
+            return False
+
+        # Different SHA — resolve GitHub creds best-effort and ask whether the
+        # grader's SHA is an ancestor of (predates) the serving SHA.
+        from app import github_refs
+        from app.models import Project
+        from app.release_promotion import _resolve_github_with_session
+
+        try:
+            project = await session.get(Project, project_id)
+        except Exception:
+            project = None
+        if project is None:
+            return None
+        resolved = await _resolve_github_with_session(session, project)
+        if not resolved:
+            return None
+        token, owner, repo = resolved
+        verdict = await github_refs.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            str(grader_source_sha),
+            str(expected_sha),
+            project_id=str(project_id),
+        )
+        if verdict is True:
+            return True
+        if verdict is False:
+            return False
+        return None
+    except Exception:
+        logger.debug(
+            "[FAILURE_CLASS] grader stale-image tag undeterminable",
+            exc_info=True,
+        )
+        return None
+
+
+async def classify_grader_nonresponse_cause(
+    grader: "Task",
+    parse_outcome: str | None,
+    gate_provenance: dict | None,
+    *,
+    completed: bool,
+    logs: str | None = None,
+    session=None,
+    project_id=None,
+) -> dict:
+    """Return a small machine-readable cause object for a grader resolution.
+
+    Rules (observability only — invents NO parallel cause vocabulary for the
+    FAILED case):
+      * FAILED grader → ``category`` drawn from the EXISTING failure taxonomy via
+        :func:`classify_failure` (which already consults the persisted
+        ``failure_category``), e.g. AGENT_TIMEOUT / RATE_LIMIT / PROVISION_FAILURE.
+      * COMPLETED grader that DID parse (``parse_outcome == "ok"`` for the
+        adversarial lane, or ``None`` for the forward-quality lane) → responsive.
+      * COMPLETED-but-unparseable grader → refusal vs format miss via
+        :func:`_refusal_or_format_miss`.
+    Plus a ``stale_agent_image`` boolean tag (best-effort) present ONLY when the
+    grader VM's recorded source SHA can be compared against the expected serving
+    SHA; absent on any error or unknown SHA. The tag COMPLEMENTS, and does not
+    replace, the separate fleet-wide serving-SHA operator surface.
+    """
+    from app.task_evaluators import ADVERSARIAL_PARSE_CHALLENGER_FAILED
+
+    cause: dict = {"parse_outcome": parse_outcome}
+    # Observability must NEVER break grader resolution — the whole body is
+    # defensive so a classification bug degrades to a minimal cause object
+    # rather than propagating an exception into the resolution path.
+    try:
+        if (not completed) or parse_outcome == ADVERSARIAL_PARSE_CHALLENGER_FAILED:
+            try:
+                category = classify_failure(grader)
+            except Exception:
+                category = CODE_ERROR
+            cause["category"] = category
+            cause["source"] = "failure_taxonomy"
+        elif parse_outcome in ("ok", None):
+            cause["category"] = GRADER_CAUSE_RESPONSIVE
+            cause["source"] = "parse_outcome"
+        else:
+            cause["category"] = _refusal_or_format_miss(parse_outcome, logs)
+            cause["source"] = "output_inspection"
+    except Exception:
+        logger.debug(
+            "[FAILURE_CLASS] grader non-response cause classification degraded",
+            exc_info=True,
+        )
+        cause.setdefault("category", CODE_ERROR)
+        cause.setdefault("source", "error")
+
+    try:
+        stale = await _grader_image_stale_tag(
+            (gate_provenance or {}).get("grader_agent_source_sha"),
+            session,
+            project_id,
+        )
+    except Exception:
+        stale = None
+    if stale is not None:
+        cause["stale_agent_image"] = stale
+    return cause
+
+
+def synthesize_forward_quality_parse_state(
+    completed: bool, logs: str | None, verdict_reason: str | None
+) -> str:
+    """Map a forward-quality grader's single artifact-level verdict onto the same
+    parse-state vocabulary the adversarial lane uses, so both lanes feed one cause
+    classifier. FAILED → challenger_failed; empty output → empty_logs; an
+    unparseable fail-closed verdict → no_json_array; otherwise → ok.
+    """
+    from app.task_evaluators import (
+        ADVERSARIAL_PARSE_CHALLENGER_FAILED,
+        ADVERSARIAL_PARSE_EMPTY_LOGS,
+        ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+        ADVERSARIAL_PARSE_OK,
+    )
+
+    if not completed:
+        return ADVERSARIAL_PARSE_CHALLENGER_FAILED
+    if not (logs or "").strip():
+        return ADVERSARIAL_PARSE_EMPTY_LOGS
+    if "unparseable" in (verdict_reason or "").lower():
+        return ADVERSARIAL_PARSE_NO_JSON_ARRAY
+    return ADVERSARIAL_PARSE_OK
+
+
+def append_grader_diagnostic_trail(
+    ctx: dict,
+    *,
+    grader_task_id,
+    parse_outcome: str | None,
+    cause: dict | None,
+    vm_provenance: dict | None,
+) -> dict:
+    """Append a bounded per-attempt entry to ``ctx[GRADER_DIAGNOSTIC_TRAIL_KEY]``.
+
+    Keeps the last ``_GRADER_DIAGNOSTIC_TRAIL_MAX`` entries so successive
+    resolutions accumulate rather than overwrite the single diagnostic record.
+    Auto-numbers ``attempt`` monotonically from the highest attempt already in
+    the trail (NOT its length — capping must not reset the counter). Mutates
+    ``ctx`` in place and returns the appended entry. Observability only.
+    """
+    trail = ctx.get(GRADER_DIAGNOSTIC_TRAIL_KEY)
+    if not isinstance(trail, list):
+        trail = []
+    _prior_attempts = [
+        e.get("attempt")
+        for e in trail
+        if isinstance(e, dict) and isinstance(e.get("attempt"), int)
+    ]
+    entry = {
+        "attempt": (max(_prior_attempts) + 1) if _prior_attempts else 1,
+        "grader_task_id": str(grader_task_id) if grader_task_id is not None else None,
+        "parse_outcome": parse_outcome,
+        "cause": cause,
+        "vm_provenance": vm_provenance or {},
+    }
+    trail = [*trail, entry][-_GRADER_DIAGNOSTIC_TRAIL_MAX:]
+    ctx[GRADER_DIAGNOSTIC_TRAIL_KEY] = trail
+    return entry
 

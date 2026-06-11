@@ -2052,3 +2052,49 @@ async def test_all_cascade_skipped_fails_plan(db_session, mocker, _quiet_mocks):
     assert len(children) == 0, (
         f"No children should spawn when all are cascade-skipped, got {len(children)}"
     )
+
+
+@pytest.mark.asyncio
+async def test_visual_evidence_propagates_through_decomposition(
+    db_session, mocker, _quiet_mocks
+):
+    """A visual_evidence declaration on a parent plan task survives onto the
+    spawned child's payload unchanged.
+
+    Regression guard: the plan_completion distribution path must forward the
+    'visual' kind through the AcceptanceEvidence schema exactly as it does for
+    'named_test' / 'observable_behavior' / 'downstream_artifact'.  The child
+    that does not self-declare its own evidence must inherit the parent's.
+    """
+    parent_evidence = {
+        "kind": "visual",
+        "component": "MetricsDashboard",
+        "viewport_width": 1280,
+    }
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: update MetricsDashboard component",
+                    "prompt": "implement the component changes",
+                    "scope": "small",
+                    "type": "create",
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task_with_evidence(
+        db_session, mocker, payload_evidence=parent_evidence
+    )
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = await _children_of(db_session, task)
+    assert len(children) == 1, f"Expected 1 child, got {len(children)}"
+    child_ev = children[0].first_payload.get("acceptance_evidence")
+    assert child_ev is not None, (
+        "visual acceptance_evidence must survive decomposition onto the child payload"
+    )
+    assert child_ev["kind"] == "visual"
+    assert child_ev["component"] == "MetricsDashboard"
+    assert child_ev["viewport_width"] == 1280

@@ -31,6 +31,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
+from sqlalchemy import insert
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -304,20 +305,32 @@ async def _post_reaper_halt_alert(crash_count: int, last_error: str) -> None:
         from app.models import Alert, AlertSeverity
 
         async with AsyncSessionLocal() as s:
-            proj_ids = (await s.execute(select(Project.id))).scalars().all()
-            for pid in proj_ids:
-                s.add(
-                    Alert(
-                        project_id=pid,
-                        severity=AlertSeverity.ERROR,
-                        title="Reaper service HALTED after crash-loop",
-                        message=(
-                            f"Reaper crash-looped {crash_count}x and self-halted. "
-                            f"Last error: {last_error[:300]}. "
-                            "No new reap cycles until process restart or operator reset."
-                        ),
-                    )
-                )
+            # Bound the fan-out scan and fan-out insert: a single capped SELECT
+            # plus one bulk INSERT instead of an unbounded full-table scan and
+            # one ORM add() per project in the error-recovery hot path.
+            proj_ids = (
+                await s.execute(select(Project.id).limit(1000))
+            ).scalars().all()
+            if not proj_ids:
+                return
+            message = (
+                f"Reaper crash-looped {crash_count}x and self-halted. "
+                f"Last error: {last_error[:300]}. "
+                "No new reap cycles until process restart or operator reset."
+            )
+            await s.execute(
+                insert(Alert),
+                [
+                    {
+                        "id": uuid.uuid4(),
+                        "project_id": pid,
+                        "severity": AlertSeverity.ERROR,
+                        "title": "Reaper service HALTED after crash-loop",
+                        "message": message,
+                    }
+                    for pid in proj_ids
+                ],
+            )
             await s.commit()
     except Exception:
         logger.exception("[REAPER] Failed to post halt alert")
@@ -329,19 +342,29 @@ async def _post_reaper_recovery_alert(probe_failures: int) -> None:
         from app.models import Alert, AlertSeverity
 
         async with AsyncSessionLocal() as s:
-            proj_ids = (await s.execute(select(Project.id))).scalars().all()
-            for pid in proj_ids:
-                s.add(
-                    Alert(
-                        project_id=pid,
-                        severity=AlertSeverity.INFO,
-                        title="Reaper service recovered autonomously",
-                        message=(
-                            f"Reaper self-recovered after {probe_failures} failed "
-                            "probe(s). Normal reap cycles have resumed."
-                        ),
-                    )
-                )
+            # Bound the fan-out scan and fan-out insert (see _post_reaper_halt_alert).
+            proj_ids = (
+                await s.execute(select(Project.id).limit(1000))
+            ).scalars().all()
+            if not proj_ids:
+                return
+            message = (
+                f"Reaper self-recovered after {probe_failures} failed "
+                "probe(s). Normal reap cycles have resumed."
+            )
+            await s.execute(
+                insert(Alert),
+                [
+                    {
+                        "id": uuid.uuid4(),
+                        "project_id": pid,
+                        "severity": AlertSeverity.INFO,
+                        "title": "Reaper service recovered autonomously",
+                        "message": message,
+                    }
+                    for pid in proj_ids
+                ],
+            )
             await s.commit()
     except Exception:
         logger.exception("[REAPER] Failed to post recovery alert")
@@ -939,47 +962,68 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             )
         )
     ).all()
-    created = 0
+
+    # New projects have not had time to establish a cadence — skip until the
+    # project itself is older than the starvation window. Filter in Python so
+    # the two batched lookups below only run over genuine candidates.
+    candidate_ids: list = []
     for project_id, project_created_at in project_rows:
-        # New projects have not had time to establish a cadence — skip until the
-        # project itself is older than the starvation window.
         if project_created_at is not None:
             pc = project_created_at
             if pc.tzinfo is not None:
                 pc = pc.replace(tzinfo=None)
             if pc > cutoff:
                 continue
+        candidate_ids.append(project_id)
 
-        recent_cycle = (
+    created = 0
+    if not candidate_ids:
+        return created
+
+    # Batched lookup 1: which candidate projects already have a recent cycle.
+    # Replaces a per-project existence SELECT (the old N+1). Equivalent to the
+    # prior ``phase1_started_at >= cutoff`` LIMIT 1 existence check, collapsed
+    # into one round-trip via DISTINCT.
+    projects_with_recent_cycle = set(
+        (
             await session.execute(
-                select(StrategicCycle.id)
+                select(StrategicCycle.project_id)
                 .where(
-                    StrategicCycle.project_id == project_id,
+                    StrategicCycle.project_id.in_(candidate_ids),
                     StrategicCycle.phase1_started_at >= cutoff,
                 )
-                .limit(1)
+                .distinct()
             )
-        ).first()
-        if recent_cycle is not None:
-            continue
-
-        # Dedup: one open WARNING alert per project for this title.
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.task_id.is_(None),
-                        Alert.severity == AlertSeverity.WARNING,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title == _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-                    )
-                )
-            )
-            .scalars()
-            .first()
         )
-        if existing is not None:
+        .scalars()
+        .all()
+    )
+
+    # Batched lookup 2: which candidate projects already have an open WARNING
+    # dedup alert. Replaces the per-project dedup SELECT (the second N+1).
+    projects_with_open_alert = set(
+        (
+            await session.execute(
+                select(Alert.project_id)
+                .where(
+                    Alert.project_id.in_(candidate_ids),
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for project_id in candidate_ids:
+        if project_id in projects_with_recent_cycle:
+            continue
+        # Dedup: one open WARNING alert per project for this title.
+        if project_id in projects_with_open_alert:
             continue
 
         session.add(

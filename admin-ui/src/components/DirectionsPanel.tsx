@@ -58,6 +58,9 @@ export interface Direction {
   completion_criteria?: string | null;
   paths?: string[];
   last_researched_at?: string | null;
+  refractory_until?: string | null;
+  refractory_reason?: 'standard' | 'saturation' | null;
+  refractory_remaining_minutes?: number | null;
   proposed_by?: string;
   proposal_rationale?: string;
   proposed_at?: string;

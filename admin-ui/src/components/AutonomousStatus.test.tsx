@@ -115,6 +115,9 @@ describe('AutonomousStatus expanded dropdown', () => {
     const user = userEvent.setup();
     await act(async () => { render(<AutonomousStatus />); });
     await user.click(screen.getByTitle('Autonomous Pipeline Status'));
+    // Flush the async debug fetch triggered by the debug poller's leading call
+    // (fetchDebug runs only when expanded, so it fires after the click).
+    await act(async () => {});
     return user;
   }
 

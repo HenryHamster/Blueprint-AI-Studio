@@ -9,8 +9,11 @@ from httpx import AsyncClient
 
 from app.efficiency_snapshot import (
     ALL_AXES,
+    AXIS_CHECKPOINT_LOSS_RATE,
     AXIS_CONSUMERS,
     AXIS_COST_PER_MERGED_PR,
+    AXIS_LANE_COST_PER_MERGED_PR,
+    AXIS_LANE_WARM_RESUME_RATE,
     AXIS_LLM_COST_PER_MERGED_PR,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
@@ -23,7 +26,10 @@ from app.efficiency_snapshot import (
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
+    _compute_checkpoint_loss_rate,
     _compute_cold_start_breakdown_p50,
+    _compute_lane_cost_per_merged_pr,
+    _compute_lane_warm_resume_rate,
     _compute_llm_cost_pricing_coverage,
     _last_run_due,
     _task_llm_attempts,
@@ -34,7 +40,7 @@ from app.efficiency_snapshot import (
     read_baseline_with_drift,
     write_snapshot,
 )
-from app.models import TaskStatus, bank_task_current_attempt
+from app.models import ImprovementLane, ImprovementLaneStatus, TaskStatus, bank_task_current_attempt
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from testing.factories import _utcnow, make_membership, make_project, make_task
 
@@ -462,10 +468,10 @@ async def test_write_snapshot_migrates_stale_cold_start_baseline(db_session):
     # Old stale value must be gone; re-seeded from the new snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 15000.0
-    # Migration marker applied — a v0 baseline chains through all migrations to current head (v5).
+    # Migration marker applied — a v0 baseline chains through all migrations to current head (v6).
     # v0 → v1 (cold-start), v1 → v2 (review-iterations), v2 → v3 (cold-start dispatch fix),
-    # v3 → v4 (llm cost init), v4 → v5 (pricing table additions).
-    assert baseline["_schema_version"] == 5
+    # v3 → v4 (llm cost init), v4 → v5 (pricing table additions), v5 → v6 (lane axes).
+    assert baseline["_schema_version"] == 6
     # Other baseline axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
 
@@ -545,8 +551,8 @@ async def test_write_snapshot_migrates_cold_start_baseline_v2_to_v3(db_session):
     # Stale provision-confirm-anchored value must be gone; re-seeded from new snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 25000.0
-    # Schema migrated: v2 → v3 (tested here) plus v3 → v4, v4 → v5 (auto-chained).
-    assert baseline["_schema_version"] == 5
+    # Schema migrated: v2 → v3 (tested here) plus v3 → v4, v4 → v5, v5 → v6 (auto-chained).
+    assert baseline["_schema_version"] == 6
     # Other baseline axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.05
 
@@ -960,8 +966,8 @@ async def test_write_snapshot_migrates_review_iterations_baseline(db_session):
     assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] != 4.0
     assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] == 2.0
     # v1 chains through v2 (review-iterations), v3 (cold-start dispatch fix),
-    # v4 (llm cost init), and v5 (pricing table additions).
-    assert baseline["_schema_version"] == 5
+    # v4 (llm cost init), v5 (pricing table additions), and v6 (lane axes).
+    assert baseline["_schema_version"] == 6
     # Other axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
 
@@ -1512,8 +1518,8 @@ async def test_schema_version_v3_migrates_llm_axis(db_session):
     assert baseline[AXIS_LLM_COST_PER_MERGED_PR] != 9999.0
     expected = round(2000 * input_rate + 1000 * output_rate, 6)
     assert baseline[AXIS_LLM_COST_PER_MERGED_PR] == expected
-    # Schema bumped to v5 (v3 → v4 for llm cost, v4 → v5 for pricing table additions).
-    assert baseline["_schema_version"] == 5
+    # Schema bumped to v6 (v3 → v4 llm cost, v4 → v5 pricing additions, v5 → v6 lane axes).
+    assert baseline["_schema_version"] == 6
     # Other axes untouched.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.03
 
@@ -5013,3 +5019,450 @@ async def test_compute_project_window_spend_usd_llm_only_task_in_window_still_co
     in_rate, out_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
     expected = round(1000 * in_rate + 500 * out_rate, 6)
     assert total == expected, f"LLM-only in-window task should contribute {expected}; got {total}"
+
+
+# ---------------------------------------------------------------------------
+# Improvement-lane axis tests
+# ---------------------------------------------------------------------------
+
+
+def test_lane_axis_constants_registered():
+    """All three lane axes appear in ALL_AXES and have consumer entries."""
+    assert AXIS_LANE_COST_PER_MERGED_PR in ALL_AXES
+    assert AXIS_LANE_WARM_RESUME_RATE in ALL_AXES
+    assert AXIS_CHECKPOINT_LOSS_RATE in ALL_AXES
+    assert AXIS_LANE_COST_PER_MERGED_PR in AXIS_CONSUMERS
+    assert AXIS_LANE_WARM_RESUME_RATE in AXIS_CONSUMERS
+    assert AXIS_CHECKPOINT_LOSS_RATE in AXIS_CONSUMERS
+    # Consumers must claim a valid disposition.
+    for key in (AXIS_LANE_COST_PER_MERGED_PR, AXIS_LANE_WARM_RESUME_RATE, AXIS_CHECKPOINT_LOSS_RATE):
+        assert AXIS_CONSUMERS[key].get("consumer"), f"{key} must declare a consumer"
+
+
+def _make_lane(project_id, *, status=ImprovementLaneStatus.RETIRED, **kwargs):
+    """Build a minimal ImprovementLane for testing."""
+    from testing.factories import _utcnow as _now
+
+    defaults = dict(
+        project_id=project_id,
+        title="Test lane",
+        goal="Improve X",
+        branch_name="lane/test",
+        base_branch="main",
+        status=status.value,
+        checkpoint_seq=0,
+        phase_requeues=0,
+        checkpoints=[],
+        vm_cost_usd_total=0.0,
+        reserved_idle_cost_usd_total=0.0,
+        retired_at=_now() if status == ImprovementLaneStatus.RETIRED else None,
+    )
+    defaults.update(kwargs)
+    return ImprovementLane(**defaults)
+
+
+def test_compute_lane_cost_per_merged_pr_retired_lane():
+    """A RETIRED lane within the window contributes its VM+idle cost."""
+    from testing.factories import _utcnow as _now
+
+    lane = _make_lane(
+        project_id=None,
+        status=ImprovementLaneStatus.RETIRED,
+        vm_cost_usd_total=2.5,
+        reserved_idle_cost_usd_total=0.5,
+        retired_at=_now(),
+    )
+    result = _compute_lane_cost_per_merged_pr([lane])
+    assert result == round(3.0 / 1, 4)
+
+
+def test_compute_lane_cost_per_merged_pr_no_retired_lanes():
+    """Returns None when there are no RETIRED lanes."""
+    lane = _make_lane(project_id=None, status=ImprovementLaneStatus.ACTIVE)
+    assert _compute_lane_cost_per_merged_pr([lane]) is None
+
+
+def test_compute_lane_cost_per_merged_pr_excludes_old_lanes():
+    """Lanes retired before the window cutoff are excluded."""
+    from datetime import timedelta
+    from testing.factories import _utcnow as _now
+
+    old_lane = _make_lane(
+        project_id=None,
+        status=ImprovementLaneStatus.RETIRED,
+        vm_cost_usd_total=100.0,
+        retired_at=_now() - timedelta(days=30),  # outside 7-day window
+    )
+    assert _compute_lane_cost_per_merged_pr([old_lane]) is None
+
+
+def test_compute_lane_warm_resume_rate_basic():
+    """warm_resume=True checkpoints counted correctly."""
+    lane = _make_lane(
+        project_id=None,
+        status=ImprovementLaneStatus.PARKED,
+        checkpoints=[
+            {"warm_resume": True, "sha": "abc"},
+            {"warm_resume": False, "sha": "def"},
+            {"warm_resume": True, "sha": "ghi"},
+        ],
+    )
+    result = _compute_lane_warm_resume_rate([lane])
+    assert result == round(2 / 3, 4)
+
+
+def test_compute_lane_warm_resume_rate_no_checkpoints():
+    """Returns None when no lanes have checkpoint records."""
+    lane = _make_lane(project_id=None, status=ImprovementLaneStatus.ACTIVE, checkpoints=[])
+    assert _compute_lane_warm_resume_rate([lane]) is None
+
+
+def test_compute_checkpoint_loss_rate_basic():
+    """phase_requeues / (checkpoint_seq + phase_requeues)."""
+    lane = _make_lane(
+        project_id=None,
+        status=ImprovementLaneStatus.PARKED,
+        checkpoint_seq=8,
+        phase_requeues=2,
+    )
+    result = _compute_checkpoint_loss_rate([lane])
+    assert result == round(2 / 10, 4)
+
+
+def test_compute_checkpoint_loss_rate_no_attempts():
+    """Returns None when all lanes have seq=0 and requeues=0."""
+    lane = _make_lane(project_id=None, status=ImprovementLaneStatus.ACTIVE, checkpoint_seq=0, phase_requeues=0)
+    assert _compute_checkpoint_loss_rate([lane]) is None
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_includes_lane_axes(db_session):
+    """compute_current_axes returns all three lane axis keys."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert AXIS_LANE_COST_PER_MERGED_PR in axes
+    assert AXIS_LANE_WARM_RESUME_RATE in axes
+    assert AXIS_CHECKPOINT_LOSS_RATE in axes
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_lane_axes_from_db(db_session):
+    """Lane axes compute correct values from ImprovementLane rows in the DB."""
+    from testing.factories import _utcnow as _now
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+
+    # RETIRED lane with vm+idle cost and warm checkpoints.
+    retired_lane = ImprovementLane(
+        project_id=project.id,
+        title="Retired lane",
+        goal="Improve auth",
+        branch_name="lane/auth",
+        base_branch="main",
+        status=ImprovementLaneStatus.RETIRED.value,
+        vm_cost_usd_total=3.0,
+        reserved_idle_cost_usd_total=1.0,
+        checkpoint_seq=5,
+        phase_requeues=1,
+        checkpoints=[{"warm_resume": True, "sha": "abc"}, {"warm_resume": False, "sha": "def"}],
+        retired_at=_now(),
+    )
+    db_session.add(retired_lane)
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    # lane_cost_per_merged_pr: (3.0 + 1.0) / 1 retired lane
+    assert axes[AXIS_LANE_COST_PER_MERGED_PR] == round(4.0 / 1, 4)
+    # lane_warm_resume_rate: 1 warm / 2 total checkpoints
+    assert axes[AXIS_LANE_WARM_RESUME_RATE] == round(1 / 2, 4)
+    # checkpoint_loss_rate: 1 requeue / (5 + 1) = 1/6
+    assert axes[AXIS_CHECKPOINT_LOSS_RATE] == round(1 / 6, 4)
+
+
+@pytest.mark.asyncio
+async def test_lane_axes_survive_snapshot_cycle(db_session):
+    """Lane axis values survive a write_snapshot / read_baseline_with_drift cycle."""
+    from testing.factories import _utcnow as _now
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    retired_lane = ImprovementLane(
+        project_id=project.id,
+        title="Lane A",
+        goal="Goal A",
+        branch_name="lane/a",
+        base_branch="main",
+        status=ImprovementLaneStatus.RETIRED.value,
+        vm_cost_usd_total=2.0,
+        reserved_idle_cost_usd_total=0.0,
+        checkpoint_seq=4,
+        phase_requeues=0,
+        checkpoints=[{"warm_resume": True}, {"warm_resume": True}],
+        retired_at=_now(),
+    )
+    db_session.add(retired_lane)
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    axes = drift["axes"]
+
+    assert AXIS_LANE_COST_PER_MERGED_PR in axes
+    assert axes[AXIS_LANE_COST_PER_MERGED_PR]["current"] == round(2.0 / 1, 4)
+    assert AXIS_LANE_WARM_RESUME_RATE in axes
+    assert axes[AXIS_LANE_WARM_RESUME_RATE]["current"] == 1.0
+    assert AXIS_CHECKPOINT_LOSS_RATE in axes
+    assert axes[AXIS_CHECKPOINT_LOSS_RATE]["current"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_schema_version_v5_migrates_lane_axes(db_session):
+    """Existing baseline at schema_version=5 gets the three lane axes cleared
+    and the version bumped to 6 on the next write_snapshot call."""
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_COST_PER_MERGED_PR: 0.07,
+                    "_schema_version": 5,
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+
+    # Schema bumped from 5 to 6.
+    assert baseline["_schema_version"] == 6
+    # Existing axes must not be clobbered.
+    assert baseline[AXIS_COST_PER_MERGED_PR] == 0.07
+    # Lane axes were cleared (None) then re-seeded if data available.
+    # With no ImprovementLane rows the re-seed leaves them None.
+    assert baseline.get(AXIS_LANE_COST_PER_MERGED_PR) is None
+    assert baseline.get(AXIS_LANE_WARM_RESUME_RATE) is None
+    assert baseline.get(AXIS_CHECKPOINT_LOSS_RATE) is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_carries_serving_sha(db_session, monkeypatch):
+    """write_snapshot stamps serving_sha matching DEPLOY_SHA when the env var is set."""
+    monkeypatch.setenv("DEPLOY_SHA", "abc1234def5678")
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    assert snap.get("serving_sha") == "abc1234def5678", (
+        f"write_snapshot must stamp serving_sha from DEPLOY_SHA; got {snap.get('serving_sha')!r}"
+    )
+    # Verify it is persisted in the stored snapshot too.
+    await db_session.refresh(project)
+    stored_snaps = project.design_doc[DESIGN_DOC_KEY]["snapshots"]
+    assert stored_snaps[-1].get("serving_sha") == "abc1234def5678"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_sha_none_when_unset(db_session, monkeypatch):
+    """write_snapshot stamps serving_sha=None when DEPLOY_SHA is not set."""
+    monkeypatch.delenv("DEPLOY_SHA", raising=False)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    assert snap.get("serving_sha") is None, (
+        f"serving_sha must be None when DEPLOY_SHA is absent; got {snap.get('serving_sha')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# format_compliance_by_type persistence and agent endpoint tests
+# ---------------------------------------------------------------------------
+
+
+def _make_format_compliance_typed_task(project_id, *, task_type: str, errors: int):
+    """Create a task with format_compliance_summary and a specific payload type."""
+    t = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        format_compliance_summary={
+            "format_error_total": errors,
+            "format_repair_attempts": 0,
+            "format_repair_successes": 0,
+        },
+    )
+    t.payloads = [{"type": task_type}]
+    return t
+
+
+@pytest.mark.asyncio
+async def test_format_compliance_by_type_persisted_in_snapshot(db_session):
+    """write_snapshot stores format_compliance_by_type in the snapshot dict."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two "create" tasks (well-formed + error) and one "research" task (well-formed).
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=0))
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=1))
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="research", errors=0))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The snapshot dict returned by write_snapshot must carry the by_type block.
+    assert "format_compliance_by_type" in snap
+    by_type = snap["format_compliance_by_type"]
+    assert "create" in by_type
+    assert "research" in by_type
+    assert by_type["create"]["tasks_measured"] == 2
+    assert by_type["create"]["format_compliance_rate"] == 0.5
+    assert by_type["research"]["tasks_measured"] == 1
+    assert by_type["research"]["format_compliance_rate"] == 1.0
+
+    # The persisted snapshot in design_doc must also carry the by_type block.
+    container = project.design_doc[DESIGN_DOC_KEY]
+    persisted_snap = container["snapshots"][-1]
+    assert "format_compliance_by_type" in persisted_snap
+    assert persisted_snap["format_compliance_by_type"]["create"]["tasks_measured"] == 2
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_surfaces_format_compliance_by_type(db_session):
+    """read_baseline_with_drift includes format_compliance_by_type from the latest snapshot."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=0))
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="fix", errors=1))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    by_type = drift.get("format_compliance_by_type")
+    assert by_type is not None
+    assert "create" in by_type
+    assert "fix" in by_type
+    assert by_type["create"]["format_compliance_rate"] == 1.0
+    assert by_type["fix"]["format_compliance_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_format_compliance_by_type_none_for_old_snapshots(db_session):
+    """Snapshots that predate format_compliance_by_type return None gracefully."""
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {"captured_at": "2026-01-01T00:00:00"},
+                "snapshots": [
+                    # Old snapshot without format_compliance_by_type key.
+                    {"captured_at": "2026-01-01T00:00:00", FORMAT_COMPLIANCE_KEY: {}},
+                ],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    # format_compliance_by_type absent in the snapshot => surfaced as None.
+    assert drift.get("format_compliance_by_type") is None
+
+
+@pytest.mark.asyncio
+async def test_agent_format_compliance_snapshot_endpoint(client: AsyncClient, db_session):
+    """GET /api/agent/efficiency-snapshot/format-compliance returns by_type block."""
+    from app.auth import create_agent_token
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a task in this project so we have a valid agent token to use.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Add format-compliance tasks and write a snapshot.
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=0))
+    db_session.add(_make_format_compliance_typed_task(project.id, task_type="research", errors=1))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "vm-fc-test-1")
+    resp = await client.get(
+        "/api/agent/efficiency-snapshot/format-compliance",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert "captured_at" in data
+    assert FORMAT_COMPLIANCE_KEY in data
+    assert "format_compliance_by_type" in data
+    by_type = data["format_compliance_by_type"]
+    assert "create" in by_type
+    assert "research" in by_type
+    assert by_type["create"]["format_compliance_rate"] == 1.0
+    assert by_type["research"]["format_compliance_rate"] == 0.0

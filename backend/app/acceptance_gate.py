@@ -58,6 +58,7 @@ from app.payload_schemas import (
     _looks_like_test_file,
     read_acceptance_evidence,
 )
+from app.viewport_evidence import resolve_visual_evidence
 
 # ---------------------------------------------------------------------------
 # Shared fail-closed numeric comparison core (compute + code share this).
@@ -139,13 +140,14 @@ class AcceptanceGateVerdict:
     ``proven`` is a STRICTER axis than ``satisfied``: it is True only when the
     claim was machine-checked — a satisfied ``named_test`` (the test is in the
     diff, ran green under a real merge-test verdict, and exercises a changed
-    production seam). A satisfied ``observable_behavior`` / ``downstream_artifact``
-    is ``satisfied=True`` but ``proven=False`` (it proves only that a diff
-    shipped, not that the specific claim holds), and every fail-closed /
-    unsatisfied / undeclared case is ``proven=False``. ``satisfied`` semantics
-    and every downstream consumer of it are unchanged; ``proven`` is purely
-    additive so callers can distinguish machine-checked proof from
-    merely-delivered work.
+    production seam), a satisfied ``visual`` evidence pair whose uploaded
+    viewport screenshot matches the declared component/width, or a consumed
+    ``downstream_artifact``. A satisfied ``observable_behavior`` is
+    ``satisfied=True`` but ``proven=False`` (it proves only that a diff shipped,
+    not that the specific claim holds), and every fail-closed / unsatisfied /
+    undeclared case is ``proven=False``. ``satisfied`` semantics and every
+    downstream consumer of it are unchanged; ``proven`` is purely additive so
+    callers can distinguish machine-checked proof from merely-delivered work.
     """
 
     declared: bool
@@ -330,6 +332,48 @@ def _evaluate_downstream_artifact(
     )
 
 
+def _evaluate_visual(task: Task, evidence: AcceptanceEvidence) -> AcceptanceGateVerdict:
+    """Fail-closed gate for a ``visual`` acceptance declaration.
+
+    A visual declaration is satisfied only when the task context already
+    carries the uploaded viewport screenshot URI for the declared
+    ``(component, viewport_width)`` pair.  The shared resolver keeps the object
+    name derivation consistent with the upload/download path and fails closed
+    on absent or mismatched evidence.
+    """
+    if evidence.component is None or evidence.viewport_width is None:
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            "declared visual acceptance evidence is malformed or incomplete",
+        )
+
+    resolved = resolve_visual_evidence(
+        task.project_id,
+        evidence.component,
+        evidence.viewport_width,
+        task.context,
+    )
+    if not resolved["resolved"]:
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            "declared visual acceptance evidence but no matching viewport "
+            f"screenshot was uploaded for component {evidence.component!r} at "
+            f"{evidence.viewport_width}px",
+        )
+    return AcceptanceGateVerdict(
+        True,
+        True,
+        evidence.kind,
+        "visual acceptance evidence matches the uploaded viewport screenshot "
+        f"{resolved['object_name']}",
+        proven=True,
+    )
+
+
 def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     """Evaluate ``task``'s declared acceptance evidence, fail-closed.
 
@@ -353,6 +397,9 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
 
     if evidence.kind == "downstream_artifact":
         return _evaluate_downstream_artifact(evidence, changed)
+
+    if evidence.kind == "visual":
+        return _evaluate_visual(task, evidence)
 
     # observable_behavior carries no machine-checkable assertion the backend can
     # independently re-run at completion. To the extent checkable, require that

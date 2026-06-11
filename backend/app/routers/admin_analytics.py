@@ -21,6 +21,9 @@ from app.models import (
     Artifact,
     ArtifactType,
     ProjectMessage,
+    ReleaseVersion,
+    ImprovementLane,
+    PoolVm,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
 )
@@ -36,6 +39,11 @@ from app.review_heuristics import (
     LANE_CONFLICT,
     LANE_REVIEW_CONVERGENCE,
     classify_iteration_lane,
+)
+from app.digest_metrics import compute_lane_waste_diagnostics
+from app.routers.admin_pipeline_observability import (
+    _load_escalation_alerts,
+    _load_outer_loop_original_tasks,
 )
 
 # Re-export for test and internal use (single source of truth is vm_cost_rates)
@@ -283,6 +291,10 @@ def _compute_lane_diag(tasks: List[Task], pr_breakdown_limit: int) -> Dict[str, 
             "task_count": 0,
             "review_seconds": 0.0,
             "fix_seconds": 0.0,
+            "queue_seconds": 0.0,
+            "provision_seconds": 0.0,
+            "cold_start_seconds": 0.0,
+            "execution_seconds": 0.0,
             "first_created_at": None,
             "last_completed_at": None,
         }
@@ -318,10 +330,27 @@ def _compute_lane_diag(tasks: List[Task], pr_breakdown_limit: int) -> Dict[str, 
 
         if task.started_at:
             active_seconds = max((completed_at - task.started_at).total_seconds(), 0.0)
-            if payload_type == "review":
+            if payload_type in {"review", "panel_review"}:
                 phase["review_seconds"] += active_seconds
             elif payload_type in _LANE_DIAG_FIX_TYPES:
                 phase["fix_seconds"] += active_seconds
+
+        if task.created_at and task.vm_dispatched_at:
+            phase["queue_seconds"] += max(
+                (task.vm_dispatched_at - task.created_at).total_seconds(), 0.0
+            )
+        if task.vm_dispatched_at and task.vm_provisioned_at:
+            phase["provision_seconds"] += max(
+                (task.vm_provisioned_at - task.vm_dispatched_at).total_seconds(), 0.0
+            )
+        if task.vm_provisioned_at and task.vm_started_at:
+            phase["cold_start_seconds"] += max(
+                (task.vm_started_at - task.vm_provisioned_at).total_seconds(), 0.0
+            )
+        if task.vm_started_at and task.vm_stopped_at:
+            phase["execution_seconds"] += max(
+                (task.vm_stopped_at - task.vm_started_at).total_seconds(), 0.0
+            )
 
     lane_distribution: Dict[str, Dict[str, Any]] = {}
     for lane in _LANE_DIAG_LANES:
@@ -356,6 +385,10 @@ def _compute_lane_diag(tasks: List[Task], pr_breakdown_limit: int) -> Dict[str, 
                 "fix_seconds": fix_seconds,
                 "gap_seconds": gap_seconds,
                 "total_seconds": total_seconds,
+                "queue_seconds": phase["queue_seconds"],
+                "provision_seconds": phase["provision_seconds"],
+                "cold_start_seconds": phase["cold_start_seconds"],
+                "execution_seconds": phase["execution_seconds"],
             }
         )
 
@@ -415,13 +448,6 @@ async def get_task_cost_breakdown(
                     )
                 )
                 .where(*filters)
-                # Windowing is by completion time (derived in Python from
-                # status_log/context), so we cannot push the cutoff into SQL.
-                # Bound the materialized set instead: most-recently-created
-                # tasks first, capped at max_tasks, so a large unarchived
-                # backlog cannot OOM the worker. completed_at >= created_at,
-                # so ordering by created_at desc keeps the recent window's
-                # tasks at the front of the result set.
                 .order_by(Task.created_at.desc())
                 .limit(max_tasks)
             )
@@ -534,33 +560,108 @@ async def get_lane_diag(
     project_id: uuid.UUID | None = Query(None),
     max_tasks: int = Query(5000, ge=1, le=20000),
     pr_breakdown_limit: int = Query(100, ge=1, le=250),
+    version_number: int | None = Query(None, ge=1),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    """Return lane diagnostics for recent completed review/fix pipeline tasks."""
-    cutoff = _utcnow() - timedelta(days=7)
-    filters = [
-        Task.status == TaskStatus.COMPLETED,
-    ]
-    if project_id:
-        filters.append(Task.project_id == project_id)
+    """Return lane diagnostics for recent review/fix pipeline tasks.
 
-    tasks = (
+    Backward-compatible: the original keys (``lane_iteration_distribution``,
+    ``per_pr_phase_breakdown``, ``relay_counts_by_lane``, ``pr_count``,
+    ``task_count`` …) still aggregate only COMPLETED tasks whose
+    ``review_loop.pr_number`` is set and which completed in-window. Additively,
+    ``lane_waste`` reports chain-complete review/fix waste — including terminal
+    FAILED/CANCELLED iterations belonging to an in-window PR chain — using the
+    same PR-chain semantics as the outer-loop convergence surfaces.
+
+    When ``version_number`` is supplied, tasks are scoped to the time window of
+    that release version (``opened_at`` to ``promoted_at``, or now for open
+    versions). Version metadata is included in the response.
+    """
+    now = _utcnow()
+    version_meta: dict | None = None
+    if version_number is not None:
+        version_filters = [ReleaseVersion.version_number == version_number]
+        if project_id is not None:
+            version_filters.append(ReleaseVersion.project_id == project_id)
+        rv = (
+            (
+                await session.execute(
+                    select(ReleaseVersion).where(*version_filters).limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if rv is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"ReleaseVersion {version_number} not found",
+            )
+        window_start = rv.opened_at
+        window_end = rv.promoted_at or now
+        version_meta = {
+            "version_number": rv.version_number,
+            "phase": rv.phase,
+            "status": rv.status,
+            "opened_at": rv.opened_at.isoformat(),
+            "promoted_at": rv.promoted_at.isoformat() if rv.promoted_at else None,
+        }
+        cutoff = window_start
+    else:
+        cutoff = now - timedelta(days=7)
+        window_end = None
+
+    project_filter = [Task.project_id == project_id] if project_id else []
+
+    _task_columns = load_only(
+        Task.id,
+        Task.project_id,
+        Task.status,
+        Task.created_at,
+        Task.started_at,
+        Task.updated_at,
+        Task.status_log,
+        Task.payloads,
+        Task.context,
+        Task.fix_loop_history,
+        Task.archived,
+        Task.vm_dispatched_at,
+        Task.vm_provisioned_at,
+        Task.vm_started_at,
+        Task.vm_stopped_at,
+    )
+
+    # Legacy surface query: COMPLETED-only, original form — the legacy aggregates
+    # (lane_iteration_distribution, per_pr_phase_breakdown, task_count, pr_count,
+    # relay_counts_by_lane) must always use THIS pool so that FAILED/CANCELLED
+    # rows can never displace COMPLETED rows from the top-N and erode existing
+    # response keys.
+    # When version-scoped, push the created_at lower bound into SQL to keep
+    # per-version pools tight.  Upper bound is applied in Python (window_end).
+    completed_filters = [Task.status == TaskStatus.COMPLETED, *project_filter]
+    terminal_filters = [
+        Task.status.in_(
+            [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+        ),
+        *project_filter,
+    ]
+    if version_number is not None:
+        completed_filters.append(Task.created_at >= cutoff)
+        terminal_filters.append(Task.created_at >= cutoff)
+        # For closed versions push the upper bound into SQL so that out-of-window
+        # rows created after promoted_at cannot consume the max_tasks cap before
+        # any in-window row is fetched.
+        if window_end is not None and window_end != now:
+            completed_filters.append(Task.created_at < window_end)
+            terminal_filters.append(Task.created_at < window_end)
+
+    completed_tasks = (
         (
             await session.execute(
                 select(Task)
-                .options(
-                    load_only(
-                        Task.id,
-                        Task.project_id,
-                        Task.created_at,
-                        Task.started_at,
-                        Task.status_log,
-                        Task.payloads,
-                        Task.context,
-                    )
-                )
-                .where(*filters)
+                .options(_task_columns)
+                .where(*completed_filters)
                 .order_by(Task.created_at.desc())
                 .limit(max_tasks)
             )
@@ -568,21 +669,105 @@ async def get_lane_diag(
         .scalars()
         .all()
     )
+
+    def _in_window(task: Task) -> bool:
+        completed_at = _derive_completed_at(task)
+        if completed_at < cutoff:
+            return False
+        if window_end is not None and task.created_at is not None:
+            created = task.created_at
+            if created.tzinfo is not None:
+                created = created.replace(tzinfo=None)
+            if created >= window_end:
+                return False
+        return True
+
     scoped_tasks = [
         task
-        for task in tasks
-        if _review_loop_pr_number(task) and _derive_completed_at(task) >= cutoff
+        for task in completed_tasks
+        if _review_loop_pr_number(task) and _in_window(task)
     ]
     diag = _compute_lane_diag(scoped_tasks, pr_breakdown_limit)
-    diag.update(
-        {
-            "project_id": str(project_id) if project_id else None,
-            "window_days": 7,
-            "window_start": cutoff.isoformat(),
-            "max_tasks": max_tasks,
-            "truncated": len(tasks) >= max_tasks,
-        }
+
+    # Waste surface query: broadened to include terminal FAILED/CANCELLED rows so
+    # chain-complete waste diagnostics are accurate.  Issued separately so it
+    # cannot truncate the legacy COMPLETED pool above.
+    all_terminal_tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(_task_columns)
+                .where(*terminal_filters)
+                .order_by(Task.created_at.desc())
+                .limit(max_tasks)
+            )
+        )
+        .scalars()
+        .all()
     )
+    if window_end is not None:
+        all_terminal_tasks = [
+            t
+            for t in all_terminal_tasks
+            if t.created_at is None
+            or (t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at)
+            < window_end
+        ]
+    original_tasks = await _load_outer_loop_original_tasks(
+        session, all_terminal_tasks, project_id=project_id
+    )
+    alerts = await _load_escalation_alerts(
+        session, cutoff=cutoff, project_id=project_id
+    )
+    diag["lane_waste"] = compute_lane_waste_diagnostics(
+        [
+            *all_terminal_tasks,
+            *[
+                task
+                for oid, task in original_tasks.items()
+                if oid not in {str(t.id) for t in all_terminal_tasks}
+            ],
+        ],
+        cutoff,
+        chain_limit=pr_breakdown_limit,
+        escalation_alerts=alerts,
+    )
+    extra: dict = {
+        "project_id": str(project_id) if project_id else None,
+        "window_start": cutoff.isoformat(),
+        "max_tasks": max_tasks,
+        "truncated": len(completed_tasks) >= max_tasks
+        or len(all_terminal_tasks) >= max_tasks,
+    }
+    if version_number is None:
+        extra["window_days"] = 7
+    if version_meta is not None:
+        extra["version"] = version_meta
+    # For closed versions, include the persisted lane baseline if available.
+    # A closed version's tasks may age past the rolling query cap; the stored
+    # baseline remains reliably accessible even after tasks are archived.
+    if version_meta is not None and rv.status != "open":
+        try:
+            from app.lane_baseline_snapshot import DESIGN_DOC_KEY
+
+            _proj_doc = (
+                await session.execute(
+                    select(Project.design_doc).where(Project.id == rv.project_id)
+                )
+            ).scalar_one_or_none()
+            if isinstance(_proj_doc, dict):
+                _stored = (_proj_doc.get(DESIGN_DOC_KEY) or {}).get(
+                    str(rv.version_number)
+                )
+                if _stored is not None:
+                    extra["lane_baseline"] = _stored
+                    extra["lane_baseline_source"] = "persisted"
+        except Exception:
+            logger.exception(
+                "[LANE_DIAG] failed to load persisted baseline for v%d",
+                rv.version_number,
+            )
+    diag.update(extra)
     return diag
 
 
@@ -908,12 +1093,29 @@ async def get_open_prs(
     github_prs = await get_open_pull_requests(
         token, project.github_owner, project.github_repo
     )
+    open_pr_numbers = {
+        pr_number
+        for pr_number in (gh_pr.get("number") for gh_pr in github_prs)
+        if isinstance(pr_number, int)
+    }
+    if not open_pr_numbers:
+        payload = {
+            "open_prs": [],
+            "project_integration_branch": get_project_integration_branch(project),
+            "project_promotion_target": get_project_promotion_target(project),
+        }
+        _open_prs_cache[project_id] = (time.time(), payload)
+        return payload
 
     # Build task lookup: pr_number -> list of linked active tasks.
     # Terminal statuses (COMPLETED/FAILED/CANCELLED) are excluded — the widget
     # is for in-flight work. Dedupe by task.id since a task can match via
     # both a PR artifact and a context pr_number.
     pr_task_map: Dict[int, Dict[uuid.UUID, Task]] = {}
+
+    artifact_pr_filters = [
+        Artifact.pr_url.like(f"%/pull/{pr_num}") for pr_num in open_pr_numbers
+    ]
 
     # Source 1: PR artifacts (agent-created PRs — extract number from URL)
     artifact_rows = (
@@ -925,7 +1127,10 @@ async def get_open_prs(
                 Artifact.pr_url.isnot(None),
                 Task.project_id == project_id,
                 Task.status.in_(list(_ACTIVE_STATUSES)),
+                or_(*artifact_pr_filters),
             )
+            .order_by(Task.created_at.desc(), Artifact.pr_url)
+            .limit(500)
         )
     ).all()
     for art, task in artifact_rows:
@@ -936,6 +1141,13 @@ async def get_open_prs(
         pr_task_map.setdefault(pr_num, {})[task.id] = task
 
     # Source 2: Tasks with pr_number in context (review/fix pipeline + rollups)
+    context_pr_filters = [
+        Task.context["review_loop"]["pr_number"].as_integer() == pr_num
+        for pr_num in open_pr_numbers
+    ] + [
+        Task.context["rollup_pr_number"].as_integer() == pr_num
+        for pr_num in open_pr_numbers
+    ]
     active_tasks = (
         (
             await session.execute(
@@ -953,13 +1165,10 @@ async def get_open_prs(
                 .where(
                     Task.project_id == project_id,
                     Task.status.in_(list(_ACTIVE_STATUSES)),
-                    or_(
-                        Task.context["review_loop"]["pr_number"]
-                        .as_integer()
-                        .isnot(None),
-                        Task.context["rollup_pr_number"].as_integer().isnot(None),
-                    ),
+                    or_(*context_pr_filters),
                 )
+                .order_by(Task.created_at.desc())
+                .limit(500)
             )
         )
         .scalars()
@@ -967,11 +1176,13 @@ async def get_open_prs(
     )
     for t in active_tasks:
         ctx = t.context or {}
-        pr_num = (ctx.get("review_loop") or {}).get("pr_number") or ctx.get(
+        context_pr_num: int | None = (
+            (ctx.get("review_loop") or {}).get("pr_number") or ctx.get(
             "rollup_pr_number"
+            )
         )
-        if pr_num and isinstance(pr_num, int):
-            pr_task_map.setdefault(pr_num, {})[t.id] = t
+        if context_pr_num and isinstance(context_pr_num, int):
+            pr_task_map.setdefault(context_pr_num, {})[t.id] = t
 
     result = []
     for gh_pr in github_prs:
@@ -1011,3 +1222,199 @@ async def get_open_prs(
     }
     _open_prs_cache[project_id] = (time.time(), payload)
     return payload
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/improvement-lanes
+# ---------------------------------------------------------------------------
+
+
+@router.get("/improvement-lanes")
+async def get_improvement_lanes(
+    project_id: uuid.UUID = Query(...),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """List improvement lanes for a project with status, checkpoint, workspace, and cost fields.
+
+    Returns control-plane state for operators to monitor active and parked lanes:
+    which lanes are ACTIVE/PARKED, how far each got (checkpoint seq/phase/sha),
+    whether a workspace reservation is held and its reserved-idle cost, which
+    pilot arm a lane is in, and whether checkpoints are being lost.
+
+    ``shadow`` is True when the checkpoint contract is running but neither a warm
+    workspace reservation nor a pilot arm has been assigned — indicates shadow mode.
+
+    ``checkpoint_loss_count`` = lane.checkpoint_seq - len(lane.checkpoints).
+    checkpoint_seq is the count of checkpoints successfully written; checkpoints[]
+    is a rolling window capped at 50.  Any positive difference means older
+    checkpoints were evicted from the window.  Note: phase_requeues (phases that
+    failed to write any checkpoint) is a separate signal also included in the row.
+    """
+    lanes = (
+        (
+            await session.execute(
+                select(ImprovementLane)
+                .where(ImprovementLane.project_id == project_id)
+                .order_by(ImprovementLane.updated_at.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Resolve active warm-pool reservations for all returned lanes in one query.
+    lane_ids = [lane.id for lane in lanes]
+    reservations: Dict[uuid.UUID, PoolVm] = {}
+    if lane_ids:
+        pool_vms = (
+            (
+                await session.execute(
+                    select(PoolVm).where(PoolVm.reserved_lane_id.in_(lane_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for pvm in pool_vms:
+            if pvm.reserved_lane_id is not None:
+                reservations[pvm.reserved_lane_id] = pvm
+
+    now = _utcnow()
+    rows: List[Dict[str, Any]] = []
+    for lane in lanes:
+        # Derive age of the most recent checkpoint from its created_at field.
+        last_checkpoint_age_seconds: float | None = None
+        if lane.checkpoints:
+            last_cp = lane.checkpoints[-1]
+            try:
+                cp_created_at = datetime.fromisoformat(last_cp["created_at"])
+                # Strip tz if present (checkpoints write naive UTC via _utcnow).
+                if cp_created_at.tzinfo is not None:
+                    cp_created_at = cp_created_at.replace(tzinfo=None)
+                last_checkpoint_age_seconds = max(
+                    (now - cp_created_at).total_seconds(), 0.0
+                )
+            except (KeyError, ValueError, TypeError):
+                pass
+
+        # checkpoint_loss_count: checkpoints written but evicted from the rolling window.
+        checkpoint_loss_count = max(
+            0, (lane.checkpoint_seq or 0) - len(lane.checkpoints or [])
+        )
+
+        # shadow: checkpoint contract running but no reservation and no pilot arm yet.
+        shadow = (
+            (lane.checkpoint_seq or 0) > 0
+            and lane.workspace_state == "COLD"
+            and lane.pilot_arm is None
+        )
+
+        # Reservation fields from PoolVm if a reservation is active for this lane.
+        pvm = reservations.get(lane.id)
+        reservation_expires_at: str | None = None
+        reserved_vm_instance_id: str | None = None
+        if pvm is not None:
+            reservation_expires_at = (
+                pvm.reservation_expires_at.isoformat()
+                if pvm.reservation_expires_at
+                else None
+            )
+            reserved_vm_instance_id = pvm.vm_instance_id
+
+        rows.append(
+            {
+                "id": str(lane.id),
+                "status": lane.status,
+                "direction_id": lane.direction_id,
+                "branch": lane.branch_name,
+                "last_checkpoint_phase": lane.last_checkpoint_phase,
+                "last_checkpoint_seq": lane.checkpoint_seq,
+                "last_checkpoint_sha": lane.last_checkpoint_sha,
+                "last_checkpoint_age_seconds": last_checkpoint_age_seconds,
+                "checkpoint_loss_count": checkpoint_loss_count,
+                "workspace_state": lane.workspace_state,
+                "workspace_vm_instance_id": lane.workspace_vm_instance_id,
+                "reservation_expires_at": reservation_expires_at,
+                "reserved_vm_instance_id": reserved_vm_instance_id,
+                "pilot_arm": lane.pilot_arm,
+                "phase_requeues": lane.phase_requeues,
+                "llm_input_tokens_total": lane.llm_input_tokens_total,
+                "llm_output_tokens_total": lane.llm_output_tokens_total,
+                "vm_cost_usd_total": round(lane.vm_cost_usd_total or 0.0, 6),
+                "reserved_idle_cost_usd_total": round(
+                    lane.reserved_idle_cost_usd_total or 0.0, 6
+                ),
+                "shadow": shadow,
+                "created_at": lane.created_at.isoformat() if lane.created_at else None,
+                "updated_at": lane.updated_at.isoformat() if lane.updated_at else None,
+            }
+        )
+
+    return {
+        "lanes": rows,
+        "total_returned": len(rows),
+        "offset": offset,
+        "limit": limit,
+        "project_id": str(project_id),
+    }
+
+
+@router.get("/lane-baselines")
+async def get_lane_baselines(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return all persisted per-version lane baselines for a project.
+
+    Baselines are written by ``persist_version_lane_baseline`` when a
+    ReleaseVersion is promoted or abandoned.  They capture lane-diagnostic
+    aggregates (phase wall-clock, iteration distribution, waste-source
+    classification) plus per-PR relay medians for the v10 lane-pilot comparison.
+
+    Up to the last 20 versions are stored under ``project.design_doc``; reads
+    are cheap because the data lives on the already-loaded project row.
+
+    Returns 404 when the project is not found.  Returns an empty
+    ``baselines`` list when the project exists but has no stored baselines yet.
+    """
+    from app.lane_baseline_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+
+    proj_doc = (
+        await session.execute(
+            select(Project.design_doc).where(Project.id == project_id)
+        )
+    ).scalar_one_or_none()
+
+    if proj_doc is None:
+        # Distinguish "project not found" from "project has null design_doc"
+        exists = (
+            await session.execute(
+                select(Project.id).where(Project.id == project_id)
+            )
+        ).scalar_one_or_none()
+        if exists is None:
+            from fastapi import HTTPException  # noqa: PLC0415
+            raise HTTPException(status_code=404, detail="Project not found")
+
+    raw_baselines: dict = {}
+    if isinstance(proj_doc, dict):
+        raw_baselines = proj_doc.get(DESIGN_DOC_KEY) or {}
+
+    # Sort versions descending so the most recent appears first.
+    sorted_baselines = sorted(
+        raw_baselines.items(),
+        key=lambda kv: int(kv[0]),
+        reverse=True,
+    )
+
+    return {
+        "project_id": str(project_id),
+        "count": len(sorted_baselines),
+        "baselines": [v for _, v in sorted_baselines],
+    }

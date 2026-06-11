@@ -13,7 +13,7 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -69,6 +69,7 @@ from app.github import (
     get_pull_request,
 )
 from app.broadcast import broadcast_to_project
+from app.claim_analytics import stamp_cold_claim_timing
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_themes,
     aggregate_sr_co_failure_pairs,
@@ -117,6 +118,58 @@ def _effective_repo_map_holdback(project: object) -> float:
     if project is None:
         return default
     return get_effective_holdback_fraction(get_trial_verdicts(project), "repo_map", default)
+
+
+def _effective_module_interfaces_holdback(project: object) -> float:
+    """Return the module_interfaces holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("module_interfaces_holdback_fraction", 0.0))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "module_interfaces", default)
+
+
+def _effective_related_tests_holdback(project: object) -> float:
+    """Return the related_tests holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("related_tests_holdback_fraction", 0.0))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "related_tests", default)
+
+
+def _effective_affected_consumers_holdback(project: object) -> float:
+    """Return the affected_consumers holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("affected_consumers_holdback_fraction", 0.0))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "affected_consumers", default)
+
+
+def _effective_diagnostics_after_edit_holdback(project: object) -> float:
+    """Return the diagnostics_after_edit holdback fraction for *project*, consulting trial verdicts."""
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    default = float(_shared_state.runtime_config.get("diagnostics_after_edit_holdback_fraction", 0.1))
+    if project is None:
+        return default
+    return get_effective_holdback_fraction(get_trial_verdicts(project), "diagnostics_after_edit", default)
 
 
 def _log_agent_auth_reject(
@@ -777,33 +830,7 @@ async def claim_task(
         task.last_heartbeat = (
             _utcnow()
         )  # Immediate heartbeat — don't wait 30s for agent interval
-        # Record time-to-claim covering the full dispatch->agent-ready interval.
-        # Use vm_dispatched_at (set before GCE create call) when available;
-        # fall back to vm_provisioned_at for tasks created before migration 0113.
-        _cold_start_anchor = task.vm_dispatched_at or task.vm_provisioned_at
-        if _cold_start_anchor:
-            claim_latency = (task.last_heartbeat - _cold_start_anchor).total_seconds()
-            _stgs = dict((task.context or {}).get("_cold_start_stages") or {})
-            _stgs["claim_at"] = task.last_heartbeat.isoformat()
-            # Backfill provision_slot_acquired_at from compute's in-memory store if
-            # not already present — lets efficiency snapshot compute dispatch_to_slot_ms.
-            if "provision_slot_acquired_at" not in _stgs and task.vm_instance_id:
-                from app.compute import get_provision_slot_acquired_at as _get_slot_at
-
-                _slot_ts = _get_slot_at(task.vm_instance_id)
-                if _slot_ts:
-                    _stgs["provision_slot_acquired_at"] = _slot_ts
-            task.context = {
-                **(task.context or {}),
-                "claim_latency_secs": round(claim_latency, 1),
-                "_cold_start_stages": _stgs,
-            }
-            # Promote claim_latency to the dedicated vm_cold_start_ms column
-            # for the efficiency direction (d-91d8dede). Guarded by IS NULL
-            # so re-provision restamps of vm_provisioned_at (orchestrator.py
-            # ~line 3240) cannot clobber the genuine first-claim measurement.
-            if task.vm_cold_start_ms is None:
-                task.vm_cold_start_ms = max(0, int(claim_latency * 1000))
+        stamp_cold_claim_timing(task)
         session.add(task)
         await session.commit()
         await session.refresh(task)
@@ -897,6 +924,13 @@ async def claim_task(
             "promotion_target": project_promotion_target,
             "integration_branch": project_integration_branch,
             "repo_map_holdback_fraction": _effective_repo_map_holdback(project),
+            "module_interfaces_holdback_fraction": _effective_module_interfaces_holdback(project),
+            "related_tests_holdback_fraction": _effective_related_tests_holdback(project),
+            "affected_consumers_holdback_fraction": _effective_affected_consumers_holdback(project),
+            "diagnostics_after_edit_holdback_fraction": _effective_diagnostics_after_edit_holdback(project),
+            "diagnostics_after_edit_enabled": bool(
+                _shared_state.runtime_config.get("diagnostics_after_edit_enabled", True)
+            ),
         }
 
     task_type = _claimed_first_payload.get("type", "")
@@ -969,91 +1003,74 @@ async def claim_task(
         task_type in ("research", "plan", "create", "fix", "refactor", "review")
         or task_type in _PEER_CODE_ANALYSIS_TYPES
     ):
-        # Active tasks (IN_PROGRESS or EVALUATING) in the same project.
-        # Phase B4 (H-P6): load_only drops status_log/plan_output JSONB.
-        # Reads below: id, title, first_payload (payloads), status, context.
-        # Audit R3-W2 (H6): cap fetch at 50 rows. The downstream loop
-        # consumes these as a bounded set (rendered into the agent's
-        # related-tasks payload), so unbounded fetch on a busy project
-        # could pull 500 MB before truncating in Python.
-        active_stmt = (
-            select(Task)
-            .options(
-                load_only(
-                    Task.id,
-                    Task.title,
-                    Task.status,
-                    Task.payloads,
-                    Task.context,
-                    Task.project_id,
+        # Active and queued tasks in the same project. The downstream payload
+        # only needs the latest context snippets, so keep one round-trip while
+        # preserving the previous per-status caps. A per-status ROW_NUMBER()
+        # window prevents queued work from crowding out active work (or vice
+        # versa) when one bucket is much newer than the other.
+        _active_queued_loadonly = load_only(
+            Task.id,
+            Task.title,
+            Task.status,
+            Task.payloads,
+            Task.context,
+            Task.project_id,
+        )
+        _active_queued_ranked = (
+            select(
+                Task.id.label("task_id"),
+                Task.status.label("task_status"),
+                func.row_number()
+                .over(
+                    partition_by=Task.status,
+                    order_by=Task.created_at.desc(),
                 )
+                .label("rn"),
             )
             .where(
                 Task.project_id == task.project_id,
                 Task.id != task.id,
-                Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                Task.status.in_(
+                    [TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING, TaskStatus.QUEUED]
+                ),
             )
-            .order_by(Task.created_at.desc())
-            .limit(50)
+            .cte("active_queued_ranked")
         )
-        active_tasks_rows = (await session.execute(active_stmt)).scalars().all()
+        active_queued_stmt = (
+            select(Task)
+            .select_from(Task)
+            .join(_active_queued_ranked, _active_queued_ranked.c.task_id == Task.id)
+            .options(_active_queued_loadonly)
+            .where(_active_queued_ranked.c.rn <= 50)
+            .order_by(Task.created_at.desc())
+        )
+        active_queued_rows = (await session.execute(active_queued_stmt)).scalars().all()
         active_tasks = []
-        for t in active_tasks_rows:
-            p = t.first_payload
-            active_tasks.append(
-                {
-                    "id": str(t.id),
-                    "title": t.title,
-                    "task_type": p.get("type", ""),
-                    "status": t.status,
-                    "prompt": p.get("prompt", p.get("description", "")),
-                    "related_files": (t.context or {}).get("related_files", []),
-                    "direction_id": (t.context or {}).get("direction_id"),
-                }
-            )
-
-        # Queued tasks in the same project. Same projection as active_stmt.
-        # Audit R3-W2 (H6): cap fetch at 50 rows (same rationale as above).
-        queued_stmt = (
-            select(Task)
-            .options(
-                load_only(
-                    Task.id,
-                    Task.title,
-                    Task.status,
-                    Task.payloads,
-                    Task.context,
-                    Task.project_id,
-                )
-            )
-            .where(
-                Task.project_id == task.project_id,
-                Task.id != task.id,
-                Task.status == TaskStatus.QUEUED,
-            )
-            .order_by(Task.created_at.desc())
-            .limit(50)
-        )
-        queued_tasks_rows = (await session.execute(queued_stmt)).scalars().all()
         queued_tasks = []
-        for t in queued_tasks_rows:
+        for t in active_queued_rows:
             p = t.first_payload
-            queued_tasks.append(
-                {
-                    "id": str(t.id),
-                    "title": t.title,
-                    "task_type": p.get("type", ""),
-                    "prompt": p.get("prompt", p.get("description", "")),
-                    "related_files": (t.context or {}).get("related_files", []),
-                    "direction_id": (t.context or {}).get("direction_id"),
-                }
-            )
+            entry = {
+                "id": str(t.id),
+                "title": t.title,
+                "task_type": p.get("type", ""),
+                "prompt": p.get("prompt", p.get("description", "")),
+                "related_files": (t.context or {}).get("related_files", []),
+                "direction_id": (t.context or {}).get("direction_id"),
+            }
+            if t.status == TaskStatus.QUEUED:
+                queued_tasks.append(entry)
+            else:
+                entry["status"] = t.status
+                active_tasks.append(entry)
+        active_tasks = active_tasks[:50]
+        queued_tasks = queued_tasks[:50]
 
-        # Recently completed tasks (10 most recent): completed first, then failed/cancelled.
-        # Phase B4 (H-P6): drop status_log/plan_output JSONB. Loop reads below
-        # also call classify_failure(t) which touches latest_status_message,
-        # context, payloads — all included.
-        _completed_loadonly = load_only(
+        # Recently completed tasks, high-iteration lessons, and direction-
+        # scoped historical context all come from the same terminal-task
+        # window. Rank terminal tasks by status first so a task with many
+        # artifacts cannot burn through the row budget before its peers are
+        # even visible, then join artifacts only for the selected task ids.
+        _terminal_loadonly = load_only(
             Task.id,
             Task.title,
             Task.status,
@@ -1066,59 +1083,149 @@ async def claim_task(
             Task.account_id,
             Task.provider,
             Task.model,
+            Task.strategic_cycle_id,
+            Task.fix_loop_history,
         )
-        completed_stmt = (
-            select(Task)
-            .options(_completed_loadonly)
+        _terminal_ranked = (
+            select(
+                Task.id.label("task_id"),
+                Task.status.label("task_status"),
+                func.row_number()
+                .over(
+                    partition_by=Task.status,
+                    order_by=Task.created_at.desc(),
+                )
+                .label("rn"),
+            )
             .where(
                 Task.project_id == task.project_id,
                 Task.id != task.id,
-                Task.status == TaskStatus.COMPLETED,
-            )
-            .order_by(Task.created_at.desc())
-            .limit(10)
-        )
-        completed_tasks_rows = list(
-            (await session.execute(completed_stmt)).scalars().all()
-        )
-
-        failed_cancelled_stmt = (
-            select(Task)
-            .options(_completed_loadonly)
-            .where(
-                Task.project_id == task.project_id,
-                Task.id != task.id,
-                Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
-            )
-            .order_by(Task.created_at.desc())
-            .limit(max(0, 15 - len(completed_tasks_rows)))
-        )
-        failed_cancelled_rows = (
-            (await session.execute(failed_cancelled_stmt)).scalars().all()
-        )
-        completed_tasks_rows = completed_tasks_rows + list(failed_cancelled_rows)
-
-        completed_task_ids = [t.id for t in completed_tasks_rows]
-        completed_artifacts: list = []
-        if completed_task_ids:
-            art_stmt = select(Artifact).where(
-                Artifact.task_id.in_(completed_task_ids),
-                Artifact.artifact_type.in_(
-                    [ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]
+                Task.status.in_(
+                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
                 ),
             )
-            completed_artifacts = (await session.execute(art_stmt)).scalars().all()
+            .cte("terminal_ranked")
+        )
+        terminal_stmt = (
+            select(Task, Artifact)
+            .select_from(Task)
+            .join(_terminal_ranked, _terminal_ranked.c.task_id == Task.id)
+            .options(_terminal_loadonly)
+            .outerjoin(
+                Artifact,
+                and_(
+                    Artifact.task_id == Task.id,
+                    Artifact.artifact_type.in_(
+                        [ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]
+                    ),
+                ),
+            )
+            .where(
+                or_(
+                    and_(
+                        _terminal_ranked.c.task_status == TaskStatus.COMPLETED,
+                        _terminal_ranked.c.rn <= 10,
+                    ),
+                    and_(
+                        _terminal_ranked.c.task_status.in_(
+                            [TaskStatus.FAILED, TaskStatus.CANCELLED]
+                        ),
+                        _terminal_ranked.c.rn <= 15,
+                    ),
+                )
+            )
+            .order_by(Task.created_at.desc())
+        )
+        terminal_rows = (await session.execute(terminal_stmt)).all()
+        terminal_tasks_by_id: dict = {}
+        terminal_task_order: list = []
+        terminal_artifacts_by_task: dict = {}
+        for terminal_task, terminal_artifact in terminal_rows:
+            if terminal_task.id not in terminal_tasks_by_id:
+                terminal_tasks_by_id[terminal_task.id] = terminal_task
+                terminal_task_order.append(terminal_task.id)
+            if terminal_artifact is not None:
+                terminal_artifacts_by_task.setdefault(terminal_task.id, []).append(
+                    terminal_artifact
+                )
+        terminal_tasks_rows = [terminal_tasks_by_id[tid] for tid in terminal_task_order]
+        completed_tasks_rows = [
+            t for t in terminal_tasks_rows if t.status == TaskStatus.COMPLETED
+        ][:10]
+        failed_cancelled_rows = [
+            t
+            for t in terminal_tasks_rows
+            if t.status in [TaskStatus.FAILED, TaskStatus.CANCELLED]
+        ][: max(0, 15 - len(completed_tasks_rows))]
 
-        artifacts_by_completed_task: dict = {}
-        for a in completed_artifacts:
-            artifacts_by_completed_task.setdefault(a.task_id, []).append(a)
+        _history_loadonly = load_only(
+            Task.id,
+            Task.title,
+            Task.status,
+            Task.payloads,
+            Task.context,
+            Task.description,
+            Task.created_at,
+            Task.latest_status_message,
+            Task.account_id,
+            Task.provider,
+            Task.model,
+            Task.strategic_cycle_id,
+            Task.fix_loop_history,
+        )
+        _history_ranked = (
+            select(
+                Task.id.label("task_id"),
+                func.row_number()
+                .over(order_by=Task.created_at.desc())
+                .label("rn"),
+            )
+            .where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status.in_(
+                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                ),
+            )
+            .cte("terminal_history_ranked")
+        )
+        history_stmt = (
+            select(Task, Artifact)
+            .select_from(Task)
+            .join(_history_ranked, _history_ranked.c.task_id == Task.id)
+            .options(_history_loadonly)
+            .outerjoin(
+                Artifact,
+                and_(
+                    Artifact.task_id == Task.id,
+                    Artifact.artifact_type.in_(
+                        [ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]
+                    ),
+                ),
+            )
+            .where(_history_ranked.c.rn <= 50)
+            .order_by(Task.created_at.desc())
+        )
+        history_rows = (await session.execute(history_stmt)).all()
+        history_tasks_by_id: dict = {}
+        history_task_order: list = []
+        history_artifacts_by_task: dict = {}
+        for history_task, history_artifact in history_rows:
+            if history_task.id not in history_tasks_by_id:
+                history_tasks_by_id[history_task.id] = history_task
+                history_task_order.append(history_task.id)
+            if history_artifact is not None:
+                history_artifacts_by_task.setdefault(history_task.id, []).append(
+                    history_artifact
+                )
+        history_tasks_rows = [history_tasks_by_id[tid] for tid in history_task_order]
 
         from app.failure_classification import classify_failure
 
         recently_completed_tasks = []
         for t in completed_tasks_rows:
             p = t.first_payload
-            task_artifacts = artifacts_by_completed_task.get(t.id, [])
+            task_artifacts = terminal_artifacts_by_task.get(t.id, [])
             pr_url = t.context.get("rollup_pr_url") if t.context else None
             if not pr_url:
                 for a in task_artifacts:
@@ -1165,6 +1272,54 @@ async def claim_task(
                     "changed_files": t_changed_files,
                 }
             )
+        for t in failed_cancelled_rows:
+            p = t.first_payload
+            task_artifacts = terminal_artifacts_by_task.get(t.id, [])
+            pr_url = t.context.get("rollup_pr_url") if t.context else None
+            if not pr_url:
+                for a in task_artifacts:
+                    if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
+                        pr_url = a.pr_url
+                        break
+            research_findings_summary = None
+            for a in task_artifacts:
+                if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
+                    research_findings_summary = a.logs[:8000]
+                    break
+            t_ctx = t.context or {}
+            t_prompt = (p.get("prompt") or p.get("description") or t.description or "")[
+                :300
+            ]
+            t_related_files = (t_ctx.get("related_files") or [])[:10]
+            t_direction_id = t_ctx.get("direction_id")
+            t_changed_files = (t_ctx.get("_pr_changed_files") or [])[:10] or None
+            recently_completed_tasks.append(
+                {
+                    "id": str(t.id),
+                    "title": t.title,
+                    "task_type": p.get("type", ""),
+                    "status": t.status.value
+                    if hasattr(t.status, "value")
+                    else str(t.status),
+                    "pr_url": pr_url,
+                    "research_findings_summary": research_findings_summary,
+                    "failure_reason": (t.latest_status_message or "")[:500]
+                    if t.latest_status_message
+                    else None,
+                    "failure_class": classify_failure(t)
+                    if t.latest_status_message
+                    else None,
+                    "review_iterations": (t_ctx.get("review_loop", {}) or {}).get(
+                        "iteration", 0
+                    )
+                    if t_ctx.get("review_loop")
+                    else None,
+                    "prompt": t_prompt or None,
+                    "related_files": t_related_files,
+                    "direction_id": t_direction_id,
+                    "changed_files": t_changed_files,
+                }
+            )
 
         # Build lessons from high-iteration tasks (3+ review cycles).
         # Phase B4 (H-P6): drop status_log/plan_output. Loop reads context,
@@ -1177,34 +1332,7 @@ async def claim_task(
         # request transaction and 500s claim_task downstream (incident
         # 2026-05-29; see reference_load_only_lazy_load_trap).
         lessons = []
-        high_iter_stmt = (
-            select(Task)
-            .options(
-                load_only(
-                    Task.id,
-                    Task.title,
-                    Task.status,
-                    Task.payloads,
-                    Task.context,
-                    Task.latest_status_message,
-                    Task.created_at,
-                    Task.updated_at,
-                    Task.project_id,
-                    Task.account_id,
-                    Task.provider,
-                    Task.model,
-                    Task.strategic_cycle_id,
-                    Task.fix_loop_history,
-                )
-            )
-            .where(
-                Task.project_id == task.project_id,
-                Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
-            )
-            .order_by(Task.created_at.desc())
-            .limit(50)
-        )
-        high_iter_rows = (await session.execute(high_iter_stmt)).scalars().all()
+        high_iter_rows = history_tasks_rows
         for ht in high_iter_rows:
             review_loop = (ht.context or {}).get("review_loop", {})
             if not review_loop:
@@ -1256,53 +1384,18 @@ async def claim_task(
         current_direction_id = (task.context or {}).get("direction_id")
         direction_recent_tasks = []
         if current_direction_id:
-            # Phase B4 (H-P6): drop status_log/plan_output. Loop reads same
-            # set as completed_stmt — id/title/status/context/payloads/etc.
-            dir_stmt = (
-                select(Task)
-                .options(
-                    load_only(
-                        Task.id,
-                        Task.title,
-                        Task.status,
-                        Task.payloads,
-                        Task.context,
-                        Task.project_id,
-                        Task.description,
-                        Task.created_at,
-                        Task.latest_status_message,
-                        Task.account_id,
-                        Task.provider,
-                        Task.model,
-                    )
-                )
-                .where(
-                    Task.project_id == task.project_id,
-                    Task.id != task.id,
-                    Task.status.in_(
-                        [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
-                    ),
-                )
-                .order_by(Task.created_at.desc())
-                .limit(50)
-            )
-            dir_rows = (await session.execute(dir_stmt)).scalars().all()
             dir_matches = [
                 t
-                for t in dir_rows
+                for t in history_tasks_rows
                 if (t.context or {}).get("direction_id") == current_direction_id
             ][:5]
             dir_match_ids = [t.id for t in dir_matches]
             dir_artifacts_by_task: dict = {}
             if dir_match_ids:
-                dir_art_stmt = select(Artifact).where(
-                    Artifact.task_id.in_(dir_match_ids),
-                    Artifact.artifact_type.in_(
-                        [ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]
-                    ),
-                )
-                for a in (await session.execute(dir_art_stmt)).scalars().all():
-                    dir_artifacts_by_task.setdefault(a.task_id, []).append(a)
+                for dir_match_id in dir_match_ids:
+                    dir_artifacts_by_task[dir_match_id] = history_artifacts_by_task.get(
+                        dir_match_id, []
+                    )
             for t in dir_matches:
                 p = t.first_payload
                 t_ctx = t.context or {}
@@ -1365,14 +1458,13 @@ async def claim_task(
                 ),
             )
             .distinct()
+            .order_by(Artifact.pr_url)
             .limit(20)
         )
         open_prs_rows = (await session.execute(open_prs_stmt)).scalars().all()
 
-        sibling_tasks = []
+        sibling_tasks: list[dict] = []
         if task.parent_task_id:
-            # Phase B4 (H-P6): drop status_log/plan_output. Reads: id/title/
-            # status/context/payloads — all included.
             _sibling_loadonly = load_only(
                 Task.id,
                 Task.title,
@@ -1388,9 +1480,17 @@ async def claim_task(
                 Task.provider,
                 Task.model,
             )
-            sibling_result = await session.execute(
-                select(Task)
-                .options(_sibling_loadonly)
+            _sibling_ranked = (
+                select(
+                    Task.id.label("task_id"),
+                    Task.status.label("task_status"),
+                    func.row_number()
+                    .over(
+                        partition_by=Task.status,
+                        order_by=Task.created_at.desc(),
+                    )
+                    .label("rn"),
+                )
                 .where(
                     Task.parent_task_id == task.parent_task_id,
                     Task.id != task.id,
@@ -1399,10 +1499,80 @@ async def claim_task(
                             TaskStatus.QUEUED,
                             TaskStatus.PROVISIONING,
                             TaskStatus.IN_PROGRESS,
+                            TaskStatus.COMPLETED,
+                            TaskStatus.FAILED,
+                            TaskStatus.CANCELLED,
                         ]
                     ),
                 )
+                .cte("sibling_ranked")
             )
+            sibling_stmt = (
+                select(Task, Artifact)
+                .select_from(Task)
+                .join(_sibling_ranked, _sibling_ranked.c.task_id == Task.id)
+                .options(_sibling_loadonly)
+                .outerjoin(
+                    Artifact,
+                    and_(
+                        Artifact.task_id == Task.id,
+                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    ),
+                )
+                .where(
+                    Task.parent_task_id == task.parent_task_id,
+                    Task.id != task.id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.COMPLETED,
+                            TaskStatus.FAILED,
+                            TaskStatus.CANCELLED,
+                        ]
+                    ),
+                )
+                .where(
+                    or_(
+                        _sibling_ranked.c.task_status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                            ]
+                        ),
+                        and_(
+                            _sibling_ranked.c.task_status.in_(
+                                [
+                                    TaskStatus.COMPLETED,
+                                    TaskStatus.FAILED,
+                                    TaskStatus.CANCELLED,
+                                ]
+                            ),
+                            _sibling_ranked.c.rn <= 5,
+                        ),
+                    )
+                )
+                .order_by(Task.created_at.desc())
+            )
+            sibling_rows = (await session.execute(sibling_stmt)).all()
+            sibling_tasks_by_id: dict = {}
+            sibling_task_order: list = []
+            sibling_pr_urls: dict = {}
+            for sib, sib_art in sibling_rows:
+                if sib.id not in sibling_tasks_by_id:
+                    sibling_tasks_by_id[sib.id] = sib
+                    sibling_task_order.append(sib.id)
+                if sib_art is not None and sib_art.pr_url:
+                    sibling_pr_urls.setdefault(sib.id, sib_art.pr_url)
+            sibling_rows = [sibling_tasks_by_id[sid] for sid in sibling_task_order]
+            active_siblings = [
+                sib
+                for sib in sibling_rows
+                if sib.status
+                in [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+            ]
             sibling_tasks.extend(
                 {
                     "id": str(sib.id),
@@ -1412,32 +1582,14 @@ async def claim_task(
                     "task_type": (sib.first_payload).get("type", ""),
                     "active": True,
                 }
-                for sib in sibling_result.scalars().all()
+                for sib in active_siblings
             )
-
-            terminal_sibling_result = await session.execute(
-                select(Task)
-                .options(_sibling_loadonly)
-                .where(
-                    Task.parent_task_id == task.parent_task_id,
-                    Task.id != task.id,
-                    Task.status.in_(
-                        [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
-                    ),
-                )
-                .order_by(Task.created_at.desc())
-                .limit(5)
-            )
-            terminal_siblings = list(terminal_sibling_result.scalars().all())
-            terminal_sibling_pr_urls: dict = {}
-            if terminal_siblings:
-                sib_art_stmt = select(Artifact).where(
-                    Artifact.task_id.in_([s.id for s in terminal_siblings]),
-                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                    Artifact.pr_url.isnot(None),
-                )
-                for art in (await session.execute(sib_art_stmt)).scalars().all():
-                    terminal_sibling_pr_urls.setdefault(art.task_id, art.pr_url)
+            terminal_siblings = [
+                sib
+                for sib in sibling_rows
+                if sib.status
+                in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ][:5]
             for sib in terminal_siblings:
                 sib_status = (
                     sib.status.value
@@ -1446,7 +1598,7 @@ async def claim_task(
                 )
                 pr_url = (sib.context or {}).get(
                     "rollup_pr_url"
-                ) or terminal_sibling_pr_urls.get(sib.id)
+                ) or sibling_pr_urls.get(sib.id)
                 entry = {
                     "id": str(sib.id),
                     "title": sib.title,
@@ -1486,7 +1638,7 @@ async def claim_task(
                 from app.review_learning import _categorize_review_issues
 
                 cutoff_14d = _utcnow() - timedelta(days=14)
-                combined_review_history = []
+                combined_review_history: list[dict] = []
                 for ht in high_iter_rows:
                     # Task.created_at is TIMESTAMPTZ since 0061; cutoff_14d is naive.
                     ht_created = _to_naive_utc(ht.created_at)
@@ -3728,16 +3880,13 @@ async def get_viewport_failure_screenshot_upload_url(
         raise HTTPException(status_code=404, detail="Task not found")
 
     import datetime as _dt
-    import re as _re
 
     from google.cloud import storage as _gcs
 
     from app.storage import ARTIFACT_BUCKET_NAME, GCP_PROJECT_ID
+    from app.viewport_evidence import viewport_object_name
 
-    safe_component = _re.sub(r"[^A-Za-z0-9._-]", "_", req.component)[:100]
-    object_name = (
-        f"viewport-failures/{task.project_id}/{safe_component}-{req.width}.png"
-    )
+    object_name = viewport_object_name(task.project_id, req.component, req.width)
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
 
     def _generate() -> str:
@@ -4181,6 +4330,31 @@ async def agent_heartbeat(
         ctx = dict(task.context or {})
         ctx["_repo_map_arm"] = req.repo_map_arm
         task.context = ctx
+    if req.module_interfaces_arm is not None and (task.context or {}).get("_module_interfaces_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_module_interfaces_arm"] = req.module_interfaces_arm
+        task.context = ctx
+    if req.related_tests_arm is not None and (task.context or {}).get("_related_tests_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_related_tests_arm"] = req.related_tests_arm
+        task.context = ctx
+    if req.affected_consumers_arm is not None and (task.context or {}).get("_affected_consumers_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_affected_consumers_arm"] = req.affected_consumers_arm
+        task.context = ctx
+
+    # Write-once diagnostics-after-edit capability flag. Set on the first
+    # heartbeat that carries had_diagnostics_after_edit; mirrors had_repo_map pattern.
+    if req.had_diagnostics_after_edit is not None and (task.context or {}).get("_had_diagnostics_after_edit") is None:
+        ctx = dict(task.context or {})
+        ctx["_had_diagnostics_after_edit"] = req.had_diagnostics_after_edit
+        task.context = ctx
+    # Write-once diagnostics-after-edit arm-assignment flag. Records the
+    # deterministic holdback vs treatment assignment for intent-to-treat analysis.
+    if req.diagnostics_after_edit_arm is not None and (task.context or {}).get("_diagnostics_after_edit_arm") is None:
+        ctx = dict(task.context or {})
+        ctx["_diagnostics_after_edit_arm"] = req.diagnostics_after_edit_arm
+        task.context = ctx
 
     # Per-task LLM telemetry (efficiency direction d-91d8dede). Cumulative
     # counters posted on every heartbeat — last write wins. Backwards-
@@ -4362,7 +4536,8 @@ async def spawn_subtask(
         try:
             payload = validate_task_payload(payload)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+            raise HTTPException(status_code=422, detail="Invalid request") from exc
         parent_payload = parent_task.first_payload
         parent_context = {
             "parent_task_id": str(parent_task.id),

@@ -4681,19 +4681,17 @@ async def test_finding_without_prerequisite_spawns_with_no_extra_deps(
 
 
 @_pytest.mark.asyncio
-async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
-    """When a finding declares a prerequisite that does not resolve to any
-    candidate, the dependent is transitioned into the BLOCKED state carrying the
-    unresolved prerequisite as its machine-resolvable need (no depends_on edge),
-    so the blocked-resume sweep gates it instead of letting it duplicate the
-    foundation."""
+async def test_unmatched_task_hash_prerequisite_escalates_to_parent(
+    db_session, mocker
+):
+    """When a task-hash prerequisite resolves to no spawned, deferred, or
+    in-flight provider, the dependent escalates immediately instead of parking
+    BLOCKED on an unmatchable hash."""
     from test_autonomous_research import _make_finding, _patch_research_externals
-    from app.task_blocked import get_blocker_metadata
+    from app.task_blocked import get_blocker_needs
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-prq04")
     finding = _make_finding(title="Add login endpoint", direction_id=direction["id"])
-    # Declare an EXACT (finding-hash) prerequisite that does not resolve to any
-    # candidate this cycle — a valid-but-unresolved forward reference.
     missing_ref = "00000000deadbeef"
     finding["prerequisite"] = {"kind": "task", "ref": missing_ref}
 
@@ -4715,24 +4713,215 @@ async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
     )
     assert len(children) == 1
     child = children[0]
-    assert child.status == TaskStatus.BLOCKED, (
-        "an unresolved prerequisite must transition the dependent into BLOCKED"
+    assert child.status == TaskStatus.CANCELLED, (
+        "an unresolvable prerequisite must escalate instead of entering BLOCKED"
     )
     assert not (child.depends_on or []), (
         "unresolved prerequisite must not create a depends_on edge"
     )
-    # The unresolved prerequisite is persisted as the canonical machine-resolvable
-    # need under context['blocker']['need'] for the blocked-resume sweep.
-    need = get_blocker_metadata(child).get("need")
-    assert need == {"kind": "task", "ref": missing_ref}, (
-        "unresolved prerequisite must be carried as the blocked need"
+    assert get_blocker_needs(child) == []
+    assert (child.context or {}).get("prerequisite_escalated_to_parent") is True
+    assert (child.context or {}).get("prerequisite_escalation_reason") == (
+        "no_live_or_deferred_provider"
     )
-    # Still stamped on context for operator visibility, in addition to BLOCKED.
     unresolved = (child.context or {}).get("unresolved_prerequisite", [])
     assert any(
         u.get("kind") == "task" and u.get("ref") == missing_ref
         for u in (unresolved if isinstance(unresolved, list) else [unresolved])
     ), "unresolved prerequisite details must remain in context for visibility"
+
+
+@_pytest.mark.asyncio
+async def test_depends_on_indices_missing_sibling_wires_to_existing_inflight(
+    db_session, mocker
+):
+    """When a depends_on_indices sibling was deduped against an EXISTING in-flight
+    task (not spawned this cycle), the dependent must wire a depends_on edge to
+    that existing task rather than be CANCELLED as 'no provider'.
+
+    Failure shape: deduplicate_findings drops the sibling finding (it matches the
+    existing task by hash), so it's absent from finding_to_child; the missing-sibling
+    loop builds a (kind=task, ref=hash) need. Before the fix, this need wasn't
+    checked against _prereq_candidates (existing_tasks + child_tasks), so it landed
+    in dead_task_needs and the dependent was CANCELLED. After the fix, the missing-
+    sibling loop also calls resolve_prerequisite_task(_prereq_candidates) and wires
+    the edge instead."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq-inflight")
+
+    # Pre-existing in-flight foundation whose finding_hash matches sibling finding A.
+    sibling_title = "Build shared event bus"
+    sibling_desc = "Core pub/sub infrastructure all other findings depend on"
+    sibling_hash = _finding_hash(sibling_title, sibling_desc)
+    existing_foundation = _Task(
+        project_id=_project.id,
+        title=sibling_title,
+        description=sibling_desc,
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={"finding_hash": sibling_hash},
+    )
+    db_session.add(existing_foundation)
+    await db_session.commit()
+    await db_session.refresh(existing_foundation)
+
+    # Research cycle produces sibling finding A (matches existing task by hash) and
+    # dependent finding B. Deduplicate_findings will drop A; B's depends_on_indices
+    # points at A (index 0). The missing-sibling loop must resolve A's hash against
+    # the existing foundation and wire the edge — not cancel B.
+    finding_a = _make_finding(
+        title=sibling_title,
+        direction_id=direction["id"],
+    )
+    finding_a["description"] = sibling_desc
+    finding_a["finding_hash"] = sibling_hash
+
+    finding_b = _make_finding(
+        title="Wire domain event handlers",
+        direction_id=direction["id"],
+    )
+    finding_b["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    # Only dependent B should spawn (A was deduped).
+    dep_children = [c for c in children if "event handler" in c.title.lower()]
+    assert len(dep_children) == 1, (
+        "dependent finding B must spawn as a child task"
+    )
+    dep = dep_children[0]
+    assert dep.status != TaskStatus.CANCELLED, (
+        "dependent with deduped sibling must not be CANCELLED as 'no provider'"
+    )
+    assert str(existing_foundation.id) in (dep.depends_on or []), (
+        "dependent must wire a depends_on edge to the existing in-flight foundation"
+    )
+    assert get_blocker_needs(dep) == [], (
+        "no unresolved need must be persisted when the edge was wired"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_task_prerequisite_rebinds_to_same_batch_design_lineage(
+    db_session, mocker
+):
+    """A dependent whose declared hash names a retitled same-batch design sibling
+    wires to that sibling via recorded finding lineage instead of blocking."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq08")
+    original_hash = _finding_hash(
+        "design: original serving contract",
+        "Original design finding before planner retitle",
+    )
+    provider = _make_finding(
+        title="design: supersession-aware serving confirmation",
+        direction_id=direction["id"],
+        finding_type="design",
+    )
+    provider["finding_hash"] = original_hash
+    dependent = _make_finding(
+        title="Implement serving confirmation guard",
+        direction_id=direction["id"],
+    )
+    dependent["prerequisite"] = {"kind": "task", "ref": original_hash}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[provider, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_title = {c.title: c for c in children}
+    design_child = by_title[provider["title"]]
+    dependent_child = by_title[dependent["title"]]
+
+    assert dependent_child.status != TaskStatus.BLOCKED
+    assert str(design_child.id) in (dependent_child.depends_on or [])
+    assert get_blocker_needs(dependent_child) == []
+    assert original_hash in (design_child.context or {}).get("finding_lineage", [])
+
+
+@_pytest.mark.asyncio
+async def test_observation_dependency_escalates_instead_of_blocking(
+    db_session, mocker
+):
+    """Observation/non-spawning findings cannot provide a task, so a dependent
+    whose only need is that finding escalates instead of entering BLOCKED."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq09")
+    observation = _make_finding(
+        title="obs: lane substrate layers a new system over pool/park-wake",
+        direction_id=direction["id"],
+        finding_type="design_doc_observation",
+    )
+    dependent = _make_finding(
+        title="Use lane substrate observation",
+        direction_id=direction["id"],
+    )
+    dependent["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[observation, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.title == dependent["title"]
+    assert child.status == TaskStatus.CANCELLED
+    assert get_blocker_needs(child) == []
+    assert (child.context or {}).get("prerequisite_escalated_to_parent") is True
+    assert (child.context or {}).get("prerequisite_escalation_reason") == (
+        "structurally_unresolvable"
+    )
 
 
 @_pytest.mark.asyncio
@@ -5686,6 +5875,165 @@ class TestDuplicateNeedDeduplication:
             "kind": "capability",
             "ref": "shared-foundation",
         }, "the explicit prerequisite must not be dropped on co-deferral"
+
+
+class TestCompletedFoundationSatisfiesPrereqAtSpawn:
+    """Spawn-time prerequisite resolution must consult the SHIPPED-completed and
+    knowledge rungs the BLOCKED-resume sweep applies — not only active tasks +
+    same-cycle siblings. A task prerequisite already satisfied by a merged
+    foundation was runnable all along and must NOT be cancelled as
+    'no_live_or_deferred_provider' (v10 release-audit HIGH)."""
+
+    async def test_completed_shipped_foundation_satisfies_prereq_no_cancel(
+        self, mocker, db_session
+    ):
+        """A finding whose explicit task prerequisite is satisfied by an
+        already-COMPLETED, merged (shipped) foundation must spawn RUNNABLE — not be
+        cancelled. The spawn-time provider universe (active tasks + same-cycle
+        siblings) omits completed/merged foundations; the completed-foundation rung
+        recognizes it the same way the reaper resume sweep does."""
+        from test_autonomous_research import (
+            _make_finding,
+            _patch_research_externals,
+            _active_direction,
+            _make_research_task,
+        )
+
+        direction = _active_direction("d-completed-found", "Completed foundation test")
+        project = _Project(
+            name="Completed Foundation Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        # An already-shipped foundation: COMPLETED + merged (pr_merged), no failed
+        # parent — exactly the provider the active-only spawn universe cannot see.
+        foundation = _Task(
+            project_id=project.id,
+            title="Already shipped foundation",
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        finding_b = {
+            **_make_finding(title="Finding B (needs shipped foundation)"),
+            "actionability_grade": "HIGH",
+            "prerequisite": {"kind": "task", "ref": str(foundation.id)},
+        }
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding_b],
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        b_children = [c for c in children if c.title.startswith("Finding B")]
+        assert b_children, "the dependent must exist as a child task"
+        for c in b_children:
+            assert c.status != TaskStatus.CANCELLED, (
+                "a prereq satisfied by a shipped COMPLETED foundation must NOT cancel "
+                "the dependent (regression: no_live_or_deferred_provider)"
+            )
+            assert c.status != TaskStatus.BLOCKED, (
+                "a satisfied prereq must not block the dependent either — "
+                "resume-with-no-edge semantics"
+            )
+            assert (c.context or {}).get(
+                "prerequisite_escalation_reason"
+            ) != "no_live_or_deferred_provider"
+
+    async def test_unmerged_completed_foundation_still_escalates(
+        self, mocker, db_session
+    ):
+        """Negative control: a COMPLETED-but-UNMERGED foundation has NOT shipped, so
+        it must NOT satisfy the prerequisite — the dependent is still cancelled. Proves
+        the fix gates on the shipped (pr_merged) signal and does not unblock against
+        unmerged work."""
+        from test_autonomous_research import (
+            _make_finding,
+            _patch_research_externals,
+            _active_direction,
+            _make_research_task,
+        )
+
+        direction = _active_direction("d-unmerged-found", "Unmerged foundation test")
+        project = _Project(
+            name="Unmerged Foundation Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        foundation = _Task(
+            project_id=project.id,
+            title="Unmerged foundation",
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={},  # NO pr_merged -> never shipped
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        finding_b = {
+            **_make_finding(title="Finding B (needs unmerged foundation)"),
+            "actionability_grade": "HIGH",
+            "prerequisite": {"kind": "task", "ref": str(foundation.id)},
+        }
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding_b],
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        b_children = [c for c in children if c.title.startswith("Finding B")]
+        assert b_children, "the dependent must exist as a child task"
+        assert all(c.status == TaskStatus.CANCELLED for c in b_children), (
+            "an UNMERGED (unshipped) foundation must NOT satisfy the prereq — the "
+            "dependent stays escalated/cancelled"
+        )
 
 
 class TestBreakFindingDependencyCycles:
@@ -7099,15 +7447,23 @@ class TestParseAdversarialFindingVerdicts:
         assert result["abc123"]["explicit"] is True
         assert outcome == "ok"
 
-    def test_missing_hash_defaults_to_fail_closed(self):
+    def test_ordinal_fallback_binds_by_position_when_hash_mismatches(self):
+        """Ordinal binding: a verdict at position 0 binds to finding[0] even with a wrong hash."""
         logs = '[{"hash": "other", "verdict": "fail", "reason": "unrelated"}]'
         result, outcome = parse_adversarial_finding_verdicts(logs, ["abc123"])
-        # fail-closed: absent hash → passed=False, not an implicit pass
+        # Ordinal binding: position 0 verdict → finding[0] = abc123
         assert result["abc123"]["passed"] is False
-        assert result["abc123"]["explicit"] is False
-        # The array was parsed but no known hash matched
-        assert outcome == "no_hash_matches"
-        assert result["abc123"]["unresolved_reason"] == "no_hash_matches"
+        assert result["abc123"]["explicit"] is True
+        assert outcome == "ok"
+        # Fail-closed only for a finding whose position has no corresponding verdict
+        logs2 = '[{"hash": "other", "verdict": "fail", "reason": "for first"}]'
+        result2, outcome2 = parse_adversarial_finding_verdicts(logs2, ["abc123", "xyz789"])
+        assert result2["abc123"]["passed"] is False
+        assert result2["abc123"]["explicit"] is True  # bound by ordinal
+        assert result2["xyz789"]["passed"] is False
+        assert result2["xyz789"]["explicit"] is False  # no verdict at position 1
+        assert result2["xyz789"]["unresolved_reason"] == "no_hash_matches"
+        assert outcome2 == "ok"
 
     def test_not_completed_defaults_all_to_fail_closed(self):
         logs = '[{"hash": "abc123", "verdict": "fail", "reason": "fail"}]'
@@ -7256,6 +7612,127 @@ def test_adversarial_parser_uses_final_verdict_after_echoed_schema():
     assert result["h_live_123"]["reason"] == "confirmed at HEAD"
 
 
+def test_spawn_gate_verdict_binds_by_index_despite_hash_mismatch():
+    """Acceptance proof: ordinal binding succeeds despite a mis-transcribed hash.
+
+    A challenger that echoes the wrong hash but places its verdict at the
+    correct ordinal position (or echoes the correct 'index' field) must have
+    that verdict bound to its finding — not degraded to no_hash_matches or
+    fail-closed.  This is the exact failure mode the research-spawn gate
+    suffered on live runs: real verdicts dropped because the hash was
+    mis-transcribed by one character.
+    """
+    # The real finding hash (as the manifest would contain it).
+    real_hash = "a1b2c3d4e5f6g7h8"
+
+    # Challenger mis-transcribed the hash but placed the verdict at position 0
+    # (the correct ordinal) — binding should succeed via ordinal fallback.
+    logs_wrong_hash = (
+        '[{"index": 1, "hash": "a1b2c3d4e5f6g7XX", "verdict": "pass", '
+        '"reason": "premise confirmed at HEAD"}]'
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs_wrong_hash, [real_hash])
+    assert outcome == "ok", (
+        f"ordinal binding must succeed despite hash mismatch; got {outcome!r}"
+    )
+    assert result[real_hash]["passed"] is True
+    assert result[real_hash]["explicit"] is True
+    assert result[real_hash]["reason"] == "premise confirmed at HEAD"
+
+    # Same scenario without the explicit index field — pure array-position binding.
+    logs_position_only = (
+        '[{"hash": "totally-wrong-hash", "verdict": "fail", '
+        '"reason": "stale premise; code was refactored"}]'
+    )
+    result2, outcome2 = parse_adversarial_finding_verdicts(
+        logs_position_only, [real_hash]
+    )
+    assert outcome2 == "ok", (
+        f"array-position ordinal binding must succeed; got {outcome2!r}"
+    )
+    assert result2[real_hash]["passed"] is False
+    assert result2[real_hash]["explicit"] is True
+    assert result2[real_hash]["reason"] == "stale premise; code was refactored"
+
+
+def test_adversarial_ordinal_binding_multi_finding_partial():
+    """Ordinal binding for multi-finding manifests with partial hash mismatches.
+
+    When some hashes match exactly and others do not, the ones with wrong
+    hashes should bind by position (or explicit index) — not collapse to
+    no_hash_matches for those entries.
+    """
+    h1 = "correct_hash_1111"
+    h2 = "correct_hash_2222"
+    h3 = "correct_hash_3333"
+
+    # h1 echoed correctly; h2 and h3 mis-transcribed but in the right order.
+    logs = (
+        '['
+        '{"index": 1, "hash": "correct_hash_1111", "verdict": "pass", "reason": "solid"},'
+        '{"index": 2, "hash": "WRONG_HASH_2222", "verdict": "fail", "reason": "stale"},'
+        '{"index": 3, "hash": "WRONG_HASH_3333", "verdict": "pass", "reason": "ok"}'
+        ']'
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs, [h1, h2, h3])
+    assert outcome == "ok"
+    assert result[h1]["passed"] is True
+    assert result[h1]["explicit"] is True
+    assert result[h2]["passed"] is False
+    assert result[h2]["explicit"] is True   # bound by explicit index=2
+    assert result[h2]["reason"] == "stale"
+    assert result[h3]["passed"] is True
+    assert result[h3]["explicit"] is True   # bound by explicit index=3
+
+
+def test_adversarial_explicit_index_overrides_array_position():
+    """An explicit 'index' field takes priority over array position as binding key.
+
+    If the challenger re-orders its output but still echoes the correct 1-based
+    index for each finding, the verdicts should bind to the correct findings.
+    """
+    h1 = "hash_for_finding_1"
+    h2 = "hash_for_finding_2"
+
+    # Output is in reverse order, but index fields point to the correct findings.
+    logs = (
+        '['
+        '{"index": 2, "hash": "wrong", "verdict": "fail", "reason": "stale"},'
+        '{"index": 1, "hash": "wrong", "verdict": "pass", "reason": "confirmed"}'
+        ']'
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs, [h1, h2])
+    assert outcome == "ok"
+    # index=1 → h1, index=2 → h2
+    assert result[h1]["passed"] is True
+    assert result[h1]["explicit"] is True
+    assert result[h2]["passed"] is False
+    assert result[h2]["explicit"] is True
+
+
+def test_adversarial_ordinal_does_not_double_bind():
+    """A finding that was matched by exact hash is never also bound by ordinal."""
+    h1 = "real_hash_abc"
+    h2 = "real_hash_xyz"
+
+    # h1 echoed correctly; h2's position in the array is also 0 after h1 is removed,
+    # but since h1 was hash-matched, ordinal position 0 should not rebind to h1 via h2.
+    logs = (
+        '['
+        '{"hash": "real_hash_abc", "verdict": "pass", "reason": "good"},'
+        '{"hash": "WRONG", "verdict": "fail", "reason": "bad"}'
+        ']'
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs, [h1, h2])
+    assert outcome == "ok"
+    # h1 bound by exact hash (position 0 is claimed)
+    assert result[h1]["passed"] is True
+    assert result[h1]["explicit"] is True
+    # h2 bound by ordinal at position 1 (hash mismatch → falls to array position)
+    assert result[h2]["passed"] is False
+    assert result[h2]["explicit"] is True
+
+
 def test_adversarial_gate_unresolved_reason_distinguishes_parse_failure_modes():
     """Each parse failure mode produces a distinct per-finding unresolved_reason.
 
@@ -7286,12 +7763,16 @@ def test_adversarial_gate_unresolved_reason_distinguishes_parse_failure_modes():
     assert outcome == "no_json_array"
     assert all(r["unresolved_reason"] == "no_json_array" for r in result.values())
 
-    # 4. JSON array with no known hashes → no_hash_matches
+    # 4. JSON array with no known hashes, but ordinal binding binds position 0 to h1.
+    # h1 gets a fail verdict via ordinal; h2 has no verdict at position 1 → unresolved.
     result, outcome = parse_adversarial_finding_verdicts(
         '[{"hash": "unknown-hash", "verdict": "fail", "reason": "x"}]', hashes
     )
-    assert outcome == "no_hash_matches"
-    assert all(r["unresolved_reason"] == "no_hash_matches" for r in result.values())
+    assert outcome == "ok"  # h1 was bound by ordinal at position 0
+    assert result["h1"]["passed"] is False
+    assert result["h1"]["explicit"] is True  # bound by ordinal fallback
+    assert result["h2"]["unresolved_reason"] == "no_hash_matches"  # no verdict at position 1
+    assert result["h2"]["explicit"] is False
 
     # 5. Happy path: both hashes receive explicit verdicts → ok, no unresolved_reason
     logs = (
@@ -7659,9 +8140,18 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
     assert len(retry_graders) == 1
     retry_grader = retry_graders[0]
     assert (retry_grader.context or {}).get("adversarial_grader") is True
-    assert task.context.get("_adversarial_wholesale_retry_count") == 1
+    # A bare-FAILED grader (no status/logs) is classified as AGENT_TIMEOUT by
+    # classify_failure, which now routes to the targeted retry path.  The targeted
+    # retry count is incremented; the wholesale count must remain untouched.
+    assert task.context.get("_adversarial_targeted_retry_count") == 1, (
+        "AGENT_TIMEOUT cause must use targeted retry first"
+    )
+    assert task.context.get("_adversarial_wholesale_retry_count") in (None, 0), (
+        "wholesale count must not be incremented on the first (targeted) retry"
+    )
     assert (task.context or {}).get("deferred_findings") in (None, [])
 
+    # Second grader failure: targeted count is exhausted (1) — falls through to wholesale.
     retry_grader.status = TaskStatus.FAILED
     db_session.add(retry_grader)
     await db_session.commit()
@@ -7671,6 +8161,40 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
         logs=None,
     )
     await _resolve_quality_grader_completion(retry_grader, retry_payload, db_session)
+    await db_session.refresh(task)
+
+    # After targeted retry exhausted, wholesale retry is spawned — still no children.
+    wholesale_graders = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id,
+                    _Task.id.notin_([task.id, grader.id, retry_grader.id]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(wholesale_graders) == 1, (
+        "targeted retry exhausted must fall through to wholesale grader"
+    )
+    wholesale_grader = wholesale_graders[0]
+    assert task.context.get("_adversarial_wholesale_retry_count") == 1, (
+        "wholesale count must be 1 after targeted retry is exhausted"
+    )
+    assert (task.context or {}).get("deferred_findings") in (None, [])
+
+    # Third grader failure: wholesale count exhausted — defer fail-closed.
+    wholesale_grader.status = TaskStatus.FAILED
+    db_session.add(wholesale_grader)
+    await db_session.commit()
+    wholesale_payload = AgentStatusPayload(
+        task_id=wholesale_grader.id,
+        status=TaskStatus.FAILED,
+        logs=None,
+    )
+    await _resolve_quality_grader_completion(wholesale_grader, wholesale_payload, db_session)
     await db_session.refresh(task)
 
     children = (
@@ -7684,8 +8208,8 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
     )
     assert children == [], "retry-exhausted finding must not spawn"
 
-    # After the bounded retry is exhausted, the failed finding must appear in
-    # deferred_findings for the next cycle.
+    # After both targeted and wholesale retries are exhausted, the failed finding
+    # must appear in deferred_findings for the next cycle.
     deferred = (task.context or {}).get("deferred_findings", [])
     assert any(
         d.get("title") == hs["title"] for d in deferred
@@ -9144,6 +9668,188 @@ async def test_adversarial_gate_uses_bounded_valid_manifest_for_long_findings(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Parked-awaiting re-dispatch guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_pytest.mark.asyncio
+async def test_redispatch_while_awaiting_adversarial_grader_spawns_nothing(
+    db_session, mocker
+):
+    """ACCEPTANCE TEST: re-dispatching a parked source is a safe no-op.
+
+    A research task parked EVALUATING (awaiting_adversarial_grader set, no verdict
+    yet) must not spawn implementation work when the completion handler is invoked
+    again — the adversarial gate's single-shot guard blocks a second grader spawn,
+    but without the parked-awaiting guard the spawn loop runs ungated and high-stakes
+    findings bypass the gate entirely.
+
+    After the no-op re-entry the task must still be EVALUATING with no children.
+    """
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-redispatch01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs = _high_stakes_finding(direction["id"], "Security-critical re-dispatch finding")
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    # Simulate a task that is already parked awaiting adversarial grader but has
+    # no verdict yet — the state that the post-commit sweep or a duplicate terminal
+    # status post would trigger a re-dispatch from.
+    task.status = TaskStatus.EVALUATING
+    task.context = {
+        **(task.context or {}),
+        "awaiting_adversarial_grader": "some-grader-id",
+        "_adversarial_challenged_hashes": ["deadbeef"],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # The task must remain EVALUATING — no status change.
+    assert task.status == TaskStatus.EVALUATING, (
+        "Re-dispatch while parked must leave task EVALUATING"
+    )
+
+    # No implementation children may have been spawned.
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], (
+        "Re-dispatch while parked must not spawn any implementation tasks"
+    )
+
+    # The awaiting flag must still be set — the guard must not clear it.
+    assert task.context.get("awaiting_adversarial_grader") == "some-grader-id", (
+        "awaiting_adversarial_grader flag must still be set after no-op re-dispatch"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_redispatch_while_awaiting_finding_challenge_spawns_nothing(
+    db_session, mocker
+):
+    """Re-dispatch while parked awaiting a finding challenge is a safe no-op."""
+    from test_autonomous_research import _patch_research_externals, _make_finding
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-redispatch02")
+    _patch_research_externals(mocker)
+
+    finding = _make_finding(direction_id=direction["id"], title="Challenge-pending finding")
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    # Simulate a task parked awaiting a finding challenge with no verdict yet.
+    task.status = TaskStatus.EVALUATING
+    task.context = {
+        **(task.context or {}),
+        "awaiting_finding_challenge": "some-challenge-id",
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.EVALUATING, (
+        "Re-dispatch while parked awaiting finding challenge must leave task EVALUATING"
+    )
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], (
+        "Re-dispatch while parked awaiting finding challenge must not spawn children"
+    )
+
+    assert task.context.get("awaiting_finding_challenge"), (
+        "awaiting_finding_challenge flag must still be set after no-op re-dispatch"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_verdict_present_allows_reentry(db_session, mocker):
+    """When the adversarial verdict IS present, re-entry must proceed normally.
+
+    The parked-awaiting guard must only fire when the verdict is absent.
+    A task with awaiting_adversarial_grader=True AND a verdict in context is a
+    legitimate re-entry (the grader completed) and must not be blocked.
+    """
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-redispatch03")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs = _high_stakes_finding(direction["id"], "Verdict-present re-entry finding")
+    fhash = _finding_hash(hs["title"], hs.get("description", "") or hs.get("prompt", ""))
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    # Task holds BOTH the awaiting flag AND a verdict — re-entry after grader completed.
+    task.status = TaskStatus.COMPLETED
+    task.plan_output = [hs]
+    task.context = {
+        **(task.context or {}),
+        # awaiting flag has already been cleared by _resolve_quality_grader_completion,
+        # but simulate the edge where it was not cleaned up yet — the guard's condition
+        # is _adversarial_verdict_raw is None, so having a verdict bypasses the guard.
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                fhash: {"passed": True, "reason": "all criteria met", "explicit": True}
+            },
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # With a PASS verdict the finding must spawn normally.
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) >= 1, (
+        "With a PASS adversarial verdict, finding must spawn even if awaiting flag was set"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _commit_or_handle_duplicate_spawn — self-claim collision recovery
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -9502,3 +10208,825 @@ async def test_adversarial_gate_uses_poolvm_provenance_after_cache_loss(
     assert verdict["grader_agent_image_build_ts"] == 1749417600
     assert verdict["grader_agent_runtime_fingerprint"] == "b" * 64
     assert verdict["grader_agent_source_sha"] == "fedcba9876543210"
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Machine-readable cause for grader non-response (observability only).
+# Production code: failure_classification.classify_grader_nonresponse_cause /
+# append_grader_diagnostic_trail, task_lifecycle._resolve_quality_grader_completion,
+# research_completion per-finding + per-cycle cause export.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestGraderNonresponseCauseHelpers:
+    """Unit coverage for the cause helper + trail accumulator."""
+
+    @_pytest.mark.asyncio
+    async def test_completed_unparseable_refusal_vs_format_miss(self, db_session):
+        from app.failure_classification import (
+            GRADER_CAUSE_FORMAT_MISS,
+            GRADER_CAUSE_REFUSAL,
+            classify_grader_nonresponse_cause,
+        )
+        from app.task_evaluators import (
+            ADVERSARIAL_PARSE_EMPTY_LOGS,
+            ADVERSARIAL_PARSE_INVALID_JSON,
+            ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+        )
+
+        _project, _direction, grader = await _grader_project_and_task(
+            db_session, "d-cause-refusal"
+        )
+
+        # Prose that reads as a refusal, with no verdict array → refusal.
+        refusal = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+            {},
+            completed=True,
+            logs="I cannot comply with this challenge request.",
+            session=None,
+        )
+        assert refusal["category"] == GRADER_CAUSE_REFUSAL
+        assert refusal["source"] == "output_inspection"
+        # session=None → stale tag must be absent, never raise.
+        assert "stale_agent_image" not in refusal
+
+        # Garbled JSON → format miss (tried in-format, missed schema).
+        garbled = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_INVALID_JSON,
+            {},
+            completed=True,
+            logs='[{"hash": "abc", "verdict": ',
+            session=None,
+        )
+        assert garbled["category"] == GRADER_CAUSE_FORMAT_MISS
+
+        # Structurally empty output → format miss (nothing to refuse with).
+        empty = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_EMPTY_LOGS,
+            {},
+            completed=True,
+            logs="",
+            session=None,
+        )
+        assert empty["category"] == GRADER_CAUSE_FORMAT_MISS
+
+        # Prose with no refusal marker and no array → format miss, not refusal.
+        prose = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+            {},
+            completed=True,
+            logs="Here is my analysis of the three findings under review.",
+            session=None,
+        )
+        assert prose["category"] == GRADER_CAUSE_FORMAT_MISS
+
+    @_pytest.mark.asyncio
+    async def test_failed_grader_draws_taxonomy_cause(self, db_session):
+        from app.failure_classification import classify_grader_nonresponse_cause
+        from app.task_evaluators import ADVERSARIAL_PARSE_CHALLENGER_FAILED
+
+        _project, _direction, grader = await _grader_project_and_task(
+            db_session, "d-cause-failed"
+        )
+        # Persisted agent failure category → classify_failure returns AGENT_TIMEOUT.
+        grader.context = {**(grader.context or {}), "failure_category": "timeout"}
+        db_session.add(grader)
+        await db_session.commit()
+
+        cause = await classify_grader_nonresponse_cause(
+            grader,
+            ADVERSARIAL_PARSE_CHALLENGER_FAILED,
+            {},
+            completed=False,
+            logs=None,
+            session=None,
+        )
+        assert cause["category"] == "AGENT_TIMEOUT"
+        assert cause["source"] == "failure_taxonomy"
+        assert cause["parse_outcome"] == ADVERSARIAL_PARSE_CHALLENGER_FAILED
+
+    @_pytest.mark.asyncio
+    async def test_stale_agent_image_tag_set_and_absent(self, db_session, mocker):
+        from app.failure_classification import classify_grader_nonresponse_cause
+
+        project, _direction, grader = await _grader_project_and_task(
+            db_session, "d-cause-stale"
+        )
+
+        # Serving SHA known + different + grader SHA is an ancestor → stale=True.
+        mocker.patch(
+            "app.compute.expected_serving_source_sha",
+            new=AsyncMock(return_value="new_serving_sha"),
+        )
+        mocker.patch(
+            "app.release_promotion._resolve_github_with_session",
+            new=AsyncMock(return_value=("tok", "owner", "repo")),
+        )
+        ancestor = mocker.patch(
+            "app.github_refs.is_ancestor_of",
+            new=AsyncMock(return_value=True),
+        )
+        cause = await classify_grader_nonresponse_cause(
+            grader,
+            "ok",
+            {"grader_agent_source_sha": "old_grader_sha"},
+            completed=True,
+            logs="[]",
+            session=db_session,
+            project_id=project.id,
+        )
+        assert cause["stale_agent_image"] is True
+        ancestor.assert_awaited_once()
+
+        # Expected serving SHA unknown → tag gracefully absent.
+        mocker.patch(
+            "app.compute.expected_serving_source_sha",
+            new=AsyncMock(return_value=None),
+        )
+        cause_unknown = await classify_grader_nonresponse_cause(
+            grader,
+            "ok",
+            {"grader_agent_source_sha": "old_grader_sha"},
+            completed=True,
+            logs="[]",
+            session=db_session,
+            project_id=project.id,
+        )
+        assert "stale_agent_image" not in cause_unknown
+
+    def test_append_grader_diagnostic_trail_accumulates_and_caps(self):
+        from app.failure_classification import (
+            GRADER_DIAGNOSTIC_TRAIL_KEY,
+            append_grader_diagnostic_trail,
+        )
+
+        ctx: dict = {}
+        for i in range(7):
+            append_grader_diagnostic_trail(
+                ctx,
+                grader_task_id=f"grader-{i}",
+                parse_outcome="empty_logs",
+                cause={"category": "grader_format_miss"},
+                vm_provenance={},
+            )
+        trail = ctx[GRADER_DIAGNOSTIC_TRAIL_KEY]
+        # Capped at 5, keeping the most-recent entries, attempts monotonically increasing.
+        assert len(trail) == 5
+        assert [e["attempt"] for e in trail] == [3, 4, 5, 6, 7]
+        assert trail[-1]["grader_task_id"] == "grader-6"
+
+
+@_pytest.mark.asyncio
+async def test_resolution_records_cause_and_accumulating_trail(db_session, mocker):
+    """Two FAILED grader resolutions accumulate per-attempt trail entries (not
+    overwrite) and stamp a taxonomy-drawn cause into the diagnostic."""
+    from app.research_completion import _finding_hash  # noqa: F401
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-cause-trail")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs = _high_stakes_finding(direction["id"], "Risky finding for trail")
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[hs]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+    grader = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id, _Task.id != task.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert grader is not None
+
+    # Resolution 1: grader FAILED with a persisted timeout category.
+    grader.status = TaskStatus.FAILED
+    grader.context = {**(grader.context or {}), "failure_category": "timeout"}
+    db_session.add(grader)
+    await db_session.commit()
+    await _resolve_quality_grader_completion(
+        grader, AgentStatusPayload(task_id=grader.id, status=TaskStatus.FAILED, logs=None),
+        db_session,
+    )
+    await db_session.refresh(task)
+
+    diag = (task.context or {}).get("adversarial_gate_diagnostic") or {}
+    assert diag.get("cause", {}).get("category") == "AGENT_TIMEOUT"
+    trail = (task.context or {}).get("grader_diagnostic_trail") or []
+    assert len(trail) == 1
+    assert trail[0]["attempt"] == 1
+
+    # The first failure spawns one bounded retry grader.
+    retry_grader = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id,
+                    _Task.id.notin_([task.id, grader.id]),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert retry_grader is not None
+
+    # Resolution 2: retry grader also FAILED → trail accumulates, not overwrites.
+    retry_grader.status = TaskStatus.FAILED
+    retry_grader.context = {**(retry_grader.context or {}), "failure_category": "rate_limited"}
+    db_session.add(retry_grader)
+    await db_session.commit()
+    await _resolve_quality_grader_completion(
+        retry_grader,
+        AgentStatusPayload(task_id=retry_grader.id, status=TaskStatus.FAILED, logs=None),
+        db_session,
+    )
+    await db_session.refresh(task)
+
+    trail2 = (task.context or {}).get("grader_diagnostic_trail") or []
+    assert len(trail2) == 2, "second resolution must append, not overwrite"
+    assert [e["attempt"] for e in trail2] == [1, 2]
+    assert trail2[1]["cause"]["category"] == "RATE_LIMIT"
+
+
+@_pytest.mark.asyncio
+async def test_unresolved_finding_and_cycle_summary_carry_cause(db_session, mocker):
+    """The deferred unresolved finding carries the cause, and the cycle exports a
+    machine-readable cause summary alongside the spawn-gate metrics."""
+    from app.research_completion import _finding_hash
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-cause-perfind")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs_verdicted = _high_stakes_finding(direction["id"], "Finding with verdict")
+    hs_unresolved = _high_stakes_finding(direction["id"], "Finding without verdict")
+    fhash_verdicted = _finding_hash(
+        hs_verdicted["title"],
+        hs_verdicted.get("description", "") or hs_verdicted.get("prompt", ""),
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs_verdicted, hs_unresolved],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+    grader = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id, _Task.id != task.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert grader is not None
+
+    # Grader returns an explicit verdict for one hash only (parse_outcome == ok);
+    # the second hash is unresolved.
+    grader.status = TaskStatus.COMPLETED
+    db_session.add(grader)
+    await db_session.commit()
+    await _resolve_quality_grader_completion(
+        grader,
+        AgentStatusPayload(
+            task_id=grader.id,
+            status=TaskStatus.COMPLETED,
+            logs='[{"hash": "' + fhash_verdicted + '", "verdict": "fail", "reason": "x"}]',
+        ),
+        db_session,
+    )
+    await db_session.refresh(task)
+
+    # Per-finding attribution: the deferred unresolved finding carries the cause.
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert deferred, "unresolved finding must be deferred"
+    assert any(
+        isinstance(d.get("adversarial_gate_cause"), dict)
+        and d["adversarial_gate_cause"].get("category")
+        for d in deferred
+    ), "deferred finding must carry adversarial_gate_cause"
+
+    # Per-cycle export: machine-readable cause summary alongside spawn-gate metrics.
+    cause = (task.context or {}).get("research_spawn_gate_cause")
+    assert isinstance(cause, dict) and cause.get("category"), (
+        "research_spawn_gate_cause must be exported"
+    )
+    counts = (task.context or {}).get("research_spawn_gate_cause_counts")
+    assert isinstance(counts, dict) and counts, (
+        "research_spawn_gate_cause_counts must be exported"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_forward_quality_lane_records_cause(db_session, mocker):
+    """The dark forward-quality lane must now also record a diagnostic + cause +
+    trail entry (it previously recorded nothing)."""
+    from app.schemas import AgentStatusPayload
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    _project, _direction, task = await _grader_project_and_task(db_session, "d-cause-fq")
+
+    grader = await spawn_forward_quality_grader(task, "artifact text", db_session)
+    assert grader is not None
+    await db_session.refresh(task)
+    assert task.context.get("awaiting_quality_grader")
+
+    grader.status = TaskStatus.COMPLETED
+    db_session.add(grader)
+    await db_session.commit()
+
+    # Stub the research resume handler + broadcast so we isolate the diagnostic write.
+    mocker.patch(
+        "app.research_completion._handle_research_completion", new_callable=AsyncMock
+    )
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+
+    await _resolve_quality_grader_completion(
+        grader,
+        AgentStatusPayload(
+            task_id=grader.id,
+            status=TaskStatus.COMPLETED,
+            logs='{"verdict": "pass", "reasoning": "well grounded"}',
+        ),
+        db_session,
+    )
+    await db_session.refresh(task)
+
+    fq_diag = (task.context or {}).get("quality_grader_diagnostic")
+    assert fq_diag is not None, "forward-quality lane must record a diagnostic"
+    assert fq_diag["cause"]["category"] == "grader_responsive"
+    assert fq_diag["completion_state"] == "completed"
+    trail = (task.context or {}).get("grader_diagnostic_trail") or []
+    assert trail, "forward-quality lane must append a trail entry"
+    assert trail[-1]["cause"]["category"] == "grader_responsive"
+
+
+# ---------------------------------------------------------------------------
+# Cause-keyed targeted retry tests (acceptance test: test_spawn_gate_targeted_retry_routes_by_cause)
+# ---------------------------------------------------------------------------
+
+@_pytest.mark.asyncio
+async def test_spawn_gate_targeted_retry_routes_by_cause(db_session, mocker):
+    """ACCEPTANCE TEST: cause-keyed routing sends each non-response cause to the
+    correct retry strategy.
+
+    Scenario A — timeout cause: spawns a targeted retry with a reduced manifest
+    (half the findings), not the full wholesale retry.
+    Scenario B — transient-infra cause: uses the existing wholesale retry path.
+    Scenario C — refusal cause: skips all retries and marks exhausted immediately.
+    Scenario D — targeted retry exhausted (timeout on second attempt): falls
+    through to wholesale retry.
+    """
+    from app.failure_classification import (
+        AGENT_TIMEOUT,
+        GRADER_CAUSE_REFUSAL,
+        RATE_LIMIT,
+    )
+    from app.research_completion import (
+        _ADVERSARIAL_TARGETED_RETRY_KEY,
+        _ADVERSARIAL_WHOLESALE_RETRY_KEY,
+        _finding_hash,
+    )
+    from test_autonomous_research import _patch_research_externals
+
+    async def _make_task_with_cause(db_session, direction_suffix, cause_category, *, targeted_count=0):
+        """Helper: build a task whose ADVERSARIAL_GATE_VERDICT_KEY carries a given cause."""
+        project, direction, task = await _grader_project_and_task(
+            db_session, f"d-targeted-{direction_suffix}"
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._is_high_stakes_finding",
+            side_effect=lambda f: f.get("risk") == "high",
+        )
+
+        # Two high-stakes findings so the "half" slice is non-trivial.
+        hs1 = _high_stakes_finding(direction["id"], f"Finding A ({direction_suffix})")
+        hs2 = _high_stakes_finding(direction["id"], f"Finding B ({direction_suffix})")
+        fhash1 = _finding_hash(hs1["title"], hs1.get("description", ""))
+        fhash2 = _finding_hash(hs2["title"], hs2.get("description", ""))
+
+        task.plan_output = [hs1, hs2]
+        task.status = TaskStatus.COMPLETED
+        task.context = {
+            **(task.context or {}),
+            ADVERSARIAL_GATE_VERDICT_KEY: {
+                "finding_verdicts": {},
+                "grader_task_id": f"test-grader-{direction_suffix}",
+                "parse_outcome": "no_hash_matches",
+                "cause": {"category": cause_category, "parse_outcome": "no_hash_matches"},
+            },
+            "_adversarial_challenged_hashes": [fhash1, fhash2],
+        }
+        if targeted_count:
+            task.context[_ADVERSARIAL_TARGETED_RETRY_KEY] = targeted_count
+
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[hs1, hs2],
+        )
+        db_session.add(project)
+        db_session.add(task)
+        await db_session.commit()
+        return project, direction, task, fhash1, fhash2
+
+    # --- Scenario A: timeout → targeted retry with reduced manifest ---
+    _proj_a, _dir_a, task_a, fhash1_a, fhash2_a = await _make_task_with_cause(
+        db_session, "timeout", AGENT_TIMEOUT
+    )
+
+    await _handle_research_completion(task_a, "", db_session)
+    await db_session.refresh(task_a)
+
+    all_tasks_a = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_a.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_a = [t for t in all_tasks_a if (t.context or {}).get("adversarial_grader")]
+    assert len(graders_a) == 1, "timeout cause must spawn exactly one targeted retry grader"
+    assert task_a.status == TaskStatus.EVALUATING
+    # Targeted retry counter must be incremented.
+    assert task_a.context.get(_ADVERSARIAL_TARGETED_RETRY_KEY) == 1, (
+        "targeted retry count must be 1 after first targeted retry"
+    )
+    # Wholesale counter must remain untouched.
+    assert task_a.context.get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) in (None, 0), (
+        "wholesale retry count must not be incremented for targeted retry"
+    )
+    # Reduced manifest: only ONE of the two findings should be challenged.
+    challenged_hashes_a = task_a.context.get("_adversarial_challenged_hashes") or []
+    assert len(challenged_hashes_a) == 1, (
+        "targeted retry must challenge only half the findings (1 of 2)"
+    )
+    # No child spawns yet (task is parked waiting for grader).
+    children_a = [t for t in all_tasks_a if t.parent_task_id == task_a.id]
+    assert len(children_a) == 0, "targeted retry must not spawn child research tasks"
+
+    # --- Scenario B: transient infra (rate-limit) → existing wholesale retry ---
+    _proj_b, _dir_b, task_b, fhash1_b, fhash2_b = await _make_task_with_cause(
+        db_session, "ratelimit", RATE_LIMIT
+    )
+
+    await _handle_research_completion(task_b, "", db_session)
+    await db_session.refresh(task_b)
+
+    all_tasks_b = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_b.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_b = [t for t in all_tasks_b if (t.context or {}).get("adversarial_grader")]
+    assert len(graders_b) == 1, "rate-limit cause must spawn a wholesale retry grader"
+    assert task_b.status == TaskStatus.EVALUATING
+    # Wholesale counter must be incremented.
+    assert task_b.context.get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) == 1, (
+        "wholesale retry count must be 1 for transient-infra cause"
+    )
+    # Targeted counter must remain untouched.
+    assert task_b.context.get(_ADVERSARIAL_TARGETED_RETRY_KEY) in (None, 0), (
+        "targeted retry count must not be incremented for transient-infra cause"
+    )
+    # Wholesale manifest should include BOTH findings.
+    challenged_hashes_b = task_b.context.get("_adversarial_challenged_hashes") or []
+    assert len(challenged_hashes_b) == 2, (
+        "wholesale retry must challenge all originally challenged findings"
+    )
+
+    # --- Scenario C: refusal → skip all retries, mark exhausted ---
+    _proj_c, _dir_c, task_c, fhash1_c, fhash2_c = await _make_task_with_cause(
+        db_session, "refusal", GRADER_CAUSE_REFUSAL
+    )
+
+    await _handle_research_completion(task_c, "", db_session)
+    await db_session.refresh(task_c)
+
+    all_tasks_c = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_c.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_c = [t for t in all_tasks_c if (t.context or {}).get("adversarial_grader")]
+    # No new grader should be spawned for a refusal.
+    assert len(graders_c) == 0, "refusal cause must NOT spawn any retry grader"
+    # Must be marked as exhausted immediately.
+    assert task_c.context.get("research_spawn_gate_wholesale_retry_exhausted") is True, (
+        "refusal cause must mark retry as exhausted immediately"
+    )
+    assert task_c.context.get("research_spawn_gate_refusal_skip_retry") is True, (
+        "refusal cause must set refusal_skip_retry flag"
+    )
+    # Both findings must be deferred fail-closed.
+    deferred_c = task_c.context.get("deferred_findings") or []
+    assert fhash1_c or fhash2_c  # just ensure hashes were computed
+    assert len(deferred_c) >= 2, (
+        "both challenged findings must be deferred fail-closed on refusal"
+    )
+
+    # --- Scenario D: timeout cause with targeted already exhausted → wholesale retry ---
+    _proj_d, _dir_d, task_d, fhash1_d, fhash2_d = await _make_task_with_cause(
+        db_session, "timeout-exhausted", AGENT_TIMEOUT, targeted_count=1
+    )
+
+    await _handle_research_completion(task_d, "", db_session)
+    await db_session.refresh(task_d)
+
+    all_tasks_d = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_d.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_d = [t for t in all_tasks_d if (t.context or {}).get("adversarial_grader")]
+    assert len(graders_d) == 1, (
+        "timeout with targeted exhausted must fall through to wholesale retry grader"
+    )
+    assert task_d.status == TaskStatus.EVALUATING
+    # Wholesale counter must now be incremented (targeted was already at limit).
+    assert task_d.context.get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) == 1, (
+        "wholesale retry count must be 1 after targeted retry is exhausted"
+    )
+    # Targeted counter must stay at limit (not incremented again).
+    assert task_d.context.get(_ADVERSARIAL_TARGETED_RETRY_KEY) == 1, (
+        "targeted retry count must remain at limit (1) after exhaustion"
+    )
+    # Wholesale manifest should include both findings (full retry).
+    challenged_hashes_d = task_d.context.get("_adversarial_challenged_hashes") or []
+    assert len(challenged_hashes_d) == 2, (
+        "wholesale retry after targeted exhaustion must challenge all findings"
+    )
+
+    # --- Scenario E: targeted retry itself times out → wholesale must use original full set ---
+    # This exercises the production path:
+    #   initial timeout → targeted retry spawned (narrows _adversarial_challenged_hashes to 1)
+    #   → targeted retry also times out → wholesale fallback must recover original 2-hash set
+    #     via _adversarial_original_challenged_hashes and challenge all findings.
+    _proj_e, _dir_e, task_e, fhash1_e, fhash2_e = await _make_task_with_cause(
+        db_session, "timeout-targeted-then-wholesale", AGENT_TIMEOUT, targeted_count=1
+    )
+    # Simulate what the targeted retry spawn wrote: narrowed challenged hashes + saved original.
+    task_e.context = {
+        **task_e.context,
+        "_adversarial_challenged_hashes": [fhash1_e],  # reduced subset
+        "_adversarial_original_challenged_hashes": [fhash1_e, fhash2_e],  # full original
+    }
+    db_session.add(task_e)
+    await db_session.commit()
+
+    await _handle_research_completion(task_e, "", db_session)
+    await db_session.refresh(task_e)
+
+    all_tasks_e = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == task_e.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders_e = [t for t in all_tasks_e if (t.context or {}).get("adversarial_grader")]
+    assert len(graders_e) == 1, (
+        "targeted-then-timeout must fall through to wholesale retry grader"
+    )
+    assert task_e.status == TaskStatus.EVALUATING
+    assert task_e.context.get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) == 1, (
+        "wholesale retry count must be 1 after targeted timeout falls through"
+    )
+    # Wholesale manifest must include BOTH findings (recovered from original, not the reduced 1).
+    challenged_hashes_e = task_e.context.get("_adversarial_challenged_hashes") or []
+    assert len(challenged_hashes_e) == 2, (
+        "wholesale retry after targeted timeout must challenge all original findings, "
+        "not just the targeted-retry subset"
+    )
+    # Original preservation key must be cleared after wholesale consumes it.
+    assert "_adversarial_original_challenged_hashes" not in task_e.context, (
+        "original hash preservation key must be cleared after wholesale retry"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Research-audit knowledge document persistence
+# ---------------------------------------------------------------------------
+
+
+async def _make_audit_project_and_task(db_session, direction_id="d-audit01", mode="audit"):
+    """A minimal project with audit-mode direction + a research task."""
+    from test_autonomous_research import _make_research_task
+
+    direction = {
+        "id": direction_id,
+        "text": "Audit direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "recommended_mode": mode,
+    }
+    project = _Project(
+        name=f"Audit project {direction_id}",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = await _make_research_task(project, direction, db_session)
+    # Stamp the direction_id on context so the handler can look it up.
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+    return project, direction, task
+
+
+@_pytest.mark.asyncio
+async def test_audit_mode_persists_knowledge_document(db_session, mocker):
+    """An audit-mode research task creates a KnowledgeDocument when findings are present."""
+    from app.models import KnowledgeDocument, SourceKind
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _make_audit_project_and_task(
+        db_session, "d-audit-persist"
+    )
+    _patch_research_externals(mocker)
+    finding = _make_finding(direction_id=direction["id"])
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        return_value=[],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                _select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id,
+                    KnowledgeDocument.source_kind == SourceKind.RESEARCH_AUDIT.value,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 1, "audit-mode research must persist a KnowledgeDocument"
+    doc = docs[0]
+    assert doc.direction_id == direction["id"]
+    assert doc.topic is not None
+    assert "research_audit" in (doc.tags or [])
+
+
+@_pytest.mark.asyncio
+async def test_non_audit_mode_no_knowledge_document(db_session, mocker):
+    """A standard (non-audit) research task does NOT persist a research_audit doc."""
+    from app.models import KnowledgeDocument, SourceKind
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _make_audit_project_and_task(
+        db_session, "d-non-audit", mode="ship"
+    )
+    _patch_research_externals(mocker)
+    finding = _make_finding(direction_id=direction["id"])
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        return_value=[],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                _select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id,
+                    KnowledgeDocument.source_kind == SourceKind.RESEARCH_AUDIT.value,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert docs == [], "non-audit mode must NOT create a research_audit KnowledgeDocument"
+
+
+@_pytest.mark.asyncio
+async def test_audit_mode_no_document_when_no_findings(db_session, mocker):
+    """An audit-mode research task with no findings/insights does NOT persist a doc."""
+    from app.models import KnowledgeDocument, SourceKind
+    from test_autonomous_research import _patch_research_externals
+
+    _project, _direction, task = await _make_audit_project_and_task(
+        db_session, "d-audit-empty"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        return_value=[],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                _select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id,
+                    KnowledgeDocument.source_kind == SourceKind.RESEARCH_AUDIT.value,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert docs == [], "empty-findings audit must NOT create a research_audit KnowledgeDocument"
+
+
+@_pytest.mark.asyncio
+async def test_audit_mode_persist_error_does_not_block_spawn(db_session, mocker):
+    """A persist failure in the audit knowledge path must not block child task spawn."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _make_audit_project_and_task(
+        db_session, "d-audit-error"
+    )
+    _patch_research_externals(mocker)
+    finding = _make_finding(direction_id=direction["id"])
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        return_value=[],
+    )
+    mocker.patch(
+        "app.knowledge_completion.persist_research_audit_document",
+        side_effect=RuntimeError("simulated persist failure"),
+    )
+
+    # Must not raise despite the persist error.
+    await _handle_research_completion(task, "", db_session)
+
+    # Children were still spawned (the persist error did not abort the spawn loop).
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) >= 1, "spawn loop must proceed even when audit persist fails"

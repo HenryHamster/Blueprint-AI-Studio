@@ -23,14 +23,14 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, Mapping
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.admin import _get_user_project_with_role
+from app.admin_helpers import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
 from app.landed_signal import (
@@ -39,6 +39,8 @@ from app.landed_signal import (
     is_verified_merge,
 )
 from app.models import (
+    ImprovementLane,
+    ImprovementLaneStatus,
     PoolIdleCostLedger,
     PoolIdleSpan,
     PoolVm,
@@ -55,6 +57,7 @@ from app.task_locking import project_lock
 from app.vm_cost_rates import idle_cost_usd
 
 router = APIRouter()
+agent_router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 # ---------------------------------------------------------------------------
 # Cold-start stage breakdown (per-stage p50 decomposition)
@@ -90,6 +93,9 @@ AXIS_VM_REUSE_RATE = "vm_reuse_rate"
 AXIS_MEDIAN_API_CALLS_PER_TASK = "median_api_calls_per_task"
 AXIS_MEDIAN_REVIEW_ITERATIONS = "median_review_iterations"
 AXIS_LLM_COST_PER_MERGED_PR = "llm_cost_per_merged_pr"
+AXIS_LANE_COST_PER_MERGED_PR = "lane_cost_per_merged_pr"
+AXIS_LANE_WARM_RESUME_RATE = "lane_warm_resume_rate"
+AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 FORMAT_COMPLIANCE_KEY = "format_compliance"
 FORMAT_COMPLIANCE_RATE_KEY = "format_compliance_rate"
 SELF_REPAIR_SUCCESS_RATE_KEY = "self_repair_success_rate"
@@ -101,6 +107,9 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
     AXIS_LLM_COST_PER_MERGED_PR,
+    AXIS_LANE_COST_PER_MERGED_PR,
+    AXIS_LANE_WARM_RESUME_RATE,
+    AXIS_CHECKPOINT_LOSS_RATE,
 )
 
 # ---------------------------------------------------------------------------
@@ -134,6 +143,15 @@ AXIS_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_LLM_COST_PER_MERGED_PR: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_LANE_COST_PER_MERGED_PR: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_LANE_WARM_RESUME_RATE: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_CHECKPOINT_LOSS_RATE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
 }
@@ -243,7 +261,9 @@ _SNAPSHOT_HISTORY_MAX = 365
 #
 # v6: cost_per_merged_pr_incl_pool_idle switched from the all-time pool idle
 #     accumulator to a windowed figure matching the dispatch-funnel window.
-METRIC_DEF_VERSION = "v6"
+# v7: three improvement-lane axes registered (lane_cost_per_merged_pr,
+#     lane_warm_resume_rate, checkpoint_loss_rate).
+METRIC_DEF_VERSION = "v7"
 
 
 async def _load_recent_tasks(
@@ -305,6 +325,88 @@ async def _load_recent_tasks(
         .limit(5000)
     )
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def _load_project_lanes(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[ImprovementLane]:
+    """Load all non-KILLED ImprovementLane rows for the project."""
+    stmt = (
+        select(ImprovementLane)
+        .where(
+            ImprovementLane.project_id == project_id,
+            ImprovementLane.status != ImprovementLaneStatus.KILLED.value,
+        )
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+def _compute_lane_cost_per_merged_pr(
+    lanes: list[ImprovementLane],
+    *,
+    window_days: int = _AXIS_WINDOW_DAYS,
+) -> float | None:
+    """Total lane VM+idle cost / RETIRED lane count in the window. None when no retired lanes.
+
+    Uses ``retired_at`` to scope to lanes that reached their terminal success
+    state within the rolling window, mirroring how task-based axes use
+    ``updated_at`` to bound the denominator. Lanes with no ``retired_at`` are
+    excluded even if their status is RETIRED.
+    """
+    cutoff = _utcnow() - timedelta(days=window_days)
+    total_cost = 0.0
+    retired_count = 0
+    for lane in lanes:
+        if lane.status != ImprovementLaneStatus.RETIRED.value:
+            continue
+        if lane.retired_at is None or lane.retired_at < cutoff:
+            continue
+        total_cost += (lane.vm_cost_usd_total or 0.0) + (
+            lane.reserved_idle_cost_usd_total or 0.0
+        )
+        retired_count += 1
+    if not retired_count:
+        return None
+    return round(total_cost / retired_count, 4)
+
+
+def _compute_lane_warm_resume_rate(lanes: list[ImprovementLane]) -> float | None:
+    """Share of lane phase resumes that reused a warm workspace.
+
+    Reads ``warm_resume`` from each checkpoint record in ``checkpoints[]``.
+    Uses all non-KILLED project lanes so ACTIVE/PARKED lanes contribute
+    real-time signal alongside completed RETIRED ones.
+    Returns None when no checkpoints exist across any lane.
+    """
+    total_checkpoints = 0
+    warm_checkpoints = 0
+    for lane in lanes:
+        for checkpoint in (lane.checkpoints or []):
+            total_checkpoints += 1
+            if checkpoint.get("warm_resume") is True:
+                warm_checkpoints += 1
+    if not total_checkpoints:
+        return None
+    return round(warm_checkpoints / total_checkpoints, 4)
+
+
+def _compute_checkpoint_loss_rate(lanes: list[ImprovementLane]) -> float | None:
+    """Fraction of checkpoint attempts that were lost (phase requeued without a checkpoint).
+
+    Formula: sum(phase_requeues) / (sum(checkpoint_seq) + sum(phase_requeues))
+    across all non-KILLED project lanes. Returns None when the denominator is 0
+    (no lanes have attempted any phases).
+    """
+    total_seq = 0
+    total_requeues = 0
+    for lane in lanes:
+        total_seq += int(lane.checkpoint_seq or 0)
+        total_requeues += int(lane.phase_requeues or 0)
+    denominator = total_seq + total_requeues
+    if not denominator:
+        return None
+    return round(total_requeues / denominator, 4)
 
 
 def _cost_and_merges(tasks: list[Task]) -> tuple[float, int]:
@@ -2049,6 +2151,7 @@ async def compute_current_axes(
     )
 
     tasks = await _load_recent_tasks(session, project_id)
+    lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
 
     # Honest net-cost companion: fold the project's warm-pool idle cost into the
@@ -2082,6 +2185,9 @@ async def compute_current_axes(
         AXIS_MEDIAN_API_CALLS_PER_TASK: _compute_median_api_calls_per_task(tasks),
         AXIS_MEDIAN_REVIEW_ITERATIONS: _compute_median_review_iterations(tasks),
         AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
+        AXIS_LANE_COST_PER_MERGED_PR: _compute_lane_cost_per_merged_pr(lanes),
+        AXIS_LANE_WARM_RESUME_RATE: _compute_lane_warm_resume_rate(lanes),
+        AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
@@ -2116,10 +2222,13 @@ async def compute_current_axes(
         # volume. See app.digest_metrics.compute_timeout_rate.
         "agent_timeout_rate": compute_timeout_rate(tasks),
         # Durable structured-output format-compliance measure (v7 shared
-        # self-repair adoption): overall block only, read from persisted
-        # Task.format_compliance_summary. Per-task-type detail remains a live
-        # digest concern; the snapshot needs the durable baseline/trend.
-        FORMAT_COMPLIANCE_KEY: compute_format_compliance_metrics(tasks)["overall"],
+        # self-repair adoption): overall block from persisted
+        # Task.format_compliance_summary, plus a per-task-type breakdown keyed
+        # by task type. The by_type block lets read-only research agents
+        # (authenticated with the agent token) obtain the durable per-type
+        # breakdown for a snapshot day without hitting admin-auth endpoints.
+        FORMAT_COMPLIANCE_KEY: (_fc := compute_format_compliance_metrics(tasks))["overall"],
+        "format_compliance_by_type": _fc["by_type"],
     }
 
 
@@ -2135,9 +2244,16 @@ async def write_snapshot(
     # Compute axes before acquiring lock — reads only Task rows, not the project.
     axes = await compute_current_axes(session, project_id)
     captured_at = _utcnow().isoformat()
+    from app.deployed_sha import get_serving_sha
+
     snapshot: Dict[str, Any] = {
         "captured_at": captured_at,
+        # metric_def_version versions the metric DEFINITIONS; serving_sha records
+        # which deployed backend code was running when this snapshot was written.
+        # Both allow consumers to partition history across definition changes and
+        # deployment boundaries. serving_sha is None on pre-stamp snapshots.
         "metric_def_version": METRIC_DEF_VERSION,
+        "serving_sha": get_serving_sha(),
         **axes,
     }
 
@@ -2234,6 +2350,15 @@ async def write_snapshot(
             if baseline.get("_schema_version") == 4:
                 baseline[AXIS_LLM_COST_PER_MERGED_PR] = None
                 baseline["_schema_version"] = 5
+            # One-time migration: baselines captured before improvement-lane
+            # efficiency axes were registered (schema_version 5) have no lane_*
+            # or checkpoint_* keys. Clear/seed them so current-vs-baseline drift
+            # is apples-to-apples.
+            if baseline.get("_schema_version") == 5:
+                baseline[AXIS_LANE_COST_PER_MERGED_PR] = None
+                baseline[AXIS_LANE_WARM_RESUME_RATE] = None
+                baseline[AXIS_CHECKPOINT_LOSS_RATE] = None
+                baseline["_schema_version"] = 6
             # Re-seed any individual axes that were cleared (e.g. by the migration
             # above) once a valid current value is available.
             for axis in ALL_AXES:
@@ -2648,6 +2773,10 @@ async def read_baseline_with_drift(
             cost_incl_pool_idle_axis,
             latest.get("pool_dispatch_funnel"),
         ),
+        # Per-task-type format-compliance breakdown from the latest snapshot,
+        # keyed by task type.  None for snapshots that predate this field (no
+        # baseline/drift semantics — snapshot-only observability field).
+        "format_compliance_by_type": latest.get("format_compliance_by_type"),
     }
 
 
@@ -3150,3 +3279,73 @@ async def compute_project_window_spend_usd(
                 in_rate, out_rate = pricing
                 total += input_tokens * in_rate + output_tokens * out_rate
     return round(total, 6)
+
+
+# ---------------------------------------------------------------------------
+# Agent-authenticated efficiency-snapshot read endpoint
+# ---------------------------------------------------------------------------
+# Research tasks that authenticate with an agent token (not admin credentials)
+# can read the latest snapshot's per-task-type format-compliance breakdown here
+# without needing access to the admin digest path.
+#
+# Auth: the same X-Agent-Token JWT used by all other agent endpoints; JWT is
+# verified via verify_agent_jwt (the low-level validator), which avoids a
+# circular import through app.routers.agent. For a read-only telemetry endpoint
+# the task-state liveness checks in verify_agent_token are unnecessary.
+
+
+@agent_router.get("/efficiency-snapshot/format-compliance")
+async def agent_get_efficiency_snapshot_format_compliance(
+    session: AsyncSession = Depends(get_session),
+    x_agent_token: str = Header(..., description="Agent JWT", alias="X-Agent-Token"),
+):
+    """Return the latest snapshot's per-task-type format-compliance breakdown.
+
+    Read-only endpoint for agent-authenticated tasks (research/measure task
+    types directed at format-compliance reads) that cannot reach the admin
+    digest path. Authenticates with the same X-Agent-Token JWT used by all
+    other agent endpoints; extracts the project_id from the task identified
+    by the token's ``sub`` claim.
+
+    Returns ``{captured_at, format_compliance, format_compliance_by_type}``
+    from the latest persisted snapshot, or 404 when no snapshot exists yet.
+    """
+    from app.auth import verify_agent_jwt
+
+    payload = verify_agent_jwt(x_agent_token)
+    task_id_str = payload.get("sub")
+    project_id_str = payload.get("project_id")
+
+    if not task_id_str and not project_id_str:
+        raise HTTPException(status_code=401, detail="token_missing_subject")
+
+    if task_id_str:
+        try:
+            task_uuid = uuid.UUID(task_id_str)
+        except ValueError:
+            raise HTTPException(status_code=401, detail="token_invalid_subject") from None
+        task = await session.get(Task, task_uuid)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task_not_found")
+        project_id = task.project_id
+    else:
+        try:
+            project_id = uuid.UUID(project_id_str)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=401, detail="token_invalid_project_id") from None
+
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project_not_found")
+
+    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    snapshots = container.get("snapshots") or []
+    if not snapshots:
+        raise HTTPException(status_code=404, detail="no_snapshot_available")
+
+    latest = snapshots[-1]
+    return {
+        "captured_at": latest.get("captured_at"),
+        FORMAT_COMPLIANCE_KEY: latest.get(FORMAT_COMPLIANCE_KEY),
+        "format_compliance_by_type": latest.get("format_compliance_by_type"),
+    }

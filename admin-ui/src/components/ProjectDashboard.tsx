@@ -143,8 +143,8 @@ function formatLift(lift: number | null | undefined): string {
 }
 
 function getVerdictClasses(verdict: string | undefined): string {
-  if (verdict === 'adopt') return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/20';
-  if (verdict === 'reject') return 'bg-red-500/15 text-red-300 border-red-500/20';
+  if (verdict === 'adopt' || verdict === 'ADOPT') return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/20';
+  if (verdict === 'reject' || verdict === 'KILL') return 'bg-red-500/15 text-red-300 border-red-500/20';
   return 'bg-amber-500/15 text-amber-300 border-amber-500/20';
 }
 
@@ -154,8 +154,35 @@ function renderThresholds(thresholds: NonNullable<Project['capability_adoption_v
     thresholds.min_n_per_arm != null ? `min n/arm ${thresholds.min_n_per_arm}` : null,
     thresholds.adopt_lift != null ? `adopt ${thresholds.adopt_lift}` : null,
     thresholds.reject_lift != null ? `reject ${thresholds.reject_lift}` : null,
+    thresholds.futility_n != null ? `futility ${thresholds.futility_n}` : null,
   ].filter(Boolean);
   return parts.length > 0 ? `Thresholds: ${parts.join(' · ')}` : 'Thresholds —';
+}
+
+function renderLaneThresholds(thresholds: NonNullable<Project['capability_adoption_verdicts']>[string]['thresholds'] | undefined): string {
+  if (!thresholds) return 'Thresholds —';
+  const parts = [
+    thresholds.min_n != null ? `min n ${thresholds.min_n}` : null,
+    thresholds.kill_merge_rate_floor != null ? `kill merge ${thresholds.kill_merge_rate_floor}` : null,
+    thresholds.kill_cost_ceiling != null ? `kill cost ${thresholds.kill_cost_ceiling}` : null,
+    thresholds.kill_gate_violations_max != null ? `kill gates ${thresholds.kill_gate_violations_max}` : null,
+    thresholds.kill_checkpoint_loss_ceiling != null ? `kill checkpoint ${thresholds.kill_checkpoint_loss_ceiling}` : null,
+    thresholds.futility_n != null ? `futility ${thresholds.futility_n}` : null,
+    thresholds.adopt_merge_lift_floor != null ? `adopt lift ${thresholds.adopt_merge_lift_floor}` : null,
+    thresholds.adopt_cost_improvement != null ? `adopt cost ${thresholds.adopt_cost_improvement}` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? `Thresholds: ${parts.join(' · ')}` : 'Thresholds —';
+}
+
+function renderLaneMetrics(verdict: NonNullable<Project['capability_adoption_verdicts']>[string]): string {
+  return [
+    `Lane samples ${verdict.n_lane ?? 0}`,
+    `Control samples ${verdict.n_control ?? 0}`,
+    `Merge rate ${verdict.lane_merge_rate == null ? '—' : `${(verdict.lane_merge_rate * 100).toFixed(1)}%`} lane / ${verdict.control_merge_rate == null ? '—' : `${(verdict.control_merge_rate * 100).toFixed(1)}%`} control`,
+    `Cost/merged ${verdict.lane_cost_per_merged == null ? '—' : `$${verdict.lane_cost_per_merged.toFixed(2)}`} lane / ${verdict.control_cost_per_merged == null ? '—' : `$${verdict.control_cost_per_merged.toFixed(2)}`} control`,
+    `Checkpoint loss ${verdict.checkpoint_loss_rate == null ? '—' : `${(verdict.checkpoint_loss_rate * 100).toFixed(1)}%`}`,
+    `Gate violations ${verdict.gate_integrity_violations ?? 0}`,
+  ].join(' · ');
 }
 
 function CapabilityEvidencePanel({ project }: { project: Project }) {
@@ -173,6 +200,7 @@ function CapabilityEvidencePanel({ project }: { project: Project }) {
           {capabilities.map(capability => {
             const proof = proofSummary[capability];
             const verdict = verdicts[capability];
+            const isLanePilot = capability === 'review_fix_lane';
             return (
               <div key={capability} className="grid gap-2 px-3 py-3 md:grid-cols-[minmax(0,1fr)_minmax(260px,auto)]">
                 <div className="min-w-0">
@@ -192,12 +220,25 @@ function CapabilityEvidencePanel({ project }: { project: Project }) {
                   <span className={`inline-flex rounded border px-2 py-1 text-[10px] font-semibold ${getVerdictClasses(verdict?.verdict)}`}>
                     {verdict?.verdict ?? 'no active/adjudicated trial'}
                   </span>
+                  {verdict?.verdict_reason && <div className="mt-0.5 text-[10px] text-neutral-500">{verdict.verdict_reason}</div>}
                   {verdict ? (
                     <div className="mt-1 text-[10px] text-neutral-400">
-                      <span className="tabular-nums text-neutral-300">{formatLift(verdict.lift)}</span>
-                      <span className="mx-1.5 text-neutral-700">·</span><span className="tabular-nums text-neutral-300">Samples {verdict.n_with ?? 0} with / {verdict.n_without ?? 0} without</span>
-                      <span className="mx-1.5 text-neutral-700">·</span><span className="text-neutral-300">{renderThresholds(verdict.thresholds)}</span>
-                      {verdict.evaluated_at && <><span className="mx-1.5 text-neutral-700">·</span>Evaluated <span className="text-neutral-300">{formatEvidenceDate(verdict.evaluated_at)}</span></>}
+                      {isLanePilot ? (
+                        <>
+                          <div className="text-neutral-300">{renderLaneMetrics(verdict)}</div>
+                          <div className="text-neutral-300">{renderLaneThresholds(verdict.thresholds)}</div>
+                          {verdict.immediate_alert && <div className="text-red-300">Immediate alert</div>}
+                          {verdict.evaluated_at && <div className="text-neutral-300">Evaluated {formatEvidenceDate(verdict.evaluated_at)}</div>}
+                        </>
+                      ) : (
+                        <>
+                          <span className="tabular-nums text-neutral-300">{formatLift(verdict.lift)}</span>
+                          <span className="mx-1.5 text-neutral-700">·</span><span className="tabular-nums text-neutral-300">Samples {verdict.n_with ?? 0} with / {verdict.n_without ?? 0} without</span>
+                          <span className="mx-1.5 text-neutral-700">·</span><span className="text-neutral-300">{renderThresholds(verdict.thresholds)}</span>
+                          {verdict.evaluated_at && <><span className="mx-1.5 text-neutral-700">·</span>Evaluated <span className="text-neutral-300">{formatEvidenceDate(verdict.evaluated_at)}</span></>}
+                          {verdict.arm_composition && <><span className="mx-1.5 text-neutral-700">·</span><span className="text-neutral-300">{verdict.arm_composition.with_assigned ?? 0}+{verdict.arm_composition.with_receipt ?? 0}w / {verdict.arm_composition.without_assigned ?? 0}+{verdict.arm_composition.without_receipt ?? 0}wo</span></>}
+                        </>
+                      )}
                     </div>
                   ) : (
                     <div className="mt-1 text-[10px] text-neutral-500">no active/adjudicated trial</div>

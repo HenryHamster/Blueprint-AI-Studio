@@ -2,33 +2,135 @@ import type { DigestData } from '../types/digest';
 
 function fmtLift(lift: number | null): string { return lift == null ? '—' : lift >= 0 ? `+${lift.toFixed(3)}` : lift.toFixed(3); }
 function fmtDate(ts?: string): string { return ts ? new Date(ts).toLocaleString() : '—'; }
+function fmtRate(rate?: number | null): string { return rate == null ? '—' : `${(rate * 100).toFixed(1)}%`; }
+function fmtMoney(value?: number | null): string { return value == null ? '—' : `$${value.toFixed(2)}`; }
+
+type AccrualProjection = NonNullable<DigestData['capability_adoption_verdicts']>[string]['accrual_projection'];
+type CapabilityVerdict = NonNullable<DigestData['capability_adoption_verdicts']>[string];
+
+function fmtAccrual(p: NonNullable<AccrualProjection>): string {
+  const days = p.window_days ?? 7;
+  const eta = p.days_to_min_n == null ? '—' : `${p.days_to_min_n}d`;
+  const holdbackPct = ((p.holdback_fraction ?? 0) * 100).toFixed(0);
+  return `${p.with_7d ?? 0} with / ${p.without_7d ?? 0} without in last ${days}d · est. ${eta} to threshold at ${holdbackPct}% holdback`;
+}
+
+function hasLaneMetrics(v: CapabilityVerdict): boolean {
+  return v.n_lane != null || v.n_control != null || v.lane_merge_rate != null || v.control_merge_rate != null;
+}
+
+function verdictClass(verdict: CapabilityVerdict['verdict']): string {
+  if (verdict === 'adopt' || verdict === 'ADOPT') return 'text-emerald-400';
+  if (verdict === 'reject' || verdict === 'KILL') return 'text-red-400';
+  return 'text-amber-400';
+}
+
+function laneMetricSummary(v: CapabilityVerdict): string[] {
+  const lines = [
+    `Lane samples ${v.n_lane ?? 0}`,
+    `Control samples ${v.n_control ?? 0}`,
+    `Merge rate ${fmtRate(v.lane_merge_rate)} lane / ${fmtRate(v.control_merge_rate)} control`,
+    `Cost/merged ${fmtMoney(v.lane_cost_per_merged)} lane / ${fmtMoney(v.control_cost_per_merged)} control`,
+    `Checkpoint loss ${fmtRate(v.checkpoint_loss_rate)}`,
+    `Gate violations ${v.gate_integrity_violations ?? 0}`,
+  ];
+  if (v.lane_fix_tasks_sampled != null) {
+    lines.push(`Warm resume ${fmtRate(v.warm_resume_fraction)} (${v.lane_fix_tasks_sampled} fix tasks)`);
+    lines.push(`Checkpoint receipt ${fmtRate(v.checkpoint_fraction)}`);
+  }
+  return lines;
+}
 
 export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null }) {
   const verdicts = Object.entries(digest?.capability_adoption_verdicts ?? {});
-  const totalWith = verdicts.reduce((sum, [, v]) => sum + Math.min(v.n_with ?? 0, 30), 0);
-  const totalWithout = verdicts.reduce((sum, [, v]) => sum + Math.min(v.n_without ?? 0, 30), 0);
-  if (verdicts.length === 0 || (totalWith === 0 && totalWithout === 0)) {
+  const genericVerdicts = verdicts.filter(([, v]) => !hasLaneMetrics(v));
+  const totalWith = genericVerdicts.reduce((sum, [, v]) => sum + Math.min(v.n_with ?? 0, v.thresholds?.min_n_per_arm ?? 30), 0);
+  const totalWithout = genericVerdicts.reduce((sum, [, v]) => sum + Math.min(v.n_without ?? 0, v.thresholds?.min_n_per_arm ?? 30), 0);
+  const genericTarget = genericVerdicts.reduce((sum, [, v]) => sum + (v.thresholds?.min_n_per_arm ?? 30), 0);
+  if (verdicts.length === 0) {
     return <section><h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials</h2><div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-[11px] text-neutral-500">No capability trials are currently running.</div></section>;
   }
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials <span className="text-neutral-600 normal-case font-normal">· {totalWith}/30 with · {totalWithout}/30 without</span></h2>
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials <span className="text-neutral-600 normal-case font-normal">{genericTarget > 0 ? `· ${totalWith}/${genericTarget} with · ${totalWithout}/${genericTarget} without` : `· ${verdicts.length} verdict${verdicts.length === 1 ? '' : 's'}`}</span></h2>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         <div className="sm:hidden divide-y divide-neutral-800/30">
-          {verdicts.map(([name, v]) => <div key={name} className="px-3 py-2 text-[10px]">
-            <div className="flex items-start justify-between gap-2 mb-1"><span className="font-medium text-neutral-200 break-words">{name}</span><span className={`shrink-0 font-medium ${v.verdict === 'adopt' ? 'text-emerald-400' : v.verdict === 'reject' ? 'text-red-400' : 'text-amber-400'}`}>{v.verdict}</span></div>
-            <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-500">
-              <span>Lift: <span className="text-neutral-300 font-mono tabular-nums">{fmtLift(v.lift)}</span></span>
-              <span>Samples: <span className="text-neutral-300 tabular-nums">{v.n_with}/{v.n_without}</span></span>
-              <span>With: <span className="text-neutral-300 tabular-nums">{Math.min(v.n_with, 30)}/30</span></span>
-              <span>Without: <span className="text-neutral-300 tabular-nums">{Math.min(v.n_without, 30)}/30</span></span>
-              <span>Evaluated: <span className="text-neutral-300">{fmtDate(v.evaluated_at)}</span></span>
-            </div>
-          </div>)}
+          {verdicts.map(([name, v]) => {
+            const minN = v.thresholds?.min_n_per_arm ?? 30;
+            const isLane = hasLaneMetrics(v);
+            return (
+              <div key={name} className="px-3 py-2 text-[10px]">
+                <div className="flex items-start justify-between gap-2 mb-1">
+                  <span className="font-medium text-neutral-200 break-words">{name}</span>
+                  <div className="shrink-0 text-right">
+                    <span className={`font-medium ${verdictClass(v.verdict)}`}>{v.verdict}</span>
+                    {v.verdict_reason && <div className="text-neutral-500">{v.verdict_reason}</div>}
+                  </div>
+                </div>
+                {isLane ? (
+                  <div className="grid grid-cols-1 gap-y-0.5 text-neutral-500 min-[420px]:grid-cols-2 min-[420px]:gap-x-4">
+                    <span>Lane samples: <span className="text-neutral-300 tabular-nums">{v.n_lane ?? 0}</span></span>
+                    <span>Control samples: <span className="text-neutral-300 tabular-nums">{v.n_control ?? 0}</span></span>
+                    <span>Lane merge rate: <span className="text-neutral-300 tabular-nums">{fmtRate(v.lane_merge_rate)}</span></span>
+                    <span>Control merge rate: <span className="text-neutral-300 tabular-nums">{fmtRate(v.control_merge_rate)}</span></span>
+                    <span>Lane cost/merged: <span className="text-neutral-300 tabular-nums">{fmtMoney(v.lane_cost_per_merged)}</span></span>
+                    <span>Control cost/merged: <span className="text-neutral-300 tabular-nums">{fmtMoney(v.control_cost_per_merged)}</span></span>
+                    <span>Checkpoint loss: <span className="text-neutral-300 tabular-nums">{fmtRate(v.checkpoint_loss_rate)}</span></span>
+                    <span>Gate violations: <span className="text-neutral-300 tabular-nums">{v.gate_integrity_violations ?? 0}</span></span>
+                    {v.lane_fix_tasks_sampled != null && <>
+                      <span>Warm resume: <span className="text-neutral-300 tabular-nums">{fmtRate(v.warm_resume_fraction)} ({v.lane_fix_tasks_sampled} fix)</span></span>
+                      <span>Checkpoint receipt: <span className="text-neutral-300 tabular-nums">{fmtRate(v.checkpoint_fraction)}</span></span>
+                    </>}
+                    {v.engagement_low && <span className="text-amber-300">Engagement low — treatment not delivered</span>}
+                    {v.immediate_alert && <span className="text-red-300">Immediate alert: yes</span>}
+                    <span>Evaluated: <span className="text-neutral-300">{fmtDate(v.evaluated_at)}</span></span>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-500">
+                    <span>Lift: <span className="text-neutral-300 font-mono tabular-nums">{fmtLift(v.lift ?? null)}</span></span>
+                    <span>Samples: <span className="text-neutral-300 tabular-nums">{v.n_with}/{v.n_without}</span></span>
+                    <span>With: <span className="text-neutral-300 tabular-nums">{Math.min(v.n_with ?? 0, minN)}/{minN}</span></span>
+                    <span>Without: <span className="text-neutral-300 tabular-nums">{Math.min(v.n_without ?? 0, minN)}/{minN}</span></span>
+                    <span>Evaluated: <span className="text-neutral-300">{fmtDate(v.evaluated_at)}</span></span>
+                  </div>
+                )}
+                {v.arm_composition && (
+                  <div className="mt-0.5 text-neutral-500">
+                    Arm: <span className="text-neutral-400">{v.arm_composition.with_assigned ?? 0}+{v.arm_composition.with_receipt ?? 0}w / {v.arm_composition.without_assigned ?? 0}+{v.arm_composition.without_receipt ?? 0}wo</span>
+                  </div>
+                )}
+                {v.accrual_projection && (
+                  <div className="mt-0.5 text-neutral-500">{fmtAccrual(v.accrual_projection)}</div>
+                )}
+              </div>
+            );
+          })}
         </div>
         <table className="hidden sm:table w-full text-xs">
-          <thead><tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50"><th className="text-left px-3 py-2 font-medium">Capability</th><th className="text-right px-3 py-2 font-medium">Verdict</th><th className="text-right px-3 py-2 font-medium">Lift</th><th className="text-right px-3 py-2 font-medium">With</th><th className="text-right px-3 py-2 font-medium">Without</th><th className="text-right px-3 py-2 font-medium">Evaluated</th></tr></thead>
-          <tbody className="divide-y divide-neutral-800/30">{verdicts.map(([name, v]) => <tr key={name}><td className="px-3 py-2 text-neutral-200">{name}</td><td className={`text-right px-3 py-2 font-medium ${v.verdict === 'adopt' ? 'text-emerald-400' : v.verdict === 'reject' ? 'text-red-400' : 'text-amber-400'}`}>{v.verdict}</td><td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">{fmtLift(v.lift)}</td><td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{v.n_with}/30</td><td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{v.n_without}/30</td><td className="text-right px-3 py-2 text-neutral-300">{fmtDate(v.evaluated_at)}</td></tr>)}</tbody>
+          <thead><tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50"><th className="text-left px-3 py-2 font-medium">Capability</th><th className="text-right px-3 py-2 font-medium">Verdict</th><th className="text-right px-3 py-2 font-medium">Metric</th><th className="text-right px-3 py-2 font-medium">Samples</th><th className="text-right px-3 py-2 font-medium">Cost / Guardrails</th><th className="text-right px-3 py-2 font-medium">Evaluated</th></tr></thead>
+          <tbody className="divide-y divide-neutral-800/30">{verdicts.map(([name, v]) => {
+            const minN = v.thresholds?.min_n_per_arm ?? 30;
+            const isLane = hasLaneMetrics(v);
+            return (
+              <tr key={name}>
+                <td className="px-3 py-2 text-neutral-200">
+                  {name}
+                  {isLane && <div className="text-[10px] text-neutral-500 font-normal">{laneMetricSummary(v).join(' · ')}</div>}
+                  {v.accrual_projection && <div className="text-[10px] text-neutral-500 font-normal">{fmtAccrual(v.accrual_projection)}</div>}
+                </td>
+                <td className="text-right px-3 py-2">
+                  <span className={`font-medium ${verdictClass(v.verdict)}`}>{v.verdict}</span>
+                  {v.verdict_reason && <div className="text-[10px] text-neutral-500">{v.verdict_reason}</div>}
+                  {v.immediate_alert && <div className="text-[10px] text-red-300">Immediate alert</div>}
+                  {v.arm_composition && <div className="text-[10px] text-neutral-500">{v.arm_composition.with_assigned ?? 0}+{v.arm_composition.with_receipt ?? 0}w / {v.arm_composition.without_assigned ?? 0}+{v.arm_composition.without_receipt ?? 0}wo</div>}
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">{isLane ? <>{fmtRate(v.lane_merge_rate)} / {fmtRate(v.control_merge_rate)}</> : fmtLift(v.lift ?? null)}</td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{v.n_lane ?? 0} lane / {v.n_control ?? 0} control</> : <>{v.n_with}/{minN}</>}</td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{fmtMoney(v.lane_cost_per_merged)} / {fmtMoney(v.control_cost_per_merged)}<div className="text-[10px] text-neutral-500">loss {fmtRate(v.checkpoint_loss_rate)} · gates {v.gate_integrity_violations ?? 0}</div>{v.lane_fix_tasks_sampled != null && <div className="text-[10px] text-neutral-500">warm {fmtRate(v.warm_resume_fraction)} · ckpt {fmtRate(v.checkpoint_fraction)} ({v.lane_fix_tasks_sampled} fix)</div>}{v.engagement_low && <div className="text-[10px] text-amber-400">engagement low</div>}</> : <>{v.n_without}/{minN}</>}</td>
+                <td className="text-right px-3 py-2 text-neutral-300">{fmtDate(v.evaluated_at)}</td>
+              </tr>
+            );
+          })}</tbody>
         </table>
       </div>
     </section>

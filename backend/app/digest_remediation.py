@@ -84,7 +84,6 @@ async def compute_remediation_and_patterns(
     window_start: datetime,
     failed_tasks: List[Task],
     all_tasks: List[Task],
-    active_tasks_all: List[Task],
     dir_id_to_text: Dict[str, str],
 ) -> Dict[str, Any]:
     """Build the remediation funnel + recurring failure patterns digest blocks.
@@ -208,7 +207,29 @@ async def compute_remediation_and_patterns(
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
     }
-    for _t in list(all_tasks) + list(active_tasks_all):
+    # Query inflight tasks without a row cap so a remediation task queued after
+    # the display-list limit is not invisible to the status ladder.  No column
+    # filter on previous_error_fingerprint — context-only fingerprints
+    # (diagnosis_fingerprint / error_fingerprint) are resolved in the loop below.
+    _inflight_fp_filters: list = [
+        Task.status.in_(list(_inflight_statuses)),
+    ]
+    if project_id:
+        _inflight_fp_filters.append(Task.project_id == project_id)
+    _inflight_fp_result = await session.execute(
+        select(Task)
+        .where(*_inflight_fp_filters)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.previous_error_fingerprint,
+                Task.context,
+            )
+        )
+    )
+    _inflight_fp_tasks = list(_inflight_fp_result.scalars().all())
+    for _t in list(all_tasks) + _inflight_fp_tasks:
         _ctx = _t.context or {}
         # Audit W1: previous_error_fingerprint is a column.
         _fp_ = (

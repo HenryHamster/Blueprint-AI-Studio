@@ -210,6 +210,82 @@ class TestStoreAgentSecretIamRetry:
         assert client.get_iam_policy.call_count == 5
 
 
+class _FleetSourceFakeSession:
+    async def execute(self, _stmt):
+        raise RuntimeError("db unavailable")
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_preserves_exact_match_without_ancestry(
+    monkeypatch, mocker
+):
+    monkeypatch.setattr(compute, "_vm_source_shas", {"vm-1": "b" * 40})
+    ancestry = mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            _FleetSourceFakeSession(),
+            "b" * 40,
+        )
+        is True
+    )
+    ancestry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_accepts_descendant_when_enabled(
+    monkeypatch, mocker
+):
+    promoted_sha = "a" * 40
+    descendant_sha = "b" * 40
+    monkeypatch.setattr(compute, "_vm_source_shas", {"vm-1": descendant_sha})
+    ancestry = mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            _FleetSourceFakeSession(),
+            promoted_sha,
+            allow_descendant=True,
+            token="tok",
+            owner="acme",
+            repo="widget",
+            project_id="proj",
+        )
+        is True
+    )
+    ancestry.assert_awaited_once()
+    assert ancestry.await_args.args[3:5] == (promoted_sha, descendant_sha)
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_indeterminate_descendant_is_not_confirmed(
+    monkeypatch, mocker
+):
+    monkeypatch.setattr(compute, "_vm_source_shas", {"vm-1": "b" * 40})
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new=AsyncMock(return_value=None),
+    )
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            _FleetSourceFakeSession(),
+            "a" * 40,
+            allow_descendant=True,
+            token="tok",
+            owner="acme",
+            repo="widget",
+        )
+        is False
+    )
+
+
 class TestAgentSecretManifest:
     def test_build_agent_secret_manifest_includes_runtime_identity(self):
         task_id = uuid.uuid4()
@@ -2471,6 +2547,93 @@ async def test_accelerator_only_resolves_canonical_machine_type(
 
 
 @pytest.mark.asyncio
+async def test_create_compute_job_gpu_extends_wall_clock_deadline(
+    db_session, monkeypatch
+):
+    """GPU jobs add GPU_PROVISIONING_ALLOWANCE_SECONDS to wall_clock_deadline; CPU jobs do not."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task_gpu = await _make_compute_task(db_session)
+    before = datetime.utcnow()
+    job_gpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_gpu,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator="T4",
+    )
+    after = datetime.utcnow()
+
+    # GPU wall_clock_deadline includes the provisioning allowance.
+    expected_allowance = compute_jobs.GPU_PROVISIONING_ALLOWANCE_SECONDS
+    lower = before + timedelta(seconds=600 + expected_allowance)
+    upper = after + timedelta(seconds=600 + expected_allowance)
+    assert lower <= job_gpu.wall_clock_deadline <= upper, (
+        f"GPU wall_clock_deadline {job_gpu.wall_clock_deadline} not in "
+        f"[{lower}, {upper}]"
+    )
+
+    # CPU job wall_clock_deadline does NOT include the allowance.
+    task_cpu = await _make_compute_task(db_session)
+    before_cpu = datetime.utcnow()
+    job_cpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_cpu,
+        command="echo cpu",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=600,
+    )
+    after_cpu = datetime.utcnow()
+    lower_cpu = before_cpu + timedelta(seconds=600)
+    upper_cpu = after_cpu + timedelta(seconds=600)
+    assert lower_cpu <= job_cpu.wall_clock_deadline <= upper_cpu, (
+        f"CPU wall_clock_deadline {job_cpu.wall_clock_deadline} not in "
+        f"[{lower_cpu}, {upper_cpu}]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_stores_park_deadline_seconds(
+    db_session, monkeypatch
+):
+    """park_deadline_seconds in polling_metadata equals deadline + allowance + grace."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task_gpu = await _make_compute_task(db_session)
+    job_gpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_gpu,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator="T4",
+    )
+    expected_gpu_park = (
+        600
+        + compute_jobs.GPU_PROVISIONING_ALLOWANCE_SECONDS
+        + compute_jobs._COMPUTE_PARK_GRACE_SECONDS
+    )
+    assert job_gpu.polling_metadata["park_deadline_seconds"] == expected_gpu_park
+
+    # CPU: no provisioning allowance, only grace.
+    task_cpu = await _make_compute_task(db_session)
+    job_cpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_cpu,
+        command="echo cpu",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=600,
+    )
+    expected_cpu_park = 600 + compute_jobs._COMPUTE_PARK_GRACE_SECONDS
+    assert job_cpu.polling_metadata["park_deadline_seconds"] == expected_cpu_park
+
+
+@pytest.mark.asyncio
 async def test_create_compute_job_rejects_a100(db_session, monkeypatch):
     """An A100 (over-quota, count=0) request is rejected loudly at create time."""
     monkeypatch.setattr(compute, "LOCAL_MODE", False)
@@ -2826,14 +2989,54 @@ async def test_list_compute_jobs_returns_active_and_recent_excludes_others(db_se
     db_session.add_all([active, recent_done, stale_done, other_active])
     await db_session.commit()
 
-    jobs = await compute_jobs.list_compute_jobs(
+    jobs, has_more = await compute_jobs.list_compute_jobs(
         db_session, project_id=project.id, include_finished_within=timedelta(hours=6)
     )
+    assert has_more is False
     job_ids = {j.id for j in jobs}
     assert active.id in job_ids
     assert recent_done.id in job_ids
     assert stale_done.id not in job_ids  # finished outside the window
     assert other_active.id not in job_ids  # different project
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_applies_limit_and_offset(db_session):
+    project = Project(name="Paged Compute", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    jobs = []
+    for _ in range(3):
+        job = ComputeJob(
+            task_id=task.id,
+            project_id=project.id,
+            backend="local-subprocess",
+            status=ComputeJobStatus.RUNNING,
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        jobs.append(job)
+
+    page, has_more = await compute_jobs.list_compute_jobs(
+        db_session,
+        project_id=project.id,
+        include_finished_within=timedelta(hours=6),
+        limit=2,
+        offset=1,
+    )
+
+    assert has_more is False
+    assert [job.id for job in page] == [jobs[1].id, jobs[0].id]
 
 
 # ─── Zone success-rate tracking tests ────────────────────────────────────────
@@ -4890,7 +5093,7 @@ async def test_wake_post_commit_recoverable_when_crash_before_marker_write(
     )
     monkeypatch.setattr(
         "app.knowledge_completion._analyze_compute_experiment_with_llm",
-        AsyncMock(return_value=None),
+        AsyncMock(return_value=(None, "precondition-not-met")),
     )
 
     again = await sweep_deliver_task_wakes(db_session, _utcnow())
@@ -5119,7 +5322,7 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
     )
     monkeypatch.setattr(
         "app.knowledge_completion._analyze_compute_experiment_with_llm",
-        AsyncMock(return_value=None),
+        AsyncMock(return_value=(None, "precondition-not-met")),
     )
 
     # Run sweep with the default batch_size. The batch_size markerless rows must NOT
@@ -5351,7 +5554,7 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
     )
     monkeypatch.setattr(
         "app.knowledge_completion._analyze_compute_experiment_with_llm",
-        AsyncMock(return_value=None),
+        AsyncMock(return_value=(None, "precondition-not-met")),
     )
 
     # Run sweep with batch_size. The batch_size backlog rows have a far-future
@@ -8079,3 +8282,181 @@ async def test_compute_job_concurrency_cap_per_project_isolation(db_session):
 
     assert job is not None
     assert job.project_id == project_b.id
+
+
+# ── Release identity injection, echo, and echo parsing ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_launch_spec_injects_release_env_vars(db_session, monkeypatch):
+    """_build_launch_spec injects BLUEPRINT_RELEASE_* when live_release_evidence is set."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="gcp",
+    )
+    evidence = {
+        "promoted_sha": "abc123def456",
+        "release_version_number": 9,
+        "release_version_id": "11111111-0000-0000-0000-000000000001",
+        "aggregate_serving_status": "serving_confirmed",
+    }
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "live_release_evidence": evidence,
+    }
+
+    spec = compute_jobs._build_launch_spec(job)
+    assert spec.env is not None
+    assert spec.env["BLUEPRINT_RELEASE_SHA"] == "abc123def456"
+    assert spec.env["BLUEPRINT_RELEASE_VERSION"] == "9"
+    assert spec.env["BLUEPRINT_RELEASE_VERSION_ID"] == "11111111-0000-0000-0000-000000000001"
+
+
+@pytest.mark.asyncio
+async def test_build_launch_spec_no_env_injection_without_evidence(db_session, monkeypatch):
+    """_build_launch_spec does NOT inject BLUEPRINT_RELEASE_* for non-live-proof jobs."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="gcp",
+    )
+    spec = compute_jobs._build_launch_spec(job)
+    env = spec.env or {}
+    assert "BLUEPRINT_RELEASE_SHA" not in env
+    assert "BLUEPRINT_RELEASE_VERSION" not in env
+    assert "BLUEPRINT_RELEASE_VERSION_ID" not in env
+
+
+@pytest.mark.asyncio
+async def test_build_launch_spec_caller_env_takes_precedence_over_release_env(
+    db_session, monkeypatch
+):
+    """Caller-provided env overrides injected release env vars."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="gcp",
+    )
+    evidence = {
+        "promoted_sha": "abc123def456",
+        "release_version_number": 9,
+    }
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "live_release_evidence": evidence,
+        "env": {"BLUEPRINT_RELEASE_SHA": "caller-override"},
+    }
+    spec = compute_jobs._build_launch_spec(job)
+    assert spec.env["BLUEPRINT_RELEASE_SHA"] == "caller-override"
+
+
+def test_gcp_startup_script_emits_release_echo_when_sha_present():
+    """GCP startup script contains the release echo emission block."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        env={"BLUEPRINT_RELEASE_SHA": "abc123def456"},
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "BLUEPRINT_COMPUTE_RELEASE_ECHO=" in script
+    assert "BLUEPRINT_RELEASE_SHA" in script
+    assert "RELEASE_ECHO_B64" in script
+
+
+def test_gcp_startup_script_release_echo_block_is_no_op_without_sha():
+    """GCP startup script echo block is safely present but no-op without env var."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # The echo block is in the script but only fires when the env var is set.
+    assert "BLUEPRINT_COMPUTE_RELEASE_ECHO=" in script
+    assert "BLUEPRINT_RELEASE_SHA" in script
+
+
+def test_parse_serial_status_extracts_release_echo():
+    """_parse_serial_status decodes BLUEPRINT_COMPUTE_RELEASE_ECHO into echoed_release_sha."""
+    sha = "abc123def456"
+    echo_b64 = base64.b64encode(sha.encode("utf-8")).decode("ascii")
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_REASON=completed",
+            "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+            f"BLUEPRINT_COMPUTE_RELEASE_ECHO={echo_b64}",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.echoed_release_sha == sha
+
+
+def test_parse_serial_status_missing_echo_yields_none():
+    """_parse_serial_status returns echoed_release_sha=None when marker is absent."""
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_REASON=completed",
+            "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.echoed_release_sha is None
+
+
+def test_parse_serial_status_garbled_echo_is_tolerated():
+    """Garbled release echo marker is tolerated — echoed_release_sha stays None."""
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+            "BLUEPRINT_COMPUTE_RELEASE_ECHO=not-valid-base64-$$$",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.echoed_release_sha is None
+
+
+def test_local_wrapper_command_writes_release_echo_to_terminal_file():
+    """Local wrapper writes RELEASE_ECHO= to the terminal state file."""
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi", external_id="local-releasetest"
+    )
+    assert "RELEASE_ECHO=$RELEASE_ECHO_B64" in wrapper
+    assert "RELEASE_ECHO_B64" in wrapper
+    assert "BLUEPRINT_RELEASE_SHA" in wrapper

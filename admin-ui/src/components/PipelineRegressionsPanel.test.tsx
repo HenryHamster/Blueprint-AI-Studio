@@ -7,9 +7,11 @@ const STORAGE_KEY = 'blueprint-admin:pipelineRegressionsPanelCollapsed';
 const LEGACY_STORAGE_KEY = 'blueprint-admin:pipelineRegressionsCollapsed';
 
 const fetchPipelineRegressions = vi.fn();
+const resolveViewportFailureDownloadUrl = vi.fn();
 
 vi.mock('../api', () => ({
   fetchPipelineRegressions: (...args: unknown[]) => fetchPipelineRegressions(...args),
+  resolveViewportFailureDownloadUrl: (...args: unknown[]) => resolveViewportFailureDownloadUrl(...args),
 }));
 
 const ACTIVE_REGRESSIONS = {
@@ -43,6 +45,7 @@ describe('PipelineRegressionsPanel', () => {
   afterEach(() => {
     cleanup();
     fetchPipelineRegressions.mockReset();
+    resolveViewportFailureDownloadUrl.mockReset();
     localStorage.clear();
   });
 
@@ -115,6 +118,97 @@ describe('PipelineRegressionsPanel', () => {
     expect(screen.getByText('Prior / change')).toBeTruthy();
     expect(screen.getByText('42.0%')).toBeTruthy();
     expect(screen.getByText('31.0%')).toBeTruthy();
+  });
+
+  test('renders viewport regression screenshot and visible unavailable state', async () => {
+    fetchPipelineRegressions.mockResolvedValueOnce({
+      project_id: 'proj-1',
+      healthy: false,
+      regressions: [
+        {
+          signal_name: 'Viewport regression: MessagesPanel at 375px',
+          regression_class: 'viewport_regression:MessagesPanel:overflow@375',
+          detected_at: '2026-06-08T10:00:00',
+          severity: 'critical',
+          current_rate: null,
+          prior_rate: null,
+          viewport_component: 'MessagesPanel',
+          viewport_assertion_type: 'overflow',
+          viewport_width: 375,
+        },
+        {
+          signal_name: 'Viewport regression without metadata',
+          regression_class: 'viewport_regression:unknown',
+          detected_at: '2026-06-08T10:05:00',
+          severity: 'warning',
+          current_rate: null,
+          prior_rate: null,
+        },
+      ],
+    });
+    resolveViewportFailureDownloadUrl.mockResolvedValueOnce('https://storage.example/MessagesPanel-375.png');
+
+    render(<PipelineRegressionsPanel projectId="proj-1" />);
+    const rows = await screen.findAllByTestId('pipeline-regression-row');
+
+    fireEvent.click(within(rows[0]).getByRole('button'));
+    const image = await screen.findByAltText('MessagesPanel viewport failure at 375px');
+    expect(image.getAttribute('src')).toBe('https://storage.example/MessagesPanel-375.png');
+    expect(resolveViewportFailureDownloadUrl).toHaveBeenCalledWith(
+      'proj-1',
+      'MessagesPanel',
+      375,
+      expect.any(AbortSignal),
+    );
+
+    fireEvent.click(within(rows[1]).getByRole('button'));
+    expect(screen.getByText('Screenshot unavailable: missing viewport metadata')).toBeTruthy();
+  });
+
+  test('shows unavailable state for viewport resolver rejection and image load failure', async () => {
+    fetchPipelineRegressions.mockResolvedValueOnce({
+      project_id: 'proj-1',
+      healthy: false,
+      regressions: [
+        {
+          signal_name: 'Viewport regression: MessagesPanel at 375px',
+          regression_class: 'viewport_regression:MessagesPanel:overflow@375',
+          detected_at: '2026-06-08T10:00:00',
+          severity: 'critical',
+          current_rate: null,
+          prior_rate: null,
+          viewport_component: 'MessagesPanel',
+          viewport_assertion_type: 'overflow',
+          viewport_width: 375,
+        },
+        {
+          signal_name: 'Viewport regression: TaskCard at 768px',
+          regression_class: 'viewport_regression:TaskCard:touch_target@768',
+          detected_at: '2026-06-08T10:05:00',
+          severity: 'warning',
+          current_rate: null,
+          prior_rate: null,
+          viewport_component: 'TaskCard',
+          viewport_assertion_type: 'touch_target',
+          viewport_width: 768,
+        },
+      ],
+    });
+    resolveViewportFailureDownloadUrl
+      .mockRejectedValueOnce(new Error('Artifact storage unavailable'))
+      .mockResolvedValueOnce('https://storage.example/TaskCard-768.png');
+
+    render(<PipelineRegressionsPanel projectId="proj-1" />);
+    const rows = await screen.findAllByTestId('pipeline-regression-row');
+
+    fireEvent.click(within(rows[0]).getByRole('button'));
+    expect(await screen.findByText('Screenshot unavailable: Artifact storage unavailable')).toBeTruthy();
+
+    fireEvent.click(within(rows[1]).getByRole('button'));
+    const image = await screen.findByAltText('TaskCard viewport failure at 768px');
+    fireEvent.error(image);
+
+    expect(screen.getByText('Screenshot unavailable: image failed to load')).toBeTruthy();
   });
 
   test('shows worst active severity in the header when collapsed', async () => {

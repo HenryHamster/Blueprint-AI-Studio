@@ -12,8 +12,9 @@ Covers:
     including the deleted-test-file and startup-failure hard-blocker sentinels.
   * run_qualification — phase + in-flight + already-dry-run guards (audit H1);
     the FOR UPDATE row-lock serialization (audit C3); the candidate_sha-pinned
-    child payloads + main...<candidate_sha> audit diff (audit C4); the
-    smoketest-skipped spawn path when smoketest_enabled is False (audit H3).
+    audit payload + main...<candidate_sha> diff (audit C4); the smoketest-skipped
+    spawn path when smoketest_enabled is False (audit H3); the deferred
+    binding-challenge spawn once audit findings exist.
   * _finalize_qualification — promote / dry-run / not-promoted decision paths;
     the smoketest-disabled drop-dimension path.
   * promote — success path (create release branch at candidate_sha, open +
@@ -1967,6 +1968,20 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         assert hold == "audit_challenge_binding_incomplete"
         assert modified is None
 
+    def test_empty_verdicts_with_matching_sha_get_distinct_hold_code(self):
+        """Correct challenge SHA with zero verdicts is not a SHA mismatch."""
+        finding = _make_verified_finding("Missing authorization on release promotion")
+        envelope = _make_challenge_envelope(self.SHA, [])
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            self._report([finding]), envelope, self.SHA
+        )
+
+        assert hold == "audit_challenge_empty_verdicts"
+        assert modified is None
+        assert refuted == []
+        assert binding == []
+
     def test_two_verdicts_two_findings_both_matched(self):
         """One-to-one verdict-to-finding matching still works correctly."""
         finding_a = _make_verified_finding("Race condition in cache invalidation")
@@ -1993,6 +2008,275 @@ class TestReconcileAuditWithChallengeVerdictConsumedOnce:
         assert hold is None
         assert modified is report
         assert refuted == []
+
+    def test_primary_finding_index_binds_retry_verdict_with_paraphrased_summary(self):
+        medium = _make_verified_finding("Medium priority challenge binding issue")
+        medium["severity"] = "medium"
+        high = _make_verified_finding("High priority challenge binding issue")
+        report = self._report([medium, high])
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": "severe retry concern",
+                },
+                {
+                    "primary_finding_index": 2,
+                    "verdict": "confirmed",
+                    "severity": "medium",
+                    "summary": "moderate retry concern",
+                },
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is report
+        assert refuted == []
+        assert [b["finding_summary"] for b in binding] == [
+            "Medium priority challenge binding issue",
+            "High priority challenge binding issue",
+        ]
+        assert [b["verdict_summary"] for b in binding] == [
+            "moderate retry concern",
+            "severe retry concern",
+        ]
+
+    def test_retry_primary_findings_cover_all_deductible_findings_past_display_cap(self):
+        findings = [
+            _make_verified_finding(f"Verified challenge binding issue {i}", f"app/{i}.py")
+            for i in range(rq._MAX_CARRIED_FINDINGS + 2)
+        ]
+        report = self._report(findings)
+
+        carried = rq._primary_findings_for_challenge_retry(report)
+        assert len(carried) == len(findings)
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": i + 1,
+                    "verdict": "confirmed",
+                    "severity": finding["severity"],
+                    "summary": finding["summary"],
+                    "reason": "confirmed by challenge review with supporting evidence",
+                }
+                for i, finding in enumerate(carried)
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is report
+        assert refuted == []
+        assert binding[0]["finding_summary"] == findings[0]["summary"]
+
+    def test_empty_summary_finding_excluded_from_index_domain(self):
+        """Empty-summary findings are excluded from the indexed and must-bind domains."""
+        a = {
+            "severity": "high",
+            "summary": "",
+            "file": "a.py",
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+        b = _make_verified_finding("Security critical authentication bypass")
+        b["file"] = "b.py"
+        report = {"findings": [a, b]}
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",
+                    "summary": "Security critical authentication bypass",
+                    "reason": "thorough code review confirmed no authentication bypass",
+                },
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert len(refuted) == 1
+        assert refuted[0]["summary"] == "Security critical authentication bypass"
+        assert refuted[0]["severity"] == "high"
+
+    def test_indexed_refuted_lower_severity_not_allowed(self):
+        """An indexed refuted_false_positive with lower severity than the finding
+        must be rejected by _indexed_verdict_can_bind.
+
+        When rejected the verdict is NOT bound by index and also excluded from
+        the fuzzy adjacency list (it has primary_finding_index set), leaving the
+        finding without any verdict and producing audit_challenge_binding_incomplete.
+        """
+        finding = _make_verified_finding("SQL injection in query builder module")
+        report = {"findings": [finding]}
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "refuted_false_positive",
+                    "severity": "low",  # lower than finding's "high"
+                    "summary": "SQL injection in query builder module",
+                    "reason": "parameterized queries are used throughout",
+                },
+            ],
+        )
+
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # Severity ceiling blocks the refutation; no fuzzy fallback since
+        # primary_finding_index is set → binding is incomplete.
+        assert hold == "audit_challenge_binding_incomplete"
+        assert refuted == []
+
+    def test_indexed_refuted_equal_severity_allowed(self):
+        """An indexed refuted_false_positive with equal severity is accepted and
+        removes the finding from scoring; this is the backend side of agent
+        canonicalization to the bound finding's severity.
+        """
+        finding = _make_verified_finding("SQL injection in query builder module")
+        report = {"findings": [finding]}
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",  # equal to finding's "high"
+                    "summary": "SQL injection in query builder module",
+                    "reason": "parameterized queries are used throughout the module",
+                },
+            ],
+        )
+
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # Severity ceiling passes; finding is removed.
+        assert hold is None
+        assert len(refuted) == 1
+        assert refuted[0]["summary"] == "SQL injection in query builder module"
+
+    def test_indexed_refuted_paraphrased_summary_binds_by_index(self):
+        """Indexed refutation binds by index regardless of summary text mismatch.
+
+        The backend binds via primary_finding_index; the verbatim requirement
+        applies only to the agent side.  _indexed_verdict_can_bind only checks
+        the severity ceiling, so a paraphrased summary must still remove the
+        finding from scoring.
+        """
+        finding = _make_verified_finding("Memory corruption in packet parser")
+        finding["severity"] = "high"
+        report = {"findings": [finding]}
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 1,
+                    "verdict": "refuted_false_positive",
+                    "severity": "high",
+                    "summary": "Heap overflow during network packet parsing",  # paraphrase
+                    "reason": "bounds-checked buffer slices prevent out-of-bounds writes",
+                },
+            ],
+        )
+
+        hold, modified, refuted, _binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        # Index-based binding bypasses summary matching; finding is removed.
+        assert hold is None
+        assert len(refuted) == 1
+
+    @pytest.mark.parametrize(
+        ("finding_summary", "verdict_summary"),
+        [
+            (
+                "Out of range index still has exact text",
+                "Out of range index still has exact text",
+            ),
+            (
+                "Release audit challenge binding retries lose primary verdict identity",
+                "challenge binding retry loses primary verdict identity",
+            ),
+        ],
+    )
+    def test_out_of_range_index_falls_back_to_content_matching(
+        self, finding_summary, verdict_summary
+    ):
+        finding = _make_verified_finding(finding_summary)
+        report = {"findings": [finding]}
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "primary_finding_index": 99,
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": verdict_summary,
+                },
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is report
+        assert refuted == []
+        assert binding[0]["verdict_summary"] == verdict_summary
+
+    def test_truncated_primary_summary_exact_match_binds(self):
+        long_summary = "A" * (rq._FINDING_SUMMARY_MAX + 40)
+        finding = _make_verified_finding(long_summary)
+        report = {"findings": [finding]}
+        shown_to_agent = long_summary[: rq._FINDING_SUMMARY_MAX]
+
+        envelope = _make_challenge_envelope(
+            self.SHA,
+            [
+                {
+                    "verdict": "confirmed",
+                    "severity": "high",
+                    "summary": shown_to_agent,
+                },
+            ],
+        )
+
+        hold, modified, refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+
+        assert hold is None
+        assert modified is report
+        assert refuted == []
+        assert binding[0]["finding_summary"] == shown_to_agent
 
     def test_refuted_verdict_consumed_second_finding_held(self):
         """One refuted verdict + one confirmed verdict match one finding each."""
@@ -3313,6 +3597,10 @@ class TestBindingRecordAndUnboundHoldDistinction:
         """audit_challenge_binding_incomplete must trigger challenge respawn."""
         assert "audit_challenge_binding_incomplete" in rq._AUDIT_CHALLENGE_BINDING_HOLDS
 
+    def test_empty_verdicts_in_binding_holds_frozenset(self):
+        """audit_challenge_empty_verdicts must trigger challenge respawn."""
+        assert "audit_challenge_empty_verdicts" in rq._AUDIT_CHALLENGE_BINDING_HOLDS
+
     def test_binding_record_capped_at_binding_record_cap(self):
         """Binding record must not exceed _BINDING_RECORD_CAP entries."""
         cap = rs._BINDING_RECORD_CAP
@@ -4430,11 +4718,12 @@ def _qualifier_ci_resolves_green(mocker):
 async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     db_session, mocker
 ):
-    """With smoketest_enabled=True, run_qualification snapshots the SHA, spawns
-    release_audit + advisory release_audit_challenge + qualifier-smoketest, and
-    stamps version.last_qualification = {status: 'pending', ...}.  All child
-    payloads carry the exact 40-char candidate_sha (audit C4 contract), and the
-    audit diff_range is pinned to main...<candidate_sha> (NOT main...automain)."""
+    """With smoketest_enabled=True, run_qualification snapshots the SHA,
+    spawns release_audit + qualifier-smoketest, and stamps
+    version.last_qualification = {status: 'pending', ...}.  The binding
+    release_audit_challenge is deferred until the audit report exists, while
+    the audit diff_range remains pinned to main...<candidate_sha> (NOT
+    main...automain)."""
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = True
@@ -4471,7 +4760,8 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     assert version.last_qualification["smoketest_enabled"] is True
     assert version.qualification_attempts == 1
 
-    # Three child tasks exist: release_audit, advisory challenge, and smoketest.
+    # Two child tasks exist: release_audit and smoketest. The binding challenge
+    # is spawned later, once the audit findings are available.
     from sqlmodel import select
 
     tasks = (
@@ -4480,11 +4770,10 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
         .all()
     )
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
-    assert types == ["release_audit", "release_audit_challenge", "smoketest"]
+    assert types == ["release_audit", "smoketest"]
 
     by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
     audit_task = by_type["release_audit"]
-    challenge_task = by_type["release_audit_challenge"]
     smoke_task = by_type["smoketest"]
 
     assert audit_task.first_payload["base_branch"] == "main"
@@ -4493,18 +4782,9 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     assert audit_task.context["release_version_id"] == str(version.id)
     assert audit_task.context["scope"] == "medium"
     assert version.last_qualification["audit_task_id"] == str(audit_task.id)
-
-    assert challenge_task.first_payload["base_branch"] == "main"
-    assert challenge_task.first_payload["diff_range"] == f"main...{candidate}"
-    assert challenge_task.first_payload["candidate_sha"] == candidate
-    assert challenge_task.first_payload["primary_audit_task_id"] == str(audit_task.id)
-    assert challenge_task.context["release_version_id"] == str(version.id)
-    assert challenge_task.context["candidate_sha"] == candidate
-    assert challenge_task.context["primary_audit_task_id"] == str(audit_task.id)
-    assert version.last_qualification["challenge_task_id"] == str(challenge_task.id)
-    assert version.last_qualification["audit_challenge_task_id"] == str(
-        challenge_task.id
-    )
+    assert version.last_qualification["challenge_task_id"] is None
+    assert version.last_qualification["audit_challenge_task_id"] is None
+    assert version.last_qualification["audit_challenge_spawn_pending"] is True
 
     from datetime import datetime, timezone
 
@@ -4527,9 +4807,9 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
 @pytest.mark.asyncio
 async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocker):
     """Audit H3: with smoketest_enabled=False (the shipped default), only the
-    release_audit and advisory challenge children are spawned — NO
-    qualifier-smoketest task — and last_qualification records
-    smoketest_enabled=False with smoketest_task_id None."""
+    release_audit child is spawned — NO qualifier-smoketest task — and
+    last_qualification records smoketest_enabled=False with
+    smoketest_task_id None."""
     from app import shared_state
 
     # Explicit for clarity — this is also the autouse-reset default.
@@ -4562,9 +4842,10 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
     assert version.last_qualification["smoketest_enabled"] is False
     assert version.last_qualification["smoketest_task_id"] is None
     assert version.last_qualification["audit_task_id"] is not None
-    assert version.last_qualification["audit_challenge_task_id"] is not None
+    assert version.last_qualification["audit_challenge_task_id"] is None
+    assert version.last_qualification["audit_challenge_spawn_pending"] is True
 
-    # Exactly two child tasks — release_audit and its advisory challenge — and NO smoketest.
+    # Exactly one child task — release_audit — and NO smoketest or challenge.
     from sqlmodel import select
 
     tasks = (
@@ -4573,15 +4854,10 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
         .all()
     )
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
-    assert types == ["release_audit", "release_audit_challenge"]
+    assert types == ["release_audit"]
     by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
     assert by_type["release_audit"].first_payload["candidate_sha"] == candidate
     assert by_type["release_audit"].first_payload["diff_range"] == f"main...{candidate}"
-    assert by_type["release_audit_challenge"].first_payload["candidate_sha"] == candidate
-    assert (
-        by_type["release_audit_challenge"].first_payload["primary_audit_task_id"]
-        == version.last_qualification["audit_task_id"]
-    )
 
 
 @pytest.mark.asyncio
@@ -5056,7 +5332,7 @@ async def test_run_qualification_second_sequential_call_does_not_double_spawn(
     await db_session.commit()
     assert second["status"] == "already_pending"
 
-    # Exactly one primary/challenge pair total — no duplicate from the second call.
+    # Exactly one release_audit task total — no duplicate from the second call.
     from sqlmodel import select
 
     tasks = (
@@ -5064,10 +5340,7 @@ async def test_run_qualification_second_sequential_call_does_not_double_spawn(
         .scalars()
         .all()
     )
-    assert sorted(t.first_payload.get("type") for t in tasks) == [
-        "release_audit",
-        "release_audit_challenge",
-    ]
+    assert sorted(t.first_payload.get("type") for t in tasks) == ["release_audit"]
     # qualification_attempts bumped exactly once (the second call no-op'd).
     await db_session.refresh(version)
     assert version.qualification_attempts == 1
@@ -5586,7 +5859,7 @@ async def test_challenge_hold_respawns_challenge_only_with_primary_findings(
 
     assert result == {
         "status": "audit_challenge_respawned",
-        "reason": "audit_challenge_missing",
+        "reason": "challenge_initial_no_primary_findings",
         "respawn_count": 1,
         "challenge_task_id": version.last_qualification["challenge_task_id"],
     }
@@ -5599,7 +5872,7 @@ async def test_challenge_hold_respawns_challenge_only_with_primary_findings(
     )
     assert version.last_qualification["audit_challenge_respawn_count"] == 1
     assert version.last_qualification["audit_challenge_retry_reason"] == (
-        "audit_challenge_missing"
+        "challenge_initial_no_primary_findings"
     )
 
     tasks = (
@@ -5639,6 +5912,503 @@ async def test_challenge_hold_respawns_challenge_only_with_primary_findings(
             "file": "backend/app/release_scoring.py",
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_initial_challenge_receives_primary_findings_before_reconciliation(
+    db_session,
+):
+    """Pre-reconciliation guard: an initial challenge (no primary_findings in
+    payload) that completed while the audit has deductible findings must be
+    re-spawned with those findings BEFORE reconciliation runs.  The new
+    challenge payload carries the findings so reconciliation can proceed
+    without a binding-failure infra override on the next pass."""
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "SQL query is missing parameterization.",
+                    "file": "backend/app/models.py",
+                    "verification_note": "Read backend/app/models.py:42 and confirmed the query is unparameterized.",
+                },
+                {
+                    "severity": "critical",
+                    "summary": "Secret key written to disk.",
+                    "file": "backend/app/services.py",
+                    "verification_note": "Read backend/app/services.py:100 and confirmed the key is written.",
+                },
+            ],
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=None,
+    )
+    # Defer the challenge spawn entirely. Finalize should create the first
+    # binding challenge only after it can carry the primary findings.
+    version.last_qualification = {
+        **version.last_qualification,
+        "challenge_task_id": None,
+        "audit_challenge_task_id": None,
+        "audit_challenge_spawn_pending": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Guard must fire before reconciliation and spawn the first bound challenge.
+    assert result["status"] == "audit_challenge_respawned"
+    assert result["reason"] == "challenge_initial_primary_findings"
+    assert result["respawn_count"] == 1
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["challenge_task_id"] is not None
+    assert version.last_qualification["audit_challenge_task_id"] == (
+        version.last_qualification["challenge_task_id"]
+    )
+    assert version.last_qualification["audit_challenge_spawn_pending"] is False
+    assert version.last_qualification["audit_challenge_respawn_count"] == 1
+    assert version.last_qualification["audit_challenge_retry_reason"] == (
+        "challenge_initial_primary_findings"
+    )
+
+    # The new challenge payload must carry primary_findings so the next
+    # reconciliation can verify them without a binding-failure hold.
+    from app.models import Task as _Task  # noqa: PLC0415
+
+    new_challenge_id = uuid.UUID(version.last_qualification["challenge_task_id"])
+    new_challenge = await db_session.get(_Task, new_challenge_id)
+    assert new_challenge is not None
+    assert new_challenge.first_payload.get("primary_findings") == [
+        {
+            "severity": "critical",
+            "summary": "Secret key written to disk.",
+            "file": "backend/app/services.py",
+        },
+        {
+            "severity": "high",
+            "summary": "SQL query is missing parameterization.",
+            "file": "backend/app/models.py",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deferred_challenge_spawn_produces_primary_findings_binding(
+    db_session, mocker
+):
+    """End-to-end: deferred challenge spawn → binding verdicts → quality verdict.
+
+    Acceptance proof for the audit-leg primary-findings binding flow:
+
+    Pass 1 (deferred spawn):
+      - version.last_qualification has audit_challenge_spawn_pending=True and no
+        challenge_task_id — the audit completed with deductible findings but the
+        challenge was intentionally deferred.
+      - _finalize_qualification spawns the initial challenge with primary_findings
+        in its payload (verbatim summaries and severities from the audit report).
+
+    Pass 2 (reconciliation → quality verdict):
+      - The challenge task completes with binding verdicts that use
+        primary_finding_index to map back to the exact primary findings.
+      - _finalize_qualification reconciles successfully, produces a real quality
+        verdict (not_promoted), and records a QualificationVerdict row.
+
+    This is the acceptance criterion for test_deferred_challenge_spawn_produces_
+    primary_findings_binding: the test must run green under a real merge-test
+    verdict (not_promoted), exercising _finalize_qualification's deferred-spawn
+    block and _reconcile_audit_with_challenge's primary_finding_index binding.
+    """
+    from app import shared_state
+    from app.models import QualificationVerdict
+
+    shared_state.runtime_config["promotion_enabled"] = False  # dry-run / not_promoted path
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Seed audit with two deductible (high-severity, verified) findings.
+    audit_task, smoke_task = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.75,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Unbounded read from untrusted input in parser.",
+                    "file": "backend/app/parser.py",
+                    "verification_note": "Read backend/app/parser.py:120 and confirmed the buffer is not bounded.",
+                },
+                {
+                    "severity": "high",
+                    "summary": "Missing CSRF token validation on state-changing endpoint.",
+                    "file": "backend/app/routers/admin.py",
+                    "verification_note": "Read backend/app/routers/admin.py:45 and confirmed no CSRF check.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=None,  # No challenge yet — will be spawned in pass 1
+    )
+
+    # Mark the qualification as having a deferred challenge spawn.
+    candidate_sha = version.last_qualification["candidate_sha"]
+    version.last_qualification = {
+        **version.last_qualification,
+        "challenge_task_id": None,
+        "audit_challenge_task_id": None,
+        "audit_challenge_spawn_pending": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Pass 1: deferred spawn ---
+    result1 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result1["status"] == "audit_challenge_respawned"
+    assert result1["reason"] in (
+        "challenge_initial_primary_findings",
+        "challenge_initial_no_primary_findings",
+    )
+    assert result1["reason"] == "challenge_initial_primary_findings", (
+        "deferred spawn must carry primary findings when the audit has deductible findings"
+    )
+    new_challenge_id = uuid.UUID(version.last_qualification["challenge_task_id"])
+    assert version.last_qualification["audit_challenge_spawn_pending"] is False
+
+    # Verify the spawned challenge payload carries the primary findings verbatim.
+    new_challenge = await db_session.get(Task, new_challenge_id)
+    assert new_challenge is not None
+    pf = new_challenge.first_payload.get("primary_findings") or []
+    assert len(pf) == 2
+    # Findings are sorted by severity rank (critical first, then high, etc.).
+    pf_summaries = [f["summary"] for f in pf]
+    assert "Unbounded read from untrusted input in parser." in pf_summaries
+    assert "Missing CSRF token validation on state-changing endpoint." in pf_summaries
+
+    # --- Seed the challenge with indexed binding verdicts ---
+    # Use primary_finding_index (1-based) to bind verdicts to findings.
+    pf_index_by_summary = {f["summary"]: i + 1 for i, f in enumerate(pf)}
+    challenge_artifact = {
+        "challenged_candidate_sha": candidate_sha,
+        "verdicts": [
+            {
+                "primary_finding_index": pf_index_by_summary[pf[0]["summary"]],
+                "severity": pf[0]["severity"],
+                "summary": pf[0]["summary"],
+                "file": pf[0]["file"],
+                "verdict": "confirmed",
+                "reason": "Independent review confirms the parser does not bound the input buffer.",
+            },
+            {
+                "primary_finding_index": pf_index_by_summary[pf[1]["summary"]],
+                "severity": pf[1]["severity"],
+                "summary": pf[1]["summary"],
+                "file": pf[1]["file"],
+                "verdict": "confirmed",
+                "reason": "Independent review confirms no CSRF token is validated on the endpoint.",
+            },
+        ],
+    }
+    new_challenge.status = TaskStatus.COMPLETED
+    db_session.add(new_challenge)
+    db_session.add(
+        Artifact(
+            task_id=new_challenge_id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            logs=json.dumps(challenge_artifact),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Pass 2: reconciliation → quality verdict ---
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result2 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Both confirmed findings still deduct → not_promoted (below promotion threshold).
+    assert result2["status"] in ("not_promoted", "dry_run"), (
+        f"expected a final quality verdict but got {result2['status']!r}"
+    )
+    lq = version.last_qualification
+    assert lq["status"] in ("not_promoted", "dry_run")
+    assert lq.get("audit_findings") is not None
+
+    # A durable QualificationVerdict row must be written (this is what
+    # distinguishes a quality verdict from an infra_failure hold).
+    verdict_count = (
+        await db_session.execute(
+            select(sa_func.count()).where(
+                QualificationVerdict.release_version_id == version.id
+            )
+        )
+    ).scalar()
+    assert verdict_count == 1, (
+        f"expected 1 QualificationVerdict row but found {verdict_count} — "
+        "the deferred-spawn + binding flow must produce a durable quality verdict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sha_mismatch_respawn_roundtrip(
+    db_session, mocker
+):
+    """End-to-end: SHA-mismatch hold → respawn with correct SHA → quality verdict.
+
+    Validates the full audit_challenge_sha_mismatch roundtrip:
+
+    Pass 1 (SHA mismatch):
+      - The initial challenge artifact carries challenged_candidate_sha that does
+        not match the qualification's candidate_sha.
+      - _finalize_qualification detects the mismatch via _reconcile_audit_with_
+        challenge, re-spawns the challenge with the correct candidate_sha, and
+        records audit_challenge_sha_mismatch_observed_sha in last_qualification
+        so operators can see what SHA the challenge actually ran on.
+
+    Pass 2 (correct SHA → quality verdict):
+      - The respawned challenge completes with challenged_candidate_sha == the
+        qualification's candidate_sha and indexed binding verdicts.
+      - _finalize_qualification reconciles successfully, produces a real quality
+        verdict, and records a QualificationVerdict row.
+    """
+    from app import shared_state
+    from app.models import QualificationVerdict
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    WRONG_SHA = "dead" * 10  # 40-char hex, intentionally different from candidate
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.80,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Credential logged in plaintext on authentication failure.",
+                    "file": "backend/app/auth.py",
+                    "verification_note": "Read backend/app/auth.py:88 and confirmed the password is written to the log.",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=None,
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+
+    # Seed an initial challenge artifact with a WRONG candidate SHA.
+    mismatched_challenge = Task(
+        project_id=project.id,
+        title="audit-challenge-mismatched",
+        payloads=[{
+            "type": "release_audit_challenge",
+            "base_branch": "main",
+            "candidate_sha": WRONG_SHA,
+        }],
+        vm_instance_id="vm-challenge-mismatch",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": WRONG_SHA},
+    )
+    db_session.add(mismatched_challenge)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=mismatched_challenge.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            logs=json.dumps({
+                "challenged_candidate_sha": WRONG_SHA,  # WRONG — does not match candidate_sha
+                "verdicts": [
+                    {
+                        "severity": "high",
+                        "summary": "Credential logged in plaintext on authentication failure.",
+                        "file": "backend/app/auth.py",
+                        "verdict": "confirmed",
+                        "reason": "Reviewed auth.py and confirmed the credential appears in the log line.",
+                    }
+                ],
+            }),
+        )
+    )
+    version.last_qualification = {
+        **version.last_qualification,
+        "challenge_task_id": str(mismatched_challenge.id),
+        "audit_challenge_task_id": str(mismatched_challenge.id),
+        "audit_challenge_respawn_count": 0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Pass 1: SHA mismatch → respawn ---
+    result1 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result1["status"] == "audit_challenge_respawned", (
+        f"expected respawn for SHA mismatch but got {result1['status']!r}"
+    )
+    assert result1["reason"] == "audit_challenge_sha_mismatch"
+
+    lq1 = version.last_qualification
+    assert lq1["audit_challenge_retry_reason"] == "audit_challenge_sha_mismatch"
+    assert lq1["audit_challenge_respawn_count"] == 1
+
+    # The production change: observed SHA must be recorded so operators know
+    # what SHA the mismatched challenge actually ran on.
+    assert lq1.get("audit_challenge_sha_mismatch_observed_sha") == WRONG_SHA, (
+        "audit_challenge_sha_mismatch_observed_sha must record the wrong SHA "
+        "so operators can debug identity drift"
+    )
+
+    # The new challenge payload must carry the CORRECT candidate_sha.
+    new_challenge_id = uuid.UUID(lq1["challenge_task_id"])
+    new_challenge = await db_session.get(Task, new_challenge_id)
+    assert new_challenge is not None
+    assert new_challenge.first_payload.get("candidate_sha") == candidate_sha, (
+        "the respawned challenge must be pinned to the qualification's candidate_sha"
+    )
+    # Primary findings must also be carried so reconciliation can succeed.
+    assert new_challenge.first_payload.get("primary_findings"), (
+        "respawned challenge must include primary_findings for indexed binding"
+    )
+
+    # --- Seed the respawned challenge with matching SHA + binding verdicts ---
+    pf = new_challenge.first_payload["primary_findings"]
+    new_challenge.status = TaskStatus.COMPLETED
+    db_session.add(new_challenge)
+    db_session.add(
+        Artifact(
+            task_id=new_challenge_id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            logs=json.dumps({
+                "challenged_candidate_sha": candidate_sha,  # CORRECT SHA
+                "verdicts": [
+                    {
+                        "primary_finding_index": 1,
+                        "severity": pf[0]["severity"],
+                        "summary": pf[0]["summary"],
+                        "file": pf[0]["file"],
+                        "verdict": "confirmed",
+                        "reason": "Confirmed on the correct candidate commit — credential appears in log.",
+                    },
+                ],
+            }),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Pass 2: correct SHA → quality verdict ---
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result2 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result2["status"] in ("not_promoted", "dry_run"), (
+        f"expected a final quality verdict after SHA-matched challenge but got "
+        f"{result2['status']!r}"
+    )
+    lq2 = version.last_qualification
+    assert lq2["status"] in ("not_promoted", "dry_run")
+
+    verdict_count = (
+        await db_session.execute(
+            select(sa_func.count()).where(
+                QualificationVerdict.release_version_id == version.id
+            )
+        )
+    ).scalar()
+    assert verdict_count == 1, (
+        f"expected 1 QualificationVerdict row but found {verdict_count} — "
+        "the SHA-mismatch respawn roundtrip must produce a durable quality verdict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_challenge_verdicts_respawn_with_distinct_reason(
+    db_session,
+):
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Empty challenge verdicts must retry with a precise reason.",
+                    "file": "backend/app/release_scoring.py",
+                    "verification_note": "Read backend/app/release_scoring.py:1300 and confirmed empty verdicts block reconciliation.",
+                }
+            ],
+            "test_erosion": {"deleted_test_files": []},
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=[],
+    )
+    original_challenge_id = version.last_qualification["challenge_task_id"]
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result == {
+        "status": "audit_challenge_respawned",
+        "reason": "audit_challenge_empty_verdicts",
+        "respawn_count": 1,
+        "challenge_task_id": version.last_qualification["challenge_task_id"],
+    }
+    assert version.last_qualification["challenge_task_id"] != original_challenge_id
+    assert version.last_qualification["audit_challenge_retry_reason"] == (
+        "audit_challenge_empty_verdicts"
+    )
 
 
 @pytest.mark.asyncio
@@ -5864,6 +6634,96 @@ async def test_finalize_dry_run_when_promotion_disabled(db_session, mocker):
     assert version.last_qualification["status"] == "dry_run"
 
 
+def test_audit_leg_proof_state_matrix():
+    """The audit-leg proof snapshot distinguishes proven, unproven, and advisory."""
+    cases = [
+        (
+            "proven",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": "challenge-1",
+                "challenged_candidate_sha": "feed" * 10,
+                "binding_expected_count": 2,
+                "binding_record_count": 2,
+                "reconciliation_status": "available",
+                "reconciliation_reason": None,
+                "legacy_advisory_only": False,
+            },
+        ),
+        (
+            "unproven",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": "challenge-1",
+                "challenged_candidate_sha": "beef" * 10,
+                "binding_expected_count": 2,
+                "binding_record_count": 2,
+                "reconciliation_status": "available",
+                "reconciliation_reason": "audit_challenge_sha_mismatch",
+                "legacy_advisory_only": False,
+            },
+        ),
+        (
+            "unproven",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": "challenge-1",
+                "challenged_candidate_sha": "feed" * 10,
+                "binding_expected_count": 2,
+                "binding_record_count": 1,
+                "reconciliation_status": "available",
+                "reconciliation_reason": None,
+                "legacy_advisory_only": False,
+            },
+        ),
+        (
+            "not_required",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": None,
+                "challenged_candidate_sha": None,
+                "binding_expected_count": 0,
+                "binding_record_count": 0,
+                "reconciliation_status": "unavailable",
+                "reconciliation_reason": "challenge_absent",
+                "legacy_advisory_only": False,
+            },
+        ),
+        (
+            "not_required",
+            {
+                "candidate_sha": "feed" * 10,
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "feed" * 10,
+                "challenge_task_id": None,
+                "challenged_candidate_sha": None,
+                "binding_expected_count": 1,
+                "binding_record_count": 0,
+                "reconciliation_status": "unavailable",
+                "reconciliation_reason": "challenge_absent",
+                "legacy_advisory_only": True,
+            },
+        ),
+    ]
+
+    for expected_state, kwargs in cases:
+        proof = rq._build_audit_leg_proof(**kwargs)
+        assert proof["state"] == expected_state
+        assert proof["required"] is (expected_state == "proven")
+        assert proof["candidate_sha"] == kwargs["candidate_sha"]
+        assert proof["audit_task_id"] == kwargs["audit_task_id"]
+        assert proof["binding_expected_count"] == kwargs["binding_expected_count"]
+        assert proof["binding_record_count"] == kwargs["binding_record_count"]
+
+
 @pytest.mark.asyncio
 async def test_finalize_persists_advisory_audit_challenge_synthesis(
     db_session, mocker
@@ -5937,6 +6797,11 @@ async def test_finalize_persists_advisory_audit_challenge_synthesis(
     assert synthesis["status"] == "unavailable"
     assert synthesis["reason"] == "challenge_absent"
     assert synthesis["binding"] is True
+    proof = version.last_qualification["audit_reconciliation"]["audit_leg_proof"]
+    assert proof["state"] == "not_required"
+    assert proof["required"] is False
+    assert proof["binding_expected_count"] == 1
+    assert proof["binding_record_count"] == 0
 
     verdict = (
         (
@@ -5951,6 +6816,7 @@ async def test_finalize_persists_advisory_audit_challenge_synthesis(
     )
     assert verdict.terminal_status == "dry_run"
     assert verdict.audit_reconciliation["audit_challenge"] == synthesis
+    assert verdict.audit_reconciliation["audit_leg_proof"] == proof
 
 
 @pytest.mark.asyncio
@@ -6053,7 +6919,14 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
         version,
         audit_logs={
             "audit_score": 1.0,
-            "findings": [],
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Binding proof finding.",
+                    "file": "backend/app/release_qualifier.py",
+                    "verification_note": "confirmed in the binding test path",
+                }
+            ],
             "test_erosion": {
                 "deleted_test_files": [],
                 "assertion_delta": 0,
@@ -6064,6 +6937,8 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
         challenge_verdicts=[
             {
                 "verdict": "confirmed",
+                "summary": "Binding proof finding.",
+                "severity": "high",
             }
         ],
     )
@@ -6081,6 +6956,10 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
     assert synthesis["binding"] is True
     assert synthesis["challenged_candidate_sha"] == _candidate_sha
     assert synthesis["confirmed_count"] >= 1
+    proof = version.last_qualification["audit_reconciliation"]["audit_leg_proof"]
+    assert proof["state"] == "proven"
+    assert proof["required"] is True
+    assert proof["challenged_candidate_sha"] == _candidate_sha
 
     # The verdict row should also land in the 'challenged' telemetry cohort.
     verdict = (
@@ -6095,6 +6974,7 @@ async def test_finalize_challenge_synthesis_resolves_emitted_artifact_only(
         .one()
     )
     assert verdict.audit_reconciliation["audit_challenge"]["status"] == "available"
+    assert verdict.audit_reconciliation["audit_leg_proof"] == proof
 
     verdict_dict = {
         "candidate_sha": verdict.candidate_sha,
@@ -8566,6 +9446,20 @@ async def _seed_infra_failure_children(
     return audit_task, smoke_task
 
 
+async def _infra_verdicts_for_version(db_session, version) -> list[QualificationVerdict]:
+    return (
+        (
+            await db_session.execute(
+                select(QualificationVerdict)
+                .where(QualificationVerdict.release_version_id == version.id)
+                .order_by(QualificationVerdict.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
 class TestFinalizeInfraFailure:
     """_finalize_qualification correctly distinguishes infra failures from verdicts."""
 
@@ -8597,19 +9491,10 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_task_failed"
 
-        # No QualificationVerdict row — the qualifier never rendered a verdict.
-        verdicts = (
-            (
-                await db_session.execute(
-                    select(QualificationVerdict).where(
-                        QualificationVerdict.release_version_id == version.id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        assert len(verdicts) == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
+        assert verdicts[0].sub_scores["infra_failure"]["error"] == "audit_task_failed"
 
         # An operator notification was posted with release_infra_failure event.
         msgs = (
@@ -8649,15 +9534,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_task_cancelled"
 
-        # No verdict row.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_audit_task_blocked_records_infra_failure_not_verdict(
@@ -8683,14 +9562,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_task_blocked"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_smoketest_task_failed_records_infra_failure_when_enabled(
@@ -8718,15 +9592,9 @@ class TestFinalizeInfraFailure:
         await db_session.refresh(version)
         assert version.last_qualification["status"] == "infra_failure"
 
-        # No verdict row even though audit completed.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_smoketest_task_blocked_records_infra_failure_when_enabled(
@@ -8753,22 +9621,15 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "smoketest_task_blocked"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_infra_failure_does_not_appear_in_promotion_readiness(
         self, db_session
     ):
-        """An infra-failure finalization writes no QualificationVerdict row, so
-        compute_promotion_readiness sees verdicts_evaluated == 0 (the infra
-        failure does not pollute the dry-run track record)."""
+        """Infra verdict rows do not pollute the dry-run readiness track record."""
         project, version = await _make_project_and_version(db_session)
         await _seed_infra_failure_children(
             db_session,
@@ -8790,8 +9651,8 @@ class TestFinalizeInfraFailure:
     ):
         """A COMPLETED audit task whose RELEASE_AUDIT_REPORT artifact is absent
         is now reclassified as infra_failure — the agent ran but emitted no
-        usable output.  No QualificationVerdict row is written; the operator
-        notification is 'release_infra_failure', not 'release_blocked'."""
+        usable output. The operator notification is 'release_infra_failure',
+        not 'release_blocked'."""
         project, version = await _make_project_and_version(db_session)
         # Both children COMPLETED but NO artifacts seeded — audit produced
         # no report, which is an infra failure (defense-in-depth path).
@@ -8811,15 +9672,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "audit_report_missing"
 
-        # NO QualificationVerdict row written — infra failure, not quality blocker.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_audit_completed_empty_artifact_reclassified_as_infra_failure(
@@ -8851,14 +9706,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "audit_report_empty_dict"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_audit_completed_unparseable_artifact_reclassified_as_infra_failure(
@@ -8893,14 +9743,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "audit_report_missing"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_audit_completed_parseable_but_unscoreable_reclassified_as_infra_failure(
@@ -8944,14 +9789,9 @@ class TestFinalizeInfraFailure:
             == "audit_report_parseable_but_unscoreable"
         )
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_legitimate_empty_findings_audit_reaches_verdict_not_infra_failure(
@@ -9055,14 +9895,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "smoketest_report_missing"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_smoketest_completed_unparseable_artifact_reclassified_as_infra_failure(
@@ -9106,14 +9941,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "smoketest_report_missing"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_consecutive_infra_errors_backstop_fires_alert(self, db_session):
@@ -9466,15 +10296,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert "audit_challenge_task_failed" in version.last_qualification["error"]
 
-        # No QualificationVerdict row — infra path never records a quality verdict.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_challenge_provision_failure_respawns_new_task(self, db_session):
@@ -9587,14 +10411,8 @@ class TestFinalizeInfraFailure:
         assert new_qual["challenge_task_id"] != original_challenge_id
 
         # No QualificationVerdict — verdict not rendered on respawn.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
 
     @pytest.mark.asyncio
     async def test_challenge_infra_respawn_cap_exceeded_routes_to_infra_failure(
@@ -9840,14 +10658,8 @@ class TestFinalizeInfraFailure:
         assert new_qual["audit_task_id"] != original_audit_id
 
         # No QualificationVerdict row — verdict was not rendered.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
 
         # No infra_failure ProjectMessage — this is a transient respawn, not a
         # hard pipeline failure.
@@ -9984,14 +10796,8 @@ class TestFinalizeInfraFailure:
         assert new_qual["audit_task_id"] != original_audit_id
 
         # No QualificationVerdict — verdict not rendered on respawn.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
 
         # No infra_failure ProjectMessage — transient respawn, not a hard failure.
         infra_msg_count = (
@@ -10120,6 +10926,121 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_infra_respawn_cap_exceeded"
 
+    @pytest.mark.asyncio
+    async def test_infra_failure_repeat_signature_recorded_across_attempts(
+        self, db_session, mocker
+    ):
+        """Re-requested qualifications carry prior infra signature/history forward."""
+        from app.failure_classification import PROVISION_FAILURE, persist_failure_category
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(
+            db_session, phase="stabilize"
+        )
+        first_candidate = "11112222" * 5
+        first_audit = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "base_branch": "automain",
+                    "diff_range": f"automain...{first_candidate}",
+                    "candidate_sha": first_candidate,
+                }
+            ],
+            vm_instance_id="vm-first-repeat",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(first_audit)
+        await db_session.commit()
+        await db_session.refresh(first_audit)
+        persist_failure_category(first_audit, PROVISION_FAILURE)
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": first_candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(first_audit.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+            "audit_infra_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        first_result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        assert first_result["status"] == "infra_failure"
+
+        await db_session.refresh(version)
+        first_qual = version.last_qualification
+        first_signature = first_qual["infra_failure_signature"]
+        assert first_qual["same_error_as_prior"] is False
+        assert len(first_qual["infra_attempt_history"]) == 1
+
+        second_candidate = "33334444" * 5
+        mocker.patch(
+            "app.github.get_repo_installation_token",
+            new=AsyncMock(return_value="gh-token"),
+        )
+        mocker.patch(
+            "app.github.get_branch_sha",
+            new=AsyncMock(return_value=second_candidate),
+        )
+        mocker.patch(
+            "app.github.get_check_runs_cached",
+            new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+        )
+
+        spawned = await rq.run_qualification(db_session, project.id, version)
+        await db_session.commit()
+        assert spawned["status"] == "spawned"
+
+        await db_session.refresh(version)
+        pending = dict(version.last_qualification)
+        assert pending["previous_infra_failure_signature"] == first_signature
+        assert pending["previous_infra_failure_candidate_sha"] == first_candidate
+        assert pending["infra_attempt_history"][0]["signature"] == first_signature
+
+        second_audit = await db_session.get(
+            Task, uuid.UUID(str(pending["audit_task_id"]))
+        )
+        second_audit.status = TaskStatus.FAILED
+        persist_failure_category(second_audit, PROVISION_FAILURE)
+        pending["audit_infra_respawn_count"] = _MAX_AUDIT_RL_RESPAWNS
+        version.last_qualification = pending
+        db_session.add(second_audit)
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        second_result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        assert second_result["status"] == "infra_failure"
+        assert second_result["infra_failure_signature"] == first_signature
+        assert second_result["same_error_as_prior"] is True
+        assert second_result["same_error_different_candidate"] is True
+
+        await db_session.refresh(version)
+        final_qual = version.last_qualification
+        assert final_qual["same_infra_failure_as_previous"] is True
+        assert final_qual["same_infra_failure_different_candidate"] is True
+        assert len(final_qual["infra_attempt_history"]) == 2
+        assert final_qual["infra_attempt_history"][1]["child_failures"][0][
+            "failure_category"
+        ] == PROVISION_FAILURE
+
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 2
+        latest_evidence = verdicts[-1].sub_scores["infra_failure"]
+        assert latest_evidence["signature"] == first_signature
+        assert latest_evidence["same_error_as_prior"] is True
+        assert latest_evidence["same_error_different_candidate"] is True
+
     # -----------------------------------------------------------------------
     # Malformed audit artifact shapes — each must produce either a real verdict
     # OR an infra_failure; never both, never neither, never a silent clean score.
@@ -10155,14 +11076,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_report_empty_dict"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_findings_list_no_audit_score_field_reaches_verdict(self, db_session):
@@ -10226,7 +11142,7 @@ class TestFinalizeInfraFailure:
 
         A single finding dict missing severity/level is "parseable_but_unscoreable" —
         the agent produced structured output but _score_audit() cannot apply any
-        deduction.  No QualificationVerdict row is written."""
+        deduction. An infra QualificationVerdict row is written."""
         project, version = await _make_project_and_version(db_session)
         await _seed_qualification_children(
             db_session,
@@ -10249,14 +11165,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["error"] == "audit_report_parseable_but_unscoreable"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
     async def test_issues_key_equivalent_to_findings_reaches_verdict(self, db_session):
@@ -10320,7 +11231,7 @@ class TestFinalizeInfraFailure:
         A "findings" key whose value is not a list causes _score_audit() to fall
         through to the "issues" fallback (also absent here), yielding a silent
         clean 1.0 without the wrong-type guard.  Verify infra_failure is returned
-        and no QualificationVerdict row is written."""
+        and an infra QualificationVerdict row is written."""
         project, version = await _make_project_and_version(db_session)
         await _seed_qualification_children(
             db_session,
@@ -10347,14 +11258,9 @@ class TestFinalizeInfraFailure:
         assert version.last_qualification["status"] == "infra_failure"
         assert version.last_qualification["error"] == "audit_report_findings_wrong_type"
 
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
 
 # ===========================================================================
@@ -10372,11 +11278,11 @@ class TestReaperInducedAuditHeartbeatTimeout:
 
     @pytest.mark.asyncio
     async def test_reaper_heartbeat_timeout_routes_to_infra_failure(self, db_session):
-        """Heartbeat-stale audit reaped as FAILED → infra_failure, no verdict.
+        """Heartbeat-stale audit reaped as FAILED → infra_failure.
 
         Five assertions (matching the task contract):
           (a) status is infra_failure, not not_promoted / dry_run.
-          (b) No QualificationVerdict row is created.
+          (b) An infra QualificationVerdict row is created.
           (c) Version remains open with phase=stabilize.
           (d) Error label carries the heartbeat_timeout enrichment so the
               operator can distinguish a VM heartbeat death from a code-defect
@@ -10462,15 +11368,9 @@ class TestReaperInducedAuditHeartbeatTimeout:
             f"expected infra_failure, got {result['status']}: {result}"
         )
 
-        # (b) No QualificationVerdict row — the qualifier never rendered a verdict.
-        count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    QualificationVerdict.release_version_id == version.id
-                )
-            )
-        ).scalar()
-        assert count == 0, f"expected 0 QualificationVerdict rows, got {count}"
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1
+        assert verdicts[0].terminal_status == "infra_failure"
 
         # (c) Version remains open with phase=stabilize.
         await db_session.refresh(version)
@@ -11782,14 +12682,17 @@ async def test_finalize_in_dedicated_session_reconciles_on_promotion_conflict(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["not_promoted", "dry_run", "promoted", "error"])
+@pytest.mark.parametrize(
+    "status",
+    ["not_promoted", "dry_run", "promoted", "error", "infra_failure"],
+)
 async def test_resolved_qualification_triggers_strategic_review(
     db_session, mocker, status
 ):
-    """Every RESOLVED qualification verdict — a promote or any flavour of miss —
-    re-triggers the strategic agent so it re-plans (opens the next wave on a
-    promote, works the blocker on a miss) instead of leaving a dry frontier
-    idle until the wall-clock backstop fires."""
+    """Every settled qualification verdict — a promote, any flavour of miss,
+    or a terminal infra failure — re-triggers the strategic agent so it
+    re-plans instead of leaving a dry frontier idle until the wall-clock
+    backstop fires."""
     project, version = await _make_project_and_version(db_session)
     spawn_mock = mocker.patch(
         "app.strategic_spawning._spawn_strategic_review",
@@ -11905,18 +12808,23 @@ async def test_strategic_trigger_queues_refresh_when_cycle_active(db_session, mo
 
 
 @pytest.mark.asyncio
-async def test_finalize_in_dedicated_session_triggers_strategic_on_miss(
-    db_session, mocker
+@pytest.mark.parametrize(
+    "finalize_result",
+    [
+        {"status": "not_promoted", "blocker": "below_threshold"},
+        {"status": "infra_failure"},
+    ],
+)
+async def test_finalize_in_dedicated_session_triggers_strategic_on_settled_outcome(
+    db_session, mocker, finalize_result
 ):
-    """End-to-end wiring: a finalize that resolves to a miss drives
+    """End-to-end wiring: a finalize that resolves to a settled outcome drives
     _finalize_in_dedicated_session to re-trigger a strategic review after its
     dedicated session has committed and closed."""
     _project, version = await _make_project_and_version(db_session)
     mocker.patch(
         "app.release_qualifier._finalize_locked_version",
-        new=AsyncMock(
-            return_value={"status": "not_promoted", "blocker": "below_threshold"}
-        ),
+        new=AsyncMock(return_value=finalize_result),
     )
     spawn_mock = mocker.patch(
         "app.strategic_spawning._spawn_strategic_review",
@@ -11927,7 +12835,7 @@ async def test_finalize_in_dedicated_session_triggers_strategic_on_miss(
         version.id, session_factory=_shared_session_factory(db_session)
     )
 
-    assert result is not None and result["status"] == "not_promoted"
+    assert result is not None and result["status"] == finalize_result["status"]
     spawn_mock.assert_awaited_once()
 
 
@@ -15527,6 +16435,7 @@ class TestFormatQualificationForApi:
         assert out["finalized_at"] is None
         assert out["migration_safety"] is None
         assert out["audit_findings"] is None
+        assert out["audit_leg_proof"] is None
         assert out["promotion_conflict"] is None
 
     def test_all_fields_passed_through(self):
@@ -15546,7 +16455,23 @@ class TestFormatQualificationForApi:
             "excluded_audit_findings": [{"severity": "low", "summary": "ignored"}],
             "test_erosion_detail": {"deleted_test_files": 1},
             "smoketest_detail": {"passed": False},
-            "audit_reconciliation": {"excluded_findings_count": 1},
+            "audit_reconciliation": {
+                "excluded_findings_count": 1,
+                "audit_leg_proof": {
+                    "state": "proven",
+                    "required": True,
+                    "candidate_sha": "feed" * 10,
+                    "audit_task_id": "audit-1",
+                    "audit_task_candidate_sha": "feed" * 10,
+                    "challenge_task_id": "challenge-1",
+                    "challenged_candidate_sha": "feed" * 10,
+                    "binding_expected_count": 1,
+                    "binding_record_count": 1,
+                    "binding_complete": True,
+                    "reconciliation_status": "available",
+                    "reconciliation_reason": None,
+                },
+            },
             "promotion_pr_url": "https://example.com/pr/123",
             "promotion_conflict": True,
             "promotion_error_detail": "merge conflict",
@@ -15567,6 +16492,7 @@ class TestFormatQualificationForApi:
         assert out["test_erosion_detail"] == {"deleted_test_files": 1}
         assert out["smoketest_detail"] == {"passed": False}
         assert out["audit_reconciliation"] == {"excluded_findings_count": 1}
+        assert out["audit_leg_proof"] == qual["audit_reconciliation"]["audit_leg_proof"]
         assert out["promotion_pr_url"] == "https://example.com/pr/123"
         assert out["promotion_conflict"] is True
         assert out["promotion_error_detail"] == "merge conflict"
@@ -19879,7 +20805,23 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         excluded_audit_findings=[{"severity": "low", "summary": "y"}],
         test_erosion_detail={"removed": 2},
         smoketest_detail={"passed": False},
-        audit_reconciliation={"reconciled": True},
+        audit_reconciliation={
+            "reconciled": True,
+            "audit_leg_proof": {
+                "state": "proven",
+                "required": True,
+                "candidate_sha": "abc123",
+                "audit_task_id": "audit-1",
+                "audit_task_candidate_sha": "abc123",
+                "challenge_task_id": "challenge-1",
+                "challenged_candidate_sha": "abc123",
+                "binding_expected_count": 1,
+                "binding_record_count": 1,
+                "binding_complete": True,
+                "reconciliation_status": "available",
+                "reconciliation_reason": None,
+            },
+        },
         promotion_pr_url="https://example.com/pr/7",
         promotion_conflict=True,
         promotion_error_detail="merge conflict",
@@ -19901,6 +20843,7 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     assert out["test_erosion_detail"] == {"removed": 2}
     assert out["smoketest_detail"] == {"passed": False}
     assert out["audit_reconciliation"] == {"reconciled": True}
+    assert out["audit_leg_proof"]["state"] == "proven"
     assert out["promotion_pr_url"] == "https://example.com/pr/7"
     assert out["promotion_conflict"] is True
     assert out["promotion_error_detail"] == "merge conflict"

@@ -14,11 +14,17 @@ Covers:
 from unittest.mock import MagicMock, patch
 
 from app.capability_trial_verdict import (
+    LANE_PILOT_ASSIGNMENT_KEY,
+    LANE_PILOT_CAP_NAME,
+    LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+    LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
     carry_adoption_verdicts_for_consolidation,
+    evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
     get_effective_holdback_fraction,
     get_trial_definitions,
     get_trial_verdicts,
+    is_lane_pilot_arm_member,
     record_trial_verdict,
 )
 
@@ -708,6 +714,68 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts["repo_map"]["evidence_source"] == "strategic_review"
         mock_flag.assert_called_once()
 
+    def test_decided_lane_verdict_survives_insufficient_data_continue(self):
+        continue_entry = evaluate_lane_pilot_verdict({"n_lane": 1, "n_control": 1})
+        assert (continue_entry["verdict"], continue_entry["verdict_reason"]) == ("CONTINUE", "insufficient_data")
+        lane_kill = evaluate_lane_pilot_verdict({"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.60, "control_merge_rate": 0.70})
+        lane_adopt = evaluate_lane_pilot_verdict(
+            {"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.75, "control_merge_rate": 0.70,
+             "lane_cost_per_merged": 90.0, "control_cost_per_merged": 100.0}
+        )
+        assert (lane_kill["verdict"], lane_adopt["verdict"]) == ("KILL", "ADOPT")
+
+        for decided in (lane_kill, lane_adopt):
+            project = _make_project()
+            project.capability_adoption_verdicts = {LANE_PILOT_CAP_NAME: decided}
+            with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+                record_trial_verdict(project, LANE_PILOT_CAP_NAME, continue_entry)
+
+            assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == decided
+            mock_flag.assert_not_called()
+
+    def test_decided_lane_verdict_survives_accumulating_data_continue(self):
+        # n between min_n (30) and futility_n (90), no kill/adopt criteria → accumulating_data
+        accumulating_entry = evaluate_lane_pilot_verdict({"n_lane": 50, "n_control": 50})
+        assert (accumulating_entry["verdict"], accumulating_entry["verdict_reason"]) == ("CONTINUE", "accumulating_data")
+
+        lane_kill = evaluate_lane_pilot_verdict({"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.60, "control_merge_rate": 0.70})
+        lane_adopt = evaluate_lane_pilot_verdict(
+            {"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.75, "control_merge_rate": 0.70,
+             "lane_cost_per_merged": 90.0, "control_cost_per_merged": 100.0}
+        )
+        assert (lane_kill["verdict"], lane_adopt["verdict"]) == ("KILL", "ADOPT")
+
+        for decided in (lane_kill, lane_adopt):
+            project = _make_project()
+            project.capability_adoption_verdicts = {LANE_PILOT_CAP_NAME: decided}
+            with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+                record_trial_verdict(project, LANE_PILOT_CAP_NAME, accumulating_entry)
+
+            assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == decided
+            mock_flag.assert_not_called()
+
+    def test_lane_kill_survives_automated_adopt_and_strategic_verdicts_still_supersede(self):
+        project = _make_project()
+        kill_entry = evaluate_lane_pilot_verdict({"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.60, "control_merge_rate": 0.70})
+        adopt_entry = evaluate_lane_pilot_verdict(
+            {"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.75, "control_merge_rate": 0.70,
+             "lane_cost_per_merged": 90.0, "control_cost_per_merged": 100.0}
+        )
+        project.capability_adoption_verdicts = {LANE_PILOT_CAP_NAME: kill_entry}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, LANE_PILOT_CAP_NAME, adopt_entry)
+
+        assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == kill_entry
+        mock_flag.assert_not_called()
+
+        strategic_reopen = {"verdict": "CONTINUE", "verdict_reason": "insufficient_data", "evidence_source": "strategic_review"}
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, LANE_PILOT_CAP_NAME, strategic_reopen)
+
+        assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == strategic_reopen
+        mock_flag.assert_called_once()
+
 
 # ── get_trial_verdicts ────────────────────────────────────────────────────────
 
@@ -906,6 +974,99 @@ class TestArmComposition:
         assert entry["verdict_reason"] == "insufficient_data"
 
 
+# ── receipt_only_trial guard ──────────────────────────────────────────────────
+
+
+class TestReceiptOnlyTrial:
+    def _cfg(self, **overrides):
+        base = {"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03}
+        base.update(overrides)
+        return base
+
+    def test_receipt_only_blocks_adopt(self):
+        # Lift qualifies for adopt, both arms meet min_n, but receipt_only_trial=True.
+        entry = evaluate_trial_verdict(
+            lift=0.08, n_with=35, n_without=33,
+            config=self._cfg(), receipt_only_trial=True,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "receipt_only_trial"
+
+    def test_receipt_only_blocks_reject(self):
+        # Lift qualifies for reject, both arms meet min_n, but receipt_only_trial=True.
+        entry = evaluate_trial_verdict(
+            lift=-0.05, n_with=35, n_without=33,
+            config=self._cfg(), receipt_only_trial=True,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "receipt_only_trial"
+
+    def test_receipt_only_blocks_futility_bound(self):
+        # Both arms >= futility_n=90 with ambiguous lift → normally futility_bound_reached.
+        entry = evaluate_trial_verdict(
+            lift=0.02, n_with=90, n_without=90,
+            config=self._cfg(), receipt_only_trial=True,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "receipt_only_trial"
+
+    def test_receipt_only_allows_continue_trial_passthrough(self):
+        # Insufficient data → continue-trial/insufficient_data regardless of the flag.
+        entry = evaluate_trial_verdict(
+            lift=0.08, n_with=5, n_without=33,
+            config=self._cfg(), receipt_only_trial=True,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_data"
+
+    def test_receipt_only_false_behaves_normally(self):
+        # Default (False) must not change the adopt outcome.
+        entry = evaluate_trial_verdict(
+            lift=0.08, n_with=35, n_without=33,
+            config=self._cfg(), receipt_only_trial=False,
+        )
+        assert entry["verdict"] == "adopt"
+
+    def test_receipt_only_continue_trial_supersedes_confounded_decided_verdict(self):
+        # A prior decided verdict recorded on confounded evidence must be replaced.
+        project = _make_project()
+        # Simulate a confounded decided verdict already on record.
+        confounded = {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 40}
+        project.capability_adoption_verdicts = {"module_interfaces": confounded}
+
+        new_entry = evaluate_trial_verdict(
+            lift=0.08, n_with=40, n_without=40,
+            config=self._cfg(), receipt_only_trial=True,
+        )
+        assert new_entry["verdict"] == "continue-trial"
+        assert new_entry["verdict_reason"] == "receipt_only_trial"
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "module_interfaces", new_entry)
+
+        # The confounded adopt must be superseded by receipt_only_trial evaluation.
+        assert project.capability_adoption_verdicts["module_interfaces"]["verdict"] == "continue-trial"
+        assert project.capability_adoption_verdicts["module_interfaces"]["verdict_reason"] == "receipt_only_trial"
+        mock_flag.assert_called_once()
+
+    def test_receipt_only_continue_trial_supersedes_confounded_reject(self):
+        project = _make_project()
+        confounded = {"verdict": "reject", "lift": -0.07, "n_with": 40, "n_without": 40}
+        project.capability_adoption_verdicts = {"related_tests": confounded}
+
+        new_entry = evaluate_trial_verdict(
+            lift=-0.07, n_with=40, n_without=40,
+            config=self._cfg(), receipt_only_trial=True,
+        )
+        assert new_entry["verdict_reason"] == "receipt_only_trial"
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "related_tests", new_entry)
+
+        assert project.capability_adoption_verdicts["related_tests"]["verdict"] == "continue-trial"
+        mock_flag.assert_called_once()
+
+
 # ── carry_adoption_verdicts_for_consolidation ─────────────────────────────────
 
 
@@ -1016,3 +1177,666 @@ class TestCarryAdoptionVerdictsForConsolidation:
         carry_adoption_verdicts_for_consolidation(consolidated, verdicts)
 
         assert set(verdicts.keys()) == original_keys
+
+
+# ── assignment_key: newly-assigned trials can reach decided verdicts ──────────
+
+
+class TestAssignedArmTrials:
+    """Tests proving the three newly-assigned trials (module_interfaces,
+    related_tests, affected_consumers) can reach adopt/reject under a real
+    merge-test scenario and are held at continue-trial when the assigned-arm
+    subpopulation is insufficient."""
+
+    def _cfg(self, **overrides):
+        base = {"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03}
+        base.update(overrides)
+        return base
+
+    def test_all_three_trials_have_assignment_key(self):
+        """Registry check: all three receipt-only trials now carry an assignment_key."""
+        defs = get_trial_definitions()
+        by_name = {td["cap_name"]: td for td in defs}
+        for cap in ("module_interfaces", "related_tests", "affected_consumers"):
+            assert cap in by_name, f"missing trial definition for {cap}"
+            td = by_name[cap]
+            assert "assignment_key" in td, f"{cap} missing assignment_key"
+        assert by_name["module_interfaces"]["assignment_key"] == "_module_interfaces_arm"
+        assert by_name["related_tests"]["assignment_key"] == "_related_tests_arm"
+        assert by_name["affected_consumers"]["assignment_key"] == "_affected_consumers_arm"
+
+    def _decided_verdict_with_sufficient_assigned_arms(self, cap_name: str, lift: float, verdict: str):
+        """Helper: build an arm_composition with both assigned arms >= min_n and verify verdict."""
+        comp = {
+            "with_assigned": 35,
+            "with_receipt": 5,
+            "without_assigned": 32,
+            "without_receipt": 3,
+        }
+        entry = evaluate_trial_verdict(
+            lift=lift,
+            n_with=40,
+            n_without=35,
+            config=self._cfg(),
+            arm_composition=comp,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+            evaluated_at="2026-06-11T00:00:00",
+        )
+        assert entry["verdict"] == verdict, (
+            f"{cap_name}: expected {verdict!r} but got {entry['verdict']!r} "
+            f"(reason={entry.get('verdict_reason')})"
+        )
+        assert entry["verdict_reason"] == "sufficient_data"
+        assert entry["arm_composition"] == comp
+        return entry
+
+    def test_module_interfaces_adopt_with_sufficient_assigned_arms(self):
+        """module_interfaces trial can reach adopt when both assigned arms meet min_n."""
+        self._decided_verdict_with_sufficient_assigned_arms("module_interfaces", 0.08, "adopt")
+
+    def test_related_tests_adopt_with_sufficient_assigned_arms(self):
+        """related_tests trial can reach adopt when both assigned arms meet min_n."""
+        self._decided_verdict_with_sufficient_assigned_arms("related_tests", 0.07, "adopt")
+
+    def test_affected_consumers_adopt_with_sufficient_assigned_arms(self):
+        """affected_consumers trial can reach adopt when both assigned arms meet min_n."""
+        self._decided_verdict_with_sufficient_assigned_arms("affected_consumers", 0.06, "adopt")
+
+    def test_module_interfaces_reject_with_sufficient_assigned_arms(self):
+        """module_interfaces trial can reach reject when both assigned arms meet min_n."""
+        self._decided_verdict_with_sufficient_assigned_arms("module_interfaces", -0.05, "reject")
+
+    def test_related_tests_reject_with_sufficient_assigned_arms(self):
+        """related_tests trial can reach reject when both assigned arms meet min_n."""
+        self._decided_verdict_with_sufficient_assigned_arms("related_tests", -0.06, "reject")
+
+    def test_affected_consumers_reject_with_sufficient_assigned_arms(self):
+        """affected_consumers trial can reach reject when both assigned arms meet min_n."""
+        self._decided_verdict_with_sufficient_assigned_arms("affected_consumers", -0.04, "reject")
+
+    def _insufficient_assigned_arm_verdict(self, cap_name: str, lift: float):
+        """Helper: assigned-arm subpopulation below min_n → insufficient_assigned_arm_data."""
+        # Total n_with/without both meet min_n, but assigned arms are below min_n.
+        comp = {
+            "with_assigned": 15,   # below min_n=30
+            "with_receipt": 20,
+            "without_assigned": 12,  # below min_n=30
+            "without_receipt": 18,
+        }
+        entry = evaluate_trial_verdict(
+            lift=lift,
+            n_with=35,
+            n_without=30,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial", (
+            f"{cap_name}: expected continue-trial but got {entry['verdict']!r}"
+        )
+        assert entry["verdict_reason"] == "insufficient_assigned_arm_data", (
+            f"{cap_name}: expected insufficient_assigned_arm_data but got "
+            f"{entry['verdict_reason']!r} — must NOT be 'receipt_only_trial'"
+        )
+        return entry
+
+    def test_module_interfaces_held_at_insufficient_assigned_arm_data(self):
+        """module_interfaces: insufficient assigned-arm subpopulation → continue-trial/insufficient_assigned_arm_data."""
+        self._insufficient_assigned_arm_verdict("module_interfaces", 0.08)
+
+    def test_related_tests_held_at_insufficient_assigned_arm_data(self):
+        """related_tests: insufficient assigned-arm subpopulation → continue-trial/insufficient_assigned_arm_data."""
+        self._insufficient_assigned_arm_verdict("related_tests", 0.07)
+
+    def test_affected_consumers_held_at_insufficient_assigned_arm_data(self):
+        """affected_consumers: insufficient assigned-arm subpopulation → continue-trial/insufficient_assigned_arm_data."""
+        self._insufficient_assigned_arm_verdict("affected_consumers", 0.06)
+
+    def test_not_receipt_only_trial_reason_for_newly_assigned_caps(self):
+        """Newly-assigned trials must NEVER surface receipt_only_trial as verdict_reason.
+
+        Before adding assignment_key, these three trials would have been evaluated
+        with receipt_only_trial=True and their verdict_reason would be receipt_only_trial.
+        Now that they have assignment_key, purity-gate is the correct gate path.
+        """
+        comp = {
+            "with_assigned": 10,
+            "with_receipt": 25,
+            "without_assigned": 8,
+            "without_receipt": 22,
+        }
+        for cap in ("module_interfaces", "related_tests", "affected_consumers"):
+            entry = evaluate_trial_verdict(
+                lift=0.09,
+                n_with=35,
+                n_without=30,
+                config=self._cfg(),
+                arm_composition=comp,
+            )
+            assert entry["verdict_reason"] != "receipt_only_trial", (
+                f"{cap}: verdict_reason must not be receipt_only_trial — "
+                "trial now has assignment_key and must use purity-gate path"
+            )
+
+    def test_full_merge_test_verdict_cycle_module_interfaces(self):
+        """End-to-end: module_interfaces accumulates assigned-arm evidence and reaches adopt.
+
+        Simulates a real merge-test scenario: enough cumulative terminal tasks in
+        both assigned arms, positive lift → adopt verdict persisted on project.
+        """
+        project = _make_project()
+
+        comp = {
+            "with_assigned": 40,
+            "with_receipt": 8,
+            "without_assigned": 38,
+            "without_receipt": 5,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.06,
+            n_with=48,
+            n_without=43,
+            config=self._cfg(),
+            arm_composition=comp,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+            evaluated_at="2026-06-11T00:00:00",
+        )
+        assert entry["verdict"] == "adopt"
+        assert entry["verdict_reason"] == "sufficient_data"
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "module_interfaces", entry)
+
+        assert project.capability_adoption_verdicts["module_interfaces"]["verdict"] == "adopt"
+        assert project.capability_adoption_verdicts["module_interfaces"]["accumulation_basis"] == "cumulative_terminal_arm_tasks"
+        mock_flag.assert_called_once()
+
+    def test_full_merge_test_verdict_cycle_related_tests(self):
+        """End-to-end: related_tests accumulates assigned-arm evidence and reaches adopt."""
+        project = _make_project()
+
+        comp = {
+            "with_assigned": 33,
+            "with_receipt": 4,
+            "without_assigned": 31,
+            "without_receipt": 2,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.07,
+            n_with=37,
+            n_without=33,
+            config=self._cfg(),
+            arm_composition=comp,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+            evaluated_at="2026-06-11T00:00:00",
+        )
+        assert entry["verdict"] == "adopt"
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "related_tests", entry)
+
+        assert project.capability_adoption_verdicts["related_tests"]["verdict"] == "adopt"
+        mock_flag.assert_called_once()
+
+    def test_full_merge_test_verdict_cycle_affected_consumers(self):
+        """End-to-end: affected_consumers accumulates assigned-arm evidence and reaches adopt."""
+        project = _make_project()
+
+        comp = {
+            "with_assigned": 32,
+            "with_receipt": 6,
+            "without_assigned": 30,
+            "without_receipt": 4,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.05,
+            n_with=38,
+            n_without=34,
+            config=self._cfg(),
+            arm_composition=comp,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+            evaluated_at="2026-06-11T00:00:00",
+        )
+        assert entry["verdict"] == "adopt"
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "affected_consumers", entry)
+
+        assert project.capability_adoption_verdicts["affected_consumers"]["verdict"] == "adopt"
+        mock_flag.assert_called_once()
+
+    def test_decided_verdict_not_reverted_by_insufficient_data_after_adoption(self):
+        """After adopt, a subsequent insufficient-data evaluation must not self-revert it."""
+        project = _make_project()
+
+        comp = {"with_assigned": 35, "with_receipt": 5, "without_assigned": 30, "without_receipt": 3}
+        adopt_entry = evaluate_trial_verdict(
+            lift=0.08, n_with=40, n_without=33,
+            config=self._cfg(), arm_composition=comp,
+            evaluated_at="2026-06-11T00:00:00",
+        )
+        assert adopt_entry["verdict"] == "adopt"
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "module_interfaces", adopt_entry)
+
+        # Post-adoption: without-arm dries up, periodic evaluator returns insufficient_data.
+        stale_entry = evaluate_trial_verdict(
+            lift=None, n_with=0, n_without=0,
+            evaluated_at="2026-06-12T00:00:00",
+        )
+        assert stale_entry["verdict"] == "continue-trial"
+        assert stale_entry["verdict_reason"] == "insufficient_data"
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "module_interfaces", stale_entry)
+
+        # Adopt must survive.
+        assert project.capability_adoption_verdicts["module_interfaces"]["verdict"] == "adopt"
+        mock_flag.assert_not_called()
+
+
+# ── diagnostics_after_edit trial definition ───────────────────────────────────
+
+
+class TestDiagnosticsAfterEditTrialDefinition:
+    def test_definition_exists_in_registry(self):
+        defs = get_trial_definitions()
+        caps = [td["cap_name"] for td in defs]
+        assert "diagnostics_after_edit" in caps
+
+    def test_definition_has_required_fields(self):
+        defs = get_trial_definitions()
+        td = next(d for d in defs if d["cap_name"] == "diagnostics_after_edit")
+        assert td["context_key"] == "_had_diagnostics_after_edit"
+        assert td["assignment_key"] == "_diagnostics_after_edit_arm"
+        assert "thresholds" in td
+        assert "min_n_per_arm" in td["thresholds"]
+        assert "adopt_lift" in td["thresholds"]
+        assert "reject_lift" in td["thresholds"]
+        assert "futility_n" in td["thresholds"]
+
+    def test_adopt_verdict_with_sufficient_assigned_arm_data(self):
+        from app.capability_trial_verdict import _DEFAULT_ADOPT_LIFT, _DEFAULT_MIN_N_PER_ARM
+        defs = get_trial_definitions()
+        td = next(d for d in defs if d["cap_name"] == "diagnostics_after_edit")
+        arm_composition = {
+            "with_assigned": _DEFAULT_MIN_N_PER_ARM,
+            "with_receipt": 0,
+            "without_assigned": _DEFAULT_MIN_N_PER_ARM,
+            "without_receipt": 0,
+        }
+        entry = evaluate_trial_verdict(
+            lift=_DEFAULT_ADOPT_LIFT,
+            n_with=_DEFAULT_MIN_N_PER_ARM,
+            n_without=_DEFAULT_MIN_N_PER_ARM,
+            config=td["thresholds"],
+            arm_composition=arm_composition,
+        )
+        assert entry["verdict"] == "adopt"
+
+    def test_purity_gate_blocks_adopt_when_assigned_arm_insufficient(self):
+        from app.capability_trial_verdict import _DEFAULT_ADOPT_LIFT
+        defs = get_trial_definitions()
+        td = next(d for d in defs if d["cap_name"] == "diagnostics_after_edit")
+        # Total n meets min_n but assigned subpopulation does not
+        arm_composition = {
+            "with_assigned": 10,
+            "with_receipt": 25,
+            "without_assigned": 10,
+            "without_receipt": 25,
+        }
+        entry = evaluate_trial_verdict(
+            lift=_DEFAULT_ADOPT_LIFT,
+            n_with=35,
+            n_without=35,
+            config=td["thresholds"],
+            arm_composition=arm_composition,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
+
+
+# ── review_fix_lane TrialDefinition registration ──────────────────────────────
+
+
+class TestTrialDefinitionsLanePilot:
+    def _lane_def(self):
+        defs = get_trial_definitions()
+        matches = [td for td in defs if td["cap_name"] == LANE_PILOT_CAP_NAME]
+        assert matches, f"{LANE_PILOT_CAP_NAME} not found in TRIAL_DEFINITIONS"
+        return matches[0]
+
+    def test_lane_pilot_registered(self):
+        caps = [td["cap_name"] for td in get_trial_definitions()]
+        assert LANE_PILOT_CAP_NAME in caps
+
+    def test_lane_pilot_required_fields_present(self):
+        td = self._lane_def()
+        assert "cap_name" in td
+        assert "context_key" in td
+        assert "thresholds" in td
+
+    def test_lane_pilot_has_assignment_key(self):
+        td = self._lane_def()
+        assert td.get("assignment_key") == LANE_PILOT_ASSIGNMENT_KEY
+
+    def test_lane_pilot_thresholds_contain_all_keys(self):
+        td = self._lane_def()
+        required_threshold_keys = [
+            "min_n",
+            "kill_merge_rate_floor",
+            "kill_cost_ceiling",
+            "kill_gate_violations_max",
+            "kill_checkpoint_loss_ceiling",
+            "futility_n",
+            "adopt_merge_lift_floor",
+            "adopt_cost_improvement",
+        ]
+        for key in required_threshold_keys:
+            assert key in td["thresholds"], f"threshold key missing: {key}"
+
+    def test_lane_pilot_threshold_values_are_numeric_and_nonzero(self):
+        td = self._lane_def()
+        for k, v in td["thresholds"].items():
+            assert isinstance(v, (int, float)), f"{k} is not numeric"
+            assert v != 0, f"{k} is zero"
+
+    def test_canonical_key_constants_exported(self):
+        assert isinstance(LANE_PILOT_CAP_NAME, str) and LANE_PILOT_CAP_NAME
+        assert isinstance(LANE_PILOT_ASSIGNMENT_KEY, str) and LANE_PILOT_ASSIGNMENT_KEY
+        assert isinstance(LANE_PILOT_WARM_RESUME_RECEIPT_KEY, str) and LANE_PILOT_WARM_RESUME_RECEIPT_KEY
+        assert isinstance(LANE_PILOT_CHECKPOINT_RECEIPT_KEY, str) and LANE_PILOT_CHECKPOINT_RECEIPT_KEY
+
+
+# ── is_lane_pilot_arm_member (partitioning helper) ────────────────────────────
+
+
+class TestIsLanePilotArmMember:
+    def test_lane_assignment_key_returns_lane(self):
+        ctx = {LANE_PILOT_ASSIGNMENT_KEY: "lane"}
+        assert is_lane_pilot_arm_member(ctx) == "lane"
+
+    def test_control_assignment_key_returns_control(self):
+        ctx = {LANE_PILOT_ASSIGNMENT_KEY: "control"}
+        assert is_lane_pilot_arm_member(ctx) == "control"
+
+    def test_receipt_key_only_not_a_member(self):
+        # A task with ONLY warm-resume or checkpoint receipt keys but NO assignment key
+        # must NOT be counted into any arm — receipts are not arm membership.
+        ctx = {
+            LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+            LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
+        }
+        assert is_lane_pilot_arm_member(ctx) is None
+
+    def test_empty_context_not_a_member(self):
+        assert is_lane_pilot_arm_member({}) is None
+
+    def test_none_context_not_a_member(self):
+        assert is_lane_pilot_arm_member(None) is None  # type: ignore[arg-type]
+
+    def test_unknown_arm_value_not_a_member(self):
+        ctx = {LANE_PILOT_ASSIGNMENT_KEY: "unknown_arm"}
+        assert is_lane_pilot_arm_member(ctx) is None
+
+
+# ── evaluate_lane_pilot_verdict ───────────────────────────────────────────────
+
+
+def _good_aggs(*, n=40, merge_lift=0.10, cost_improvement=0.10, gate_violations=0, checkpoint_loss=0.01) -> dict:
+    """Build a healthy aggregate dict (ADOPT territory by default)."""
+    control_rate = 0.70
+    lane_rate = control_rate + merge_lift
+    control_cost = 1000.0
+    lane_cost = control_cost * (1.0 - cost_improvement)
+    return {
+        "n_lane": n,
+        "n_control": n,
+        "lane_merge_rate": lane_rate,
+        "control_merge_rate": control_rate,
+        "lane_cost_per_merged": lane_cost,
+        "control_cost_per_merged": control_cost,
+        "gate_integrity_violations": gate_violations,
+        "checkpoint_loss_rate": checkpoint_loss,
+    }
+
+
+class TestEvaluateLanePilotVerdict:
+    # ── acceptance test (named in the plan) ──────────────────────────────────
+
+    def test_lane_pilot_thresholds_kill_and_adopt(self):
+        """Acceptance: pre-registered thresholds produce KILL on synthetic regressing
+        data and ADOPT on synthetic improving data."""
+        # Synthetic regressing: merge rate tanks well below the kill floor.
+        bad = _good_aggs(merge_lift=-0.10)
+        kill_verdict = evaluate_lane_pilot_verdict(bad)
+        assert kill_verdict["verdict"] == "KILL"
+
+        # Synthetic improving: cost down ≥5%, merge rate non-inferior, no violations.
+        good = _good_aggs(merge_lift=0.05, cost_improvement=0.05)
+        adopt_verdict = evaluate_lane_pilot_verdict(good)
+        assert adopt_verdict["verdict"] == "ADOPT"
+
+    # ── KILL conditions ───────────────────────────────────────────────────────
+
+    def test_kill_on_lane_merge_rate_below_floor(self):
+        aggs = _good_aggs(merge_lift=-0.05)  # lift = -0.05 <= -0.03
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "lane_merge_rate_below_floor"
+        assert result["immediate_alert"] is False
+
+    def test_kill_on_lane_merge_rate_exactly_at_floor(self):
+        # lift = -0.03 (exactly at floor) → KILL
+        aggs = _good_aggs(merge_lift=-0.03)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "lane_merge_rate_below_floor"
+
+    def test_kill_on_cost_per_merged_above_ceiling(self):
+        # Lane costs 15% more than control — exceeds +10% ceiling.
+        aggs = _good_aggs(cost_improvement=-0.15)  # lane_cost = control * 1.15
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "lane_cost_ceiling_exceeded"
+        assert result["immediate_alert"] is False
+
+    def test_kill_on_gate_integrity_violations(self):
+        # 3 gate violations → KILL + immediate_alert.
+        aggs = _good_aggs(gate_violations=3)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "gate_integrity_violations_exceeded"
+        assert result["immediate_alert"] is True
+
+    def test_kill_on_gate_integrity_violations_above_min(self):
+        aggs = _good_aggs(gate_violations=10)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["immediate_alert"] is True
+
+    def test_kill_on_checkpoint_loss_rate_above_ceiling(self):
+        # 8% checkpoint loss > 5% ceiling.
+        aggs = _good_aggs(checkpoint_loss=0.08)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "checkpoint_loss_rate_exceeded"
+        assert result["immediate_alert"] is False
+
+    def test_kill_on_futility_at_max_n(self):
+        # n >= 90 per arm, adopt criteria NOT met → futility KILL.
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "futility_at_max_n"
+
+    # ── CONTINUE conditions ───────────────────────────────────────────────────
+
+    def test_continue_insufficient_n(self):
+        aggs = _good_aggs(n=10)  # below min_n=30
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+        assert result["verdict_reason"] == "insufficient_data"
+        assert result["immediate_alert"] is False
+
+    def test_continue_none_merge_rate(self):
+        aggs = _good_aggs()
+        aggs["lane_merge_rate"] = None
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+
+    def test_continue_none_cost(self):
+        aggs = _good_aggs()
+        aggs["lane_cost_per_merged"] = None
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+
+    def test_continue_ambiguous_metrics_sufficient_n(self):
+        # n ≥ min_n but metrics don't meet adopt OR kill.
+        aggs = _good_aggs(merge_lift=0.005, cost_improvement=0.02)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+        assert result["verdict_reason"] == "accumulating_data"
+
+    # ── ADOPT condition ───────────────────────────────────────────────────────
+
+    def test_adopt_all_criteria_met(self):
+        aggs = _good_aggs(merge_lift=0.05, cost_improvement=0.05, gate_violations=0)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "ADOPT"
+        assert result["verdict_reason"] == "adopt_criteria_met"
+        assert result["immediate_alert"] is False
+
+    def test_adopt_requires_zero_gate_violations(self):
+        # Exactly adopt metrics but 1 gate violation → not ADOPT.
+        aggs = _good_aggs(merge_lift=0.05, cost_improvement=0.05, gate_violations=1)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] != "ADOPT"
+
+    def test_adopt_requires_cost_improvement_at_threshold(self):
+        # Exactly 5% cost improvement meets the adopt criterion.
+        aggs = _good_aggs(merge_lift=0.05, cost_improvement=0.05)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "ADOPT"
+
+    def test_adopt_requires_merge_non_inferiority(self):
+        # Lift = -0.005 (> -0.01 floor) — still non-inferior.
+        aggs = _good_aggs(merge_lift=-0.005, cost_improvement=0.05)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "ADOPT"
+
+    # ── gate-integrity violations raise immediate_alert below min_n ───────────
+
+    def test_gate_violations_alert_below_min_n(self):
+        aggs = _good_aggs(n=5, gate_violations=3)  # n << min_n
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["immediate_alert"] is True
+
+    # ── KILL takes priority over ADOPT ───────────────────────────────────────
+
+    def test_kill_takes_priority_over_adopt(self):
+        # Meets adopt criteria but also has gate violations → KILL wins.
+        aggs = _good_aggs(merge_lift=0.05, cost_improvement=0.10, gate_violations=3)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["immediate_alert"] is True
+
+    def test_kill_merge_rate_takes_priority_over_cost_improvement(self):
+        aggs = _good_aggs(merge_lift=-0.05, cost_improvement=0.10)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "lane_merge_rate_below_floor"
+
+    # ── snapshot fields present ───────────────────────────────────────────────
+
+    def test_snapshot_fields_present_on_kill(self):
+        aggs = _good_aggs(merge_lift=-0.05)
+        result = evaluate_lane_pilot_verdict(aggs)
+        for field in ("n_lane", "n_control", "lane_merge_rate", "control_merge_rate",
+                      "lane_cost_per_merged", "control_cost_per_merged",
+                      "gate_integrity_violations", "checkpoint_loss_rate", "thresholds"):
+            assert field in result, f"missing field: {field}"
+
+    def test_snapshot_fields_present_on_adopt(self):
+        aggs = _good_aggs()
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "ADOPT"
+        assert "thresholds" in result
+        assert isinstance(result["thresholds"], dict)
+        for key in ("min_n", "kill_merge_rate_floor", "kill_cost_ceiling",
+                    "kill_gate_violations_max", "kill_checkpoint_loss_ceiling",
+                    "futility_n", "adopt_merge_lift_floor", "adopt_cost_improvement"):
+            assert key in result["thresholds"]
+
+    def test_snapshot_fields_present_on_continue(self):
+        aggs = _good_aggs(n=10)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+        assert "thresholds" in result
+        assert "immediate_alert" in result
+
+
+class TestEvaluateLanePilotVerdictEngagement:
+    """Engagement guard: futility KILL is suppressed when warm-resume fraction
+    is below _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT.  Tests verify BOTH the guard
+    firing and the passthrough (engagement absent or sufficient)."""
+
+    def test_futility_blocked_when_treatment_not_engaging(self):
+        """Acceptance: n ≥ 90, adopt not met, engagement=0.0 → CONTINUE not KILL."""
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        aggs["warm_resume_fraction"] = 0.0
+        aggs["checkpoint_fraction"] = 0.0
+        aggs["lane_fix_tasks_sampled"] = 90
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "CONTINUE"
+        assert result["verdict_reason"] == "treatment_not_engaging"
+        assert result["immediate_alert"] is True
+        assert result["engagement_low"] is True
+
+    def test_futility_kill_proceeds_when_engagement_meets_threshold(self):
+        """When warm_resume_fraction meets the threshold, futility KILL fires normally."""
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        aggs["warm_resume_fraction"] = 0.80
+        aggs["checkpoint_fraction"] = 0.75
+        aggs["lane_fix_tasks_sampled"] = 90
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "futility_at_max_n"
+        assert result.get("engagement_low") is not True
+
+    def test_futility_kill_proceeds_when_engagement_exactly_at_threshold(self):
+        """warm_resume_fraction == threshold (0.50) is NOT below threshold → KILL."""
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        aggs["warm_resume_fraction"] = 0.50
+        aggs["lane_fix_tasks_sampled"] = 90
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "futility_at_max_n"
+
+    def test_engagement_guard_skipped_when_fields_absent(self):
+        """_good_aggs without engagement fields → falls through to futility_at_max_n."""
+        aggs = _good_aggs(n=90, merge_lift=0.005, cost_improvement=-0.02)
+        # warm_resume_fraction absent (None from aggregates.get) → guard is skipped
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "futility_at_max_n"
+
+    def test_engagement_fields_propagated_in_snapshot(self):
+        """warm_resume_fraction / checkpoint_fraction / lane_fix_tasks_sampled appear
+        in the returned dict regardless of verdict path."""
+        aggs = _good_aggs(n=40)
+        aggs["warm_resume_fraction"] = 0.6
+        aggs["checkpoint_fraction"] = 0.5
+        aggs["lane_fix_tasks_sampled"] = 40
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["warm_resume_fraction"] == 0.6
+        assert result["checkpoint_fraction"] == 0.5
+        assert result["lane_fix_tasks_sampled"] == 40
+
+    def test_engagement_threshold_in_thresholds_snapshot(self):
+        """thresholds dict includes futility_min_engagement."""
+        aggs = _good_aggs(n=10)  # CONTINUE (insufficient data)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert "futility_min_engagement" in result["thresholds"]
+        assert result["thresholds"]["futility_min_engagement"] == 0.50

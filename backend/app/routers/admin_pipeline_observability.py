@@ -13,6 +13,7 @@ removed alongside the detect->investigate->fix regression apparatus.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -23,9 +24,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
-from app.admin import _get_user_project_with_role
+from app.admin_helpers import _get_user_project_with_role
 from app.auth import get_current_user, require_admin
 from app.database import get_session, resolve_dialect_name
+from app.failure_layer_classifier import parse_viewport_regression_class
 from app.models import (
     Alert,
     AlertSeverity,
@@ -43,8 +45,108 @@ logger = logging.getLogger(__name__)
 # (``pipeline_alert_scan._run_signal_staleness_watchdog``), the re-homed source
 # of the "Signal staleness" WARNING alerts surfaced by ``/pipeline-regressions``.
 _SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
+_VIEWPORT_FAILURE_CLASS = "VIEWPORT_REGRESSION"
+_VIEWPORT_TASK_LOOKBACK_DAYS = 14
+_VIEWPORT_ASSERTION_FUNCTIONS = {
+    "expectNoOverflowAt": "overflow",
+    "expectNoTextTruncationAt": "text_truncation",
+    "expectMinTouchTargetAt": "touch_target",
+}
+_VIEWPORT_ASSERTION_RE = re.compile(
+    r"\b(expectNoOverflowAt|expectNoTextTruncationAt|expectMinTouchTargetAt)\((\d+)\)"
+)
+_VIEWPORT_TEST_FILE_RE = re.compile(r"\[?([A-Za-z0-9_.-]+)\.viewport\.test\.tsx\]?")
+_VIEWPORT_OVERFLOW_COMPONENT_RE = re.compile(
+    r"[:\s]([A-Za-z][A-Za-z0-9_.-]+)\s+overflows\s+viewport\b",
+    re.IGNORECASE,
+)
+_VIEWPORT_IN_COMPONENT_RE = re.compile(
+    r"\bin\s+([A-Za-z][A-Za-z0-9_.-]+)(?:\b|$)",
+    re.IGNORECASE,
+)
 
 router = APIRouter()
+
+
+def _iter_viewport_regression_keys(value: Any):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if isinstance(key, str) and key.startswith("viewport_regression:"):
+                yield key
+            yield from _iter_viewport_regression_keys(nested)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_viewport_regression_keys(item)
+
+
+def _viewport_metadata_from_regression_class(
+    regression_class: str,
+) -> Dict[str, Any] | None:
+    parsed = parse_viewport_regression_class(regression_class)
+    component = parsed.get("component")
+    width = parsed.get("width")
+    if not component or not width:
+        return None
+    try:
+        numeric_width = int(width)
+    except (TypeError, ValueError):
+        return None
+    if numeric_width <= 0:
+        return None
+    return {
+        "component": component,
+        "assertion_type": parsed.get("assertion_type"),
+        "width": numeric_width,
+    }
+
+
+def _component_from_viewport_status_text(message: str) -> str | None:
+    if match := _VIEWPORT_TEST_FILE_RE.search(message):
+        return match.group(1)
+    if match := _VIEWPORT_OVERFLOW_COMPONENT_RE.search(message):
+        return match.group(1)
+    if match := _VIEWPORT_IN_COMPONENT_RE.search(message):
+        return match.group(1)
+    return None
+
+
+def _viewport_metadata_from_status_text(message: str | None) -> Dict[str, Any] | None:
+    if not message:
+        return None
+    match = _VIEWPORT_ASSERTION_RE.search(message)
+    if not match:
+        return None
+    assertion_func, width = match.groups()
+    component = _component_from_viewport_status_text(message)
+    if not component:
+        return None
+    return {
+        "component": component,
+        "assertion_type": _VIEWPORT_ASSERTION_FUNCTIONS[assertion_func],
+        "width": int(width),
+    }
+
+
+def _viewport_failure_context(task: Task) -> tuple[bool, list[str]]:
+    ctx = task.context or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+
+    failure_class = str(
+        ctx.get("failure_category") or ctx.get("failure_class") or ""
+    ).strip()
+    viewport_keys = list(_iter_viewport_regression_keys(ctx))
+    return failure_class == _VIEWPORT_FAILURE_CLASS or bool(viewport_keys), viewport_keys
+
+
+def _viewport_metadata_for_failed_task(
+    task: Task, viewport_keys: list[str]
+) -> Dict[str, Any] | None:
+
+    for key in viewport_keys:
+        if metadata := _viewport_metadata_from_regression_class(key):
+            return metadata
+    return _viewport_metadata_from_status_text(task.latest_status_message)
 
 
 @router.get("/provider-cost-summary")
@@ -1262,6 +1364,79 @@ async def get_pipeline_regressions(
             }
         )
 
+    viewport_cutoff = now - timedelta(days=_VIEWPORT_TASK_LOOKBACK_DAYS)
+    viewport_task_rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.FAILED,
+                    Task.created_at >= viewport_cutoff,
+                )
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.project_id,
+                        Task.title,
+                        Task.status,
+                        Task.created_at,
+                        Task.updated_at,
+                        Task.latest_status_message,
+                        Task.context,
+                    )
+                )
+                .order_by(Task.created_at.desc())
+                .limit(100)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    seen_viewport_classes: set[str] = set()
+    for task in viewport_task_rows:
+        is_viewport_failure, viewport_keys = _viewport_failure_context(task)
+        if not is_viewport_failure:
+            continue
+        metadata = _viewport_metadata_for_failed_task(task, viewport_keys)
+        if metadata:
+            component = metadata["component"]
+            assertion_type = metadata.get("assertion_type")
+            width = metadata["width"]
+            regression_class = (
+                f"viewport_regression:{component}:{assertion_type}@{width}"
+                if assertion_type
+                else f"viewport_regression:{component}@{width}"
+            )
+            signal_name = f"Viewport regression: {component} at {width}px"
+        else:
+            component = None
+            assertion_type = None
+            width = None
+            regression_class = f"viewport_regression:metadata_unavailable:{task.id}"
+            signal_name = "Viewport regression: metadata unavailable"
+        if regression_class in seen_viewport_classes:
+            continue
+        seen_viewport_classes.add(regression_class)
+        regressions.append(
+            {
+                "signal_name": signal_name,
+                "regression_class": regression_class,
+                "detected_at": (task.updated_at or task.created_at).isoformat()
+                if (task.updated_at or task.created_at)
+                else None,
+                "severity": "critical",
+                "current_rate": None,
+                "prior_rate": None,
+                "resolved": False,
+                "resolved_at": None,
+                "details": task.latest_status_message,
+                "viewport_component": component,
+                "viewport_assertion_type": assertion_type,
+                "viewport_width": width,
+            }
+        )
+
     # The detect->investigate->fix regression apparatus has been removed: these
     # signals are now surfaced purely for operator visibility (design-doc flags +
     # the Alert table). No autonomous remediation task is spawned, so the prior
@@ -1370,6 +1545,22 @@ async def get_warm_reuse_dropout_trend(
             }
         )
     return {"buckets": buckets}
+
+
+@router.get("/digest-latency-stats")
+async def get_digest_latency_stats(
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Return in-process rolling latency aggregate for /api/admin/digest.
+
+    Reports p50/p95 request durations (seconds) and per-tier serve counts
+    since the last process restart. All values are per-instance — replicas
+    maintain independent aggregates and this endpoint only reflects the
+    instance that answered the request.
+    """
+    from app.digest_latency import get_digest_latency_snapshot  # noqa: PLC0415
+
+    return get_digest_latency_snapshot()
 
 
 @router.get("/projects/{project_id}/pool-dispatch-funnel-trend")

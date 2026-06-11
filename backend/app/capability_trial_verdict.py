@@ -52,6 +52,182 @@ class TrialDefinition(_TrialDefinitionRequired, total=False):
     assignment_key: str
 
 
+# ── Lane pilot threshold constants (pre-registered, auditable) ────────────────
+# All thresholds are module-level named constants so they appear in trial
+# registry entries and are not buried as magic numbers inside branch bodies.
+
+_LANE_PILOT_MIN_N = 30
+# KILL conditions
+_LANE_PILOT_KILL_MERGE_RATE_FLOOR = -0.03     # lift (lane_rate - control_rate) <= this
+_LANE_PILOT_KILL_COST_CEILING = 0.10          # cost-per-merged-PR >= +10% vs control
+_LANE_PILOT_KILL_GATE_VIOLATIONS_MAX = 3      # >= this → KILL + immediate operator alert
+_LANE_PILOT_KILL_CHECKPOINT_LOSS_CEILING = 0.05  # checkpoint-loss rate > this
+_LANE_PILOT_FUTILITY_N = 90                   # n per arm without reaching adopt → KILL
+# ADOPT conditions
+_LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR = -0.01   # merge-rate lift must exceed this (non-inferiority)
+_LANE_PILOT_ADOPT_COST_IMPROVEMENT = 0.05    # cost-per-merged-PR must improve >= this
+# Engagement guard: futility KILL is suppressed when warm-resume engagement is below
+# this fraction among lane-arm fix tasks.  A trial that never exercised warm-resume
+# cannot produce a valid futility verdict — the treatment was never delivered.
+_LANE_PILOT_FUTILITY_MIN_ENGAGEMENT = 0.50
+
+# ── Canonical exported keys (downstream pilot-wiring subtask imports these) ──
+LANE_PILOT_CAP_NAME = "review_fix_lane"
+LANE_PILOT_ASSIGNMENT_KEY = "_review_fix_lane_arm"        # intent-to-treat arm key
+LANE_PILOT_WARM_RESUME_RECEIPT_KEY = "_review_fix_warm_resume"
+LANE_PILOT_CHECKPOINT_RECEIPT_KEY = "_review_fix_checkpoint"
+
+_DECIDED_VERDICTS = frozenset({"adopt", "reject", "ADOPT", "KILL"})
+_CONTINUE_VERDICTS = frozenset({"continue-trial", "CONTINUE"})
+_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset({"ambiguous_lift", "receipt_only_trial"})
+
+
+class LanePilotAggregates(TypedDict, total=False):
+    """Per-arm aggregate statistics consumed by evaluate_lane_pilot_verdict."""
+    n_lane: int
+    n_control: int
+    lane_merge_rate: float | None
+    control_merge_rate: float | None
+    lane_cost_per_merged: float | None
+    control_cost_per_merged: float | None
+    gate_integrity_violations: int
+    checkpoint_loss_rate: float | None
+    # Treatment-engagement telemetry (optional; absent when no fix tasks yet).
+    # warm_resume_fraction: fraction of lane-arm fix tasks that carried the
+    #   warm-resume receipt (actually claimed a warm workspace).
+    # checkpoint_fraction: fraction of lane-arm fix tasks that wrote a checkpoint.
+    # lane_fix_tasks_sampled: denominator for the two fractions above.
+    warm_resume_fraction: float | None
+    checkpoint_fraction: float | None
+    lane_fix_tasks_sampled: int
+
+
+def is_lane_pilot_arm_member(context: dict[str, Any]) -> str | None:
+    """Return the arm ('lane' or 'control') for a task, or None if not assigned.
+
+    Uses LANE_PILOT_ASSIGNMENT_KEY for intent-to-treat partitioning.  A task
+    that carries only receipt keys (warm-resume, checkpoint) but has no
+    assignment key is NOT a member of either arm and must not be counted.
+    """
+    arm = context.get(LANE_PILOT_ASSIGNMENT_KEY) if isinstance(context, dict) else None
+    if arm in ("lane", "control"):
+        return arm
+    return None
+
+
+def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, Any]:
+    """Return a KILL / ADOPT / CONTINUE verdict for the review-fix lane pilot.
+
+    Kill conditions are checked in priority order before adopt.  Gate-integrity
+    violations additionally set ``immediate_alert=True`` regardless of sample
+    size — the caller is responsible for raising the operator alert.
+
+    Parameters
+    ----------
+    aggregates:
+        Per-arm aggregate statistics.  All rate fields may be None when
+        not yet measurable (insufficient merges, no cost data, etc.).
+
+    Returns
+    -------
+    A dict with keys:
+      verdict            : "KILL" | "ADOPT" | "CONTINUE"
+      verdict_reason     : machine-readable slug
+      immediate_alert    : bool — True when gate-integrity violations triggered
+      thresholds         : snapshot of the pre-registered threshold constants
+      <metric fields>    : snapshot of every input field from aggregates
+    """
+    n_lane = int(aggregates.get("n_lane") or 0)
+    n_control = int(aggregates.get("n_control") or 0)
+    lane_merge_rate = aggregates.get("lane_merge_rate")
+    control_merge_rate = aggregates.get("control_merge_rate")
+    lane_cost = aggregates.get("lane_cost_per_merged")
+    control_cost = aggregates.get("control_cost_per_merged")
+    gate_violations = int(aggregates.get("gate_integrity_violations") or 0)
+    checkpoint_loss = aggregates.get("checkpoint_loss_rate")
+    warm_resume_fraction = aggregates.get("warm_resume_fraction")
+    checkpoint_fraction = aggregates.get("checkpoint_fraction")
+    lane_fix_tasks_sampled = int(aggregates.get("lane_fix_tasks_sampled") or 0)
+
+    thresholds = {
+        "min_n": _LANE_PILOT_MIN_N,
+        "kill_merge_rate_floor": _LANE_PILOT_KILL_MERGE_RATE_FLOOR,
+        "kill_cost_ceiling": _LANE_PILOT_KILL_COST_CEILING,
+        "kill_gate_violations_max": _LANE_PILOT_KILL_GATE_VIOLATIONS_MAX,
+        "kill_checkpoint_loss_ceiling": _LANE_PILOT_KILL_CHECKPOINT_LOSS_CEILING,
+        "futility_n": _LANE_PILOT_FUTILITY_N,
+        "adopt_merge_lift_floor": _LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR,
+        "adopt_cost_improvement": _LANE_PILOT_ADOPT_COST_IMPROVEMENT,
+        "futility_min_engagement": _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT,
+    }
+
+    base: dict[str, Any] = {
+        "n_lane": n_lane,
+        "n_control": n_control,
+        "lane_merge_rate": lane_merge_rate,
+        "control_merge_rate": control_merge_rate,
+        "lane_cost_per_merged": lane_cost,
+        "control_cost_per_merged": control_cost,
+        "gate_integrity_violations": gate_violations,
+        "checkpoint_loss_rate": checkpoint_loss,
+        "warm_resume_fraction": warm_resume_fraction,
+        "checkpoint_fraction": checkpoint_fraction,
+        "lane_fix_tasks_sampled": lane_fix_tasks_sampled,
+        "thresholds": thresholds,
+    }
+
+    # Gate-integrity violations trigger immediate alert regardless of sample size.
+    immediate_alert = gate_violations >= _LANE_PILOT_KILL_GATE_VIOLATIONS_MAX
+
+    # ── KILL checks (ordered; first match wins) ───────────────────────────────
+    if immediate_alert:
+        return {**base, "verdict": "KILL", "verdict_reason": "gate_integrity_violations_exceeded", "immediate_alert": True}
+
+    if n_lane < _LANE_PILOT_MIN_N or n_control < _LANE_PILOT_MIN_N:
+        return {**base, "verdict": "CONTINUE", "verdict_reason": "insufficient_data", "immediate_alert": False}
+
+    if lane_merge_rate is not None and control_merge_rate is not None:
+        merge_lift = lane_merge_rate - control_merge_rate
+        if merge_lift <= _LANE_PILOT_KILL_MERGE_RATE_FLOOR:
+            return {**base, "verdict": "KILL", "verdict_reason": "lane_merge_rate_below_floor", "immediate_alert": False}
+
+    if lane_cost is not None and control_cost is not None and control_cost > 0:
+        cost_delta = (lane_cost - control_cost) / control_cost
+        if cost_delta >= _LANE_PILOT_KILL_COST_CEILING:
+            return {**base, "verdict": "KILL", "verdict_reason": "lane_cost_ceiling_exceeded", "immediate_alert": False}
+
+    if checkpoint_loss is not None and checkpoint_loss > _LANE_PILOT_KILL_CHECKPOINT_LOSS_CEILING:
+        return {**base, "verdict": "KILL", "verdict_reason": "checkpoint_loss_rate_exceeded", "immediate_alert": False}
+
+    adopt_criteria_met = (
+        lane_merge_rate is not None and control_merge_rate is not None
+        and (lane_merge_rate - control_merge_rate) > _LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR
+        and lane_cost is not None and control_cost is not None and control_cost > 0
+        and (control_cost - lane_cost) / control_cost >= _LANE_PILOT_ADOPT_COST_IMPROVEMENT
+        and gate_violations == 0
+    )
+    if n_lane >= _LANE_PILOT_FUTILITY_N and n_control >= _LANE_PILOT_FUTILITY_N and not adopt_criteria_met:
+        # Engagement guard: if the treatment was never delivered (warm-resume
+        # engagement below threshold), futility cannot be concluded — the trial
+        # accrued arm counts without the treatment actually running.  Emit
+        # CONTINUE so the operator can diagnose the infrastructure gap.
+        if warm_resume_fraction is not None and warm_resume_fraction < _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT:
+            return {
+                **base,
+                "verdict": "CONTINUE",
+                "verdict_reason": "treatment_not_engaging",
+                "immediate_alert": True,
+                "engagement_low": True,
+            }
+        return {**base, "verdict": "KILL", "verdict_reason": "futility_at_max_n", "immediate_alert": False}
+
+    # ── ADOPT check ───────────────────────────────────────────────────────────
+    if adopt_criteria_met:
+        return {**base, "verdict": "ADOPT", "verdict_reason": "adopt_criteria_met", "immediate_alert": False}
+
+    return {**base, "verdict": "CONTINUE", "verdict_reason": "accumulating_data", "immediate_alert": False}
+
+
 TRIAL_DEFINITIONS: list[TrialDefinition] = [
     {
         "cap_name": "repo_map",
@@ -67,6 +243,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
     {
         "cap_name": "module_interfaces",
         "context_key": "_had_module_interfaces",
+        "assignment_key": "_module_interfaces_arm",
         "thresholds": {
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
@@ -77,6 +254,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
     {
         "cap_name": "related_tests",
         "context_key": "_had_related_tests",
+        "assignment_key": "_related_tests_arm",
         "thresholds": {
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
@@ -87,11 +265,39 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
     {
         "cap_name": "affected_consumers",
         "context_key": "_had_affected_consumers",
+        "assignment_key": "_affected_consumers_arm",
         "thresholds": {
             "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
             "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
+        },
+    },
+    {
+        "cap_name": "diagnostics_after_edit",
+        "context_key": "_had_diagnostics_after_edit",
+        "assignment_key": "_diagnostics_after_edit_arm",
+        "thresholds": {
+            "min_n_per_arm": _DEFAULT_MIN_N_PER_ARM,
+            "adopt_lift": _DEFAULT_ADOPT_LIFT,
+            "reject_lift": _DEFAULT_REJECT_LIFT,
+            "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
+        },
+    },
+    {
+        "cap_name": LANE_PILOT_CAP_NAME,
+        "context_key": LANE_PILOT_ASSIGNMENT_KEY,
+        "assignment_key": LANE_PILOT_ASSIGNMENT_KEY,
+        "thresholds": {
+            "min_n": _LANE_PILOT_MIN_N,
+            "kill_merge_rate_floor": _LANE_PILOT_KILL_MERGE_RATE_FLOOR,
+            "kill_cost_ceiling": _LANE_PILOT_KILL_COST_CEILING,
+            "kill_gate_violations_max": _LANE_PILOT_KILL_GATE_VIOLATIONS_MAX,
+            "kill_checkpoint_loss_ceiling": _LANE_PILOT_KILL_CHECKPOINT_LOSS_CEILING,
+            "futility_n": _LANE_PILOT_FUTILITY_N,
+            "adopt_merge_lift_floor": _LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR,
+            "adopt_cost_improvement": _LANE_PILOT_ADOPT_COST_IMPROVEMENT,
+            "futility_min_engagement": _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT,
         },
     },
 ]
@@ -112,6 +318,7 @@ def evaluate_trial_verdict(
     evaluated_at: str | None = None,
     accumulation_basis: str | None = None,
     arm_composition: dict | None = None,
+    receipt_only_trial: bool = False,
 ) -> dict[str, Any]:
     """Return a verdict dict for a capability trial based on measured lift and sample sizes.
 
@@ -139,6 +346,11 @@ def evaluate_trial_verdict(
                     requires the assignment-based subpopulation alone to satisfy
                     ``min_n_per_arm`` — fallback-receipt tasks cannot tip a decision.
                     When None the entry omits the key and the purity gate is skipped.
+    receipt_only_trial: When True, a decided verdict (adopt/reject) is blocked and
+                    replaced with ``continue-trial`` / ``receipt_only_trial``. Use for
+                    trials that have no ``assignment_key`` and therefore accumulate only
+                    receipt-context evidence — structurally confounded evidence must
+                    never produce a durable adoption decision.
 
     Returns
     -------
@@ -193,6 +405,13 @@ def evaluate_trial_verdict(
             verdict = "continue-trial"
             verdict_reason = "ambiguous_lift"
 
+    # Receipt-only guard: trials with no assignment key accumulate only receipt
+    # context — the arms are structurally confounded and must never produce a
+    # decided verdict regardless of sample size.
+    if verdict in ("adopt", "reject") and receipt_only_trial:
+        verdict = "continue-trial"
+        verdict_reason = "receipt_only_trial"
+
     # Purity gate: a decided verdict requires the assignment-based subpopulation
     # alone to satisfy min_n per arm. Receipt-fallback tasks (legacy tasks that
     # pre-date intent-to-treat assignment) are confounded and must not tip the
@@ -240,10 +459,24 @@ def record_trial_verdict(
     new_reason = entry.get("verdict_reason")
 
     if (
-        new_verdict == "continue-trial"
+        cap_name == LANE_PILOT_CAP_NAME
+        and prior_verdict == "KILL"
         and entry.get("evidence_source") != "strategic_review"
-        and (prior_verdict in ("adopt", "reject") or prior_source == "strategic_review")
-        and new_reason != "ambiguous_lift"
+        and new_verdict != "KILL"
+    ):
+        logger.info(
+            "[CAPABILITY_TRIAL] skipping non-strategic write for %s — "
+            "durable KILL must survive later automated verdicts until an "
+            "explicit strategist re-declaration arrives",
+            cap_name,
+        )
+        return
+
+    if (
+        new_verdict in _CONTINUE_VERDICTS
+        and entry.get("evidence_source") != "strategic_review"
+        and (prior_verdict in _DECIDED_VERDICTS or prior_source == "strategic_review")
+        and new_reason not in _SUFFICIENT_DATA_CONTINUE_REASONS
     ):
         logger.info(
             "[CAPABILITY_TRIAL] skipping continue-trial write for %s — "

@@ -5731,6 +5731,73 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
 
 
 @pytest.mark.asyncio
+async def test_spawn_gate_cause_flows_from_research_ctx_to_history(
+    db_session: AsyncSession,
+):
+    """research_spawn_gate_cause and cause_counts are copied from research task ctx into history.
+
+    When the research task context carries research_spawn_gate_cause and
+    research_spawn_gate_cause_counts, both must appear in the research_history entry.
+    When they are absent, the keys must not be present in the entry.
+    """
+    direction_id = "d-spawn-gate-cause"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_challenged_count": 2,
+        "research_spawn_gate_unresolved_count": 2,
+        "research_spawn_gate_cause": {"category": "AGENT_TIMEOUT", "detail": "timed out"},
+        "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 2},
+    }
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=0)]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["research_spawn_gate_cause"] == {"category": "AGENT_TIMEOUT", "detail": "timed out"}
+    assert entry["research_spawn_gate_cause_counts"] == {"AGENT_TIMEOUT": 2}
+
+    # Verify that absent cause keys do not appear in the entry.
+    direction_id2 = "d-spawn-gate-cause-absent"
+    research_task2 = await _make_research_task(db_session, project.id)
+    research_task2_id = str(research_task2.id)
+    research_task2.context = {
+        "direction_id": direction_id2,
+        "research_spawn_gate_challenged_count": 1,
+    }
+    project.directions = project.directions + [
+        _make_direction(direction_id2, research_task2_id, tasks_created=0)
+    ]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id2,
+        research_task_id=research_task2_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry2 = next(
+        d["research_history"][0]
+        for d in project.directions
+        if d["id"] == direction_id2
+    )
+    assert "research_spawn_gate_cause" not in entry2
+    assert "research_spawn_gate_cause_counts" not in entry2
+
+
+@pytest.mark.asyncio
 async def test_adversarial_give_up_count_rolls_up_to_spawn_gate_metrics(
     db_session: AsyncSession,
 ):

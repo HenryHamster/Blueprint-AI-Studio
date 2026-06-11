@@ -10,7 +10,7 @@ Tests cover:
 """
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -33,6 +33,10 @@ from app.direction_metrics import (
     _compute_momentum_factor,
     _compute_productivity_score,
     _compute_rolling_median_review_iterations,
+)
+from app.direction_refractory import (
+    get_direction_refractory_info,
+    stamp_direction_refractory,
 )
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
@@ -414,6 +418,41 @@ async def test_get_directions_includes_null_hold_timing_when_not_held(
     assert payload["held_reason"] is None
     assert payload["held_at"] is None
     assert payload["held_until"] is None
+    assert payload["refractory_until"] is None
+    assert payload["refractory_reason"] is None
+    assert payload["refractory_remaining_minutes"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_directions_includes_refractory_payload(
+    client: AsyncClient, mocker
+):
+    """GET surfaces remaining refractory time and whether it is a standard or saturation hold."""
+    project_id = await _deploy_project(client, mocker)
+    future_ts = (datetime.now(timezone.utc) + timedelta(minutes=90)).isoformat()
+    await client.put(
+        f"/api/admin/projects/{project_id}/directions",
+        json=[
+            {
+                "id": "d-refract",
+                "text": "Direction A",
+                "priority": "low",
+                "status": "active",
+                "added_at": "2026-01-01T00:00:00",
+                "last_researched_at": datetime.now(timezone.utc).isoformat(),
+                "refractory_until": future_ts,
+                "possibly_saturated": True,
+                "research_history": [],
+            }
+        ],
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    payload = resp.json()["directions"][0]
+    assert payload["refractory_reason"] == "saturation"
+    assert payload["refractory_remaining_minutes"] >= 89
+    assert payload["refractory_until"] is not None
 
 
 @pytest.mark.asyncio
@@ -1184,8 +1223,10 @@ async def test_manual_research_409_when_concurrent_spawn_holds_claim(
 
 
 @pytest.mark.asyncio
-async def test_cooldown_filter_excludes_recently_researched_direction(db_session):
-    """A direction researched 1 hour ago (within 4-hour cooldown) should not trigger a task."""
+async def test_cooldown_filter_ignores_recent_last_researched_at_without_refractory(
+    db_session,
+):
+    """A recent last_researched_at alone no longer blocks research; refractory_until does."""
     project = Project(
         name="Cooldown Test — Recent",
         user_id="test-user-123",
@@ -1215,9 +1256,7 @@ async def test_cooldown_filter_excludes_recently_researched_direction(db_session
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
-    assert len(tasks) == 0, (
-        "No task should be spawned for a recently-researched direction"
-    )
+    assert len(tasks) >= 1, "recent last_researched_at alone should not block research"
 
 
 @pytest.mark.asyncio
@@ -7999,61 +8038,72 @@ async def test_completion_suggestion_toggles_off_when_no_longer_complete(db_sess
     assert "completion_suggestion" not in persisted
 
 
-@pytest.mark.asyncio
-async def test_tiered_unproductive_cooldown_escalates_with_consecutive_failures(
-    db_session,
+def test_direction_refractory_helper_uses_adaptive_tiers_and_saturation_multiplier(
+    mocker,
 ):
-    """1st unproductive cycle waits 0.375x base; 3rd+ waits full base."""
-    base_cooldown = 240.0
-    now = datetime.utcnow()
+    """The shared refractory helper stamps the adaptive standard and saturation holds."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {
+            "autonomous_direction_cooldown_minutes": 240,
+            "productive_direction_cooldown_minutes": 45,
+            "direction_refractory_minutes": None,
+            "direction_saturation_refractory_minutes": None,
+        },
+        clear=False,
+    )
+    now = datetime(2026, 1, 1, 0, 0, 0)
 
-    def _make_direction(did: str, consecutive: int, minutes_ago: float) -> dict:
-        return {
-            "id": did,
-            "text": f"dir-{did}",
-            "status": "active",
-            "priority": "medium",
-            "paths": [],
-            "added_at": "2026-01-01T00:00:00",
-            "last_researched_at": (now - timedelta(minutes=minutes_ago)).isoformat(),
-            "last_cycle_productive": False,
-            "consecutive_unproductive_cycles": consecutive,
-            "research_history": [],
-        }
+    standard = {
+        "last_cycle_productive": False,
+        "consecutive_unproductive_cycles": 1,
+    }
+    stamp_direction_refractory(standard, now=now)
+    assert datetime.fromisoformat(standard["refractory_until"]) == now + timedelta(
+        minutes=90
+    )
+    standard_info = get_direction_refractory_info(standard, now=now)
+    assert standard_info["refractory_reason"] == "standard"
+    assert standard_info["refractory_remaining_minutes"] == 90
 
-    # 1st consecutive (multiplier 0.375 → 90m): 100m ago passes, 80m ago does not.
-    # 3rd+ consecutive (multiplier 1.0 → 240m): 100m ago does NOT pass.
-    project = Project(
-        name="Tiered Cooldown Test",
-        user_id="u-tiered",
-        autonomous_enabled=True,
-        directions=[
-            _make_direction("d-tier-1st-pass", consecutive=1, minutes_ago=100),
-            _make_direction("d-tier-1st-fail", consecutive=1, minutes_ago=80),
-            _make_direction("d-tier-3rd-fail", consecutive=3, minutes_ago=100),
-        ],
-        vision={"purpose": "t"},
+    productive = {
+        "last_cycle_productive": True,
+        "consecutive_unproductive_cycles": 0,
+    }
+    stamp_direction_refractory(productive, now=now)
+    assert datetime.fromisoformat(productive["refractory_until"]) == now + timedelta(
+        minutes=45
     )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
 
-    active = await _process_direction_lifecycle(
-        project,
-        db_session,
-        cooldown_minutes=base_cooldown,
-        busy_direction_ids=set(),
-        now=now,
+    saturated = {
+        "last_cycle_productive": False,
+        "consecutive_unproductive_cycles": 1,
+        "possibly_saturated": True,
+    }
+    stamp_direction_refractory(saturated, now=now)
+    assert datetime.fromisoformat(saturated["refractory_until"]) == now + timedelta(
+        minutes=180
     )
-    active_ids = {d["id"] for d in active}
-    assert "d-tier-1st-pass" in active_ids, (
-        "1 consecutive unproductive cycle should use 0.375x cooldown"
+    saturated_info = get_direction_refractory_info(saturated, now=now)
+    assert saturated_info["refractory_reason"] == "saturation"
+
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {
+            "autonomous_direction_cooldown_minutes": 240,
+            "productive_direction_cooldown_minutes": 45,
+            "direction_refractory_minutes": 360,
+            "direction_saturation_refractory_minutes": None,
+        },
+        clear=False,
     )
-    assert "d-tier-1st-fail" not in active_ids, (
-        "80m < 90m (0.375 * 240) — still cooling down"
-    )
-    assert "d-tier-3rd-fail" not in active_ids, (
-        "3+ consecutive unproductive cycles should use full base cooldown"
+    explicit_standard = {
+        "last_cycle_productive": False,
+        "consecutive_unproductive_cycles": 1,
+    }
+    stamp_direction_refractory(explicit_standard, now=now)
+    assert datetime.fromisoformat(explicit_standard["refractory_until"]) == now + timedelta(
+        minutes=135
     )
 
 
@@ -8397,6 +8447,27 @@ async def test_update_direction_clear_both_context_fields(client: AsyncClient, m
     ctx = d.get("context") or {}
     assert "success_evidence" not in ctx
     assert "retirement_condition" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_update_direction_clear_refractory_until(client: AsyncClient, mocker):
+    """PATCH clears refractory_until when set to null."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Hold-clear direction")
+
+    future_ts = (datetime.utcnow() + timedelta(minutes=30)).isoformat()
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"refractory_until": future_ts},
+    )
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"refractory_until": None},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    assert "refractory_until" not in d
 
 
 @pytest.mark.asyncio

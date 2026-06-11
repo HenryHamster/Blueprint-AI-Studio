@@ -160,7 +160,8 @@ async def deploy_blueprint(
         try:
             p = validate_task_payload(p)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
+            logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+            raise HTTPException(status_code=422, detail="Invalid request")
         # GCP instance names must match a specific regex (lowercase, hyphens, numbers)
         vm_name = f"agent-vm-{uuid.uuid4().hex}"
 

@@ -1,0 +1,67 @@
+"""
+Route-table auth invariant for /api/admin endpoints.
+
+Every route under /api/admin must declare require_admin or get_current_user
+somewhere in its FastAPI dependency tree. One forgotten Depends silently ships
+an unauthenticated endpoint — this test catches that before merge.
+
+Run with: pytest testing/test_admin_auth_invariant.py -v --noconftest
+"""
+
+import os
+
+# auth.py raises ValueError at module load if these are absent
+os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check")
+os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
+
+from fastapi.routing import APIRoute
+
+from app.auth import get_current_user, require_admin
+from app.main import app
+
+# Intentional exceptions — expected to be empty.
+# When a route genuinely should be unauthenticated (e.g. a public health check
+# under /api/admin for infra monitoring), add its path here with a comment
+# explaining why auth is intentionally absent.
+ALLOWLIST: set[str] = set()
+
+_AUTH_CALLABLES = frozenset({get_current_user, require_admin})
+
+
+def _collect_dep_callables(dependant, visited: set) -> set:
+    """Recursively collect all dependency callables in a FastAPI Dependant tree."""
+    if id(dependant) in visited:
+        return set()
+    visited.add(id(dependant))
+
+    found = set()
+    if dependant.call is not None:
+        found.add(dependant.call)
+    for dep in dependant.dependencies:
+        found.update(_collect_dep_callables(dep, visited))
+    return found
+
+
+def test_all_admin_routes_require_auth():
+    """Every /api/admin route must have require_admin or get_current_user in its dependency tree."""
+    offenders = []
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        if not route.path.startswith("/api/admin"):
+            continue
+        if route.path in ALLOWLIST:
+            continue
+
+        dep_callables = _collect_dep_callables(route.dependant, set())
+
+        if not dep_callables.intersection(_AUTH_CALLABLES):
+            offenders.append(f"{', '.join(sorted(route.methods or []))} {route.path}")
+
+    assert not offenders, (
+        "The following /api/admin routes have NO require_admin or get_current_user "
+        "dependency — add Depends(require_admin) to each route signature, or add to "
+        "ALLOWLIST if the route is intentionally public:\n"
+        + "\n".join(f"  - {r}" for r in sorted(offenders))
+    )

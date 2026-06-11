@@ -28,7 +28,8 @@ import {
 //   {
 //     "challenged_candidate_sha": "<40-hex>",
 //     "verdicts": [
-//       { "severity": "high", "summary": "<matches a primary finding>",
+//       { "primary_finding_index": 1,
+//         "severity": "high", "summary": "<matches a primary finding>",
 //         "file": "<path|''>",
 //         "verdict": "confirmed" | "refuted_false_positive" | "uncertain",
 //         "reason": "<auditable >=20-char justification>" }
@@ -62,6 +63,7 @@ export const CHALLENGE_SEVERITIES_REQUIRING_VERDICT = [
 ];
 
 export interface ChallengeVerdictEntry {
+  primary_finding_index?: number;
   severity: string;
   summary: string;
   file: string;
@@ -164,7 +166,7 @@ export function parsePrimaryFindings(payload: Record<string, unknown>): PrimaryF
  * confirmation/refutation without an auditable justification.
  */
 export function normalizeChallengeOutput(
-  raw: unknown, candidateSha: string,
+  raw: unknown, candidateSha: string, primaryFindings?: PrimaryFinding[],
 ): ChallengeArtifact {
   const out: ChallengeArtifact = { challenged_candidate_sha: candidateSha, verdicts: [] };
   if (!raw || typeof raw !== 'object') return out;
@@ -176,10 +178,28 @@ export function normalizeChallengeOutput(
     const verdictRaw = strVal(obj.verdict).trim().toLowerCase();
     if (!(CHALLENGE_VERDICTS as readonly string[]).includes(verdictRaw)) continue;
     let verdict = verdictRaw as ChallengeVerdict;
-    const severity = strVal(obj.severity).trim().toLowerCase() || 'unknown';
-    const summary = strVal(obj.summary || obj.description || obj.title).trim();
+    let severity = strVal(obj.severity).trim().toLowerCase() || 'unknown';
+    const primaryFindingIndexRaw = obj.primary_finding_index;
+    const primaryFindingIndex = (
+      typeof primaryFindingIndexRaw === 'number' &&
+      Number.isInteger(primaryFindingIndexRaw) &&
+      primaryFindingIndexRaw > 0
+    ) ? primaryFindingIndexRaw : undefined;
+    let resolvedPrimaryFindingIndex: number | undefined;
+    let file = strVal(obj.file || obj.file_path).trim();
+    let summary = strVal(obj.summary || obj.description || obj.title).trim();
+    if (
+      primaryFindingIndex !== undefined &&
+      primaryFindings !== undefined &&
+      primaryFindingIndex <= primaryFindings.length
+    ) {
+      const primaryFinding = primaryFindings[primaryFindingIndex - 1];
+      resolvedPrimaryFindingIndex = primaryFindingIndex;
+      severity = primaryFinding.severity;
+      summary = primaryFinding.summary;
+      file = primaryFinding.file;
+    }
     if (!summary) continue;
-    const file = strVal(obj.file || obj.file_path).trim();
     const reason = strVal(obj.reason || obj.verification_note).trim();
     if (
       (verdict === 'confirmed' || verdict === 'refuted_false_positive') &&
@@ -187,7 +207,9 @@ export function normalizeChallengeOutput(
     ) {
       verdict = 'uncertain';
     }
-    out.verdicts.push({ severity, summary, file, verdict, reason });
+    const entry: ChallengeVerdictEntry = { severity, summary, file, verdict, reason };
+    if (resolvedPrimaryFindingIndex !== undefined) entry.primary_finding_index = resolvedPrimaryFindingIndex;
+    out.verdicts.push(entry);
   }
   return out;
 }
@@ -199,7 +221,8 @@ function formatPrimaryFindingsSection(findings: PrimaryFinding[]): string {
       'No primary audit findings were supplied in your payload. Independently ' +
       'identify the higher-severity issues in this diff yourself (those at ' +
       `severity ${CHALLENGE_SEVERITIES_REQUIRING_VERDICT.join('/')}), then judge ` +
-      'each one with a verdict.\n\n'
+      'each one with a verdict. When no primary findings were supplied, omit `primary_finding_index` ' +
+      'from each verdict entry — the backend can fuzzy-match it by content.\n\n'
     );
   }
   const lines = findings.map((f, i) =>
@@ -208,8 +231,16 @@ function formatPrimaryFindingsSection(findings: PrimaryFinding[]): string {
   return (
     'The primary release audit reported these higher-severity findings. ' +
     'Independently re-investigate EACH against the real diff and the full repo, ' +
-    'and emit one verdict per finding (match it back by severity + summary + ' +
-    'file):\n' + lines.join('\n') + '\n\n'
+    'and emit one verdict per finding:\n' + lines.join('\n') + '\n\n' +
+    'IMPORTANT — index and verbatim summary requirement: for each verdict, set ' +
+    '`primary_finding_index` to the 1-based number from this list (1 for the first ' +
+    'finding, 2 for the second, etc.), and copy that finding\'s `summary` text EXACTLY ' +
+    'into the `summary` field and its listed severity EXACTLY into the `severity` field — ' +
+    'verbatim: same words, punctuation, capitalization, and severity label; do not paraphrase. ' +
+    'The backend uses `primary_finding_index` first, then falls back to exact string ' +
+    'matching on `summary` to bind verdicts to findings; its `summary` must be copied EXACTLY from that list. ' +
+    'Do not paraphrase the `summary` on a primary-findings retry — paraphrasing breaks ' +
+    'the binding and causes the qualification to be held.\n\n'
   );
 }
 
@@ -358,8 +389,9 @@ export async function handleReleaseAuditChallenge(
   "challenged_candidate_sha": "${candidateSha}",
   "verdicts": [
     {
+      "primary_finding_index": 1,
       "severity": "high",
-      "summary": "One sentence matching the primary finding it judges",
+      "summary": "EXACT primary finding summary text when primary_findings were supplied; otherwise one sentence describing the finding",
       "file": "path/to/affected/file.py",
       "verdict": "confirmed",
       "reason": "Read app/auth.py lines 45-62 — req.user_id is user-controlled and reaches the SQL call at line 60 with no sanitisation, so the injection finding is real."
@@ -370,7 +402,7 @@ export async function handleReleaseAuditChallenge(
 
 Field semantics:
 - \`challenged_candidate_sha\`: the pinned candidate SHA — use exactly \`${candidateSha}\`.
-- \`verdicts\`: one entry per higher-severity finding you judged. Each entry has \`severity\` (critical|blocker|high|medium|moderate|warning), \`summary\` (one sentence, matching the primary finding by content so it can be matched back), \`file\` (file path or empty string if cross-cutting), \`verdict\` (one of: confirmed | refuted_false_positive | uncertain), and \`reason\`.
+- \`verdicts\`: one entry per higher-severity finding you judged. Each entry has \`severity\` (critical|blocker|high|medium|moderate|warning), \`summary\` (when primary findings were listed above, copy the exact text from the numbered list character-for-character — the backend uses exact string matching to bind verdicts to findings, so paraphrasing breaks the binding; when deriving findings independently, one descriptive sentence), \`file\` (file path or empty string if cross-cutting), \`verdict\` (one of: confirmed | refuted_false_positive | uncertain), and \`reason\`.
 - \`reason\`: an auditable justification (≥ 20 non-whitespace characters) citing the specific files/lines you read. It is REQUIRED for \`confirmed\` and \`refuted_false_positive\`; a verdict of those types WITHOUT a substantive reason will be downgraded to \`uncertain\`.
 
 Rules:
@@ -396,14 +428,17 @@ Rules:
   let logs = '';
   let challengeUnparseable = false;
   if (handlerOutput !== null && validateChallengeArtifactShape(handlerOutput).ok) {
-    logs = sanitize(JSON.stringify(normalizeChallengeOutput(handlerOutput, candidateSha)));
+    logs = sanitize(JSON.stringify(normalizeChallengeOutput(handlerOutput, candidateSha, primaryFindings)));
   } else {
+    const reopenPrompt = primaryFindings.length > 0
+      ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nReturn ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`
+      : `Your prior release audit challenge response did not end with a parseable JSON verdict object.
+Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`;
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['challenged_candidate_sha', 'verdicts'],
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `Your prior release audit challenge response did not end with a parseable JSON verdict object.
-Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`,
+      reopenPrompt,
       ws,
       statusRef,
       model,
@@ -414,7 +449,7 @@ Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with
       validateParsedValue: validateChallengeArtifactShape,
     });
     if (repaired.value !== null) {
-      logs = sanitize(JSON.stringify(normalizeChallengeOutput(repaired.value, candidateSha)));
+      logs = sanitize(JSON.stringify(normalizeChallengeOutput(repaired.value, candidateSha, primaryFindings)));
     } else {
       challengeUnparseable = exitCode === 0;
       logs = sanitize(lastResultText || allOutput.slice(-50_000));

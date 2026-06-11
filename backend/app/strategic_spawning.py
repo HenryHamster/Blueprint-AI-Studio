@@ -4136,8 +4136,17 @@ async def _spawn_strategic_review(
         if exhaustion_count <= 0:
             continue
         direction_label = f"{stat_entry.get('id')}: {(stat_entry.get('text') or '')[:120]}".strip()
+        cause_distribution = spawn_gate_metrics.get("cause_distribution") or {}
+        if cause_distribution:
+            cause_parts = ", ".join(
+                f"{cat} x{cnt}"
+                for cat, cnt in sorted(cause_distribution.items())
+            )
+            cause_note = f"observed causes: {cause_parts}"
+        else:
+            cause_note = "repeated grader non-response looks infrastructural rather than like a real finding refutation"
         spawn_gate_hint_lines.append(
-            f"- {direction_label} — Spawn-gate grader note: wholesale retry exhausted {exhaustion_count} time(s); repeated grader non-response in this direction looks infrastructural rather than like a real finding refutation."
+            f"- {direction_label} — Spawn-gate grader note: wholesale retry exhausted {exhaustion_count} time(s); {cause_note}."
         )
     if spawn_gate_hint_lines:
         spawn_gate_block = "\n".join(

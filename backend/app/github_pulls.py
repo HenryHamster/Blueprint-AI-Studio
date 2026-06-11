@@ -268,7 +268,7 @@ async def create_pull_request(
         status_code=status.HTTP_502_BAD_GATEWAY
         if response.status_code >= 500
         else status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail=f"Failed to create pull request (GitHub {response.status_code}): {response.text[:500]}",
+        detail="Failed to create pull request",
     )
 
 

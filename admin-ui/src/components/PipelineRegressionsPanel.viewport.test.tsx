@@ -30,6 +30,7 @@ vi.mock('../api', () => ({
       },
     ],
   })),
+  resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://storage.example/viewport.png'),
 }));
 
 describe('PipelineRegressionsPanel — viewport regression', () => {

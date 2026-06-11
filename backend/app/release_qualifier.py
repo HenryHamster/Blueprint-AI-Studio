@@ -127,6 +127,7 @@ from app.release_qualifier_audit import (
     # Re-exports — release_qualifier stays the canonical import + patch surface
     # for the qualifier's audit/spawn and infra-failure seam.
     _MIN_INFRA_ERROR_STREAK,  # noqa: F401 — re-exported for callers/tests
+    append_infra_failure_child_event,
     _enrich_infra_error,
     _handle_independent_blocker,  # noqa: F401 — re-exported for callers/tests
     _handle_infra_failure,
@@ -1281,6 +1282,21 @@ async def run_qualification(
         if prior_qual.get("status") == "infra_failure"
         else 0
     )
+    prior_infra_failure_signature = (
+        prior_qual.get("infra_failure_signature")
+        if prior_qual.get("status") == "infra_failure"
+        else None
+    )
+    prior_infra_failure_candidate_sha = (
+        prior_qual.get("candidate_sha")
+        if prior_qual.get("status") == "infra_failure"
+        else None
+    )
+    infra_attempt_history = (
+        prior_qual.get("infra_attempt_history")
+        if prior_qual.get("status") == "infra_failure"
+        else []
+    )
 
     # 5. Spawn the heavy children.
     started_at = _utcnow().isoformat()
@@ -1301,6 +1317,7 @@ async def run_qualification(
     challenge_task_id: str | None = None
     audit_challenge_task_id: str | None = None
     audit_challenge_spawn_error: str | None = None
+    audit_challenge_spawn_pending = True
     smoketest_task_id: str | None = None
     try:
         audit_task = await _spawn_release_audit_task(
@@ -1312,22 +1329,6 @@ async def run_qualification(
             candidate_sha=candidate_sha,
         )
         audit_task_id = str(audit_task.id)
-        # Binding adversarial second opinion on the primary audit's findings,
-        # pinned to the SAME candidate as the audit.  Spawned alongside (not
-        # gated on) the audit; its verdicts are BINDING — verified higher-severity
-        # findings must be challenger-confirmed to deduct, and a missing/uncertain
-        # verdict HOLDS the finalization attempt (fail-closed gate).
-        challenge_task = await _spawn_release_audit_challenge_task(
-            session,
-            project_id,
-            version_id=version.id,
-            base_branch=promotion_target,
-            diff_range=diff_range,
-            candidate_sha=candidate_sha,
-            primary_audit_task_id=audit_task_id,
-        )
-        challenge_task_id = str(challenge_task.id)
-        audit_challenge_task_id = challenge_task_id
         if smoketest_enabled:
             smoketest_task = await _spawn_qualifier_smoketest_task(
                 session,
@@ -1380,8 +1381,12 @@ async def run_qualification(
         "challenge_task_id": challenge_task_id,
         "audit_challenge_task_id": audit_challenge_task_id,
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
+        "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
         "prior_infra_streak": prior_infra_streak,
+        "previous_infra_failure_signature": prior_infra_failure_signature,
+        "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
+        "infra_attempt_history": infra_attempt_history,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -1395,14 +1400,14 @@ async def run_qualification(
     logger.info(
         "[RELEASE_QUALIFIER] qualification started for v%d project=%s "
         "candidate=%s ci_green=%s smoketest_enabled=%s audit_task=%s "
-        "challenge_task=%s smoketest_task=%s",
+        "challenge_pending=%s smoketest_task=%s",
         version.version_number,
         project_id,
         candidate_sha[:8],
         ci_green,
         smoketest_enabled,
         audit_task_id,
-        challenge_task_id,
+        audit_challenge_spawn_pending,
         smoketest_task_id,
     )
     return {
@@ -1415,6 +1420,7 @@ async def run_qualification(
         "challenge_task_id": challenge_task_id,
         "audit_challenge_task_id": audit_challenge_task_id,
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
+        "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
     }
 
@@ -1435,6 +1441,7 @@ _AUDIT_CHALLENGE_BINDING_HOLDS: frozenset[str] = frozenset(
         "audit_challenge_binding_incomplete",
         "audit_challenge_uncertain",
         "audit_challenge_sha_mismatch",
+        "audit_challenge_empty_verdicts",
     }
 )
 
@@ -1500,10 +1507,12 @@ def _primary_findings_for_challenge_retry(
                 ).strip()[:_FINDING_SUMMARY_MAX],
             }
         )
-    # Sort by severity rank (most severe first) then cap count so the retry
-    # payload stays well within the validate_internal_payload size budget.
+    # Sort by severity rank (most severe first). Do not cap this binding list:
+    # reconciliation requires a verdict for every verified deductible finding,
+    # so the challenge prompt must cover the same domain. Payload size is still
+    # guarded by validate_internal_payload at spawn time.
     primary_findings.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 99))
-    return primary_findings[:_MAX_CARRIED_FINDINGS]
+    return primary_findings
 
 
 def _audit_task_matches_candidate(task: Task | None, candidate_sha: str | None) -> bool:
@@ -1515,6 +1524,64 @@ def _audit_task_matches_candidate(task: Task | None, candidate_sha: str | None) 
         return context_sha == candidate_sha
     payload_sha = str((task.first_payload or {}).get("candidate_sha") or "").strip()
     return bool(payload_sha and payload_sha == candidate_sha)
+
+
+def _build_audit_leg_proof(
+    *,
+    candidate_sha: str | None,
+    audit_task_id: str | None,
+    audit_task_candidate_sha: str | None,
+    challenge_task_id: str | None,
+    challenged_candidate_sha: str | None,
+    binding_expected_count: int,
+    binding_record_count: int,
+    reconciliation_status: str | None,
+    reconciliation_reason: str | None,
+    legacy_advisory_only: bool,
+) -> dict[str, Any]:
+    """Derive the machine-readable audit-leg proof snapshot for a verdict."""
+    required = binding_expected_count > 0 and not legacy_advisory_only
+    binding_complete = (
+        binding_expected_count > 0 and binding_record_count == binding_expected_count
+    )
+    audit_sha_pinned = bool(
+        candidate_sha
+        and audit_task_candidate_sha
+        and audit_task_candidate_sha == candidate_sha
+    )
+    challenge_sha_pinned = bool(
+        candidate_sha
+        and challenged_candidate_sha
+        and challenged_candidate_sha == candidate_sha
+    )
+    reconciliation_success = (
+        reconciliation_status == "available" and reconciliation_reason is None
+    )
+    if not required:
+        state = "not_required"
+    elif (
+        audit_sha_pinned
+        and challenge_sha_pinned
+        and binding_complete
+        and reconciliation_success
+    ):
+        state = "proven"
+    else:
+        state = "unproven"
+    return {
+        "state": state,
+        "required": state == "proven",
+        "candidate_sha": candidate_sha,
+        "audit_task_id": audit_task_id,
+        "audit_task_candidate_sha": audit_task_candidate_sha,
+        "challenge_task_id": challenge_task_id,
+        "challenged_candidate_sha": challenged_candidate_sha,
+        "binding_expected_count": binding_expected_count,
+        "binding_record_count": binding_record_count,
+        "binding_complete": binding_complete,
+        "reconciliation_status": reconciliation_status,
+        "reconciliation_reason": reconciliation_reason,
+    }
 
 
 async def _resolve_migration_identity_at_finalize(
@@ -2016,8 +2083,16 @@ async def _finalize_qualification(
                         candidate_sha=candidate_sha,
                     )
                     new_count = infra_respawn_count + 1
+                    updated_qual = append_infra_failure_child_event(
+                        qual,
+                        leg="audit",
+                        failed_task=_audit_task_obj,
+                        replacement_task_id=str(new_audit_task.id),
+                        label="audit_infra_respawned",
+                        respawn_count=new_count,
+                    )
                     updated_qual = {
-                        **qual,
+                        **updated_qual,
                         "audit_task_id": str(new_audit_task.id),
                         "audit_infra_respawn_count": new_count,
                     }
@@ -2198,6 +2273,92 @@ async def _finalize_qualification(
     # Carry the specific smoketest-failure detail (failed suite / named tests)
     # so the agent can target it when smoketest is the binding constraint.
     smoketest_detail = _extract_smoketest_detail(smoketest_result)
+    primary_findings = _primary_findings_for_challenge_retry(audit_report)
+
+    # If the qualifying run intentionally deferred the challenge spawn, do the
+    # first binding spawn now that the audit report exists.  This is the point
+    # where the initial release_audit_challenge finally has the audit findings
+    # needed to copy primary summaries verbatim into the prompt.
+    if (
+        bool(qual.get("audit_challenge_spawn_pending"))
+        and not challenge_task_id
+        and _audit_task_matches_candidate(_audit_task_obj, candidate_sha)
+    ):
+        audit_payload = (
+            _audit_task_obj.first_payload if _audit_task_obj is not None else {}
+        )
+        project = await session.get(Project, version.project_id)
+        _integration_branch, promotion_target = (
+            _lts_branch_names(project) if project is not None else ("", "main")
+        )
+        challenge_base_branch = (
+            audit_payload.get("base_branch") or promotion_target
+        )
+        challenge_diff_range = (
+            audit_payload.get("diff_range")
+            or f"{challenge_base_branch}...{candidate_sha}"
+        )
+        from app.payload_schemas import PayloadTooLargeError
+
+        try:
+            challenge_task = await _spawn_release_audit_challenge_task(
+                session,
+                version.project_id,
+                version_id=version.id,
+                base_branch=challenge_base_branch,
+                diff_range=challenge_diff_range,
+                candidate_sha=candidate_sha,
+                primary_audit_task_id=audit_task_id,
+                primary_findings=primary_findings,
+            )
+        except PayloadTooLargeError as _spawn_exc:
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d initial challenge spawn skipped "
+                "— primary_findings payload too large (%s); routing to "
+                "infra_failure so finalize can record state",
+                version.version_number,
+                _spawn_exc,
+            )
+            return await _handle_infra_failure(
+                session, version, qual, "audit_challenge_spawn_payload_too_large"
+            )
+        new_respawn_count = int(qual.get("audit_challenge_respawn_count") or 0) + 1
+        challenge_task_id = str(challenge_task.id)
+        audit_challenge_task_id = challenge_task_id
+        version.last_qualification = {
+            **qual,
+            "status": "pending",
+            "challenge_task_id": challenge_task_id,
+            "audit_challenge_task_id": challenge_task_id,
+            "audit_challenge_spawn_pending": False,
+            "audit_challenge_respawn_count": new_respawn_count,
+            "audit_challenge_retry_reason": (
+                "challenge_initial_primary_findings"
+                if primary_findings
+                else "challenge_initial_no_primary_findings"
+            ),
+            "audit_challenge_retry_primary_findings_count": len(primary_findings),
+        }
+        flag_modified(version, "last_qualification")
+        session.add(version)
+        await session.flush()
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d initial challenge spawned as %s with %d "
+            "primary findings",
+            version.version_number,
+            challenge_task_id,
+            len(primary_findings),
+        )
+        return {
+            "status": "audit_challenge_respawned",
+            "reason": (
+                "challenge_initial_primary_findings"
+                if primary_findings
+                else "challenge_initial_no_primary_findings"
+            ),
+            "respawn_count": new_respawn_count,
+            "challenge_task_id": challenge_task_id,
+        }
 
     _audit_report_scored = audit_report
     challenge_verdicts: dict[str, Any] | None = None
@@ -2287,8 +2448,16 @@ async def _finalize_qualification(
                                 )
                             else:
                                 _chal_new_count = challenge_infra_respawn_count + 1
+                                updated_qual = append_infra_failure_child_event(
+                                    qual,
+                                    leg="challenge",
+                                    failed_task=_challenge_task_obj,
+                                    replacement_task_id=str(_new_challenge_task.id),
+                                    label="challenge_infra_respawned",
+                                    respawn_count=_chal_new_count,
+                                )
                                 version.last_qualification = {
-                                    **qual,
+                                    **updated_qual,
                                     "status": "pending",
                                     "challenge_task_id": str(_new_challenge_task.id),
                                     "audit_challenge_task_id": str(
@@ -2338,11 +2507,12 @@ async def _finalize_qualification(
                     version.version_number,
                 )
 
-        # The challenge child runs in parallel with the audit.  Its per-finding
-        # verdicts (confirmed / refuted_false_positive / uncertain) are now BINDING:
-        # a verified higher-severity finding may only deduct after the challenger
-        # confirms it.  A missing or uncertain verdict for any such finding HOLDS
-        # this attempt (fail-closed) so the version returns to stabilize for
+        # The challenge child now binds to the audit findings after the audit
+        # report exists.  Its per-finding verdicts (confirmed /
+        # refuted_false_positive / uncertain) are BINDING: a verified
+        # higher-severity finding may only deduct after the challenger confirms
+        # it.  A missing or uncertain verdict for any such finding HOLDS this
+        # attempt (fail-closed) so the version returns to stabilize for
         # re-evaluation rather than falsely promoting or silently dropping the
         # deduction.  The artifact is still read best-effort; a missing challenge
         # with NO deductible findings proceeds normally (no hold needed).
@@ -2358,6 +2528,95 @@ async def _finalize_qualification(
                 challenge_task_id,
                 version.version_number,
             )
+
+        # Legacy fallback: if an older challenge task completed without
+        # primary_findings in its payload and produced no artifact, respawn it
+        # immediately rather than incurring a wasted reconciliation-failure
+        # round-trip.  Only fires on the first pass (respawn_count == 0) and
+        # only when no artifact was produced (empty-verdicts and SHA-mismatch
+        # cases have an artifact and are handled by the reconciliation path
+        # below with their own distinct reason codes).
+        if (
+            challenge_verdicts is None
+            and _challenge_task_obj is not None
+            and _challenge_task_obj.status == TaskStatus.COMPLETED
+            and not ((_challenge_task_obj.first_payload or {}).get("primary_findings"))
+            and primary_findings
+            and int(qual.get("audit_challenge_respawn_count") or 0) == 0
+            and _audit_task_matches_candidate(_audit_task_obj, candidate_sha)
+        ):
+            _early_payload = _challenge_task_obj.first_payload or {}
+            _early_audit_payload = (
+                _audit_task_obj.first_payload if _audit_task_obj is not None else {}
+            )
+            _early_project = await session.get(Project, version.project_id)
+            _early_int_branch, _early_promo_target = (
+                _lts_branch_names(_early_project)
+                if _early_project is not None
+                else ("", "main")
+            )
+            _early_base_branch = (
+                _early_payload.get("base_branch")
+                or _early_audit_payload.get("base_branch")
+                or _early_promo_target
+            )
+            _early_diff_range = (
+                _early_payload.get("diff_range")
+                or _early_audit_payload.get("diff_range")
+                or f"{_early_base_branch}...{candidate_sha}"
+            )
+            from app.payload_schemas import PayloadTooLargeError
+
+            try:
+                _early_retry_task = await _spawn_release_audit_challenge_task(
+                    session,
+                    version.project_id,
+                    version_id=version.id,
+                    base_branch=_early_base_branch,
+                    diff_range=_early_diff_range,
+                    candidate_sha=candidate_sha,
+                    primary_audit_task_id=audit_task_id,
+                    primary_findings=primary_findings,
+                )
+            except PayloadTooLargeError as _early_exc:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] v%d initial challenge retry skipped "
+                    "— primary_findings payload too large (%s); proceeding to "
+                    "reconciliation",
+                    version.version_number,
+                    _early_exc,
+                )
+            else:
+                version.last_qualification = {
+                    **qual,
+                    "status": "pending",
+                    "challenge_task_id": str(_early_retry_task.id),
+                    "audit_challenge_task_id": str(_early_retry_task.id),
+                    "audit_challenge_spawn_pending": False,
+                    "audit_challenge_respawn_count": 1,
+                    "audit_challenge_retry_reason": "challenge_initial_no_primary_findings",
+                    "audit_challenge_previous_task_id": challenge_task_id,
+                    "audit_challenge_retry_primary_findings_count": len(
+                        primary_findings
+                    ),
+                }
+                flag_modified(version, "last_qualification")
+                session.add(version)
+                await session.flush()
+                logger.info(
+                    "[RELEASE_QUALIFIER] v%d initial challenge %s had no "
+                    "primary_findings; re-spawned as %s with %d findings",
+                    version.version_number,
+                    challenge_task_id,
+                    _early_retry_task.id,
+                    len(primary_findings),
+                )
+                return {
+                    "status": "audit_challenge_respawned",
+                    "reason": "challenge_initial_no_primary_findings",
+                    "respawn_count": 1,
+                    "challenge_task_id": str(_early_retry_task.id),
+                }
 
         # --- Challenge reconciliation: fail-closed audit challenge gate -----------
         # Each verified higher-severity finding must have a challenger-confirmed
@@ -2442,6 +2701,20 @@ async def _finalize_qualification(
                         session, version, qual, _challenge_hold
                     )
                 new_respawn_count = challenge_respawn_count + 1
+                # When the hold was a SHA mismatch, record the SHA the challenge
+                # reported so operators can see what candidate it actually ran on
+                # vs what this qualification expected.
+                _sha_mismatch_observed = (
+                    str(
+                        (challenge_verdicts or {}).get(
+                            "challenged_candidate_sha"
+                        )
+                        or ""
+                    )
+                    or None
+                    if _challenge_hold == "audit_challenge_sha_mismatch"
+                    else None
+                )
                 version.last_qualification = {
                     **qual,
                     "status": "pending",
@@ -2452,6 +2725,13 @@ async def _finalize_qualification(
                     "audit_challenge_previous_task_id": challenge_task_id,
                     "audit_challenge_retry_primary_findings_count": len(
                         primary_findings
+                    ),
+                    **(
+                        {
+                            "audit_challenge_sha_mismatch_observed_sha": _sha_mismatch_observed
+                        }
+                        if _sha_mismatch_observed
+                        else {}
                     ),
                 }
                 flag_modified(version, "last_qualification")
@@ -2501,6 +2781,38 @@ async def _finalize_qualification(
         "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),
         "challenge_binding_record": _challenge_binding_record,
     }
+    audit_challenge = audit_reconciliation.get("audit_challenge")
+    audit_task_candidate_sha = None
+    if _audit_task_obj is not None:
+        audit_task_candidate_sha = str(
+            (_audit_task_obj.context or {}).get("candidate_sha")
+            or (_audit_task_obj.first_payload or {}).get("candidate_sha")
+            or ""
+        ).strip() or None
+    audit_reconciliation["audit_leg_proof"] = _build_audit_leg_proof(
+        candidate_sha=candidate_sha,
+        audit_task_id=str(audit_task_id) if audit_task_id else None,
+        audit_task_candidate_sha=audit_task_candidate_sha,
+        challenge_task_id=str(challenge_task_id) if challenge_task_id else None,
+        challenged_candidate_sha=(
+            str(audit_challenge.get("challenged_candidate_sha") or "").strip() or None
+            if isinstance(audit_challenge, dict)
+            else None
+        ),
+        binding_expected_count=len(primary_findings),
+        binding_record_count=len(_challenge_binding_record),
+        reconciliation_status=(
+            str(audit_challenge.get("status") or "").strip() or None
+            if isinstance(audit_challenge, dict)
+            else None
+        ),
+        reconciliation_reason=(
+            str(audit_challenge.get("reason") or "").strip() or None
+            if isinstance(audit_challenge, dict)
+            else None
+        ),
+        legacy_advisory_only=bool(audit_challenge_task_id) and not bool(challenge_task_id),
+    )
 
     # --- Deterministic Alembic revision-identity safety gate ----------------
     # A revision-identity collision between the candidate and the deployed
@@ -3006,11 +3318,19 @@ async def _maybe_reconcile_after_promotion_conflict(
 
 
 # Qualification outcomes after which the strategic agent should re-plan: a
-# RESOLVED verdict (a promote, or any flavour of miss). Excludes the in-flight
-# (``pending_auto_merge``), transient (``audit_rate_limit_respawned``) and
-# read-only no-op (``None``) states, which do not represent a settled cut.
+# settled verdict (a promote, any flavour of miss, or a terminal infra
+# failure). Excludes the in-flight (``pending_auto_merge``), transient
+# (``audit_rate_limit_respawned``) and read-only no-op (``None``) states,
+# which do not represent a settled cut.
 _STRATEGIC_RETRIGGER_STATUSES: frozenset[str] = frozenset(
-    {"promoted", "promotion_failed", "not_promoted", "dry_run", "error"}
+    {
+        "promoted",
+        "promotion_failed",
+        "not_promoted",
+        "dry_run",
+        "error",
+        "infra_failure",
+    }
 )
 
 

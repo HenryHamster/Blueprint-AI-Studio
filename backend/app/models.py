@@ -254,6 +254,7 @@ class SourceKind(str, Enum):
     DESIGN = "design"
     WEB_RESEARCH = "web_research"
     COMPUTE_EXPERIMENT = "compute_experiment"
+    RESEARCH_AUDIT = "research_audit"
     UNKNOWN = "unknown"
 
 
@@ -1003,6 +1004,10 @@ class Task(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
     started_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    completed_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1976,6 +1981,17 @@ class PoolVm(SQLModel, table=True):
     # it later WITHOUT a second model change.
     idle_cost_banked: float | None = Field(
         default=None, sa_column=Column(Float, nullable=True)
+    )
+
+    # Lane-scoped workspace reservation (improvement lanes, d-5fd69fe1). When
+    # released from a lane phase, the member returns IDLE stamped with the lane's
+    # id so the lane's next phase can reclaim its warm workspace. Plain GUID — no
+    # FK, mirrors leased_task_id — so a lane row can be archived independently.
+    reserved_lane_id: uuid.UUID | None = Field(
+        default=None, sa_column=Column(GUID(), nullable=True)
+    )
+    reservation_expires_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
     )
 
     created_at: datetime = Field(
@@ -3029,6 +3045,7 @@ class Artifact(SQLModel, table=True):
             postgresql_using="gin",
             postgresql_ops={"pr_url": "gin_trgm_ops"},
         ),
+        Index("ix_artifact_artifact_type", "artifact_type"),
     )
 
     # Git-based outputs
@@ -4131,6 +4148,175 @@ class MigrationReservation(SQLModel, table=True):
             "project_id",
             "status",
         ),
+    )
+
+
+class ImprovementLaneStatus(str, Enum):
+    """Lifecycle of a persistent improvement lane.
+
+    PROPOSED -> ACTIVE (first phase dispatched)
+    ACTIVE -> PARKED (checkpoint verified; no live task)
+    PARKED -> ACTIVE (next phase dispatched; current_task_id bound)
+    ACTIVE | PARKED -> RETIRED (goal met / version closed; terminal)
+    ACTIVE | PARKED -> KILLED (pilot kill or operator action; terminal)
+    """
+
+    PROPOSED = "PROPOSED"
+    ACTIVE = "ACTIVE"
+    PARKED = "PARKED"
+    RETIRED = "RETIRED"
+    KILLED = "KILLED"
+
+
+_IMPROVEMENT_LANE_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("PROPOSED", "ACTIVE"),
+        ("ACTIVE", "PARKED"),
+        ("PARKED", "ACTIVE"),
+        ("ACTIVE", "RETIRED"),
+        ("PARKED", "RETIRED"),
+        ("ACTIVE", "KILLED"),
+        ("PARKED", "KILLED"),
+    }
+)
+
+# Maximum checkpoint records kept per lane (rolling window).
+_LANE_CHECKPOINT_LIMIT = 50
+# Maximum serialized manifest bytes (~8KB).
+_LANE_MANIFEST_MAX_BYTES = 8192
+# Maximum phase requeues before escalating to strategist.
+_LANE_MAX_PHASE_REQUEUES = 3
+
+
+class ImprovementLane(SQLModel, table=True):
+    """Durable control-plane record for a multi-phase improvement lane.
+
+    Product state (code, commits, PRs) lives in git on ``branch_name``.
+    Control state (status, checkpoint history, manifest, accounting) lives
+    here. Every phase executes as a normal fresh-context task; the lane row
+    provides the bounded inter-phase carrier (manifest + checkpoint info).
+
+    Schema matches knowledge doc 18840e55 (v10 Persistent Improvement Lanes).
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    direction_id: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True, index=True)
+    )
+    version_number: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    title: str = Field(sa_column=Column(Text, nullable=False))
+    goal: str = Field(sa_column=Column(Text, nullable=False))
+
+    status: str = Field(
+        default=ImprovementLaneStatus.PROPOSED.value,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=ImprovementLaneStatus.PROPOSED.value,
+        ),
+    )
+
+    # Product state pointers
+    branch_name: str = Field(sa_column=Column(String(255), nullable=False))
+    base_branch: str = Field(sa_column=Column(String(255), nullable=False))
+    last_checkpoint_sha: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    last_checkpoint_phase: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    checkpoint_seq: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    checkpoints: List[Any] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    manifest: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+
+    # Execution state
+    current_task_id: uuid.UUID | None = Field(
+        default=None, sa_column=Column(GUID(), nullable=True)
+    )
+    # COLD | WARM_RESERVED | LEASED
+    workspace_state: str = Field(
+        default="COLD",
+        sa_column=Column(String(32), nullable=False, server_default="COLD"),
+    )
+    workspace_vm_instance_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    phase_requeues: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
+    # Accounting rollups (per-phase detail lives in checkpoints[])
+    llm_input_tokens_total: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    llm_output_tokens_total: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    vm_cost_usd_total: float = Field(
+        default=0.0,
+        sa_column=Column(Float, nullable=False, server_default=text("0.0")),
+    )
+    reserved_idle_cost_usd_total: float = Field(
+        default=0.0,
+        sa_column=Column(Float, nullable=False, server_default=text("0.0")),
+    )
+
+    # Pilot arm: "lane" | "control" | None (intent-to-treat assignment)
+    pilot_arm: str | None = Field(
+        default=None, sa_column=Column(String(32), nullable=True)
+    )
+
+    # Timestamps
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    parked_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    last_resumed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    retired_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        # Sweep hot path: scan ACTIVE lanes looking for stuck tasks.
+        Index("ix_improvementlane_project_status", "project_id", "status"),
+        # Direction scope: find lanes for a given direction.
+        Index("ix_improvementlane_direction_status", "direction_id", "status"),
     )
 
 

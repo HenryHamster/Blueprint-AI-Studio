@@ -217,6 +217,7 @@ export interface ComputeExperimentLaunchRequest {
   metric?: string;
   success_criterion?: ComputeSuccessCriterion;
   require_live_release?: boolean;
+  require_durable_artifact?: boolean;
   model?: string;
   effort?: string;
 }
@@ -325,6 +326,10 @@ export interface ArtifactDownloadUrlResponse {
   url: string;
 }
 
+export interface ViewportFailureDownloadUrlResponse {
+  url: string;
+}
+
 export async function resolveArtifactDownloadUrl(
   projectId: string,
   storageUri: string,
@@ -349,6 +354,36 @@ export async function resolveArtifactDownloadUrl(
   const data = await res.json().catch(() => ({})) as Partial<ArtifactDownloadUrlResponse>;
   if (typeof data.url !== 'string' || data.url.length === 0) {
     throw new Error('Artifact download resolver returned an empty URL');
+  }
+  return data.url;
+}
+
+export async function resolveViewportFailureDownloadUrl(
+  projectId: string,
+  component: string,
+  width: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const query = new URLSearchParams({
+    project_id: projectId,
+    component,
+    width: String(width),
+  });
+  const res = await apiFetch(
+    `/api/admin/viewport-failures/download-url?${query.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to resolve viewport screenshot: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to resolve viewport screenshot: ${res.status}`);
+  }
+  const data = await res.json().catch(() => ({})) as Partial<ViewportFailureDownloadUrlResponse>;
+  if (typeof data.url !== 'string' || data.url.length === 0) {
+    throw new Error('Viewport screenshot resolver returned an empty URL');
   }
   return data.url;
 }
@@ -574,6 +609,9 @@ export interface PipelineRegression {
   spawned_task_id?: string | null;
   spawned_task_status?: string | null;
   spawned_task_title?: string | null;
+  viewport_component?: string | null;
+  viewport_assertion_type?: string | null;
+  viewport_width?: number | null;
   [key: string]: unknown;
 }
 
@@ -596,6 +634,63 @@ export async function fetchPipelineRegressions(
     signal,
   );
   if (!res.ok) throw new Error(`Failed to fetch pipeline regressions: ${res.status}`);
+  return res.json();
+}
+
+export interface ImprovementLaneRow {
+  id: string;
+  status: string;
+  direction_id: string | null;
+  branch: string | null;
+  last_checkpoint_phase: string | null;
+  last_checkpoint_seq: number | null;
+  last_checkpoint_sha: string | null;
+  last_checkpoint_age_seconds: number | null;
+  checkpoint_loss_count: number;
+  workspace_state: string | null;
+  workspace_vm_instance_id: string | null;
+  reservation_expires_at: string | null;
+  reserved_vm_instance_id: string | null;
+  pilot_arm: string | null;
+  phase_requeues: number;
+  llm_input_tokens_total: number | null;
+  llm_output_tokens_total: number | null;
+  vm_cost_usd_total: number;
+  reserved_idle_cost_usd_total: number;
+  shadow: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  [key: string]: unknown;
+}
+
+export interface ImprovementLanesResponse {
+  lanes: ImprovementLaneRow[];
+  total_returned: number;
+  offset: number;
+  limit: number;
+  project_id: string;
+  [key: string]: unknown;
+}
+
+export async function fetchImprovementLanes(
+  projectId: string,
+  limit = 50,
+  offset = 0,
+  signal?: AbortSignal,
+): Promise<ImprovementLanesResponse> {
+  const params = new URLSearchParams({
+    project_id: projectId,
+    limit: String(limit),
+    offset: String(offset),
+  });
+  const res = await apiFetch(
+    `/api/admin/improvement-lanes?${params.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch improvement lanes: ${res.status}`);
   return res.json();
 }
 
@@ -2717,4 +2812,81 @@ export interface StrategicRefreshMarker {
   /** Origin of the last consumed marker ('operator' or 'qualification'). Lets the UI
    *  attribute receipts correctly — only operator-origin consumes show 'Steer picked up'. */
   last_fired_origin?: string;
+}
+
+// ── Lane Diagnostics ─────────────────────────────────────────────────────────
+
+export interface LaneWasteTaxonomy {
+  infra: number;
+  merge_conflict: number;
+  ci_churn: number;
+  review_ambiguity: number;
+  lost_reasoning: number;
+  unknown: number;
+  [key: string]: number;
+}
+
+export interface LaneWasteDiagnostics {
+  waste_taxonomy: LaneWasteTaxonomy;
+  waste_task_count: number;
+  cap_counted_task_count: number;
+  cap_excluded_task_count: number;
+  chain_count: number;
+  cap_exhausted_chain_count: number;
+  chain_limit: number;
+  chains_truncated: boolean;
+}
+
+export interface PerPrPhaseRow {
+  pr_number: string;
+  task_count: number;
+  review_seconds: number;
+  fix_seconds: number;
+  gap_seconds: number;
+  total_seconds: number;
+  queue_seconds: number;
+  provision_seconds: number;
+  cold_start_seconds: number;
+  execution_seconds: number;
+}
+
+export interface LaneDiagResponse {
+  lane_iteration_distribution: Record<string, {
+    p50_iterations: number;
+    p90_iterations: number;
+    max_iterations: number;
+    task_count: number;
+    pr_count: number;
+  }>;
+  per_pr_phase_breakdown: PerPrPhaseRow[];
+  relay_counts_by_lane: Record<string, number>;
+  pr_count: number;
+  task_count: number;
+  pr_breakdown_limit: number;
+  pr_breakdown_truncated: boolean;
+  lane_waste: LaneWasteDiagnostics;
+  project_id: string | null;
+  window_start: string;
+  max_tasks: number;
+  truncated: boolean;
+  window_days?: number;
+  version?: {
+    version_number: number;
+    phase: string;
+    status: string;
+    opened_at: string;
+    promoted_at: string | null;
+  };
+}
+
+export async function fetchLaneDiag(
+  projectId?: string,
+  signal?: AbortSignal,
+): Promise<LaneDiagResponse> {
+  const params = new URLSearchParams();
+  if (projectId) params.set('project_id', projectId);
+  const query = params.toString() ? `?${params.toString()}` : '';
+  const res = await apiFetch(`/api/admin/lane-diag${query}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch lane diagnostics: ${res.status}`);
+  return res.json();
 }

@@ -5,6 +5,8 @@ import {
   fetchComputeJobs,
   analyzeComputeJob,
   retryProjectBootstrap,
+  resolveViewportFailureDownloadUrl,
+  fetchImprovementLanes,
 } from './api';
 
 vi.mock('./firebase', () => ({
@@ -117,6 +119,47 @@ describe('retryProjectBootstrap', () => {
   });
 });
 
+describe('resolveViewportFailureDownloadUrl', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('serializes the stable viewport screenshot lookup query and returns the URL', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ url: 'https://storage.example/signed.png' }), { status: 200 }),
+    );
+
+    await expect(resolveViewportFailureDownloadUrl('proj-1', 'Messages Panel', 375)).resolves.toBe(
+      'https://storage.example/signed.png',
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/api/admin/viewport-failures/download-url?project_id=proj-1&component=Messages+Panel&width=375',
+    );
+  });
+
+  it('throws the backend detail when screenshot resolution fails', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ detail: 'Screenshot not found' }), { status: 404 }),
+    );
+
+    await expect(
+      resolveViewportFailureDownloadUrl('proj-1', 'MessagesPanel', 375),
+    ).rejects.toThrow('Screenshot not found');
+  });
+
+  it('rejects an empty resolver payload', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ url: '' }), { status: 200 }),
+    );
+
+    await expect(
+      resolveViewportFailureDownloadUrl('proj-1', 'MessagesPanel', 375),
+    ).rejects.toThrow('Viewport screenshot resolver returned an empty URL');
+  });
+});
+
 describe('fetchComputeJobs', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -142,6 +185,45 @@ describe('fetchComputeJobs', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/projects/proj-1/compute-jobs?include_finished_minutes=1440');
+  });
+});
+
+describe('fetchImprovementLanes', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('serializes the project paging query and preserves additive response fields', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        lanes: [],
+        total_returned: 0,
+        offset: 5,
+        limit: 25,
+        project_id: 'proj-1',
+        extra_banner: 'shadow-mode',
+      }), { status: 200 }),
+    );
+
+    const result = await fetchImprovementLanes('proj-1', 25, 5);
+
+    expect(result).toMatchObject({
+      total_returned: 0,
+      offset: 5,
+      limit: 25,
+      project_id: 'proj-1',
+      extra_banner: 'shadow-mode',
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/improvement-lanes?project_id=proj-1&limit=25&offset=5');
+    expect((fetchMock.mock.calls[0][1] as RequestInit | undefined)?.method).toBeUndefined();
+  });
+
+  it('throws the backend status on non-2xx responses', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ detail: 'project not found' }), { status: 404 }),
+    );
+
+    await expect(fetchImprovementLanes('proj-1')).rejects.toThrow('Failed to fetch improvement lanes: 404');
   });
 });
 

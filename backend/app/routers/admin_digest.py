@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import desc, or_, text
+from sqlalchemy import desc, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -35,12 +35,15 @@ from app.models import (
     CYCLE_META_MEMOS_CITED,
 )
 from app.auth import get_current_user, require_admin
+from app.digest_latency import record_digest_request
 from app.shared_state import runtime_config as _runtime_config
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
 from app import strategic_cycle as _strategic_cycle
 from app.strategic_analysis import _compute_prediction_calibration
 from app.strategic_completion import strategic_challenge_summary
 from app.capability_trial_verdict import (
+    LANE_PILOT_CAP_NAME,
+    evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
     get_trial_definitions,
     get_trial_verdicts,
@@ -59,6 +62,7 @@ from app.digest_metrics import (
     compute_effort_model_efficiency,
     compute_dependency_health_signals,
     compute_trial_arm_accumulation,
+    compute_trial_arm_accrual,
     compute_wake_post_commit_health_signals,
     compute_park_wake_health,
     compute_merge_gate_fleet_health,
@@ -136,7 +140,6 @@ from app.routers.admin_release_version import (  # noqa: E402, F401
 )
 
 _SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
-_ACTIVE_TASKS_QUERY_LIMIT = 500
 
 # Pipeline-observability endpoints relocated to app.routers.admin_pipeline_observability
 # (cluster 1/4 — keep admin_digest focused on the catch-up digest). Re-exported here so
@@ -199,8 +202,8 @@ async def get_digest(
     fresh-for-``PRECOMPUTE_STALE_FALLBACK_SECONDS`` (``worker_only=True``),
     because only the leader's tick continuously refreshes it. On a NON-leader
     instance the worker never runs, so there is no worker-written entry and we
-    deliberately fall through to the ``DigestCache`` path below — its 15s TTL
-    keeps non-leader freshness at the prior 15s, NOT the 5-minute fallback
+    deliberately fall through to the ``DigestCache`` path below — its short TTL
+    keeps non-leader freshness bounded, NOT the 5-minute fallback
     window. (An earlier version primed the precompute cache opportunistically
     from this on-demand compute; that one-shot, never-refreshed entry would
     then be served as precomputed-for-300s on subsequent non-leader polls,
@@ -209,10 +212,11 @@ async def get_digest(
 
     Bounded fallback: when there is no fresh WORKER entry for this key (fresh
     boot, non-leader instance, or a non-primed window such as a custom
-    ``hours``), fall back to the existing ``DigestCache`` (15s TTL + in-flight
+    ``hours``), fall back to the existing ``DigestCache`` (short TTL + in-flight
     dedup + serve-stale-on-failure) so at most one on-demand 5000-row scan runs
     per key per TTL — the prior behavior, preserved as a safety net.
     """
+    _t0 = time.monotonic()
     precompute_cache = get_precompute_cache()
     entry = precompute_cache.get_fresh(
         hours,
@@ -221,6 +225,7 @@ async def get_digest(
         worker_only=True,
     )
     if entry is not None:
+        record_digest_request(time.monotonic() - _t0, "l1_precompute")
         return annotate_precompute_metadata(
             entry.result,
             precomputed=True,
@@ -241,6 +246,7 @@ async def get_digest(
         session=session,
     )
     if shared is not None:
+        record_digest_request(time.monotonic() - _t0, "l2_shared_cache")
         return annotate_precompute_metadata(
             shared.payload,
             precomputed=True,
@@ -254,12 +260,14 @@ async def get_digest(
     result = await cache.get_or_compute(
         cache_key,
         lambda: _compute_digest(hours=hours, project_id=project_id, session=session),
+        ttl=60.0,
     )
     # NOTE: deliberately do NOT prime the precompute cache here. The DigestCache
-    # already gives this on-demand path a 15s TTL + in-flight dedup; priming a
+    # already gives this on-demand path a short TTL + in-flight dedup; priming a
     # non-worker entry would let a non-leader instance serve a never-refreshed
     # payload as fresh-for-PRECOMPUTE_STALE_FALLBACK_SECONDS, regressing
     # non-leader digest freshness from 15s to 5 minutes.
+    record_digest_request(time.monotonic() - _t0, "l3_on_demand")
     return annotate_precompute_metadata(
         result,
         precomputed=False,
@@ -311,6 +319,7 @@ async def _compute_digest(
 
     _DIGEST_TASK_ROW_CAP = 5000
     _ACTIVE_TASKS_DISPLAY_LIMIT = 5
+    _ACTIVE_TASKS_SIGNAL_LIMIT = 50
     # Project payloads[0] and status_log[-1]->>'t' SQL-side on PostgreSQL.
     # Loading the full JSONB arrays for 5000 rows blew a Cloud Run instance
     # past its 4 GiB limit under concurrent polling; with projection each
@@ -478,6 +487,15 @@ async def _compute_digest(
     active_filters = [Task.status.in_(_active_statuses)]
     if project_id:
         active_filters.append(Task.project_id == project_id)
+    active_counts_result = await session.execute(
+        select(Task.status, func.count())
+        .where(*active_filters)
+        .group_by(Task.status)
+    )
+    active_count_by_status = {
+        row_status: int(row_count or 0)
+        for row_status, row_count in active_counts_result.all()
+    }
     if _use_projection:
         active_result = await session.execute(
             select(
@@ -486,7 +504,7 @@ async def _compute_digest(
             )
             .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
-            .limit(_ACTIVE_TASKS_QUERY_LIMIT)
+            .limit(_ACTIVE_TASKS_SIGNAL_LIMIT)
             .options(
                 load_only(
                     Task.id,
@@ -515,7 +533,7 @@ async def _compute_digest(
             select(Task)
             .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
-            .limit(_ACTIVE_TASKS_QUERY_LIMIT)
+            .limit(_ACTIVE_TASKS_SIGNAL_LIMIT)
             .options(
                 load_only(
                     Task.id,
@@ -585,7 +603,13 @@ async def _compute_digest(
     for _chunk_start in range(0, len(all_task_ids), 200):
         _chunk = all_task_ids[_chunk_start : _chunk_start + 200]
         artifacts_result = await session.execute(
-            select(Artifact)
+            select(
+                Artifact.task_id,
+                Artifact.artifact_type,
+                Artifact.pr_url,
+                func.substr(Artifact.logs, 1, 500).label("error_log_snippet"),
+                Artifact.created_at,
+            )
             .where(
                 Artifact.task_id.in_(_chunk),
                 Artifact.artifact_type.in_(
@@ -598,18 +622,20 @@ async def _compute_digest(
             .order_by(Artifact.created_at.asc())
             .limit(500)
         )
-        for a in artifacts_result.scalars().all():
-            tid = str(a.task_id)
-            if a.artifact_type == ArtifactType.PULL_REQUEST:
-                if a.created_at >= window_start:
+        for task_id, artifact_type, pr_url, error_log_snippet, created_at in (
+            artifacts_result.all()
+        ):
+            tid = str(task_id)
+            if artifact_type == ArtifactType.PULL_REQUEST:
+                if created_at >= window_start:
                     pr_count += 1
-                pr_artifact_map[tid] = a.pr_url or ""
+                pr_artifact_map[tid] = pr_url or ""
             elif (
-                a.artifact_type == ArtifactType.ERROR_LOG
-                and a.logs
+                artifact_type == ArtifactType.ERROR_LOG
+                and error_log_snippet
                 and tid not in error_log_map
             ):
-                error_log_map[tid] = a.logs[:500]
+                error_log_map[tid] = error_log_snippet
 
     # --- needs_attention: failed + pending approval ---
     from app.failure_classification import classify_failure as _classify_failure
@@ -877,8 +903,13 @@ async def _compute_digest(
 
     running_statuses = {TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING}
     queued_statuses = {TaskStatus.QUEUED, TaskStatus.EVALUATING}
-    running_count = sum(1 for t in active_tasks_all if t.status in running_statuses)
-    queued_count = sum(1 for t in active_tasks_all if t.status in queued_statuses)
+    running_count = sum(
+        active_count_by_status.get(status, 0) for status in running_statuses
+    )
+    queued_count = sum(
+        active_count_by_status.get(status, 0) for status in queued_statuses
+    )
+    active_count = running_count + queued_count
 
     total_terminal = len(completed_tasks) + len(failed_tasks)
     success_rate = (
@@ -1334,7 +1365,6 @@ async def _compute_digest(
         window_start=window_start,
         failed_tasks=failed_tasks,
         all_tasks=all_tasks,
-        active_tasks_all=active_tasks_all,
         dir_id_to_text=dir_id_to_text,
     )
     remediation_funnel = _remediation_result["remediation_funnel"]
@@ -1396,11 +1426,17 @@ async def _compute_digest(
     # scan).  The WINDOWED per-arm rates/counts in ``_first_attempt_success_rate``
     # (``trial_breakdowns``, ``with_{cap}_n``, …) are left untouched for dashboard
     # display — only the decision basis changes.
+    _augmented_verdicts: dict = {}
     if _digest_project is not None:
         from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
         _verdict_evaluated_at = _tv_utcnow().isoformat()
         for _td in get_trial_definitions():
             _cap = _td["cap_name"]
+            # Lane pilot uses its own multi-axis evaluator (KILL/ADOPT thresholds
+            # differ from the generic lift/min_n model) — skip it here and handle
+            # it in the dedicated block below.
+            if _cap == LANE_PILOT_CAP_NAME:
+                continue
             _accum = await compute_trial_arm_accumulation(
                 session,
                 project_id=project_id,
@@ -1416,12 +1452,137 @@ async def _compute_digest(
                 config=_td["thresholds"],
                 accumulation_basis="cumulative_terminal_arm_tasks",
                 arm_composition=_accum.get("arm_composition"),
+                receipt_only_trial=(_td.get("assignment_key") is None),
             )
             record_trial_verdict(_digest_project, _cap, _verdict_entry)
+
+        # ── Lane pilot: dedicated multi-axis verdict path ─────────────────────
+        # Uses compute_lane_pilot_aggregates -> evaluate_lane_pilot_verdict which
+        # checks lane-specific KILL/ADOPT thresholds (merge-rate floor, cost
+        # ceiling, gate-integrity violations, checkpoint-loss rate, futility-N).
+        # A KILL verdict degrades spawning + force-expires reservations; an
+        # immediate_alert verdict posts a BLOCKER ProjectMessage.
+        from app.review_fix_lane_pilot import (  # noqa: PLC0415
+            apply_lane_pilot_kill,
+            compute_lane_pilot_aggregates,
+            raise_gate_integrity_alert,
+        )
+        if project_id is not None:
+            _lane_aggs = await compute_lane_pilot_aggregates(session, project_id)
+            _lane_verdict = evaluate_lane_pilot_verdict(_lane_aggs)
+            _lane_verdict["evaluated_at"] = _verdict_evaluated_at
+            # Annotate with the most recent closed version's relay baseline so the
+            # lane-vs-relay comparison is recorded alongside the verdict for auditing.
+            try:
+                from app.lane_baseline_snapshot import read_version_lane_baseline  # noqa: PLC0415
+                from app.models import ReleaseVersion as _ReleaseVersion  # noqa: PLC0415
+                _latest_rv = (
+                    await session.execute(
+                        select(_ReleaseVersion)
+                        .where(
+                            _ReleaseVersion.project_id == project_id,
+                            _ReleaseVersion.status.in_(["promoted", "abandoned"]),
+                        )
+                        .order_by(desc(_ReleaseVersion.version_number))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if _latest_rv is not None and _digest_project is not None:
+                    _rb = read_version_lane_baseline(_digest_project, _latest_rv.version_number)
+                    if _rb is not None:
+                        _lane_verdict["relay_baseline"] = _rb
+            except Exception:
+                logger.warning("[LANE_PILOT] failed to annotate relay_baseline", exc_info=True)
+            record_trial_verdict(_digest_project, LANE_PILOT_CAP_NAME, _lane_verdict)
+            if _lane_verdict.get("verdict") == "KILL":
+                await apply_lane_pilot_kill(
+                    session,
+                    project_id,
+                    reason=_lane_verdict.get("verdict_reason", "digest_eval"),
+                )
+            if _lane_verdict.get("immediate_alert"):
+                await raise_gate_integrity_alert(
+                    session,
+                    project_id,
+                    detail=str(_lane_verdict.get("verdict_reason", "")),
+                )
+
         try:
             await session.flush()
         except Exception:
             logger.warning("[CAPABILITY_TRIAL] failed to flush verdicts", exc_info=True)
+
+        # --- Per-trial accrual projection (ephemeral, NOT persisted) ---
+        # Augment the verdict entries returned in the response with a recent
+        # assigned-arm accrual rate and a projection of how many days remain until
+        # BOTH arms' assigned subpopulation reaches the min-N decision threshold at
+        # the current rate. Only assignment-based trials (an ``assignment_key``) have
+        # a randomized holdback arm to project; receipt-only trials get no projection.
+        #
+        # This is read-only display compute. We deliberately do NOT mutate the live
+        # ``project.capability_adoption_verdicts`` entries (which ``get_trial_verdicts``
+        # returns by reference) — mutating them would risk a later autoflush
+        # persisting ``accrual_projection`` to the JSONB column. Instead we build a
+        # response-only copy with the projection grafted on.
+        _accrual_window_days = 7
+        _stored_verdicts = get_trial_verdicts(_digest_project)
+        _augmented_verdicts = {
+            _k: (dict(_v) if isinstance(_v, dict) else _v)
+            for _k, _v in _stored_verdicts.items()
+        }
+        for _td in get_trial_definitions():
+            _assignment_key = _td.get("assignment_key")
+            if not _assignment_key or _td["cap_name"] == LANE_PILOT_CAP_NAME:
+                continue
+            _cap = _td["cap_name"]
+            _verdict_entry = _augmented_verdicts.get(_cap)
+            if not isinstance(_verdict_entry, dict):
+                continue
+            _accrual = await compute_trial_arm_accrual(
+                session,
+                project_id=project_id,
+                assignment_key=_assignment_key,
+                window_days=_accrual_window_days,
+            )
+            _holdback_fraction = float(
+                _runtime_config.get(f"{_cap}_holdback_fraction", 0.0)
+            )
+            _with_daily = _accrual["with_7d"] / _accrual_window_days
+            _without_daily = _accrual["without_7d"] / _accrual_window_days
+            _thresholds = _verdict_entry.get("thresholds") or {}
+            _min_n = int(_thresholds.get("min_n_per_arm", 0))
+            _arm_comp = _verdict_entry.get("arm_composition") or {}
+            _with_assigned = int(_arm_comp.get("with_assigned") or 0)
+            _without_assigned = int(_arm_comp.get("without_assigned") or 0)
+            # Days for the slower-filling assigned arm to reach min_n at its recent rate.
+            _with_days = (
+                (_min_n - _with_assigned) / _with_daily if _with_daily > 0 else None
+            )
+            _without_days = (
+                (_min_n - _without_assigned) / _without_daily
+                if _without_daily > 0
+                else None
+            )
+            _with_remaining = max(_with_days, 0.0) if _with_days is not None else None
+            _without_remaining = (
+                max(_without_days, 0.0) if _without_days is not None else None
+            )
+            _days_to_min_n: "float | None"
+            if _with_assigned >= _min_n and _without_assigned >= _min_n:
+                _days_to_min_n = 0.0
+            elif _with_remaining is None or _without_remaining is None:
+                # At least one arm has a zero recent rate and is still under min_n —
+                # it can never reach threshold at the current accrual, so no estimate.
+                _days_to_min_n = None
+            else:
+                _days_to_min_n = round(max(_with_remaining, _without_remaining), 1)
+            _verdict_entry["accrual_projection"] = {
+                "with_7d": _accrual["with_7d"],
+                "without_7d": _accrual["without_7d"],
+                "window_days": _accrual_window_days,
+                "holdback_fraction": _holdback_fraction,
+                "days_to_min_n": _days_to_min_n,
+            }
 
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(
         completed_tasks + failed_tasks
@@ -1489,7 +1650,7 @@ async def _compute_digest(
         "pending_approval_count": len(approval_tasks),
         "research_cycles": research_cycles,
         "prs_opened": pr_count,
-        "active_count": len(active_tasks_all),
+        "active_count": active_count,
         "running_count": running_count,
         "queued_count": queued_count,
         "active_tasks": active_tasks_list,
@@ -1580,7 +1741,7 @@ async def _compute_digest(
         if prediction_calibration
         else None,
         "release_qualifier_infra_metrics": release_qualifier_infra_metrics,
-        "capability_adoption_verdicts": get_trial_verdicts(_digest_project)
+        "capability_adoption_verdicts": _augmented_verdicts
         if _digest_project is not None
         else {},
         "research_output_quality": _research_output_quality,

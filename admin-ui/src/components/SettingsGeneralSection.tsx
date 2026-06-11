@@ -12,7 +12,7 @@ const REFRESH_PRESETS = [
 ];
 
 const PAGE_PRESETS = [25, 50, 100, 200];
-const ALL_PAGE_SIZE = 500;
+const MAX_PAGE_SIZE = 200;
 
 interface SettingsGeneralSectionProps {
   apiHealthy: boolean;
@@ -224,37 +224,31 @@ export function SettingsGeneralSection({
                   {p}
                 </button>
               ))}
-              <button
-                onClick={() => { onUpdatePageSize(ALL_PAGE_SIZE); setPageSizeInputVal(''); }}
-                className={`flex-1 text-xs py-3.5 rounded-lg border transition-colors ${pageSize === ALL_PAGE_SIZE && !pageSizeInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
-              >
-                All
-              </button>
             </div>
             <div className="flex items-center gap-2">
               <input
                 type="number"
                 min={1}
-                max={ALL_PAGE_SIZE}
+                max={MAX_PAGE_SIZE}
                 placeholder="Custom"
                 value={pageSizeInputVal}
                 onChange={e => setPageSizeInputVal(e.target.value)}
                 onBlur={() => {
                   const n = parseInt(pageSizeInputVal);
-                  if (n > 0) onUpdatePageSize(Math.min(n, ALL_PAGE_SIZE));
+                  if (n > 0) onUpdatePageSize(Math.min(n, MAX_PAGE_SIZE));
                   setPageSizeInputVal('');
                 }}
                 onKeyDown={e => {
                   if (e.key === 'Enter') {
                     const n = parseInt(pageSizeInputVal);
-                    if (n > 0) onUpdatePageSize(Math.min(n, ALL_PAGE_SIZE));
+                    if (n > 0) onUpdatePageSize(Math.min(n, MAX_PAGE_SIZE));
                     setPageSizeInputVal('');
                   }
                 }}
                 className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-1.5 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
               />
               <span className="text-xs text-neutral-500 shrink-0">
-                {pageSize >= ALL_PAGE_SIZE ? 'all' : pageSize}
+                {pageSize}
               </span>
             </div>
           </div>

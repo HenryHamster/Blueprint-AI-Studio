@@ -135,11 +135,198 @@ function buildLaunchBody(payload: Record<string, unknown>): Record<string, unkno
   return body;
 }
 
-export async function handleComputeExperiment(
-  taskId: string, payload: Record<string, unknown>, _task: Record<string, unknown>,
-  _ghToken: string, _owner: string, _repo: string, ws: WebSocket | null, statusRef: { value: string },
-  _model?: string, _effort?: string,
+// Context key carrying the backend-built VM-substrate analysis request bundle.
+// MUST match backend task_completion._COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY:
+// when present, the resumed compute_experiment runs the model leg instead of
+// re-launching a job.
+const COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY = 'compute_vm_analysis_request';
+
+type VmAnalysisRequest = {
+  prompt: string;
+  result_logs: string;
+};
+
+// Read and validate the optional VM-analysis request bundle off task.context.
+// Absent/malformed → null (launch mode); present+valid → analysis mode.
+function readVmAnalysisRequest(task: Record<string, unknown>): VmAnalysisRequest | null {
+  const context = task.context;
+  if (!context || typeof context !== 'object' || Array.isArray(context)) return null;
+  const raw = (context as Record<string, unknown>)[COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const bundle = raw as Record<string, unknown>;
+  const prompt = strVal(bundle.prompt);
+  const resultLogs = strVal(bundle.result_logs);
+  if (!prompt || !resultLogs) return null;
+  return { prompt, result_logs: resultLogs };
+}
+
+// Extract the analysis JSON {title, summary, body, source_citations} the model
+// returned. The CLI may wrap it in prose or a ```json fence — find the last
+// balanced object so a grounded analysis survives chatty output.
+function parseAnalysisDocument(output: string): Record<string, unknown> | null {
+  const tryParse = (text: string): Record<string, unknown> | null => {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const obj = parsed as Record<string, unknown>;
+        if (strVal(obj.summary) && strVal(obj.body)) return obj;
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  };
+  // Scan from each '{' to the matching end, preferring the last valid object.
+  let found: Record<string, unknown> | null = null;
+  for (let i = 0; i < output.length; i += 1) {
+    if (output[i] !== '{') continue;
+    let depth = 0;
+    for (let j = i; j < output.length; j += 1) {
+      if (output[j] === '{') depth += 1;
+      else if (output[j] === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          const candidate = tryParse(output.slice(i, j + 1));
+          if (candidate) found = candidate;
+          break;
+        }
+      }
+    }
+  }
+  return found;
+}
+
+// ── Analysis mode: run the model on the centralized-accounts substrate ────────
+// The backend re-queued this compute_experiment with a prepared analysis prompt
+// because it has no ANTHROPIC_API_KEY (operator policy p-13f153e9). Call the
+// Anthropic Messages API directly (non-agentic, no tool use, no privileged env
+// credentials) over the durable artifacts, submit the produced analysis JSON to
+// the backend (which re-grounds the citations authoritatively), then post the
+// honest terminal completion with the backend-supplied COMPUTE_RESULT logs.
+
+// Non-agentic single-turn call to the Anthropic Messages API.  No subprocess,
+// no --dangerously-skip-permissions, no AGENT_API_TOKEN / ORCHESTRATOR_URL
+// exposure.  Untrusted compute artifacts in the prompt cannot call tools or
+// exfiltrate secrets because the model only returns text.
+async function callAnalysisModel(
+  prompt: string, ws: WebSocket | null, model?: string,
+): Promise<string | null> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    sendLog(ws, '[WARN] ANTHROPIC_API_KEY not available; skipping analysis model call.\n');
+    return null;
+  }
+  const resolvedModel = model ?? 'claude-sonnet-4-6';
+  let resp: Response;
+  try {
+    resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: resolvedModel,
+        max_tokens: 4096,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+  } catch (e) {
+    sendLog(ws, `[WARN] compute analysis API request failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    return null;
+  }
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '');
+    sendLog(ws, `[WARN] compute analysis API error (${resp.status}): ${errText.slice(0, 300)}\n`);
+    return null;
+  }
+  const body = await resp.json() as Record<string, unknown>;
+  const content = body.content;
+  if (!Array.isArray(content) || content.length === 0) return null;
+  const first = content[0] as Record<string, unknown>;
+  if (first.type !== 'text' || typeof first.text !== 'string') return null;
+  return first.text;
+}
+
+async function runVmAnalysisLeg(
+  taskId: string, request: VmAnalysisRequest, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, _effort?: string,
 ) {
+  statusRef.value = 'Analyzing compute artifacts (centralized accounts)...';
+  sendLog(ws, 'Resumed for VM-side compute analysis; running model over durable artifacts.\n');
+
+  let analysis: Record<string, unknown> | null = null;
+  try {
+    const responseText = await callAnalysisModel(request.prompt, ws, model);
+    if (responseText !== null) {
+      analysis = parseAnalysisDocument(responseText);
+    }
+    if (!analysis) {
+      sendLog(ws, '[WARN] compute analysis model returned no parseable document; submitting no analysis.\n');
+    }
+  } catch (e) {
+    sendLog(ws, `[WARN] compute analysis model run failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+
+  if (analysis) {
+    try {
+      await apiPost('/api/agent/compute-analysis', {
+        job_id: extractJobId(request.result_logs),
+        analysis: {
+          title: strVal(analysis.title) || undefined,
+          summary: strVal(analysis.summary),
+          body: strVal(analysis.body),
+          source_citations: Array.isArray(analysis.source_citations)
+            ? analysis.source_citations.filter((c): c is string => typeof c === 'string')
+            : [],
+        },
+      });
+      sendLog(ws, 'Submitted VM-produced compute analysis to backend for grounding.\n');
+    } catch (e) {
+      // Submission failure leaves the deterministic measured_only doc intact.
+      // The honest completion below posts via the direct path (no re-routing),
+      // so the task terminates at measured_only with no further retry.
+      sendLog(ws, `[WARN] compute analysis submission failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+  }
+
+  // Post the honest terminal completion using the backend-authoritative
+  // COMPUTE_RESULT logs (re-gated + upgrade-only; never downgrades an llm doc).
+  statusRef.value = 'Finalizing compute experiment after analysis';
+  await persistAndPostStatus(taskId, {
+    task_id: taskId,
+    status: 'COMPLETED',
+    artifact_type: 'COMPUTE_RESULT',
+    logs: sanitize(request.result_logs),
+  });
+}
+
+function extractJobId(resultLogs: string): string {
+  try {
+    const parsed: unknown = JSON.parse(resultLogs);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return strVal((parsed as Record<string, unknown>).job_id);
+    }
+  } catch {
+    return '';
+  }
+  return '';
+}
+
+export async function handleComputeExperiment(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  _ghToken: string, _owner: string, _repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string,
+) {
+  // Analysis mode: a backend re-queue stamped a prepared analysis request onto
+  // task.context. Run the model leg instead of launching a new compute job.
+  const vmAnalysisRequest = readVmAnalysisRequest(task);
+  if (vmAnalysisRequest) {
+    await runVmAnalysisLeg(taskId, vmAnalysisRequest, ws, statusRef, model, effort);
+    return;
+  }
+
   const command = strVal(payload.command);
   const spendCap = numOrNull(payload.spend_cap_usd);
   const deadlineSeconds = numOrNull(payload.deadline_seconds);
@@ -218,11 +405,22 @@ export async function handleComputeExperiment(
   // Release this VM/fleet slot now instead of polling the job to terminal. The
   // park registration is FINALIZE-action and keyed to the job id; the backend
   // wake worker runs the compute_experiment completion path when the monitor fires
-  // the wake. The park deadline outlasts the job's own deadline (+grace) so the
-  // reaper only ages the task out if the monitor never reports terminal. A duplicate
-  // launch returns the same job (backend idempotency), so re-parking targets the
-  // same job id and the backend's park guard prevents duplicate registrations.
-  const parkDeadlineSeconds = (deadlineSeconds as number) + COMPUTE_PARK_GRACE_SECONDS;
+  // the wake. The park deadline outlasts the job's full worst-case window
+  // (declared deadline + any provisioning allowance for GPU jobs) plus grace, so
+  // the reaper only ages the task out if the monitor never reports terminal. A
+  // duplicate launch returns the same job (backend idempotency), so re-parking
+  // targets the same job id and the backend's park guard prevents duplicate
+  // registrations.
+  //
+  // Prefer the backend-computed park_deadline_seconds from polling_metadata (which
+  // accounts for the GPU provisioning allowance) over the local fallback so GPU
+  // jobs never have their park expire during the substrate's legal provisioning
+  // window.
+  const pollingMeta = job && typeof job.polling_metadata === 'object' && job.polling_metadata !== null
+    ? job.polling_metadata as Record<string, unknown>
+    : null;
+  const parkDeadlineSeconds = numOrNull(pollingMeta?.park_deadline_seconds)
+    ?? (deadlineSeconds as number) + COMPUTE_PARK_GRACE_SECONDS;
   statusRef.value = `Parked on compute job ${jobId} until terminal`;
   sendLog(ws, `Parking task on compute job ${jobId} (releasing VM/slot); backend will finalize on terminal.\n`);
   await persistAndPostStatus(taskId, {

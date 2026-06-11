@@ -35,6 +35,7 @@ from app.auth import (
     VM_SCOPED_TOKEN_SCOPE,
 )
 from app.broadcast import broadcast_to_project
+from app.claim_analytics import stamp_warm_claim_timing
 from app.database import get_session, resolve_dialect_name
 from app.models import Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
@@ -621,11 +622,20 @@ async def _finalize_warm_claim(
         # bookkeeping before committing the IN_PROGRESS transition.
         ctx.pop("parked_for_retarget", None)
         ctx.pop("park_deadline", None)
-        existing_timing = dict(ctx.get("_timing") or {})
-        existing_timing.setdefault("warm_start", True)
-        existing_timing["warm_claim_origin"] = origin
-        existing_timing["prior_role_vm_id"] = vm_instance_id
-        ctx["_timing"] = existing_timing
+        ctx = stamp_warm_claim_timing(
+            ctx,
+            origin=origin,
+            vm_instance_id=vm_instance_id,
+        )
+        # Ground warm-resume receipts in actual outcome: stamp only here, at the
+        # warm-claim site, so a cold-fallback fix (reserved member reaped, lease
+        # expired, or pool fallback) leaves the receipt absent.
+        if ctx.get("is_lane_phase"):
+            from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+            confirm_lane_warm_resume(
+                ctx, has_checkpoint=bool(ctx.get("lane_checkpoint_sha"))
+            )
         task.context = ctx
         flag_modified(task, "context")
         agent_token = create_agent_token(
@@ -679,6 +689,19 @@ async def _finalize_warm_claim(
     }
     if secret_manifest is not None:
         response["secret_manifest"] = secret_manifest
+    # Lane workspace-mode: pass the checkpoint SHA + lane marker to the agent
+    # when a lane phase is dispatched warm. The agent uses these to hard-reset
+    # the warm workspace to the last verified checkpoint (treating it as truth)
+    # instead of resetting to origin/<branch>. Gated on improvement_lanes_enabled
+    # so the path is completely inert when the feature flag is off.
+    from app.runtime_config_state import is_improvement_lanes_enabled
+
+    if is_improvement_lanes_enabled():
+        task_ctx = task.context or {}
+        _lane_checkpoint_sha = task_ctx.get("lane_checkpoint_sha")
+        if task_ctx.get("is_lane_phase") and _lane_checkpoint_sha:
+            response["lane_checkpoint_sha"] = str(_lane_checkpoint_sha)
+            response["is_lane_phase"] = True
     return response
 
 

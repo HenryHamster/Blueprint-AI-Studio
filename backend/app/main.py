@@ -53,6 +53,7 @@ from app.routers.agent import router as agent_router
 from app.routers.agent_github import router as agent_github_router
 from app.routers.agent_strategic_fetch import router as agent_strategic_fetch_router
 from app.routers.agent_warm_continuity import router as agent_warm_continuity_router
+from app.efficiency_snapshot import agent_router as efficiency_snapshot_agent_router
 from app.routers.agent_credentials import router as agent_credentials_router
 from app.routers.agent_compute_jobs import router as agent_compute_jobs_router
 from app.routers.admin_compute_jobs import router as admin_compute_jobs_router
@@ -86,7 +87,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0222"
+EXPECTED_SCHEMA_REVISION = "0235"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -774,6 +775,7 @@ app.include_router(admin_pool_accounts_router)
 app.include_router(admin_project_config_router)
 app.include_router(admin_warm_pool_router)
 app.include_router(agent_router)
+app.include_router(efficiency_snapshot_agent_router)
 app.include_router(agent_github_router)
 app.include_router(agent_strategic_fetch_router)
 app.include_router(agent_warm_continuity_router)
@@ -1194,6 +1196,7 @@ async def get_viewport_failure_screenshot_download_url(
     project_id: uuid.UUID,
     component: str,
     width: int,
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Generate a 1-hour signed download URL for a viewport failure screenshot.
@@ -1209,16 +1212,16 @@ async def get_viewport_failure_screenshot_download_url(
     the general artifact-download resolver share one bucket-allowlisting +
     V4-signing implementation instead of duplicating it.
     """
-    import re as _re
-
     from app.storage import (
         ARTIFACT_BUCKET_NAME,
         StorageUriError,
         generate_download_signed_url,
     )
+    from app.viewport_evidence import viewport_object_name
 
-    safe_component = _re.sub(r"[^A-Za-z0-9._-]", "_", component)[:100]
-    object_name = f"viewport-failures/{project_id}/{safe_component}-{width}.png"
+    await _get_user_project(project_id, current_user["user_id"], session)
+
+    object_name = viewport_object_name(project_id, component, width)
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
 
     try:
@@ -1684,13 +1687,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error(
+    logger.exception(
         f"[UNHANDLED] {request.method} {request.url.path}: {type(exc).__name__}: {exc}",
-        exc_info=True,
     )
     resp = JSONResponse(
         status_code=500,
-        content={"detail": f"{type(exc).__name__}: {str(exc)[:200]}"},
+        content={"detail": "Internal Server Error"},
     )
     return _apply_cors_headers(resp, request)
 

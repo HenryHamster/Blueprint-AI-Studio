@@ -1318,6 +1318,8 @@ from app.models import (  # noqa: E402
     AlertSeverity,
     DeploymentState,
     DeploymentStatus,
+    PoolVm,
+    PoolVmState,
     QualificationVerdict,
     ReleaseDeployArtifact,
     ReleaseVersion,
@@ -1331,6 +1333,7 @@ from app.release_artifacts import (  # noqa: E402
     SUPERSEDED_BY_DESCENDANT_REASON,
     _previously_deployed_sha,
     aggregate_required_artifact_status,
+    artifact_is_unconfirmed,
     get_or_create_release_deploy_artifact,
     is_backend_revision_artifact,
     iter_release_artifact_providers,
@@ -1349,6 +1352,7 @@ from sqlalchemy import select as _select  # noqa: E402
 
 _SHA_A = "a" * 40
 _SHA_B = "b" * 40
+_SHA_C = "c" * 40
 
 
 def _ds(status, deployed_at, current_sha="", halted_at=None):
@@ -1413,8 +1417,10 @@ def test_classify_no_new_revision_times_out_after_deadline():
     promoted_at = datetime(2026, 6, 5, 12, 0, 0)
     deadline = datetime(2026, 6, 5, 13, 0, 0)
     # Old revision that predates the promotion never advanced; STABLE but stale.
+    # It runs _SHA_B (the pre-promotion sha) — NOT the promoted sha (_SHA_A),
+    # which is the post-merge commit that did not exist before the promotion.
     ds = _ds(
-        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_A
+        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_B
     )
     # Within the window → no decision yet.
     assert (
@@ -1438,8 +1444,10 @@ def test_classify_missing_deadline_backstops_from_promoted_at():
 
     promoted_at = datetime(2026, 6, 5, 12, 0, 0)
     # Stale revision that predates the promotion never advanced; deadline=None.
+    # It runs _SHA_B (the pre-promotion sha) — a pre-promotion revision cannot
+    # serve the promoted sha (_SHA_A) which did not exist before the promotion.
     ds = _ds(
-        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_A
+        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_B
     )
     # Just before the derived deadline → still waiting (no premature decision).
     within = promoted_at + timedelta(seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS - 60)
@@ -1481,6 +1489,36 @@ def test_classify_monitoring_new_revision_waits_within_window():
         DeploymentStatus.MONITORING, promoted_at.replace(minute=5), current_sha=_SHA_A
     )
     assert _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now) is None
+
+
+def test_classify_serving_confirmed_deploy_finished_before_promotion_recorded():
+    """v9 race: Cloud Run revision booted BEFORE the orchestrator finished
+    recording promoted_at (deployed_at < promoted_at).  An exact SHA match is
+    positive evidence regardless of ordering — a pre-promotion revision cannot
+    serve the promoted merge SHA, so this must confirm, not time out."""
+    promoted_at = datetime(2026, 6, 5, 2, 15, 14)  # promotion finalized later
+    deployed_at = datetime(2026, 6, 5, 2, 14, 54)  # deploy booted earlier (race)
+    deadline = promoted_at + timedelta(hours=1)
+    now = promoted_at + timedelta(minutes=5)
+    ds = _ds(DeploymentStatus.STABLE, deployed_at, current_sha=_SHA_A)
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out is not None
+    assert out[0] == "serving_confirmed"
+    assert out[1] == _SHA_A
+    assert out[2] == deployed_at  # served_at is the boot time
+
+
+def test_classify_stable_pre_promotion_sha_mismatch_waits_not_fails():
+    """A pre-promotion revision (deployed_at < promoted_at) serving a different
+    SHA must NOT be reported as sha_mismatch — it predates the promotion, so
+    the mismatch is expected while waiting for the new revision to boot."""
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deployed_at = datetime(2026, 6, 5, 11, 50, 0)  # predates promotion
+    deadline = promoted_at + timedelta(hours=1)
+    now = promoted_at + timedelta(minutes=15)
+    ds = _ds(DeploymentStatus.STABLE, deployed_at, current_sha=_SHA_B)
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out is None  # still waiting, not sha_mismatch
 
 
 async def _make_promoted_unconfirmed_version(
@@ -1678,6 +1716,156 @@ async def test_confirm_serving_confirmed_scenario(db_session):
     )
     assert verdict.post_promotion_outcome == "serving_confirmed"
     assert verdict.post_promotion_outcome_at is not None
+
+
+@pytest.mark.asyncio
+async def test_confirm_backend_revision_descendant_serving_sha_records_observed_sha(
+    db_session, mocker
+):
+    """A STABLE post-promotion revision serving a descendant of promoted_sha is
+    healthy, and the provider records the observed serving SHA rather than
+    substituting the promoted SHA."""
+    ancestry = mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+
+    assert resolved is True
+    ancestry.assert_awaited()
+    assert ancestry.await_args.args[3:5] == (_SHA_A, _SHA_B)
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_B
+    artifact = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert artifact.serving_status == "serving_confirmed"
+    assert artifact.served_identifier == _SHA_B
+
+
+@pytest.mark.asyncio
+async def test_confirm_backend_revision_non_ancestor_sha_mismatch_stays_failed(
+    db_session, mocker
+):
+    ancestry = mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+
+    assert resolved is True
+    ancestry.assert_awaited()
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "sha_mismatch"
+    assert version.served_sha is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_backend_revision_indeterminate_ancestry_defers_within_window(
+    db_session, mocker
+):
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=None),
+    )
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+
+    assert resolved is False
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+    assert version.deploy_failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_backend_revision_indeterminate_ancestry_times_out_after_deadline(
+    db_session, mocker
+):
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=None),
+    )
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(hours=2),
+    )
+
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "confirmation_timed_out"
+    assert version.deploy_failure_reason == "backend_revision_ancestry_indeterminate"
+    assert version.served_sha is None
 
 
 @pytest.mark.asyncio
@@ -2615,6 +2803,47 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session):
 
 
 @pytest.mark.asyncio
+async def test_recover_deploy_failed_when_descendant_sha_serves_within_window(
+    db_session, mocker
+):
+    """A sha_mismatch deploy_failed latch recovers when the observed serving SHA
+    is deterministically descended from the promoted SHA."""
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    deadline = promoted_at + timedelta(hours=1)
+    alerted_at = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+        deploy_failure_reason="sha_mismatch",
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+
+    assert recovered is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_B
+    assert version.deploy_failure_reason is None
+
+
+@pytest.mark.asyncio
 async def test_recover_confirmation_timed_out_when_sha_serves_within_window(db_session):
     """A version latched confirmation_timed_out (NOT deploy_failed) whose promoted
     SHA is later observed serving within the recovery window also recovers to
@@ -2809,12 +3038,13 @@ async def test_recover_skips_when_non_backend_required_artifact_still_failed(
 
 
 @pytest.mark.asyncio
-async def test_recover_skips_beyond_recovery_window(db_session):
-    """(b) A deploy whose promoted SHA only begins serving AFTER the recovery
-    window has elapsed stays deploy_failed forever — the recovery check is bounded
-    so a genuinely dead deploy is no longer re-examined."""
+async def test_recover_exact_sha_after_recovery_window(db_session):
+    """A deploy whose promoted SHA is now DETERMINISTICALLY observed serving
+    recovers even AFTER the old recovery window has elapsed: the recovery gate is
+    the truth recheck (a serving_confirmed aggregate), not a timer.  Recording the
+    failure far in the past no longer condemns a deploy that is genuinely live."""
     now = _utcnow()
-    # Failure was recorded well beyond the recovery window.
+    # Failure was recorded well beyond the old recovery window.
     alerted_at = now - timedelta(
         seconds=_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT + 3600
     )
@@ -2826,7 +3056,8 @@ async def test_recover_skips_beyond_recovery_window(db_session):
         deadline=deadline,
         alerted_at=alerted_at,
     )
-    # Even though the promoted SHA is NOW genuinely serving, the window elapsed.
+    # The promoted SHA is NOW genuinely serving (exact match); the elapsed window
+    # must no longer suppress the recheck.
     await _set_deploy_state(
         db_session,
         status=DeploymentStatus.STABLE,
@@ -2839,10 +3070,138 @@ async def test_recover_skips_beyond_recovery_window(db_session):
         session_factory=_shared_session_factory(db_session),
         now=now,
     )
+    assert recovered is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+    assert version.deploy_failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_recover_deploy_failed_descendant_after_recovery_window(
+    db_session, mocker
+):
+    """A sha_mismatch deploy_failed latch recovers when the observed serving SHA
+    is an ancestry-verified DESCENDANT of the promoted SHA — even though the old
+    24h recovery window has long since elapsed.
+
+    This is the v9 case: the promoted merge SHA served, then a newer main deploy
+    containing a descendant superseded it; the latch must clear once the
+    descendant-aware provider confirms serving, regardless of elapsed time."""
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+    now = _utcnow()
+    # Failure recorded well beyond the old recovery window.
+    alerted_at = now - timedelta(
+        seconds=_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT + 3600
+    )
+    promoted_at = alerted_at - timedelta(hours=1)
+    deadline = alerted_at
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+        deploy_failure_reason="sha_mismatch",
+    )
+    # A descendant of the promoted SHA is now serving.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_B
+    assert version.deploy_failure_reason is None
+
+    # The loud deploy-failed operator alert was resolved (dismissed).
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is not None
+
+    # Strategic refresh armed so the crisis directive recomputes off the truth.
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is True
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_beyond_window_determinate_non_ancestry(
+    db_session, mocker
+):
+    """A sha_mismatch latch whose observed serving SHA is DETERMINISTICALLY not
+    descended from the promoted SHA stays deploy_failed beyond the recovery
+    window: an elapsed window must never force-clear a determinate negative."""
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+    now = _utcnow()
+    alerted_at = now - timedelta(
+        seconds=_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT + 3600
+    )
+    promoted_at = alerted_at - timedelta(hours=1)
+    deadline = alerted_at
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+        deploy_failure_reason="sha_mismatch",
+    )
+    # An unrelated SHA is serving and ancestry is determinately false.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
     assert recovered is False
     await db_session.refresh(version)
     assert version.serving_status == "deploy_failed"
     assert version.served_sha is None
+
+    # The open deploy-failed alert is untouched and no refresh was armed.
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is None
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
 
 
 # ===========================================================================
@@ -3007,15 +3366,29 @@ async def test_confirm_diverged_sha_stays_deploy_failed_sha_mismatch(
 async def test_confirm_github_failure_falls_back_to_sha_mismatch(
     db_session, mocker, ancestry_failure
 ):
-    """Any GitHub/compare failure on the supersession check fails toward existing
-    semantics: deploy_failed/sha_mismatch, never a silent confirmation."""
+    """Any GitHub/compare failure on the supersession check never silently confirms.
+
+    ``raises`` and ``no_credentials`` still land deploy_failed/sha_mismatch (they
+    bypass the indeterminate defer path via the exception handler and the
+    no-credentials early return respectively).  An ``indeterminate`` response
+    (GitHub returned a valid but inconclusive answer) defers within the window and
+    times out to confirmation_timed_out past the deadline — a soft non-confirmation,
+    not deploy_failed, but still not a silent serving_confirmed."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # deadline is 1 h ago
     if ancestry_failure == "raises":
         mocker.patch(
             "app.github.is_ancestor_of",
             new=AsyncMock(side_effect=RuntimeError("github exploded")),
         )
+        # Exception path falls back immediately to deploy_failed/sha_mismatch.
+        expected_status = "deploy_failed"
+        expected_reason = "sha_mismatch"
     elif ancestry_failure == "indeterminate":
         mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=None))
+        # Past deadline: indeterminate becomes confirmation_timed_out (soft non-confirm).
+        expected_status = "confirmation_timed_out"
+        expected_reason = "backend_revision_ancestry_indeterminate"
     else:  # no_credentials — the compare API must never even be attempted.
         mocker.patch(
             "app.release_promotion._resolve_github_with_session",
@@ -3025,9 +3398,10 @@ async def test_confirm_github_failure_falls_back_to_sha_mismatch(
             "app.github.is_ancestor_of",
             new=AsyncMock(side_effect=AssertionError("must not be called")),
         )
+        # No-credentials early return falls back to deploy_failed/sha_mismatch.
+        expected_status = "deploy_failed"
+        expected_reason = "sha_mismatch"
 
-    promoted_at = _utcnow()
-    deadline = promoted_at + timedelta(hours=1)
     _project, version = await _make_promoted_unconfirmed_version(
         db_session, promoted_at=promoted_at, deadline=deadline
     )
@@ -3041,12 +3415,12 @@ async def test_confirm_github_failure_falls_back_to_sha_mismatch(
     resolved = await _confirm_serving_or_fail(
         version.id,
         session_factory=_shared_session_factory(db_session),
-        now=promoted_at + timedelta(minutes=40),
+        now=promoted_at + timedelta(hours=2),  # well past deadline
     )
     assert resolved is True
     await db_session.refresh(version)
-    assert version.serving_status == "deploy_failed"
-    assert version.deploy_failure_reason == "sha_mismatch"
+    assert version.serving_status == expected_status
+    assert version.deploy_failure_reason == expected_reason
     assert version.served_sha is None
 
 
@@ -3238,6 +3612,18 @@ def test_previously_deployed_sha_uses_current_when_not_advanced():
     assert _previously_deployed_sha(ds, _SHA_A) == _SHA_B
 
 
+def test_previously_deployed_sha_uses_prior_when_current_contains_promoted():
+    """When the observed backend SHA is a descendant of the promoted SHA, the
+    bake diff still starts at the pre-promotion deploy SHA."""
+    ds = DeploymentState(
+        id=1, current_sha=_SHA_B, prior_deploy_sha=_SHA_C, deployed_at=_utcnow()
+    )
+    assert (
+        _previously_deployed_sha(ds, _SHA_A, current_contains_promoted=True)
+        == _SHA_C
+    )
+
+
 def test_previously_deployed_sha_indeterminate_returns_none():
     """No DeploymentState, or current==promoted with no prior, is an
     unobservable diff base → None (indeterminate)."""
@@ -3336,6 +3722,170 @@ async def test_agent_image_bake_path_waits_for_fleet_then_confirms(db_session, m
     assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].serving_status == "serving_confirmed"
     assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].served_identifier == _SHA_A
     assert await _aggregate_serving_status(db_session, version.id) == "serving_confirmed"
+
+
+@pytest.mark.agent_image_gate
+@pytest.mark.asyncio
+async def test_agent_image_bake_path_confirms_with_descendant_fleet_sha(
+    db_session, mocker
+):
+    """A bake-path promotion confirms when a live fleet VM reports a source SHA
+    that deterministically descends from promoted_sha."""
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=True),
+    )
+    ancestry = mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    db_session.add(
+        PoolVm(
+            vm_instance_id="pool-descendant",
+            project_id=project.id,
+            state=PoolVmState.IDLE,
+            agent_source_sha=_SHA_B,
+        )
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        prior_deploy_sha=_SHA_C,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+
+    assert resolved is True
+    ancestry.assert_awaited()
+    assert ancestry.await_args.args[3:5] == (_SHA_A, _SHA_B)
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_kind = {a.artifact_kind: a for a in artifacts}
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].serving_status == "serving_confirmed"
+
+
+@pytest.mark.agent_image_gate
+@pytest.mark.asyncio
+async def test_agent_image_descendant_fleet_indeterminate_stays_unconfirmed(
+    db_session, mocker
+):
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new=AsyncMock(return_value=None),
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    db_session.add(
+        PoolVm(
+            vm_instance_id="pool-indeterminate",
+            project_id=project.id,
+            state=PoolVmState.IDLE,
+            agent_source_sha=_SHA_B,
+        )
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        prior_deploy_sha=_SHA_C,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+
+    assert resolved is False
+    assert await _aggregate_serving_status(db_session, version.id) == "unconfirmed"
+
+
+@pytest.mark.agent_image_gate
+@pytest.mark.asyncio
+async def test_agent_image_bake_diff_uses_prior_when_backend_sha_is_ahead(
+    db_session, mocker
+):
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    rebake = mocker.patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+    # Backend-revision sha_mismatch path calls app.github.is_ancestor_of (distinct
+    # from app.github_refs) to check descendant supersession.  Mock it here so the
+    # backend_revision provider produces a definitive result without hitting the
+    # real GitHub API.
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        prior_deploy_sha=_SHA_C,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+
+    assert resolved is True
+    rebake.assert_awaited_once()
+    assert rebake.await_args.args[3:5] == (_SHA_C, _SHA_A)
 
 
 @pytest.mark.agent_image_gate
@@ -3772,3 +4322,106 @@ def test_summarize_armed_unconfirmed_promotion_still_gates():
     assert aggregate["serving_status"] == "unconfirmed"
     by_kind = {entry["artifact_kind"]: entry for entry in evidence}
     assert by_kind[BACKEND_REVISION_ARTIFACT_KIND]["serving_status"] == "unconfirmed"
+
+
+# ===========================================================================
+# Unobservable-provider orphan resolution (Bug: split-brain pending rows).
+#
+# When a REQUIRED artifact row was armed when the deploy identity matched but
+# the provider is now unobservable (identity changed / cleared), the row must
+# be resolved rather than orphaned.  Past its deadline it must be timed out
+# with reason_code="provider_unobservable"; within the deadline it counts as
+# still pending so the sweep keeps trying (identity may be restored).
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_confirm_unobservable_required_row_resolves_past_deadline(
+    db_session, monkeypatch
+):
+    """An armed REQUIRED artifact row whose provider is now unobservable (deploy
+    identity cleared after arming) must NOT orphan forever.  Past its
+    confirmation_deadline it must be timed out with reason_code=
+    'provider_unobservable' so the aggregate converges and the version exits
+    'unconfirmed'."""
+    # Clear deploy identity: backend_revision + agent_image become unobservable.
+    monkeypatch.delenv("DEPLOY_REPO_IDENTITY", raising=False)
+
+    promoted_at = _utcnow() - timedelta(hours=3)
+    deadline = _utcnow() - timedelta(hours=1)  # past deadline
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # _make_promoted_unconfirmed_version creates the backend_revision row;
+    # with deploy identity cleared this provider is now unobservable.
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert resolved is True, "must transition out of unconfirmed"
+
+    await db_session.refresh(version)
+    # The version must exit 'unconfirmed'; confirmation_timed_out is expected
+    # (backend_revision past deadline → provider_unobservable; promotion_merge
+    # was stubbed to confirm by the autouse fixture).
+    assert version.serving_status not in (
+        "unconfirmed",
+    ), f"version still unconfirmed: {version.serving_status}"
+
+    # The backend_revision artifact row must be resolved.
+    artifact = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert artifact is not None
+    assert artifact.serving_status == "confirmation_timed_out"
+    assert artifact.reason_code == "provider_unobservable"
+
+
+@pytest.mark.asyncio
+async def test_confirm_unobservable_required_row_stays_pending_within_deadline(
+    db_session, monkeypatch
+):
+    """Within the confirmation window, an unobservable required artifact row must
+    still count as pending (had_required_unconfirmed) so the sweep keeps
+    retrying — the deploy identity may be restored before the deadline."""
+    monkeypatch.delenv("DEPLOY_REPO_IDENTITY", raising=False)
+
+    promoted_at = _utcnow() - timedelta(minutes=5)
+    deadline = _utcnow() + timedelta(hours=2)  # still within window
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    # Within deadline: no transition yet (still waiting for identity to come back).
+    assert resolved is False
+
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+
+    # The backend_revision artifact row must remain unconfirmed (not orphaned).
+    artifact = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert artifact is not None
+    assert artifact_is_unconfirmed(artifact)

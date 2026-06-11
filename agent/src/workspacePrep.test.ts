@@ -168,6 +168,63 @@ describe('prepareWorkspaceForRole', () => {
     expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
   });
 
+  // ── Review-fix lane pilot: warm-resume guard ───────────────────────────────
+  describe('warm path: review-fix lane pilot resume guard', () => {
+    afterEach(() => {
+      delete process.env.BLUEPRINT_LANE_MODE;
+      delete process.env.BLUEPRINT_LANE_CHECKPOINT_SHA;
+    });
+
+    it('fix side (allowLaneResume default) + lane env → hard-resets to checkpoint SHA, not origin', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'deadbeefcafe1234';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:NEW@github.com/o/r.git',
+        githubToken: 'NEW',
+        branch: 'feature/x',
+        baseBranch: 'main',
+        // allowLaneResume omitted → defaults to true (env-driven, fix side).
+      });
+
+      const gitArgsList = execFileSyncMock.mock.calls
+        .filter(c => c[0] === 'git')
+        .map(c => (c[1] as string[]).join(' '));
+      // Lane resume: hard-reset to the checkpoint SHA …
+      expect(gitArgsList.some(a => a.includes('reset --hard deadbeefcafe1234'))).toBe(true);
+      // … and NOT to origin/<branch> (the classic warm reset is replaced).
+      expect(gitArgsList.some(a => a.includes('reset --hard origin/feature/x'))).toBe(false);
+    });
+
+    it('review/audit side (allowLaneResume=false) + lane env LEAKED → still resets to origin, never the checkpoint', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      // A lane env should never reach a cold reviewer claim, but assert the
+      // hard guard holds even if it leaked: the reviewer stays independent.
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'deadbeefcafe1234';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:NEW@github.com/o/r.git',
+        githubToken: 'NEW',
+        branch: 'feature/x',
+        baseBranch: 'main',
+        allowLaneResume: false,
+      });
+
+      const gitArgsList = execFileSyncMock.mock.calls
+        .filter(c => c[0] === 'git')
+        .map(c => (c[1] as string[]).join(' '));
+      // Guard wins: classic reset to origin/<branch>, never the checkpoint SHA.
+      expect(gitArgsList.some(a => a.includes('reset --hard origin/feature/x'))).toBe(true);
+      expect(gitArgsList.some(a => a.includes('reset --hard deadbeefcafe1234'))).toBe(false);
+    });
+  });
+
   it('warm path failure: git fetch throws → falls through to cold clone', async () => {
     process.env.BLUEPRINT_WARM_HANDOFF = '1';
     fsMocks.existsSync.mockReturnValue(true);
@@ -550,6 +607,132 @@ describe('prepareWorkspaceForRole', () => {
         'clone', '--depth', '50', '--branch', 'feature/x',
         'https://x-access-token:tok@github.com/o/r.git', '/ws',
       ]);
+    });
+  });
+
+  // ── Lane workspace-mode ──────────────────────────────────────────────────────
+  //
+  // When BLUEPRINT_LANE_MODE=1 and BLUEPRINT_LANE_CHECKPOINT_SHA=<sha> are set,
+  // the warm path must hard-reset to the checkpoint SHA instead of origin/<branch>.
+  // If the reset fails (SHA unreachable), the outer catch must fall back to cold.
+  describe('lane workspace-mode', () => {
+    beforeEach(() => {
+      delete process.env.BLUEPRINT_LANE_MODE;
+      delete process.env.BLUEPRINT_LANE_CHECKPOINT_SHA;
+    });
+
+    afterEach(() => {
+      delete process.env.BLUEPRINT_LANE_MODE;
+      delete process.env.BLUEPRINT_LANE_CHECKPOINT_SHA;
+    });
+
+    it('lane mode: resets to checkpoint SHA, not origin/<branch>', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'abc1234def5678901234567890123456789012ab';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feat/lane',
+      });
+
+      const gitArgsList = execFileSyncMock.mock.calls
+        .filter(c => c[0] === 'git')
+        .map(c => (c[1] as string[]).join(' '));
+
+      // Must reset to the checkpoint SHA, not origin/feat/lane.
+      expect(gitArgsList.some(a =>
+        a.includes('reset --hard abc1234def5678901234567890123456789012ab'),
+      )).toBe(true);
+      expect(gitArgsList.some(a =>
+        a.includes('reset --hard origin/feat/lane'),
+      )).toBe(false);
+
+      // Warm path completed — no cold fallback.
+      expect(cloneWithRetryMock).not.toHaveBeenCalled();
+
+      // Logged the lane-mode reset.
+      const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
+      expect(logged).toMatch(/lane-mode reset to checkpoint/i);
+    });
+
+    it('lane mode: SHA unreachable → falls back to cold clone', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'deadbeef00000000000000000000000000000000';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === 'git' && Array.isArray(args) && args.includes('reset')
+            && args.includes('deadbeef00000000000000000000000000000000')) {
+          throw new Error('fatal: unknown revision or path not in the working tree');
+        }
+        return '';
+      });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feat/lane',
+      });
+
+      // Cold path taken after the warm-path failure.
+      const rmCall = execFileSyncMock.mock.calls.find(
+        c => c[0] === 'rm' && Array.isArray(c[1]) && (c[1] as string[]).includes('-rf'),
+      );
+      expect(rmCall).toBeDefined();
+      expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
+      const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
+      expect(logged).toMatch(/warm path failed/i);
+    });
+
+    it('lane mode off (BLUEPRINT_LANE_MODE unset): warm path uses origin/<branch>', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      // BLUEPRINT_LANE_MODE intentionally not set.
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feat/normal',
+      });
+
+      const gitArgsList = execFileSyncMock.mock.calls
+        .filter(c => c[0] === 'git')
+        .map(c => (c[1] as string[]).join(' '));
+      // Non-lane warm path: reset to origin/<branch>.
+      expect(gitArgsList.some(a =>
+        a.includes('reset --hard origin/feat/normal'),
+      )).toBe(true);
+      expect(cloneWithRetryMock).not.toHaveBeenCalled();
+    });
+
+    it('lane mode=1 but no checkpoint SHA: falls back to origin/<branch>', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      // BLUEPRINT_LANE_CHECKPOINT_SHA intentionally not set.
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feat/lane-no-sha',
+      });
+
+      const gitArgsList = execFileSyncMock.mock.calls
+        .filter(c => c[0] === 'git')
+        .map(c => (c[1] as string[]).join(' '));
+      // Without a SHA, fall back to normal reset target.
+      expect(gitArgsList.some(a =>
+        a.includes('reset --hard origin/feat/lane-no-sha'),
+      )).toBe(true);
+      expect(cloneWithRetryMock).not.toHaveBeenCalled();
     });
   });
 

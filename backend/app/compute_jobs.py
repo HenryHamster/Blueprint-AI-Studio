@@ -77,6 +77,21 @@ MAX_COMPUTE_JOB_DEADLINE_SECONDS = int(
 COMPUTE_JOB_MONITOR_INTERVAL_SECONDS = float(
     os.getenv("COMPUTE_JOB_MONITOR_INTERVAL_SECONDS", "15")
 )
+# Extra wall-clock window added to the declared deadline for GPU (accelerator)
+# jobs to cover the Deep Learning VM cold-start. The provisioning phase can
+# consume the entire declared deadline before the command even begins on a
+# short job; this additive floor is independent of and stacked on top of the
+# declared runtime budget so provisioning-phase deaths are distinguishable from
+# runtime-overrun kills.
+GPU_PROVISIONING_ALLOWANCE_SECONDS = int(
+    os.getenv("COMPUTE_GPU_PROVISIONING_ALLOWANCE_SECONDS", "900")
+)
+# Grace added on top of the job's full worst-case window (declared deadline +
+# provisioning allowance) before the backend reaper ages a parked
+# compute_experiment task out (park_wake_timeout). The monitor fires the
+# compute_job_terminal wake well before this, so the deadline is only a
+# backstop against a wedged monitor — generous so a healthy run never trips it.
+_COMPUTE_PARK_GRACE_SECONDS = 600
 _COMPUTE_RPC_DIAGNOSTIC_KEY = "compute_rpc_diagnostic"
 _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING = 1000
 
@@ -265,7 +280,13 @@ async def create_compute_job(
         project_id=locked_task.project_id,
         requested_cap_usd=capped_spend,
     )
-    deadline_at = _utcnow() + timedelta(seconds=capped_deadline)
+    # GPU jobs add a provisioning allowance to the wall-clock deadline so a
+    # Deep Learning VM cold-start cannot exhaust the declared runtime budget
+    # before the command begins. The runtime budget itself is unchanged.
+    provisioning_allowance = (
+        GPU_PROVISIONING_ALLOWANCE_SECONDS if persisted_accelerator is not None else 0
+    )
+    deadline_at = _utcnow() + timedelta(seconds=capped_deadline + provisioning_allowance)
     # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
     # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
     rate = get_compute_rate_per_second(
@@ -274,6 +295,10 @@ async def create_compute_job(
         count=accelerator_count,
         spot=normalized_provisioning == "SPOT",
     )
+    # Park deadline: worst-case window (declared runtime + provisioning allowance)
+    # plus grace. Stored in polling_metadata so the agent can read it from the
+    # job response instead of recomputing from the declared deadline alone.
+    park_deadline_seconds = capped_deadline + provisioning_allowance + _COMPUTE_PARK_GRACE_SECONDS
     polling_metadata = {
         "command": command,
         "cwd": cwd,
@@ -283,6 +308,7 @@ async def create_compute_job(
         "requested_deadline_seconds": capped_deadline,
         "launch_request_fingerprint": launch_request_fingerprint,
         "status_message": "queued for compute-job launch",
+        "park_deadline_seconds": park_deadline_seconds,
     }
     if live_release_evidence is not None:
         polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
@@ -842,7 +868,9 @@ async def list_compute_jobs(
     *,
     project_id: uuid.UUID,
     include_finished_within: timedelta = timedelta(hours=6),
-) -> list[ComputeJob]:
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[ComputeJob], bool]:
     """Return a project's active compute jobs plus recently-finished ones.
 
     Active jobs are always included; terminal jobs are included only when they
@@ -862,9 +890,13 @@ async def list_compute_jobs(
                 )
             ),
         )
-        .order_by(ComputeJob.created_at.desc())
+        .order_by(ComputeJob.created_at.desc(), ComputeJob.id.desc())
+        .offset(offset)
+        .limit(limit + 1)
     )
-    return list(result.scalars().all())
+    jobs = list(result.scalars().all())
+    has_more = len(jobs) > limit
+    return jobs[:limit], has_more
 
 
 async def get_recent_terminal_compute_spend_usd(
@@ -1283,13 +1315,14 @@ async def _process_single_compute_job(
                 next_retry_at=None,
                 reason="deadline",
             )
+        salvaged = await _salvage_poll_status(backend, job)
         await _apply_polled_compute_job_result(
             session_factory,
             job.id,
             now=now,
             poll_attempt_count=poll_attempt_count,
             next_poll_at=next_poll_at,
-            status=status,
+            status=_merge_salvaged_status(status, salvaged),
             accrued_cost_usd=accrued_cost_usd,
             terminal_status=ComputeJobStatus.TIMED_OUT,
             outcome=ComputeJobOutcome.TIMED_OUT,
@@ -1321,13 +1354,14 @@ async def _process_single_compute_job(
                 next_retry_at=None,
                 reason="budget",
             )
+        salvaged = await _salvage_poll_status(backend, job)
         await _apply_polled_compute_job_result(
             session_factory,
             job.id,
             now=now,
             poll_attempt_count=poll_attempt_count,
             next_poll_at=next_poll_at,
-            status=status,
+            status=_merge_salvaged_status(status, salvaged),
             accrued_cost_usd=accrued_cost_usd,
             terminal_status=ComputeJobStatus.FAILED,
             outcome=ComputeJobOutcome.SPEND_CAP_EXCEEDED,
@@ -1406,6 +1440,54 @@ async def _apply_launch_result(
         return True
 
 
+_SALVAGE_POLL_TIMEOUT_SECONDS = float(
+    os.getenv("COMPUTE_SALVAGE_POLL_TIMEOUT_SECONDS", "10")
+)
+
+
+async def _salvage_poll_status(
+    backend, job: ComputeJob, *, timeout_seconds: float = _SALVAGE_POLL_TIMEOUT_SECONDS
+) -> "ComputeStatusResult | None":
+    """Best-effort post-terminate poll — never raises, never hangs the monitor."""
+    try:
+        return await asyncio.wait_for(
+            backend.poll_status(job), timeout=timeout_seconds
+        )
+    except Exception as exc:
+        logger.warning(
+            "[COMPUTE_JOB] salvage poll failed for job=%s (ignored): %s",
+            job.id,
+            exc,
+        )
+        return None
+
+
+def _merge_salvaged_status(
+    base: "ComputeStatusResult", salvaged: "ComputeStatusResult | None"
+) -> "ComputeStatusResult":
+    """Return a new status snapshot with late-arriving fields from salvaged merged in.
+
+    The terminal outcome, status code, and cost semantics all come from ``base``.
+    Only metrics, command_log, and echoed_release_sha are overridden by non-None
+    values from the post-terminate poll so late-emitted evidence is not dropped.
+    """
+    if salvaged is None:
+        return base
+    return ComputeStatusResult(
+        status=base.status,
+        message=base.message,
+        exit_code=base.exit_code,
+        finished_at=base.finished_at,
+        metrics=salvaged.metrics if salvaged.metrics is not None else base.metrics,
+        command_log=salvaged.command_log
+        if salvaged.command_log is not None
+        else base.command_log,
+        echoed_release_sha=salvaged.echoed_release_sha
+        if salvaged.echoed_release_sha is not None
+        else base.echoed_release_sha,
+    )
+
+
 async def _apply_polled_compute_job_result(
     session_factory,
     job_id: uuid.UUID,
@@ -1438,6 +1520,8 @@ async def _apply_polled_compute_job_result(
             _set_meta(live, result_metrics=dict(status.metrics))
         if status.command_log:
             _set_meta(live, command_log=dict(status.command_log))
+        if status.echoed_release_sha is not None:
+            _set_meta(live, release_echo_sha=status.echoed_release_sha)
         if compute_rpc_diagnostic is None:
             _clear_compute_rpc_diagnostic(live)
         if terminal_status is not None and outcome is not None:
@@ -1513,6 +1597,20 @@ async def _apply_task_terminal_cancellation(
 
 def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
     meta = job.polling_metadata or {}
+    env = {str(k): str(v) for k, v in (meta.get("env") or {}).items()}
+    live_evidence = meta.get(_LIVE_PROOF_METADATA_KEY)
+    if isinstance(live_evidence, dict):
+        release_env = {
+            "BLUEPRINT_RELEASE_SHA": str(live_evidence.get("promoted_sha") or ""),
+            "BLUEPRINT_RELEASE_VERSION": str(
+                live_evidence.get("release_version_number") or ""
+            ),
+            "BLUEPRINT_RELEASE_VERSION_ID": str(
+                live_evidence.get("release_version_id") or ""
+            ),
+        }
+        # Caller-provided env takes precedence over release defaults.
+        env = {**release_env, **env}
     return ComputeLaunchSpec(
         job_id=job.id,
         external_id=job.external_compute_id,
@@ -1524,7 +1622,7 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         runtime_deadline_seconds=int(meta.get("requested_deadline_seconds") or 0)
         or None,
         cwd=meta.get("cwd"),
-        env={str(k): str(v) for k, v in (meta.get("env") or {}).items()},
+        env=env,
         provisioning_model=str(meta.get("provisioning_model") or "STANDARD"),
         accelerator=job.accelerator_type,
         accelerator_count=int(job.accelerator_count or 1),
@@ -1780,6 +1878,16 @@ def build_compute_result_logs(job: ComputeJob) -> str:
         "terminal_reason": job.terminal_reason,
         "result_reference": job.result_reference,
     }
+    # Inject backend-derived durable-artifact metrics as top-level numeric keys.
+    # These are stamped by _link_terminal_artifact and remain evaluable even when
+    # the job timed out or crashed before writing a command result.  Command-reported
+    # values (below) are NOT allowed to overwrite these reserved backend keys.
+    _BACKEND_DERIVED_KEYS = ("durable_file_count", "durable_payload_bytes")
+    for key in _BACKEND_DERIVED_KEYS:
+        raw = meta.get(key)
+        num = _coerce_metric_number(raw)
+        if num is not None:
+            result[key] = num
     # Flatten command-reported result metrics to top-level numeric keys so the
     # success-criterion gate can read them by name, exactly as the agent did. A
     # reported metric whose name collides with a job-level key is skipped so it
@@ -1787,7 +1895,7 @@ def build_compute_result_logs(job: ComputeJob) -> str:
     reported = meta.get("result_metrics")
     if isinstance(reported, dict):
         for name, value in reported.items():
-            if name in result:
+            if name in result or name in _BACKEND_DERIVED_KEYS:
                 continue
             num = _coerce_metric_number(value)
             if num is not None:
@@ -1818,6 +1926,13 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
     reference = await collect_terminal_artifact_reference(job)
     if reference is None:
         return
+    # Stamp backend-derived durable metrics so build_compute_result_logs can
+    # surface them as evaluable top-level keys even for timed-out/failed jobs.
+    _set_meta(
+        job,
+        durable_file_count=reference.file_count,
+        durable_payload_bytes=reference.total_size_bytes,
+    )
     task = await session.get(Task, job.task_id)
     try:
         async with session.begin_nested():

@@ -443,6 +443,70 @@ class TestStrategicCycleStarvation:
             == 1
         )
 
+    @pytest.mark.asyncio
+    async def test_batched_lookup_differentiates_projects(self, db_session):
+        """The batched (non-N+1) sweep flags only the starved project when several
+        projects with mixed cycle/alert state are scanned together: one starved,
+        one with a recent cycle, one with an existing open alert."""
+        from app.reaper import (
+            _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        old = now - timedelta(days=10)
+
+        starved = make_project(autonomous_enabled=True, created_at=old)
+        with_cycle = make_project(autonomous_enabled=True, created_at=old)
+        with_alert = make_project(autonomous_enabled=True, created_at=old)
+        db_session.add_all([starved, with_cycle, with_alert])
+        await db_session.commit()
+        for p in (starved, with_cycle, with_alert):
+            await db_session.refresh(p)
+
+        # with_cycle has a recent cycle → no alert.
+        db_session.add(
+            StrategicCycle(
+                id=uuid.uuid4().hex,
+                project_id=with_cycle.id,
+                phase1_started_at=now - timedelta(hours=1),
+            )
+        )
+        # with_alert already has an open WARNING dedup alert → not duplicated.
+        db_session.add(
+            Alert(
+                project_id=with_alert.id,
+                severity=AlertSeverity.WARNING,
+                title=_STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+                message="pre-existing",
+            )
+        )
+        await db_session.commit()
+
+        created = await _sweep_strategic_cycle_starvation(db_session, now)
+
+        assert created == 1
+        assert (
+            len(
+                await _open_warning_alerts(
+                    db_session, starved.id, _STRATEGIC_CYCLE_STALL_ALERT_TITLE
+                )
+            )
+            == 1
+        )
+        assert not await _open_warning_alerts(
+            db_session, with_cycle.id, _STRATEGIC_CYCLE_STALL_ALERT_TITLE
+        )
+        # Still exactly one alert for with_alert — not duplicated by the sweep.
+        assert (
+            len(
+                await _open_warning_alerts(
+                    db_session, with_alert.id, _STRATEGIC_CYCLE_STALL_ALERT_TITLE
+                )
+            )
+            == 1
+        )
+
 
 # ── _run_signal_staleness_watchdog ───────────────────────────────────────────
 

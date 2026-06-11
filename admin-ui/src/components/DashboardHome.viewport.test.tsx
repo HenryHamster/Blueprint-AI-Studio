@@ -374,6 +374,7 @@ vi.mock('../api', () => ({
     promotion_target: null,
     promotion_head_sha: null,
   })),
+  fetchImprovementLanes: vi.fn(async () => ({ total: 0, lanes: [] })),
 }));
 
 describe('DashboardHome — viewport regression', () => {

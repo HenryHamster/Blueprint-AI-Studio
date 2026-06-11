@@ -38,6 +38,7 @@ from app.knowledge_query import (
 )
 from app.broadcast import broadcast_to_project
 from app.admin import _get_user_project, _get_user_project_with_role
+from app.direction_refractory import get_direction_refractory_info
 from app.autonomous_research import project_parallelism_cap
 from app.reaper import _heartbeat_stale_cutoff
 from app.task_capabilities import STRATEGIC_TASK_TYPES
@@ -677,23 +678,19 @@ async def get_autonomy_debug(
             active_research_count += 1
 
     # Guard 3: no_eligible_directions — a direction is eligible only if it's
-    # active, out of cooldown, AND not already held by another research task.
+    # active, out of refractory, AND not already held by another research task.
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
-    cooldown_seconds_dir = cooldown_minutes * 60
     directions_info = []
     for d in project.directions or []:
         if d.get("status") != "active":
             continue
+        refractory_info = get_direction_refractory_info(d, now=now)
         last_researched_at = d.get("last_researched_at")
-        if last_researched_at:
-            last_dt = datetime.fromisoformat(last_researched_at)
-            elapsed = (now - last_dt).total_seconds()
-            remaining = cooldown_seconds_dir - elapsed
-            in_cooldown = remaining > 0
-            seconds_until_eligible = max(0, int(remaining)) if in_cooldown else None
-        else:
-            in_cooldown = False
-            seconds_until_eligible = None
+        remaining_minutes = refractory_info["refractory_remaining_minutes"]
+        in_cooldown = remaining_minutes is not None
+        seconds_until_eligible = (
+            max(0, int(remaining_minutes * 60)) if in_cooldown else None
+        )
         is_busy = d.get("id") in busy_direction_ids
         is_eligible = not in_cooldown and not is_busy
         entry = {
@@ -702,6 +699,7 @@ async def get_autonomy_debug(
             "status": d.get("status", "active"),
             "last_researched_at": last_researched_at,
             "cooldown_minutes": cooldown_minutes,
+            "refractory_reason": refractory_info["refractory_reason"],
             "is_eligible": is_eligible,
             "seconds_until_eligible": seconds_until_eligible,
         }
@@ -1425,9 +1423,16 @@ async def get_global_diagnostics(
     # Fetch project remediation state once so the aggregate can surface
     # needs_manual_intervention directions even for projects with no active tasks.
     # Skip projects with no directions — they can never contribute remediation entries.
+    # Narrow the scan to relevant projects before the .limit(500) cap so stale
+    # rows don't crowd out active ones. Project has no updated_at/activity
+    # timestamp, so archived-state is the available relevance signal: archived
+    # projects are inactive and never contribute live remediation entries.
     projects_result = await session.execute(
         select(Project)
-        .where(func.coalesce(func.jsonb_array_length(Project.directions), 0) > 0)
+        .where(
+            func.coalesce(func.jsonb_array_length(Project.directions), 0) > 0,
+            Project.not_archived(),
+        )
         .options(load_only(Project.id, Project.directions))
         .limit(500)
     )

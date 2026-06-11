@@ -2102,6 +2102,7 @@ async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
     suffix = payload.get("prompt_suffix", "")
     assert "Spawn-gate grader notes for this cycle:" in suffix
     assert "wholesale retry exhausted 1 time(s)" in suffix
+    # Without cause data the fallback phrasing is used.
     assert "repeated grader non-response" in suffix
 
 
@@ -2134,6 +2135,90 @@ async def test_spawn_gate_metrics_absent_when_no_activity(db_session):
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-sg02")
 
     assert "spawn_gate_metrics" not in d_stat, "spawn_gate_metrics should be absent when no spawn-gate activity"
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_exhaustion_note_names_cause_distribution(db_session):
+    """Exhaustion hint names observed cause distribution when cause_distribution is present in spawn_gate_metrics."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-sg03",
+                "status": "active",
+                "text": "Direction with cause data",
+                "priority": "medium",
+                "research_history": [
+                    {
+                        "prs_merged": 1,
+                        "research_spawn_gate_challenged_count": 3,
+                        "research_spawn_gate_unresolved_count": 2,
+                        "research_spawn_gate_challenged_spawned": 2,
+                        "research_spawn_gate_wholesale_retry_exhausted": True,
+                        "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 2, "RATE_LIMIT": 1},
+                    }
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    suffix = payload.get("prompt_suffix", "")
+    assert "wholesale retry exhausted 1 time(s)" in suffix
+    assert "observed causes:" in suffix
+    assert "AGENT_TIMEOUT x2" in suffix
+    assert "RATE_LIMIT x1" in suffix
+    # Fallback phrasing should NOT appear when cause data is present.
+    assert "looks infrastructural" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_exhaustion_note_falls_back_without_cause_data(db_session):
+    """Exhaustion hint falls back to generic phrasing when no cause_distribution is present."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-sg04",
+                "status": "active",
+                "text": "Direction without cause data",
+                "priority": "medium",
+                "research_history": [
+                    {
+                        "prs_merged": 1,
+                        "research_spawn_gate_challenged_count": 2,
+                        "research_spawn_gate_challenged_spawned": 2,
+                        "research_spawn_gate_wholesale_retry_exhausted": True,
+                    }
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    suffix = payload.get("prompt_suffix", "")
+    assert "wholesale retry exhausted 1 time(s)" in suffix
+    assert "repeated grader non-response" in suffix
+    assert "looks infrastructural" in suffix
+    assert "observed causes:" not in suffix
 
 
 @pytest.mark.asyncio

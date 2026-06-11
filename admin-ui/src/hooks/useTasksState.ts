@@ -74,10 +74,10 @@ export function useTasksState(deps: UseTasksStateDeps) {
   const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(1);
   const [rawLimit, setLimit] = usePersistedState<number>('pageSize', 50);
-  // Backend caps /admin/tasks at 500 rows to keep response under Cloud Run's
-  // 32 MB body limit; clamp stale localStorage values so pagination offsets
-  // stay consistent with what the server actually returns.
-  const limit = Math.min(rawLimit, 500);
+  // Backend supports up to 500 rows, but the UI caps at 200 — stale
+  // localStorage values (e.g. a previously saved 500) are clamped so the
+  // steady-state poll stays cheap and pagination stays consistent.
+  const limit = Math.min(rawLimit, 200);
   const [refreshInterval, setRefreshInterval] = usePersistedState<number>('refreshInterval', 30000);
 
   const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});

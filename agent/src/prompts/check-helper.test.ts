@@ -259,6 +259,269 @@ describe('writeCheckHelper — direct invocation', () => {
   });
 });
 
+// ── Visual acceptance evidence success-path capture+upload ───────────────────
+// GAP 3 of the visual-acceptance loop: nothing uploaded a screenshot on a
+// SUCCESSFUL run, so a declared `visual` acceptance evidence could never
+// resolve. writeCheckHelper now emits a best-effort success-path capture+upload
+// block, presence-gated on cfg.visualAcceptance. These tests pin (a) the block
+// is emitted ONLY when a visual declaration is configured, (b) it is otherwise
+// byte-identical to today, and (c) it captures+uploads EXACTLY the declared
+// (component, width) so the canonical context URI resolves.
+describe('writeCheckHelper — visual acceptance capture+upload (success path)', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  const baseCfg = {
+    workBranch: 'blueprint/visual-1',
+    baseBranch: 'automain',
+    owner: 'HenryHamster',
+    repo: 'BlueprintAIStudio',
+    testsOnMainBranch: true,
+  };
+
+  it('emits the success-path viewport screenshot capture+upload block only when a visual acceptance declaration is configured', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+
+    // WITHOUT a visual declaration: no capture+upload block at all.
+    writeCheckHelper({ ...baseCfg, taskId: 'visual-off' });
+    const without = capturedScripts['/tmp/workspace/check'];
+    expect(without).toBeDefined();
+    expect(without).not.toContain('visual acceptance evidence capture+upload');
+    expect(without).not.toContain('test:viewport:capture');
+
+    // WITH a visual declaration: the block appears and drives the declared pair.
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+    writeCheckHelper({
+      ...baseCfg,
+      taskId: 'visual-on',
+      visualAcceptance: { component: 'MetricsDashboard', width: 375 },
+    });
+    const withVisual = capturedScripts['/tmp/workspace/check'];
+    expect(withVisual).toBeDefined();
+    // It is a SUCCESS-path block: gated on no failed checks + admin-ui touched.
+    expect(withVisual).toContain('visual acceptance evidence capture+upload (success path)');
+    expect(withVisual).toContain('if [ ${#FAILED[@]} -eq 0 ] && admin_ui_runtime_touched');
+    // Captures via the capture-mode config, scoped to the declared component.
+    expect(withVisual).toContain('npm run test:viewport:capture -- "$_VA_COMPONENT"');
+    expect(withVisual).toContain(`_VA_COMPONENT='MetricsDashboard'`);
+    expect(withVisual).toContain('_VA_WIDTH=375');
+    // Finds the PNG for EXACTLY the declared width.
+    expect(withVisual).toContain('-name "*-${_VA_WIDTH}px.png"');
+    // POSTs {task_id, component, width} to the signed-URL endpoint and PUTs the PNG.
+    expect(withVisual).toContain('/api/agent/viewport/failure-screenshot-upload-url');
+    expect(withVisual).toContain('\\"task_id\\":\\"visual-on\\"');
+    expect(withVisual).toContain('-T "$_VA_PNG" -H "Content-Type: image/png"');
+  });
+
+  it('the generated ./check is byte-identical outside the visual block (block-removal round-trips)', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({ ...baseCfg, taskId: 'visual-id' });
+    const without = capturedScripts['/tmp/workspace/check'];
+
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+    writeCheckHelper({
+      ...baseCfg,
+      taskId: 'visual-id',
+      visualAcceptance: { component: 'TaskCard', width: 768 },
+    });
+    const withVisual = capturedScripts['/tmp/workspace/check'];
+
+    // Splice the visual block back out — the remainder must be byte-for-byte
+    // identical to the no-declaration script (presence-gated, additive only).
+    const start = withVisual.indexOf('\n# ── visual acceptance evidence capture+upload (success path)');
+    const endText = '# ── end visual acceptance evidence capture+upload';
+    const endIdx = withVisual.indexOf(endText);
+    const endOfLine = withVisual.indexOf('\n', endIdx) + 1;
+    expect(start).toBeGreaterThan(-1);
+    expect(endIdx).toBeGreaterThan(-1);
+    const reconstructed = withVisual.slice(0, start) + withVisual.slice(endOfLine);
+    expect(reconstructed).toBe(without);
+  });
+
+  it('the generated ./check with a visual declaration passes `bash -n`', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      ...baseCfg,
+      taskId: 'visual-syntax',
+      visualAcceptance: { component: 'OrchestratorHealthBar', width: 1280 },
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    const { execSync } = await import('child_process');
+    execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
+  });
+
+  it('validateCfgShellSafety rejects an unsafe visual component name', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    expect(() => {
+      writeCheckHelper({
+        ...baseCfg,
+        taskId: 'visual-unsafe',
+        visualAcceptance: { component: "Foo'; rm -rf /", width: 375 },
+      });
+    }).toThrow(/visualAcceptance\.component contains unsafe characters/);
+  });
+
+  it('ignores a visual declaration on a foreign repo (config-less, non-self-repo)', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'visual-foreign',
+      workBranch: 'blueprint/visual-foreign',
+      baseBranch: 'main',
+      owner: 'some-org',
+      repo: 'some-other-repo',
+      testsOnMainBranch: true,
+      visualAcceptance: { component: 'MetricsDashboard', width: 375 },
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    // No Blueprint admin-ui viewport harness on a foreign repo → no capture block.
+    expect(script).not.toContain('visual acceptance evidence capture+upload');
+  });
+
+  it('emits capture block for visual declaration + config-driven stack with admin-ui', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'visual-config-driven',
+      workBranch: 'blueprint/visual-config-driven',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+      visualAcceptance: { component: 'TaskCard', width: 768 },
+      buildConfig: {
+        directories: [
+          { path: 'admin-ui', type: 'node', build_cmd: 'npm run build' },
+          { path: 'backend', type: 'python', build_cmd: 'python -m build' },
+        ],
+      },
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    // Config-driven stack with admin-ui configured → should capture, not skip.
+    expect(script).toContain('visual acceptance evidence capture+upload (success path)');
+    expect(script).toContain("_VA_COMPONENT='TaskCard'");
+    expect(script).toContain('_VA_WIDTH=768');
+    expect(script).toContain('npm run test:viewport:capture');
+    // NOT a skip block.
+    expect(script).not.toContain('visual acceptance declared but');
+  });
+
+  it('emits loud skip for visual declaration + config-driven stack WITHOUT admin-ui', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'visual-config-no-admin-ui',
+      workBranch: 'blueprint/visual-config-no-admin-ui',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+      visualAcceptance: { component: 'SomeComponent', width: 1024 },
+      buildConfig: {
+        directories: [
+          { path: 'backend', type: 'python', build_cmd: 'python -m build' },
+          { path: 'frontend', type: 'node', build_cmd: 'npm run build' },
+        ],
+      },
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    // Config-driven stack WITHOUT admin-ui → should emit loud skip, not capture.
+    expect(script).toContain('visual acceptance declared but admin-ui not configured in build_config');
+    // NOT a capture block.
+    expect(script).not.toContain('visual acceptance evidence capture+upload (success path)');
+    expect(script).not.toContain('npm run test:viewport:capture');
+  });
+
+  it('loud skip message for undeclared visual passes `bash -n` syntax check', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'visual-skip-syntax',
+      workBranch: 'blueprint/visual-skip-syntax',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+      visualAcceptance: { component: 'Panel', width: 768 },
+      buildConfig: {
+        directories: [
+          { path: 'backend', type: 'python' },
+        ],
+      },
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    const { execSync } = await import('child_process');
+    execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
+  });
+
+  it('byte-identical ./check when visual acceptance is not declared (no visual block at all)', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    // Config-driven WITHOUT visual declaration
+    writeCheckHelper({
+      taskId: 'no-visual-id',
+      workBranch: 'blueprint/no-visual-id',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+      buildConfig: {
+        directories: [
+          { path: 'admin-ui', type: 'node', build_cmd: 'npm run build' },
+        ],
+      },
+    });
+    const configDrivenNoVisual = capturedScripts['/tmp/workspace/check'];
+
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+    // Same config WITH visual declaration
+    writeCheckHelper({
+      taskId: 'no-visual-id',
+      workBranch: 'blueprint/no-visual-id',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+      visualAcceptance: { component: 'X', width: 375 },
+      buildConfig: {
+        directories: [
+          { path: 'admin-ui', type: 'node', build_cmd: 'npm run build' },
+        ],
+      },
+    });
+    const configDrivenWithVisual = capturedScripts['/tmp/workspace/check'];
+
+    // Splice out the capture block — remainder must be byte-identical.
+    const start = configDrivenWithVisual.indexOf('\n# ── visual acceptance evidence');
+    const endText = '# ── end visual acceptance evidence';
+    const endIdx = configDrivenWithVisual.indexOf(endText);
+    const endOfLine = configDrivenWithVisual.indexOf('\n', endIdx) + 1;
+    expect(start).toBeGreaterThan(-1);
+    expect(endIdx).toBeGreaterThan(-1);
+    const reconstructed = configDrivenWithVisual.slice(0, start) + configDrivenWithVisual.slice(endOfLine);
+    expect(reconstructed).toBe(configDrivenNoVisual);
+  });
+});
+
 // ── Config-driven pytest gate — sanctioned harness + GATE-ENVIRONMENT ────────
 // Regression guard for the trapped-task bug (22cb9d94 / 6b14ec01, 2026-06-06):
 // a configured bare `pytest` ran verbatim on VMs without the Postgres test

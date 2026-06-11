@@ -53,6 +53,9 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
 )
 from app.failure_classification import (
     CO_DEFERRED_SHELVED,
+    GRADER_CAUSE_REFUSAL,
+    GRADER_TIMEOUT_CAUSES,
+    GRADER_TRANSIENT_INFRA_CAUSES,
     INFRA_CLASSES,
     classify_failure,
 )
@@ -63,6 +66,7 @@ from app.finding_deduplication import (
     extract_archived_diagnoses,
     finding_hash as _finding_hash,
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
+    need_matches_task_lineage,
     normalize_prerequisite,
     resolve_prerequisite_task,
 )
@@ -108,6 +112,8 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
     apply_post_spawn_state,
     direction_saturation_refractory_minutes,
 )
+from app.direction_refractory import stamp_direction_refractory
+from app.direction_mode import normalized_recommended_mode as _normalized_recommended_mode
 from app.source_ref_validation import (
     validate_source_refs,
     resolve_branch_verification_context,
@@ -145,11 +151,6 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
     predict_spawn_success,
     check_scope_budget_mismatch,
     SPEND_BUDGET_APPROVAL_HOLD_REASON,
-)
-from app.task_completion import (
-    _extract_json_array,
-    _ensure_branch,
-    _apply_synthesized_memo,
 )
 from app.task_locking import (
     with_design_doc_locked,
@@ -235,6 +236,11 @@ _SPAWN_GATE_REASONS_SAMPLE_CAP = 5
 _SPAWN_GATE_REASON_MAX_LEN = 200
 _ADVERSARIAL_WHOLESALE_RETRY_KEY = "_adversarial_wholesale_retry_count"
 _ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
+# Targeted retry: used when the non-response cause is time-based (timeout/stall).
+# A reduced-manifest grader is spawned BEFORE falling back to the wholesale retry,
+# so the total grader budget is: initial + at most one targeted + at most one wholesale.
+_ADVERSARIAL_TARGETED_RETRY_KEY = "_adversarial_targeted_retry_count"
+_ADVERSARIAL_TARGETED_RETRY_LIMIT = 1
 
 # Verification-basis tiers, ordered from highest evidence (the finding's claim
 # was checked against real code) to lowest (asserted/deduced). Defined once here
@@ -590,6 +596,8 @@ def _reconcile_reproduce_provenance_state(
 
 def _parse_research_findings(text: str) -> List[Dict[str, Any]] | None:
     """Extract structured research findings JSON array from agent output text."""
+    from app.task_completion import _extract_json_array
+
     json_str = _extract_json_array(text, "title", "prompt")
     if json_str:
         try:
@@ -1203,8 +1211,6 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     if not direction_id or task.project_id is None:
         return
     now_iso = _utcnow().isoformat()
-    sat_refractory_min = direction_saturation_refractory_minutes()
-
     def _apply_no_findings_refractory(dirs: list) -> None:
         target = next((d for d in dirs if d.get("id") == direction_id), None)
         if not target:
@@ -1217,10 +1223,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
         # "No actionable findings" is direct saturation evidence — mark the direction
         # and apply the longer refractory so the portfolio moves on.
         target["possibly_saturated"] = True
-        if isinstance(sat_refractory_min, (int, float)) and sat_refractory_min > 0:
-            target["refractory_until"] = (
-                _utcnow() + timedelta(minutes=float(sat_refractory_min))
-            ).isoformat()
+        stamp_direction_refractory(target)
 
     await with_directions_locked(session, task.project_id, _apply_no_findings_refractory)
 
@@ -1760,6 +1763,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
     _adversarial_verdict_raw = (task.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
     _finding_challenge_verdict = (task.context or {}).get(FINDING_CHALLENGE_VERDICT_KEY)
+
+    # Parked-awaiting guards: re-dispatch while a sidecar verdict is pending is
+    # a safe no-op — return immediately so the spawn loop does not run ungated.
+    # The stranded-sidecar sweep owns redelivery when a sidecar dies silently.
+    if (task.context or {}).get("awaiting_adversarial_grader") and _adversarial_verdict_raw is None:
+        logger.info(
+            "[RESEARCH] Task %s re-dispatched while parked awaiting adversarial "
+            "grader — no-op (verdict not yet present)",
+            task.id,
+        )
+        return
+    if (task.context or {}).get("awaiting_finding_challenge") and _finding_challenge_verdict is None:
+        logger.info(
+            "[RESEARCH] Task %s re-dispatched while parked awaiting finding "
+            "challenge — no-op (verdict not yet present)",
+            task.id,
+        )
+        return
+
     if _grader_verdict is not None and not _grader_verdict.get("passed", False):
         # FAILED forward-quality gate: do NOT spawn implementation tasks and do
         # NOT complete clean. Mark FAILED so the research is not trusted, and
@@ -2241,6 +2263,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     for f in _decayed[:5]
                 ],
             }
+            # Carry the grader non-response cause onto the give-up record when any
+            # adversarial-gate finding was decayed, so a structural give-up driven
+            # by a non-responsive grader is attributable. Observability only.
+            _give_up_cause = (
+                (task.context or {}).get("adversarial_gate_diagnostic") or {}
+            ).get("cause")
+            if _give_up_cause and any(
+                f.get("deferred_reason") == "adversarial_gate" for f in _decayed
+            ):
+                _finding_give_up["adversarial_gate_cause"] = _give_up_cause
         prior_actionable = _kept
         # Stale-targeting: a deferred finding carries the integration HEAD it was
         # generated against. On re-dispatch, ask whether any cited file changed
@@ -2387,6 +2419,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _spawn_gate_parse_outcome = None
     if _adversarial_verdict_raw is not None:
         _spawn_gate_parse_outcome = _adversarial_verdict_raw.get("parse_outcome")
+        # Machine-readable non-response cause from the resolution-time diagnostic
+        # (or the gate record). Stamped onto each unresolved finding below so the
+        # deferred record is attributable. Observability only.
+        _spawn_gate_cause = _adversarial_verdict_raw.get("cause") or (
+            (task.context or {}).get("adversarial_gate_diagnostic") or {}
+        ).get("cause")
         _adv_verdicts: dict[str, dict] = (
             _adversarial_verdict_raw.get("finding_verdicts") or {}
         )
@@ -2413,71 +2451,206 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             and _wholesale_parse_outcome in ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES
         )
         if _wholesale_non_response:
-            _retry_count = int(
-                (task.context or {}).get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) or 0
+            # Dispatch on the diagnosed non-response cause so the retry
+            # strategy matches the failure mode rather than always doing the
+            # same wholesale re-challenge.
+            _cause_category = (
+                (_adversarial_verdict_raw.get("cause") or {}).get("category") or ""
             )
-            if _retry_count < _ADVERSARIAL_WHOLESALE_RETRY_LIMIT:
-                _retry_findings = []
-                for _f in findings:
-                    _fhash = _fh(
-                        str(_f.get("title", "")),
-                        str(_f.get("description", "") or _f.get("prompt", "")),
-                    )
-                    if _fhash in _challenged_hashes_set:
-                        _retry_findings.append({**_f, "hash": _fhash})
-                _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
-                    _retry_findings
+            # _do_wholesale: True means fall through to the existing wholesale
+            # retry logic.  The refusal path sets it False to skip retries.
+            _do_wholesale = True
+
+            if _cause_category in GRADER_TIMEOUT_CAUSES:
+                # The grader ran out of time.  Retry with a reduced manifest
+                # (half the challenged findings) so the next grader is less
+                # likely to time out.  Findings excluded from the reduced set
+                # fail closed via the existing manifest-exclusion path.
+                _targeted_count = int(
+                    (task.context or {}).get(_ADVERSARIAL_TARGETED_RETRY_KEY) or 0
                 )
-                _retry_hashes = [
-                    item["hash"]
-                    for item in _manifest_items
-                    if item.get("hash") in _challenged_hashes_set
-                ]
-                if _retry_hashes:
-                    _ctx = dict(task.context or {})
-                    _ctx.pop(ADVERSARIAL_GATE_VERDICT_KEY, None)
-                    _ctx[_ADVERSARIAL_WHOLESALE_RETRY_KEY] = _retry_count + 1
-                    _ctx["_adversarial_challenged_hashes"] = _retry_hashes
-                    _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
-                        _wholesale_parse_outcome
-                    )
-                    _ctx["research_spawn_gate_challenged_count"] = len(_retry_hashes)
-                    _ctx["research_spawn_gate_refuted_count"] = 0
-                    _ctx["research_spawn_gate_survived_count"] = 0
-                    _ctx["research_spawn_gate_explicit_pass_count"] = 0
-                    _ctx["research_spawn_gate_fail_open_count"] = 0
-                    _ctx["research_spawn_gate_unresolved_count"] = len(_retry_hashes)
-                    _ctx["research_spawn_gate_parse_outcome"] = _wholesale_parse_outcome
-                    task.context = _ctx
-                    flag_modified(task, "context")
-                    session.add(task)
-                    await session.flush()
-                    adv_grader = await spawn_forward_quality_grader(
-                        task,
-                        _manifest_json,
-                        session,
-                        adversarial_mode=True,
-                        finding_hashes=_retry_hashes,
-                    )
-                    if adv_grader is not None:
-                        logger.warning(
-                            "[RESEARCH] Task %s deferred wholesale adversarial "
-                            "non-response (%s) and spawned bounded retry grader %s",
-                            task.id,
-                            _wholesale_parse_outcome,
-                            adv_grader.id,
+                if _targeted_count < _ADVERSARIAL_TARGETED_RETRY_LIMIT:
+                    _half = max(1, len(_challenged_hashes_set) // 2)
+                    _retry_findings = []
+                    for _f in findings:
+                        _fhash = _fh(
+                            str(_f.get("title", "")),
+                            str(_f.get("description", "") or _f.get("prompt", "")),
                         )
-                        return
-                    # If the single-shot guard refuses a retry, continue into the
-                    # fail-closed path; high-stakes work still must not spawn.
-            else:
+                        if (
+                            _fhash in _challenged_hashes_set
+                            and len(_retry_findings) < _half
+                        ):
+                            _retry_findings.append({**_f, "hash": _fhash})
+                    _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
+                        _retry_findings
+                    )
+                    _retry_hashes = [
+                        item["hash"]
+                        for item in _manifest_items
+                        if item.get("hash") in _challenged_hashes_set
+                    ]
+                    if _retry_hashes:
+                        _ctx = dict(task.context or {})
+                        _ctx.pop(ADVERSARIAL_GATE_VERDICT_KEY, None)
+                        _ctx[_ADVERSARIAL_TARGETED_RETRY_KEY] = _targeted_count + 1
+                        # Preserve the original full hash list before narrowing to the
+                        # reduced targeted-retry manifest. The wholesale fallback reads
+                        # this key so a second timeout still challenges all findings
+                        # rather than only the already-reduced subset.
+                        if not _ctx.get("_adversarial_original_challenged_hashes"):
+                            _ctx["_adversarial_original_challenged_hashes"] = list(
+                                _challenged_hashes_set
+                            )
+                        _ctx["_adversarial_challenged_hashes"] = _retry_hashes
+                        _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
+                            _wholesale_parse_outcome
+                        )
+                        _ctx["research_spawn_gate_challenged_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_refuted_count"] = 0
+                        _ctx["research_spawn_gate_survived_count"] = 0
+                        _ctx["research_spawn_gate_explicit_pass_count"] = 0
+                        _ctx["research_spawn_gate_fail_open_count"] = 0
+                        _ctx["research_spawn_gate_unresolved_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_parse_outcome"] = _wholesale_parse_outcome
+                        task.context = _ctx
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.flush()
+                        adv_grader = await spawn_forward_quality_grader(
+                            task,
+                            _manifest_json,
+                            session,
+                            adversarial_mode=True,
+                            finding_hashes=_retry_hashes,
+                        )
+                        if adv_grader is not None:
+                            logger.warning(
+                                "[RESEARCH] Task %s deferred timeout adversarial "
+                                "non-response (%s) and spawned targeted retry "
+                                "grader %s (%d/%d findings in reduced manifest)",
+                                task.id,
+                                _wholesale_parse_outcome,
+                                adv_grader.id,
+                                len(_retry_hashes),
+                                len(_challenged_hashes_set),
+                            )
+                            return
+                        # Single-shot guard blocked spawn; fall through to wholesale.
+                # Targeted retry exhausted or spawn blocked: fall through to
+                # wholesale retry so the cycle still gets one more chance with
+                # the full manifest before deferring everything fail-closed.
+
+            elif _cause_category in GRADER_TRANSIENT_INFRA_CAUSES:
+                # Transient-infra failure (rate-limit, provisioning, etc.):
+                # fall through to wholesale retry with _do_wholesale=True.
+                pass
+
+            elif _cause_category == GRADER_CAUSE_REFUSAL:
+                # The grader completed but explicitly refused to answer.
+                # Re-asking an identical prompt predictably refuses again;
+                # skip all retries and defer fail-closed immediately so the
+                # cycle does not burn extra budget on a known-futile re-ask.
+                logger.warning(
+                    "[RESEARCH] Task %s adversarial grader refused (parse=%s) — "
+                    "skipping retries, all challenged findings deferred fail-closed",
+                    task.id,
+                    _wholesale_parse_outcome,
+                )
                 _ctx = dict(task.context or {})
                 _ctx["research_spawn_gate_wholesale_retry_exhausted"] = True
+                _ctx["research_spawn_gate_refusal_skip_retry"] = True
                 _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
                     _wholesale_parse_outcome
                 )
                 task.context = _ctx
                 flag_modified(task, "context")
+                _do_wholesale = False
+
+            if _do_wholesale:
+                # Transient-infra cause (rate-limit, provisioning, reassignment,
+                # etc.), format miss, unknown, or timeout after targeted retry
+                # exhausted: use the existing wholesale retry (same manifest,
+                # fresh grader), counted against the wholesale budget.
+                _retry_count = int(
+                    (task.context or {}).get(_ADVERSARIAL_WHOLESALE_RETRY_KEY) or 0
+                )
+                if _retry_count < _ADVERSARIAL_WHOLESALE_RETRY_LIMIT:
+                    # If the targeted retry narrowed _adversarial_challenged_hashes to
+                    # a subset, _challenged_hashes_set reflects only that subset here.
+                    # Recover the original full list from the preservation key written
+                    # at targeted-retry spawn time so the wholesale challenge covers all
+                    # originally-challenged findings, not just the reduced half.
+                    _wholesale_original = (task.context or {}).get(
+                        "_adversarial_original_challenged_hashes"
+                    )
+                    _wholesale_hashes_set = (
+                        set(_wholesale_original)
+                        if _wholesale_original
+                        else _challenged_hashes_set
+                    )
+                    _retry_findings = []
+                    for _f in findings:
+                        _fhash = _fh(
+                            str(_f.get("title", "")),
+                            str(_f.get("description", "") or _f.get("prompt", "")),
+                        )
+                        if _fhash in _wholesale_hashes_set:
+                            _retry_findings.append({**_f, "hash": _fhash})
+                    _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
+                        _retry_findings
+                    )
+                    _retry_hashes = [
+                        item["hash"]
+                        for item in _manifest_items
+                        if item.get("hash") in _wholesale_hashes_set
+                    ]
+                    if _retry_hashes:
+                        _ctx = dict(task.context or {})
+                        _ctx.pop(ADVERSARIAL_GATE_VERDICT_KEY, None)
+                        _ctx.pop("_adversarial_original_challenged_hashes", None)
+                        _ctx[_ADVERSARIAL_WHOLESALE_RETRY_KEY] = _retry_count + 1
+                        _ctx["_adversarial_challenged_hashes"] = _retry_hashes
+                        _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
+                            _wholesale_parse_outcome
+                        )
+                        _ctx["research_spawn_gate_challenged_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_refuted_count"] = 0
+                        _ctx["research_spawn_gate_survived_count"] = 0
+                        _ctx["research_spawn_gate_explicit_pass_count"] = 0
+                        _ctx["research_spawn_gate_fail_open_count"] = 0
+                        _ctx["research_spawn_gate_unresolved_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_parse_outcome"] = _wholesale_parse_outcome
+                        task.context = _ctx
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.flush()
+                        adv_grader = await spawn_forward_quality_grader(
+                            task,
+                            _manifest_json,
+                            session,
+                            adversarial_mode=True,
+                            finding_hashes=_retry_hashes,
+                        )
+                        if adv_grader is not None:
+                            logger.warning(
+                                "[RESEARCH] Task %s deferred wholesale adversarial "
+                                "non-response (%s) and spawned bounded retry grader %s",
+                                task.id,
+                                _wholesale_parse_outcome,
+                                adv_grader.id,
+                            )
+                            return
+                        # If the single-shot guard refuses a retry, continue into the
+                        # fail-closed path; high-stakes work still must not spawn.
+                else:
+                    _ctx = dict(task.context or {})
+                    _ctx["research_spawn_gate_wholesale_retry_exhausted"] = True
+                    _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
+                        _wholesale_parse_outcome
+                    )
+                    task.context = _ctx
+                    flag_modified(task, "context")
 
         for _f in findings:
             _fhash = _fh(
@@ -2552,6 +2725,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         or _reason
                         or "fail-closed: no verdict returned for this finding"
                     )
+                    # Attribute the unresolved finding to the grader non-response
+                    # cause so the deferred record carries WHY, not just WHAT.
+                    if _spawn_gate_cause:
+                        _f["_adversarial_verdict_cause"] = _spawn_gate_cause
             _f["_adversarial_verdict_reason"] = _reason
             _f["_adversarial_verdict_explicit"] = _explicit
         # Bound counters to findings that were actually in the challenge manifest.
@@ -2728,6 +2905,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
     # On success, returns the freshly-locked Task (caller mutates under
     # the new lock). On failure or peer-mutation defer, returns None.
+    from app.task_completion import _ensure_branch
+
     relocked = await _ensure_branch(
         task, research_branch, original_base, "RESEARCH", session
     )
@@ -3082,6 +3261,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _adversarial_gate_deferred: list[dict] = []
     _low_conf_skipped_findings: list[dict] = []
     _scope_skip_counts: dict[str, int] = {}
+
+    # Persist research-audit knowledge document when the direction is in audit/measurement
+    # mode. This runs before the spawn loop so the document is durable even if all findings
+    # are deduped away. Best-effort: a failure never blocks the spawn loop.
+    _audit_direction_id = (task.context or {}).get("direction_id")
+    _audit_direction: dict | None = None
+    if _audit_direction_id and project_obj is not None:
+        _audit_direction = next(
+            (d for d in (project_obj.directions or []) if d.get("id") == _audit_direction_id),
+            None,
+        )
+    if _normalized_recommended_mode(_audit_direction) == "audit" and (findings or insights):
+        try:
+            from app.knowledge_completion import persist_research_audit_document
+
+            await persist_research_audit_document(
+                task, findings, insights, _audit_direction, session
+            )
+        except Exception:  # noqa: BLE001 — best-effort; must not block spawn loop
+            logger.warning(
+                "[RESEARCH] Failed to persist research-audit knowledge doc for task %s",
+                task.id,
+                exc_info=True,
+            )
 
     # Create all child tasks — no wave dependencies, priority ordering handles dispatch order
     child_tasks = []
@@ -4255,6 +4458,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _acceptance_evidence = parse_acceptance_evidence(
             finding.get("acceptance_evidence")
         )
+        _finding_lineage = {
+            str(v).strip().lower()
+            for v in (
+                fhash,
+                finding.get("finding_hash"),
+                _finding_hash(
+                    str(finding.get("title", title) or ""),
+                    str(
+                        finding.get("description", finding.get("prompt", "")) or ""
+                    ),
+                ),
+            )
+            if isinstance(v, str) and v.strip()
+        }
         new_task = Task(
             project_id=task.project_id,
             title=title,
@@ -4273,6 +4490,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_depth": research_depth + 1,
                 "related_files": related_files,
                 "finding_hash": fhash,
+                "finding_lineage": sorted(_finding_lineage),
                 **(
                     {"acceptance_evidence": _acceptance_evidence}
                     if _acceptance_evidence
@@ -4522,6 +4740,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # missing-verdict deferral to its challenger task without opening each one.
     _adv_diagnostic = (task.context or {}).get("adversarial_gate_diagnostic") or {}
     _adv_challenger_id = str(_adv_diagnostic.get("challenger_task_id") or "").strip() or None
+    # Machine-readable cause (taxonomy class / refusal / format-miss + optional
+    # stale-image tag) for the grader non-response, lifted from the resolution-
+    # time diagnostic so each deferred finding is attributable without opening
+    # the challenger task. Observability only.
+    _adv_cause = _adv_diagnostic.get("cause") if isinstance(_adv_diagnostic, dict) else None
     for _adf in _adversarial_gate_deferred:
         _adf_stamped = _stamp_deferral(_adf, "adversarial_gate")
         # Re-key the finding_hash the SAME way adversarial verdicts are keyed
@@ -4539,6 +4762,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _adf_stamped["adversarial_gate_reason"] = _gate_reason
         if _adv_challenger_id:
             _adf_stamped["adversarial_challenger_task_id"] = _adv_challenger_id
+        if _adv_cause:
+            _adf_stamped["adversarial_gate_cause"] = _adv_cause
         _adv_deferred_stamped.append(_adf_stamped)
 
     _all_deferred = (
@@ -4630,6 +4855,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         session.add(_memo_task)
         try:
+            from app.task_completion import _apply_synthesized_memo
+
             _synth = _synthesize_deferred_finding_memo(
                 _memo_payload.get("source_finding") or {},
                 _drop_reason,
@@ -4724,6 +4951,27 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ctx["research_spawn_gate_refuted_reasons"] = _spawn_gate_refuted_reasons
             if _spawn_gate_parse_outcome:
                 ctx["research_spawn_gate_parse_outcome"] = _spawn_gate_parse_outcome
+            # Per-cycle machine-readable cause export (additive observability):
+            # surfaces the grader non-response WHY (taxonomy class / refusal /
+            # format-miss + optional stale-image tag) alongside the existing
+            # spawn-gate metrics so a downstream consumer can plumb it into
+            # research_history. `research_spawn_gate_cause` is the cause object;
+            # `research_spawn_gate_cause_counts` maps its category to the number
+            # of unresolved findings it accounts for this cycle.
+            _cycle_cause = (
+                ctx.get("adversarial_gate_diagnostic") or {}
+            ).get("cause")
+            if _cycle_cause:
+                ctx["research_spawn_gate_cause"] = _cycle_cause
+                _cause_category = (
+                    _cycle_cause.get("category")
+                    if isinstance(_cycle_cause, dict)
+                    else None
+                )
+                if _cause_category:
+                    ctx["research_spawn_gate_cause_counts"] = {
+                        _cause_category: _spawn_gate_unresolved_count
+                    }
         if _spawn_gate_manifest_excluded_count:
             ctx["research_spawn_gate_manifest_excluded_fail_closed_count"] = (
                 _spawn_gate_manifest_excluded_count
@@ -4860,6 +5108,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _working_registry_caps = working_capability_names(
         getattr(project_obj, "problem_model", None)
     )
+    # Prerequisites already satisfied by SHIPPED prior-cycle work or a durable
+    # knowledge document are resolved at spawn time too — the completed-foundation
+    # and knowledge rungs the BLOCKED-resume sweep applies
+    # (reaper_sweeps._resolve_blocked_task_needs) but the spawn-time provider
+    # universe (active tasks + same-cycle siblings, built above) OMITS. Without
+    # them a task-kind prerequisite whose only provider is a COMPLETED+merged
+    # foundation is mis-routed to CANCEL ("no_live_or_deferred_provider"), so the
+    # dependent — runnable all along — is permanently discarded and deterministically
+    # re-cancelled on every re-discovery. recent_tasks_for_dedup already holds the
+    # 90-day same-project COMPLETED rows; completed_foundation_for_need re-applies
+    # the shipped gate (pr_merged + non-ghost via failed_parent_ids).
+    from app.blocked_need_resolution import (
+        completed_foundation_for_need,
+        knowledge_substance_satisfies_need,
+    )
+    from app.knowledge_query import fetch_knowledge_substance_index
+
+    _completed_foundations = [
+        t for t in recent_tasks_for_dedup if t.status == TaskStatus.COMPLETED
+    ]
+    _knowledge_substance_index = await fetch_knowledge_substance_index(
+        session, task.project_id
+    )
     # Identities (kind, ref) that a finding deferred THIS cycle would satisfy. A
     # dependent blocked on one of these sits live-blocked behind dormant data: the
     # deferred foundation is not a real task, so nothing can satisfy the need until
@@ -4877,6 +5148,42 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if isinstance(_dcap, str) and _dcap.strip():
             _deferred_identities.add(("capability", _dcap.strip()))
     _codeferred_findings: list[dict] = []
+
+    def _wire_prerequisite_edge(
+        dependent: Task,
+        foundation: Task,
+        *,
+        finding_title: str,
+        prereq_label: str,
+    ) -> bool:
+        if foundation.id == dependent.id:
+            return False
+        if _would_create_cycle(dependent, foundation, _prereq_candidates):
+            logger.warning(
+                "[RESEARCH] Finding '%s' prerequisite %s resolved to foundation %s "
+                "but the edge would close a depends_on cycle — refused at spawn "
+                "(no edge)",
+                finding_title,
+                prereq_label,
+                foundation.id,
+            )
+            return False
+        foundation_id = str(foundation.id)
+        existing_dep = list(dependent.depends_on or [])
+        if foundation_id not in existing_dep:
+            existing_dep.append(foundation_id)
+            dependent.depends_on = existing_dep
+            remember_structural_depends_on(dependent, foundation_id)
+            session.add(dependent)
+            logger.info(
+                "[RESEARCH] Wired finding '%s' depends_on foundation %s "
+                "(prerequisite %s)",
+                finding_title,
+                foundation_id,
+                prereq_label,
+            )
+        return True
+
     for ci, ct in enumerate(child_tasks):
         fi = finding_indices[ci]
         finding_title = findings[fi].get("title", f"#{fi}")
@@ -4896,6 +5203,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # below (that path is correct); only the unresolved remainder becomes needs.
         needs: list = []
         unresolved_entries: list = []
+        structurally_dead_entries: list = []
 
         dep_indices = findings[fi].get("depends_on_indices", [])
         missing_dep_indices = [j for j in dep_indices if j not in finding_to_child]
@@ -4911,6 +5219,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 continue
             missing_finding = findings[missing_fi]
             missing_title = missing_finding.get("title", f"#{missing_fi}")
+            missing_type = str(missing_finding.get("type") or "")
+            missing_label = str(missing_title or "")
+            if (
+                missing_type in _NON_SPAWNING_FINDING_TYPES
+                or missing_label.lower().startswith("obs:")
+            ):
+                structurally_dead_entries.append(
+                    {
+                        "finding_index": missing_fi,
+                        "title": missing_title,
+                        "type": missing_type or None,
+                        "reason": "non_spawning_finding",
+                    }
+                )
+                continue
             missing_hash = _finding_hash(
                 str(missing_title),
                 str(
@@ -4920,6 +5243,39 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     or ""
                 ),
             )
+            lineage_need = {"kind": "task", "ref": missing_hash}
+            same_batch_foundation = next(
+                (
+                    candidate
+                    for candidate in child_tasks
+                    if need_matches_task_lineage(lineage_need, candidate)
+                ),
+                None,
+            )
+            if same_batch_foundation is not None and same_batch_foundation.id != ct.id:
+                _wire_prerequisite_edge(
+                    ct,
+                    same_batch_foundation,
+                    finding_title=finding_title,
+                    prereq_label=f"task:{missing_hash}",
+                )
+                continue
+            # Not in same-batch spawns — check existing in-flight / recently-completed
+            # foundations the same way the explicit-prerequisite path does. A sibling
+            # dropped by deduplicate_findings (deduped against an existing task) leaves
+            # its dependents with a missing_dep_indices entry whose hash matches that
+            # existing task exactly. Wire an edge rather than creating a dead need.
+            existing_foundation = resolve_prerequisite_task(
+                lineage_need, _prereq_candidates
+            )
+            if existing_foundation is not None and existing_foundation.id != ct.id:
+                _wire_prerequisite_edge(
+                    ct,
+                    existing_foundation,
+                    finding_title=finding_title,
+                    prereq_label=f"task:{missing_hash}",
+                )
+                continue
             unresolved_entries.append(
                 {
                     "finding_index": missing_fi,
@@ -4939,32 +5295,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if prereq:
             foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
             if foundation is not None and foundation.id != ct.id:
-                if _would_create_cycle(ct, foundation, _prereq_candidates):
-                    logger.warning(
-                        "[RESEARCH] Finding '%s' prerequisite %s:%s resolved to "
-                        "foundation %s but the edge would close a depends_on cycle "
-                        "— refused at spawn (no edge)",
-                        finding_title,
-                        prereq.get("kind"),
-                        prereq.get("ref"),
-                        foundation.id,
-                    )
-                else:
-                    foundation_id = str(foundation.id)
-                    existing_dep = list(ct.depends_on or [])
-                    if foundation_id not in existing_dep:
-                        existing_dep.append(foundation_id)
-                        ct.depends_on = existing_dep
-                        remember_structural_depends_on(ct, foundation_id)
-                        session.add(ct)
-                        logger.info(
-                            "[RESEARCH] Wired finding '%s' depends_on foundation %s "
-                            "(prerequisite %s:%s)",
-                            finding_title,
-                            foundation_id,
-                            prereq.get("kind"),
-                            prereq.get("ref"),
-                        )
+                _wire_prerequisite_edge(
+                    ct,
+                    foundation,
+                    finding_title=finding_title,
+                    prereq_label=f"{prereq.get('kind')}:{prereq.get('ref')}",
+                )
             elif foundation is None:
                 # Unresolved explicit prerequisite: a finding declared an explicit
                 # {kind, ref} foundation it must build on, but no in-flight or
@@ -5006,7 +5342,110 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     deduped_needs.append(need)
             needs = deduped_needs
 
+        # Drop needs already satisfied by a SHIPPED COMPLETED foundation or a
+        # durable knowledge document — the completed-foundation/knowledge rungs the
+        # spawn-time provider universe omits (see _completed_foundations /
+        # _knowledge_substance_index above). A task-kind need satisfied here was
+        # runnable all along, so it must NOT cancel or block the dependent;
+        # capability needs are already covered by the working registry and never
+        # reach this filter. If this empties `needs`, the dependent spawns runnable
+        # via the `if not needs` guard below (resume-with-no-edge semantics).
+        if needs:
+            _satisfied_keys = set()
+            for _need in needs:
+                if not (isinstance(_need, dict) and _need.get("kind") == "task"):
+                    continue
+                if (
+                    completed_foundation_for_need(
+                        ct, _need, _completed_foundations, failed_parent_ids
+                    )
+                    is not None
+                    or knowledge_substance_satisfies_need(
+                        _need, _knowledge_substance_index
+                    )
+                ):
+                    _satisfied_keys.add((_need.get("kind"), _need.get("ref")))
+            if _satisfied_keys:
+                for _k in _satisfied_keys:
+                    logger.info(
+                        "[RESEARCH] Finding '%s' prerequisite %s:%s already satisfied "
+                        "by shipped COMPLETED foundation or knowledge document — "
+                        "resolved at spawn (no gate)",
+                        finding_title,
+                        _k[0],
+                        _k[1],
+                    )
+                needs = [
+                    n
+                    for n in needs
+                    if (n.get("kind"), n.get("ref")) not in _satisfied_keys
+                ]
+
         if not needs:
+            if structurally_dead_entries:
+                ctx = dict(ct.context or {})
+                ctx["unresolved_prerequisite"] = (
+                    list(ctx.get("unresolved_prerequisite") or [])
+                    + structurally_dead_entries
+                )
+                ctx["prerequisite_escalated_to_parent"] = True
+                ctx["prerequisite_escalation_reason"] = "structurally_unresolvable"
+                ct.context = ctx
+                flag_modified(ct, "context")
+                ct.status = TaskStatus.CANCELLED
+                ct.latest_status_message = (
+                    f"Escalated to parent: finding '{finding_title}' declared only "
+                    "structurally unresolvable prerequisite(s)."
+                )[:500]
+                session.add(ct)
+                logger.warning(
+                    "[RESEARCH] Finding '%s' escalated to parent instead of BLOCKED "
+                    "on structurally unresolvable prerequisite(s): %s",
+                    finding_title,
+                    structurally_dead_entries,
+                )
+            continue
+
+        live_need_keys = {
+            (n.get("kind"), n.get("ref"))
+            for n in needs
+            if isinstance(n, dict)
+            and not (
+                n.get("kind") == "task"
+                and (n.get("kind"), n.get("ref")) not in _deferred_identities
+            )
+        }
+        dead_task_needs = [
+            n
+            for n in needs
+            if isinstance(n, dict)
+            and n.get("kind") == "task"
+            and (n.get("kind"), n.get("ref")) not in _deferred_identities
+        ]
+        if dead_task_needs and not live_need_keys:
+            ctx = dict(ct.context or {})
+            existing_unresolved = ctx.get("unresolved_prerequisite") or []
+            if not isinstance(existing_unresolved, list):
+                existing_unresolved = [existing_unresolved]
+            existing_unresolved.extend(unresolved_entries)
+            existing_unresolved.extend(structurally_dead_entries)
+            ctx["unresolved_prerequisite"] = existing_unresolved
+            ctx["prerequisite_escalated_to_parent"] = True
+            ctx["prerequisite_escalation_reason"] = "no_live_or_deferred_provider"
+            ct.context = ctx
+            flag_modified(ct, "context")
+            ct.status = TaskStatus.CANCELLED
+            ct.latest_status_message = (
+                f"Escalated to parent: finding '{finding_title}' declared task "
+                "prerequisite(s) with no spawned, deferred, or in-flight provider."
+            )[:500]
+            session.add(ct)
+            logger.warning(
+                "[RESEARCH] Finding '%s' escalated to parent instead of BLOCKED "
+                "on dead task prerequisite(s): %s",
+                finding_title,
+                ", ".join(f"{n['kind']}:{n['ref']}" for n in dead_task_needs),
+            )
             continue
 
         # Co-defer a dependent whose foundation was deferred THIS cycle. Leaving it
@@ -5233,6 +5672,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await with_directions_locked(session, task.project_id, _update_productivity)
         await session.commit()
 
+        def _stamp_refractory(dirs: list) -> None:
+            for d in dirs:
+                if d.get("id") in touched_dir_ids:
+                    stamp_direction_refractory(d)
+
+        await with_directions_locked(session, task.project_id, _stamp_refractory)
+        await session.commit()
+
     # Credit playbook entries shown to this research agent when research succeeded.
     # followed_count tracks how many times each entry was seen by a successful research agent,
     # giving a denominator for per-entry success rates used by the archival ranker.
@@ -5311,6 +5758,7 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             target["consecutive_unproductive_cycles"] = (
                 int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
             )
+        stamp_direction_refractory(target)
 
     await with_directions_locked(session, task.project_id, _record_failure)
     if _found:

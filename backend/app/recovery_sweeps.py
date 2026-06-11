@@ -22,6 +22,7 @@ module object so that test patches against ``app.services.<name>`` (e.g.
 
 import asyncio
 import contextlib
+import hashlib as _hashlib
 import json
 import logging
 import re
@@ -2633,6 +2634,31 @@ async def _sweep_post_commit_pending():
                 # DUPLICATE children. A childed EVALUATING parent is a normal
                 # parked parent whose marker is stale; clear it without re-run.
                 if task.status == TaskStatus.EVALUATING:
+                    # Parked-awaiting sidecar guard: an EVALUATING task that holds
+                    # an awaiting_* key is intentionally parked waiting for a
+                    # side-car verdict — it is NOT a dead childless handler. The
+                    # stranded-sidecar sweep owns redelivery when the sidecar dies.
+                    # Clear the stale post_commit_pending flag without re-running.
+                    _awaiting_sidecar = any(
+                        ctx.get(k) for k in _AWAITING_SIDECAR_KEYS
+                    )
+                    if _awaiting_sidecar:
+                        logger.info(
+                            f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} is "
+                            f"EVALUATING and parked awaiting sidecar — clearing "
+                            f"stale pending marker without re-run"
+                        )
+                        from sqlalchemy.orm.attributes import flag_modified as _fm2
+
+                        new_ctx = dict(ctx)
+                        new_ctx.pop("_post_commit_pending_meta", None)
+                        task.context = new_ctx
+                        task.post_commit_pending = False
+                        _fm2(task, "context")
+                        session.add(task)
+                        await session.commit()
+                        continue
+
                     child_count = (
                         await session.execute(
                             select(func.count())
@@ -3526,6 +3552,7 @@ _AWAITING_SIDECAR_KEYS = (
     "awaiting_finding_challenge",
     "awaiting_review_second_opinion",
 )
+_SIDECAR_VERDICT_APPLICATION_PENDING_KEY = "sidecar_verdict_application_pending"
 
 
 async def _sweep_stranded_sidecar_sources() -> None:
@@ -3541,7 +3568,9 @@ async def _sweep_stranded_sidecar_sources() -> None:
     (post-spawn; initial value is ``True``), loads each referenced sidecar, and,
     if the sidecar is terminal (FAILED/CANCELLED), calls the lane resolver via
     ``trigger_stranded_sidecar_resolution``, which constructs a synthetic payload
-    and invokes the resolver with existing fail-closed semantics.
+    and invokes the resolver with existing fail-closed semantics. It also retries
+    terminal source tasks that already recorded a side-car verdict but still carry
+    the durable application-pending marker.
     """
     import uuid as _uuid
 
@@ -3592,6 +3621,75 @@ async def _sweep_stranded_sidecar_sources() -> None:
                 logger.info(
                     "[SIDECAR-RECOVERY] Resolved %d stranded source task(s)", resolved
                 )
+
+            if resolve_dialect_name(session) == "postgresql":
+                pending_marker_present = Task.context.has_key(
+                    _SIDECAR_VERDICT_APPLICATION_PENDING_KEY
+                )
+            else:
+                pending_marker_present = func.json_extract(
+                    Task.context,
+                    f"$.{_SIDECAR_VERDICT_APPLICATION_PENDING_KEY}",
+                ).isnot(None)
+
+            pending_result = await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.archived,
+                        Task.project_id,
+                        Task.context,
+                    )
+                )
+                .where(
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.archived.is_(False),
+                    pending_marker_present,
+                )
+            )
+            terminal_sources = pending_result.scalars().all()
+            retried = 0
+            for source in terminal_sources:
+                ctx = source.context or {}
+                marker = ctx.get(_SIDECAR_VERDICT_APPLICATION_PENDING_KEY)
+                if not isinstance(marker, dict):
+                    continue
+                sidecar_ref = marker.get("sidecar_task_id")
+                try:
+                    sidecar_uuid = _uuid.UUID(str(sidecar_ref))
+                except (ValueError, TypeError):
+                    continue
+                sidecar = await session.get(Task, sidecar_uuid)
+                if sidecar is None or sidecar.status not in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }:
+                    continue
+                logger.warning(
+                    "[SIDECAR-RECOVERY] Source %s has unapplied side-car verdict "
+                    "(lane=%s sidecar=%s status=%s) — retrying application",
+                    source.id,
+                    marker.get("lane"),
+                    sidecar.id,
+                    sidecar.status,
+                )
+                try:
+                    await trigger_stranded_sidecar_resolution(sidecar, session)
+                    retried += 1
+                except Exception:
+                    logger.exception(
+                        "[SIDECAR-RECOVERY] Application retry failed for sidecar %s / source %s",
+                        sidecar.id,
+                        source.id,
+                    )
+            if retried:
+                logger.info(
+                    "[SIDECAR-RECOVERY] Retried %d unapplied side-car verdict(s)",
+                    retried,
+                )
     except Exception:
         logger.exception("[SIDECAR-RECOVERY] Stranded-sidecar sweep failed")
 
@@ -3599,6 +3697,39 @@ async def _sweep_stranded_sidecar_sources() -> None:
 # ── Bootstrap recovery sweep ───────────────────────────────────────────────────
 
 _BOOTSTRAP_SWEEP_BATCH_SIZE = 20
+
+
+def _bootstrap_spawn_lock_key(project_id: object) -> int:
+    """Stable 31-bit advisory-lock key for a project's bootstrap spawn.
+
+    Uses SHA-256 (not Python hash()) because hash() is PYTHONHASHSEED-salted
+    and two orchestrator processes compute DIFFERENT keys for the same project —
+    the advisory lock would never exclude anything across instances.
+    """
+    digest = _hashlib.sha256(f"bootstrap_spawn:{project_id}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") % (2**31)
+
+
+async def _try_bootstrap_spawn_advisory_lock(session, project_id: object) -> bool:
+    """Try to take the per-project bootstrap-spawn advisory lock (Postgres).
+
+    Transaction-scoped (``pg_try_advisory_xact_lock``) so it is released when
+    the transaction commits or rolls back. Best-effort: reduces duplicate
+    work between concurrently-ticking orchestrator instances. Non-Postgres
+    dialects (tests) report no contention and always return True.
+    """
+    from sqlalchemy import text as _sql_text
+
+    try:
+        got = (
+            await session.execute(
+                _sql_text("SELECT pg_try_advisory_xact_lock(:k)"),
+                {"k": _bootstrap_spawn_lock_key(project_id)},
+            )
+        ).scalar()
+    except Exception:
+        return True
+    return bool(got)
 
 
 async def _sweep_bootstrap_recovery() -> None:
@@ -3610,7 +3741,11 @@ async def _sweep_bootstrap_recovery() -> None:
 
     The sweep is bounded and idempotent: the shared spawn_bootstrap_task helper
     refuses to create a duplicate when one is already active, so repeated ticks
-    never pile up duplicate tasks.
+    never pile up duplicate tasks. A per-project transaction-scoped advisory
+    lock (``pg_try_advisory_xact_lock``) further guards against the non-atomic
+    check-then-act race that lets two concurrent orchestrator instances both
+    find no active task and both spawn one in the same second (mirrors the
+    strategic double-spawn fix, PR #8927).
     """
     from app.models import Project
     from app.repo_bootstrap import spawn_bootstrap_task
@@ -3655,6 +3790,20 @@ async def _sweep_bootstrap_recovery() -> None:
 
             spawned = 0
             for project in candidates:
+                # Per-project advisory lock guards the non-atomic check-then-act:
+                # two concurrent orchestrator instances may both read "no active
+                # task" before either's spawn commits, then both insert a duplicate.
+                # The transaction-scoped lock serialises spawns per project so only
+                # one instance wins; the other sees "already_active" on its next
+                # spawn_bootstrap_task call and skips. Non-Postgres (tests) returns
+                # True (no contention) so test behaviour is unchanged.
+                if not await _try_bootstrap_spawn_advisory_lock(session, project.id):
+                    logger.debug(
+                        "[BOOTSTRAP-RECOVERY] Another instance holds bootstrap lock "
+                        "for project %s — skipping this tick",
+                        project.id,
+                    )
+                    continue
                 spawn_result = await spawn_bootstrap_task(
                     project,
                     session,

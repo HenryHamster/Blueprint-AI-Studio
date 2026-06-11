@@ -231,6 +231,25 @@ describe('DirectionCard — viewport regression', () => {
     });
   });
 
+  test('recent research history does not disable research without a refractory hold', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<DirectionCard {...noopProps} direction={richDirection} />);
+    });
+    const researchButton = Array.from(host.querySelectorAll('button')).find(
+      button => button.textContent === 'Research',
+    ) as HTMLButtonElement | undefined;
+    expect(researchButton).toBeTruthy();
+    expect(researchButton?.disabled).toBe(false);
+    expect(researchButton?.title).toBe('Trigger research for this direction');
+    expect(host.querySelector('button[title="Force research (bypass cooldown)"]')).toBeNull();
+    expect(host.textContent).toContain('Last researched');
+  });
+
   test('staged direction renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');

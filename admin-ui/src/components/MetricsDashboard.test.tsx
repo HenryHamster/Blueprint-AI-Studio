@@ -3,9 +3,36 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { act } from 'react';
 import MetricsDashboard from './MetricsDashboard';
 import type { Task } from '../types/task';
+import { __pollerInternals } from '../hooks/usePoller';
 
 const { apiFetch } = vi.hoisted(() => ({
   apiFetch: vi.fn(async (url: string) => {
+    if (url.includes('/lane-diag')) {
+      return new Response(JSON.stringify({
+        pr_count: 5,
+        task_count: 20,
+        truncated: false,
+        pr_breakdown_limit: 100,
+        pr_breakdown_truncated: false,
+        window_days: 7,
+        window_start: '2026-04-17T12:00:00Z',
+        project_id: 'project-1',
+        max_tasks: 5000,
+        relay_counts_by_lane: { LANE_CI: 3, LANE_CONFLICT: 1, LANE_REVIEW_CONVERGENCE: 2, LANE_ARBITRATION: 0 },
+        lane_iteration_distribution: {},
+        per_pr_phase_breakdown: [],
+        lane_waste: {
+          waste_taxonomy: { infra: 2, merge_conflict: 1, ci_churn: 3, review_ambiguity: 0, lost_reasoning: 1, unknown: 0 },
+          waste_task_count: 7,
+          cap_counted_task_count: 7,
+          cap_excluded_task_count: 0,
+          chain_count: 4,
+          cap_exhausted_chain_count: 0,
+          chain_limit: 50,
+          chains_truncated: false,
+        },
+      }), { status: 200 });
+    }
     if (url.includes('/task-cost-breakdown')) {
       return new Response(JSON.stringify({
         project_id: 'project-1',
@@ -40,6 +67,14 @@ const { apiFetch } = vi.hoisted(() => ({
             estimated_cost_usd: 7.0,
           },
         ],
+      }), { status: 200 });
+    }
+    if (url.includes('/digest-latency-stats')) {
+      return new Response(JSON.stringify({
+        latency_percentiles: { p50_seconds: 0.42, p95_seconds: 1.87, sample_n: 12 },
+        tier_counts: { l1_precompute: 7, l2_shared_cache: 3, l3_on_demand: 2 },
+        total_served: 12,
+        instance_note: 'per-instance aggregate; does not sum across replicas',
       }), { status: 200 });
     }
     return new Response(JSON.stringify({
@@ -106,9 +141,11 @@ describe('MetricsDashboard', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-04-24T12:00:00Z'));
     apiFetch.mockClear();
+    __pollerInternals.reset();
   });
 
   afterEach(() => {
+    __pollerInternals.reset();
     vi.useRealTimers();
   });
 
@@ -165,6 +202,32 @@ describe('MetricsDashboard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '6h' }));
     expect(onWindowChange).toHaveBeenCalledWith('6h');
+  });
+
+  it('renders digest latency p50/p95, tier mix, and per-instance caveat', async () => {
+    render(
+      <MetricsDashboard
+        metricsHistory={[]}
+        cumulativeCost={0}
+        cumulativeVmHours={0}
+        maxConcurrentVMs={4}
+        tasks={[]}
+        metricsWindow="1h"
+        onWindowChange={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('Digest Latency')).toBeInTheDocument();
+    expect(screen.getByText('0.42s')).toBeInTheDocument();
+    expect(screen.getByText('1.87s')).toBeInTheDocument();
+    expect(screen.getByText('7 | 58%')).toBeInTheDocument();
+    expect(screen.getByText('3 | 25%')).toBeInTheDocument();
+    expect(screen.getByText('2 | 17%')).toBeInTheDocument();
+    expect(screen.getByTestId('digest-latency-caveat')).toHaveTextContent('per-instance aggregate');
   });
 
   it('exports the currently filtered metric series as CSV and JSON', () => {

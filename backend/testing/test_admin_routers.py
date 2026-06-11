@@ -4897,6 +4897,31 @@ class TestNotificationConfigSettings:
             assert bad.status_code == 400, f"{bad_val!r} should be rejected"
 
     @pytest.mark.asyncio
+    async def test_deploy_identity_resolved_in_settings(
+        self, client: AsyncClient, monkeypatch
+    ):
+        """GET /api/admin/settings exposes deploy_identity_resolved — the actual
+        resolved identity (env var + runtime_config override), not just the
+        runtime_config value.  Operators use this to confirm that deploy-level
+        serving confirmation is active/inactive."""
+        # Without env var or runtime_config override, identity is unresolved.
+        monkeypatch.delenv("DEPLOY_REPO_IDENTITY", raising=False)
+        resp = await client.get("/api/admin/settings")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "deploy_identity_resolved" in data
+        assert data["deploy_identity_resolved"] is None
+
+        # Setting runtime_config makes it resolvable.
+        await client.patch(
+            "/api/admin/settings", json={"deploy_repo_identity": "acme/widget"}
+        )
+        resp = await client.get("/api/admin/settings")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deploy_identity_resolved"] == "acme/widget"
+
+    @pytest.mark.asyncio
     async def test_patch_warm_continuity_enabled(self, client: AsyncClient):
         """warm_continuity_enabled accepts booleans and rejects non-booleans; round-trips on GET."""
         resp = await client.patch(
@@ -5009,6 +5034,103 @@ class TestNotificationConfigSettings:
             "/api/admin/settings", json={"rollup_merge_queue_enabled": 0}
         )
         assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_capability_holdback_fractions_round_trip_and_persist(
+        self, client: AsyncClient, db_session
+    ):
+        """The three capability holdback fractions must PATCH, surface in GET,
+        and persist into DeploymentState.runtime_config_json.
+
+        Regression: PATCH previously rejected the keys via _KNOWN_SETTINGS_KEYS,
+        so operators could not tune the rollout holdback for the three assigned
+        capability trials from the admin settings API.
+        """
+        from app.models import DeploymentState
+
+        payload = {
+            "module_interfaces_holdback_fraction": 0.125,
+            "related_tests_holdback_fraction": 0.25,
+            "affected_consumers_holdback_fraction": 0.375,
+        }
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch("/api/admin/settings", json=payload)
+        assert resp.status_code == 200, resp.text
+
+        get_resp = await client.get("/api/admin/settings")
+        body = get_resp.json()
+        for key, expected in payload.items():
+            assert body[key] == expected
+
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        for key, expected in payload.items():
+            assert row.runtime_config_json[key] == expected
+
+    @pytest.mark.asyncio
+    async def test_patch_direction_refractory_settings_round_trip_and_fallback(
+        self, client: AsyncClient, db_session
+    ):
+        """Direction refractory settings PATCH, surface in GET, persist, and fall back to cooldown when cleared."""
+        from app.models import DeploymentState
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        payload = {
+            "autonomous_direction_cooldown_minutes": 240,
+            "direction_refractory_minutes": 180,
+            "direction_saturation_refractory_minutes": 360,
+        }
+
+        resp = await client.patch("/api/admin/settings", json=payload)
+        assert resp.status_code == 200, resp.text
+
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["direction_refractory_minutes"] == 180
+        assert body["direction_saturation_refractory_minutes"] == 360
+
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["direction_refractory_minutes"] == 180
+        assert row.runtime_config_json["direction_saturation_refractory_minutes"] == 360
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "direction_refractory_minutes": None,
+                "direction_saturation_refractory_minutes": None,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(row)
+        assert "direction_refractory_minutes" not in row.runtime_config_json
+        assert "direction_saturation_refractory_minutes" not in row.runtime_config_json
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        await sync_runtime_config_from_state(row)
+        assert "direction_refractory_minutes" not in _shared_state.runtime_config
+        assert (
+            "direction_saturation_refractory_minutes"
+            not in _shared_state.runtime_config
+        )
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"autonomous_direction_cooldown_minutes": 300},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(row)
+        await sync_runtime_config_from_state(row)
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["direction_refractory_minutes"] == 300
+        assert body["direction_saturation_refractory_minutes"] == 600
 
     @pytest.mark.asyncio
     async def test_patch_review_second_opinion_gate_enabled(self, client: AsyncClient):
@@ -9221,7 +9343,23 @@ class TestVersionLifecycleQualificationEvidence:
                 "excluded_audit_findings": [{"severity": "low", "summary": "stale noise"}],
                 "test_erosion_detail": {"deleted_test_files": 1},
                 "smoketest_detail": {"passed": False, "suite": "release"},
-                "audit_reconciliation": {"excluded_findings_count": 1},
+                "audit_reconciliation": {
+                    "excluded_findings_count": 1,
+                    "audit_leg_proof": {
+                        "state": "unproven",
+                        "required": True,
+                        "candidate_sha": "open-sha",
+                        "audit_task_id": "audit-1",
+                        "audit_task_candidate_sha": "open-sha",
+                        "challenge_task_id": "challenge-1",
+                        "challenged_candidate_sha": "wrong-sha",
+                        "binding_expected_count": 1,
+                        "binding_record_count": 0,
+                        "binding_complete": False,
+                        "reconciliation_status": "available",
+                        "reconciliation_reason": "audit_challenge_sha_mismatch",
+                    },
+                },
                 "promotion_pr_url": "https://example.com/pr/open",
                 "promotion_conflict": True,
                 "promotion_error_detail": "merge conflict",
@@ -9244,6 +9382,23 @@ class TestVersionLifecycleQualificationEvidence:
                 "migration_safety": "pass",
                 "migration_safety_detail": "migration dry-run matched",
                 "audit_findings": [{"severity": "low", "summary": "reviewed"}],
+                "audit_reconciliation": {
+                    "excluded_findings_count": 0,
+                    "audit_leg_proof": {
+                        "state": "not_required",
+                        "required": False,
+                        "candidate_sha": "recent-sha",
+                        "audit_task_id": "audit-2",
+                        "audit_task_candidate_sha": "recent-sha",
+                        "challenge_task_id": None,
+                        "challenged_candidate_sha": None,
+                        "binding_expected_count": 0,
+                        "binding_record_count": 0,
+                        "binding_complete": False,
+                        "reconciliation_status": "unavailable",
+                        "reconciliation_reason": "challenge_absent",
+                    },
+                },
                 "promotion_pr_url": "https://example.com/pr/recent",
             },
         )
@@ -9282,6 +9437,21 @@ class TestVersionLifecycleQualificationEvidence:
         assert current["last_qualification"]["excluded_audit_findings"] == [
             {"severity": "low", "summary": "stale noise"}
         ]
+        assert current["last_qualification"]["audit_leg_proof"]["state"] == "unproven"
+        assert current["last_qualification"]["audit_reconciliation"]["audit_leg_proof"] == {
+            "state": "unproven",
+            "required": True,
+            "candidate_sha": "open-sha",
+            "audit_task_id": "audit-1",
+            "audit_task_candidate_sha": "open-sha",
+            "challenge_task_id": "challenge-1",
+            "challenged_candidate_sha": "wrong-sha",
+            "binding_expected_count": 1,
+            "binding_record_count": 0,
+            "binding_complete": False,
+            "reconciliation_status": "available",
+            "reconciliation_reason": "audit_challenge_sha_mismatch",
+        }
         assert current["last_qualification"]["test_erosion_detail"] == {"deleted_test_files": 1}
         assert current["last_qualification"]["smoketest_detail"] == {"passed": False, "suite": "release"}
         assert current["last_qualification"]["promotion_conflict"] is True
@@ -9292,6 +9462,7 @@ class TestVersionLifecycleQualificationEvidence:
         assert recent["last_qualification"]["audit_findings"] == [
             {"severity": "low", "summary": "reviewed"}
         ]
+        assert recent["last_qualification"]["audit_leg_proof"]["state"] == "not_required"
         assert recent["last_qualification"]["promotion_pr_url"] == "https://example.com/pr/recent"
 
 
@@ -10023,7 +10194,23 @@ class TestQualificationVerdictsAuditMissingReason:
             excluded_audit_findings=[{"severity": "low", "summary": "y"}],
             test_erosion_detail={"removed": 3},
             smoketest_detail={"passed": False},
-            audit_reconciliation={"reconciled": True},
+            audit_reconciliation={
+                "reconciled": True,
+                "audit_leg_proof": {
+                    "state": "proven",
+                    "required": True,
+                    "candidate_sha": "blockedsha",
+                    "audit_task_id": "audit-1",
+                    "audit_task_candidate_sha": "blockedsha",
+                    "challenge_task_id": "challenge-1",
+                    "challenged_candidate_sha": "blockedsha",
+                    "binding_expected_count": 1,
+                    "binding_record_count": 1,
+                    "binding_complete": True,
+                    "reconciliation_status": "available",
+                    "reconciliation_reason": None,
+                },
+            },
             promotion_pr_url="https://example.com/pr/1",
             promotion_conflict=True,
             promotion_error_detail="merge conflict",
@@ -10047,6 +10234,7 @@ class TestQualificationVerdictsAuditMissingReason:
         assert v["test_erosion_detail"] == {"removed": 3}
         assert v["smoketest_detail"] == {"passed": False}
         assert v["audit_reconciliation"] == {"reconciled": True}
+        assert v["audit_leg_proof"]["state"] == "proven"
         assert v["promotion_pr_url"] == "https://example.com/pr/1"
         assert v["promotion_conflict"] is True
         assert v["promotion_error_detail"] == "merge conflict"
@@ -11711,8 +11899,11 @@ class TestClearWaveDeps:
         project = await _make_project(db_session)
         resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
         assert resp.status_code == 200
-        assert resp.json()["cleared"] == 0
-        assert resp.json()["total_queued"] == 0
+        body = resp.json()
+        assert body["cleared"] == 0
+        assert body["total_queued"] == 0
+        assert body["truncated"] is False
+        assert body["skipped_queued"] == 0
 
     @pytest.mark.asyncio
     async def test_clears_ordering_only_edge_when_dispatch_gate_says_eligible(
@@ -11983,6 +12174,29 @@ class TestClearWaveDeps:
 
         await db_session.refresh(dependent)
         assert dependent.depends_on == [str(live_foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_truncates_queue_scan_at_cap(self, client: AsyncClient, db_session):
+        """The stale-edge repair scan is capped and reports skipped queued rows."""
+        project = await _make_project(db_session)
+        for idx in range(503):
+            db_session.add(
+                Task(
+                    project_id=project.id,
+                    title=f"Queued task {idx}",
+                    payloads=[{"type": "smoketest"}],
+                    status=TaskStatus.QUEUED,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_queued"] == 503
+        assert body["processed_queued"] == 500
+        assert body["truncated"] is True
+        assert body["skipped_queued"] == 3
 
 
 class TestCancelStrategicRefresh:
@@ -13619,6 +13833,167 @@ class TestComputeExperimentTaskLaunch:
         payload = task.payloads[0]
         assert "live_proof" not in payload
 
+    @pytest.mark.asyncio
+    async def test_accelerator_only_supported_request_persists(
+        self, client: AsyncClient, db_session
+    ):
+        """An accelerator-only request for a supported accelerator stays valid.
+
+        The canonical single-GPU machine type is resolved downstream when the
+        agent launches the actual compute job, so omitting machine_type here is
+        not a rejection.
+        """
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload()
+        payload.pop("machine_type", None)
+        payload["accelerator"] = "L4"
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.payloads[0]["accelerator"] == "L4"
+
+    @pytest.mark.asyncio
+    async def test_supported_explicit_t4_pairing_persists(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload(
+            accelerator="T4", machine_type="n1-standard-1"
+        )
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.payloads[0]["accelerator"] == "T4"
+        assert task.payloads[0]["machine_type"] == "n1-standard-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("override", "expected_detail"),
+        [
+            # Unsupported / over-quota accelerator.
+            ({"accelerator": "A100", "machine_type": None}, "unsupported accelerator"),
+            # GPU accelerator paired with an unpriced GPU machine type.
+            (
+                {"accelerator": "T4", "machine_type": "n1-standard-99"},
+                "not a valid single-GPU shape",
+            ),
+            # CPU-only request with a machine type that is not explicitly priced.
+            (
+                {"accelerator": None, "machine_type": "bogus-machine-type"},
+                "unsupported machine_type",
+            ),
+            # GPU / machine-family mismatch: T4 (n1) paired with a G2 shape.
+            (
+                {"accelerator": "T4", "machine_type": "g2-standard-4"},
+                "not a valid single-GPU shape",
+            ),
+        ],
+    )
+    async def test_gpu_shape_validation_rejects_without_creating_task(
+        self, client: AsyncClient, db_session, override, expected_detail
+    ):
+        """Invalid accelerator/machine-shape combinations fail fast with 422.
+
+        The launch endpoint applies the same accelerator/machine-shape truth as
+        compute-job creation (``app.vm_cost_rates.validate_compute_request``)
+        before persisting a Task, so no Task row is created for a rejected
+        contract.
+        """
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload()
+        for key, value in override.items():
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert expected_detail in resp.text
+        from sqlalchemy import func as _func
+
+        count = (
+            await db_session.execute(select(_func.count(Task.id)))
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_require_durable_artifact_persists_in_payload(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(require_durable_artifact=True),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["require_durable_artifact"] is True
+
+    @pytest.mark.asyncio
+    async def test_require_durable_artifact_default_omits_payload_flag(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert "require_durable_artifact" not in payload
+
 
 class TestBugReportCitationGate:
     """Reproduce-on-HEAD citation grounding for free-text bug reports.
@@ -14226,3 +14601,128 @@ class TestDeriveSaturation:
 
         assert _derive_saturation(None, None) is None
         assert _derive_saturation(None, 0.5) is None
+
+
+class TestGetBuildConfigCommands:
+    @pytest.mark.asyncio
+    async def test_unauthenticated_returns_401_or_403(self, override_get_session):
+        """Unauthenticated GET to build-config/commands must be rejected."""
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    f"/api/admin/projects/{uuid.uuid4()}/build-config/commands"
+                )
+            assert resp.status_code in (401, 403)
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_admin_authenticated_returns_200(self, client: AsyncClient, db_session):
+        """Authenticated admin GET returns 200 with directories payload."""
+        project = await _make_project(db_session, name="BuildCfg Commands")
+        project.build_config = {
+            "directories": [
+                {
+                    "path": "backend",
+                    "type": "python",
+                    "test_cmd": "pytest",
+                    "build_cmd": None,
+                    "install_cmd": "pip install -r requirements.txt",
+                    "lint_cmd": "ruff check .",
+                    "confirmed_test_cmd": "pytest -x",
+                    "confirmed_build_cmd": None,
+                    "confirmed_install_cmd": None,
+                    "confirmed_lint_cmd": None,
+                    "commands_confirmed_at": None,
+                    "confirming_task_id": None,
+                }
+            ]
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/build-config/commands"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["project_id"] == str(project.id)
+        assert len(data["directories"]) == 1
+        assert data["directories"][0]["path"] == "backend"
+        assert data["directories"][0]["detected_test_cmd"] == "pytest"
+        assert data["directories"][0]["confirmed_test_cmd"] == "pytest -x"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Improvement-lane pilot flag settings
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestImprovementLaneSettings:
+    """PATCH /api/admin/settings round-trip tests for improvement_lanes_enabled
+    and review_fix_lane_pilot_enabled."""
+
+    @pytest.mark.asyncio
+    async def test_settings_patch_improvement_lane_flags(self, client: AsyncClient):
+        """PATCH both flags true/false; GET confirms round-trip; non-bool is rejected."""
+        # Default: both flags default False in GET response.
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.status_code == 200
+        data = get_resp.json()
+        assert "improvement_lanes_enabled" in data
+        assert "review_fix_lane_pilot_enabled" in data
+
+        # Enable improvement_lanes_enabled.
+        resp = await client.patch(
+            "/api/admin/settings", json={"improvement_lanes_enabled": True}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["improvement_lanes_enabled"] is True
+
+        # Enable review_fix_lane_pilot_enabled.
+        resp = await client.patch(
+            "/api/admin/settings", json={"review_fix_lane_pilot_enabled": True}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["review_fix_lane_pilot_enabled"] is True
+
+        # Disable both in a single PATCH.
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"improvement_lanes_enabled": False, "review_fix_lane_pilot_enabled": False},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        body = get_resp.json()
+        assert body["improvement_lanes_enabled"] is False
+        assert body["review_fix_lane_pilot_enabled"] is False
+
+        # Non-boolean values must be rejected (strings, ints).
+        bad1 = await client.patch(
+            "/api/admin/settings", json={"improvement_lanes_enabled": "true"}
+        )
+        assert bad1.status_code == 400
+
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"review_fix_lane_pilot_enabled": 1}
+        )
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_settings_patch_unknown_key_still_rejected(self, client: AsyncClient):
+        """A typo in a flag name must still be rejected (unknown-key gate intact)."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"improvement_lanes_enabld": True}
+        )
+        assert resp.status_code == 400
+        assert "unknown settings key" in resp.text.lower() or "improvement_lanes_enabld" in resp.text

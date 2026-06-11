@@ -11,6 +11,12 @@ import {
   type CodeChangeHelperConfig,
 } from './code-change-helpers.js';
 
+export const BLUEPRINT_ADMIN_UI_ESLINT_CMD = 'npx eslint 2>&1';
+export const BLUEPRINT_AGENT_ESLINT_CMD = 'npx eslint 2>&1';
+export const BLUEPRINT_AGENT_TSC_CMD = 'npx tsc --noEmit 2>&1';
+export const BLUEPRINT_BACKEND_RUFF_CHECK_CMD = 'python3 -m ruff check --select E,F,W --ignore E501 2>&1';
+export const BLUEPRINT_BACKEND_RUFF_FORMAT_CMD = 'python3 -m ruff format --check 2>&1';
+
 /** Emit the ci_failure closed-loop verify block for the generated ./check.
  *
  *  For a ci_failure fix task we know the EXACT pytest node-ids CI reported
@@ -121,6 +127,223 @@ if [ -n "$_mv_all" ]; then
     printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "merge-resolution verify skipped — no Docker for the sanctioned harness; CI verifies affected tests on the PR" >> /tmp/check_gate_env_${taskId}.txt
   fi
 fi
+`;
+}
+
+/** Emit a bash sub-block that uploads the failed viewport screenshot(s) for a
+ *  PR-only regression through the signed-URL endpoint.  Every failure mode is
+ *  non-fatal (WARN + continue) so the only blocking gate remains the viewport
+ *  regression itself.  Emitted only inside the PR-only-regression else-branch
+ *  so it never runs for --full or baseline-also-broken paths.
+ *
+ *  The block:
+ *  1. Guards on jq, curl, AGENT_API_TOKEN, and ORCHESTRATOR_URL.
+ *  2. Reads admin-ui/test-results/viewport-failures.json (written by the JSON
+ *     reporter in vitest.viewport.config.ts).
+ *  3. For each failed test, extracts component and width from the fullName
+ *     (e.g. "EffortEfficiencyPanel — viewport regression renders without
+ *     overflow at 375px") using sed/grep — no eval, no unquoted expansions.
+ *  4. Finds the screenshot whose filename best matches that failed test rather
+ *     than reusing the first PNG in admin-ui/test-results/.
+ *  5. POSTs to the signed-URL endpoint and PUTs the PNG to the returned URL.
+ *  6. Logs the storage_uri on success. */
+function buildViewportUploadBlock(taskId: string): string {
+  return `
+      # ── viewport screenshot upload (PR-only regression evidence) ──────────
+      # Non-fatal: missing JSON / PNG / tools / token → WARN and skip.
+      if command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \\
+          && [ -n "\${AGENT_API_TOKEN:-}" ] && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
+        VP_JSON="admin-ui/test-results/viewport-failures.json"
+        if [ -f "$VP_JSON" ]; then
+          _vp_slugify() {
+            printf '%s' "$1" | sed -E 's/[^A-Za-z0-9]+/-/g; s/^-+|-+$//g'
+          }
+          _vp_component_from_name() {
+            printf '%s' "$1" | sed -E 's/[[:space:]]+viewport[[:space:]].*$//' | sed -E 's/[[:space:]]+[-—–]+$//' | awk '
+              {
+                last = $NF;
+                for (i = 1; i <= NF; i++) {
+                  if ($i ~ /^[A-Z][A-Za-z0-9._-]*$/) {
+                    comp = $i;
+                  }
+                }
+              }
+              END {
+                if (comp != "") print comp;
+                else if (last != "") print last;
+              }
+            '
+          }
+          while IFS=$'\t' read -r _vp_file _vp_name; do
+            [ -z "$_vp_name" ] && continue
+            # Extract component from the pre-viewport title while preserving
+            # compound component names like "MessagesPanel composed with shell
+            # panels — viewport regression ...".
+            _vp_comp=$(_vp_component_from_name "$_vp_name")
+            # Extract width: first run of digits immediately before "px".
+            _vp_width=$(printf '%s' "$_vp_name" | grep -oE '[0-9]+px' | head -1 | tr -d 'px')
+            if [ -z "$_vp_comp" ] || [ -z "$_vp_width" ]; then
+              echo "[check] WARN: viewport upload — could not parse component/width from: $_vp_name"
+              continue
+            fi
+            # Match the screenshot for this exact failed assertion when Vitest
+            # emits one. Falling back to a broad glob would risk publishing the
+            # wrong pixels for a different failure.
+            _vp_name_slug=$(_vp_slugify "$_vp_name")
+            _vp_file_slug=$(_vp_slugify "\${_vp_file##*/}")
+            _vp_png=$(
+              find admin-ui/test-results -maxdepth 6 -type f -name "*\${_vp_file_slug}*\${_vp_name_slug}*.png" 2>/dev/null \
+                | sort | head -1 || true
+            )
+            if [ -z "$_vp_png" ]; then
+              _vp_png=$(find admin-ui/test-results -maxdepth 6 -type f -name "*\${_vp_name_slug}*.png" 2>/dev/null | sort | head -1 || true)
+            fi
+            if [ -z "$_vp_png" ]; then
+              echo "[check] WARN: viewport upload — no screenshot PNG found for $_vp_comp@\${_vp_width}px"
+              continue
+            fi
+            # POST for a signed upload URL.
+            _vp_resp=$(curl -sf -X POST \\
+              -H "Authorization: Bearer \${AGENT_API_TOKEN}" \\
+              -H "Content-Type: application/json" \\
+              -d "{\\"task_id\\":\\"${taskId}\\",\\"component\\":\\"$_vp_comp\\",\\"width\\":$_vp_width}" \\
+              "\${ORCHESTRATOR_URL}/api/agent/viewport/failure-screenshot-upload-url") || {
+              echo "[check] WARN: viewport upload — signing request failed for $_vp_comp@\${_vp_width}px"
+              continue
+            }
+            _vp_url=$(printf '%s' "$_vp_resp" | jq -r '.upload_url // empty' 2>/dev/null || true)
+            _vp_uri=$(printf '%s' "$_vp_resp" | jq -r '.storage_uri // empty' 2>/dev/null || true)
+            if [ -z "$_vp_url" ]; then
+              echo "[check] WARN: viewport upload — empty upload_url for $_vp_comp@\${_vp_width}px"
+              continue
+            fi
+            # PUT the PNG to the signed URL.
+            curl -sf -T "$_vp_png" -H "Content-Type: image/png" "$_vp_url" || {
+              echo "[check] WARN: viewport upload — PUT failed for $_vp_comp@\${_vp_width}px"
+              continue
+            }
+            echo "[check] viewport screenshot uploaded: $_vp_uri ($_vp_comp@\${_vp_width}px)"
+          done < <(
+            jq -r '
+              .testResults[]
+              | ((.name // .filepath // .file // .testFile // "") | tostring) as $file
+              | .assertionResults[]
+              | select(.status=="failed")
+              | [$file, (.fullName // .title // "")]
+              | @tsv
+            ' "$VP_JSON" 2>/dev/null || true
+          )
+        fi
+      fi
+      # ── end viewport screenshot upload ───────────────────────────────────
+`;
+}
+
+/** Emit the SUCCESS-PATH visual-acceptance capture+upload block.  Presence-gated
+ *  on a declared `visual` acceptance-evidence requirement: this function is only
+ *  called (and the block only appears in the generated ./check) when
+ *  `cfg.visualAcceptance` is set, so a task with no visual declaration produces
+ *  a byte-identical ./check.
+ *
+ *  Distinct from {@link buildViewportUploadBlock} (the FAILURE-path block that
+ *  uploads a regression screenshot): this runs when ./check is GREEN, so a
+ *  declared visual evidence can actually be SATISFIED on a passing change — not
+ *  only when a regression is detected. It:
+ *  1. Guards on the admin-ui stack having run (deps + Chromium already
+ *     bootstrapped), jq, curl, AGENT_API_TOKEN, ORCHESTRATOR_URL, and all
+ *     checks green ($\{#FAILED[@]\} == 0).
+ *  2. Runs the capture-mode viewport config (vitest.viewport.capture.config.ts)
+ *     scoped to the declared component, with VIEWPORT_SHOT_DIR set — maybeCapture
+ *     writes one PNG per (test, width) under that dir.
+ *  3. Locates the PNG for EXACTLY the declared width.
+ *  4. POSTs {task_id, component, width} to the failure-screenshot-upload-url
+ *     endpoint (which stamps the canonical context URI) and PUTs the PNG.
+ *
+ *  Because the context URI key is a single last-write-wins scalar, it captures
+ *  and uploads ONLY the declared (component, width) pair so resolve_visual_evidence
+ *  matches. Every failure mode is non-fatal (WARN + continue) — this is NOT a
+ *  blocking gate. component/width are validated shell-safe by
+ *  validateCfgShellSafety, so single-quote/JSON interpolation here is injection-safe. */
+function buildVisualCaptureBlock(taskId: string, component: string, width: number): string {
+  return `
+# ── visual acceptance evidence capture+upload (success path) ─────────────────
+# Presence-gated: emitted only when this task declares a \`visual\` acceptance
+# requirement. Best-effort — every failure mode is WARN + continue, never a
+# blocking gate. Runs only when ./check is otherwise GREEN so the captured
+# screenshot reflects a passing change, making the declared visual evidence
+# satisfiable (the upload stamps the canonical (component, width) context URI
+# the acceptance gate resolves against).
+if [ \${#FAILED[@]} -eq 0 ] && admin_ui_runtime_touched \\
+    && command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \\
+    && [ -n "\${AGENT_API_TOKEN:-}" ] && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
+  _VA_COMPONENT='${component}'
+  _VA_WIDTH=${width}
+  _VA_SHOT_DIR="/tmp/check_visual_shots_${taskId}"
+  rm -rf "$_VA_SHOT_DIR" 2>/dev/null || true
+  mkdir -p "$_VA_SHOT_DIR"
+  echo "[check] visual acceptance: capturing $_VA_COMPONENT@\${_VA_WIDTH}px screenshot..."
+  # Capture ONLY the declared component's viewport test(s) — the positional
+  # filter is a vitest substring match against the test file path.
+  if ! ( cd admin-ui && VIEWPORT_SHOT_DIR="$_VA_SHOT_DIR" VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport:capture -- "$_VA_COMPONENT" >/tmp/check_visual_capture_${taskId}.log 2>&1 ); then
+    echo "[check] WARN: visual acceptance — capture run failed (non-fatal); see /tmp/check_visual_capture_${taskId}.log"
+  fi
+  # The PNG for this exact width: maybeCapture writes <dir>/<slug(file)>/<slug(test)>-<width>px.png.
+  _VA_PNG=$(find "$_VA_SHOT_DIR" -type f -name "*-\${_VA_WIDTH}px.png" 2>/dev/null | sort | head -1 || true)
+  if [ -z "$_VA_PNG" ]; then
+    echo "[check] WARN: visual acceptance — no screenshot PNG captured for $_VA_COMPONENT@\${_VA_WIDTH}px; skipping upload"
+  else
+    # POST for a signed upload URL bound to the canonical (component, width) object.
+    _VA_RESP=$(curl -sf -X POST \\
+      -H "Authorization: Bearer \${AGENT_API_TOKEN}" \\
+      -H "Content-Type: application/json" \\
+      -d "{\\"task_id\\":\\"${taskId}\\",\\"component\\":\\"$_VA_COMPONENT\\",\\"width\\":$_VA_WIDTH}" \\
+      "\${ORCHESTRATOR_URL}/api/agent/viewport/failure-screenshot-upload-url") || _VA_RESP=""
+    if [ -z "$_VA_RESP" ]; then
+      echo "[check] WARN: visual acceptance — signing request failed for $_VA_COMPONENT@\${_VA_WIDTH}px"
+    else
+      _VA_URL=$(printf '%s' "$_VA_RESP" | jq -r '.upload_url // empty' 2>/dev/null || true)
+      _VA_URI=$(printf '%s' "$_VA_RESP" | jq -r '.storage_uri // empty' 2>/dev/null || true)
+      if [ -z "$_VA_URL" ]; then
+        echo "[check] WARN: visual acceptance — empty upload_url for $_VA_COMPONENT@\${_VA_WIDTH}px"
+      elif curl -sf -T "$_VA_PNG" -H "Content-Type: image/png" "$_VA_URL"; then
+        echo "[check] visual acceptance screenshot uploaded: $_VA_URI ($_VA_COMPONENT@\${_VA_WIDTH}px)"
+      else
+        echo "[check] WARN: visual acceptance — PUT failed for $_VA_COMPONENT@\${_VA_WIDTH}px"
+      fi
+    fi
+  fi
+fi
+# ── end visual acceptance evidence capture+upload ────────────────────────────
+`;
+}
+
+/** Detect whether the given stack can capture visual evidence. Capability-gated
+ *  on admin-ui being available and having the viewport harness infrastructure:
+ *  - Blueprint self-repo: YES (has hardcoded viewport blocks)
+ *  - Config-driven with admin-ui in directories: YES
+ *  - Config-driven without admin-ui or foreign repo: NO */
+function canCaptureVisual(
+  isSelfRepo: boolean,
+  buildConfig: BuildConfig | undefined,
+): boolean {
+  if (isSelfRepo) {
+    return true;
+  }
+  if (buildConfig?.directories?.some(dir => dir.path.replace(/\/$/, '') === 'admin-ui')) {
+    return true;
+  }
+  return false;
+}
+
+/** Emit a loud skip message when visual evidence is declared but cannot be
+ *  captured. This ensures unmet declarations are observable downstream instead
+ *  of silently degraded. Emitted as a best-effort advisory (non-fatal). */
+function buildVisualSkipBlock(reason: string): string {
+  return `
+# ── visual acceptance evidence — cannot capture ────────────────────────────────
+# Visual acceptance evidence was declared but this stack cannot capture it.
+echo "[check] visual acceptance declared but ${reason} — skipping capture"
+# ── end visual acceptance evidence skip ────────────────────────────────────────
 `;
 }
 
@@ -260,7 +483,7 @@ if admin_ui_runtime_touched; then
       [ -f "$f" ] && printf '%s\\0' "\${f#admin-ui/}" >> /tmp/check_admin_ui_lint.txt
     done
     if [ -s /tmp/check_admin_ui_lint.txt ]; then
-      run "admin-ui eslint (changed)" bash -c 'cd admin-ui && xargs -0 -a /tmp/check_admin_ui_lint.txt npx eslint 2>&1'
+      run "admin-ui eslint (changed)" bash -c 'cd admin-ui && xargs -0 -a /tmp/check_admin_ui_lint.txt ${BLUEPRINT_ADMIN_UI_ESLINT_CMD}'
     else
       echo "[check] no admin-ui JS/TS files changed, skipping eslint"
     fi
@@ -417,7 +640,7 @@ if admin_ui_runtime_touched; then
         [ -n "$BASELINE_REASON" ] && echo "[check] (baseline check skipped: $BASELINE_REASON — treating PR failure as real)"
         tail -100 "$PR_VP_LOG" || true
         FAILED+=("$VIEWPORT_LABEL")
-      fi
+${buildViewportUploadBlock(cfg.taskId)}      fi
     fi
   fi
 
@@ -430,7 +653,7 @@ if touches agent/; then
     tail -30 /tmp/check_agent_npm_ci.log
     FAILED+=("agent npm ci")
   }
-  run "agent tsc"        bash -c 'cd agent && npx tsc --noEmit 2>&1'
+  run "agent tsc"        bash -c 'cd agent && ${BLUEPRINT_AGENT_TSC_CMD}'
 
   # Scope agent eslint to changed files. Errors in files the agent
   # edited are the agent's responsibility ("don't leave preexisting
@@ -443,7 +666,7 @@ if touches agent/; then
       [ -f "$f" ] && printf '%s\\0' "\${f#agent/}" >> /tmp/check_agent_lint.txt
     done
     if [ -s /tmp/check_agent_lint.txt ]; then
-      run "agent eslint (changed)" bash -c 'cd agent && xargs -0 -a /tmp/check_agent_lint.txt npx eslint 2>&1'
+      run "agent eslint (changed)" bash -c 'cd agent && xargs -0 -a /tmp/check_agent_lint.txt ${BLUEPRINT_AGENT_ESLINT_CMD}'
     else
       echo "[check] no agent JS/TS files changed, skipping eslint"
     fi
@@ -472,8 +695,8 @@ if touches backend/; then
       [ -f "$f" ] && printf '%s\\0' "$f" >> /tmp/check_backend_py.txt
     done
     if [ -s /tmp/check_backend_py.txt ]; then
-      run "backend ruff (changed)"     bash -c 'xargs -0 -a /tmp/check_backend_py.txt python3 -m ruff check --select E,F,W --ignore E501 2>&1'
-      run "backend ruff fmt (changed)" bash -c 'xargs -0 -a /tmp/check_backend_py.txt python3 -m ruff format --check 2>&1'
+      run "backend ruff (changed)"     bash -c 'xargs -0 -a /tmp/check_backend_py.txt ${BLUEPRINT_BACKEND_RUFF_CHECK_CMD}'
+      run "backend ruff fmt (changed)" bash -c 'xargs -0 -a /tmp/check_backend_py.txt ${BLUEPRINT_BACKEND_RUFF_FORMAT_CMD}'
     else
       echo "[check] no backend/*.py files changed, skipping ruff"
     fi
@@ -527,12 +750,36 @@ run "size guardrail" bash -c "python3 backend/testing/check_size_limits.py 2>&1"
   //     worse, lint/build the wrong tree. The agent is told to configure
   //     build_config (or rely on CI) instead.
   let stackBlocks: string;
+  const isSelfRepo = isBlueprintSelfRepo(cfg.owner, cfg.repo);
   if (cfg.buildConfig?.directories?.length) {
     stackBlocks = buildConfigDrivenStackBlocks(cfg.buildConfig, cfg.taskId);
-  } else if (isBlueprintSelfRepo(cfg.owner, cfg.repo)) {
+  } else if (isSelfRepo) {
     stackBlocks = blueprintStackBlocks;
   } else {
     stackBlocks = genericNoConfigStackBlock(cfg.owner, cfg.repo);
+  }
+  // Success-path visual-acceptance capture+upload. Keyed to capability signal
+  // rather than generated-string identity: can this stack actually capture
+  // visual evidence? Blueprint self-repo YES (has viewport harness), config-driven
+  // MAYBE (check if admin-ui is configured), foreign repo NO.
+  // - If declared and can capture: emit capture block
+  // - If declared but cannot capture: emit loud skip (observable unmet declaration)
+  // - If not declared: emit nothing (byte-identical ./check)
+  let visualCaptureBlock = '';
+  if (cfg.visualAcceptance) {
+    const canCapture = canCaptureVisual(isSelfRepo, cfg.buildConfig);
+    if (canCapture) {
+      visualCaptureBlock = buildVisualCaptureBlock(
+        cfg.taskId,
+        cfg.visualAcceptance.component,
+        cfg.visualAcceptance.width,
+      );
+    } else {
+      const reason = isSelfRepo
+        ? 'admin-ui stack not available'
+        : 'admin-ui not configured in build_config';
+      visualCaptureBlock = buildVisualSkipBlock(reason);
+    }
   }
   const footer = `
 if [ \${#FAILED[@]} -eq 0 ]; then
@@ -545,7 +792,7 @@ else
   exit 1
 fi
 `;
-  const script = header + stackBlocks + footer;
+  const script = header + stackBlocks + visualCaptureBlock + footer;
   fs.writeFileSync(`${WORKSPACE}/check`, script, { mode: 0o755 });
 }
 

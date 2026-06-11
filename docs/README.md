@@ -27,7 +27,7 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
   - Database indexes and schema versioning
 
 - **[PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md)** — Task payload reference
-  - Payload structure for all 20 task types
+  - Payload structure for all 26 task types
   - Field validation rules and constraints
   - Complete examples for each task type
   - How to extend payloads
@@ -225,7 +225,7 @@ QUEUED → PROVISIONING → IN_PROGRESS → EVALUATING? → COMPLETED/FAILED/CAN
 See [TASK_LIFECYCLE.md](TASK_LIFECYCLE.md) for complete lifecycle details, [DATA_MODELS.md — TaskStatus](DATA_MODELS.md#taskstatus) for enum definition, and [BACKEND_MODULES.md — task_lifecycle.py](BACKEND_MODULES.md#task_lifecyclepy) for implementation.
 
 ### Task Types
-20 types: create, review, fix, plan, research, docs, security_audit, qa, deps, migrate, smoketest, refactor, debug, perf, investigate, design_doc_update, strategic_review, self_audit, release_audit, memo.
+26 types: create, review, panel_review, fix, verify_tests, plan, research, strategic_review, design_doc_update, security_audit, qa, deps, docs, smoketest, migrate, debug, perf, investigate, self_audit, release_audit, release_audit_challenge, memo, compute_experiment, web_research, design, refactor.
 
 See [PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md) for payload configuration for each type, and [AGENT_HANDLERS.md](AGENT_HANDLERS.md) for handler implementation.
 
@@ -287,5 +287,5 @@ For questions or issues:
 
 ---
 
-**Last updated:** 2026-06-05  
-**Current schema revision:** 0150 (see [../backend/app/main.py](../backend/app/main.py))
+**Last updated:** 2026-06-11  
+**Current schema revision:** see [../backend/app/main.py](../backend/app/main.py)

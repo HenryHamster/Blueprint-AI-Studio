@@ -7,6 +7,7 @@ needs viewer, killing needs member.
 """
 
 import json
+import logging
 import uuid
 from datetime import timedelta
 from typing import Any, Dict
@@ -21,6 +22,8 @@ from app.compute_jobs import kill_compute_job, list_compute_jobs
 from app.database import get_session
 from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
 from app.schemas import serialize_compute_job_response_safe
+
+logger = logging.getLogger(__name__)
 
 _COMPUTE_JOB_TERMINAL_STATUSES = frozenset(
     {
@@ -100,6 +103,8 @@ async def _build_compute_job_payload(session: AsyncSession, jobs) -> list[Dict[s
 async def get_project_compute_jobs(
     project_id: uuid.UUID,
     include_finished_minutes: int = Query(360, ge=0, le=10080),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -107,12 +112,19 @@ async def get_project_compute_jobs(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
-    jobs = await list_compute_jobs(
+    jobs, has_more = await list_compute_jobs(
         session,
         project_id=project_id,
         include_finished_within=timedelta(minutes=include_finished_minutes),
+        limit=limit,
+        offset=offset,
     )
-    return {"compute_jobs": await _build_compute_job_payload(session, jobs)}
+    return {
+        "compute_jobs": await _build_compute_job_payload(session, jobs),
+        "has_more": has_more,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.post("/compute-jobs/{job_id}/kill")
@@ -141,7 +153,8 @@ async def kill_project_compute_job(
             killed_by=current_user.get("email") or current_user.get("user_id"),
         )
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.warning("Validation error killing compute job: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=409, detail="Invalid request") from exc
     if killed is None:
         # A peer drove the job terminal during the lock-free RPC window; re-fetch
         # the now-terminal job so the caller still gets the final state.

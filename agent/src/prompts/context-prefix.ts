@@ -10,6 +10,14 @@ import { formatProjectContext } from './project-context.js';
 // Cannot import the Python frozenset cross-language; kept as a mirrored literal.
 const REVIEW_GATED_TASK_TYPES = ['create', 'fix', 'refactor', 'migrate', 'qa', 'docs', 'deps'];
 
+// Utility task types that should receive only durable operator steering
+// (user_purpose + constraints) and NOT the rolling agent current_focus narrative.
+// Injecting current_focus into these tasks causes steering-context hijack: the
+// utility agent follows the crisis narrative in current_focus instead of doing
+// its actual job (incident 2026-06-11: repo_bootstrap agent produced a
+// qualification-pipeline investigation report instead of the bootstrap overview).
+const UTILITY_TASK_TYPES = new Set(['repo_bootstrap']);
+
 type SRCatchRateSource = {
   categories?: Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>;
   by_task_type?: Record<string, Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>>;
@@ -312,10 +320,18 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
   const strategicIntent = task.strategic_intent as Record<string, unknown> | undefined;
   if (strategicIntent && typeof strategicIntent === 'object') {
     const siLines: string[] = ['## Strategic Intent'];
+    // Durable operator-owned purpose — set at onboarding and never overwritten by agents.
+    // Rendered first and in a clearly labeled block so it reads as the immutable directive,
+    // separate from the agent-volatile strategic purpose/focus below.
+    const userPurpose = strVal(strategicIntent.user_purpose);
+    if (userPurpose) siLines.push(`**Operator Purpose (immutable):** ${userPurpose}`);
+    // Agent-volatile purpose — may have been rewritten by the strategic cycle.
     const purpose = strVal(strategicIntent.purpose);
     if (purpose) siLines.push(`**Purpose:** ${purpose}`);
+    // Rolling current focus narrative — omitted for utility task types (repo_bootstrap, etc.)
+    // that should act on durable steering only, not the strategist's volatile narrative.
     const currentFocus = strVal(strategicIntent.current_focus);
-    if (currentFocus) siLines.push(`**Current focus:** ${currentFocus}`);
+    if (currentFocus && !UTILITY_TASK_TYPES.has(taskType)) siLines.push(`**Current focus:** ${currentFocus}`);
     const ctx = strategicIntent.context as Record<string, unknown> | undefined;
     if (ctx && typeof ctx === 'object') {
       const ctxFields: Array<[string, string]> = [
@@ -878,11 +894,29 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         test: 'test (a named test or selector exercising the seam end-to-end)',
         behavior: 'behavior (an observable runtime behavior)',
         artifact: 'artifact (an artifact a downstream task consumes)',
+        visual: 'visual (a viewport screenshot of an admin-ui component proving it renders correctly at a given width)',
       };
       if (kind) aeLines.push(`- Kind: ${kindLabels[kind] ?? kind}`);
-      if (descriptor) aeLines.push(`- Proof: ${descriptor}`);
-      const selector = strVal(acceptanceEvidence.selector);
-      if (selector) aeLines.push(`- Selector: ${selector}`);
+      if (kind === 'visual') {
+        // Visual evidence travels as PlanAcceptanceEvidence on the context
+        // channel: descriptor = the component to capture, selector = the
+        // viewport width (px). Read those fields (with a defensive fallback to
+        // the payload-shape field names) and render an explicit, actionable
+        // capture instruction plus how the proof is verified.
+        const component = descriptor || strVal(acceptanceEvidence.component);
+        const widthStr = strVal(acceptanceEvidence.selector) || strVal(acceptanceEvidence.viewport_width);
+        const assertionType = strVal(acceptanceEvidence.assertion_type);
+        if (component) aeLines.push(`- Component to capture: ${component}`);
+        if (widthStr) aeLines.push(`- Viewport width: ${widthStr}px`);
+        if (assertionType) aeLines.push(`- Assertion focus: ${assertionType}`);
+        aeLines.push(
+          `- How it is verified: on a successful run a viewport screenshot of ${component || 'the component'}${widthStr ? ` at ${widthStr}px` : ''} is captured and uploaded, and the acceptance gate matches that screenshot against this declaration. Ensure ${component || 'the component'} has a \`*.viewport.test.tsx\` that renders it at that width so the screenshot can be captured.`,
+        );
+      } else {
+        if (descriptor) aeLines.push(`- Proof: ${descriptor}`);
+        const selector = strVal(acceptanceEvidence.selector);
+        if (selector) aeLines.push(`- Selector: ${selector}`);
+      }
       aeLines.push('');
       prefix += aeLines.join('\n') + '\n';
     }

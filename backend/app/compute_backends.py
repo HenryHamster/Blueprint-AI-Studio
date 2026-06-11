@@ -46,6 +46,9 @@ _SERIAL_REASON_PREFIX = "BLUEPRINT_COMPUTE_REASON="
 _SERIAL_METRICS_PREFIX = "BLUEPRINT_COMPUTE_METRICS="
 # Single-line, base64-encoded marker carrying the command's bounded combined log.
 _SERIAL_COMMAND_LOG_PREFIX = "BLUEPRINT_COMPUTE_COMMAND_LOG="
+# Single-line, base64-encoded marker carrying the echoed release SHA so the
+# completion handler can verify the runtime was bound to the promoted release.
+_SERIAL_RELEASE_ECHO_PREFIX = "BLUEPRINT_COMPUTE_RELEASE_ECHO="
 
 # Well-known env var pointing the launched command at a result file it may write
 # (a small flat JSON object of metric-name -> number). Absence = no metrics.
@@ -133,6 +136,10 @@ class ComputeStatusResult:
     metrics: dict[str, float] | None = None
     # Bounded combined stdout/stderr from the launched command.
     command_log: dict[str, Any] | None = None
+    # Promoted release SHA echoed back by the startup script; None if absent or
+    # garbled. Only populated for live-proof jobs where BLUEPRINT_RELEASE_SHA was
+    # injected into the runtime environment.
+    echoed_release_sha: str | None = None
 
 
 @dataclass(slots=True)
@@ -156,6 +163,7 @@ class TerminalArtifactReference:
     uri: str
     backend: str
     file_count: int
+    total_size_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -577,6 +585,7 @@ def _read_local_terminal_status_for_external_id(
             finished_at = _utcnow()
     metrics = _decode_result_metrics(data.get("METRICS"))
     command_log = _decode_command_log(data.get("COMMAND_LOG"))
+    echoed_release_sha = _decode_release_echo_sha(data.get("RELEASE_ECHO"))
     if raw_status == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -585,6 +594,7 @@ def _read_local_terminal_status_for_external_id(
             finished_at=finished_at,
             metrics=metrics,
             command_log=command_log,
+            echoed_release_sha=echoed_release_sha,
         )
     if exit_code is None:
         return ComputeStatusResult(
@@ -593,6 +603,7 @@ def _read_local_terminal_status_for_external_id(
             finished_at=finished_at,
             metrics=metrics,
             command_log=command_log,
+            echoed_release_sha=echoed_release_sha,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -601,6 +612,7 @@ def _read_local_terminal_status_for_external_id(
         finished_at=finished_at,
         metrics=metrics,
         command_log=command_log,
+        echoed_release_sha=echoed_release_sha,
     )
 
 
@@ -690,12 +702,17 @@ COMMAND_LOG_B64=""
 if [ -s {command_log_path} ]; then
   COMMAND_LOG_B64=$(base64 -w0 < {command_log_path} 2>/dev/null || true)
 fi
+RELEASE_ECHO_B64=""
+if [ -n "${{BLUEPRINT_RELEASE_SHA:-}}" ]; then
+  RELEASE_ECHO_B64=$(printf '%s' "${{BLUEPRINT_RELEASE_SHA}}" | base64 -w0 2>/dev/null || true)
+fi
 cat > {terminal_path} <<EOF
 STATUS=$STATUS
 EXIT_CODE=$EXIT_CODE
 FINISHED_AT=$FINISHED_AT
 METRICS=$METRICS_B64
 COMMAND_LOG=$COMMAND_LOG_B64
+RELEASE_ECHO=$RELEASE_ECHO_B64
 EOF
 exit "$EXIT_CODE"
 """
@@ -798,7 +815,10 @@ def _collect_local_artifact_reference(
         return None
     uri = str(meta.get("artifact_uri") or "").strip() or f"file://{artifact_dir}"
     return TerminalArtifactReference(
-        uri=uri, backend=LOCAL_BACKEND_NAME, file_count=file_count
+        uri=uri,
+        backend=LOCAL_BACKEND_NAME,
+        file_count=file_count,
+        total_size_bytes=_compute_tree_size_bytes(artifact_dir),
     )
 
 
@@ -812,8 +832,12 @@ async def _collect_gcp_artifact_reference(
     file_count = await storage.count_compute_job_artifacts(job.id)
     if file_count <= 0:
         return None
+    total_size_bytes = await storage.get_compute_job_artifact_total_bytes(job.id)
     return TerminalArtifactReference(
-        uri=artifact_uri, backend=GCP_BACKEND_NAME, file_count=file_count
+        uri=artifact_uri,
+        backend=GCP_BACKEND_NAME,
+        file_count=file_count,
+        total_size_bytes=total_size_bytes,
     )
 
 
@@ -824,6 +848,20 @@ def _count_files_in_tree(path: str) -> int:
     total = 0
     for _root, _dirs, files in os.walk(path):
         total += len(files)
+    return total
+
+
+def _compute_tree_size_bytes(path: str) -> int:
+    """Sum the byte sizes of all regular files under ``path`` (0 if unreadable)."""
+    if not path or not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
     return total
 
 
@@ -1049,6 +1087,12 @@ if [ -s {command_log_path} ]; then
     echo "{_SERIAL_COMMAND_LOG_PREFIX}$COMMAND_LOG_B64"
   fi
 fi
+if [ -n "${{BLUEPRINT_RELEASE_SHA:-}}" ]; then
+  RELEASE_ECHO_B64=$(printf '%s' "${{BLUEPRINT_RELEASE_SHA}}" | base64 -w0 2>/dev/null || true)
+  if [ -n "$RELEASE_ECHO_B64" ]; then
+    echo "{_SERIAL_RELEASE_ECHO_PREFIX}$RELEASE_ECHO_B64"
+  fi
+fi
 upload_artifacts
 kill "$TTL_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
@@ -1135,12 +1179,31 @@ def _decode_command_log(raw_b64: str | None) -> dict[str, Any] | None:
     }
 
 
+def _decode_release_echo_sha(raw_b64: str | None) -> str | None:
+    """Decode a base64 release-echo SHA marker. Returns None on any error."""
+    if not raw_b64:
+        return None
+    candidate = raw_b64.strip()
+    if not candidate:
+        return None
+    try:
+        decoded = base64.b64decode(candidate, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    try:
+        result = decoded.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    return result or None
+
+
 def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
     status_line: str | None = None
     exit_code: int | None = None
     reason: str | None = None
     metrics_b64: str | None = None
     command_log_b64: str | None = None
+    release_echo_b64: str | None = None
     for raw_line in serial_output.splitlines():
         line = raw_line.strip()
         if line.startswith(_SERIAL_STATUS_PREFIX):
@@ -1156,12 +1219,15 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
             metrics_b64 = line[len(_SERIAL_METRICS_PREFIX) :]
         elif line.startswith(_SERIAL_COMMAND_LOG_PREFIX):
             command_log_b64 = line[len(_SERIAL_COMMAND_LOG_PREFIX) :]
+        elif line.startswith(_SERIAL_RELEASE_ECHO_PREFIX):
+            release_echo_b64 = line[len(_SERIAL_RELEASE_ECHO_PREFIX) :]
     if status_line is None:
         return None
     if status_line == "RUNNING":
         return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
     metrics = _decode_result_metrics(metrics_b64)
     command_log = _decode_command_log(command_log_b64)
+    echoed_release_sha = _decode_release_echo_sha(release_echo_b64)
     if status_line == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -1170,6 +1236,7 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
             finished_at=_utcnow(),
             metrics=metrics,
             command_log=command_log,
+            echoed_release_sha=echoed_release_sha,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -1178,4 +1245,5 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
         finished_at=_utcnow(),
         metrics=metrics,
         command_log=command_log,
+        echoed_release_sha=echoed_release_sha,
     )

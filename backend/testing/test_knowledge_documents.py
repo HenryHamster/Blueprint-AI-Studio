@@ -2470,3 +2470,84 @@ async def test_analyze_unavailable_stamps_cause_on_existing_doc(
     assert verdict.get("analysis_attempted_at") is not None
     # analysis_mode must NOT have changed (still deterministic).
     assert verdict.get("analysis_mode") == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_analyze_transient_llm_error_stamps_recoverable_cause(
+    db_session, _quiet_broadcast
+):
+    """A transient LLM/runtime failure surfaces the recoverable ``llm-error``
+    cause (distinct from the terminal ``analysis-disabled``/``no-evidence`` causes
+    the auto-delivery path classifies as never-retry). The deterministic doc is
+    left intact and measured-only so acceptance credit stays withheld.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from app.knowledge_completion import (
+        analyze_compute_experiment_knowledge,
+        persist_compute_experiment_knowledge,
+    )
+
+    _project, task = await _make_compute_task(
+        db_session, project_name="AnalyzeTransient"
+    )
+
+    gs_uri = "gs://test-bucket/jobs/transient/result.json"
+
+    # Persist the deterministic document first (as completion would have).
+    doc = await persist_compute_experiment_knowledge(
+        task,
+        outcome="SUCCESS",
+        cost=0.50,
+        criterion=None,
+        result_reference=gs_uri,
+        session=db_session,
+        logs=None,
+    )
+    assert doc is not None
+    assert doc.forward_quality_verdict.get("analysis_mode") == "deterministic"
+
+    # Force durable evidence to be present (so the path reaches the LLM call) and
+    # make the LLM call itself fail transiently → reason "llm-error".
+    fake_evidence = {
+        "job_id": "transient-job",
+        "artifact_uri": gs_uri,
+        "file_count": 2,
+        "metrics": {"accuracy": 0.93},
+        "citations": [gs_uri, f"{gs_uri}#metric:accuracy=0.93"],
+        "real_evidence": [gs_uri, f"{gs_uri}#metric:accuracy=0.93"],
+        "log_excerpt": "",
+    }
+    with (
+        patch.dict(
+            "os.environ",
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_COMPUTE_ANALYSIS": ""},
+        ),
+        patch(
+            "app.knowledge_completion._gather_compute_evidence",
+            new=AsyncMock(return_value=fake_evidence),
+        ),
+        patch(
+            "app.knowledge_completion._call_compute_analysis_llm",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        result = await analyze_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.50,
+            criterion=None,
+            result_reference=gs_uri,
+            session=db_session,
+            logs=None,
+        )
+
+    assert result["status"] == "analysis_unavailable"
+    assert result["reason"] == "llm-error"
+
+    await db_session.refresh(doc)
+    verdict = doc.forward_quality_verdict
+    assert verdict.get("unavailable_cause") == "llm-error"
+    # Still measured-only: a recoverable failure must not earn acceptance credit.
+    assert verdict.get("analysis_mode") == "deterministic"
+    assert verdict.get("knowledge_acceptance_evidence") is False

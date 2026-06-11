@@ -14,6 +14,15 @@ export function formatTimeRemaining(isoString: string, cooldownMinutes: number):
   return mins > 0 ? `${hrs}h ${mins}m left` : `${hrs}h left`;
 }
 
+export function formatRemainingMinutes(minutes: number): string {
+  if (!Number.isFinite(minutes) || minutes <= 0) return '';
+  const remainingMins = Math.ceil(minutes);
+  if (remainingMins < 60) return `${remainingMins}m left`;
+  const hrs = Math.floor(remainingMins / 60);
+  const mins = remainingMins % 60;
+  return mins > 0 ? `${hrs}h ${mins}m left` : `${hrs}h left`;
+}
+
 export function getCooldownStatus(d: Direction, cooldownMinutes: number): 'ready' | 'cooling' | 'never' {
   if (!d.last_researched_at) return 'never';
   const elapsedMs = Date.now() - parseTimestamp(d.last_researched_at).getTime();

@@ -127,7 +127,7 @@ import { expectCalledWith, expectLastCalledWith } from '../utils/typed-mock-call
 import {
   handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS,
   detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying,
-  buildBlueprintPrFooter,
+  buildBlueprintPrFooter, formatLaneResumeSection,
 } from './review-fix.js';
 import { computeReviewPromptFingerprint } from '../prompts/review-prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -421,6 +421,97 @@ describe('handleFix — provenance / stale-premise notice', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
     expect(capturedFixPrompt()).not.toContain('## Stale-premise notice');
+  });
+});
+
+// ── handleFix: lane-resume section (review-fix improvement-lane pilot) ───────
+describe('handleFix — lane resume section', () => {
+  const hist = [{
+    iteration: 1,
+    feedback: 'address the issues',
+    issues: [{ severity: 'major', description: 'real problem', file: 'a.ts', line: 10 }],
+  }];
+
+  it('renders the ## Lane Resume section when context.lane_resume is present', async () => {
+    await handleFix(
+      'task-lane-resume-fix',
+      { branch: 'lane/x', base_branch: 'main', pr_number: 11, prompt: 'address review' },
+      {
+        context: {
+          scope: 'small',
+          review_loop: { iteration: 2, review_history: hist },
+          lane_resume: {
+            checkpoint_seq: 3,
+            last_checkpoint_sha: 'deadbeef1234',
+            last_phase: 'fix',
+            phase_log: ['create PR#11 iter1: built endpoint', 'fix PR#11 iter2: addressed review'],
+            critical_files: ['backend/app/foo.py', 'agent/src/bar.ts'],
+            remaining: ['[MAJOR] [a.ts] handle the null case'],
+            risks: ['disputed: the flag is intentional'],
+          },
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Lane Resume — accumulated chain knowledge (checkpoint 3, last phase fix)');
+    expect(prompt).toContain('Resumed from checkpoint SHA `deadbeef1234`.');
+    expect(prompt).toContain('Prior phases of this chain:');
+    expect(prompt).toContain('- create PR#11 iter1: built endpoint');
+    expect(prompt).toContain('Files changed across the chain:');
+    expect(prompt).toContain('- backend/app/foo.py');
+    expect(prompt).toContain('Open issues carried into this fix:');
+    expect(prompt).toContain('Known risks / deferred items:');
+    // Additive — existing review context still present.
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+
+  it('omits the ## Lane Resume section when context.lane_resume is absent', async () => {
+    await handleFix(
+      'task-no-lane-resume-fix',
+      { branch: 'feat/y', base_branch: 'main', pr_number: 12, prompt: 'address review' },
+      { context: { scope: 'small', review_loop: { iteration: 2, review_history: hist } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).not.toContain('## Lane Resume');
+  });
+});
+
+describe('formatLaneResumeSection — pure formatter', () => {
+  it('returns empty string for undefined / non-object input', () => {
+    expect(formatLaneResumeSection(undefined)).toBe('');
+    expect(formatLaneResumeSection(null)).toBe('');
+  });
+
+  it('returns empty string when the block has no usable signal', () => {
+    // No lists and no checkpoint sha — nothing to resume from.
+    expect(formatLaneResumeSection({ checkpoint_seq: 0 })).toBe('');
+    expect(formatLaneResumeSection({ phase_log: [] })).toBe('');
+  });
+
+  it('renders a sha-only block even with no list fields', () => {
+    const out = formatLaneResumeSection({ last_checkpoint_sha: 'abc1234', checkpoint_seq: 1 });
+    expect(out).toContain('## Lane Resume — accumulated chain knowledge (checkpoint 1)');
+    expect(out).toContain('Resumed from checkpoint SHA `abc1234`.');
+  });
+
+  it('caps rendered list items per field at the render max', () => {
+    const many = Array.from({ length: 30 }, (_, i) => `file-${i}.py`);
+    const out = formatLaneResumeSection({ last_checkpoint_sha: 'abc1234', critical_files: many });
+    expect(out).toContain('- file-0.py');
+    expect(out).toContain('- file-11.py');
+    // 13th item (index 12) must be dropped by the 12-item render cap.
+    expect(out).not.toContain('- file-12.py');
+  });
+
+  it('ignores non-string list entries defensively', () => {
+    const out = formatLaneResumeSection({
+      last_checkpoint_sha: 'abc1234',
+      critical_files: ['ok.py', 42, null, 'also-ok.ts'],
+    });
+    expect(out).toContain('- ok.py');
+    expect(out).toContain('- also-ok.ts');
+    expect(out).not.toContain('- 42');
   });
 });
 

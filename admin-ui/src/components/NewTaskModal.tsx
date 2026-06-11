@@ -2,7 +2,7 @@ import { useState, useRef } from 'react';
 import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes, Cpu } from 'lucide-react';
 import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
-import { COMPUTE_EXPERIMENT_TASK_TYPE } from '../hooks/useTaskModal';
+import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
 import type { ComputeSuccessOperator } from '../api';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
@@ -130,6 +130,17 @@ export function NewTaskModal({
     // is only ever set from the operator <select> whose options are the closed
     // ComputeSuccessOperator set.
     setComputeExperiment(f => ({ ...f, [field]: value }) as ComputeExperimentForm);
+  const selectedCanonicalMachineType = canonicalMachineTypeForAccelerator(computeExperiment.accelerator);
+  const handleComputeAcceleratorChange = (accelerator: string) => {
+    setComputeExperiment(f => {
+      const nextCanonical = canonicalMachineTypeForAccelerator(accelerator);
+      return {
+        ...f,
+        accelerator,
+        machineType: f.machineType === nextCanonical ? f.machineType : '',
+      };
+    });
+  };
   // Client-side mirror of the backend launch-contract rules (non-empty command,
   // positive spend cap + deadline). Surfaced inline once a submit is attempted.
   const computeCommandInvalid = !computeExperiment.command.trim();
@@ -333,25 +344,37 @@ export function NewTaskModal({
                   <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Accelerator <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                   <select
                     value={computeExperiment.accelerator}
-                    onChange={e => updateCompute('accelerator', e.target.value)}
+                    onChange={e => handleComputeAcceleratorChange(e.target.value)}
                     className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
                   >
                     <option value="">CPU (none)</option>
-                    <option value="T4">T4</option>
-                    <option value="L4">L4</option>
-                    <option value="V100">V100</option>
+                    {COMPUTE_ACCELERATOR_OPTIONS.map(option => (
+                      <option key={option.accelerator} value={option.accelerator}>
+                        {option.accelerator}
+                      </option>
+                    ))}
                   </select>
                 </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
-                  <input
-                    type="text"
-                    value={computeExperiment.machineType}
-                    onChange={e => updateCompute('machineType', e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
-                    placeholder="n1-standard-4"
-                  />
-                </div>
+                {selectedCanonicalMachineType ? (
+                  <div>
+                    <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                    <select
+                      value={computeExperiment.machineType}
+                      onChange={e => updateCompute('machineType', e.target.value)}
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                    >
+                      <option value="">Default canonical</option>
+                      <option value={selectedCanonicalMachineType}>{selectedCanonicalMachineType}</option>
+                    </select>
+                  </div>
+                ) : (
+                  <div>
+                    <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                    <div className="w-full bg-neutral-950 border border-neutral-800 text-neutral-600 rounded-lg px-3 py-2 text-base md:text-sm font-mono">
+                      Default CPU
+                    </div>
+                  </div>
+                )}
               </div>
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
@@ -453,6 +476,24 @@ export function NewTaskModal({
                   />
                   <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Require live release</span>
                   <span className="text-[11px] text-neutral-600 normal-case font-normal tracking-normal">(block until promoted release is serving-confirmed)</span>
+                </label>
+                <label className="mt-2 flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={computeExperiment.requireDurableArtifact}
+                    onChange={e =>
+                      setComputeExperiment(f => ({
+                        ...f,
+                        requireDurableArtifact: e.target.checked,
+                      }))
+                    }
+                    className="w-4 h-4 rounded border-neutral-700 bg-neutral-950 accent-neutral-400"
+                  />
+                  <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Require durable artifact</span>
+                  <span className="text-[11px] text-neutral-600 normal-case font-normal tracking-normal">
+                    (block completion unless a durable-class gs://, s3://, az://,
+                    or file: COMPUTE_RESULT artifact is delivered)
+                  </span>
                 </label>
               </div>
             </div>

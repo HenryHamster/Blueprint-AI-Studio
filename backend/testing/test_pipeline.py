@@ -4563,6 +4563,33 @@ async def test_spawn_task_semantic_duplicate_title_deduped(strategic_db):
     assert count == 1
 
 
+@pytest.mark.asyncio
+async def test_spawn_task_dedup_scan_is_limited(strategic_db, mocker):
+    """The strategic dedup scan applies a hard row cap before materializing rows."""
+    _project, review_id = await _make_strategic_review(strategic_db)
+
+    captured_statements = []
+    original_execute = strategic_db.execute
+
+    async def _capture_execute(statement, *args, **kwargs):
+        captured_statements.append(statement)
+        return await original_execute(statement, *args, **kwargs)
+
+    mocker.patch.object(strategic_db, "execute", side_effect=_capture_execute)
+
+    body = await _post_spawn_task(
+        strategic_db,
+        review_id,
+        title="Investigate bounded scan",
+        prompt="confirm the dedup query stays bounded",
+    )
+    assert body["status"] == "ok"
+    assert any(
+        "LIMIT 200" in str(stmt.compile(compile_kwargs={"literal_binds": True}))
+        for stmt in captured_statements
+    )
+
+
 # ── Direction Starvation Detection ───────────────────────────────────────────
 
 

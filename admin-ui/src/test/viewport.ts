@@ -1,4 +1,5 @@
 import { page } from 'vitest/browser';
+import { expect } from 'vitest';
 
 // Extract the *.viewport.test.tsx filename from the call stack so failures
 // embed the component reference that the backend regression classifier needs
@@ -7,6 +8,68 @@ function _callerTestFile(): string {
   const stack = new Error().stack ?? '';
   const m = stack.match(/([\w-]+\.viewport\.test\.tsx)/i);
   return m ? m[1] : '';
+}
+
+// ---------------------------------------------------------------------------
+// Capture mode (before/after screenshot pilot)
+//
+// When the suite runs under vitest.viewport.capture.config.ts (which define-
+// injects VITE_VIEWPORT_CAPTURE='1' and VITE_VIEWPORT_SHOT_DIR=<abs dir>),
+// `maybeCapture` writes one PNG per (test, width) so scripts/viewport-snapshot.sh
+// can pair a working-tree "after" run against a base-worktree "before" run.
+// Under the normal gate config (VITE_VIEWPORT_CAPTURE unset), it is a pure
+// no-op — the 143 gate tests are byte-unaffected.
+// ---------------------------------------------------------------------------
+
+// Per-file ordinal fallback for naming when the current test name is
+// unavailable in browser mode. vitest runs tests within a file in declaration
+// order, so the ordinal is stable across the before/after runs.
+const _captureOrdinals = new Map<string, number>();
+
+/** Filesystem-safe slug: lowercase, non-alphanumerics → single hyphen, trimmed. */
+function _slug(s: string): string {
+  return (
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 120) || 'unnamed'
+  );
+}
+
+/**
+ * In capture mode, write one PNG per (test, width) to
+ * `<VITE_VIEWPORT_SHOT_DIR>/<slug(callerFile)>/<slug(testName)>-<width>px.png`.
+ * No-op (returns immediately) under the normal gate config. Capture failures
+ * are swallowed — this is informational tooling and must never fail a run.
+ */
+async function maybeCapture(width: number, callerFile: string): Promise<void> {
+  if (import.meta.env.VITE_VIEWPORT_CAPTURE !== '1') return;
+  const shotDir = import.meta.env.VITE_VIEWPORT_SHOT_DIR;
+  if (!shotDir) return;
+
+  const fileSlug = _slug(callerFile || 'unknown');
+  let testName = '';
+  try {
+    testName = expect.getState().currentTestName ?? '';
+  } catch {
+    testName = '';
+  }
+  let nameSlug: string;
+  if (testName) {
+    nameSlug = _slug(testName);
+  } else {
+    const next = (_captureOrdinals.get(callerFile) ?? 0) + 1;
+    _captureOrdinals.set(callerFile, next);
+    nameSlug = `test-${next}`;
+  }
+
+  const path = `${shotDir}/${fileSlug}/${nameSlug}-${width}px.png`;
+  try {
+    await page.screenshot({ path });
+  } catch {
+    // Informational capture — never let a screenshot error fail the test.
+  }
 }
 
 /**
@@ -86,6 +149,11 @@ export async function expectNoOverflowAt(
   }
 
   _assertNoErrorBoundaryFallback(width, callerFile);
+
+  // Capture AFTER the layout-settle waits and error-boundary guard but BEFORE
+  // the assertions, so the screenshot exists even when the render is broken —
+  // which is precisely when the before/after pair is most worth inspecting.
+  await maybeCapture(width, callerFile);
 
   const limit = width + tolerance;
   const docScrollWidth = document.documentElement.scrollWidth;

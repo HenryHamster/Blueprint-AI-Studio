@@ -20,6 +20,7 @@ from datetime import timedelta
 from sqlalchemy.orm import aliased
 
 from app.database import get_session
+from app.deploy_identity import deploy_repo_identity as _deploy_repo_identity
 from app.url_security import _is_safe_external_url
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
 from app.models import (
@@ -122,7 +123,12 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "max_total_research_per_project",
         "next_role_poll_timeout_secs",
         "notification_config",
+        "module_interfaces_holdback_fraction",
+        "related_tests_holdback_fraction",
+        "affected_consumers_holdback_fraction",
         "productive_direction_cooldown_minutes",
+        "direction_refractory_minutes",
+        "direction_saturation_refractory_minutes",
         "promotion_enabled",
         "promotion_enabled_by_project",
         "promotion_threshold",
@@ -169,6 +175,10 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "warm_pool_idle_ttl_secs",
         "warm_pool_account_retarget_enabled",
         "warm_pool_cross_provider_retarget_enabled",
+        "diagnostics_after_edit_holdback_fraction",
+        "diagnostics_after_edit_enabled",
+        "improvement_lanes_enabled",
+        "review_fix_lane_pilot_enabled",
     }
 )
 
@@ -331,6 +341,16 @@ async def get_settings(
         )
         in ("balanced", "preferred"),
         "deploy_repo_identity": _runtime_config.get("deploy_repo_identity"),
+        # Resolved identity combines the DEPLOY_REPO_IDENTITY env var (stamped by
+        # the deploy pipeline) with the operator runtime-config override.  Operators
+        # can read this field to confirm whether deploy-level serving confirmation
+        # (backend_revision, agent_image) is active; None means all promotions fall
+        # back to merge-level confirmation only.
+        "deploy_identity_resolved": (
+            "/".join(_resolved_identity)
+            if (_resolved_identity := _deploy_repo_identity()) is not None
+            else None
+        ),
         "providers": _build_provider_catalog(_runtime_config),
         # Published, backend-owned task-capability contract. Operator/agent
         # surfaces consume this map instead of maintaining private task-type
@@ -365,6 +385,18 @@ async def get_settings(
         ),
         "productive_direction_cooldown_minutes": _runtime_config.get(
             "productive_direction_cooldown_minutes", 45
+        ),
+        "direction_refractory_minutes": _runtime_config.get(
+            "direction_refractory_minutes",
+            _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
+        ),
+        "direction_saturation_refractory_minutes": _runtime_config.get(
+            "direction_saturation_refractory_minutes",
+            _runtime_config.get(
+                "direction_refractory_minutes",
+                _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
+            )
+            * 2,
         ),
         "max_parallel_research_per_project": _runtime_config.get(
             "max_parallel_research_per_project", 3
@@ -416,6 +448,12 @@ async def get_settings(
         ),
         "park_and_retarget_budget_seconds": int(
             _runtime_config.get("park_and_retarget_budget_seconds", 600)
+        ),
+        "improvement_lanes_enabled": bool(
+            _runtime_config.get("improvement_lanes_enabled", False)
+        ),
+        "review_fix_lane_pilot_enabled": bool(
+            _runtime_config.get("review_fix_lane_pilot_enabled", False)
         ),
         "warm_pool_enabled": bool(_runtime_config.get("warm_pool_enabled", False)),
         "warm_pool_account_retarget_enabled": bool(
@@ -478,6 +516,15 @@ async def get_settings(
         ),
         "drift_over_claim_consistency_threshold": float(
             _runtime_config.get("drift_over_claim_consistency_threshold", 0.4)
+        ),
+        "module_interfaces_holdback_fraction": float(
+            _runtime_config.get("module_interfaces_holdback_fraction", 0.1)
+        ),
+        "related_tests_holdback_fraction": float(
+            _runtime_config.get("related_tests_holdback_fraction", 0.1)
+        ),
+        "affected_consumers_holdback_fraction": float(
+            _runtime_config.get("affected_consumers_holdback_fraction", 0.1)
         ),
         "drift_stall_min_claims": int(_runtime_config.get("drift_stall_min_claims", 5)),
         "reserved_slots_for_types": _runtime_config.get(
@@ -1364,6 +1411,63 @@ async def _apply_settings(
                 detail="drift_over_claim_consistency_threshold must be between 0.0 and 1.0",
             )
         _runtime_config["drift_over_claim_consistency_threshold"] = round(val, 3)
+    for float_key in (
+        "module_interfaces_holdback_fraction",
+        "related_tests_holdback_fraction",
+        "affected_consumers_holdback_fraction",
+    ):
+        if float_key in payload:
+            try:
+                val = float(payload[float_key])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{float_key} must be a number",
+                )
+            if not (0.0 <= val <= 1.0):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{float_key} must be between 0.0 and 1.0",
+                )
+            _runtime_config[float_key] = round(val, 4)
+    if "diagnostics_after_edit_holdback_fraction" in payload:
+        try:
+            val = float(payload["diagnostics_after_edit_holdback_fraction"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="diagnostics_after_edit_holdback_fraction must be a number",
+            )
+        if not (0.0 <= val <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="diagnostics_after_edit_holdback_fraction must be between 0.0 and 1.0",
+            )
+        _runtime_config["diagnostics_after_edit_holdback_fraction"] = round(val, 3)
+    if "diagnostics_after_edit_enabled" in payload:
+        val = payload["diagnostics_after_edit_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="diagnostics_after_edit_enabled must be a boolean",
+            )
+        _runtime_config["diagnostics_after_edit_enabled"] = val
+    if "improvement_lanes_enabled" in payload:
+        val = payload["improvement_lanes_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="improvement_lanes_enabled must be a boolean",
+            )
+        _runtime_config["improvement_lanes_enabled"] = val
+    if "review_fix_lane_pilot_enabled" in payload:
+        val = payload["review_fix_lane_pilot_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="review_fix_lane_pilot_enabled must be a boolean",
+            )
+        _runtime_config["review_fix_lane_pilot_enabled"] = val
     if "drift_stall_min_claims" in payload:
         try:
             val = int(payload["drift_stall_min_claims"])
@@ -1836,6 +1940,40 @@ async def _apply_settings(
                 detail="autonomous_direction_cooldown_hours must be a number",
             )
         _runtime_config["autonomous_direction_cooldown_minutes"] = val * 60
+    if "direction_refractory_minutes" in payload:
+        if payload["direction_refractory_minutes"] is None:
+            _runtime_config.pop("direction_refractory_minutes", None)
+        else:
+            try:
+                val = int(payload["direction_refractory_minutes"])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="direction_refractory_minutes must be a number",
+                )
+            if not (1 <= val <= 525600):
+                raise HTTPException(
+                    status_code=400,
+                    detail="direction_refractory_minutes must be between 1 and 525600",
+                )
+            _runtime_config["direction_refractory_minutes"] = val
+    if "direction_saturation_refractory_minutes" in payload:
+        if payload["direction_saturation_refractory_minutes"] is None:
+            _runtime_config.pop("direction_saturation_refractory_minutes", None)
+        else:
+            try:
+                val = int(payload["direction_saturation_refractory_minutes"])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="direction_saturation_refractory_minutes must be a number",
+                )
+            if not (1 <= val <= 525600):
+                raise HTTPException(
+                    status_code=400,
+                    detail="direction_saturation_refractory_minutes must be between 1 and 525600",
+                )
+            _runtime_config["direction_saturation_refractory_minutes"] = val
     if "productive_direction_cooldown_minutes" in payload:
         try:
             val = int(payload["productive_direction_cooldown_minutes"])
@@ -2273,7 +2411,7 @@ async def _apply_settings(
             )
             # Persist dict/list config fields to JSONB column
             try:
-                state.runtime_config_json = {
+                runtime_config_json = {
                     "provider_tier_model_map": _runtime_config.get(
                         "provider_tier_model_map", {}
                     ),
@@ -2307,6 +2445,15 @@ async def _apply_settings(
                     ),
                     "task_type_provider_overrides": _runtime_config.get(
                         "task_type_provider_overrides", {}
+                    ),
+                    "module_interfaces_holdback_fraction": _runtime_config.get(
+                        "module_interfaces_holdback_fraction", 0.1
+                    ),
+                    "related_tests_holdback_fraction": _runtime_config.get(
+                        "related_tests_holdback_fraction", 0.1
+                    ),
+                    "affected_consumers_holdback_fraction": _runtime_config.get(
+                        "affected_consumers_holdback_fraction", 0.1
                     ),
                     "agent_prompt_suffixes": _runtime_config.get(
                         "agent_prompt_suffixes", {}
@@ -2376,6 +2523,22 @@ async def _apply_settings(
                     ),
                     "productive_direction_cooldown_minutes": _runtime_config.get(
                         "productive_direction_cooldown_minutes", 45
+                    ),
+                    "direction_refractory_minutes": _runtime_config.get(
+                        "direction_refractory_minutes",
+                        _runtime_config.get(
+                            "autonomous_direction_cooldown_minutes", 240
+                        ),
+                    ),
+                    "direction_saturation_refractory_minutes": _runtime_config.get(
+                        "direction_saturation_refractory_minutes",
+                        _runtime_config.get(
+                            "direction_refractory_minutes",
+                            _runtime_config.get(
+                                "autonomous_direction_cooldown_minutes", 240
+                            ),
+                        )
+                        * 2,
                     ),
                     "warm_continuity_enabled": bool(
                         _runtime_config.get("warm_continuity_enabled", False)
@@ -2553,7 +2716,20 @@ async def _apply_settings(
                     ),
                     "promotion_threshold": _runtime_config.get("promotion_threshold"),
                     "promotion_weights": _runtime_config.get("promotion_weights"),
+                    "diagnostics_after_edit_holdback_fraction": float(
+                        _runtime_config.get("diagnostics_after_edit_holdback_fraction", 0.1)
+                    ),
+                    "diagnostics_after_edit_enabled": bool(
+                        _runtime_config.get("diagnostics_after_edit_enabled", True)
+                    ),
                 }
+                if "direction_refractory_minutes" not in _runtime_config:
+                    runtime_config_json.pop("direction_refractory_minutes", None)
+                if "direction_saturation_refractory_minutes" not in _runtime_config:
+                    runtime_config_json.pop(
+                        "direction_saturation_refractory_minutes", None
+                    )
+                state.runtime_config_json = runtime_config_json
             except AttributeError:
                 pass  # Column not yet added (rolling deploy, old schema)
             session.add(state)
@@ -2947,16 +3123,23 @@ async def repair_state(
         .all()
     )
 
-    for parent in evaluating_tasks:
-        children = (
+    parent_ids = [p.id for p in evaluating_tasks]
+    children_by_parent: dict = {}
+    if parent_ids:
+        all_children = (
             (
                 await session.execute(
-                    select(Task).where(Task.parent_task_id == parent.id)
+                    select(Task).where(Task.parent_task_id.in_(parent_ids))
                 )
             )
             .scalars()
             .all()
         )
+        for child in all_children:
+            children_by_parent.setdefault(child.parent_task_id, []).append(child)
+
+    for parent in evaluating_tasks:
+        children = children_by_parent.get(parent.id, [])
 
         if not children:
             continue

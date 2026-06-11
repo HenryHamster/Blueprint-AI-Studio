@@ -82,6 +82,19 @@ class Intent(BaseModel):
     current_focus: str = Field(default="")
     """What we're actively working toward right now. Updates as phases complete."""
 
+    user_purpose: str = Field(default="")
+    """Durable operator-owned copy of the project purpose.
+
+    Set only via :func:`apply_user_intent_patch` (the operator PATCH path).
+    Agent writes can NEVER modify this field — :func:`apply_agent_update`
+    unconditionally strips any proposed value and restores it from the durable
+    current model before any merge pass. This makes it the immutable backstop
+    that survives strategic-cycle rewrites, thinker JSON-repair clobbers, and
+    3-way merge resolutions. Rendered in the agent context prefix as a separate
+    clearly-labeled operator block so agents see the durable steering even when
+    ``intent.purpose`` has been overwritten by a prior strategic cycle.
+    """
+
     source: Source | None = None
     """Where the most recent intent change came from — cite the user message
     or reflection that drove it. Full change history lives in
@@ -1189,6 +1202,15 @@ def apply_user_intent_patch(
         validated.intent.source = (
             Source(type="user_message", excerpt=purpose[:120]) if purpose else None
         )
+        # Durable operator copy: update user_purpose to mirror the new operator-set
+        # purpose so the field survives any future agent strategic-cycle rewrites.
+        validated.intent.user_purpose = purpose
+    else:
+        # No intent patch — the shallow merged.update(patch) replaced the intent
+        # dict entirely, dropping user_purpose from the merged object. Carry it
+        # forward explicitly so an unrelated patch (context-only, constraints-only)
+        # never silently blanks the durable operator purpose.
+        validated.intent.user_purpose = current.intent.user_purpose
     validated.revision = current.revision + 1
     validated.last_updated = now_iso
     validated.last_updated_by = "user"
@@ -1252,7 +1274,7 @@ def _preserve_operator_intent(current: ProblemModel, proposed: ProblemModel) -> 
         and _context_is_blank(proposed.context)
     ):
         proposed.context = current.context.model_copy(deep=True)
-    if operator_owned and current.constraints and not proposed.constraints:
+    if current.constraints and not proposed.constraints:
         proposed.constraints = list(current.constraints)
 
 
@@ -1807,6 +1829,16 @@ def apply_agent_update(
 
     proposed = ProblemModel.model_validate(proposed_raw)
     current = parse_problem_model(current_raw)
+
+    # user_purpose is a durable operator-owned copy of the purpose; agents must
+    # never change it (it is set exclusively by apply_user_intent_patch). Restore
+    # it unconditionally before any merge pass so the diff and 3-way merge see the
+    # correct value. Constraints are NOT unconditionally restored here — agents CAN
+    # update constraints when no operator edit occurred (3-way merge: current ==
+    # baseline → agent wins). The blank/drop case is handled by
+    # _preserve_operator_intent below (which now guards regardless of operator_owned
+    # to close the legacy-path clobber where dropped source makes operator_owned=False).
+    proposed.intent.user_purpose = current.intent.user_purpose
 
     proposed.revision = current.revision + 1
     proposed.last_updated = now_iso

@@ -27,9 +27,18 @@ from app.shared_state import (
 from app.release_artifacts import summarize_release_artifacts
 from app import release_version as _release_version
 from app import compute as _compute
+from app.digest_cache import DigestCache
 
 router = APIRouter()
 
+# Short-window caches for dashboard-polled endpoints.
+# Keyed by project_id (not user) — access check runs before every cache lookup.
+# agent-serving-shas: GitHub branch SHA lookups change infrequently; 5-min TTL
+# prevents quota burn on the ~30s poll cadence.
+_agent_serving_shas_cache = DigestCache(default_ttl=300.0, stale_retry_ttl=60.0)
+# version-lifecycle: multi-step DB computation polled every 30s+; 30s TTL keeps
+# it fresh enough while collapsing burst polls into a single DB round-trip.
+_version_lifecycle_cache = DigestCache(default_ttl=30.0, stale_retry_ttl=15.0)
 
 _MAX_RETIREMENT_CRITIQUES = 100
 
@@ -223,6 +232,10 @@ async def get_agent_serving_shas(
     Read-only operator provenance: combines durable warm-pool heartbeat rows
     with in-memory task-VM heartbeat caches, plus best-effort current image and
     branch metadata. Missing external data degrades to ``null`` fields.
+
+    GitHub branch SHA lookups are cached for 5 minutes (TTL) to avoid quota
+    burn on the ~30-second dashboard poll cadence. Fleet/DB data is always
+    fresh per request.
     """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
@@ -266,9 +279,24 @@ async def get_agent_serving_shas(
 
     integration_branch = get_project_integration_branch(project)
     promotion_target = get_project_promotion_target(project)
+
+    # Cache GitHub branch SHA lookups keyed by (project_id, branch).
+    # In-flight dedup + stale-on-failure prevents quota bursts and 500s.
+    async def _cached_integration_sha() -> str | None:
+        return await _best_effort_branch_sha(project, integration_branch)
+
+    async def _cached_promotion_sha() -> str | None:
+        return await _best_effort_branch_sha(project, promotion_target)
+
     integration_head_sha, promotion_head_sha, current_image = await asyncio.gather(
-        _best_effort_branch_sha(project, integration_branch),
-        _best_effort_branch_sha(project, promotion_target),
+        _agent_serving_shas_cache.get_or_compute(
+            ("integration_sha", str(project_id), integration_branch),
+            _cached_integration_sha,
+        ),
+        _agent_serving_shas_cache.get_or_compute(
+            ("promotion_sha", str(project_id), promotion_target),
+            _cached_promotion_sha,
+        ),
         asyncio.to_thread(_compute.get_current_agent_image),
     )
     fleet = await _compute.agent_fleet_source_sha_snapshot(session, project_id)
@@ -310,6 +338,10 @@ async def get_version_lifecycle(
     count) and a short history of recent closed versions for calibration.
     Projects with no version lifecycle return ``null`` for ``current_version``
     and an empty ``recent_versions`` list.
+
+    The response is cached per project for 30 seconds (in-flight dedup + stale
+    fallback) to bound the DB work from dashboard polling at ~30s cadence.
+    ``precomputed`` in the response is ``true`` when a cached value was served.
     """
     from app.release_version import (  # noqa: PLC0415
         count_merged_since,
@@ -328,206 +360,213 @@ async def get_version_lifecycle(
         project_id, current_user["user_id"], session, min_role="viewer"
     )
 
-    project_row = (
-        await session.execute(select(Project).where(Project.id == project_id))
-    ).scalar_one_or_none()
+    async def _compute_lifecycle() -> Dict[str, Any]:
+        project_row = (
+            await session.execute(select(Project).where(Project.id == project_id))
+        ).scalar_one_or_none()
 
-    open_row = (
-        (
-            await session.execute(
-                select(ReleaseVersion)
-                .options(selectinload(ReleaseVersion.deploy_artifacts))
-                .where(
-                    ReleaseVersion.project_id == project_id,
-                    ReleaseVersion.status == "open",
+        open_row = (
+            (
+                await session.execute(
+                    select(ReleaseVersion)
+                    .options(selectinload(ReleaseVersion.deploy_artifacts))
+                    .where(
+                        ReleaseVersion.project_id == project_id,
+                        ReleaseVersion.status == "open",
+                    )
+                    .order_by(ReleaseVersion.opened_at.desc())
+                    .limit(1)
                 )
-                .order_by(ReleaseVersion.opened_at.desc())
-                .limit(1)
             )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-    )
 
-    current_version_out: Optional[Dict[str, Any]] = None
-    if open_row is not None:
-        merged_count = await count_merged_since(session, project_id, open_row.opened_at)
-        in_flight_count = await count_in_flight_tasks(session, project_id)
-        qual = open_row.last_qualification or {}
-        aggregate_serving, artifact_evidence = _version_serving_summary(open_row)
-        acceptance_aggregate = None
-        if isinstance(qual, dict):
-            acceptance_aggregate = qual.get("acceptance_aggregate")
-        if acceptance_aggregate is None:
-            acceptance_aggregate = getattr(open_row, "acceptance_aggregate", None)
-        # Verdict-staleness signal: how many tasks merged AT/AFTER the open
-        # version's last qualification verdict was finalized. Each verdict is
-        # evaluated against one candidate commit; merges landing after
-        # ``finalized_at`` mean the displayed confidence/sub-scores no longer
-        # reflect the current tree. Computed from the verdict's ``finalized_at``
-        # (NOT the version's ``opened_at``). ``None`` when there is no verdict or
-        # no parseable ``finalized_at`` — never fabricate a count.
-        merged_since_verdict: Optional[int] = None
-        finalized_at_raw = qual.get("finalized_at")
-        if finalized_at_raw:
-            try:
-                from datetime import datetime  # noqa: PLC0415
+        current_version_out: Optional[Dict[str, Any]] = None
+        if open_row is not None:
+            merged_count = await count_merged_since(session, project_id, open_row.opened_at)
+            in_flight_count = await count_in_flight_tasks(session, project_id)
+            qual = open_row.last_qualification or {}
+            aggregate_serving, artifact_evidence = _version_serving_summary(open_row)
+            acceptance_aggregate = None
+            if isinstance(qual, dict):
+                acceptance_aggregate = qual.get("acceptance_aggregate")
+            if acceptance_aggregate is None:
+                acceptance_aggregate = getattr(open_row, "acceptance_aggregate", None)
+            # Verdict-staleness signal: how many tasks merged AT/AFTER the open
+            # version's last qualification verdict was finalized. Each verdict is
+            # evaluated against one candidate commit; merges landing after
+            # ``finalized_at`` mean the displayed confidence/sub-scores no longer
+            # reflect the current tree. Computed from the verdict's ``finalized_at``
+            # (NOT the version's ``opened_at``). ``None`` when there is no verdict or
+            # no parseable ``finalized_at`` — never fabricate a count.
+            merged_since_verdict: Optional[int] = None
+            finalized_at_raw = qual.get("finalized_at")
+            if finalized_at_raw:
+                try:
+                    from datetime import datetime  # noqa: PLC0415
 
-                finalized_at_dt = datetime.fromisoformat(finalized_at_raw)
-            except (ValueError, TypeError):
-                finalized_at_dt = None
-            if finalized_at_dt is not None:
-                merged_since_verdict = await count_merged_since(
-                    session, project_id, finalized_at_dt
+                    finalized_at_dt = datetime.fromisoformat(finalized_at_raw)
+                except (ValueError, TypeError):
+                    finalized_at_dt = None
+                if finalized_at_dt is not None:
+                    merged_since_verdict = await count_merged_since(
+                        session, project_id, finalized_at_dt
+                    )
+            # Surface the open version's audit findings/score so a verdict is
+            # explainable (the verdict record only keeps the composite, and the
+            # task API strips artifact logs — otherwise operators are blind to WHY).
+            # Scoped to THIS version's evaluated candidate so a fresh/newly-cut
+            # version never inherits another version's findings: ``latest_audit`` is
+            # populated only when the newest scoped audit matches the evaluated
+            # candidate SHA; otherwise the audit is surfaced as ``stale_audit``
+            # provenance and ``audit_evidence_state`` explains which case applies.
+            audit_evidence = await resolve_lifecycle_audit_evidence(session, open_row)
+            latest_audit = audit_evidence["latest_audit"]
+            # Feed the version-scoped audit child into the qualification-state summary
+            # so a crashed audit (terminal-failed, no report) reconciles to
+            # ``audit_crashed`` instead of a misleading ``qualifying``/'wait' — the top
+            # badge and the audit-findings section then agree by construction.
+            qual_state = _release_version.summarize_qualification_state(
+                qual,
+                open_row.serving_status,
+                open_row.deploy_failure_reason,
+                audit_child=latest_audit,
+                aggregate_serving_status=aggregate_serving["serving_status"],
+                aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
+                artifact_evidence=artifact_evidence,
+            )
+
+            # Fetch live current_focus from the project's problem_model
+            live_current_focus = None
+            if project_row and project_row.problem_model:
+                intent = project_row.problem_model.get("intent", {})
+                live_current_focus = intent.get("current_focus")
+
+            current_version_out = {
+                "version_number": open_row.version_number,
+                "phase": open_row.phase,
+                "phase_changed_at": open_row.phase_changed_at.isoformat()
+                if open_row.phase_changed_at
+                else None,
+                "phase_reasoning": open_row.phase_reasoning,
+                "goal": open_row.goal,
+                "goal_updated_at": open_row.goal_updated_at.isoformat()
+                if open_row.goal_updated_at
+                else None,
+                "goal_editor_info": open_row.goal_editor_info,
+                "live_current_focus": live_current_focus,
+                "opened_at": open_row.opened_at.isoformat(),
+                "qualification_attempts": open_row.qualification_attempts,
+                "merged_task_count": merged_count,
+                # Version-window acceptance aggregate (proven-vs-merged) — additive
+                # and nullable, surfaced ALONGSIDE the raw ``merged_task_count`` (not
+                # replacing it). Computed/stored by the acceptance layer; ``None`` on
+                # legacy open versions that predate the aggregate.
+                "acceptance_aggregate": acceptance_aggregate,
+                # Tasks merged AT/AFTER the last qualification verdict's finalized_at
+                # (verdict-staleness signal). None when no verdict/finalized_at.
+                "merged_since_verdict": merged_since_verdict,
+                # In-flight (non-terminal) tasks that a version cut will NOT stop —
+                # they keep running and land against the freshly-opened next version.
+                # Surfaced so the cut confirmation can disclose this consequence.
+                "in_flight_task_count": in_flight_count,
+                "qualification_state": qual_state,
+                "last_qualification": _format_qualification(qual) if qual else None,
+                # The candidate commit currently under evaluation for this open
+                # version, surfaced as a first-class field (not buried in
+                # last_qualification) so the UI can show what is being qualified and,
+                # when audit evidence is stale, contrast it against the historical
+                # audited candidate. Identical to the resolver's ``evaluated_sha``
+                # (``last_qualification['candidate_sha']``) — same single source.
+                "active_candidate_sha": qual.get("candidate_sha"),
+                "latest_audit": latest_audit,
+                # Provenance for version-scoped audit evidence (additive). When the
+                # newest scoped audit was run against an OLDER candidate than the one
+                # under evaluation, its report is surfaced here (not as latest_audit)
+                # so the UI can mark the findings historical. ``audit_evidence_state``
+                # is ``current`` | ``stale`` | ``none``.
+                "audit_evidence_state": audit_evidence["state"],
+                "stale_audit": audit_evidence["stale_audit"],
+                # Post-promotion serving confirmation (additive; NULL until the open
+                # version is itself promoted — normally NULL for a still-open one).
+                "serving_status": open_row.serving_status,
+                "served_sha": open_row.served_sha,
+                "served_at": open_row.served_at.isoformat()
+                if open_row.served_at
+                else None,
+                "deploy_failure_reason": open_row.deploy_failure_reason,
+                "aggregate_serving_status": aggregate_serving["serving_status"],
+                "aggregate_deploy_failure_reason": aggregate_serving["reason_code"],
+                "artifacts": artifact_evidence,
+                "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
+                if open_row.deploy_confirm_deadline
+                else None,
+            }
+
+        history_rows = (
+            (
+                await session.execute(
+                    select(ReleaseVersion)
+                    .options(selectinload(ReleaseVersion.deploy_artifacts))
+                    .where(
+                        ReleaseVersion.project_id == project_id,
+                        ReleaseVersion.status != "open",
+                    )
+                    .order_by(ReleaseVersion.opened_at.desc())
+                    .limit(5)
                 )
-        # Surface the open version's audit findings/score so a verdict is
-        # explainable (the verdict record only keeps the composite, and the
-        # task API strips artifact logs — otherwise operators are blind to WHY).
-        # Scoped to THIS version's evaluated candidate so a fresh/newly-cut
-        # version never inherits another version's findings: ``latest_audit`` is
-        # populated only when the newest scoped audit matches the evaluated
-        # candidate SHA; otherwise the audit is surfaced as ``stale_audit``
-        # provenance and ``audit_evidence_state`` explains which case applies.
-        audit_evidence = await resolve_lifecycle_audit_evidence(session, open_row)
-        latest_audit = audit_evidence["latest_audit"]
-        # Feed the version-scoped audit child into the qualification-state summary
-        # so a crashed audit (terminal-failed, no report) reconciles to
-        # ``audit_crashed`` instead of a misleading ``qualifying``/'wait' — the top
-        # badge and the audit-findings section then agree by construction.
-        qual_state = _release_version.summarize_qualification_state(
-            qual,
-            open_row.serving_status,
-            open_row.deploy_failure_reason,
-            audit_child=latest_audit,
-            aggregate_serving_status=aggregate_serving["serving_status"],
-            aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-            artifact_evidence=artifact_evidence,
+            )
+            .scalars()
+            .all()
         )
 
-        # Fetch live current_focus from the project's problem_model
-        live_current_focus = None
-        if project_row and project_row.problem_model:
-            intent = project_row.problem_model.get("intent", {})
-            live_current_focus = intent.get("current_focus")
+        promotion_readiness = await compute_promotion_readiness(session, project_id)
 
-        current_version_out = {
-            "version_number": open_row.version_number,
-            "phase": open_row.phase,
-            "phase_changed_at": open_row.phase_changed_at.isoformat()
-            if open_row.phase_changed_at
-            else None,
-            "phase_reasoning": open_row.phase_reasoning,
-            "goal": open_row.goal,
-            "goal_updated_at": open_row.goal_updated_at.isoformat()
-            if open_row.goal_updated_at
-            else None,
-            "goal_editor_info": open_row.goal_editor_info,
-            "live_current_focus": live_current_focus,
-            "opened_at": open_row.opened_at.isoformat(),
-            "qualification_attempts": open_row.qualification_attempts,
-            "merged_task_count": merged_count,
-            # Version-window acceptance aggregate (proven-vs-merged) — additive
-            # and nullable, surfaced ALONGSIDE the raw ``merged_task_count`` (not
-            # replacing it). Computed/stored by the acceptance layer; ``None`` on
-            # legacy open versions that predate the aggregate.
-            "acceptance_aggregate": acceptance_aggregate,
-            # Tasks merged AT/AFTER the last qualification verdict's finalized_at
-            # (verdict-staleness signal). None when no verdict/finalized_at.
-            "merged_since_verdict": merged_since_verdict,
-            # In-flight (non-terminal) tasks that a version cut will NOT stop —
-            # they keep running and land against the freshly-opened next version.
-            # Surfaced so the cut confirmation can disclose this consequence.
-            "in_flight_task_count": in_flight_count,
-            "qualification_state": qual_state,
-            "last_qualification": _format_qualification(qual) if qual else None,
-            # The candidate commit currently under evaluation for this open
-            # version, surfaced as a first-class field (not buried in
-            # last_qualification) so the UI can show what is being qualified and,
-            # when audit evidence is stale, contrast it against the historical
-            # audited candidate. Identical to the resolver's ``evaluated_sha``
-            # (``last_qualification['candidate_sha']``) — same single source.
-            "active_candidate_sha": qual.get("candidate_sha"),
-            "latest_audit": latest_audit,
-            # Provenance for version-scoped audit evidence (additive). When the
-            # newest scoped audit was run against an OLDER candidate than the one
-            # under evaluation, its report is surfaced here (not as latest_audit)
-            # so the UI can mark the findings historical. ``audit_evidence_state``
-            # is ``current`` | ``stale`` | ``none``.
-            "audit_evidence_state": audit_evidence["state"],
-            "stale_audit": audit_evidence["stale_audit"],
-            # Post-promotion serving confirmation (additive; NULL until the open
-            # version is itself promoted — normally NULL for a still-open one).
-            "serving_status": open_row.serving_status,
-            "served_sha": open_row.served_sha,
-            "served_at": open_row.served_at.isoformat()
-            if open_row.served_at
-            else None,
-            "deploy_failure_reason": open_row.deploy_failure_reason,
-            "aggregate_serving_status": aggregate_serving["serving_status"],
-            "aggregate_deploy_failure_reason": aggregate_serving["reason_code"],
-            "artifacts": artifact_evidence,
-            "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
-            if open_row.deploy_confirm_deadline
-            else None,
+        from app.release_readiness import (  # noqa: PLC0415
+            get_challenged_vs_unchallenged_telemetry,
+        )
+
+        challenged_vs_unchallenged = await get_challenged_vs_unchallenged_telemetry(
+            session, project_id
+        )
+
+        return {
+            "current_version": current_version_out,
+            "recent_versions": [
+                _serialize_version_history_entry(version) for version in history_rows
+            ],
+            "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
+            # Per-project live-promotion enablement. ``promotion_enabled_effective``
+            # is the value the promotion gate actually consults for THIS project (the
+            # override when set, else the fleet default). ``promotion_enabled_override``
+            # is the explicit per-project value (None when the project rides the fleet
+            # default), and ``promotion_enabled_source`` tells the operator which one
+            # is in effect.
+            "promotion_enabled_effective": resolve_project_promotion_enabled(project_id),
+            "promotion_enabled_override": promotion_enabled_by_project_map().get(
+                str(project_id)
+            ),
+            "promotion_enabled_source": (
+                "project"
+                if str(project_id) in promotion_enabled_by_project_map()
+                else "fleet"
+            ),
+            "promotion_readiness": promotion_readiness,
+            # Directions deliberately queued (status=staged) to begin only after the
+            # current version promotes. Surfaced read-only so an operator can confirm
+            # staged work is queued and spot items rotting past their target version.
+            "staged_directions": (
+                _build_staged_directions_summary(project_row) if project_row else []
+            ),
+            "challenged_vs_unchallenged": challenged_vs_unchallenged,
         }
 
-    history_rows = (
-        (
-            await session.execute(
-                select(ReleaseVersion)
-                .options(selectinload(ReleaseVersion.deploy_artifacts))
-                .where(
-                    ReleaseVersion.project_id == project_id,
-                    ReleaseVersion.status != "open",
-                )
-                .order_by(ReleaseVersion.opened_at.desc())
-                .limit(5)
-            )
-        )
-        .scalars()
-        .all()
+    result, served_stale = await _version_lifecycle_cache.get_or_compute_meta(
+        str(project_id),
+        _compute_lifecycle,
     )
-
-    promotion_readiness = await compute_promotion_readiness(session, project_id)
-
-    from app.release_readiness import (  # noqa: PLC0415
-        get_challenged_vs_unchallenged_telemetry,
-    )
-
-    challenged_vs_unchallenged = await get_challenged_vs_unchallenged_telemetry(
-        session, project_id
-    )
-
-    return {
-        "current_version": current_version_out,
-        "recent_versions": [
-            _serialize_version_history_entry(version) for version in history_rows
-        ],
-        "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
-        # Per-project live-promotion enablement. ``promotion_enabled_effective``
-        # is the value the promotion gate actually consults for THIS project (the
-        # override when set, else the fleet default). ``promotion_enabled_override``
-        # is the explicit per-project value (None when the project rides the fleet
-        # default), and ``promotion_enabled_source`` tells the operator which one
-        # is in effect.
-        "promotion_enabled_effective": resolve_project_promotion_enabled(project_id),
-        "promotion_enabled_override": promotion_enabled_by_project_map().get(
-            str(project_id)
-        ),
-        "promotion_enabled_source": (
-            "project"
-            if str(project_id) in promotion_enabled_by_project_map()
-            else "fleet"
-        ),
-        "promotion_readiness": promotion_readiness,
-        # Directions deliberately queued (status=staged) to begin only after the
-        # current version promotes. Surfaced read-only so an operator can confirm
-        # staged work is queued and spot items rotting past their target version.
-        "staged_directions": (
-            _build_staged_directions_summary(project_row) if project_row else []
-        ),
-        "challenged_vs_unchallenged": challenged_vs_unchallenged,
-    }
+    return {**result, "precomputed": served_stale}
 
 
 class _SetVersionPhaseBody(BaseModel):
@@ -1047,6 +1086,7 @@ async def clear_deploy_failed(
                 ReleaseVersion.status == "promoted",
             )
             .order_by(ReleaseVersion.promoted_at.desc())
+            .limit(20)
         )
     ).scalars().all()
     for candidate in promoted_versions:

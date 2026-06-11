@@ -63,6 +63,7 @@ from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
 )
+from app.vm_cost_rates import validate_compute_request
 from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
 from app.task_outcomes import build_task_evaluation_summary
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
@@ -83,9 +84,6 @@ from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
     router as _operator_triggers_router,
 )
-from app.research_completion import resolve_research_findings_for_surface
-
-
 # Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts
 # (MAX_LINT_FIX_ATTEMPTS=5, MAX_TEST_FIX_ATTEMPTS=3); "check" has no
 # agent-side constant — 5 is a heuristic default used only for the
@@ -216,6 +214,8 @@ async def get_all_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    from app.research_completion import resolve_research_findings_for_surface
+
     limit = min(limit, ADMIN_TASKS_MAX_LIMIT)
 
     # Build shared filter conditions
@@ -981,6 +981,8 @@ async def get_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    from app.research_completion import resolve_research_findings_for_surface
+
     try:
         tid = uuid.UUID(task_id)
     except ValueError:
@@ -1376,6 +1378,7 @@ class ComputeExperimentTaskPayload(BaseModel):
     metric: str | None = None
     success_criterion: ComputeSuccessCriterion | None = None
     require_live_release: bool = False
+    require_durable_artifact: bool = False
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
@@ -1622,7 +1625,8 @@ async def create_task_manually(
     try:
         task_payload = validate_task_payload(task_payload)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=422, detail="Invalid request")
 
     # Guard: cap active tasks per project to prevent queue explosion
     active_count = (
@@ -1832,6 +1836,18 @@ async def create_compute_experiment_task(
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
 
+    # Apply the same accelerator / machine-shape validation as compute-job
+    # creation BEFORE persisting a Task, so invalid GPU launch contracts fail
+    # fast with a clear 422 instead of creating a task that can never launch.
+    # Accelerator-only requests for supported accelerators stay valid and are
+    # canonicalized downstream when the agent launches the actual compute job.
+    _, gpu_reason = validate_compute_request(
+        launch_contract.get("accelerator"),
+        launch_contract.get("machine_type"),
+    )
+    if gpu_reason is not None:
+        raise HTTPException(status_code=422, detail=gpu_reason)
+
     requires_approval, threshold = resolve_compute_spend_approval(
         runtime_config=runtime_config,
         direction=None,
@@ -1865,11 +1881,17 @@ async def create_compute_experiment_task(
             if launch_contract.get(k) is not None
         },
         **({"live_proof": True} if payload.require_live_release else {}),
+        **(
+            {"require_durable_artifact": True}
+            if payload.require_durable_artifact
+            else {}
+        ),
     }
     try:
         task_payload = validate_task_payload(task_payload_raw)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=422, detail="Invalid request")
 
     active_count = (
         await session.execute(

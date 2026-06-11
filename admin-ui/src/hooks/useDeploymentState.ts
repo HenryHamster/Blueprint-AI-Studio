@@ -3,7 +3,7 @@ import type { User } from 'firebase/auth';
 import type { DeployState, OrchestratorHealth, ProviderApisHealth, FailedRollbackInfo } from '../types/settings';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
-import { usePoller, DEFAULT_POLL_MS } from './usePoller';
+import { usePoller } from './usePoller';
 
 interface CircuitBreakerState {
   state: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
@@ -226,7 +226,7 @@ export function useDeploymentState(
     } catch { /* ignore */ }
   };
 
-  usePoller(fetchZoneHealth, { intervalMs: DEFAULT_POLL_MS, enabled: !!user, deps: [user] });
+  usePoller(fetchZoneHealth, { intervalMs: 60_000, enabled: !!user, deps: [user] });
 
   // --- Orchestrator Health ---
   const [orchestratorHealth, setOrchestratorHealth] = useState<OrchestratorHealth | null>(null);
@@ -239,7 +239,7 @@ export function useDeploymentState(
     } catch { setOrchestratorHealth(null); }
   };
 
-  usePoller(fetchOrchestratorHealth, { intervalMs: DEFAULT_POLL_MS, enabled: !!user, deps: [user] });
+  usePoller(fetchOrchestratorHealth, { intervalMs: 60_000, enabled: !!user, deps: [user] });
 
   // --- Detailed Health ---
   const [detailedHealth, setDetailedHealth] = useState<DetailedHealth | null>(null);
@@ -272,7 +272,7 @@ export function useDeploymentState(
     } catch { setDetailedHealth(null); }
   };
 
-  usePoller(fetchDetailedHealth, { intervalMs: DEFAULT_POLL_MS, enabled: !!user, deps: [user] });
+  usePoller(fetchDetailedHealth, { intervalMs: 60_000, enabled: !!user, deps: [user] });
 
   // --- Diagnostics ---
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
@@ -290,7 +290,7 @@ export function useDeploymentState(
     if (!user || !selectedProjectId) setDiagnostics(null);
   }, [user, selectedProjectId]);
   usePoller(fetchDiagnostics, {
-    intervalMs: DEFAULT_POLL_MS,
+    intervalMs: 60_000,
     enabled: !!user && !!selectedProjectId,
     deps: [user, selectedProjectId, fetchDiagnostics],
   });

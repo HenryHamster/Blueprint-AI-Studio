@@ -87,9 +87,7 @@ def is_warm_pool_cross_provider_retarget_enabled() -> bool:
     the cross-provider agent capability lands. Only meaningful when
     :func:`is_warm_pool_account_retarget_enabled` is also on.
     """
-    return bool(
-        _runtime_config.get("warm_pool_cross_provider_retarget_enabled", False)
-    )
+    return bool(_runtime_config.get("warm_pool_cross_provider_retarget_enabled", False))
 
 
 def warm_pool_project_scope() -> set[str]:
@@ -224,10 +222,14 @@ async def register_pool_vm(
 async def get_pool_vm(session, vm_instance_id: str) -> Optional[PoolVm]:
     """Return the pool member with this ``vm_instance_id``, or None."""
     return (
-        await session.execute(
-            select(PoolVm).where(PoolVm.vm_instance_id == vm_instance_id)
+        (
+            await session.execute(
+                select(PoolVm).where(PoolVm.vm_instance_id == vm_instance_id)
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
 
 
 async def list_pool_vms(
@@ -315,9 +317,7 @@ async def count_idle_state_pool_vms(
     idle inventory regardless of why the lease could not match.
     """
     stmt = (
-        select(func.count())
-        .select_from(PoolVm)
-        .where(PoolVm.state == PoolVmState.IDLE)
+        select(func.count()).select_from(PoolVm).where(PoolVm.state == PoolVmState.IDLE)
     )
     if project_id is not None:
         stmt = stmt.where(PoolVm.project_id == project_id)
@@ -395,6 +395,7 @@ async def lease_idle_pool_vm(
     lease_ttl_secs: Optional[int] = None,
     allow_account_mismatch: bool = False,
     allow_provider_mismatch: bool = False,
+    lane_id: Optional[str] = None,
 ) -> Optional[PoolVm]:
     """Atomically lease an IDLE, compatible, same-tenant pool member, or None.
 
@@ -438,6 +439,7 @@ async def lease_idle_pool_vm(
     The caller owns the transaction (commit). Returns the locked, now-LEASED
     member, or None when no compatible IDLE member is free.
     """
+    now = _utcnow()
     filters = [
         PoolVm.project_id == project_id,
         PoolVm.state == PoolVmState.IDLE,
@@ -461,6 +463,30 @@ async def lease_idle_pool_vm(
             )
         )
 
+    # Reservation predicate: skip members reserved for a DIFFERENT (or any)
+    # lane. A matching lane_id can claim its own reserved member; an expired
+    # reservation makes the member generally claimable by anyone. These are
+    # additional WHERE clauses (not a new ordering or a second query) so the
+    # oldest-idle ordering and FOR UPDATE SKIP LOCKED are unchanged.
+    if lane_id is not None:
+        filters.append(
+            or_(
+                PoolVm.reserved_lane_id.is_(None),
+                PoolVm.reservation_expires_at.is_(None),
+                PoolVm.reservation_expires_at <= now,
+                PoolVm.reserved_lane_id == uuid.UUID(str(lane_id)),
+            )
+        )
+    else:
+        # Non-lane (or lane-unaware) request: skip any actively reserved member.
+        filters.append(
+            or_(
+                PoolVm.reserved_lane_id.is_(None),
+                PoolVm.reservation_expires_at.is_(None),
+                PoolVm.reservation_expires_at <= now,
+            )
+        )
+
     stmt = (
         select(PoolVm)
         .where(*filters)
@@ -472,16 +498,16 @@ async def lease_idle_pool_vm(
     if member is None:
         logger.debug(
             "[WARM-POOL] no compatible IDLE member project=%s account=%s "
-            "provider=%s model=%s",
+            "provider=%s model=%s lane=%s",
             project_id,
             account_id,
             provider,
             model,
+            lane_id,
         )
         return None
 
     ttl = lease_ttl_secs if lease_ttl_secs is not None else _DEFAULT_LEASE_TTL_SECS
-    now = _utcnow()
     member.state = PoolVmState.LEASED
     member.leased_task_id = leased_task_id
     member.lease_expires_at = now + timedelta(seconds=ttl)
@@ -494,6 +520,9 @@ async def lease_idle_pool_vm(
 
     settle_pool_vm_idle_cost(member, now=now, session=session)
     member.idle_since = None
+    # Clear any reservation — a leased member holds no reservation.
+    member.reserved_lane_id = None
+    member.reservation_expires_at = None
     session.add(member)
     logger.info(
         "[WARM-POOL] leased pool VM vm_instance_id=%s project=%s task=%s "
@@ -561,7 +590,12 @@ async def mark_pool_vm_idle(session, vm_instance_id: str) -> Optional[PoolVm]:
     return member
 
 
-async def release_pool_vm(session, vm_instance_id: str) -> Optional[PoolVm]:
+async def release_pool_vm(
+    session,
+    vm_instance_id: str,
+    *,
+    lane_id: Optional[str] = None,
+) -> Optional[PoolVm]:
     """Atomically return a LEASED member to the IDLE pool so it can be re-leased.
 
     Called from the task-completion path when a pool-leased task reaches a
@@ -584,6 +618,12 @@ async def release_pool_vm(session, vm_instance_id: str) -> Optional[PoolVm]:
     Idle-cost banking is preserved trivially: a LEASED member's ``idle_since`` is
     already None (cleared at lease time, with its accrued span banked then), so
     the fresh IDLE window simply restarts from now with nothing to erase.
+
+    ``lane_id``: when supplied (improvement lanes enabled, caller passes the lane's
+    id), the member is returned IDLE stamped with ``reserved_lane_id`` /
+    ``reservation_expires_at`` so the lane's next phase can reclaim its warm
+    workspace. A normal (no-lane) release stamps no reservation and clears any
+    prior reservation fields.
     """
     stmt = (
         select(PoolVm)
@@ -597,14 +637,25 @@ async def release_pool_vm(session, vm_instance_id: str) -> Optional[PoolVm]:
     member = (await session.execute(stmt)).scalars().first()
     if member is None:
         return None
+    now = _utcnow()
     member.state = PoolVmState.IDLE
     member.leased_task_id = None
     member.lease_expires_at = None
-    member.idle_since = _utcnow()
+    member.idle_since = now
+    if lane_id is not None:
+        ttl = int(
+            _runtime_config.get("warm_pool_lane_reservation_ttl_seconds", 900) or 900
+        )
+        member.reserved_lane_id = uuid.UUID(str(lane_id))
+        member.reservation_expires_at = now + timedelta(seconds=ttl)
+    else:
+        member.reserved_lane_id = None
+        member.reservation_expires_at = None
     session.add(member)
     logger.info(
-        "[WARM-POOL] released pool VM vm_instance_id=%s -> IDLE (re-leasable)",
+        "[WARM-POOL] released pool VM vm_instance_id=%s -> IDLE (re-leasable) lane=%s",
         vm_instance_id,
+        lane_id,
     )
     return member
 
@@ -740,6 +791,20 @@ async def try_pool_dispatch(
     allow_provider_mismatch = (
         allow_account_mismatch and is_warm_pool_cross_provider_retarget_enabled()
     )
+
+    # Lane-reservation awareness: read the improvement_lane_id from the task
+    # context (when improvement lanes are enabled) and thread it into the lease
+    # so the reserved-member predicate is applied. Reviews/audits carry no lane id
+    # and are treated as non-lane lessees that skip reserved members. Completely
+    # inert when improvement_lanes_enabled is False.
+    from app.runtime_config_state import is_improvement_lanes_enabled
+
+    lane_id: Optional[str] = None
+    if is_improvement_lanes_enabled():
+        raw_lane = (task.context or {}).get("improvement_lane_id")
+        if raw_lane is not None:
+            lane_id = str(raw_lane)
+
     try:
         member = await lease_idle_pool_vm(
             session,
@@ -752,11 +817,10 @@ async def try_pool_dispatch(
             lease_ttl_secs=lease_ttl_secs,
             allow_account_mismatch=allow_account_mismatch,
             allow_provider_mismatch=allow_provider_mismatch,
+            lane_id=lane_id,
         )
     except Exception:
-        logger.exception(
-            "[WARM-POOL] lease error during dispatch for task %s", task.id
-        )
+        logger.exception("[WARM-POOL] lease error during dispatch for task %s", task.id)
         record_pool_claim_failure("lease_error")
         record_pool_lease_miss("lease_error")
         return None
@@ -869,6 +933,7 @@ def _pin_task_to_pool_vm(
     new_ctx["warm_handoff_deadline"] = deadline.isoformat()
     task.context = new_ctx
     flag_modified(task, "context")
+
 
 # NOTE: the pool-hit-vs-cold-dispatch funnel lives in warm_backlog_reuse
 # (record_pool_lease_hit / record_pool_cold_dispatch / record_pool_lease_miss /

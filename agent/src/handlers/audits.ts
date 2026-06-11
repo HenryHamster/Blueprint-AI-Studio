@@ -105,6 +105,9 @@ export async function handleSecurityAudit(
   await prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+    // Audit is an independent verification role — never warm-resume onto a
+    // lane workspace (gate integrity; lane pilot lane-izes only the fix side).
+    allowLaneResume: false,
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
@@ -220,6 +223,9 @@ export async function handleSelfAudit(
   await prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+    // Audit is an independent verification role — never warm-resume onto a
+    // lane workspace (gate integrity; lane pilot lane-izes only the fix side).
+    allowLaneResume: false,
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
@@ -431,6 +437,9 @@ export async function handleReleaseAudit(
   await prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: 0,
+    // Release audit is an independent verification role — never warm-resume
+    // onto a lane workspace (gate integrity; pilot lane-izes only the fix side).
+    allowLaneResume: false,
   });
 
   // Fetch the EXACT candidate commit so git diff can compute the merge-base

@@ -52,7 +52,7 @@ from typing import Any, Mapping
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only, selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.acceptance_gate import (
@@ -265,11 +265,15 @@ async def count_merged_since(
     That keeps post-terminal writes (for example consumption-proof updates to
     a merged producer task) from re-opening the version window.
     """
-    stmt = select(Task).where(
-        Task.project_id == project_id,
-        Task.status == TaskStatus.COMPLETED,
-        landed_signal_predicate(session),
-        Task.updated_at >= since,
+    stmt = (
+        select(Task)
+        .options(load_only(Task.id, Task.status_log, Task.created_at))
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            landed_signal_predicate(session),
+            Task.updated_at >= since,
+        )
     )
     rows = (await session.execute(stmt)).scalars().all()
     return sum(1 for task in rows if _task_completed_at(task) >= since)
@@ -1310,6 +1314,31 @@ async def abandon_current_version(
         logger.warning(
             "[RELEASE_VERSION] abandon: operator notification failed after v%d "
             "cut (non-fatal): %s",
+            locked.version_number,
+            exc,
+        )
+
+    # Best-effort: snapshot the lane baseline for the just-abandoned version.
+    # Isolated in its OWN session so a failure here can never abort the cut —
+    # exactly mirroring the staged-direction activation / notification pattern.
+    try:
+        from app.database import AsyncSessionLocal
+        from app.lane_baseline_snapshot import persist_version_lane_baseline
+
+        async with AsyncSessionLocal() as _snap_session:
+            await persist_version_lane_baseline(
+                _snap_session,
+                project_id=project_id,
+                version_number=locked.version_number,
+                opened_at=locked.opened_at,
+                closed_at=now,
+                terminal_status="abandoned",
+            )
+            await _snap_session.commit()
+    except Exception as exc:  # noqa: BLE001 — baseline snapshot must not abort the cut
+        logger.warning(
+            "[RELEASE_VERSION] abandon: lane baseline persistence failed after "
+            "v%d cut (non-fatal): %s",
             locked.version_number,
             exc,
         )

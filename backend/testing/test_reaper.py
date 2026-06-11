@@ -6187,6 +6187,56 @@ async def test_cycle_halt_alert_posted_exactly_once(
 
 
 @pytest.mark.asyncio
+async def test_post_reaper_halt_alert_bulk_inserts_one_per_project(reaper_db):
+    """_post_reaper_halt_alert bulk-inserts exactly one ERROR alert per project
+    in a single round-trip (no per-project ORM add())."""
+    from app.reaper import _post_reaper_halt_alert
+
+    for i in range(3):
+        reaper_db.add(Project(name=f"halt-proj-{i}", user_id="u"))
+    await reaper_db.commit()
+
+    await _post_reaper_halt_alert(crash_count=4, last_error="boom")
+
+    alerts = (await reaper_db.execute(select(Alert))).scalars().all()
+    assert len(alerts) == 3
+    assert all(a.severity == AlertSeverity.ERROR for a in alerts)
+    assert all(a.title == "Reaper service HALTED after crash-loop" for a in alerts)
+    assert all("crash-looped 4x" in a.message for a in alerts)
+    # One alert per distinct project — no duplicates, none dropped.
+    assert len({a.project_id for a in alerts}) == 3
+
+
+@pytest.mark.asyncio
+async def test_post_reaper_recovery_alert_bulk_inserts_one_per_project(reaper_db):
+    """_post_reaper_recovery_alert bulk-inserts exactly one INFO alert per project."""
+    from app.reaper import _post_reaper_recovery_alert
+
+    for i in range(3):
+        reaper_db.add(Project(name=f"recover-proj-{i}", user_id="u"))
+    await reaper_db.commit()
+
+    await _post_reaper_recovery_alert(probe_failures=2)
+
+    alerts = (await reaper_db.execute(select(Alert))).scalars().all()
+    assert len(alerts) == 3
+    assert all(a.severity == AlertSeverity.INFO for a in alerts)
+    assert all(a.title == "Reaper service recovered autonomously" for a in alerts)
+    assert len({a.project_id for a in alerts}) == 3
+
+
+@pytest.mark.asyncio
+async def test_post_reaper_halt_alert_no_projects_is_noop(reaper_db):
+    """With no projects the early return avoids issuing an empty bulk INSERT."""
+    from app.reaper import _post_reaper_halt_alert
+
+    await _post_reaper_halt_alert(crash_count=1, last_error="x")
+
+    alerts = (await reaper_db.execute(select(Alert))).scalars().all()
+    assert alerts == []
+
+
+@pytest.mark.asyncio
 async def test_per_task_crash_does_not_trigger_cycle_halt(
     reaper_db,
     stop_after_one_cycle,
@@ -8002,6 +8052,129 @@ async def test_unblock_sweep_does_not_treat_ghost_merge_as_completed_foundation(
     # resolution that would proceed as if the dependency were already built.
     assert t.context.get("_blocked_optimistic_retries") == 1
     assert "optimistic" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_resumes_when_provider_landed_in_base_lineage_before_rollup(
+    reaper_db, mocker
+):
+    """LANDED-IN-BASE-LINEAGE (audit case 3): a COMPLETED, exact-title provider
+    whose PR merged into the plan branch (merge-unblock signal) must resume its
+    dependent even though the parent rollup has NOT yet integrated. A parent that
+    has merely not-yet-rolled-up — here COMPLETED while its rollup PR to
+    integration is still pending, so it carries no merge-unblock signal — must NOT
+    strand the provider as a ghost merge: the provider's code is already on the
+    plan branch in the dependent's base lineage. (Before the fix the
+    completed-without-merge parent was treated as stranded and the dependent sat
+    blocked indefinitely.)"""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # Plan/rollup parent: COMPLETED but its rollup PR to integration is still
+    # pending, so it carries NO merge-unblock signal. It is ALIVE, not dead.
+    parent = Task(
+        project_id=project.id, title="plan-rollup", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+    # Provider: merged onto the plan branch (merge-unblock signal, not yet landed
+    # on integration), parented under the not-yet-rolled-up plan.
+    provider = Task(
+        project_id=project.id, title="feat: foundation", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True, "landed_on_integration": False,
+                 "_non_merge_unblock_reason": "merged_pr_non_integration_branch"},
+        parent_task_id=parent.id, status_log=[],
+    )
+    reaper_db.add(provider)
+    await reaper_db.commit()
+    await reaper_db.refresh(provider)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundation",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: waiting on foundation",
+                "need": {"kind": "task", "ref": str(provider.id)},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # Resumed via completed (base-lineage-landed) work — no edge wired.
+    assert not (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+    assert "completed work" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_escalates_structurally_unobservable_need_without_rearm(
+    reaper_db, mocker
+):
+    """BOUNDED-OUTCOME LIVENESS: a residual need the sweep can prove is
+    structurally unobservable — here an observation-class ("obs:") finding ref no
+    task can ever provide — must reach a terminal disposition IMMEDIATELY rather
+    than re-arm the recheck for another indefinite loop. The dependent is
+    escalate-and-cancelled on the FIRST sweep with a durable never-satisfiable
+    marker; it never sits re-armed."""
+    from app.reaper_sweeps import (
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+        GIVE_UP_NEVER_SATISFIABLE,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # Observation-class need: a valid finding-hash ref paired with an "obs:" label.
+    # Observation findings never spawn a provider task, so no foundation can ever
+    # exist — re-arming the recheck would loop forever.
+    obs_need = {
+        "kind": "task",
+        "ref": "deadbeefcafe0001",
+        "label": "obs: lane substrate layers a new system over pool/park-wake",
+    }
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on an observation",
+        depends_on=[],
+        context={
+            "direction_id": "d-obs1",
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "observation",
+                "reason": "BLOCKER: waiting on an observation",
+                "need": obs_need,
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    # Terminal disposition on the FIRST sweep — never re-armed.
+    assert t.status == TaskStatus.CANCELLED
+    assert "structurally unobservable" in (t.latest_status_message or "").lower()
+    marker = (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+    assert isinstance(marker, dict)
+    assert marker["give_up_class"] == GIVE_UP_NEVER_SATISFIABLE
+    # No recheck re-armed into the future: the loop is closed by construction.
+    assert not (t.context or {}).get("_blocked_recheck_attempts")
 
 
 async def _cross_base_completed_foundation(db, project, *, landed=True):

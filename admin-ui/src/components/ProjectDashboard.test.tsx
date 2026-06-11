@@ -396,6 +396,101 @@ describe('ProjectDashboard', () => {
     expect(screen.getAllByText('no active/adjudicated trial').length).toBeGreaterThanOrEqual(1);
   });
 
+  it('renders lane verdict metrics and colors in project detail evidence', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const { container } = render(
+      <ProjectDashboard
+        projects={[makeProject({
+          capability_proof_summary: {},
+          capability_adoption_verdicts: {
+            review_fix_lane: {
+              verdict: 'ADOPT',
+              n_lane: 42,
+              n_control: 40,
+              lane_merge_rate: 0.45,
+              control_merge_rate: 0.375,
+              lane_cost_per_merged: 12.5,
+              control_cost_per_merged: 15,
+              checkpoint_loss_rate: 0.025,
+              gate_integrity_violations: 0,
+              immediate_alert: false,
+              evaluated_at: '2026-06-10T10:00:00Z',
+              verdict_reason: 'adopt_criteria_met',
+              thresholds: {
+                min_n: 30,
+                kill_merge_rate_floor: -0.03,
+                kill_cost_ceiling: 0.1,
+                kill_gate_violations_max: 3,
+                kill_checkpoint_loss_ceiling: 0.05,
+                futility_n: 90,
+                adopt_merge_lift_floor: -0.01,
+                adopt_cost_improvement: 0.05,
+              },
+            },
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId="proj-1"
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('review_fix_lane')).toBeInTheDocument();
+    expect(screen.getByText('ADOPT')).toHaveClass('text-emerald-300');
+    expect(container).toHaveTextContent('Lane samples 42');
+    expect(container).toHaveTextContent('Control samples 40');
+    expect(container).toHaveTextContent('Merge rate 45.0% lane / 37.5% control');
+    expect(container).toHaveTextContent('Cost/merged $12.50 lane / $15.00 control');
+    expect(container).toHaveTextContent('Checkpoint loss 2.5%');
+    expect(container).toHaveTextContent('Gate violations 0');
+    expect(container).toHaveTextContent('Thresholds: min n 30');
+    expect(container).not.toHaveTextContent('Samples 0 with / 0 without');
+  });
+
+  it('renders lane KILL verdicts with the error color and lane metrics', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const { container } = render(
+      <ProjectDashboard
+        projects={[makeProject({
+          capability_proof_summary: {},
+          capability_adoption_verdicts: {
+            review_fix_lane: {
+              verdict: 'KILL',
+              n_lane: 2,
+              n_control: 1,
+              lane_merge_rate: null,
+              control_merge_rate: null,
+              lane_cost_per_merged: null,
+              control_cost_per_merged: null,
+              checkpoint_loss_rate: null,
+              gate_integrity_violations: 3,
+              immediate_alert: true,
+              verdict_reason: 'gate_integrity_violations_exceeded',
+              thresholds: {
+                min_n: 30,
+                kill_merge_rate_floor: -0.03,
+                kill_cost_ceiling: 0.1,
+                kill_gate_violations_max: 3,
+                kill_checkpoint_loss_ceiling: 0.05,
+                futility_n: 90,
+                adopt_merge_lift_floor: -0.01,
+                adopt_cost_improvement: 0.05,
+              },
+            },
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId="proj-1"
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('KILL')).toHaveClass('text-red-300');
+    expect(container).toHaveTextContent('Lane samples 2');
+    expect(container).toHaveTextContent('Gate violations 3');
+    expect(container).toHaveTextContent('Immediate alert');
+  });
+
   it('leaves the badge tooltip unchanged for a legacy runtime with no summary', () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
     render(

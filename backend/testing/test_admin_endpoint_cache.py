@@ -4,6 +4,8 @@ Verifies the TTL+in-flight-dedup pattern (replicated from admin_digest.py)
 applied to:
   - /api/admin/health-overview
   - /api/admin/max-plan-accounts/health
+  - /api/admin/projects/{id}/version-lifecycle
+  - /api/admin/projects/{id}/agent-serving-shas
 
 The compounded admin-dashboard polling load (DashboardHome polls every
 30s, multiple admins polling in parallel) makes deduplication a
@@ -14,7 +16,7 @@ JSONB scans run in parallel and have caused OOM/instance kill before
 
 import asyncio
 from typing import Any, Dict
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -23,6 +25,7 @@ from app.digest_cache import DigestCache
 from app.main import app
 from app.routers import admin_health as _admin_health
 from app.routers import admin_pool_accounts as _admin_pool_accounts
+from app.routers import admin_release_version as _admin_release_version
 from app.routers.admin_health import get_health_overview  # noqa: F401  (route registered)
 from app.routers.admin_pool_accounts import get_account_health_summary  # noqa: F401
 from app.digest_cache import get_digest_cache
@@ -448,3 +451,207 @@ async def test_pool_accounts_health_dedups_concurrent_polls(
     assert all(r.status_code == 200 for r in responses)
     assert all(r.json() == {"accounts": []} for r in responses)
     assert call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{id}/version-lifecycle cache
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_caches_repeated_calls_within_ttl(
+    client: AsyncClient, db_session, mocker
+):
+    """Two polls within TTL → expensive DB compute runs once; precomputed flag absent on miss."""
+    from app.models import Project, ProjectMember
+
+    # Create a project with no open version (simplest scenario).
+    project = Project(name="lifecycle-cache-test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    await db_session.commit()
+
+    # Install a fresh cache so tests are isolated from module-level state.
+    fresh_cache = DigestCache(default_ttl=60.0, stale_retry_ttl=10.0)
+    mocker.patch.object(_admin_release_version, "_version_lifecycle_cache", fresh_cache)
+
+    # Spy on compute_promotion_readiness — it runs on every un-cached call.
+    spy = AsyncMock(return_value={"infra_failure_count": 0, "consecutive_infra_errors": 0})
+    mocker.patch(
+        "app.release_qualifier.compute_promotion_readiness",
+        spy,
+    )
+    mocker.patch(
+        "app.release_readiness.get_challenged_vs_unchallenged_telemetry",
+        AsyncMock(return_value={}),
+    )
+
+    r1 = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    r2 = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    # Both responses return the same payload (dedup via TTL cache).
+    assert r1.json()["current_version"] == r2.json()["current_version"]
+    # precomputed=False on first (fresh compute); precomputed=False again on
+    # second because it came from the fresh TTL cache, not the stale fallback.
+    assert r1.json()["precomputed"] is False
+    assert r2.json()["precomputed"] is False
+    # The underlying compute ran exactly once.
+    assert spy.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_serves_stale_on_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """When compute fails after a cached result exists, the stale result is served
+    and precomputed=True signals the client that data may be old."""
+    from app.models import Project, ProjectMember
+
+    project = Project(name="lifecycle-stale-test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    await db_session.commit()
+
+    # Short negative-cache TTL so failure-path can complete quickly.
+    fresh_cache = DigestCache(default_ttl=60.0, stale_retry_ttl=5.0)
+    mocker.patch.object(_admin_release_version, "_version_lifecycle_cache", fresh_cache)
+
+    call_count = 0
+
+    async def _good_readiness(*_a, **_kw):
+        return {"infra_failure_count": 0, "consecutive_infra_errors": 0}
+
+    async def _failing_readiness(*_a, **_kw):
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("DB timeout")
+
+    mocker.patch(
+        "app.release_readiness.get_challenged_vs_unchallenged_telemetry",
+        AsyncMock(return_value={}),
+    )
+
+    # First call succeeds and populates the last-good cache.
+    mocker.patch("app.release_qualifier.compute_promotion_readiness", _good_readiness)
+    r1 = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert r1.status_code == 200
+    assert r1.json()["precomputed"] is False
+
+    # Expire the TTL entries so the next call triggers a fresh compute.
+    # Do NOT wipe _last_good — that is the stale fallback we want to exercise.
+    fresh_cache._results.clear()
+
+    # Second call: compute fails → stale fallback is served.
+    mocker.patch("app.release_qualifier.compute_promotion_readiness", _failing_readiness)
+    r2 = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert r2.status_code == 200
+    assert r2.json()["precomputed"] is True  # served from stale fallback
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_access_check_runs_on_cache_hit(
+    client: AsyncClient, db_session, mocker
+):
+    """Access check must run on every request — even when the cache is warm.
+
+    A caller without project access must receive a 403/404, not the cached
+    payload that was served to an authorized caller on the prior request.
+    """
+    from app.auth import get_current_user
+    from app.main import app
+    from app.models import Project, ProjectMember
+
+    # Authorized project with test-user-123 as owner.
+    project = Project(name="lifecycle-access-check-test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    await db_session.commit()
+
+    fresh_cache = DigestCache(default_ttl=60.0, stale_retry_ttl=10.0)
+    mocker.patch.object(_admin_release_version, "_version_lifecycle_cache", fresh_cache)
+    mocker.patch(
+        "app.release_qualifier.compute_promotion_readiness",
+        AsyncMock(return_value={"infra_failure_count": 0, "consecutive_infra_errors": 0}),
+    )
+    mocker.patch(
+        "app.release_readiness.get_challenged_vs_unchallenged_telemetry",
+        AsyncMock(return_value={}),
+    )
+
+    # First request: authorized user populates the cache.
+    r1 = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert r1.status_code == 200
+
+    # Second request: unauthorized user — not a project member — should be rejected
+    # even though the cache is now warm.
+    async def _unauthorized_user():
+        return {"user_id": "other-user-not-a-member", "email": "other@example.com", "role": "admin"}
+
+    app.dependency_overrides[get_current_user] = _unauthorized_user
+    try:
+        r2 = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert r2.status_code in (403, 404), (
+        f"Expected 403/404 for unauthorized user on cached endpoint, got {r2.status_code}"
+    )
+
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{id}/agent-serving-shas cache
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_serving_shas_caches_github_branch_lookups(
+    client: AsyncClient, db_session, mocker
+):
+    """Two calls within TTL → GitHub branch SHA calls run once each (cached)."""
+    from app.models import Project, ProjectMember
+
+    project = Project(
+        name="sha-cache-test",
+        user_id="test-user-123",
+        github_owner="owner",
+        github_repo="repo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    await db_session.commit()
+
+    # Install a fresh cache with a long TTL so both requests are cache hits.
+    fresh_cache = DigestCache(default_ttl=300.0, stale_retry_ttl=60.0)
+    mocker.patch.object(_admin_release_version, "_agent_serving_shas_cache", fresh_cache)
+
+    github_token_mock = AsyncMock(return_value="token")
+    branch_sha_mock = AsyncMock(side_effect=["int-sha-1", "promo-sha-1"])
+    mocker.patch("app.compute.get_current_agent_image", return_value=None)
+
+    with (
+        patch("app.github.get_repo_installation_token", github_token_mock),
+        patch("app.github_refs.get_branch_sha", branch_sha_mock),
+    ):
+        r1 = await client.get(f"/api/admin/projects/{project.id}/agent-serving-shas")
+        r2 = await client.get(f"/api/admin/projects/{project.id}/agent-serving-shas")
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    data1, data2 = r1.json(), r2.json()
+    assert data1["integration_head_sha"] == "int-sha-1"
+    assert data1["promotion_head_sha"] == "promo-sha-1"
+    # Second call returns the same cached SHAs.
+    assert data2["integration_head_sha"] == "int-sha-1"
+    assert data2["promotion_head_sha"] == "promo-sha-1"
+    # GitHub branch SHA lookups ran exactly once (cache hit on second call).
+    assert branch_sha_mock.call_count == 2  # one per distinct branch, not per request
