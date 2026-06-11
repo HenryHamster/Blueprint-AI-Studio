@@ -4522,7 +4522,39 @@ _RESEARCH_VERIFICATION_BASIS_TIERS = (
 )
 
 
-def compute_research_output_quality(tasks: List[Task]) -> Optional[Dict[str, Any]]:
+async def compute_research_output_quality_for_digest(
+    session: AsyncSession,
+    tasks: List[Task],
+) -> Optional[Dict[str, Any]]:
+    """Digest entry point: fetch ``plan_output`` narrowly, then aggregate.
+
+    The digest loads its task rows with a ``load_only`` projection that
+    deliberately omits ``Task.plan_output`` (loading the full JSONB for
+    thousands of rows blew the instance memory cap). Reading the attribute on
+    those instances triggers a sync lazy-load inside async context →
+    ``MissingGreenlet`` (prod digest 500 storm, 2026-06-11, rev 00429). This
+    wrapper SELECTs ``plan_output`` for only the qualifying research tasks —
+    a handful per window — and feeds the pure aggregator below.
+    """
+    candidate_ids = [
+        task.id
+        for task in tasks
+        if (task.first_payload or {}).get("type") == "research"
+        and _RESEARCH_SURVIVING_KEY in (task.context or {})
+    ]
+    if not candidate_ids:
+        return None
+    rows = await session.execute(
+        select(Task.id, Task.plan_output).where(Task.id.in_(candidate_ids))
+    )
+    plan_output_by_task_id = {row[0]: row[1] for row in rows.all()}
+    return compute_research_output_quality(tasks, plan_output_by_task_id)
+
+
+def compute_research_output_quality(
+    tasks: List[Task],
+    plan_output_by_task_id: Optional[Dict[Any, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Aggregate research output-quality signals across the digest window.
 
     Aggregates three complementary signals from the per-task JSONB that
@@ -4538,6 +4570,13 @@ def compute_research_output_quality(tasks: List[Task]) -> Optional[Dict[str, Any
     Tasks without ``research_surviving_findings`` in context OR with an empty/
     missing ``plan_output`` are skipped (nil-safe). Returns ``None`` when no
     qualifying tasks exist.
+
+    ``plan_output_by_task_id`` supplies each task's findings without touching
+    ``task.plan_output``. Pass it whenever the tasks came from a DB query that
+    may not have loaded that column (the digest's projection does not) — a
+    direct attribute read on such an instance lazy-loads synchronously and
+    raises ``MissingGreenlet`` in async context. When ``None``, findings are
+    read from the attribute (in-memory/fully-loaded instances only).
     """
     surviving_ratios: List[float] = []
     agrees = disagrees = indeterminate = 0
@@ -4550,8 +4589,13 @@ def compute_research_output_quality(tasks: List[Task]) -> Optional[Dict[str, Any
         ctx = task.context or {}
         if _RESEARCH_SURVIVING_KEY not in ctx:
             continue
+        raw_findings = (
+            plan_output_by_task_id.get(task.id)
+            if plan_output_by_task_id is not None
+            else task.plan_output
+        )
         findings = [
-            f for f in (task.plan_output or []) if isinstance(f, dict)
+            f for f in (raw_findings or []) if isinstance(f, dict)
         ]
         if not findings:
             continue
