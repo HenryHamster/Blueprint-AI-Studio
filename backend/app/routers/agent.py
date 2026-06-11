@@ -69,6 +69,7 @@ from app.github import (
     get_pull_request,
 )
 from app.broadcast import broadcast_to_project
+from app.claim_analytics import stamp_cold_claim_timing
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_themes,
     aggregate_sr_co_failure_pairs,
@@ -829,33 +830,7 @@ async def claim_task(
         task.last_heartbeat = (
             _utcnow()
         )  # Immediate heartbeat — don't wait 30s for agent interval
-        # Record time-to-claim covering the full dispatch->agent-ready interval.
-        # Use vm_dispatched_at (set before GCE create call) when available;
-        # fall back to vm_provisioned_at for tasks created before migration 0113.
-        _cold_start_anchor = task.vm_dispatched_at or task.vm_provisioned_at
-        if _cold_start_anchor:
-            claim_latency = (task.last_heartbeat - _cold_start_anchor).total_seconds()
-            _stgs = dict((task.context or {}).get("_cold_start_stages") or {})
-            _stgs["claim_at"] = task.last_heartbeat.isoformat()
-            # Backfill provision_slot_acquired_at from compute's in-memory store if
-            # not already present — lets efficiency snapshot compute dispatch_to_slot_ms.
-            if "provision_slot_acquired_at" not in _stgs and task.vm_instance_id:
-                from app.compute import get_provision_slot_acquired_at as _get_slot_at
-
-                _slot_ts = _get_slot_at(task.vm_instance_id)
-                if _slot_ts:
-                    _stgs["provision_slot_acquired_at"] = _slot_ts
-            task.context = {
-                **(task.context or {}),
-                "claim_latency_secs": round(claim_latency, 1),
-                "_cold_start_stages": _stgs,
-            }
-            # Promote claim_latency to the dedicated vm_cold_start_ms column
-            # for the efficiency direction (d-91d8dede). Guarded by IS NULL
-            # so re-provision restamps of vm_provisioned_at (orchestrator.py
-            # ~line 3240) cannot clobber the genuine first-claim measurement.
-            if task.vm_cold_start_ms is None:
-                task.vm_cold_start_ms = max(0, int(claim_latency * 1000))
+        stamp_cold_claim_timing(task)
         session.add(task)
         await session.commit()
         await session.refresh(task)

@@ -147,6 +147,7 @@ async def test_backlog_reuse_claims_same_project_task(
         assert backlog.vm_warm_start is True
         # Warm claim must NOT stamp a cold-start sample.
         assert backlog.vm_cold_start_ms is None
+        assert "claim_latency_secs" not in (backlog.context or {})
 
 
 @pytest.mark.asyncio

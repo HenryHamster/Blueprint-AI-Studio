@@ -16805,6 +16805,7 @@ async def test_claim_records_vm_cold_start_ms_once(client: AsyncClient, db_sessi
 
     await db_session.refresh(task)
     assert task.vm_cold_start_ms is not None
+    assert 10.0 <= (task.context or {}).get("claim_latency_secs", 0) <= 30.0
     # ~12s elapsed, so cold-start should be ≥10s and ≤30s (test slack).
     assert 10_000 <= task.vm_cold_start_ms <= 30_000
     initial_cold_start = task.vm_cold_start_ms
@@ -16918,6 +16919,7 @@ async def test_claim_uses_vm_dispatched_at_for_cold_start(
 
     await db_session.refresh(task)
     assert task.vm_cold_start_ms is not None
+    assert (task.context or {}).get("claim_latency_secs", 0) >= 15.0
     # Must reflect the full ~20s dispatch interval, not the 5s provision-confirm interval.
     assert task.vm_cold_start_ms >= 15_000, (
         f"Expected vm_cold_start_ms to reflect dispatch->claim (~20s), got {task.vm_cold_start_ms}ms"

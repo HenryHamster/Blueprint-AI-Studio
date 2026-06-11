@@ -35,6 +35,7 @@ from app.auth import (
     VM_SCOPED_TOKEN_SCOPE,
 )
 from app.broadcast import broadcast_to_project
+from app.claim_analytics import stamp_warm_claim_timing
 from app.database import get_session, resolve_dialect_name
 from app.models import Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
@@ -621,11 +622,11 @@ async def _finalize_warm_claim(
         # bookkeeping before committing the IN_PROGRESS transition.
         ctx.pop("parked_for_retarget", None)
         ctx.pop("park_deadline", None)
-        existing_timing = dict(ctx.get("_timing") or {})
-        existing_timing.setdefault("warm_start", True)
-        existing_timing["warm_claim_origin"] = origin
-        existing_timing["prior_role_vm_id"] = vm_instance_id
-        ctx["_timing"] = existing_timing
+        ctx = stamp_warm_claim_timing(
+            ctx,
+            origin=origin,
+            vm_instance_id=vm_instance_id,
+        )
         # Ground warm-resume receipts in actual outcome: stamp only here, at the
         # warm-claim site, so a cold-fallback fix (reserved member reaped, lease
         # expired, or pool fallback) leaves the receipt absent.
