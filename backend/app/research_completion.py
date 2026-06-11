@@ -113,7 +113,9 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
     direction_saturation_refractory_minutes,
 )
 from app.direction_refractory import stamp_direction_refractory
-from app.direction_mode import normalized_recommended_mode as _normalized_recommended_mode
+from app.direction_mode import (
+    normalized_recommended_mode as _normalized_recommended_mode,
+)
 from app.source_ref_validation import (
     validate_source_refs,
     resolve_branch_verification_context,
@@ -367,8 +369,7 @@ async def recompute_launch_staleness(session: Any, task: Any) -> bool:
             return False
         # Only annotate findings derived from a research parent.
         if not (
-            context.get("research_task_id")
-            or context.get("parent_research_task_id")
+            context.get("research_task_id") or context.get("parent_research_task_id")
         ):
             return False
         project = (
@@ -472,9 +473,7 @@ def _synthesize_deferred_finding_memo(
         parts.append(f"Description: {description}")
     absent = sf.get("absent_references")
     if isinstance(absent, list) and absent:
-        parts.append(
-            "Cited code absent on HEAD: " + ", ".join(str(r) for r in absent)
-        )
+        parts.append("Cited code absent on HEAD: " + ", ".join(str(r) for r in absent))
     challenge = sf.get(_FINDING_CHALLENGE_RECORD_KEY)
     if isinstance(challenge, dict):
         agreement = str(challenge.get("agreement") or "unknown")
@@ -504,9 +503,7 @@ def _finding_challenge_enabled(boundary: str) -> bool:
         return bool(_runtime_config.get(_RESEARCH_FINDING_CHALLENGE_FLAG, False))
     if boundary == CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH:
         return bool(
-            _runtime_config.get(
-                _RESEARCH_FINDING_INDETERMINATE_CHALLENGE_FLAG, False
-            )
+            _runtime_config.get(_RESEARCH_FINDING_INDETERMINATE_CHALLENGE_FLAG, False)
         )
     return False
 
@@ -567,9 +564,10 @@ def _challenge_second_verdict(record: Dict[str, Any] | None) -> str:
 
 
 def _challenge_confirms_verdict(record: Dict[str, Any] | None, verdict: str) -> bool:
-    return _challenge_agrees(record) and _challenge_second_verdict(record) == str(
-        verdict
-    ).lower()
+    return (
+        _challenge_agrees(record)
+        and _challenge_second_verdict(record) == str(verdict).lower()
+    )
 
 
 def _reconcile_reproduce_provenance_state(
@@ -1211,6 +1209,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     if not direction_id or task.project_id is None:
         return
     now_iso = _utcnow().isoformat()
+
     def _apply_no_findings_refractory(dirs: list) -> None:
         target = next((d for d in dirs if d.get("id") == direction_id), None)
         if not target:
@@ -1225,7 +1224,9 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
         target["possibly_saturated"] = True
         stamp_direction_refractory(target)
 
-    await with_directions_locked(session, task.project_id, _apply_no_findings_refractory)
+    await with_directions_locked(
+        session, task.project_id, _apply_no_findings_refractory
+    )
 
 
 def _summarize_dispatch_outcome(
@@ -1323,9 +1324,7 @@ async def _summarize_ungrounded_claims_grounded(
     }
 
 
-def _count_total_symbol_refs(
-    claims: list | None, sources: list | None
-) -> int:
+def _count_total_symbol_refs(claims: list | None, sources: list | None) -> int:
     """Count distinct ``path:symbol`` references across a finding's claims/excerpts.
 
     The denominator for the reproduce-on-HEAD verdict: paired with the
@@ -1449,7 +1448,9 @@ def _is_high_stakes_finding(finding: Dict[str, Any]) -> bool:
     # Malformed contracts (missing/invalid spend_cap_usd) are NOT flagged here —
     # they defer through the existing _validate_compute_launch_contract path.
     if finding.get("type") in COMPUTE_EXPERIMENT_FINDING_TYPES:
-        _nested = finding.get("compute_experiment") or finding.get("launch_contract") or {}
+        _nested = (
+            finding.get("compute_experiment") or finding.get("launch_contract") or {}
+        )
         if not isinstance(_nested, dict):
             _nested = {}
 
@@ -1677,14 +1678,18 @@ async def _commit_or_handle_duplicate_spawn(
         if _own_key:
             with contextlib.suppress(Exception):
                 _peer_id = (
-                    await session.execute(
-                        select(Task.id).where(
-                            Task.idempotency_key == _own_key,
-                            Task.id != _task_pk,
-                            Task.status.in_(_IDEMPOTENCY_INDEX_ACTIVE_STATUSES),
+                    (
+                        await session.execute(
+                            select(Task.id).where(
+                                Task.idempotency_key == _own_key,
+                                Task.id != _task_pk,
+                                Task.status.in_(_IDEMPOTENCY_INDEX_ACTIVE_STATUSES),
+                            )
                         )
                     )
-                ).scalars().first()
+                    .scalars()
+                    .first()
+                )
         if _peer_id is not None:
             # Release this task's claim — the peer legitimately re-claimed the
             # direction while this task sat terminal — and re-apply the batch:
@@ -1767,14 +1772,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Parked-awaiting guards: re-dispatch while a sidecar verdict is pending is
     # a safe no-op — return immediately so the spawn loop does not run ungated.
     # The stranded-sidecar sweep owns redelivery when a sidecar dies silently.
-    if (task.context or {}).get("awaiting_adversarial_grader") and _adversarial_verdict_raw is None:
+    if (task.context or {}).get(
+        "awaiting_adversarial_grader"
+    ) and _adversarial_verdict_raw is None:
         logger.info(
             "[RESEARCH] Task %s re-dispatched while parked awaiting adversarial "
             "grader — no-op (verdict not yet present)",
             task.id,
         )
         return
-    if (task.context or {}).get("awaiting_finding_challenge") and _finding_challenge_verdict is None:
+    if (task.context or {}).get(
+        "awaiting_finding_challenge"
+    ) and _finding_challenge_verdict is None:
         logger.info(
             "[RESEARCH] Task %s re-dispatched while parked awaiting finding "
             "challenge — no-op (verdict not yet present)",
@@ -1857,13 +1866,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # actually completed. Drop them here.
     if findings:
         findings = [f for f in findings if isinstance(f, dict)]
-    if not findings and _grader_verdict is not None and isinstance(task.plan_output, list):
+    if (
+        not findings
+        and _grader_verdict is not None
+        and isinstance(task.plan_output, list)
+    ):
         # Grader resume: the re-dispatch reconstructs the artifact from the
         # findings stored on the first pass. If that reconstruction does not
         # round-trip through the findings parser, fall back to the stored
         # findings directly so a PASSING grade can never silently spawn nothing.
         findings = [f for f in task.plan_output if isinstance(f, dict)]
-    if not findings and (task.context or {}).get("_research_spawn_pending") and isinstance(task.plan_output, list):
+    if (
+        not findings
+        and (task.context or {}).get("_research_spawn_pending")
+        and isinstance(task.plan_output, list)
+    ):
         # Spawn-pending resume: a prior pass was interrupted mid-spawn (lock
         # timeout / network error after _ensure_branch committed the marker).
         # The sweep retry replays with the same agent logs, which may no longer
@@ -2037,7 +2054,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             total_symbol_refs=_count_total_symbol_refs(
                 _f.get("claims"), _f.get("sources")
             ),
-            ungrounded_symbol_count=len((_ungrounded or {}).get("ungrounded_refs") or []),
+            ungrounded_symbol_count=len(
+                (_ungrounded or {}).get("ungrounded_refs") or []
+            ),
             has_backend=_has_backend,
         )
         # Store the FULL verdict (present/absent/indeterminate), not only the
@@ -2067,9 +2086,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # into read-only planning/knowledge child payloads below so producers and
     # consumers draw declared capabilities from the SAME shared namespace.
     _registry_vocab = annotate_capability_proof_status(
-        registry_capability_vocabulary(
-            getattr(project_obj, "problem_model", None)
-        ),
+        registry_capability_vocabulary(getattr(project_obj, "problem_model", None)),
         getattr(project_obj, "capability_proof_records", None),
     )
     _annotate_capability_declarations(findings, _registry_names)
@@ -2245,7 +2262,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _reason_key = f.get("deferred_reason") or "unknown"
                 _by_reason[_reason_key] = _by_reason.get(_reason_key, 0) + 1
                 _direction_key = (
-                    f.get("direction_id") or (task.context or {}).get("direction_id") or "(none)"
+                    f.get("direction_id")
+                    or (task.context or {}).get("direction_id")
+                    or "(none)"
                 )
                 _by_direction[_direction_key] = _by_direction.get(_direction_key, 0) + 1
             _finding_give_up = {
@@ -2438,10 +2457,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         ) or []
         _challenged_hashes_set: set[str] = set(_challenged_hashes_ctx)
         _explicit_verdicts = [
-            v for v in _adv_verdicts.values() if isinstance(v, dict) and v.get("explicit")
+            v
+            for v in _adv_verdicts.values()
+            if isinstance(v, dict) and v.get("explicit")
         ]
         _wholesale_parse_outcome = _spawn_gate_parse_outcome
-        if _wholesale_parse_outcome is None and _challenged_hashes_set and not _adv_verdicts:
+        if (
+            _wholesale_parse_outcome is None
+            and _challenged_hashes_set
+            and not _adv_verdicts
+        ):
             # Legacy gate records predate parse_outcome; an empty verdict map for
             # a non-empty manifest is equivalent to the parser finding no matches.
             _wholesale_parse_outcome = ADVERSARIAL_PARSE_NO_HASH_MATCHES
@@ -2454,9 +2479,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # Dispatch on the diagnosed non-response cause so the retry
             # strategy matches the failure mode rather than always doing the
             # same wholesale re-challenge.
-            _cause_category = (
-                (_adversarial_verdict_raw.get("cause") or {}).get("category") or ""
-            )
+            _cause_category = (_adversarial_verdict_raw.get("cause") or {}).get(
+                "category"
+            ) or ""
             # _do_wholesale: True means fall through to the existing wholesale
             # retry logic.  The refusal path sets it False to skip retries.
             _do_wholesale = True
@@ -2482,8 +2507,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             and len(_retry_findings) < _half
                         ):
                             _retry_findings.append({**_f, "hash": _fhash})
-                    _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
-                        _retry_findings
+                    _manifest_items, _manifest_json = (
+                        build_adversarial_challenge_manifest(_retry_findings)
                     )
                     _retry_hashes = [
                         item["hash"]
@@ -2506,13 +2531,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
                             _wholesale_parse_outcome
                         )
-                        _ctx["research_spawn_gate_challenged_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_challenged_count"] = len(
+                            _retry_hashes
+                        )
                         _ctx["research_spawn_gate_refuted_count"] = 0
                         _ctx["research_spawn_gate_survived_count"] = 0
                         _ctx["research_spawn_gate_explicit_pass_count"] = 0
                         _ctx["research_spawn_gate_fail_open_count"] = 0
-                        _ctx["research_spawn_gate_unresolved_count"] = len(_retry_hashes)
-                        _ctx["research_spawn_gate_parse_outcome"] = _wholesale_parse_outcome
+                        _ctx["research_spawn_gate_unresolved_count"] = len(
+                            _retry_hashes
+                        )
+                        _ctx["research_spawn_gate_parse_outcome"] = (
+                            _wholesale_parse_outcome
+                        )
                         task.context = _ctx
                         flag_modified(task, "context")
                         session.add(task)
@@ -2597,8 +2628,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         )
                         if _fhash in _wholesale_hashes_set:
                             _retry_findings.append({**_f, "hash": _fhash})
-                    _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
-                        _retry_findings
+                    _manifest_items, _manifest_json = (
+                        build_adversarial_challenge_manifest(_retry_findings)
                     )
                     _retry_hashes = [
                         item["hash"]
@@ -2614,13 +2645,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         _ctx["research_spawn_gate_last_wholesale_parse_outcome"] = (
                             _wholesale_parse_outcome
                         )
-                        _ctx["research_spawn_gate_challenged_count"] = len(_retry_hashes)
+                        _ctx["research_spawn_gate_challenged_count"] = len(
+                            _retry_hashes
+                        )
                         _ctx["research_spawn_gate_refuted_count"] = 0
                         _ctx["research_spawn_gate_survived_count"] = 0
                         _ctx["research_spawn_gate_explicit_pass_count"] = 0
                         _ctx["research_spawn_gate_fail_open_count"] = 0
-                        _ctx["research_spawn_gate_unresolved_count"] = len(_retry_hashes)
-                        _ctx["research_spawn_gate_parse_outcome"] = _wholesale_parse_outcome
+                        _ctx["research_spawn_gate_unresolved_count"] = len(
+                            _retry_hashes
+                        )
+                        _ctx["research_spawn_gate_parse_outcome"] = (
+                            _wholesale_parse_outcome
+                        )
                         task.context = _ctx
                         flag_modified(task, "context")
                         session.add(task)
@@ -2678,7 +2715,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         )
                         _explicit = False
                         _spawn_gate_manifest_excluded_count += 1
-                        if len(_spawn_gate_manifest_excluded_samples) < _SPAWN_GATE_REASONS_SAMPLE_CAP:
+                        if (
+                            len(_spawn_gate_manifest_excluded_samples)
+                            < _SPAWN_GATE_REASONS_SAMPLE_CAP
+                        ):
                             _spawn_gate_manifest_excluded_samples.append(
                                 {
                                     "hash": _fhash,
@@ -2711,7 +2751,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _reason = str(_verdict_obj.get("reason") or "")
                 # Validate "explicit" is actually a boolean; malformed/missing -> implicit
                 explicit_value = _verdict_obj.get("explicit")
-                _explicit = explicit_value if isinstance(explicit_value, bool) else False
+                _explicit = (
+                    explicit_value if isinstance(explicit_value, bool) else False
+                )
             if not _passed:
                 _f["_adversarial_verdict"] = "fail"
                 if not _explicit:
@@ -2737,15 +2779,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # survived = challenged - refuted to go negative.
         if _challenged_hashes_set:
             _high_stakes_challenged = [
-                _f for _f in findings
+                _f
+                for _f in findings
                 if _fh(
                     str(_f.get("title", "")),
                     str(_f.get("description", "") or _f.get("prompt", "")),
-                ) in _challenged_hashes_set
+                )
+                in _challenged_hashes_set
             ]
         else:
-            _high_stakes_challenged = [_f for _f in findings if _is_high_stakes_finding(_f)]
-        _spawn_gate_challenged_count = len(_challenged_hashes_ctx) or len(_high_stakes_challenged)
+            _high_stakes_challenged = [
+                _f for _f in findings if _is_high_stakes_finding(_f)
+            ]
+        _spawn_gate_challenged_count = len(_challenged_hashes_ctx) or len(
+            _high_stakes_challenged
+        )
         _spawn_gate_refuted_count = sum(
             1
             for _f in _high_stakes_challenged
@@ -3269,10 +3317,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _audit_direction: dict | None = None
     if _audit_direction_id and project_obj is not None:
         _audit_direction = next(
-            (d for d in (project_obj.directions or []) if d.get("id") == _audit_direction_id),
+            (
+                d
+                for d in (project_obj.directions or [])
+                if d.get("id") == _audit_direction_id
+            ),
             None,
         )
-    if _normalized_recommended_mode(_audit_direction) == "audit" and (findings or insights):
+    if _normalized_recommended_mode(_audit_direction) == "audit" and (
+        findings or insights
+    ):
         try:
             from app.knowledge_completion import persist_research_audit_document
 
@@ -3535,8 +3589,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "[RESEARCH] Task %s parked awaiting reproduce-absent "
                         "challenge for finding %r",
                         task.id,
-                        finding.get("title")
-                        or finding.get("description", "")[:60],
+                        finding.get("title") or finding.get("description", "")[:60],
                     )
                     return
             if _challenge_enabled:
@@ -3566,8 +3619,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "[RESEARCH] Reproduce-absent challenge for finding %r did not "
                         "establish a non-absent target; preserving original absent "
                         "verdict",
-                        finding.get("title")
-                        or finding.get("description", "")[:60],
+                        finding.get("title") or finding.get("description", "")[:60],
                     )
                     _reproduce_rejected.append(finding)
                     logger.warning(
@@ -3582,8 +3634,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     logger.info(
                         "[RESEARCH] Reproduce-absent challenge for finding %r "
                         "was indeterminate; preserving original absent verdict",
-                        finding.get("title")
-                        or finding.get("description", "")[:60],
+                        finding.get("title") or finding.get("description", "")[:60],
                     )
                 _reproduce_rejected.append(finding)
                 logger.warning(
@@ -3626,8 +3677,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "[RESEARCH] Task %s parked awaiting indeterminate "
                         "reproduce challenge for finding %r",
                         task.id,
-                        finding.get("title")
-                        or finding.get("description", "")[:60],
+                        finding.get("title") or finding.get("description", "")[:60],
                     )
                     return
             elif _challenge_agrees(_record):
@@ -4436,8 +4486,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     # agents ignore the field and still validate.
                     **(
                         {"available_capabilities": _registry_vocab}
-                        if _registry_vocab
-                        and task_type in _VOCAB_RENDERING_TASK_TYPES
+                        if _registry_vocab and task_type in _VOCAB_RENDERING_TASK_TYPES
                         else {}
                     ),
                 },
@@ -4465,9 +4514,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 finding.get("finding_hash"),
                 _finding_hash(
                     str(finding.get("title", title) or ""),
-                    str(
-                        finding.get("description", finding.get("prompt", "")) or ""
-                    ),
+                    str(finding.get("description", finding.get("prompt", "")) or ""),
                 ),
             )
             if isinstance(v, str) and v.strip()
@@ -4739,12 +4786,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Carry challenger task ID from the diagnostic so operators can connect a
     # missing-verdict deferral to its challenger task without opening each one.
     _adv_diagnostic = (task.context or {}).get("adversarial_gate_diagnostic") or {}
-    _adv_challenger_id = str(_adv_diagnostic.get("challenger_task_id") or "").strip() or None
+    _adv_challenger_id = (
+        str(_adv_diagnostic.get("challenger_task_id") or "").strip() or None
+    )
     # Machine-readable cause (taxonomy class / refusal / format-miss + optional
     # stale-image tag) for the grader non-response, lifted from the resolution-
     # time diagnostic so each deferred finding is attributable without opening
     # the challenger task. Observability only.
-    _adv_cause = _adv_diagnostic.get("cause") if isinstance(_adv_diagnostic, dict) else None
+    _adv_cause = (
+        _adv_diagnostic.get("cause") if isinstance(_adv_diagnostic, dict) else None
+    )
     for _adf in _adversarial_gate_deferred:
         _adf_stamped = _stamp_deferral(_adf, "adversarial_gate")
         # Re-key the finding_hash the SAME way adversarial verdicts are keyed
@@ -4958,9 +5009,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # research_history. `research_spawn_gate_cause` is the cause object;
             # `research_spawn_gate_cause_counts` maps its category to the number
             # of unresolved findings it accounts for this cycle.
-            _cycle_cause = (
-                ctx.get("adversarial_gate_diagnostic") or {}
-            ).get("cause")
+            _cycle_cause = (ctx.get("adversarial_gate_diagnostic") or {}).get("cause")
             if _cycle_cause:
                 ctx["research_spawn_gate_cause"] = _cycle_cause
                 _cause_category = (
@@ -5355,17 +5404,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             for _need in needs:
                 if not (isinstance(_need, dict) and _need.get("kind") == "task"):
                     continue
-                if (
-                    completed_foundation_for_need(
-                        ct, _need, _completed_foundations, failed_parent_ids
-                    )
-                    is not None
-                    or knowledge_substance_satisfies_need(
-                        _need, _knowledge_substance_index
-                    )
+                if completed_foundation_for_need(
+                    ct, _need, _completed_foundations, failed_parent_ids
+                ) is not None or knowledge_substance_satisfies_need(
+                    _need, _knowledge_substance_index
                 ):
                     _satisfied_keys.add((_need.get("kind"), _need.get("ref")))
             if _satisfied_keys:
+                _resolved_records: list = []
                 for _k in _satisfied_keys:
                     logger.info(
                         "[RESEARCH] Finding '%s' prerequisite %s:%s already satisfied "
@@ -5375,6 +5421,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         _k[0],
                         _k[1],
                     )
+                    _resolved_records.append({"kind": _k[0], "ref": _k[1]})
+                # Stamp the resolved prerequisites on the child task context for
+                # observability: operators can see which prereqs were auto-resolved at
+                # spawn (vs. gated/blocked until the blocked-resume sweep fires).
+                _rsp_ctx = dict(ct.context or {})
+                _prev_resolved = list(_rsp_ctx.get("_spawn_prereq_resolved") or [])
+                _rsp_ctx["_spawn_prereq_resolved"] = _prev_resolved + _resolved_records
+                ct.context = _rsp_ctx
+                flag_modified(ct, "context")
+                session.add(ct)
                 needs = [
                     n
                     for n in needs
@@ -5803,7 +5859,9 @@ def resolve_research_findings_for_surface(
         challenge = finding.get(_FINDING_CHALLENGE_RECORD_KEY)
         if not isinstance(challenge, dict):
             return finding
-        bounded = {k: v for k, v in challenge.items() if k in _BOUNDED_CHALLENGE_SURFACE_KEYS}
+        bounded = {
+            k: v for k, v in challenge.items() if k in _BOUNDED_CHALLENGE_SURFACE_KEYS
+        }
         if bounded == challenge:
             return finding
         out = dict(finding)
