@@ -61,6 +61,36 @@ async def test_digest_empty_window(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_compute_digest_counts_active_tasks_without_display_row_cap(db_session):
+    """active_count/running/queued use SQL aggregation, not the display row cap."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    active_tasks = [
+        make_task(
+            project_id=project.id,
+            title=f"Queued task {idx}",
+            status=TaskStatus.QUEUED,
+            created_at=now - timedelta(minutes=idx % 60),
+            payloads=[{"type": "create"}],
+        )
+        for idx in range(525)
+    ]
+    db_session.add_all(active_tasks)
+    await db_session.commit()
+
+    data = await _compute_digest(hours=24, project_id=None, session=db_session)
+
+    assert data["active_count"] == 525
+    assert data["queued_count"] == 525
+    assert data["running_count"] == 0
+    assert len(data["active_tasks"]) == 5
+
+
+@pytest.mark.asyncio
 async def test_digest_with_completed_tasks(client: AsyncClient, db_session):
     """Completed tasks inside the window appear in recent_completions with correct count."""
     project = make_project()
@@ -4640,7 +4670,6 @@ async def test_compute_remediation_and_patterns_helper_direct(db_session):
         window_start=window_start,
         failed_tasks=[],
         all_tasks=[],
-        active_tasks_all=[],
         dir_id_to_text={},
     )
 

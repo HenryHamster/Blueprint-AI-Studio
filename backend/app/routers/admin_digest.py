@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import desc, or_, text
+from sqlalchemy import desc, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -136,7 +136,6 @@ from app.routers.admin_release_version import (  # noqa: E402, F401
 )
 
 _SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
-_ACTIVE_TASKS_QUERY_LIMIT = 500
 
 # Pipeline-observability endpoints relocated to app.routers.admin_pipeline_observability
 # (cluster 1/4 — keep admin_digest focused on the catch-up digest). Re-exported here so
@@ -199,8 +198,8 @@ async def get_digest(
     fresh-for-``PRECOMPUTE_STALE_FALLBACK_SECONDS`` (``worker_only=True``),
     because only the leader's tick continuously refreshes it. On a NON-leader
     instance the worker never runs, so there is no worker-written entry and we
-    deliberately fall through to the ``DigestCache`` path below — its 15s TTL
-    keeps non-leader freshness at the prior 15s, NOT the 5-minute fallback
+    deliberately fall through to the ``DigestCache`` path below — its short TTL
+    keeps non-leader freshness bounded, NOT the 5-minute fallback
     window. (An earlier version primed the precompute cache opportunistically
     from this on-demand compute; that one-shot, never-refreshed entry would
     then be served as precomputed-for-300s on subsequent non-leader polls,
@@ -209,7 +208,7 @@ async def get_digest(
 
     Bounded fallback: when there is no fresh WORKER entry for this key (fresh
     boot, non-leader instance, or a non-primed window such as a custom
-    ``hours``), fall back to the existing ``DigestCache`` (15s TTL + in-flight
+    ``hours``), fall back to the existing ``DigestCache`` (short TTL + in-flight
     dedup + serve-stale-on-failure) so at most one on-demand 5000-row scan runs
     per key per TTL — the prior behavior, preserved as a safety net.
     """
@@ -254,9 +253,10 @@ async def get_digest(
     result = await cache.get_or_compute(
         cache_key,
         lambda: _compute_digest(hours=hours, project_id=project_id, session=session),
+        ttl=60.0,
     )
     # NOTE: deliberately do NOT prime the precompute cache here. The DigestCache
-    # already gives this on-demand path a 15s TTL + in-flight dedup; priming a
+    # already gives this on-demand path a short TTL + in-flight dedup; priming a
     # non-worker entry would let a non-leader instance serve a never-refreshed
     # payload as fresh-for-PRECOMPUTE_STALE_FALLBACK_SECONDS, regressing
     # non-leader digest freshness from 15s to 5 minutes.
@@ -311,6 +311,7 @@ async def _compute_digest(
 
     _DIGEST_TASK_ROW_CAP = 5000
     _ACTIVE_TASKS_DISPLAY_LIMIT = 5
+    _ACTIVE_TASKS_SIGNAL_LIMIT = 50
     # Project payloads[0] and status_log[-1]->>'t' SQL-side on PostgreSQL.
     # Loading the full JSONB arrays for 5000 rows blew a Cloud Run instance
     # past its 4 GiB limit under concurrent polling; with projection each
@@ -478,6 +479,15 @@ async def _compute_digest(
     active_filters = [Task.status.in_(_active_statuses)]
     if project_id:
         active_filters.append(Task.project_id == project_id)
+    active_counts_result = await session.execute(
+        select(Task.status, func.count())
+        .where(*active_filters)
+        .group_by(Task.status)
+    )
+    active_count_by_status = {
+        row_status: int(row_count or 0)
+        for row_status, row_count in active_counts_result.all()
+    }
     if _use_projection:
         active_result = await session.execute(
             select(
@@ -486,7 +496,7 @@ async def _compute_digest(
             )
             .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
-            .limit(_ACTIVE_TASKS_QUERY_LIMIT)
+            .limit(_ACTIVE_TASKS_SIGNAL_LIMIT)
             .options(
                 load_only(
                     Task.id,
@@ -515,7 +525,7 @@ async def _compute_digest(
             select(Task)
             .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
-            .limit(_ACTIVE_TASKS_QUERY_LIMIT)
+            .limit(_ACTIVE_TASKS_SIGNAL_LIMIT)
             .options(
                 load_only(
                     Task.id,
@@ -585,7 +595,13 @@ async def _compute_digest(
     for _chunk_start in range(0, len(all_task_ids), 200):
         _chunk = all_task_ids[_chunk_start : _chunk_start + 200]
         artifacts_result = await session.execute(
-            select(Artifact)
+            select(
+                Artifact.task_id,
+                Artifact.artifact_type,
+                Artifact.pr_url,
+                func.substr(Artifact.logs, 1, 500).label("error_log_snippet"),
+                Artifact.created_at,
+            )
             .where(
                 Artifact.task_id.in_(_chunk),
                 Artifact.artifact_type.in_(
@@ -598,18 +614,20 @@ async def _compute_digest(
             .order_by(Artifact.created_at.asc())
             .limit(500)
         )
-        for a in artifacts_result.scalars().all():
-            tid = str(a.task_id)
-            if a.artifact_type == ArtifactType.PULL_REQUEST:
-                if a.created_at >= window_start:
+        for task_id, artifact_type, pr_url, error_log_snippet, created_at in (
+            artifacts_result.all()
+        ):
+            tid = str(task_id)
+            if artifact_type == ArtifactType.PULL_REQUEST:
+                if created_at >= window_start:
                     pr_count += 1
-                pr_artifact_map[tid] = a.pr_url or ""
+                pr_artifact_map[tid] = pr_url or ""
             elif (
-                a.artifact_type == ArtifactType.ERROR_LOG
-                and a.logs
+                artifact_type == ArtifactType.ERROR_LOG
+                and error_log_snippet
                 and tid not in error_log_map
             ):
-                error_log_map[tid] = a.logs[:500]
+                error_log_map[tid] = error_log_snippet
 
     # --- needs_attention: failed + pending approval ---
     from app.failure_classification import classify_failure as _classify_failure
@@ -877,8 +895,13 @@ async def _compute_digest(
 
     running_statuses = {TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING}
     queued_statuses = {TaskStatus.QUEUED, TaskStatus.EVALUATING}
-    running_count = sum(1 for t in active_tasks_all if t.status in running_statuses)
-    queued_count = sum(1 for t in active_tasks_all if t.status in queued_statuses)
+    running_count = sum(
+        active_count_by_status.get(status, 0) for status in running_statuses
+    )
+    queued_count = sum(
+        active_count_by_status.get(status, 0) for status in queued_statuses
+    )
+    active_count = running_count + queued_count
 
     total_terminal = len(completed_tasks) + len(failed_tasks)
     success_rate = (
@@ -1334,7 +1357,6 @@ async def _compute_digest(
         window_start=window_start,
         failed_tasks=failed_tasks,
         all_tasks=all_tasks,
-        active_tasks_all=active_tasks_all,
         dir_id_to_text=dir_id_to_text,
     )
     remediation_funnel = _remediation_result["remediation_funnel"]
@@ -1487,7 +1509,7 @@ async def _compute_digest(
         "pending_approval_count": len(approval_tasks),
         "research_cycles": research_cycles,
         "prs_opened": pr_count,
-        "active_count": len(active_tasks_all),
+        "active_count": active_count,
         "running_count": running_count,
         "queued_count": queued_count,
         "active_tasks": active_tasks_list,
