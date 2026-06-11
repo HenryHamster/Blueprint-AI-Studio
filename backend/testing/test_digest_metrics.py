@@ -5821,6 +5821,105 @@ def test_compute_research_output_quality_skips_non_dict_findings_and_unknown_bas
     assert result["qualifying_task_count"] == 1
 
 
+def test_compute_research_output_quality_map_takes_precedence_over_attribute():
+    """An explicit plan_output_by_task_id map is the findings source — the
+    task.plan_output attribute is never read (it may be unloaded on projected
+    DB rows, where the read would lazy-load → MissingGreenlet)."""
+    task = _make_research_task(
+        surviving=1,
+        findings=[
+            {"title": f"attr{i}", "verification_basis": "deduced"} for i in range(4)
+        ],
+    )
+    by_id = {task.id: [{"title": "map", "verification_basis": "code_verified"}]}
+    result = compute_research_output_quality([task], by_id)
+    assert result is not None
+    # 1 surviving / 1 map finding — NOT 1/4 from the attribute
+    assert result["surviving_rate"] == 1.0
+    assert result["verification_basis_distribution"]["code_verified"] == 1
+    assert result["verification_basis_distribution"]["deduced"] == 0
+
+
+def test_compute_research_output_quality_map_missing_entry_skips_task():
+    """With a map supplied, a task absent from it counts as no findings."""
+    task = _make_research_task(
+        surviving=1,
+        findings=[{"title": "attr", "verification_basis": "deduced"}],
+    )
+    assert compute_research_output_quality([task], {}) is None
+
+
+@pytest.mark.asyncio
+async def test_research_output_quality_for_digest_with_projected_rows(db_session):
+    """Regression for the prod digest 500 storm (2026-06-11, rev 00429): the
+    digest loads its task rows with a load_only projection that omits
+    plan_output, and reading that attribute on a projected instance triggers a
+    sync lazy-load inside async context → MissingGreenlet. The digest wrapper
+    must fetch findings through its own narrow SELECT instead."""
+    from sqlalchemy.orm import load_only
+    from sqlmodel import select
+
+    from app.digest_metrics import compute_research_output_quality_for_digest
+    from app.models import Task
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"research_surviving_findings": 2},
+        plan_output=[
+            {"title": f"F{i}", "verification_basis": "deduced"} for i in range(4)
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    db_session.expunge_all()  # force a fresh load below
+
+    rows = await db_session.execute(
+        select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.project_id,
+                Task.payloads,
+                Task.context,
+            )
+        )
+        .where(Task.project_id == project.id)
+    )
+    projected = list(rows.scalars().all())
+    assert "plan_output" not in projected[0].__dict__  # column really unloaded
+
+    result = await compute_research_output_quality_for_digest(db_session, projected)
+    assert result is not None
+    assert result["qualifying_task_count"] == 1
+    assert result["surviving_rate"] == 0.5  # 2 surviving / 4 findings
+
+
+@pytest.mark.asyncio
+async def test_research_output_quality_for_digest_no_candidates_skips_query(db_session):
+    """No qualifying research tasks → None without issuing the findings SELECT."""
+    from app.digest_metrics import compute_research_output_quality_for_digest
+
+    tasks = [
+        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}]),
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={},
+        ),
+    ]
+    assert (
+        await compute_research_output_quality_for_digest(db_session, tasks) is None
+    )
+
+
 # ── compute_trial_arm_accumulation: arm_composition basis tracking ────────────
 
 

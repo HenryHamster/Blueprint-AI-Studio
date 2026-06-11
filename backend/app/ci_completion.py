@@ -1873,10 +1873,19 @@ async def handle_ci_completion(
     # The fix-spawned branch pre-set _bcast_status at its status-decision point so
     # we don't re-read a possibly-expired ``task`` (a rollback inside
     # _spawn_pipeline_task expires it → sync lazy-load in async context →
-    # MissingGreenlet, #6754 family). Other paths reach here with a fresh ``task``
-    # (no nested rollback), so fall back to reading task.status directly.
+    # MissingGreenlet, #6754 family). Other paths reach here with a fresh ``task``,
+    # but "fresh" proved unreliable in prod (2026-06-11: an unrelated mid-handler
+    # rollback expired the instance and the direct read crashed the worker), so
+    # the fallback reads from the instance dict — never IO — and only goes to the
+    # DB through an explicit async SELECT when the attribute really is expired.
     if _bcast_status is None:
-        _bcast_status = task.status
+        _bcast_status = task.__dict__.get("status")
+    if _bcast_status is None:
+        _bcast_status = (
+            await session.execute(
+                select(Task.status).where(Task.id == _bcast_task_id)
+            )
+        ).scalar_one_or_none()
     await session.commit()
     await broadcast_to_project(
         _bcast_project_id,
