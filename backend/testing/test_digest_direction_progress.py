@@ -2783,3 +2783,90 @@ def test_compute_spawn_gate_census_gate_not_invoked_when_no_challenged():
     result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
     assert result["gate_invoked_count"] == 0
     assert result["rows"][0]["gate_invoked"] is False
+
+
+@pytest.mark.asyncio
+async def test_conversion_denominator_excludes_knowledge_and_compute_children(
+    client: AsyncClient, db_session
+):
+    """conversion_rate denominator excludes web_research, design, compute_experiment tasks.
+
+    A direction that emits 2 knowledge findings (web_research + design) and 2
+    implementation findings (create), with both implementations merged, must report
+    conversion_rate=1.0 (2/2), not 0.5 (2/4).  This is the acceptance gate for the
+    'fix: exclude never-PR child types from conversion stats' change.
+    """
+    from app.digest_direction_progress import pr_ineligible_created_in_entry
+
+    entry = {
+        "timestamp": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+        "prs_merged": 2,
+        "verified_prs_merged": 2,
+        "tasks_created": 4,
+        "type_breakdown": {
+            "create": {"created": 2, "merged": 2, "failed": 0},
+            "web_research": {"created": 1, "merged": 0, "failed": 0},
+            "design": {"created": 1, "merged": 0, "failed": 0},
+        },
+    }
+
+    # pr_ineligible_created_in_entry must count web_research + design as ineligible
+    assert pr_ineligible_created_in_entry(entry) == 2
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-knowledge",
+                "text": "Direction with knowledge children",
+                "status": "active",
+                "research_history": [entry],
+                "history_aggregate": {
+                    "total_cycles": 1,
+                    "total_prs_merged": 1,
+                    "total_verified_prs_merged": 1,
+                    "total_tasks_created": 3,
+                    "total_pr_ineligible_tasks_created": 2,
+                },
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research cycle",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-knowledge"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    # 2 merged / 2 PR-eligible (create tasks only) = 1.0, NOT 2/4 = 0.5.
+    # Lifetime uses the same denominator, including folded aggregate ineligible counts:
+    # (2 + 1) verified merges / ((4 + 3) created - (2 + 2) ineligible) = 1.0.
+    assert dp["prs_merged"] == 2
+    assert dp["conversion_rate"] == 1.0
+    assert dp["lifetime_conversion_rate"] == 1.0
+    assert dp["pr_eligible_tasks_created"] == 2
+
+    # Also verify compute_experiment is excluded
+    entry_ce = {
+        "timestamp": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+        "prs_merged": 0,
+        "tasks_created": 3,
+        "type_breakdown": {
+            "compute_experiment": {"created": 2, "merged": 0, "failed": 0},
+            "fix": {"created": 1, "merged": 0, "failed": 0},
+        },
+    }
+    assert pr_ineligible_created_in_entry(entry_ce) == 2

@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.direction_outcomes import (
+    PR_INELIGIBLE_TASK_TYPES,
     _SPAWN_GATE_REASON_MAX_LEN,
     _SPAWN_GATE_REASONS_SAMPLE_CAP,
     declared_merged_count,
@@ -30,10 +31,6 @@ from app.task_evaluators import (
 )
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
 
-# Task types that never open a PR. These are excluded from the
-# conversion_rate denominator so the metric means the same thing on every
-# surface: merged PRs / PR-eligible tasks created (NOT / all tasks created).
-PR_INELIGIBLE_TASK_TYPES = ("research", "investigate", "audit", "memo")
 _CHALLENGE_BOUNDARY_BUCKETS = (
     CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
     CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
@@ -91,6 +88,11 @@ def pr_ineligible_created_in_entry(entry: Dict[str, Any]) -> int:
         (type_breakdown.get(ttype) or {}).get("created", 0) or 0
         for ttype in PR_INELIGIBLE_TASK_TYPES
     )
+
+
+def pr_ineligible_created_in_aggregate(aggregate: Dict[str, Any]) -> int:
+    """Number of folded PR-ineligible tasks in a direction history aggregate."""
+    return aggregate.get("total_pr_ineligible_tasks_created") or 0
 
 
 def compute_spawn_gate_aggregate(
@@ -808,12 +810,18 @@ async def compute_direction_progress(
         lifetime_tasks_created = sum(
             h.get("tasks_created", 0) for h in _history_all
         ) + (_agg.get("total_tasks_created") or 0)
+        lifetime_pr_ineligible_tasks_created = sum(
+            pr_ineligible_created_in_entry(h) for h in _history_all
+        ) + pr_ineligible_created_in_aggregate(_agg)
+        lifetime_pr_eligible_tasks_created = (
+            lifetime_tasks_created - lifetime_pr_ineligible_tasks_created
+        )
         lifetime_tasks_failed = sum(h.get("tasks_failed", 0) for h in _history_all) + (
             _agg.get("total_tasks_failed") or 0
         )
         lifetime_conversion_rate = (
-            round(lifetime_verified_prs_merged / lifetime_tasks_created, 3)
-            if lifetime_tasks_created > 0
+            round(lifetime_verified_prs_merged / lifetime_pr_eligible_tasks_created, 3)
+            if lifetime_pr_eligible_tasks_created > 0
             else None
         )
         lifetime_autonomous_prs_merged = sum(

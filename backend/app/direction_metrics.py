@@ -8,6 +8,7 @@ research pipeline orchestration.
 from typing import Any
 
 from app.direction_outcomes import (
+    PR_INELIGIBLE_TASK_TYPES,
     consumed_merged_count,
     proven_merged_count,
     verified_merged_count,
@@ -143,6 +144,7 @@ def _agg_proof_weighted_merged(agg: dict) -> float:
 _HISTORY_AGG_DEFAULTS = {
     "total_cycles": 0,
     "total_tasks_created": 0,
+    "total_pr_ineligible_tasks_created": 0,
     "total_prs_merged": 0,
     # Verification-aware lifetime merge count: total_prs_merged minus merges
     # whose verification was degraded (blocked by an environment/setup failure).
@@ -468,6 +470,11 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
     for ev in evicted:
         agg["total_cycles"] += 1
         agg["total_tasks_created"] += ev.get("tasks_created", 0)
+        type_breakdown = ev.get("type_breakdown") or {}
+        agg["total_pr_ineligible_tasks_created"] += sum(
+            (type_breakdown.get(ttype) or {}).get("created", 0) or 0
+            for ttype in PR_INELIGIBLE_TASK_TYPES
+        )
         agg["total_prs_merged"] += ev.get("prs_merged", 0)
         # Legacy fallback: pre-verification entries have no verified_prs_merged;
         # treat all merges as verified so lifetime burn is unchanged for old data.
@@ -793,5 +800,4 @@ def _compute_autonomy_threshold_state(d: dict) -> dict:
         "retirement_eligible": lifetime_autonomous >= _AUTONOMY_RETIREMENT_THRESHOLD
         and lifetime_operator_actions == 0,
     }
-
 
