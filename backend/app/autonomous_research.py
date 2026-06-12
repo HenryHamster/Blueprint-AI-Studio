@@ -7,7 +7,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func
+from sqlalchemy import case, exists, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -2206,6 +2206,94 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
         # Recover deferred findings from recent completed research tasks.
         task_context: dict = {}
+        if resolve_dialect_name(session) == "postgresql":
+            deferred_findings_filters = [
+                Task.context.has_key("deferred_findings"),
+                case(
+                    (
+                        func.jsonb_typeof(Task.context["deferred_findings"]) == "array",
+                        func.jsonb_array_length(Task.context["deferred_findings"]),
+                    ),
+                    else_=0,
+                )
+                > 0,
+            ]
+        else:
+            deferred_findings_filters = [
+                func.json_type(Task.context, "$.deferred_findings") == "array",
+                func.json_array_length(Task.context, "$.deferred_findings") > 0,
+            ]
+        if current_dir_id:
+            if resolve_dialect_name(session) == "postgresql":
+                deferred_findings_scope_rows = func.jsonb_array_elements(
+                    Task.context["deferred_findings"]
+                ).table_valued("value")
+                deferred_findings_scope_filter = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.jsonb_extract_path_text(
+                            deferred_findings_scope_rows.c.value,
+                            "direction_id",
+                        )
+                        == current_dir_id
+                    )
+                )
+            else:
+                deferred_findings_scope_rows = func.json_each(
+                    Task.context, "$.deferred_findings"
+                ).table_valued("key", "value")
+                deferred_findings_scope_filter = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.coalesce(
+                            func.json_extract(
+                                deferred_findings_scope_rows.c.value,
+                                "$.direction_id",
+                            ),
+                            "",
+                        )
+                        == current_dir_id
+                    )
+                )
+        else:
+            if resolve_dialect_name(session) == "postgresql":
+                deferred_findings_scope_rows = func.jsonb_array_elements(
+                    Task.context["deferred_findings"]
+                ).table_valued("value")
+                deferred_findings_scope_filter = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.coalesce(
+                            func.jsonb_extract_path_text(
+                                deferred_findings_scope_rows.c.value,
+                                "direction_id",
+                            ),
+                            "",
+                        )
+                        == ""
+                    )
+                )
+            else:
+                deferred_findings_scope_rows = func.json_each(
+                    Task.context, "$.deferred_findings"
+                ).table_valued("key", "value")
+                deferred_findings_scope_filter = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.coalesce(
+                            func.json_extract(
+                                deferred_findings_scope_rows.c.value,
+                                "$.direction_id",
+                            ),
+                            "",
+                        )
+                        == ""
+                    )
+                )
         prev_research_rows = (
             (
                 await session.execute(
@@ -2213,6 +2301,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     .where(
                         Task.project_id == project.id,
                         Task.status == TaskStatus.COMPLETED,
+                        Task.payloads[0]["type"].as_string() == "research",
+                        *deferred_findings_filters,
+                        deferred_findings_scope_filter,
                     )
                     .order_by(Task.created_at.desc())
                     .limit(20)
@@ -2221,9 +2312,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             .scalars()
             .all()
         )
-        prev_research_rows = [
-            r for r in prev_research_rows if (r.context or {}).get("deferred_findings")
-        ]
         from app.finding_deduplication import finding_hash as _finding_hash
 
         _deferred_ttl_days = int(_runtime_config.get("deferred_finding_ttl_days", 7))
@@ -2237,7 +2325,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     continue
                 f_dir_id = f.get("direction_id")
                 if current_dir_id:
-                    if f_dir_id and f_dir_id != current_dir_id:
+                    if f_dir_id != current_dir_id:
                         continue
                 else:
                     if f_dir_id:

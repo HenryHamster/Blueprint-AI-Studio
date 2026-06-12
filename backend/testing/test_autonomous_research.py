@@ -8823,6 +8823,113 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
     )
 
 
+@pytest.mark.asyncio
+async def test_deferred_research_recovery_filters_before_cap_and_keeps_scope(
+    db_session,
+):
+    direction_a = _active_direction("d-recover-a1", "Recovery A")
+    direction_b = _active_direction("d-recover-b1", "Recovery B")
+    project = Project(
+        name="Deferred Recovery Busy Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction_a],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.now(timezone.utc)
+    target_finding = _make_finding("Recover direction A", direction_a["id"])
+    other_direction_finding = _make_finding("Skip direction B", direction_b["id"])
+    relevant_research = Task(
+        project_id=project.id,
+        title="Research: older relevant deferred row",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction_a],
+                "current_direction_id": direction_a["id"],
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "deferred_findings": [
+                target_finding,
+            ]
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(hours=8),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(relevant_research)
+
+    for i in range(20):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Research: recent deferred row {i}",
+                payloads=[
+                    {
+                        "type": "research",
+                        "directions": [direction_a],
+                        "current_direction_id": direction_a["id"],
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "deferred_findings": [
+                        {
+                            **other_direction_finding,
+                            "title": f"{other_direction_finding['title']} {i}",
+                            "finding_hash": f"hash-other-{i}",
+                        }
+                    ]
+                },
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(hours=5, minutes=i),
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Completed create with deferred context",
+            payloads=[{"type": "create", "base_branch": "main"}],
+            context={
+                "deferred_findings": [
+                    _make_finding("Ignore non-research deferred", direction_a["id"])
+                ]
+            },
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=1),
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status == TaskStatus.QUEUED,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    new_task = result.scalar_one()
+    assert new_task.first_payload.get("current_direction_id") == direction_a["id"]
+    prior_titles = {
+        f.get("title")
+        for f in (new_task.context or {}).get("prior_deferred_findings", [])
+    }
+    assert prior_titles == {"Recover direction A"}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 17. _handle_research_completion — Batch Cap Deferral & Priority Sort
 # ─────────────────────────────────────────────────────────────────────────────
