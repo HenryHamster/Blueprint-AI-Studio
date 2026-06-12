@@ -135,6 +135,61 @@ function CiBadge({ ci }: { ci: CiResolution }) {
   );
 }
 
+function ManagedCheckWaitSnapshotDetails({
+  state,
+}: {
+  state: QualificationState | null | undefined;
+}) {
+  const snapshot = state?.check_snapshot;
+  if (!snapshot) return null;
+  const color = CI_STATE_STYLE[snapshot.state] ?? 'text-neutral-400';
+  const checks = Array.isArray(snapshot.checks) ? snapshot.checks : [];
+  const totalChecks =
+    typeof snapshot.total_checks === 'number' && Number.isFinite(snapshot.total_checks)
+      ? snapshot.total_checks
+      : checks.length;
+  return (
+    <div
+      data-testid="promotion-check-wait-snapshot"
+      className="text-[10px] text-neutral-400 border border-neutral-800 bg-neutral-950/40 rounded px-2 py-1 space-y-1"
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className={`font-mono ${color}`}>ci:{snapshot.state}</span>
+        <span title={snapshot.classified_at}>classified {timeAgo(snapshot.classified_at)}</span>
+        {snapshot.head_sha && (
+          <span className="font-mono text-neutral-500">head {snapshot.head_sha.slice(0, 7)}</span>
+        )}
+        <span>{totalChecks} check{totalChecks === 1 ? '' : 's'}</span>
+        {snapshot.reason && <span className="text-amber-400">{snapshot.reason.replace(/_/g, ' ')}</span>}
+      </div>
+      {snapshot.detail && <p className="text-neutral-500">{snapshot.detail}</p>}
+      {checks.length > 0 ? (
+        <div className="flex flex-wrap gap-1">
+          {checks.map((check, index) => {
+            const status = check.conclusion ?? check.status ?? 'unknown';
+            return (
+              <span
+                key={`${check.name}-${index}`}
+                className="font-mono text-[9px] px-1 py-0.5 rounded border border-neutral-800 bg-neutral-900 text-neutral-300"
+                title={`${check.name}: ${status}`}
+              >
+                {check.name}: {status}
+              </span>
+            );
+          })}
+          {snapshot.truncated && (
+            <span className="font-mono text-[9px] px-1 py-0.5 rounded border border-neutral-800 text-neutral-500">
+              +{Math.max(0, totalChecks - checks.length)} more
+            </span>
+          )}
+        </div>
+      ) : (
+        <p className="text-neutral-500">No check runs reported yet.</p>
+      )}
+    </div>
+  );
+}
+
 const AUDIT_MISSING_REASON_LABELS: Record<string, string> = {
   no_findings_key: 'audit findings key missing',
   empty_findings_list: 'audit findings list empty',
@@ -1370,6 +1425,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   >
                     Migration-carrying promotion PR{cv.qualification_state.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} waiting for required checks{promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — Blueprint retries the merge automatically
                   </p>
+                )}
+                {cv.qualification_state.state === 'promotion_check_wait' && (
+                  <ManagedCheckWaitSnapshotDetails state={cv.qualification_state} />
                 )}
                 {(cv.qualification_state.state === 'required_check_failed' || cv.qualification_state.state === 'protection_blocked_review') && cv.qualification_state.detail && (
                   <p

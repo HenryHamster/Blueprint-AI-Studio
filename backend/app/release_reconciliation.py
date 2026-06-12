@@ -50,7 +50,7 @@ from app.release_promotion import (
     _resolve_github_with_session,
 )
 from app.rollup_migration_validation import _validate_migration_chain_post_merge
-from app.release_scoring import _CI_GREEN, _CI_RED, _classify_check_runs
+from app.release_scoring import _CI_GREEN, _CI_PENDING, _CI_RED, _classify_check_runs
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -83,6 +83,128 @@ logger = logging.getLogger(__name__)
 # the 4h stall alert and any realistic CI duration so it only fires on a
 # genuinely wedged promotion, never on a slow-but-progressing one.
 _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
+_MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT = 10
+_MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT = 160
+
+
+def _trim_check_snapshot_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    return value[:_MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT]
+
+
+def _managed_check_wait_snapshot(
+    *,
+    ci_state: str,
+    classified_at: datetime,
+    head_sha: str | None = None,
+    check_result: dict | None = None,
+    reason: str | None = None,
+    detail: str | None = None,
+) -> dict:
+    """Build a bounded operator snapshot for a non-terminal check-wait sweep."""
+
+    details = []
+    raw_details = check_result.get("details") if isinstance(check_result, dict) else None
+    if isinstance(raw_details, list):
+        for raw in raw_details[:_MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT]:
+            if not isinstance(raw, dict):
+                continue
+            item = {
+                "name": _trim_check_snapshot_text(raw.get("name")) or "unknown",
+            }
+            status = _trim_check_snapshot_text(raw.get("status"))
+            conclusion = _trim_check_snapshot_text(raw.get("conclusion"))
+            if status is not None:
+                item["status"] = status
+            if conclusion is not None:
+                item["conclusion"] = conclusion
+            details.append(item)
+    else:
+        raw_details = []
+
+    snapshot = {
+        "state": ci_state,
+        "classified_at": classified_at.isoformat(),
+        "head_sha": head_sha,
+        "total_checks": len(raw_details),
+        "checks": details,
+        "truncated": len(raw_details) > _MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT,
+    }
+    if reason:
+        snapshot["reason"] = reason
+    if detail:
+        snapshot["detail"] = detail[:_MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT]
+    return snapshot
+
+
+async def _persist_managed_check_wait_snapshot(
+    session,
+    version_id: uuid.UUID,
+    *,
+    pr_number: int,
+    ci_state: str,
+    snapshot: dict,
+) -> bool:
+    """Persist additive CI telemetry without clobbering promotion PR provenance."""
+
+    try:
+        # The row lock was released by the earlier commit, so this session may
+        # still be holding a stale identity-map copy. Expire before the
+        # FOR-UPDATE re-read so we evaluate the current DB state, not the cached
+        # pre-I/O instance.
+        session.expire_all()
+        locked: release_version.ReleaseVersion | None = (
+            (
+                await session.execute(
+                    select(release_version.ReleaseVersion)
+                    .where(release_version.ReleaseVersion.id == version_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked is None or locked.status != "open":
+            return False
+        qual = dict(locked.last_qualification or {})
+        if qual.get("status") != "pending":
+            return False
+        pending = qual.get("promotion_pending")
+        if not isinstance(pending, dict) or not pending.get("managed_check_wait"):
+            return False
+        if pending.get("pr_number") != pr_number:
+            return False
+
+        updated_pending = dict(pending)
+        updated_pending["ci_state"] = ci_state
+        updated_pending["ci_classified_at"] = snapshot.get("classified_at")
+        updated_pending["check_snapshot"] = snapshot
+        qual["promotion_pending"] = updated_pending
+        locked.last_qualification = qual
+        flag_modified(locked, "last_qualification")
+        session.add(locked)
+        await session.commit()
+        return True
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] reconcile managed_check_wait: failed to persist "
+            "check snapshot for version %s",
+            version_id,
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile managed_check_wait: rollback failed "
+                "after check snapshot persist error for version %s",
+                version_id,
+            )
+        return False
 
 
 async def _refresh_release_artifact_rows(
@@ -1023,6 +1145,14 @@ async def _reconcile_if_managed_check_wait(
                     )
                     return False
                 if alembic_status == "block":
+                    await _cleanup_managed_check_wait_failure_artifacts(
+                        token,
+                        owner,
+                        repo,
+                        release_branch,
+                        version,
+                        int(pr_number),
+                    )
                     await _record_promotion_failure(
                         session,
                         version,
@@ -1099,6 +1229,14 @@ async def _reconcile_if_managed_check_wait(
                     pr_number,
                     version.version_number,
                 )
+                await _cleanup_managed_check_wait_failure_artifacts(
+                    token,
+                    owner,
+                    repo,
+                    release_branch,
+                    version,
+                    int(pr_number),
+                )
                 await _record_promotion_failure(
                     session,
                     version,
@@ -1113,6 +1251,19 @@ async def _reconcile_if_managed_check_wait(
 
             if pr_data.get("state") != "open":
                 # Unknown/transient state — leave pending.
+                classified_at = _utcnow()
+                await _persist_managed_check_wait_snapshot(
+                    session,
+                    version.id,
+                    pr_number=int(pr_number),
+                    ci_state=_CI_PENDING,
+                    snapshot=_managed_check_wait_snapshot(
+                        ci_state=_CI_PENDING,
+                        classified_at=classified_at,
+                        reason="pr_not_open",
+                        detail=f"PR state is {pr_data.get('state')!r}",
+                    ),
+                )
                 return False
 
             pr_head_sha: str | None = (pr_data.get("head") or {}).get("sha")
@@ -1122,6 +1273,18 @@ async def _reconcile_if_managed_check_wait(
                     "for v%d has no head SHA — leaving pending",
                     pr_number,
                     version.version_number,
+                )
+                classified_at = _utcnow()
+                await _persist_managed_check_wait_snapshot(
+                    session,
+                    version.id,
+                    pr_number=int(pr_number),
+                    ci_state=_CI_PENDING,
+                    snapshot=_managed_check_wait_snapshot(
+                        ci_state=_CI_PENDING,
+                        classified_at=classified_at,
+                        reason="missing_pr_head_sha",
+                    ),
                 )
                 return False
 
@@ -1144,14 +1307,34 @@ async def _reconcile_if_managed_check_wait(
                     version.version_number,
                     exc,
                 )
+                classified_at = _utcnow()
+                await _persist_managed_check_wait_snapshot(
+                    session,
+                    version.id,
+                    pr_number=int(pr_number),
+                    ci_state=_CI_PENDING,
+                    snapshot=_managed_check_wait_snapshot(
+                        ci_state=_CI_PENDING,
+                        classified_at=classified_at,
+                        head_sha=pr_head_sha,
+                        reason="ci_fetch_failed",
+                        detail=str(exc),
+                    ),
+                )
                 return False
 
             ci_state = _classify_check_runs(check_result)
             if ci_state == _CI_RED:
+                blocking_conclusions = {
+                    "failure",
+                    "cancelled",
+                    "timed_out",
+                    "action_required",
+                }
                 failing_names = [
                     d.get("name", "unknown")
                     for d in check_result.get("details", [])
-                    if d.get("conclusion") in ("failure", "timed_out")
+                    if d.get("conclusion") in blocking_conclusions
                 ]
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
@@ -1159,6 +1342,14 @@ async def _reconcile_if_managed_check_wait(
                     pr_number,
                     version.version_number,
                     failing_names,
+                )
+                await _cleanup_managed_check_wait_failure_artifacts(
+                    token,
+                    owner,
+                    repo,
+                    release_branch,
+                    version,
+                    int(pr_number),
                 )
                 await _record_promotion_failure(
                     session,
@@ -1177,6 +1368,19 @@ async def _reconcile_if_managed_check_wait(
 
             if ci_state != _CI_GREEN:
                 # Checks pending or no-checks — leave pending for next sweep.
+                classified_at = _utcnow()
+                await _persist_managed_check_wait_snapshot(
+                    session,
+                    version.id,
+                    pr_number=int(pr_number),
+                    ci_state=ci_state,
+                    snapshot=_managed_check_wait_snapshot(
+                        ci_state=ci_state,
+                        classified_at=classified_at,
+                        head_sha=pr_head_sha,
+                        check_result=check_result,
+                    ),
+                )
                 return False
 
             # 4. CI is green — re-run the Alembic dual-head guard before merging.
@@ -1191,6 +1395,14 @@ async def _reconcile_if_managed_check_wait(
                     pr_number,
                     version.version_number,
                     hold_reason,
+                )
+                await _cleanup_managed_check_wait_failure_artifacts(
+                    token,
+                    owner,
+                    repo,
+                    release_branch,
+                    version,
+                    int(pr_number),
                 )
                 await _record_promotion_failure(
                     session,
@@ -1247,6 +1459,14 @@ async def _reconcile_if_managed_check_wait(
                         pr_number,
                         version.version_number,
                     )
+                    await _cleanup_managed_check_wait_failure_artifacts(
+                        token,
+                        owner,
+                        repo,
+                        release_branch,
+                        version,
+                        int(pr_number),
+                    )
                     await _record_promotion_failure(
                         session,
                         version,
@@ -1270,6 +1490,14 @@ async def _reconcile_if_managed_check_wait(
                         pr_number,
                         version.version_number,
                         msg,
+                    )
+                    await _cleanup_managed_check_wait_failure_artifacts(
+                        token,
+                        owner,
+                        repo,
+                        release_branch,
+                        version,
+                        int(pr_number),
                     )
                     await _record_promotion_failure(
                         session,
@@ -1338,6 +1566,36 @@ async def _reconcile_if_managed_check_wait(
                     version_id,
                 )
             return False
+
+
+async def _cleanup_managed_check_wait_failure_artifacts(
+    token: str,
+    owner: str,
+    repo: str,
+    release_branch: str,
+    version: release_version.ReleaseVersion,
+    pr_number: int,
+) -> None:
+    """Close the managed-check promotion PR and delete its branch best-effort."""
+    try:
+        await github.close_pull_request(
+            token,
+            owner,
+            repo,
+            pr_number,
+            project_id=str(version.project_id),
+        )
+    except Exception as exc:  # noqa: BLE001 — cleanup must not block failure recording
+        logger.warning(
+            "[RELEASE_QUALIFIER] reconcile managed_check_wait: could not close "
+            "PR #%s for v%d (%s) — continuing with branch cleanup",
+            pr_number,
+            version.version_number,
+            exc,
+        )
+    await _delete_release_branch_best_effort(
+        token, owner, repo, release_branch, version
+    )
 
 
 async def _reconcile_if_pending_qualification_superseded(

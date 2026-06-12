@@ -1580,6 +1580,73 @@ describe('VersionLifecyclePanel', () => {
       // The native in-flight freshness must NOT render.
       expect(screen.queryByTestId('promotion-in-flight-freshness')).not.toBeInTheDocument();
     });
+
+    it('renders managed check-wait snapshot details', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makeCheckWaitState({
+                check_snapshot: {
+                  state: 'pending',
+                  classified_at: '2026-01-01T00:20:00Z',
+                  head_sha: 'cafebabecafebabecafebabecafebabecafebabe',
+                  total_checks: 12,
+                  checks: [
+                    { name: 'CI / Backend', status: 'in_progress' },
+                    { name: 'CI / Agent', status: 'queued' },
+                  ],
+                  truncated: true,
+                },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const snapshot = screen.getByTestId('promotion-check-wait-snapshot');
+      expect(snapshot).toHaveTextContent('ci:pending');
+      expect(snapshot).toHaveTextContent('head cafebab');
+      expect(snapshot).toHaveTextContent('12 checks');
+      expect(snapshot).toHaveTextContent('CI / Backend: in_progress');
+      expect(snapshot).toHaveTextContent('CI / Agent: queued');
+      expect(snapshot).toHaveTextContent('+10 more');
+    });
+
+    it('renders managed check-wait no-checks snapshot as absent CI', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makeCheckWaitState({
+                ci_state: 'no_checks',
+                check_snapshot: {
+                  state: 'no_checks',
+                  classified_at: '2026-01-01T00:20:00Z',
+                  head_sha: '1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa',
+                  total_checks: 0,
+                  checks: [],
+                  truncated: false,
+                },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const snapshot = screen.getByTestId('promotion-check-wait-snapshot');
+      expect(snapshot).toHaveTextContent('ci:no_checks');
+      expect(snapshot).toHaveTextContent('0 checks');
+      expect(snapshot).toHaveTextContent('No check runs reported yet.');
+    });
   });
 
   describe('promotion blocker classification copy', () => {

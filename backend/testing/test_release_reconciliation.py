@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import timedelta
+from uuid import uuid4
 from unittest.mock import AsyncMock
 
 import pytest
@@ -4831,7 +4832,7 @@ async def test_managed_check_wait_skipped_by_native_auto_merge_reconciler(
 
 
 @pytest.mark.asyncio
-async def test_managed_check_wait_ci_red_records_required_check_failed(
+async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_names(
     db_session, mocker
 ):
     """When the PR's CI is red, the reconciler records required_check_failed with
@@ -4862,7 +4863,24 @@ async def test_managed_check_wait_ci_red_records_required_check_failed(
                 "conclusion": "failure",
                 "details": [
                     {"name": "backend", "status": "completed", "conclusion": "failure"},
+                    {
+                        "name": "deploy",
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                    {
+                        "name": "lint",
+                        "status": "completed",
+                        "conclusion": "timed_out",
+                    },
+                    {
+                        "name": "security",
+                        "status": "completed",
+                        "conclusion": "action_required",
+                    },
                     {"name": "frontend", "status": "completed", "conclusion": "success"},
+                    {"name": "docs", "status": "completed", "conclusion": "neutral"},
+                    {"name": "smoke", "status": "completed", "conclusion": "skipped"},
                 ],
             }
         ),
@@ -4887,7 +4905,14 @@ async def test_managed_check_wait_ci_red_records_required_check_failed(
     assert version.phase == "stabilize"
     assert version.last_qualification["status"] == "promotion_failed"
     assert version.last_qualification["error"] == "required_check_failed"
-    assert "backend" in version.last_qualification.get("detail", "")
+    detail = version.last_qualification.get("detail", "")
+    assert "backend" in detail
+    assert "deploy" in detail
+    assert "lint" in detail
+    assert "security" in detail
+    assert "frontend" not in detail
+    assert "docs" not in detail
+    assert "smoke" not in detail
     assert "promotion_pending" not in version.last_qualification
 
 
@@ -5012,11 +5037,109 @@ async def test_managed_check_wait_alembic_guard_blocks(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_managed_check_wait_still_pending_ci_leaves_version_open(
+@pytest.mark.parametrize(
+    "check_result, guard_result, merge_result, expected_error, expected_detail",
+    [
+        (
+            {"status": "completed", "conclusion": "failure", "details": [
+                {"name": "backend", "status": "completed", "conclusion": "failure"},
+                {"name": "frontend", "status": "completed", "conclusion": "success"},
+            ]},
+            None,
+            None,
+            "required_check_failed",
+            "backend",
+        ),
+        ({"status": "completed", "conclusion": "success", "details": []}, (False, "duplicate migration head"), None, "migration_guard_blocked", "duplicate migration head"),
+        ({"status": "completed", "conclusion": "success", "details": []}, (True, None), {"merged": False, "conflict": True, "message": "merge conflict"}, "merge_blocked", "merge conflict"),
+        ({"status": "completed", "conclusion": "success", "details": []}, (True, None), {"merged": False, "conflict": False, "message": "required reviews not satisfied"}, "protection_blocked_review", "required reviews not satisfied"),
+    ],
+    ids=[
+        "required_check_failed",
+        "migration_guard_blocked",
+        "merge_blocked",
+        "protection_blocked_review",
+    ],
+)
+async def test_managed_check_wait_terminal_failure_closes_pr_and_deletes_branch(
+    db_session,
+    mocker,
+    check_result,
+    guard_result,
+    merge_result,
+    expected_error,
+    expected_detail,
+):
+    """Terminal managed_check_wait failures close the PR and delete the branch."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": "feedface" * 5},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value=check_result),
+    )
+    close_pull_request = mocker.patch(
+        "app.github.close_pull_request", new=AsyncMock(return_value=True)
+    )
+    delete_branch = mocker.patch(
+        "app.github.delete_branch", new=AsyncMock(return_value=True)
+    )
+    if guard_result is not None:
+        mocker.patch(
+            "app.rollup_migration_validation.enforce_premerge_migration_guard",
+            new=AsyncMock(return_value=guard_result),
+        )
+    if merge_result is not None:
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new=AsyncMock(return_value=merge_result),
+        )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == expected_error
+    assert expected_detail in version.last_qualification.get("detail", "")
+    assert "promotion_pending" not in version.last_qualification
+    assert close_pull_request.await_count == 1
+    assert delete_branch.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_still_pending_ci_persists_check_snapshot(
     db_session, mocker
 ):
     """When CI is still pending, the reconciler leaves the version in its
-    managed_check_wait pending state for the next sweep."""
+    managed_check_wait pending state and persists bounded CI telemetry."""
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="tok"),
@@ -5035,14 +5158,23 @@ async def test_managed_check_wait_still_pending_ci_leaves_version_open(
             }
         ),
     )
-    # CI still in progress.
+    # CI still in progress, with more check details than the persisted snapshot
+    # should retain.
+    details = [
+        {"name": "backend", "status": "in_progress", "conclusion": None},
+        {"name": "frontend", "status": "queued", "conclusion": None},
+        *[
+            {"name": f"extra-{i}", "status": "queued", "conclusion": None}
+            for i in range(12)
+        ],
+    ]
     mocker.patch(
         "app.github.get_check_runs_cached",
         new=AsyncMock(
             return_value={
                 "status": "in_progress",
                 "conclusion": None,
-                "details": [{"name": "backend", "status": "in_progress", "conclusion": None}],
+                "details": details,
             }
         ),
     )
@@ -5064,7 +5196,200 @@ async def test_managed_check_wait_still_pending_ci_leaves_version_open(
     await db_session.refresh(version)
     assert version.status == "open"
     assert version.last_qualification["status"] == "pending"
-    assert version.last_qualification["promotion_pending"]["managed_check_wait"] is True
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["pr_number"] == 42
+    assert pending["pr_url"] == "https://github.com/acme/widget/pull/42"
+    assert pending["ci_state"] == "pending"
+    assert pending["ci_classified_at"] == pending["check_snapshot"]["classified_at"]
+    snapshot = pending["check_snapshot"]
+    assert snapshot["state"] == "pending"
+    assert snapshot["head_sha"] == pr_head
+    assert snapshot["total_checks"] == len(details)
+    assert snapshot["truncated"] is True
+    assert snapshot["checks"][:2] == [
+        {"name": "backend", "status": "in_progress"},
+        {"name": "frontend", "status": "queued"},
+    ]
+    assert len(snapshot["checks"]) == 10
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_no_checks_persists_snapshot_idempotently(
+    db_session, mocker
+):
+    """No-checks CI is non-terminal but still durable operator telemetry.
+
+    Repeated sweeps overwrite the bounded snapshot without clobbering the
+    promotion PR provenance the retry path needs.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
+    )
+    pr_head_first = "1111aaaa" * 5
+    pr_head_second = "2222bbbb" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            side_effect=[
+                {
+                    "state": "open",
+                    "merged": False,
+                    "head": {"sha": pr_head_first},
+                },
+                {
+                    "state": "open",
+                    "merged": False,
+                    "head": {"sha": pr_head_second},
+                },
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "no_checks",
+                "conclusion": None,
+                "details": [],
+            }
+        ),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    first = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    second = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert first is False
+    assert second is False
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["pr_number"] == 42
+    assert pending["pr_url"] == "https://github.com/acme/widget/pull/42"
+    assert pending["why_not_native_automerge"] == "migration_carrying"
+    assert pending["ci_state"] == "no_checks"
+    snapshot = pending["check_snapshot"]
+    assert snapshot["state"] == "no_checks"
+    assert snapshot["head_sha"] == pr_head_second
+    assert snapshot["total_checks"] == 0
+    assert snapshot["checks"] == []
+    assert snapshot["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
+    mocker,
+):
+    """A stale cached row must be expired before the helper re-reads it."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": "cafebabe" * 5},
+            }
+        ),
+    )
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={}))
+
+    candidate_sha = "abcd" * 10
+    version_id = uuid4()
+    project_id = uuid4()
+    stale = rv.ReleaseVersion(project_id=project_id, id=version_id)
+    stale.status = "open"
+    stale.last_qualification = _managed_check_wait_qual(candidate_sha)
+    fresh = rv.ReleaseVersion(project_id=project_id, id=version_id)
+    fresh.status = "promoted"
+    fresh.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": candidate_sha,
+        "confidence": 0.95,
+        "promoted_sha": "feedface" * 5,
+    }
+
+    class _FakeResult:
+        def __init__(self, value):
+            self._value = value
+
+        def scalars(self):
+            return self
+
+        def first(self):
+            return self._value
+
+    class _FakeSession:
+        def __init__(self, stale_row, fresh_row):
+            self._stale_row = stale_row
+            self._fresh_row = fresh_row
+            self.expired = False
+
+        def expire_all(self):
+            self.expired = True
+
+        async def execute(self, _stmt):
+            return _FakeResult(self._fresh_row if self.expired else self._stale_row)
+
+        async def get(self, model, pk):
+            if model is Project and pk == project_id:
+                return Project(
+                    id=project_id,
+                    name="Reconcile-Test",
+                    user_id="reconcile-user",
+                    github_owner="acme",
+                    github_repo="widget",
+                    integration_branch="automain",
+                    promotion_target="release",
+                )
+            return None
+
+        def add(self, _obj):
+            pass
+
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    fake_session = _FakeSession(stale, fresh)
+
+    @contextlib.asynccontextmanager
+    async def _factory():
+        yield fake_session
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version_id, session_factory=_factory
+    )
+
+    assert reconciled is False
+    assert fake_session.expired is True
+    assert "check_snapshot" not in stale.last_qualification["promotion_pending"]
+    assert fresh.status == "promoted"
+    assert fresh.last_qualification["status"] == "promoted"
 
 
 @pytest.mark.asyncio

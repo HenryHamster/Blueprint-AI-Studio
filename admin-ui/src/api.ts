@@ -1506,6 +1506,23 @@ export interface ReleaseArtifactEvidence {
   reason_code?: string | null;
 }
 
+export interface ManagedCheckWaitSnapshotCheck {
+  name: string;
+  status?: string | null;
+  conclusion?: string | null;
+}
+
+export interface ManagedCheckWaitSnapshot {
+  state: string;
+  classified_at: string;
+  head_sha?: string | null;
+  total_checks?: number | null;
+  checks?: ManagedCheckWaitSnapshotCheck[];
+  truncated?: boolean | null;
+  reason?: string | null;
+  detail?: string | null;
+}
+
 export interface QualificationState {
   state: string;
   summary: string;
@@ -1528,7 +1545,7 @@ export interface QualificationState {
   // (distinct from native auto-merge 'promotion_in_flight'). These are additive
   // and absent for native auto-merge.
   migration_carrying?: boolean | null;
-  check_snapshot?: unknown;
+  check_snapshot?: ManagedCheckWaitSnapshot | null;
   ci_state?: string | null;
   blocker?: string | null;
   // Post-promotion serving confirmation. A 'promoted' state is provisional:

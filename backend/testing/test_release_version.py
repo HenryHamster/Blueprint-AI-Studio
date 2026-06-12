@@ -1374,7 +1374,19 @@ def test_qual_state_managed_check_wait_is_distinct_state():
                 "managed_check_wait": True,
                 "enabled_at": enabled_at,
                 "ci_state": "pending",
-                "check_snapshot": {"pending": ["CI / Backend"]},
+                "check_snapshot": {
+                    "state": "pending",
+                    "classified_at": enabled_at,
+                    "head_sha": "cafebabe" * 5,
+                    "total_checks": 1,
+                    "checks": [
+                        {
+                            "name": "CI / Backend",
+                            "status": "in_progress",
+                        }
+                    ],
+                    "truncated": False,
+                },
             },
         }
     )
@@ -1384,7 +1396,11 @@ def test_qual_state_managed_check_wait_is_distinct_state():
     assert state["migration_carrying"] is True
     # The additive CI context is forwarded for operator surfaces.
     assert state["ci_state"] == "pending"
-    assert state["check_snapshot"] == {"pending": ["CI / Backend"]}
+    assert state["check_snapshot"]["state"] == "pending"
+    assert state["check_snapshot"]["head_sha"] == "cafebabe" * 5
+    assert state["check_snapshot"]["checks"] == [
+        {"name": "CI / Backend", "status": "in_progress"}
+    ]
     # Freshness keys are present (same machinery as in-flight).
     assert state["promotion_enabled_at"] == enabled_at
     assert state["promotion_age_seconds"] >= 590
