@@ -467,7 +467,11 @@ async def _qualification_in_flight(
 def _promotion_in_flight_result(
     version: release_version.ReleaseVersion,
 ) -> dict[str, Any] | None:
-    """Return a ``promotion_in_flight`` status dict, or None when not in flight.
+    """Return a promotion-blocking status dict, or None when not mid-promotion.
+
+    The status echoes the blocking sub-state: ``promotion_in_flight`` (native
+    GitHub auto-merge) or ``promotion_check_wait`` (the managed migration-
+    carrying wait whose merge the reconciler retries after required checks pass).
 
     A version whose audit PASSED and now has an open promotion PR auto-merging
     (``last_qualification.status == "pending"`` + a ``promotion_pending``
@@ -482,9 +486,12 @@ def _promotion_in_flight_result(
     qual_state = release_version.summarize_qualification_state(
         version.last_qualification
     )
-    if qual_state and qual_state.get("state") == "promotion_in_flight":
+    if qual_state and qual_state.get("state") in release_version.PROMOTION_BLOCKING_STATES:
         result = {
-            "status": "promotion_in_flight",
+            # Echo the specific blocking sub-state (``promotion_in_flight`` for
+            # native auto-merge, ``promotion_check_wait`` for the managed
+            # migration-carrying wait) so callers can tell which hold fired.
+            "status": qual_state["state"],
             "promotion_pr_number": qual_state.get("promotion_pr_number"),
             "promotion_pr_url": qual_state.get("promotion_pr_url"),
         }

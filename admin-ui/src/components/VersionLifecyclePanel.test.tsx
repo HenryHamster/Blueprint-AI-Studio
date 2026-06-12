@@ -1496,6 +1496,147 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
+  describe('managed promotion check-wait locks qualify + phase controls', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    function makeCheckWaitState(
+      overrides: Partial<api.QualificationState> = {},
+    ): api.QualificationState {
+      return {
+        state: 'promotion_check_wait',
+        summary:
+          'Audit PASSED; a migration-carrying promotion PR is open. Blueprint is WAITING for required status checks and will retry the merge AUTOMATICALLY.',
+        promotion_pr_number: 9191,
+        promotion_pr_url: 'https://example/pr/9191',
+        migration_carrying: true,
+        ci_state: 'pending',
+        ...overrides,
+      };
+    }
+
+    // Plan-time acceptance target: the managed check-wait state must lock the
+    // re-qualify affordance (no fresh qualification needed/possible) and present
+    // copy distinct from native auto-merge.
+    it('renders_managed_promotion_check_wait_without_requalify_affordance', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makeCheckWaitState(),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      // The Run Qualify control is present but LOCKED — there is no actionable
+      // re-qualify affordance while Blueprint owns the retry.
+      const qualifyBtn = screen.getByRole('button', { name: /Run Qualify/ });
+      expect(qualifyBtn).toBeDisabled();
+      expect(qualifyBtn).toHaveAttribute(
+        'title',
+        'A migration-carrying promotion PR is open and waiting for required checks — Blueprint retries the merge automatically; wait for it to land or cancel it before re-qualifying'
+      );
+      // The phase flip is locked too.
+      expect(screen.getByRole('button', { name: /build/ })).toBeDisabled();
+
+      // Distinct check-wait note (NOT the native auto-merge note) carries the
+      // truth: waiting for required checks, auto-retry, no fresh qualify needed.
+      const note = screen.getByTestId('promotion-check-wait-note');
+      expect(note).toHaveTextContent('#9191');
+      expect(note).toHaveTextContent('waiting for required checks');
+      expect(note).toHaveTextContent('no fresh qualification needed');
+      // The native auto-merge note must NOT render for this state.
+      expect(screen.queryByTestId('promotion-in-flight-note')).not.toBeInTheDocument();
+      // The badge renders with the distinct check-wait label.
+      expect(screen.getByText('promotion check wait')).toBeInTheDocument();
+    });
+
+    it('surfaces the check-wait freshness with auto-retry copy', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makeCheckWaitState({
+                promotion_age_seconds: 1800,
+                promotion_timeout_seconds: 14400,
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('promotion-check-wait-freshness')).toHaveTextContent(
+        'Migration-carrying promotion PR #9191 waiting for required checks (in flight ~30m (auto-timeout cap 4h)) — Blueprint retries the merge automatically'
+      );
+      // The native in-flight freshness must NOT render.
+      expect(screen.queryByTestId('promotion-in-flight-freshness')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('promotion blocker classification copy', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('renders required_check_failed detail in red', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: {
+                state: 'required_check_failed',
+                summary: 'The promotion PR required checks FAILED.',
+                error: 'required_check_failed',
+                detail: 'PR #9191 required checks failed: CI / Backend',
+              },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('promotion-blocker-detail')).toHaveTextContent('CI / Backend');
+      // A failed blocker is NOT a lock — qualify stays actionable to retry.
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toBeEnabled();
+    });
+
+    it('renders protection_blocked_review detail in orange and keeps qualify enabled', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: {
+                state: 'protection_blocked_review',
+                summary: 'Branch protection refused the merge; a human action is required.',
+                error: 'protection_blocked_review',
+                detail: 'At least 1 approving review is required',
+              },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const detail = screen.getByTestId('promotion-blocker-detail');
+      expect(detail).toHaveTextContent('approving review');
+      expect(detail.className).toContain('text-orange-400');
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toBeEnabled();
+    });
+  });
+
   describe('promotion readiness regime labeling', () => {
     function makeReadiness(overrides: Partial<api.PromotionReadiness> = {}): api.PromotionReadiness {
       return {

@@ -1179,26 +1179,49 @@ async def promote(
         from app.rollup_migration_validation import pr_touches_migrations
 
         if await pr_touches_migrations(token, owner, repo, pr_number):
-            logger.warning(
+            # Migration-carrying PR with pending CI: enter managed_check_wait
+            # mode instead of native auto-merge.  The promotion target can
+            # advance while CI is pending (exactly the hotfix-migration-after-
+            # qualification race documented above), so we must NOT delegate to
+            # GitHub native auto-merge — it would merge without re-running the
+            # Alembic dual-head guard.  Instead, persist a durable sub-state
+            # that the reconciler rung in the qualifier sweep will periodically
+            # re-check: once CI is green the reconciler re-runs the pre-merge
+            # Alembic guard and retries the merge itself.  The release branch is
+            # kept open (do NOT delete it) because the reconciler needs it.
+            logger.info(
                 "[RELEASE_QUALIFIER] promote: promotion PR #%s for v%d pending "
-                "CI touches Alembic migrations — NOT delegating to GitHub "
-                "native auto-merge; holding for re-validation against %s",
+                "CI touches Alembic migrations — entering managed_check_wait "
+                "instead of native auto-merge; reconciler will retry after CI "
+                "passes and re-validates the migration chain against %s",
                 pr_number,
                 version.version_number,
                 promotion_target,
             )
-            await _delete_release_branch_best_effort(
-                token, owner, repo, release_branch, version
+            locked = await _relock_version_for_promotion_write(
+                session, version, lock_released=True
             )
-            return await _record_promotion_failure(
-                session,
-                version,
-                base_record,
-                "migration_pending_no_automerge",
-                detail=str(msg)[:300],
-                pr_url=pr_url,
-                lock_released=True,
-            )
+            if locked is not None and locked.status == "open":
+                q = dict(locked.last_qualification or {})
+                q.update(base_record)
+                q["status"] = "pending"
+                q["promotion_pending"] = {
+                    "pr_number": pr_number,
+                    "pr_url": pr_url,
+                    "auto_merge_enabled": False,
+                    "migration_carrying": True,
+                    "managed_check_wait": True,
+                    "why_not_native_automerge": "migration_carrying",
+                    "enabled_at": _utcnow().isoformat(),
+                }
+                locked.last_qualification = q
+                session.add(locked)
+            return {
+                "status": "pending_managed_check_wait",
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "managed_check_wait": True,
+            }
         try:
             am_result = await github.enable_auto_merge(
                 token,

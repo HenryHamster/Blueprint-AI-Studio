@@ -1458,6 +1458,16 @@ export interface QualificationState {
   promotion_past_timeout?: boolean | null;
   promotion_nearing_timeout?: boolean | null;
   error?: string | null;
+  // Failing-check names / branch-protection detail surfaced for the
+  // required_check_failed and protection_blocked_review states.
+  detail?: string | null;
+  // Managed promotion check-wait context: a migration-carrying promotion PR is
+  // open and Blueprint is waiting for required checks before retrying the merge
+  // (distinct from native auto-merge 'promotion_in_flight'). These are additive
+  // and absent for native auto-merge.
+  migration_carrying?: boolean | null;
+  check_snapshot?: unknown;
+  ci_state?: string | null;
   blocker?: string | null;
   // Post-promotion serving confirmation. A 'promoted' state is provisional:
   // serving_status is 'unconfirmed' while the deploy is still within its

@@ -630,11 +630,18 @@ async def set_version_phase(
     _qual_state = _release_version.summarize_qualification_state(
         open_ver.last_qualification
     )
-    if _qual_state and _qual_state.get("state") == "promotion_in_flight":
-        detail = (
-            "a promotion PR is open and auto-merging — wait for it to land or "
-            "cancel it before changing the phase"
-        )
+    if _qual_state and _qual_state.get("state") in _release_version.PROMOTION_BLOCKING_STATES:
+        if _qual_state.get("state") == "promotion_check_wait":
+            detail = (
+                "a migration-carrying promotion PR is open and waiting for "
+                "required checks — Blueprint will retry the merge automatically; "
+                "wait for it to land or cancel it before changing the phase"
+            )
+        else:
+            detail = (
+                "a promotion PR is open and auto-merging — wait for it to land or "
+                "cancel it before changing the phase"
+            )
         pr_number = _qual_state.get("promotion_pr_number")
         if pr_number is not None:
             detail += f" (PR #{pr_number}"
@@ -770,10 +777,18 @@ async def cut_version(
             idempotency_key=payload.idempotency_key,
         )
     except _release_version.VersionCutBlockedByPromotion as exc:
-        detail = (
-            "a promotion PR is open and auto-merging — wait for it to land or "
-            "cancel it before cutting"
-        )
+        _cut_state = (exc.promotion_freshness or {}).get("state")
+        if _cut_state == "promotion_check_wait":
+            detail = (
+                "a migration-carrying promotion PR is open and waiting for "
+                "required checks — Blueprint will retry the merge automatically; "
+                "wait for it to land or cancel it before cutting"
+            )
+        else:
+            detail = (
+                "a promotion PR is open and auto-merging — wait for it to land or "
+                "cancel it before cutting"
+            )
         if exc.promotion_pr_number is not None:
             detail += f" (PR #{exc.promotion_pr_number}"
             if exc.promotion_pr_url:
