@@ -1914,6 +1914,28 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await _stamp_no_findings_refractory(task, session)
         session.add(task)
         await session.commit()
+        # Evergreen-fill completion adapter: zero findings → verified_stale.
+        # This early-return path bypasses the main adapter call below, so we
+        # must fire it here.
+        _evergreen_item_id_early = (task.context or {}).get("evergreen_backlog_item_id")
+        if _evergreen_item_id_early:
+            try:
+                from app.evergreen_backlog import apply_research_outcome
+
+                await apply_research_outcome(
+                    session,
+                    item_id=str(_evergreen_item_id_early),
+                    impl_spawned=0,
+                    reproduce_rejected=0,
+                    surviving=0,
+                )
+            except Exception as _eg_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EVERGREEN] failed to apply research outcome for item %s: %s",
+                    _evergreen_item_id_early,
+                    _eg_exc,
+                )
+            await session.commit()
         return
 
     # Normalize actionability_grade: any missing or invalid value defaults to MEDIUM.
@@ -5864,6 +5886,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await session.commit()
 
 
+
 async def _record_research_task_failure(task: Task, session: AsyncSession) -> None:
     """Record a FAILED research task in the direction's research_history.
 
@@ -5875,6 +5898,33 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     referenced in task.context.direction_id (falling back to the payload field).
     """
     from app.failure_classification import INFRA_CLASSES, classify_failure
+
+    # Evergreen-fill requeue adapter: an environmental (infra-class) failure of
+    # an evergreen probe requeues the backlog item (attempts+=1, bounded), rather
+    # than burning it. Runs before the direction guard below because an evergreen
+    # probe may carry no direction_id (synthetic strand).
+    _ev_item_id = (task.context or {}).get("evergreen_backlog_item_id")
+    if _ev_item_id:
+        _ev_failure_category = classify_failure(task, task.latest_status_message or "")
+        if _ev_failure_category in INFRA_CLASSES:
+            try:
+                from app.evergreen_backlog import apply_research_outcome
+
+                await apply_research_outcome(
+                    session,
+                    item_id=str(_ev_item_id),
+                    impl_spawned=0,
+                    reproduce_rejected=0,
+                    surviving=0,
+                    environmental_failure=True,
+                )
+            except Exception as _eg_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EVERGREEN] failed to apply environmental failure outcome for item %s: %s",
+                    _ev_item_id,
+                    _eg_exc,
+                )
+            await session.commit()
 
     direction_id = (task.context or {}).get("direction_id") or task.first_payload.get(
         "current_direction_id"
