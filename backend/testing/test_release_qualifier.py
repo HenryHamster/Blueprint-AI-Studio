@@ -8906,21 +8906,18 @@ async def test_promote_blocks_on_dual_alembic_head(db_session, mocker):
 
     # Drive the REAL combined-chain validator: the promotion PR adds migration
     # revision 0042, which already exists on the promotion target → collision.
+    # The per-file patch is included inline so _collect_added_migration_sources
+    # can reconstruct the source without a fallback API call.
     migration_path = "backend/alembic/versions/0042_feature.py"
     mocker.patch(
         "app.github.get_pr_files",
-        new=AsyncMock(return_value=[{"filename": migration_path}]),
-    )
-    mocker.patch(
-        "app.github.get_pull_request_diff",
         new=AsyncMock(
-            return_value=(
-                f"diff --git a/{migration_path} b/{migration_path}\n"
-                f"--- /dev/null\n"
-                f"+++ b/{migration_path}\n"
-                "+revision = '0042'\n"
-                "+down_revision = '0041'\n"
-            )
+            return_value=[
+                {
+                    "filename": migration_path,
+                    "patch": "+revision = '0042'\n+down_revision = '0041'\n",
+                }
+            ]
         ),
     )
     mocker.patch(
@@ -8984,8 +8981,8 @@ async def test_promote_guard_block_skips_auto_merge(db_session, mocker):
         new=AsyncMock(return_value={"enabled": True}),
     )
     mocker.patch(
-        "app.rollup_migration_validation.enforce_premerge_migration_guard",
-        new=AsyncMock(return_value=(False, "dual-head: duplicate revision")),
+        "app.rollup_migration_validation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("block", "dual-head: duplicate revision")),
     )
 
     result = await rq.promote(
@@ -9012,8 +9009,9 @@ async def test_promote_guard_block_skips_auto_merge(db_session, mocker):
 @pytest.mark.asyncio
 async def test_promote_defers_on_migration_metadata_unfetchable(db_session, mocker):
     """A transient inability to fetch the migration metadata HOLDS the promotion
-    (retryable) rather than merging blind — fail-safe, mirroring the other
-    pre-merge guard paths."""
+    in managed_check_wait (retryable) rather than recording a terminal failure
+    or merging blind — fail-safe. The release branch is KEPT so the reconciler
+    can re-validate and retry the merge once metadata is available."""
     _project, version = await _make_project_and_version(db_session)
 
     mocker.patch(
@@ -9031,16 +9029,10 @@ async def test_promote_defers_on_migration_metadata_unfetchable(db_session, mock
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True}),
     )
-    # The PR touches a migration file, but the diff fetch fails → guard "defer".
+    # The guard returns a defer verdict — metadata temporarily unavailable.
     mocker.patch(
-        "app.github.get_pr_files",
-        new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0042_x.py"}]
-        ),
-    )
-    mocker.patch(
-        "app.github.get_pull_request_diff",
-        new=AsyncMock(side_effect=RuntimeError("502 from GitHub")),
+        "app.rollup_migration_validation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("defer", "502 from GitHub")),
     )
 
     result = await rq.promote(
@@ -9052,15 +9044,106 @@ async def test_promote_defers_on_migration_metadata_unfetchable(db_session, mock
     )
     await db_session.commit()
 
+    # Merge never ran — held pending the guard re-check.
     merge_mock.assert_not_called()
-    assert result["status"] == "promotion_failed"
-    assert result["error"] == "migration_guard_blocked"
+    # Result is managed_check_wait, NOT a terminal failure.
+    assert result["status"] == "pending_managed_check_wait"
+    assert result["managed_check_wait"] is True
+    assert result["pr_number"] == 78
 
     await db_session.refresh(version)
+    # Version stays open; no terminal failure recorded.
     assert version.status == "open"
-    assert version.phase == "stabilize"
-    assert version.last_qualification["error"] == "migration_guard_blocked"
-    delete_branch_mock.assert_awaited()
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["why_not_native_automerge"] == "migration_guard_deferred"
+    assert pending["pr_number"] == 78
+    # The release branch was NOT deleted — the reconciler needs it.
+    delete_branch_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_promote_defer_migration_verdict_enters_managed_check_wait(
+    db_session, mocker
+):
+    """promote() with a 'defer' migration guard verdict enters managed_check_wait
+    with the release branch KEPT and NO terminal failure recorded.
+
+    A 'defer' means migration safety is temporarily unknown (e.g. the PR file
+    list could not be fetched). The correct response is to hold in the durable
+    managed_check_wait sub-state so the reconciler re-runs the guard on the next
+    sweep — NOT to record a terminal promotion_failed. The release branch must
+    stay open (not deleted) because the reconciler needs it to retry the merge.
+    """
+    _project, version = await _make_project_and_version(db_session)
+    candidate = "d3fer001" * 5
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_pull_request_merge_state",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 91, "html_url": "http://pr/91"}),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    delete_branch_mock = mocker.patch(
+        "app.github.delete_branch", new=AsyncMock(return_value=True)
+    )
+    # Guard returns defer — metadata temporarily unavailable (not a hard block).
+    mocker.patch(
+        "app.rollup_migration_validation._validate_rollup_migration_chain",
+        new=AsyncMock(
+            return_value=("defer", "could not list PR files: 503 Service Unavailable")
+        ),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        candidate,
+        composite={"confidence": 0.88},
+        base_record={"candidate_sha": candidate},
+    )
+    await db_session.commit()
+
+    # The merge API was never called.
+    merge_mock.assert_not_called()
+    # Result is a pending managed_check_wait, NOT a terminal failure.
+    assert result["status"] == "pending_managed_check_wait"
+    assert result["managed_check_wait"] is True
+    assert result["pr_number"] == 91
+    assert result["pr_url"] == "http://pr/91"
+
+    await db_session.refresh(version)
+    # Version stays open; last_qualification is pending (not promotion_failed).
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["migration_carrying"] is True
+    assert pending["pr_number"] == 91
+    assert pending["why_not_native_automerge"] == "migration_guard_deferred"
+    # No terminal failure record.
+    assert "error" not in version.last_qualification
+    # Release branch NOT deleted — the reconciler needs it.
+    delete_branch_mock.assert_not_called()
+
+    # No next version was opened — the version is still pending, not resolved.
+    open_version = await rv.current_open_version(db_session, version.project_id)
+    assert open_version is not None
+    assert open_version.version_number == version.version_number
 
 
 @pytest.mark.asyncio

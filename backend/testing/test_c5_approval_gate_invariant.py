@@ -393,7 +393,11 @@ def _patch_c5_dual_head_collision(mocker):
     mocker.patch(
         "app.github.get_pr_files",
         AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}]
+            return_value=[{
+                "filename": "backend/alembic/versions/0002_dup.py",
+                "status": "added",
+                "patch": '+"""dup migration"""\n+revision = "0002"\n+down_revision = "0001"',
+            }]
         ),
     )
     mocker.patch(

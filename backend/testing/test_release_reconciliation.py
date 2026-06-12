@@ -1761,7 +1761,8 @@ async def test_confirm_backend_revision_descendant_serving_sha_records_observed_
             await db_session.execute(
                 _select(ReleaseDeployArtifact).where(
                     ReleaseDeployArtifact.version_id == version.id,
-                    ReleaseDeployArtifact.artifact_kind == BACKEND_REVISION_ARTIFACT_KIND,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
                 )
             )
         )
@@ -2232,9 +2233,9 @@ async def test_required_artifact_deadline_failure_records_reason_code(
         .scalars()
         .all()
     )
-    assert any(
-        "synthetic_required" in (alert.message or "") for alert in alerts
-    ), "deploy-failed alert should describe the failed required artifact"
+    assert any("synthetic_required" in (alert.message or "") for alert in alerts), (
+        "deploy-failed alert should describe the failed required artifact"
+    )
 
 
 @pytest.mark.asyncio
@@ -3148,9 +3149,7 @@ async def test_recover_deploy_failed_descendant_after_recovery_window(
 
 
 @pytest.mark.asyncio
-async def test_recover_skips_beyond_window_determinate_non_ancestry(
-    db_session, mocker
-):
+async def test_recover_skips_beyond_window_determinate_non_ancestry(db_session, mocker):
     """A sha_mismatch latch whose observed serving SHA is DETERMINISTICALLY not
     descended from the promoted SHA stays deploy_failed beyond the recovery
     window: an elapsed window must never force-clear a determinate negative."""
@@ -3592,7 +3591,11 @@ async def _aggregate_serving_status(db_session, version_id):
         .all()
     )
     providers = {p.artifact_kind: p for p in iter_release_artifact_providers()}
-    rows = [(providers[a.artifact_kind], a) for a in artifacts if a.artifact_kind in providers]
+    rows = [
+        (providers[a.artifact_kind], a)
+        for a in artifacts
+        if a.artifact_kind in providers
+    ]
     status, _reason = aggregate_required_artifact_status(rows)
     return status
 
@@ -3622,8 +3625,7 @@ def test_previously_deployed_sha_uses_prior_when_current_contains_promoted():
         id=1, current_sha=_SHA_B, prior_deploy_sha=_SHA_C, deployed_at=_utcnow()
     )
     assert (
-        _previously_deployed_sha(ds, _SHA_A, current_contains_promoted=True)
-        == _SHA_C
+        _previously_deployed_sha(ds, _SHA_A, current_contains_promoted=True) == _SHA_C
     )
 
 
@@ -3724,7 +3726,9 @@ async def test_agent_image_bake_path_waits_for_fleet_then_confirms(db_session, m
     by_kind = {a.artifact_kind: a for a in artifacts}
     assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].serving_status == "serving_confirmed"
     assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].served_identifier == _SHA_A
-    assert await _aggregate_serving_status(db_session, version.id) == "serving_confirmed"
+    assert (
+        await _aggregate_serving_status(db_session, version.id) == "serving_confirmed"
+    )
 
 
 @pytest.mark.agent_image_gate
@@ -4367,9 +4371,9 @@ async def test_confirm_unobservable_required_row_resolves_past_deadline(
     # The version must exit 'unconfirmed'; confirmation_timed_out is expected
     # (backend_revision past deadline → provider_unobservable; promotion_merge
     # was stubbed to confirm by the autouse fixture).
-    assert version.serving_status not in (
-        "unconfirmed",
-    ), f"version still unconfirmed: {version.serving_status}"
+    assert version.serving_status not in ("unconfirmed",), (
+        f"version still unconfirmed: {version.serving_status}"
+    )
 
     # The backend_revision artifact row must be resolved.
     artifact = (
@@ -4377,7 +4381,8 @@ async def test_confirm_unobservable_required_row_resolves_past_deadline(
             await db_session.execute(
                 _select(ReleaseDeployArtifact).where(
                     ReleaseDeployArtifact.version_id == version.id,
-                    ReleaseDeployArtifact.artifact_kind == BACKEND_REVISION_ARTIFACT_KIND,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
                 )
             )
         )
@@ -4419,7 +4424,8 @@ async def test_confirm_unobservable_required_row_stays_pending_within_deadline(
             await db_session.execute(
                 _select(ReleaseDeployArtifact).where(
                     ReleaseDeployArtifact.version_id == version.id,
-                    ReleaseDeployArtifact.artifact_kind == BACKEND_REVISION_ARTIFACT_KIND,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
                 )
             )
         )
@@ -4492,7 +4498,9 @@ async def test_pending_qualification_superseded_out_of_band_reconciles(
     # candidate_sha and audit_findings must be preserved for the finding ledger.
     assert qual["candidate_sha"] == candidate_sha
     assert qual["confidence"] == pytest.approx(0.82)
-    assert qual["audit_findings"] == [{"severity": "high", "summary": "stale dependency"}]
+    assert qual["audit_findings"] == [
+        {"severity": "high", "summary": "stale dependency"}
+    ]
     assert "finalized_at" in qual
 
 
@@ -4729,9 +4737,7 @@ async def test_managed_check_wait_green_revalidates_and_merges(db_session, mocke
         new=AsyncMock(return_value="tok"),
     )
     # Candidate is NOT yet on main (the normal pending path).
-    mocker.patch(
-        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
-    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     # PR is open with a head SHA.
     pr_head = "deadbeef" * 5
     mocker.patch(
@@ -4766,9 +4772,7 @@ async def test_managed_check_wait_green_revalidates_and_merges(db_session, mocke
         "app.github.get_branch_sha",
         new=AsyncMock(return_value=promoted_sha),
     )
-    mocker.patch(
-        "app.github.delete_branch", new=AsyncMock(return_value=True)
-    )
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
     mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
 
     _project, version = await _make_project_and_version(
@@ -4841,9 +4845,7 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="tok"),
     )
-    mocker.patch(
-        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
-    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     pr_head = "badc0de0" * 5
     mocker.patch(
         "app.github.get_pull_request",
@@ -4878,7 +4880,11 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
                         "status": "completed",
                         "conclusion": "action_required",
                     },
-                    {"name": "frontend", "status": "completed", "conclusion": "success"},
+                    {
+                        "name": "frontend",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
                     {"name": "docs", "status": "completed", "conclusion": "neutral"},
                     {"name": "smoke", "status": "completed", "conclusion": "skipped"},
                 ],
@@ -4926,24 +4932,22 @@ async def test_managed_check_wait_out_of_band_landing_records_promoted(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="tok"),
     )
-    mocker.patch(
-        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
-    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
     )
     promoted_sha = "release0" * 5
-    mocker.patch(
-        "app.github.get_branch_sha", new=AsyncMock(return_value=promoted_sha)
-    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=promoted_sha))
     mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
 
     _project, version = await _make_project_and_version(
         db_session, integration_branch="automain", promotion_target="release"
     )
     candidate_sha = "abcd" * 10
-    version.last_qualification = _managed_check_wait_qual(candidate_sha, confidence=0.88)
+    version.last_qualification = _managed_check_wait_qual(
+        candidate_sha, confidence=0.88
+    )
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
@@ -4967,9 +4971,7 @@ async def test_managed_check_wait_alembic_guard_blocks(db_session, mocker):
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="tok"),
     )
-    mocker.patch(
-        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
-    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     pr_head = "deadbeef" * 5
     mocker.patch(
         "app.github.get_pull_request",
@@ -4991,9 +4993,7 @@ async def test_managed_check_wait_alembic_guard_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0200_new_col.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0200_new_col.py"}]
         ),
     )
     # Target branch has a duplicate revision slot — block.
@@ -5009,9 +5009,7 @@ async def test_managed_check_wait_alembic_guard_blocks(db_session, mocker):
     )
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(
-            side_effect=_file_text_from_map({"0199": None, "0200": "0199"})
-        ),
+        new=AsyncMock(side_effect=_file_text_from_map({"0199": None, "0200": "0199"})),
     )
 
     _project, version = await _make_project_and_version(
@@ -5037,22 +5035,128 @@ async def test_managed_check_wait_alembic_guard_blocks(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_managed_check_wait_alembic_defer_leaves_pending(db_session, mocker):
+    """When CI is green but the Alembic pre-merge guard returns 'defer' (metadata
+    temporarily unavailable), the reconciler leaves the version pending for the
+    next sweep — NO terminal failure, NO artifact cleanup.
+
+    This mirrors the out-of-band post-merge site already in this function which
+    treats 'defer' as keep-waiting/return False.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "d3ferb33f" * 4 + "dddd"
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "completed", "conclusion": "success", "details": []}
+        ),
+    )
+    close_pr_mock = mocker.patch(
+        "app.github.close_pull_request", new=AsyncMock(return_value=True)
+    )
+    delete_branch_mock = mocker.patch(
+        "app.github.delete_branch", new=AsyncMock(return_value=True)
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", new=AsyncMock(return_value={"merged": True})
+    )
+    # Guard returns defer — metadata temporarily unavailable (not a hard block).
+    mocker.patch(
+        "app.rollup_migration_validation._validate_rollup_migration_chain",
+        new=AsyncMock(
+            return_value=("defer", "could not list PR files: 503 Service Unavailable")
+        ),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Defer → keep waiting; returns False (not reconciled to a terminal state).
+    assert reconciled is False
+    # Merge never ran; no cleanup.
+    merge_mock.assert_not_called()
+    close_pr_mock.assert_not_called()
+    delete_branch_mock.assert_not_called()
+    # Version stays open and pending — no terminal record written.
+    await db_session.refresh(version)
+    assert version.status == "open"
+    qual = version.last_qualification
+    assert qual["status"] == "pending"
+    assert "error" not in qual
+    assert qual.get("promotion_pending", {}).get("managed_check_wait") is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "check_result, guard_result, merge_result, expected_error, expected_detail",
     [
         (
-            {"status": "completed", "conclusion": "failure", "details": [
-                {"name": "backend", "status": "completed", "conclusion": "failure"},
-                {"name": "frontend", "status": "completed", "conclusion": "success"},
-            ]},
+            {
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {"name": "backend", "status": "completed", "conclusion": "failure"},
+                    {
+                        "name": "frontend",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ],
+            },
             None,
             None,
             "required_check_failed",
             "backend",
         ),
-        ({"status": "completed", "conclusion": "success", "details": []}, (False, "duplicate migration head"), None, "migration_guard_blocked", "duplicate migration head"),
-        ({"status": "completed", "conclusion": "success", "details": []}, (True, None), {"merged": False, "conflict": True, "message": "merge conflict"}, "merge_blocked", "merge conflict"),
-        ({"status": "completed", "conclusion": "success", "details": []}, (True, None), {"merged": False, "conflict": False, "message": "required reviews not satisfied"}, "protection_blocked_review", "required reviews not satisfied"),
+        (
+            {"status": "completed", "conclusion": "success", "details": []},
+            ("block", "duplicate migration head"),
+            None,
+            "migration_guard_blocked",
+            "duplicate migration head",
+        ),
+        (
+            {"status": "completed", "conclusion": "success", "details": []},
+            ("ok", None),
+            {"merged": False, "conflict": True, "message": "merge conflict"},
+            "merge_blocked",
+            "merge conflict",
+        ),
+        (
+            {"status": "completed", "conclusion": "success", "details": []},
+            ("ok", None),
+            {
+                "merged": False,
+                "conflict": False,
+                "message": "required reviews not satisfied",
+            },
+            "protection_blocked_review",
+            "required reviews not satisfied",
+        ),
     ],
     ids=[
         "required_check_failed",
@@ -5075,9 +5179,7 @@ async def test_managed_check_wait_terminal_failure_closes_pr_and_deletes_branch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="tok"),
     )
-    mocker.patch(
-        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
-    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     mocker.patch(
         "app.github.get_pull_request",
         new=AsyncMock(
@@ -5100,7 +5202,7 @@ async def test_managed_check_wait_terminal_failure_closes_pr_and_deletes_branch(
     )
     if guard_result is not None:
         mocker.patch(
-            "app.rollup_migration_validation.enforce_premerge_migration_guard",
+            "app.rollup_migration_validation._validate_rollup_migration_chain",
             new=AsyncMock(return_value=guard_result),
         )
     if merge_result is not None:
@@ -5144,9 +5246,7 @@ async def test_managed_check_wait_still_pending_ci_persists_check_snapshot(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="tok"),
     )
-    mocker.patch(
-        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
-    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     pr_head = "cafebabe" * 5
     mocker.patch(
         "app.github.get_pull_request",
@@ -5227,9 +5327,7 @@ async def test_managed_check_wait_no_checks_persists_snapshot_idempotently(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="tok"),
     )
-    mocker.patch(
-        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
-    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     pr_head_first = "1111aaaa" * 5
     pr_head_second = "2222bbbb" * 5
     mocker.patch(

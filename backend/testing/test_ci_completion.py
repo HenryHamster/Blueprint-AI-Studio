@@ -3418,7 +3418,11 @@ async def test_merge_held_on_dual_head_migration(db_session, mocker):
     # chain that already owns revision "0002".
     mocker.patch(
         "app.github.get_pr_files",
-        AsyncMock(return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}]),
+        AsyncMock(return_value=[{
+            "filename": "backend/alembic/versions/0002_dup.py",
+            "status": "added",
+            "patch": '+"""dup migration"""\n+revision = "0002"\n+down_revision = "0001"',
+        }]),
     )
     mocker.patch(
         "app.github.get_pull_request_diff",
@@ -3580,7 +3584,11 @@ async def test_clean_migration_pr_merges(db_session, mocker):
     )
     mocker.patch(
         "app.github.get_pr_files",
-        AsyncMock(return_value=[{"filename": "backend/alembic/versions/0003_next.py"}]),
+        AsyncMock(return_value=[{
+            "filename": "backend/alembic/versions/0003_next.py",
+            "status": "added",
+            "patch": '+"""next migration"""\n+revision = "0003"\n+down_revision = "0002"',
+        }]),
     )
     mocker.patch(
         "app.github.get_pull_request_diff",

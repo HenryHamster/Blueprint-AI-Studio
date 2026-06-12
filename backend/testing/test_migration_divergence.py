@@ -168,8 +168,7 @@ async def test_qualification_gate_authorizes_reconciled_0143_divergence(mocker):
     assert "authorized" in detail.lower()
     assert "0143" in detail
     assert (
-        "vm_contact_last_tool_use" in detail
-        and "add_compute_job_persistence" in detail
+        "vm_contact_last_tool_use" in detail and "add_compute_job_persistence" in detail
     )
 
 
@@ -242,9 +241,7 @@ async def test_qualification_gate_defers_when_target_fetch_fails(mocker):
             raise RuntimeError("GitHub 500 on target")
         return ["0142_parent.py", "0143_x.py"]
 
-    mocker.patch(
-        "app.github.list_versions_at_ref", new=AsyncMock(side_effect=_side)
-    )
+    mocker.patch("app.github.list_versions_at_ref", new=AsyncMock(side_effect=_side))
     verdict, detail = await check_qualification_migration_identity(
         "tok", "acme", "widget", "cand-sha", "main"
     )
@@ -490,6 +487,13 @@ def _versions_by_branch(
     return AsyncMock(side_effect=_side)
 
 
+def _migration_file(path: str, revision: str, down_revision: str) -> dict:
+    """Create a pr_files entry for a migration file with per-file patch."""
+    src = _migration_source(revision, down_revision)
+    body = "".join(f"+{line}\n" for line in src.splitlines())
+    return {"filename": path, "status": "added", "patch": f"@@ -0,0 +1,7 @@\n{body}"}
+
+
 @pytest.mark.asyncio
 async def test_premerge_guard_blocks_cross_branch_reuse_vs_promotion_target(mocker):
     """The revision-0143 class: the rollup adds 0143_add_compute_job_persistence
@@ -497,10 +501,9 @@ async def test_premerge_guard_blocks_cross_branch_reuse_vs_promotion_target(mock
     the deployed promotion target already stamped 0143 to vm_contact_last_tool_use.
     The integration-only checks pass; the promotion-target check must BLOCK."""
     path = f"{_VERSIONS_DIR}/0143_add_compute_job_persistence.py"
-    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=_files(path)))
     mocker.patch(
-        "app.github.get_pull_request_diff",
-        new=AsyncMock(return_value=_added_migration_diff(path, "0143", "0142")),
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_migration_file(path, "0143", "0142")]),
     )
     mocker.patch(
         "app.github.list_versions_at_ref",
@@ -518,8 +521,7 @@ async def test_premerge_guard_blocks_cross_branch_reuse_vs_promotion_target(mock
     assert "0143" in reason
     assert "promotion target" in reason
     assert (
-        "vm_contact_last_tool_use" in reason
-        and "add_compute_job_persistence" in reason
+        "vm_contact_last_tool_use" in reason and "add_compute_job_persistence" in reason
     )
 
 
@@ -529,10 +531,9 @@ async def test_premerge_guard_passes_integration_ahead_of_promotion_target(mocke
     of the deployed target, and the rollup adds a brand-new id (0151) above both.
     No shared revision id diverges, so the guard must return ('ok', None)."""
     path = f"{_VERSIONS_DIR}/0151_new_feature.py"
-    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=_files(path)))
     mocker.patch(
-        "app.github.get_pull_request_diff",
-        new=AsyncMock(return_value=_added_migration_diff(path, "0151", "0150")),
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_migration_file(path, "0151", "0150")]),
     )
     mocker.patch(
         "app.github.list_versions_at_ref",
@@ -553,10 +554,9 @@ async def test_premerge_guard_defers_when_promotion_target_fetch_fails(mocker):
     """Fail-safe: a failure listing the deployed promotion target's migrations
     HOLDS the merge (defer), never waves it through as 'no collision'."""
     path = f"{_VERSIONS_DIR}/0143_new.py"
-    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=_files(path)))
     mocker.patch(
-        "app.github.get_pull_request_diff",
-        new=AsyncMock(return_value=_added_migration_diff(path, "0143", "0142")),
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_migration_file(path, "0143", "0142")]),
     )
 
     async def _side(token, owner, repo, ref, project_id=None):

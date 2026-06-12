@@ -12305,7 +12305,11 @@ class TestModifyTaskApplySeam:
         mocker.patch(
             "app.github.get_pr_files",
             new_callable=AsyncMock,
-            return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}],
+            return_value=[{
+                "filename": "backend/alembic/versions/0002_dup.py",
+                "status": "added",
+                "patch": '+revision = "0002"\n+down_revision = "0001"',
+            }],
         )
         mocker.patch(
             "app.github.get_pull_request_diff",
@@ -13346,7 +13350,11 @@ class TestTriggerRollup:
         mocker.patch(
             "app.github.get_pr_files",
             new_callable=AsyncMock,
-            return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}],
+            return_value=[{
+                "filename": "backend/alembic/versions/0002_dup.py",
+                "status": "added",
+                "patch": '+revision = "0002"\n+down_revision = "0001"',
+            }],
         )
         mocker.patch(
             "app.github.get_pull_request_diff",

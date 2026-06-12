@@ -1018,29 +1018,27 @@ async def promote(
     # migration chain against the promotion target's CURRENT chain immediately
     # before merging, reusing the SAME shared validator the other gates use.
     #
-    # On a non-clean verdict — a real dual-head / duplicate-revision / stale-
-    # anchor collision OR an inability to fetch/parse the migration metadata —
-    # DO NOT call the merge API. Hold the promotion in a RETRYABLE state:
-    # _record_promotion_failure keeps the version open and bounces it to
-    # stabilize (main is untouched), so the next strategic cycle re-qualifies
-    # once the main → automain back-merge reconciles the integration branch.
-    # This is the missing hard backstop at merge time, NOT a replacement for the
-    # structural sync gate (which stays as-is).
-    from app.rollup_migration_validation import enforce_premerge_migration_guard
+    # Use the 3-way verdict directly so 'defer' and 'block' are handled
+    # differently: 'block' is a hard terminal failure (delete branch); 'defer'
+    # means migration safety is temporarily unknown — hold in managed_check_wait
+    # and let the reconciler re-run the guard on the next sweep (branch KEPT).
+    # Only 'ok' proceeds to the merge. enforce_premerge_migration_guard (the
+    # bool wrapper) is NOT used here because it collapses defer→hold, which for
+    # this release site means a spurious terminal failure.
+    from app.rollup_migration_validation import _validate_rollup_migration_chain
 
-    ok_to_merge, hold_reason = await enforce_premerge_migration_guard(
-        token, owner, repo, pr_number, promotion_target
+    migration_verdict, hold_reason = await _validate_rollup_migration_chain(
+        token, owner, repo, pr_number, target_branch=promotion_target
     )
-    if not ok_to_merge:
+    if migration_verdict == "block":
         logger.warning(
-            "[RELEASE_QUALIFIER] promote: held merge of promotion PR #%s for "
-            "v%d — Alembic combined-chain guard: %s",
+            "[RELEASE_QUALIFIER] promote: migration chain guard BLOCKED merge of "
+            "promotion PR #%s for v%d — recording terminal migration_guard_blocked: %s",
             pr_number,
             version.version_number,
             hold_reason,
         )
-        # The merge never ran; clean up the release branch best-effort so it
-        # does not dangle while the version waits to re-qualify.
+        # Hard collision — delete the branch so it does not dangle.
         await _delete_release_branch_best_effort(
             token, owner, repo, release_branch, version
         )
@@ -1053,6 +1051,44 @@ async def promote(
             pr_url=pr_url,
             lock_released=True,
         )
+    if migration_verdict == "defer":
+        # Migration metadata temporarily unavailable — migration safety unknown.
+        # Do NOT delete the release branch; hold in managed_check_wait so the
+        # reconciler re-runs the guard on the next sweep.
+        logger.info(
+            "[RELEASE_QUALIFIER] promote: migration chain guard DEFERRED for "
+            "promotion PR #%s (v%d) — entering managed_check_wait; reconciler "
+            "will retry after metadata is available and re-validate against %s. "
+            "Reason: %s",
+            pr_number,
+            version.version_number,
+            promotion_target,
+            hold_reason,
+        )
+        locked = await _relock_version_for_promotion_write(
+            session, version, lock_released=True
+        )
+        if locked is not None and locked.status == "open":
+            q = dict(locked.last_qualification or {})
+            q.update(base_record)
+            q["status"] = "pending"
+            q["promotion_pending"] = {
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "auto_merge_enabled": False,
+                "migration_carrying": True,
+                "managed_check_wait": True,
+                "why_not_native_automerge": "migration_guard_deferred",
+                "enabled_at": _utcnow().isoformat(),
+            }
+            locked.last_qualification = q
+            session.add(locked)
+        return {
+            "status": "pending_managed_check_wait",
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "managed_check_wait": True,
+        }
 
     # 2. Merge the PR — merge_method="merge" preserves integration history.
     #    merge_pull_request does NOT raise on 405/409; it returns merged=False.

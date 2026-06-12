@@ -464,7 +464,11 @@ async def test_bulk_approve_critical_merge_blocks_on_dual_head_collision(
     mocker.patch(
         "app.github.get_pr_files",
         new_callable=AsyncMock,
-        return_value=[{"filename": "backend/alembic/versions/0002_dupe.py"}],
+        return_value=[{
+            "filename": "backend/alembic/versions/0002_dupe.py",
+            "status": "added",
+            "patch": '+revision = "0002"\n+down_revision = "0001"',
+        }],
     )
     mocker.patch(
         "app.github.get_pull_request_diff",

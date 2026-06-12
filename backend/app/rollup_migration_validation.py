@@ -46,9 +46,86 @@ def _extract_rollup_migration_sources(diff: str) -> dict[str, str]:
                 current = sources.setdefault(path, [])
             else:
                 current = None
-        elif current is not None and line.startswith("+") and not line.startswith("+++"):
+        elif (
+            current is not None and line.startswith("+") and not line.startswith("+++")
+        ):
             current.append(line[1:])
     return {path: "\n".join(lines) for path, lines in sources.items()}
+
+
+def _extract_source_from_patch(patch: str) -> str:
+    """Reconstruct a file's post-image from a GitHub per-file unified diff patch.
+
+    The GitHub per-file patch contains hunk headers and +/-/context lines but
+    NOT the ``diff --git`` or ``+++`` header. Extracts only the added lines.
+    """
+    lines = [
+        line[1:]
+        for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    return "\n".join(lines)
+
+
+async def _collect_added_migration_sources(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    pr_files: list[dict],
+) -> dict[str, str]:
+    """Collect added Alembic migration sources from per-file patches.
+
+    For each migration file in *pr_files* that has a ``'patch'`` key, the
+    source is reconstructed via :func:`_extract_source_from_patch`. For any
+    migration file that is listed but lacks a ``'patch'`` (e.g. binary,
+    oversized, or absent from the 100-file window), the GitHub contents API is
+    used as a fallback (fetching the file at the PR head SHA).
+
+    Raises on any I/O failure so callers can return a ``'defer'`` verdict.
+    A fetch error is never silently treated as an empty migration set.
+    """
+    migration_files = [
+        f
+        for f in pr_files
+        if _touches_alembic_versions(f.get("filename", ""))
+        and f.get("status") != "removed"
+    ]
+    if not migration_files:
+        return {}
+
+    sources: dict[str, str] = {}
+    files_without_patch = [f for f in migration_files if "patch" not in f]
+
+    for f in migration_files:
+        if "patch" in f:
+            sources[f["filename"]] = _extract_source_from_patch(f["patch"])
+
+    if files_without_patch:
+        pr = await github.get_pull_request(gh_token, owner, repo, pr_number)
+        head_sha = (pr.get("head") or {}).get("sha") or ""
+        if not head_sha:
+            raise RuntimeError(
+                f"PR #{pr_number} has no head SHA — cannot fetch migration "
+                f"source(s) that are missing per-file patches"
+            )
+        for f in files_without_patch:
+            path = f["filename"]
+            text = await github.get_file_text_at_ref(
+                path,
+                token=gh_token,
+                owner=owner,
+                repo=repo,
+                ref=head_sha,
+            )
+            if not text:
+                raise RuntimeError(
+                    f"could not fetch migration source '{path}' at PR head SHA "
+                    f"'{head_sha}' (no patch in PR files, contents API returned empty)"
+                )
+            sources[path] = text
+
+    return sources
 
 
 def _touches_alembic_versions(filename: str) -> bool:
@@ -80,65 +157,6 @@ async def pr_touches_migrations(
     except Exception:
         return True
     return any(_touches_alembic_versions(f.get("filename", "")) for f in files)
-
-
-async def _read_added_migration_sources_at_head(
-    gh_token: str,
-    owner: str,
-    repo: str,
-    pr_number: int,
-    files: list[dict],
-) -> tuple[dict[str, str] | None, str | None]:
-    """Read each touched migration's source at the PR head (diff-cap-immune).
-
-    Fallback for when the whole-PR unified diff is unavailable (empty body —
-    GitHub 406s the ``.diff`` media type once a PR exceeds its diff size cap,
-    which a large release rollup routinely does). Reads only ADDED/modified
-    ``alembic/versions`` files (a pure deletion contributes no post-image, just
-    like the diff-based reconstruction) one file at a time via the contents API,
-    which is not subject to the unified-diff size cap.
-
-    Returns ``(sources, None)`` on success or ``(None, defer_reason)`` when the
-    PR head or any migration source cannot be read — fail-safe, mirroring the
-    caller's ``defer`` semantics (an unreadable source is never "no migrations").
-    """
-    migration_files = [
-        f
-        for f in files
-        if _touches_alembic_versions(f.get("filename", ""))
-        and f.get("status") != "removed"
-    ]
-    if not migration_files:
-        return ({}, None)
-    try:
-        pr_detail = await github.get_pull_request(gh_token, owner, repo, pr_number)
-    except Exception as e:
-        return (
-            None,
-            f"could not fetch PR #{pr_number} detail to read Alembic migration "
-            f"sources at its head: {type(e).__name__}: {e}",
-        )
-    head_sha = (pr_detail.get("head") or {}).get("sha")
-    if not head_sha:
-        return (
-            None,
-            f"PR #{pr_number} detail is missing a head SHA; cannot read Alembic "
-            f"migration sources to validate the chain",
-        )
-    sources: dict[str, str] = {}
-    for f in migration_files:
-        path = f["filename"]
-        text = await github.get_file_text_at_ref(
-            path, token=gh_token, owner=owner, repo=repo, ref=head_sha
-        )
-        if not text:
-            return (
-                None,
-                f"could not read migration source '{path}' at PR #{pr_number} head "
-                f"{head_sha[:7]}; deferring Alembic chain validation",
-            )
-        sources[path] = text
-    return (sources, None)
 
 
 async def _validate_rollup_migration_chain(
@@ -180,7 +198,9 @@ async def _validate_rollup_migration_chain(
     fail-safe (``"defer"``), mirroring the target-branch handling.
     """
     try:
-        files = await github.get_pr_files(gh_token, owner, repo, pr_number)
+        files = await github.get_pr_files(
+            gh_token, owner, repo, pr_number, include_patch=True
+        )
     except Exception as e:
         return (
             "defer",
@@ -191,29 +211,15 @@ async def _validate_rollup_migration_chain(
         return ("ok", None)
 
     try:
-        diff = await github.get_pull_request_diff(gh_token, owner, repo, pr_number)
+        added_sources = await _collect_added_migration_sources(
+            gh_token, owner, repo, pr_number, files
+        )
     except Exception as e:
         return (
             "defer",
-            f"could not fetch rollup diff to validate Alembic migrations: "
+            f"could not fetch migration sources to validate Alembic migrations: "
             f"{type(e).__name__}: {e}",
         )
-    if diff:
-        added_sources = _extract_rollup_migration_sources(diff)
-    else:
-        # The whole-PR diff came back empty. GitHub's ``.diff`` media type 406s
-        # (-> empty body here) once a PR exceeds its diff size cap, and a release
-        # rollup routinely does (v10: 107 files / 20k+ lines). Treating that as a
-        # fail-safe ``defer`` wedged EVERY migration-carrying release: it deferred
-        # each promotion cycle and never landed, and the rollup only grows, so it
-        # never self-heals. Fall back to reading each touched migration's source
-        # directly at the PR head — small per-file contents immune to the diff
-        # size cap, the same per-file approach the post-merge guard uses.
-        added_sources, defer_reason = await _read_added_migration_sources_at_head(
-            gh_token, owner, repo, pr_number, files
-        )
-        if defer_reason is not None:
-            return ("defer", defer_reason)
 
     if not target_branch:
         reason = validate_added_migrations(added_sources)
@@ -350,17 +356,25 @@ def _divergence_record_is_authorized(
     revision to its renumbered slot.
     """
     for auth in authorized:
-        if record["kind"] == "reused" and record["revision"] == auth.revision and {
-            record["base_identity"],
-            record["head_identity"],
-        } == {auth.deployed_identity, auth.integration_identity}:
+        if (
+            record["kind"] == "reused"
+            and record["revision"] == auth.revision
+            and {
+                record["base_identity"],
+                record["head_identity"],
+            }
+            == {auth.deployed_identity, auth.integration_identity}
+        ):
             return True
-        if record["kind"] == "renumbered" and record[
-            "identity"
-        ] == auth.deployed_identity and {
-            record["base_revision"],
-            record["head_revision"],
-        } == {auth.revision, auth.integration_revision}:
+        if (
+            record["kind"] == "renumbered"
+            and record["identity"] == auth.deployed_identity
+            and {
+                record["base_revision"],
+                record["head_revision"],
+            }
+            == {auth.revision, auth.integration_revision}
+        ):
             return True
     return False
 
@@ -639,9 +653,7 @@ async def _validate_migration_chain_post_merge(
                 f"would fail. Chain needs manual resolution.",
             )
         dangling = sorted(
-            rev
-            for rev, down in chain.items()
-            if down is not None and down not in chain
+            rev for rev, down in chain.items() if down is not None and down not in chain
         )
         if dangling:
             rev = dangling[0]
@@ -679,12 +691,14 @@ async def _plan_rollup_migration_reconciliation(
     if not target_branch:
         return None
     try:
-        diff = await github.get_pull_request_diff(gh_token, owner, repo, pr_number)
+        pr_files = await github.get_pr_files(
+            gh_token, owner, repo, pr_number, include_patch=True
+        )
+        added_sources = await _collect_added_migration_sources(
+            gh_token, owner, repo, pr_number, pr_files
+        )
     except Exception:
         return None
-    if not diff:
-        return None
-    added_sources = _extract_rollup_migration_sources(diff)
     if not added_sources:
         return None
     try:

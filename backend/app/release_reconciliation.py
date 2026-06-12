@@ -108,7 +108,9 @@ def _managed_check_wait_snapshot(
     """Build a bounded operator snapshot for a non-terminal check-wait sweep."""
 
     details = []
-    raw_details = check_result.get("details") if isinstance(check_result, dict) else None
+    raw_details = (
+        check_result.get("details") if isinstance(check_result, dict) else None
+    )
     if isinstance(raw_details, list):
         for raw in raw_details[:_MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT]:
             if not isinstance(raw, dict):
@@ -282,9 +284,7 @@ async def _refresh_release_artifact_rows(
     # resolution.  Within the deadline, count them as unconfirmed so the sweep
     # re-evaluates on each tick (the identity may be restored before deadline).
     all_required_provider_map = {
-        p.artifact_kind: p
-        for p in iter_release_artifact_providers()
-        if p.required
+        p.artifact_kind: p for p in iter_release_artifact_providers() if p.required
     }
     unobservable_required_kinds = set(all_required_provider_map) - observable_kinds
     if unobservable_required_kinds:
@@ -320,7 +320,11 @@ async def _refresh_release_artifact_rows(
             if artifact_deadline is not None and _now_naive >= artifact_deadline:
                 # Past deadline: resolve with provider_unobservable so the row
                 # is no longer pending and the aggregate can converge.
-                decision: tuple = ("confirmation_timed_out", "provider_unobservable", None)
+                decision: tuple = (
+                    "confirmation_timed_out",
+                    "provider_unobservable",
+                    None,
+                )
                 if apply_serving_decision(artifact, decision, now=now):
                     mutated = True
                 session.add(artifact)
@@ -1049,8 +1053,6 @@ async def _reconcile_if_managed_check_wait(
     Transient GitHub errors leave the version pending (fail-open) so the next
     sweep retries.  Returns True iff the version reached a terminal state.
     """
-    from app.rollup_migration_validation import enforce_premerge_migration_guard
-
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
@@ -1174,7 +1176,10 @@ async def _reconcile_if_managed_check_wait(
                 promoted_sha_oob: str | None = None
                 try:
                     promoted_sha_oob = await github.get_branch_sha(
-                        token, owner, repo, promotion_target,
+                        token,
+                        owner,
+                        repo,
+                        promotion_target,
                         project_id=str(version.project_id),
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -1384,13 +1389,28 @@ async def _reconcile_if_managed_check_wait(
                 return False
 
             # 4. CI is green — re-run the Alembic dual-head guard before merging.
-            ok_to_merge, hold_reason = await enforce_premerge_migration_guard(
-                token, owner, repo, int(pr_number), promotion_target
+            # Use the 3-way verdict so 'defer' (metadata temporarily unavailable)
+            # leaves the version pending for the next sweep without cleanup, while
+            # 'block' (genuine collision) records the terminal failure.
+            from app.rollup_migration_validation import _validate_rollup_migration_chain
+
+            migration_verdict, hold_reason = await _validate_rollup_migration_chain(
+                token, owner, repo, int(pr_number), target_branch=promotion_target
             )
-            if not ok_to_merge:
+            if migration_verdict == "defer":
+                logger.info(
+                    "[RELEASE_QUALIFIER] reconcile managed_check_wait: migration "
+                    "chain guard DEFERRED for PR #%s (v%d) — leaving pending for "
+                    "next sweep. Reason: %s",
+                    pr_number,
+                    version.version_number,
+                    hold_reason,
+                )
+                return False
+            if migration_verdict == "block":
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile managed_check_wait: Alembic "
-                    "guard holds for PR #%s (v%d): %s — recording "
+                    "guard BLOCKED for PR #%s (v%d): %s — recording "
                     "migration_guard_blocked",
                     pr_number,
                     version.version_number,
@@ -1439,7 +1459,12 @@ async def _reconcile_if_managed_check_wait(
             if not merge_result.get("merged"):
                 # Disambiguate: the PR may have already merged (idempotency).
                 if await _promotion_pr_landed(
-                    token, owner, repo, int(pr_number), candidate_sha, version,
+                    token,
+                    owner,
+                    repo,
+                    int(pr_number),
+                    candidate_sha,
+                    version,
                     project=project,
                 ):
                     logger.info(
@@ -1524,7 +1549,10 @@ async def _reconcile_if_managed_check_wait(
             promoted_sha_new: str | None = None
             try:
                 promoted_sha_new = await github.get_branch_sha(
-                    token, owner, repo, promotion_target,
+                    token,
+                    owner,
+                    repo,
+                    promotion_target,
                     project_id=str(version.project_id),
                 )
             except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
@@ -1682,7 +1710,12 @@ async def _reconcile_if_pending_qualification_superseded(
             # state without the normal finalizer running (the stuck-qualification
             # scenario this reconciler exists to resolve).
             _TERMINAL = frozenset(
-                {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED}
+                {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.BLOCKED,
+                }
             )
             smoketest_required = bool(qual.get("smoketest_enabled", True))
             audit_task_id_raw = qual.get("audit_task_id")
@@ -1696,7 +1729,9 @@ async def _reconcile_if_pending_qualification_superseded(
                     pass
             if smoketest_required and smoketest_task_id_raw:
                 try:
-                    smoke_t = await session.get(Task, uuid.UUID(str(smoketest_task_id_raw)))
+                    smoke_t = await session.get(
+                        Task, uuid.UUID(str(smoketest_task_id_raw))
+                    )
                     if smoke_t is not None and smoke_t.status not in _TERMINAL:
                         return False
                 except (ValueError, TypeError):
@@ -2470,7 +2505,10 @@ async def _reconcile_if_deploy_failed_recovered(
             # Both an active failure (deploy_failed) and a confirmation timeout
             # (confirmation_timed_out) are non-terminal: if the promoted SHA is
             # later observed serving, recover either to serving_confirmed.
-            if version.serving_status not in ("deploy_failed", "confirmation_timed_out"):
+            if version.serving_status not in (
+                "deploy_failed",
+                "confirmation_timed_out",
+            ):
                 return False
 
             # Recovery is gated on the deterministic positive below (a full
