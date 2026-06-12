@@ -1571,7 +1571,8 @@ async def _provision_local(
         provider_metadata=provider_metadata,
         provider_settings=provider_settings,
     )
-    env = {**os.environ, **_materialize_local_manifest(vm_instance_id, manifest)}
+    env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
+    env.update(_materialize_local_manifest(vm_instance_id, manifest))
     env["PAYLOAD_URI"] = payload_uri or ""
 
     agent_dir = os.path.abspath(AGENT_DIR)

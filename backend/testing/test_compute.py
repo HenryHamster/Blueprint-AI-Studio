@@ -692,6 +692,51 @@ async def test_local_compute_backend_idempotent_launch_preserves_started_at():
 
 
 @pytest.mark.asyncio
+async def test_local_subprocess_env_does_not_inherit_orchestrator_secrets(
+    monkeypatch,
+):
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "DATABASE_URL",
+        "GITHUB_PRIVATE_KEY",
+        "AGENT_JWT_SECRET",
+        "WS_TICKET_SECRET",
+    ):
+        monkeypatch.setenv(key, f"sentinel-{key}")
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 12345
+    fake_proc.poll.return_value = None
+
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="env",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        env={"EXPLICIT_JOB_ENV": "present"},
+    )
+
+    with patch("app.compute_backends.subprocess.Popen", return_value=fake_proc) as popen:
+        result = await backend.launch(spec)
+
+    try:
+        child_env = popen.call_args.kwargs["env"]
+        assert child_env["EXPLICIT_JOB_ENV"] == "present"
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "DATABASE_URL",
+            "GITHUB_PRIVATE_KEY",
+            "AGENT_JWT_SECRET",
+            "WS_TICKET_SECRET",
+        ):
+            assert key not in child_env
+    finally:
+        backend._processes.pop(result.external_id, None)
+
+
+@pytest.mark.asyncio
 async def test_gcp_compute_backend_uses_persisted_zone_for_restart_serial_recovery(
     monkeypatch,
 ):
@@ -8631,3 +8676,44 @@ def test_local_wrapper_command_writes_release_echo_to_terminal_file():
     assert "RELEASE_ECHO=$RELEASE_ECHO_B64" in wrapper
     assert "RELEASE_ECHO_B64" in wrapper
     assert "BLUEPRINT_RELEASE_SHA" in wrapper
+
+
+@pytest.mark.asyncio
+async def test_provision_local_does_not_inherit_orchestrator_secrets(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GITHUB_PRIVATE_KEY", "sentinel-private-key")
+    monkeypatch.setenv("AGENT_JWT_SECRET", "sentinel-jwt-secret")
+
+    captured_envs = []
+
+    def fake_popen(args, cwd=None, env=None, **kwargs):
+        captured_envs.append(dict(env) if env is not None else None)
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.returncode = None
+        mock_proc.wait = MagicMock(return_value=0)
+        return mock_proc
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(compute, "AGENT_DIR", str(tmp_path))
+
+    task_id = uuid.uuid4()
+    vm_instance_id = f"local-{uuid.uuid4()}"
+
+    await compute._provision_local(
+        vm_instance_id=vm_instance_id,
+        task_id=task_id,
+        payload_uri="payload://test",
+        oauth_token="test-oauth-token",
+        task_type="test",
+    )
+
+    assert len(captured_envs) == 1, "expected exactly one Popen call"
+    child_env = captured_envs[0]
+    assert child_env is not None
+    assert "GITHUB_PRIVATE_KEY" not in child_env
+    assert "AGENT_JWT_SECRET" not in child_env
+    assert child_env.get("PAYLOAD_URI") == "payload://test"
+    assert child_env.get("VM_INSTANCE_ID") == vm_instance_id

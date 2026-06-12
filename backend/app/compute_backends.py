@@ -243,7 +243,7 @@ class LocalSubprocessComputeBackend:
             started_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
         )
         _remove_local_terminal_status_for_external_id(external_id)
-        env = os.environ.copy()
+        env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
         env.update(spec.env or {})
         proc = subprocess.Popen(
             [
