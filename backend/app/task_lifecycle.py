@@ -53,12 +53,13 @@ from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
-    _is_verification_only_rejection,
+    _genuine_blocking_issue_exists,
     _spawn_pipeline_task,
     build_ci_failure_fix_prompt,
     build_merge_conflict_fix_prompt,
     detect_fix_all_issue_class,
     fix_all_occurrences_directive,
+    reconciled_approve_markers,
     should_auto_approve_diff,
 )
 from app.failure_classification import classify_failure
@@ -2831,40 +2832,26 @@ async def _process_post_commit(
                     )
                     verdict = "REQUEST_CHANGES"
 
-                # Verification-only REQUEST_CHANGES → treat as APPROVE.
-                #
-                # A reviewer can emit REQUEST_CHANGES purely because it could
-                # not RUN/VERIFY in its sandbox (missing verify tool, a CI
-                # probe that 401'd, a stale workspace, a failed install, a
-                # "build failed"/CI pass-status worry) — NOT because it found a
-                # concrete code defect. The merge gate is
-                # `ci_passed AND review_approved` with `ci_passed` from the
-                # orchestrator's OWN authoritative check-run polling. Such a
-                # verdict on a CI-green PR with no concrete defect means "the
-                # reviewer had no real objection and CI passed" — the correct
-                # outcome is to APPROVE and let the PR merge through the normal
-                # path (with every normal approve-time gate still applying),
-                # NOT to halt the loop in limbo (open-but-unmerged: a downgrade
-                # that stops the fix loop without setting review_approved leaves
-                # the merge gate forever unsatisfied) and NOT to burn a fix
-                # iteration on a complaint that has no code-level cause.
-                #
-                # CONSERVATIVE flip — fires ONLY when:
-                #   1. every blocking issue is verification-class AND none cites
-                #      a concrete code defect (_is_verification_only_rejection),
-                #      AND
-                #   2. CI is AUTHORITATIVELY green: the SAME check-run poll the
-                #      merge gate uses, with treat_missing_as_success=False so
-                #      "no checks ran" is NOT mistaken for a pass, and
-                #      conclusion == "success".
-                # If EITHER fails — any concrete defect, CI red/pending/no-
-                # checks, or a get_check_runs error — we leave the verdict as
-                # REQUEST_CHANGES exactly as before (fail-safe), and the
-                # REQUEST_CHANGES branch spawns a fix as usual.
+                # REQUEST_CHANGES unsupported by its own evidence → reconcile to
+                # APPROVE. The decision must follow the reviewer's structured
+                # ``issues``, not the free-text ``verdict`` token taken on faith —
+                # that decoupling let a reviewer stamp REQUEST_CHANGES while its own
+                # findings cleared the PR, churning the fix loop to the iteration
+                # cap on a green, mergeable PR (PR #9678).
+                # ``_genuine_blocking_issue_exists`` encodes the review contract
+                # (agent/src/prompts/review-prompt.ts): a genuine blocker is a
+                # CRITICAL/MAJOR issue that is not purely verification-class, so an
+                # empty / all-MINOR / verification-only set (the old
+                # _is_verification_only_rejection case, now subsumed) is no genuine
+                # objection. CONSERVATIVE — flips ONLY with no genuine blocker AND
+                # AUTHORITATIVELY-green CI (the same check-run poll the merge gate
+                # uses, treat_missing_as_success=False, conclusion=="success"); any
+                # blocker or non-green CI keeps REQUEST_CHANGES + spawns a fix
+                # (fail-safe). Reconciled trunk APPROVEs still pass second-opinion.
                 if (
                     verdict == "REQUEST_CHANGES"
                     and not verdict_unparseable
-                    and _is_verification_only_rejection(issues, feedback)
+                    and not _genuine_blocking_issue_exists(issues)
                 ):
                     _ci_green_for_downgrade = False
                     try:
@@ -2904,31 +2891,22 @@ async def _process_post_commit(
                         _ci_green_for_downgrade = False
 
                     if _ci_green_for_downgrade:
+                        _markers, _vd_note = reconciled_approve_markers(
+                            issues, feedback
+                        )
                         logger.warning(
-                            f"[REVIEW PIPELINE] PR #{pr_number}: REQUEST_CHANGES "
-                            f"verdict is verification-only (reviewer could not "
-                            f"run/verify, no concrete code defect) and CI is "
-                            f"authoritatively GREEN — treating as APPROVE so the "
-                            f"PR merges through the normal approve path. Not "
-                            f"spawning a fix iteration."
+                            "[REVIEW PIPELINE] PR #%s: REQUEST_CHANGES carries no "
+                            "genuine blocking issue and CI is authoritatively GREEN "
+                            "— recording APPROVE (%s); not spawning a fix iteration.",
+                            pr_number,
+                            "+".join(sorted(_markers)),
                         )
                         verdict = "APPROVE"
-                        task.context = {
-                            **(task.context or {}),
-                            "verification_only_downgrade": True,
-                        }
+                        task.context = {**(task.context or {}), **_markers}
                         session.add(task)
-                        # Surface why this approved despite a verification-only
-                        # REQUEST_CHANGES. The APPROVE review posted below
-                        # carries `feedback`, so a one-line note here keeps the
-                        # reviewer's concerns visible without a second comment.
-                        _vd_note = (
-                            "_Note: the reviewer raised only verification/tooling "
-                            "concerns (could not run or verify in its sandbox), "
-                            "with no concrete code defect, while CI is "
-                            "authoritatively green. Treated as APPROVE._"
+                        feedback = (
+                            f"{_vd_note}\n\n{feedback}" if feedback else _vd_note
                         )
-                        feedback = f"{_vd_note}\n\n{feedback}" if feedback else _vd_note
 
                 # If verdict was unparseable, flag the original task for manual review
                 if verdict_unparseable:

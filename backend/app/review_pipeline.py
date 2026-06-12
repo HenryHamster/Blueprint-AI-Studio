@@ -240,6 +240,108 @@ def _is_verification_only_rejection(
     return all(_VERIFICATION_CLASS_RE.search(text) for text in blocking_texts)
 
 
+# Severities the review contract defines as NON-blocking. Per
+# agent/src/prompts/review-prompt.ts, MINOR findings (cosmetic nits, naming,
+# docs, optional polish) "are NON-BLOCKING … Only CRITICAL and MAJOR issues
+# should drive a REQUEST_CHANGES verdict. A … PR with only MINOR findings should
+# APPROVE." A blank/unknown severity is deliberately NOT in this set: an
+# unclassified issue cannot be PROVEN non-blocking, so it keeps blocking.
+_NON_BLOCKING_SEVERITIES = frozenset(
+    {"MINOR", "NIT", "NITPICK", "LOW", "INFO", "INFORMATIONAL", "TRIVIAL", "STYLE", "SUGGESTION", "NONE"}
+)
+
+
+def _genuine_blocking_issue_exists(issues: "list | None") -> bool:
+    """Does this REQUEST_CHANGES carry a GENUINE, actionable blocker?
+
+    The recorded review decision must be a function of the reviewer's own
+    STRUCTURED evidence, not of the free-text ``verdict`` token taken on faith.
+    The review contract (agent/src/prompts/review-prompt.ts) already defines when
+    REQUEST_CHANGES is justified, and this encodes exactly that contract. A
+    genuine blocker is a structured issue that is BOTH:
+
+      * blocking-severity — CRITICAL/MAJOR. MINOR (and synonyms) are non-blocking
+        by the agent's OWN classification; a blank/unknown severity is treated
+        conservatively AS blocking (cannot prove it non-blocking), AND
+      * not purely verification-class — the reviewer's inability to run or verify
+        (missing tool, 401/403 probe, failed install, "build failed"/CI
+        pass-status worry) is, per the contract, NEVER grounds for REQUEST_CHANGES
+        regardless of the severity the agent stamped on it (the prompt tells
+        reviewers to flag unverifiable steps as MAJOR, so severity alone cannot
+        distinguish a real defect from a tooling gap). An issue that is
+        verification-class BUT also cites a concrete code defect
+        (``_CONCRETE_DEFECT_RE``) IS a genuine blocker — the conservative bias.
+
+    So a REQUEST_CHANGES whose ``issues`` array is empty, or holds only MINOR /
+    purely-verification entries, is unsupported by its own structured evidence
+    and (on authoritative green CI — checked by the caller) reconciles to APPROVE.
+
+    Deliberately does NOT scan the free-text ``feedback`` to MANUFACTURE a blocker
+    the structured ``issues`` omit: that free-text→decision coupling is the exact
+    defect this reconciliation removes, and prose scanning was negation-blind (a
+    CLEARING phrase such as "no remaining blocking correctness issue" read as a
+    concrete defect via the bare ``correctness`` cue, latching the fix loop to the
+    iteration cap). The structured issues are authoritative; CI-green is the
+    independent safety gate, and trunk APPROVEs still pass the second-opinion gate.
+    Pure / side-effect-free — unit-testable.
+    """
+    for issue in issues or []:
+        if not isinstance(issue, dict):
+            continue
+        desc = (issue.get("description") or "").strip()
+        if not desc:
+            # No description → no actionable blocker the fix agent could address.
+            continue
+        sev = (issue.get("severity") or "").strip().upper()
+        if sev in _NON_BLOCKING_SEVERITIES:
+            continue
+        # A concrete code defect is ALWAYS a genuine blocker, even if the same
+        # issue also mentions a build/verify phrase.
+        if _CONCRETE_DEFECT_RE.search(desc):
+            return True
+        # Purely verification-class (could-not-run/verify) → not a code defect;
+        # never grounds for REQUEST_CHANGES per contract, regardless of severity.
+        if _VERIFICATION_CLASS_RE.search(desc):
+            continue
+        # A CRITICAL/MAJOR (or blank/unknown-severity) issue that is neither a
+        # recognized verification phrase nor a recognized concrete-defect cue is
+        # an opaque blocker ("please fix this") — keep it blocking (fail-safe).
+        return True
+    return False
+
+
+def reconciled_approve_markers(
+    issues: "list | None", feedback: "str | None"
+) -> "tuple[dict[str, bool], str]":
+    """Context markers + operator note for a REQUEST_CHANGES that reconciles to
+    APPROVE because it carries no genuine blocker on authoritative-green CI
+    (see ``_genuine_blocking_issue_exists``).
+
+    Returns ``({context_key: True, ...}, note_markdown)``.
+    ``review_verdict_reconciled_to_approve`` is always set; the legacy
+    ``verification_only_downgrade`` marker is added only for the
+    verification-only sub-case (reviewer could not run/verify), which also
+    selects a more specific note. The note is prepended to the APPROVE review's
+    feedback so the reviewer's concerns stay visible without a second comment.
+    """
+    markers: dict[str, bool] = {"review_verdict_reconciled_to_approve": True}
+    if _is_verification_only_rejection(issues, feedback):
+        markers["verification_only_downgrade"] = True
+        note = (
+            "_Note: the reviewer raised only verification/tooling concerns "
+            "(could not run or verify in its sandbox), with no concrete code "
+            "defect, while CI is authoritatively green. Treated as APPROVE._"
+        )
+    else:
+        note = (
+            "_Note: the reviewer returned REQUEST_CHANGES but listed no blocking "
+            "(CRITICAL/MAJOR) issue — only non-blocking observations — while CI "
+            "is authoritatively green. Per the review contract that does not "
+            "block merge; treated as APPROVE._"
+        )
+    return markers, note
+
+
 def build_ci_failure_fix_prompt(
     *,
     pr_number: int,
