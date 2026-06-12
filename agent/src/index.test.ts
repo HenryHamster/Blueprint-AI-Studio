@@ -295,6 +295,39 @@ describe('sanitize', () => {
     expect(sanitize('key: sk-ant-api03-someverylongkey-abc')).toBe('key: sk-ant-***');
   });
 
+  it('redacts OpenAI sk- API keys with a conservative minimum length', () => {
+    const stderr = 'openai stderr: invalid key sk-abcdefghijklmnopqrstuvwxyz123456';
+    expect(sanitize(stderr)).toBe('openai stderr: invalid key sk-***');
+    expect(sanitize('short marker sk-not-a-real-key')).toBe('short marker sk-not-a-real-key');
+  });
+
+  it('redacts OpenAI sk-proj- API keys', () => {
+    expect(
+      sanitize('codex failed with OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456'),
+    ).toBe('codex failed with OPENAI_API_KEY=sk-proj-***');
+  });
+
+  it('redacts Google API keys', () => {
+    expect(
+      sanitize('gemini stderr: api key AIzaSyabcdefghijklmnopqrstuvwxyz123456789'),
+    ).toBe('gemini stderr: api key AIza***');
+  });
+
+  it('redacts quoted credential fields while preserving field names and quote style', () => {
+    const json = '{"access_token":"ya29.secret","refresh_token":"1//refresh","id_token":"header.payload.sig","api_key":"AIzaSyabcdefghijklmnopqrstuvwxyz123456789","client_secret":"client-secret","private_key":"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----","token":"opaque"}';
+    expect(sanitize(json)).toBe('{"access_token":"***","refresh_token":"***","id_token":"***","api_key":"***","client_secret":"***","private_key":"***","token":"***"}');
+  });
+
+  it('redacts quoted key-value credential fields in stderr-like text', () => {
+    const stderr = "stderr: access_token='ya29.secret' client_secret=\"secret\" token='opaque'";
+    expect(sanitize(stderr)).toBe("stderr: access_token='***' client_secret=\"***\" token='***'");
+  });
+
+  it('does not mangle ordinary prose mentioning token or api_key without credential-looking values', () => {
+    const text = 'The token field and api_key setting are missing; no secret value was provided.';
+    expect(sanitize(text)).toBe(text);
+  });
+
   it('redacts JWT tokens matching eyJ…eyJ…sig pattern', () => {
     const jwt =
       'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';

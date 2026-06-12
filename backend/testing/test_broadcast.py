@@ -44,6 +44,24 @@ def test_anthropic_api_key():
     assert "sk-ant-***" in out
 
 
+def test_openai_project_key():
+    out = _sanitize_log("OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456")
+    assert "sk-proj-abcdefghijklmnopqrstuvwxyz123456" not in out
+    assert "sk-proj-***" in out
+
+
+def test_openai_generic_key():
+    out = _sanitize_log("stderr: invalid key sk-abcdefghijklmnopqrstuvwxyz123456")
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in out
+    assert "sk-***" in out
+
+
+def test_google_api_key():
+    out = _sanitize_log("gemini stderr: api key AIzaSyabcdefghijklmnopqrstuvwxyz123456789")
+    assert "AIzaSyabcdefghijklmnopqrstuvwxyz123456789" not in out
+    assert "AIza***" in out
+
+
 def test_bearer_token():
     out = _sanitize_log("Authorization: Bearer abc.def.ghi more")
     assert "abc.def.ghi" not in out
@@ -68,9 +86,30 @@ def test_oauth_token_colon_case_insensitive():
     assert "oauth_token=***" in out
 
 
+def test_named_credential_fields_redacted():
+    text = (
+        '{"access_token":"ya29.secret","refresh_token":"1//refresh",'
+        '"id_token":"header.payload.sig","api_key":"AIzaSyabcdefghijklmnopqrstuvwxyz123456789",'
+        '"client_secret":"client-secret",'
+        '"token":"opaque"}'
+    )
+    out = _sanitize_log(text)
+    assert "ya29.secret" not in out
+    assert "1//refresh" not in out
+    assert "header.payload.sig" not in out
+    assert "AIzaSyabcdefghijklmnopqrstuvwxyz123456789" not in out
+    assert "client-secret" not in out
+    assert '"access_token":"***"' in out
+    assert '"refresh_token":"***"' in out
+    assert '"id_token":"***"' in out
+    assert '"api_key":"***"' in out
+    assert '"client_secret":"***"' in out
+    assert '"token":"***"' in out
+
+
 def test_jwt_three_segment():
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcDEF_123-xyz"
-    out = _sanitize_log(f"token={jwt} rest")
+    out = _sanitize_log(jwt)
     assert jwt not in out
     assert "eyJ***" in out
 

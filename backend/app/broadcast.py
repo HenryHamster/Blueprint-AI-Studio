@@ -211,12 +211,24 @@ async def broadcast_to_project(project_id: str, event_type: str, data: dict):
 
 # Log sanitization patterns — mirrors agent/src/index.ts sanitize() to catch secrets
 # that bypass agent-side sanitization (compromised agent, direct WS injection)
+# keep in sync with agent/src/utils/sanitize.ts and backend/app/failure_classification.py
+# Value group uses [^'"\\]|\\. (unambiguous: first alt rejects backslash, second starts with
+# backslash) — avoids the exponential backtracking that ((?:\\.|(?!\4)[\s\S])+) exhibits
+# on inputs with many backslashes and no closing quote.
+_CRED_FIELD_RE = re.compile(
+    r"""(["\']?)(access_token|refresh_token|id_token|api_key|client_secret|private_key|token)\1(\s*[:=]\s*)(["\'])((?:[^'"\\]|\\.)+)\4""",
+    re.IGNORECASE,
+)
+
 _SANITIZE_PATTERNS = [
     (re.compile(r"https://x-access-token:[^@]+@"), "https://x-access-token:***@"),
     (re.compile(r"ghp_[A-Za-z0-9_]+"), "ghp_***"),
     (re.compile(r"ghs_[A-Za-z0-9_]+"), "ghs_***"),
     (re.compile(r"github_pat_[A-Za-z0-9_]+"), "github_pat_***"),
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]+"), "sk-ant-***"),
+    (re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}"), "sk-proj-***"),
+    (re.compile(r"sk-(?!ant-|proj-)[A-Za-z0-9_\-]{20,}"), "sk-***"),
+    (re.compile(r"AIza[A-Za-z0-9_\-]{20,}"), "AIza***"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"), "eyJ***"),
     (re.compile(r'Bearer\s+[^\s,\'"]+', re.IGNORECASE), "Bearer ***"),
     (re.compile(r'oauth_token[=:]\s*[^\s&\'"]+', re.IGNORECASE), "oauth_token=***"),
@@ -235,4 +247,8 @@ def _sanitize_log(text: str) -> str:
         return text
     for pattern, replacement in _SANITIZE_PATTERNS:
         text = pattern.sub(replacement, text)
+    text = _CRED_FIELD_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{m.group(1)}{m.group(3)}{m.group(4)}***{m.group(4)}",
+        text,
+    )
     return text

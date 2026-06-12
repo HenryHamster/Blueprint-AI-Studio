@@ -1101,6 +1101,95 @@ _ERROR_REPORT_STDERR_TAIL_CHARS = 2000
 _ERROR_REPORT_MAX_PROVIDER_ERRORS = 5
 _ERROR_REPORT_ERROR_MESSAGE_CHARS = 500
 
+# ---------------------------------------------------------------------------
+# Credential redaction — applied to stderr_tail and provider error messages
+# before storage so secrets never reach task.context or the DB.
+# ---------------------------------------------------------------------------
+_CRED_FIELD_NAMES = (
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "api_key",
+    "client_secret",
+    "private_key",
+    "token",
+)
+
+# Match JSON-style "field": "value" and key=value / key: value pairs.
+# Group 1: key name + separator (+ optional opening quote of value)
+# Group 2: the credential value (8+ chars to skip booleans/nulls); includes '@' so that
+#           OAuth tokens like ya29.a0@abc... are fully redacted (keep in sync with
+#           broadcast.py _CRED_FIELD_RE and agent/src/utils/sanitize.ts)
+# Group 3: optional closing quote
+# The optional leading quote is consumed BEFORE the \b word-boundary check so
+# that "token": "value" (JSON) is matched while OPENAI_API_KEY=value is not:
+# inside OPENAI_API_KEY the underscore before API_KEY is \w, so \b does not
+# fire there.
+_CRED_FIELD_RE = re.compile(
+    r'(["\']?\b(?:'
+    + "|".join(_CRED_FIELD_NAMES)
+    + r")"
+    + r'\b["\']?\s*[:=]\s*["\']?)([A-Za-z0-9_.+=\-/@]{8,})(["\']?)',
+    re.IGNORECASE,
+)
+
+# Ordered substitution table: (compiled-pattern, replacement-string).
+# Apply sk-ant- before generic sk- so Anthropic keys are not double-matched.
+# Apply sk-proj- before generic sk- for the same reason.
+_CRED_REDACT_SUBS: tuple[tuple[re.Pattern, str], ...] = (
+    # Embedded git URL credentials: https://x-access-token:<token>@host
+    (re.compile(r"https://x-access-token:[^@]+@"), "https://x-access-token:***@"),
+    # GitHub tokens
+    (re.compile(r"ghp_[A-Za-z0-9_]+"), "ghp_***"),
+    (re.compile(r"ghs_[A-Za-z0-9_]+"), "ghs_***"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]+"), "github_pat_***"),
+    # Anthropic API keys (sk-ant-…)
+    (re.compile(r"sk-ant-[A-Za-z0-9_-]+"), "sk-ant-***"),
+    # OpenAI project-scoped API keys (sk-proj-…); {10,} is intentionally more aggressive
+    # than broadcast.py's {20,} — stored error reports tolerate more false positives
+    # than the live WS broadcast path, so we redact shorter sk-proj- strings here.
+    (re.compile(r"sk-proj-[A-Za-z0-9_-]{10,}"), "sk-proj-***"),
+    # OpenAI generic API keys (sk-…); minimum 20 chars to avoid false positives
+    (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-***"),
+    # Google AIza API keys (39 chars total: "AIza" + 35 alphanumeric)
+    (re.compile(r"AIza[A-Za-z0-9_-]{35}"), "AIza***"),
+    # JWT tokens: three base64url-encoded parts separated by dots
+    (
+        re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+        "eyJ***",
+    ),
+    # Bearer tokens
+    (re.compile(r"Bearer\s+[^\s,'\"]+", re.IGNORECASE), "Bearer ***"),
+    # OAuth token query parameters
+    (re.compile(r"oauth_token[=:]\s*[^\s&'\"]+", re.IGNORECASE), "oauth_token=***"),
+    # PEM private keys (multiline)
+    (
+        re.compile(
+            r"-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----"
+        ),
+        "***PRIVATE KEY***",
+    ),
+)
+
+
+def _redact_credentials(text: str) -> str:
+    """Redact known credential patterns from *text* before storage.
+
+    Covers GitHub tokens, Anthropic/OpenAI/Google API keys, JWTs, Bearer and
+    OAuth tokens, PEM private keys, and named credential fields in JSON/key-value
+    pairs (access_token, refresh_token, id_token, api_key, client_secret,
+    private_key, token). Preserves field names; replaces values with ``***``.
+    """
+    if not text:
+        return text
+    for pattern, replacement in _CRED_REDACT_SUBS:
+        text = pattern.sub(replacement, text)
+    # Named credential fields — applied last so the specific prefix patterns
+    # above run first and their redacted placeholders (which are short and
+    # contain '*') are not re-matched by the alphanumeric value pattern.
+    text = _CRED_FIELD_RE.sub(r"\1***\3", text)
+    return text
+
 
 def sanitize_agent_error_report(raw: object) -> dict | None:
     """Validate and bound an agent-posted structured error report for storage.
@@ -1144,7 +1233,9 @@ def sanitize_agent_error_report(raw: object) -> dict | None:
     out["result_event_seen"] = bool(raw.get("result_event_seen"))
     stderr_tail = raw.get("stderr_tail")
     if isinstance(stderr_tail, str) and stderr_tail:
-        out["stderr_tail"] = stderr_tail[-_ERROR_REPORT_STDERR_TAIL_CHARS:]
+        out["stderr_tail"] = _redact_credentials(
+            stderr_tail[-_ERROR_REPORT_STDERR_TAIL_CHARS:]
+        )
     provider_errors: list[dict] = []
     raw_errors = raw.get("provider_errors")
     if isinstance(raw_errors, list):
@@ -1154,7 +1245,11 @@ def sanitize_agent_error_report(raw: object) -> dict | None:
             message = entry.get("message")
             if not isinstance(message, str) or not message:
                 continue
-            cleaned: dict = {"message": message[:_ERROR_REPORT_ERROR_MESSAGE_CHARS]}
+            cleaned: dict = {
+                "message": _redact_credentials(
+                    message[:_ERROR_REPORT_ERROR_MESSAGE_CHARS]
+                )
+            }
             source = entry.get("source")
             if isinstance(source, str) and source:
                 cleaned["source"] = source[:50]
@@ -1323,7 +1418,7 @@ def _cli_output_tail(combined_lower: str) -> str | None:
     idx = combined_lower.rfind(_CLI_OUTPUT_TAIL_MARKER)
     if idx < 0:
         return None
-    return combined_lower[idx + len(_CLI_OUTPUT_TAIL_MARKER):]
+    return combined_lower[idx + len(_CLI_OUTPUT_TAIL_MARKER) :]
 
 
 def _cli_startup_death_tail(combined_lower: str) -> bool:
@@ -2452,9 +2547,7 @@ def escalated_effort_for_execution_timeout(task: "Task") -> str | None:
     from app.max_plan_pool import resolve_effective_effort
     from app.shared_state import runtime_config
 
-    if not runtime_config.get(
-        "effort_escalation_on_execution_timeout_enabled", True
-    ):
+    if not runtime_config.get("effort_escalation_on_execution_timeout_enabled", True):
         return None
     if not is_pure_execution_timeout(task):
         return None
@@ -2462,9 +2555,7 @@ def escalated_effort_for_execution_timeout(task: "Task") -> str | None:
     payload = task.first_payload or {}
     ctx = task.context or {}
     task_type = payload.get("type") if isinstance(payload, dict) else None
-    current_effort = resolve_effective_effort(
-        payload, ctx, task_type, runtime_config
-    )
+    current_effort = resolve_effective_effort(payload, ctx, task_type, runtime_config)
     return escalate_effort(current_effort)
 
 
@@ -2564,9 +2655,7 @@ async def _grader_image_stale_tag(
             return None
         from app.compute import expected_serving_source_sha
 
-        expected_sha = await expected_serving_source_sha(
-            session, project_id=project_id
-        )
+        expected_sha = await expected_serving_source_sha(session, project_id=project_id)
         if not expected_sha:
             return None
         if str(grader_source_sha) == str(expected_sha):
@@ -2734,4 +2823,3 @@ def append_grader_diagnostic_trail(
     trail = [*trail, entry][-_GRADER_DIAGNOSTIC_TRAIL_MAX:]
     ctx[GRADER_DIAGNOSTIC_TRAIL_KEY] = trail
     return entry
-

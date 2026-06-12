@@ -204,7 +204,9 @@ class TestIsPureExecutionTimeout:
     def test_execution_timeout_is_pure(self):
         from app.failure_classification import is_pure_execution_timeout
 
-        assert is_pure_execution_timeout(_effort_timeout_task(TIMEOUT_EXECUTION)) is True
+        assert (
+            is_pure_execution_timeout(_effort_timeout_task(TIMEOUT_EXECUTION)) is True
+        )
 
     @pytest.mark.parametrize(
         "subtype",
@@ -299,23 +301,32 @@ class TestStuckLlmCallHelper:
     def test_call_started_zero_output_is_stuck(self):
         from app.failure_classification import _stuck_llm_call_no_progress
 
-        assert _stuck_llm_call_no_progress(
-            self._t({"llm_call_count": 1, "total_output_tokens": 0})
-        ) is True
+        assert (
+            _stuck_llm_call_no_progress(
+                self._t({"llm_call_count": 1, "total_output_tokens": 0})
+            )
+            is True
+        )
 
     def test_output_present_is_not_stuck(self):
         from app.failure_classification import _stuck_llm_call_no_progress
 
-        assert _stuck_llm_call_no_progress(
-            self._t({"llm_call_count": 2, "total_output_tokens": 800})
-        ) is False
+        assert (
+            _stuck_llm_call_no_progress(
+                self._t({"llm_call_count": 2, "total_output_tokens": 800})
+            )
+            is False
+        )
 
     def test_no_call_started_is_not_stuck(self):
         from app.failure_classification import _stuck_llm_call_no_progress
 
-        assert _stuck_llm_call_no_progress(
-            self._t({"llm_call_count": 0, "total_output_tokens": 0})
-        ) is False
+        assert (
+            _stuck_llm_call_no_progress(
+                self._t({"llm_call_count": 0, "total_output_tokens": 0})
+            )
+            is False
+        )
 
     def test_missing_or_nondict_summary_is_not_stuck(self):
         from app.failure_classification import _stuck_llm_call_no_progress
@@ -375,7 +386,11 @@ class TestStuckLlmCallReclassifiedToRateLimit:
         # Real work happened (output produced) before the stall → genuine timeout.
         t = self._stalled(
             "Fatal error: Claude Code exceeded 45-minute time limit",
-            {"llm_call_count": 3, "total_input_tokens": 5000, "total_output_tokens": 1200},
+            {
+                "llm_call_count": 3,
+                "total_input_tokens": 5000,
+                "total_output_tokens": 1200,
+            },
         )
         assert classify_failure(t) == AGENT_TIMEOUT
 
@@ -437,7 +452,9 @@ class TestCliDeathReclassifiedToRateLimit:
         '"delta":{"type":"signature_delta","signature":"d7nCuJvWDPvT/UFq"}}}'
     )
 
-    def _dead(self, msg: str, category: str = "claude_code_failed", summary=None) -> Task:
+    def _dead(
+        self, msg: str, category: str = "claude_code_failed", summary=None
+    ) -> Task:
         t = _task(msg, {"failure_category": category})
         t.api_call_summary = summary
         return t
@@ -531,7 +548,9 @@ class TestAgentErrorReportClassification:
         report.update(overrides)
         return report
 
-    def _failed(self, report: dict | None, category: str = "claude_code_failed") -> Task:
+    def _failed(
+        self, report: dict | None, category: str = "claude_code_failed"
+    ) -> Task:
         ctx: dict = {"failure_category": category}
         if report is not None:
             ctx[AGENT_ERROR_REPORT_CONTEXT_KEY] = report
@@ -543,21 +562,15 @@ class TestAgentErrorReportClassification:
         # The incident signature: instant exit, model never produced output.
         t = self._failed(self._report())
         assert classify_failure(t) == RATE_LIMIT
-        assert (
-            t.context.get("rate_limit_inferred_from") == "error_report_startup_death"
-        )
+        assert t.context.get("rate_limit_inferred_from") == "error_report_startup_death"
         assert t.context.get("rate_limit_kind") == "unknown"
 
     def test_startup_death_report_via_normalize(self):
         # The status-write boundary path (normalize_agent_failure_category) —
         # the exact route the agent's FAILED POST takes.
         t = self._failed(self._report())
-        assert (
-            normalize_agent_failure_category("claude_code_failed", t) == RATE_LIMIT
-        )
-        assert (
-            t.context.get("rate_limit_inferred_from") == "error_report_startup_death"
-        )
+        assert normalize_agent_failure_category("claude_code_failed", t) == RATE_LIMIT
+        assert t.context.get("rate_limit_inferred_from") == "error_report_startup_death"
 
     def test_provider_error_event_report_classifies_rate_limit(self):
         t = self._failed(
@@ -2560,7 +2573,9 @@ class TestDeadAuthClassification:
         report.update(overrides)
         return report
 
-    def _dead_auth_task(self, report: dict, category: str = "claude_code_failed") -> "Task":
+    def _dead_auth_task(
+        self, report: dict, category: str = "claude_code_failed"
+    ) -> "Task":
         ctx: dict = {
             "failure_category": category,
             AGENT_ERROR_REPORT_CONTEXT_KEY: report,
@@ -2579,6 +2594,7 @@ class TestDeadAuthClassification:
         )
         t = self._dead_auth_task(report)
         from app.failure_classification import DEAD_AUTH
+
         assert classify_failure(t) == DEAD_AUTH
         assert t.context.get("dead_auth_matched_pattern") == "app_session_terminated"
 
@@ -2588,6 +2604,7 @@ class TestDeadAuthClassification:
         )
         t = self._dead_auth_task(report)
         from app.failure_classification import DEAD_AUTH
+
         assert classify_failure(t) == DEAD_AUTH
         assert t.context.get("dead_auth_matched_pattern") == "token_invalidated"
 
@@ -2597,6 +2614,7 @@ class TestDeadAuthClassification:
         )
         t = self._dead_auth_task(report)
         from app.failure_classification import DEAD_AUTH
+
         assert classify_failure(t) == DEAD_AUTH
 
     # ── Anthropic OAUTH dead-auth signatures ───────────────────────────────
@@ -2607,6 +2625,7 @@ class TestDeadAuthClassification:
         )
         t = self._dead_auth_task(report)
         from app.failure_classification import DEAD_AUTH
+
         assert classify_failure(t) == DEAD_AUTH
         assert t.context.get("dead_auth_matched_pattern") == "oauth_org_not_allowed"
 
@@ -2677,12 +2696,18 @@ class TestDeadAuthClassification:
         # CODE_ERROR depending on whether the text matches a rate-limit pattern.
         result = classify_failure(t)
         from app.failure_classification import DEAD_AUTH
+
         assert result != DEAD_AUTH
 
     # ── Classification metadata ─────────────────────────────────────────────
 
     def test_dead_auth_is_infra_class(self):
-        from app.failure_classification import DEAD_AUTH, INFRA_CLASSES, ALL_FAILURE_CLASSES
+        from app.failure_classification import (
+            DEAD_AUTH,
+            INFRA_CLASSES,
+            ALL_FAILURE_CLASSES,
+        )
+
         assert DEAD_AUTH in INFRA_CLASSES
         assert DEAD_AUTH in ALL_FAILURE_CLASSES
 
@@ -2690,6 +2715,7 @@ class TestDeadAuthClassification:
         # The agent-status write boundary (normalize_agent_failure_category) must
         # also route to DEAD_AUTH when the error report has the signature.
         from app.failure_classification import DEAD_AUTH
+
         report = self._openai_oauth_report(
             stderr_tail="app_session_terminated\nYour session has ended."
         )
@@ -2701,3 +2727,304 @@ class TestDeadAuthClassification:
         t = _task("Claude subprocess exited with code 1", ctx)
         t.api_call_summary = None
         assert normalize_agent_failure_category("claude_code_failed", t) == DEAD_AUTH
+
+
+class TestRedactCredentials:
+    """Unit tests for the _redact_credentials helper.
+
+    Each sub-class tests a specific credential family; the last sub-class
+    tests that classification still works on sanitized text.
+    """
+
+    from app.failure_classification import _redact_credentials as _r
+
+    # ── GitHub tokens ────────────────────────────────────────────────────────
+
+    def test_ghp_token_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        assert _redact_credentials("token ghp_AbCdEfGhIjKl1234") == "token ghp_***"
+
+    def test_ghs_token_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        assert _redact_credentials("auth ghs_AbCdEfGhIjKl1234") == "auth ghs_***"
+
+    def test_github_pat_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("github_pat_11ABCDE12_longpatvalue123")
+        assert out == "github_pat_***"
+
+    def test_git_url_credential_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        url = "https://x-access-token:ghs_secret123@github.com/org/repo.git"
+        out = _redact_credentials(url)
+        assert "ghs_secret123" not in out
+        assert "https://x-access-token:***@" in out
+
+    # ── Anthropic keys ───────────────────────────────────────────────────────
+
+    def test_sk_ant_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials(
+            "key=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"
+        )
+        assert "sk-ant-api03-" not in out
+        assert "sk-ant-***" in out
+
+    # ── OpenAI keys ──────────────────────────────────────────────────────────
+
+    def test_sk_proj_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("OPENAI_API_KEY=sk-proj-abcdefghijk1234567890extra")
+        assert "sk-proj-abcdefghijk1234567890extra" not in out
+        assert "sk-proj-***" in out
+
+    def test_sk_generic_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("key sk-abcdefghijklmnopqrstuvwxyz1234 used")
+        assert "sk-abcdefghijklmnopqrstuvwxyz1234" not in out
+        assert "sk-***" in out
+
+    def test_sk_too_short_not_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        # Fewer than 20 chars after "sk-" — must NOT be treated as an API key.
+        out = _redact_credentials("error code sk-1234 encountered")
+        assert "sk-1234" in out
+
+    # ── Google AIza keys ─────────────────────────────────────────────────────
+
+    def test_google_aiza_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        # 35 alphanumeric chars after "AIza"
+        key = "AIza" + "A" * 35
+        out = _redact_credentials(f"api key {key} used")
+        assert key not in out
+        assert "AIza***" in out
+
+    def test_google_aiza_too_short_not_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        # 34 chars — one short — must not match.
+        key = "AIza" + "A" * 34
+        out = _redact_credentials(f"key={key}")
+        assert key in out
+
+    # ── JWT tokens ───────────────────────────────────────────────────────────
+
+    def test_jwt_three_part_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        out = _redact_credentials(f"Authorization: Bearer {jwt}")
+        assert jwt not in out
+        # The Bearer pattern fires first, or the JWT pattern — either redacts
+        assert "eyJ" not in out or "eyJ***" in out
+
+    # ── Bearer tokens ────────────────────────────────────────────────────────
+
+    def test_bearer_token_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("Authorization: Bearer ya29.a0AfH6SMBx_longtoken")
+        assert "ya29.a0AfH6SMBx_longtoken" not in out
+        assert "Bearer ***" in out
+
+    def test_bearer_case_insensitive(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("authorization: BEARER secret_token_value")
+        assert "secret_token_value" not in out
+
+    # ── OAuth token query params ─────────────────────────────────────────────
+
+    def test_oauth_token_query_param_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("GET /api?oauth_token=secretvalue&state=xyz")
+        assert "secretvalue" not in out
+        assert "oauth_token=***" in out
+
+    # ── PEM private keys ─────────────────────────────────────────────────────
+
+    def test_pem_private_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        pem = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEpAIBAAKCAQEA1234567890abcdefghijklmnopqrstuvwxyz\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        out = _redact_credentials(pem)
+        assert "MIIEpAIBAAKCAQEA" not in out
+        assert "***PRIVATE KEY***" in out
+
+    # ── JSON/key-value credential fields ─────────────────────────────────────
+
+    def test_access_token_json_field_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials('{"access_token": "ya29.a0AfH6SMBx"}')
+        assert "ya29.a0AfH6SMBx" not in out
+        assert "access_token" in out  # field name preserved
+
+    def test_refresh_token_kv_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("refresh_token=1//0abcdefghijklmno")
+        assert "1//0abcdefghijklmno" not in out
+
+    def test_api_key_field_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials('api_key: "AIzaSyXXXXXXXXXXXXX"')
+        assert "AIzaSyXXXXXXXXXXXXX" not in out
+
+    def test_client_secret_field_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("client_secret=abcdefghijklmnop1234")
+        assert "abcdefghijklmnop1234" not in out
+
+    def test_id_token_field_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        # Short JWT-like value in id_token field
+        out = _redact_credentials("id_token=eyJhbGciOiJSUzI1NiIsImtpZCI6Ijll")
+        assert "eyJhbGciOiJSUzI1NiIsImtpZCI6Ijll" not in out
+
+    def test_short_value_not_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        # Fewer than 8 chars — booleans/null/short IDs must not be redacted.
+        out = _redact_credentials('{"token": "abc"}')
+        assert "abc" in out
+
+    def test_boolean_value_not_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials('{"token": false}')
+        assert "false" in out
+
+    # ── Empty / passthrough ──────────────────────────────────────────────────
+
+    def test_empty_string_unchanged(self):
+        from app.failure_classification import _redact_credentials
+
+        assert _redact_credentials("") == ""
+
+    def test_clean_text_unchanged(self):
+        from app.failure_classification import _redact_credentials
+
+        text = "No credentials here, just a normal error message."
+        assert _redact_credentials(text) == text
+
+    # ── Multiple patterns in one string ─────────────────────────────────────
+
+    def test_multiple_credentials_all_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        text = (
+            "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrst "
+            "GOOGLE_KEY=AIza" + "B" * 35 + " "
+            "Authorization: Bearer mytoken123"
+        )
+        out = _redact_credentials(text)
+        assert "sk-proj-abcdefghijklmnopqrst" not in out
+        assert "AIza" + "B" * 35 not in out
+        assert "mytoken123" not in out
+
+
+class TestSanitizeReportAppliesRedaction:
+    """sanitize_agent_error_report must apply _redact_credentials to
+    stderr_tail and provider_errors[].message before storing them."""
+
+    def test_stderr_tail_credentials_redacted(self):
+        raw = {
+            "exit_code": 1,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [],
+            "stderr_tail": "Error: invalid key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123",
+        }
+        out = sanitize_agent_error_report(raw)
+        assert out is not None
+        assert "sk-ant-api03-" not in out["stderr_tail"]
+        assert "sk-ant-***" in out["stderr_tail"]
+
+    def test_provider_error_message_credentials_redacted(self):
+        raw = {
+            "exit_code": 1,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [
+                {
+                    "source": "claude-stream",
+                    "message": "Auth failed: ghp_AbCdEfGhIjKl1234secrettoken",
+                }
+            ],
+            "stderr_tail": "",
+        }
+        out = sanitize_agent_error_report(raw)
+        assert out is not None
+        assert len(out["provider_errors"]) == 1
+        msg = out["provider_errors"][0]["message"]
+        assert "ghp_AbCdEfGhIjKl1234secrettoken" not in msg
+        assert "ghp_***" in msg
+
+    def test_google_key_in_stderr_redacted(self):
+        key = "AIza" + "C" * 35
+        raw = {
+            "exit_code": 1,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [],
+            "stderr_tail": f"GEMINI_API_KEY={key} caused auth error",
+        }
+        out = sanitize_agent_error_report(raw)
+        assert out is not None
+        assert key not in out["stderr_tail"]
+        assert "AIza***" in out["stderr_tail"]
+
+    def test_openai_key_in_provider_error_redacted(self):
+        raw = {
+            "exit_code": 1,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [
+                {
+                    "message": "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxx raised 401",
+                }
+            ],
+            "stderr_tail": "",
+        }
+        out = sanitize_agent_error_report(raw)
+        assert out is not None
+        msg = out["provider_errors"][0]["message"]
+        assert "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxx" not in msg
+        assert "sk-proj-***" in msg
+
+    def test_sanitized_report_still_classifies_rate_limit(self):
+        """Redaction must not break the classifier — a sanitized startup-death
+        report (no model output, non-zero exit) still routes to RATE_LIMIT."""
+        raw = {
+            "schema": 1,
+            "exit_code": 1,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [],
+            "stderr_tail": "OPENAI_API_KEY=sk-ant-api03-secret123456789 killed",
+        }
+        out = sanitize_agent_error_report(raw)
+        assert out is not None
+        t = _task("exited 1", {"failure_category": "fatal"})
+        t.api_call_summary = None
+        t.context = {**t.context, AGENT_ERROR_REPORT_CONTEXT_KEY: out}
+        assert classify_failure(t) == RATE_LIMIT
