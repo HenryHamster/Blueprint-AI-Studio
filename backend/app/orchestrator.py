@@ -3152,7 +3152,13 @@ async def orchestrator_worker():
                         # feed the pool breaker, NOT the warm-continuity pin-clear
                         # metric, so the two breakers stay independent.
                         if _is_pool_pin:
-                            await mark_pool_vm_retiring(session, _warm_target_vm_id)
+                            from app.models import PoolVmState as _PoolVmState
+
+                            await mark_pool_vm_retiring(
+                                session,
+                                _warm_target_vm_id,
+                                source_states=(_PoolVmState.LEASED,),
+                            )
                             if _clear_reason != "circuit_breaker":
                                 _shared_state.record_pool_claim_failure(_clear_reason)
                             # _pin_task_to_pool_vm stamped this retiring member's

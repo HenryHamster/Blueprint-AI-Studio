@@ -1063,7 +1063,9 @@ async def _release_pool_member_if_terminal(
         await release_pool_vm(session, vm_id, owning_task_id=task.id)
         outcome = "idle"
     else:
-        await mark_pool_vm_retiring(session, vm_id)
+        await mark_pool_vm_retiring(
+            session, vm_id, source_states=(PoolVmState.LEASED,)
+        )
         outcome = "retiring"
     logger.info(
         "[WARM-POOL] task %s terminal (%s) — pool member %s -> %s",

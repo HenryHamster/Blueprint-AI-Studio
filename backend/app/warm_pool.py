@@ -604,24 +604,6 @@ async def promote_pool_vm_to_idle(session, vm_instance_id: str) -> bool:
     return bool(result.rowcount)
 
 
-async def mark_pool_vm_idle(session, vm_instance_id: str) -> Optional[PoolVm]:
-    """Transition a member to IDLE (booted-ready, or returned from a lease).
-
-    Clears any lease binding and stamps ``idle_since`` so the idle reaper /
-    maintainer can age the member out. No-op (returns None) when the member is
-    unknown. The caller owns the transaction (commit).
-    """
-    member = await get_pool_vm(session, vm_instance_id)
-    if member is None:
-        return None
-    member.state = PoolVmState.IDLE
-    member.leased_task_id = None
-    member.lease_expires_at = None
-    member.idle_since = _utcnow()
-    session.add(member)
-    return member
-
-
 async def release_pool_vm(
     session,
     vm_instance_id: str,
@@ -639,9 +621,8 @@ async def release_pool_vm(
     (blocking replenishment) until the reaper's orphan-lease sweep eventually
     retires and DELETEs it, making every member single-use.
 
-    Unlike :func:`mark_pool_vm_idle` (which flips ANY state to IDLE — the
-    booted-ready PROVISIONING->IDLE signal), this return is GUARDED to a
-    ``state == LEASED`` row owned by ``owning_task_id`` and locked
+    This return is GUARDED to a ``state == LEASED`` row owned by
+    ``owning_task_id`` and locked
     ``FOR UPDATE SKIP LOCKED`` before it is flipped to IDLE, so a member a
     concurrent reaper/maintainer already moved to RETIRING (mid-teardown) is
     NEVER resurrected onto the leasable set, a duplicate completion signal is a
@@ -731,21 +712,46 @@ async def clear_lane_warm_workspace_if_matching_member(
     return bool(result.rowcount)
 
 
-async def mark_pool_vm_retiring(session, vm_instance_id: str) -> Optional[PoolVm]:
-    """Mark a member RETIRING so it is never leased again (pending teardown).
+async def mark_pool_vm_retiring(
+    session,
+    vm_instance_id: str,
+    *,
+    source_states: tuple[PoolVmState, ...] = (PoolVmState.PROVISIONING, PoolVmState.IDLE),
+) -> Optional[PoolVm]:
+    """Atomically mark a member RETIRING so it is never leased again.
 
-    No-op (returns None) when the member is unknown. The caller owns the
+    Uses ``SELECT … FOR UPDATE SKIP LOCKED`` restricted to ``source_states`` so a
+    concurrent lease commit (IDLE → LEASED) causes this call to see no matching
+    unlocked row and return None without clobbering the lease binding.
+
+    Default ``source_states`` covers the vm-heartbeat pre-claim-failure path
+    (member failed before its first lease — PROVISIONING or IDLE). Callers that
+    need to retire an already-LEASED member (orchestrator pool-pin timeout,
+    task-completion FAILED/CANCELLED, doomed-VM guard in try_pool_dispatch) must
+    pass ``source_states=(PoolVmState.LEASED,)`` explicitly.
+
+    Returns None when the member is unknown, not in a qualifying state, or the
+    row is locked by a concurrent transaction (SKIP LOCKED). The caller owns the
     transaction (commit).
     """
-    member = await get_pool_vm(session, vm_instance_id)
+    stmt = (
+        select(PoolVm)
+        .where(
+            PoolVm.vm_instance_id == vm_instance_id,
+            PoolVm.state.in_(source_states),
+        )
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    member = (await session.execute(stmt)).scalars().first()
     if member is None:
         return None
     member.state = PoolVmState.RETIRING
     member.leased_task_id = None
     member.lease_expires_at = None
     # Bank accrued idle cost before clearing idle_since (IDLE->RETIRING is a
-    # settle call site; a no-op when the member was LEASED, whose idle_since is
-    # already None — teardown must never erase measured idle spend).
+    # settle call site; a no-op for LEASED members whose idle_since is already
+    # None — teardown must never erase measured idle spend).
     from app.efficiency_snapshot import settle_pool_vm_idle_cost
 
     settle_pool_vm_idle_cost(member, session=session)
@@ -967,7 +973,11 @@ async def try_pool_dispatch(
             delete_reason,
             task.id,
         )
-        await mark_pool_vm_retiring(session, member.vm_instance_id)
+        await mark_pool_vm_retiring(
+            session,
+            member.vm_instance_id,
+            source_states=(PoolVmState.LEASED,),
+        )
         record_pool_claim_failure("doomed_vm")
         record_pool_lease_miss("doomed_vm")
         return None

@@ -31,6 +31,7 @@ from pathlib import Path
 # E402; no circular-import risk because compute_manifest does not import
 # compute.
 from app.compute_manifest import validate_payload_uri, build_agent_secret_manifest
+from app.database import AsyncSessionLocal
 
 # Quota-scope classification (project-global vs regional vs zonal blast radius
 # for provisioning errors) lives in app.provision_error_scope — extracted to
@@ -2857,6 +2858,14 @@ class CleanupResult:
         self.failed: list[str] = []
 
 
+async def _refresh_gcp_cleanup_active_vm_ids() -> set[str]:
+    """Re-read the live exemption set immediately before deleting orphans."""
+    from app.services import _collect_gcp_cleanup_active_vm_ids
+
+    async with AsyncSessionLocal() as session:
+        return await _collect_gcp_cleanup_active_vm_ids(session)
+
+
 async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
     """Scan all zones for orphaned VMs and delete them.
 
@@ -2900,6 +2909,28 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
         f"[GCP CLEANUP] GCP inventory: {result.total_gcp_vms} VMs, "
         f"DB active: {len(active_vm_ids)}, orphans: {result.orphan_count}"
     )
+
+    if not orphans:
+        return result
+
+    # Revalidate the classification right before deleting anything so a VM that
+    # just became active after the inventory snapshot is not reaped by stale
+    # state from the start of the sweep.
+    fresh_active_set = await _refresh_gcp_cleanup_active_vm_ids()
+    if fresh_active_set != active_set:
+        refreshed_orphans = [
+            (name, zone, status)
+            for name, zone, status in orphans
+            if name not in fresh_active_set
+        ]
+        if len(refreshed_orphans) != len(orphans):
+            logger.info(
+                "[GCP CLEANUP] Revalidated before delete — orphans %d -> %d",
+                len(orphans),
+                len(refreshed_orphans),
+            )
+        orphans = refreshed_orphans
+        result.orphan_count = len(orphans)
 
     if not orphans:
         return result

@@ -901,6 +901,113 @@ async def test_gcp_cleanup_passes_active_vm_ids_to_cleanup(gcp_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_gcp_cleanup_spares_live_warm_handoff_target_vm(gcp_db, mocker):
+    """A QUEUED warm-handoff successor should keep its source VM active until
+    the deadline, so the generic orphan sweep must not pass that VM to cleanup."""
+    project = await _make_project(gcp_db)
+    live_deadline = (datetime.utcnow() + timedelta(minutes=10)).isoformat()
+    handoff_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "warm_target_vm_id": "agent-vm-warm-1",
+            "warm_handoff_deadline": live_deadline,
+        },
+    )
+    gcp_db.add(handoff_task)
+    await gcp_db.commit()
+
+    mock_cleanup = AsyncMock(
+        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=1)
+    )
+    mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+
+    await gcp_cleanup_service()
+
+    mock_cleanup.assert_called_once()
+    called_vm_ids = mock_cleanup.call_args[0][0]
+    assert "agent-vm-warm-1" in called_vm_ids
+
+
+@pytest.mark.asyncio
+async def test_gcp_cleanup_reclaims_expired_warm_handoff_target_vm(gcp_db, mocker):
+    """Once a warm-handoff deadline expires, the source VM should be reclaimable
+    again if no task has claimed it."""
+    project = await _make_project(gcp_db)
+    expired_deadline = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+    handoff_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "warm_target_vm_id": "agent-vm-expired-1",
+            "warm_handoff_deadline": expired_deadline,
+        },
+    )
+    gcp_db.add(handoff_task)
+    await gcp_db.commit()
+
+    mock_cleanup = AsyncMock(
+        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=1)
+    )
+    mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+
+    await gcp_cleanup_service()
+
+    mock_cleanup.assert_called_once()
+    called_vm_ids = mock_cleanup.call_args[0][0]
+    assert "agent-vm-expired-1" not in called_vm_ids
+
+
+@pytest.mark.asyncio
+async def test_gcp_cleanup_does_not_exempt_pool_vm_when_pool_disabled(gcp_db, mocker):
+    """Pool members stay reclaimable when warm_pool_enabled is off."""
+    project = await _make_project(gcp_db)
+    gcp_db.add(
+        PoolVm(
+            project_id=project.id,
+            vm_instance_id="agent-vm-pool-disabled",
+            state=PoolVmState.IDLE,
+            account_id="acct-1",
+            provider="anthropic",
+        )
+    )
+    await _make_task_with_vm(
+        gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-active-1"
+    )
+    await gcp_db.commit()
+
+    prev = _shared_state.runtime_config.get("warm_pool_enabled", False)
+    try:
+        _shared_state.runtime_config["warm_pool_enabled"] = False
+        mock_cleanup = AsyncMock(
+            return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=2)
+        )
+        mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
+        mocker.patch(
+            "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+        )
+
+        await gcp_cleanup_service()
+
+        mock_cleanup.assert_called_once()
+        called_vm_ids = mock_cleanup.call_args[0][0]
+        assert "agent-vm-active-1" in called_vm_ids
+        assert "agent-vm-pool-disabled" not in called_vm_ids
+    finally:
+        _shared_state.runtime_config["warm_pool_enabled"] = prev
+
+
+@pytest.mark.asyncio
 async def test_gcp_cleanup_handles_api_failure_gracefully(gcp_db, mocker):
     """If cleanup_orphaned_vms raises an exception, gcp_cleanup_service should log and continue."""
     project = await _make_project(gcp_db)

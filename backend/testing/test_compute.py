@@ -11,16 +11,19 @@ import base64
 import json
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 import os
 import shlex
 import signal
 import uuid
 
 import pytest
+import pytest_asyncio
 from google.api_core.exceptions import Aborted
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlmodel import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from sqlmodel import SQLModel, select
 
 from app import compute
 from app import compute_backends as compute_backends_module
@@ -128,6 +131,34 @@ def patched_client():
         yield client
 
 
+@pytest_asyncio.fixture()
+async def gcp_cleanup_db(mocker):
+    """Isolated DB for _cleanup_gcp revalidation tests."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    session_factory = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    mocker.patch("app.compute.AsyncSessionLocal", session_factory)
+
+    async with session_factory() as session:
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await engine.dispose()
+
+
 class TestStoreAgentSecretIamRetry:
     """Retry + idempotency tests for _store_agent_secret IAM policy handling."""
 
@@ -213,6 +244,62 @@ class TestStoreAgentSecretIamRetry:
 class _FleetSourceFakeSession:
     async def execute(self, _stmt):
         raise RuntimeError("db unavailable")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_gcp_skips_vm_that_becomes_active_mid_sweep(
+    gcp_cleanup_db, mocker
+):
+    """A VM that flips to IN_PROGRESS after inventory but before deletion must
+    be spared by the fresh revalidation step."""
+    project = Project(name="Cleanup Revalidate", user_id="user-1")
+    gcp_cleanup_db.add(project)
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(project)
+
+    target_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id="agent-vm-flip-1",
+    )
+    gcp_cleanup_db.add(target_task)
+    await gcp_cleanup_db.commit()
+
+    mocker.patch("app.compute.LOCAL_MODE", False)
+    mocker.patch("app.compute.FALLBACK_ZONES", [("us-central1-a", "subnet-a")])
+    mocker.patch(
+        "app.compute._list_vms_in_zone",
+        return_value=[
+            ("agent-vm-flip-1", "us-central1-a", "RUNNING"),
+            ("agent-vm-orphan-1", "us-central1-a", "RUNNING"),
+        ],
+    )
+    delete_mock = mocker.patch("app.compute._delete_single_vm", return_value=True)
+
+    from app.services import _collect_gcp_cleanup_active_vm_ids as real_collect
+
+    flipped = {"done": False}
+
+    async def _flip_then_collect(session):
+        if not flipped["done"]:
+            target_task.status = TaskStatus.IN_PROGRESS
+            gcp_cleanup_db.add(target_task)
+            await gcp_cleanup_db.commit()
+            flipped["done"] = True
+        return await real_collect(session)
+
+    mocker.patch(
+        "app.services._collect_gcp_cleanup_active_vm_ids",
+        side_effect=_flip_then_collect,
+    )
+
+    result = await compute._cleanup_gcp([])
+
+    assert "agent-vm-orphan-1" in result.deleted
+    assert "agent-vm-flip-1" not in result.deleted
+    assert delete_mock.call_args_list == [call("agent-vm-orphan-1", "us-central1-a")]
 
 
 @pytest.mark.asyncio

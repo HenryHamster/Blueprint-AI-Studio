@@ -34,7 +34,6 @@ from app.warm_pool import (
     get_pool_vm,
     lease_idle_pool_vm,
     list_pool_vms,
-    mark_pool_vm_idle,
     mark_pool_vm_retiring,
     pool_vm_cleanup_exemptions,
     promote_pool_vm_to_idle,
@@ -368,8 +367,9 @@ async def test_register_list_and_state_transitions(db_session):
     assert members[0].idle_since is None  # PROVISIONING has no idle stamp
 
     # PROVISIONING -> IDLE stamps idle_since.
-    idle = await mark_pool_vm_idle(db_session, "vm-crud")
+    assert await promote_pool_vm_to_idle(db_session, "vm-crud")
     await db_session.commit()
+    idle = await get_pool_vm(db_session, "vm-crud")
     assert idle.state == PoolVmState.IDLE
     assert idle.idle_since is not None
 
@@ -404,7 +404,7 @@ async def test_register_list_and_state_transitions(db_session):
 
 @pytest.mark.asyncio
 async def test_transition_helpers_noop_on_unknown_vm(db_session):
-    assert await mark_pool_vm_idle(db_session, "ghost") is None
+    assert not await promote_pool_vm_to_idle(db_session, "ghost")
     assert await mark_pool_vm_retiring(db_session, "ghost") is None
     assert await get_pool_vm(db_session, "ghost") is None
 
@@ -437,7 +437,7 @@ async def test_release_pool_vm_is_guarded_to_leased_only(db_session):
     assert (await get_pool_vm(db_session, "vm-guard")).state == PoolVmState.PROVISIONING
 
     # Promote -> lease, then release: LEASED -> IDLE, lease binding cleared.
-    await mark_pool_vm_idle(db_session, "vm-guard")
+    await promote_pool_vm_to_idle(db_session, "vm-guard")
     await db_session.commit()
     leased = await lease_idle_pool_vm(
         db_session,
@@ -1316,3 +1316,139 @@ async def test_count_idle_state_pool_vms_zero_when_no_idle(db_session):
     )
     await db_session.commit()
     assert await count_idle_state_pool_vms(db_session, project_id=project.id) == 1
+
+
+# ---------------------------------------------------------------------------
+# mark_pool_vm_retiring atomicity — source_states guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_pool_vm_retiring_skips_leased_member(db_session):
+    """Default source_states=(PROVISIONING, IDLE) must not clobber a committed lease."""
+    project = await _make_project(db_session, name="Retire Skip Leased")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-skip-leased",
+        project_id=project.id,
+        account_id="acct-1",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    owner_task_id = uuid.uuid4()
+    leased = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        account_id="acct-1",
+        leased_task_id=owner_task_id,
+    )
+    await db_session.commit()
+    assert leased.state == PoolVmState.LEASED
+
+    # Default source_states excludes LEASED — must return None and leave the
+    # lease binding intact.
+    result = await mark_pool_vm_retiring(db_session, "vm-skip-leased")
+    assert result is None
+    await db_session.refresh(leased)
+    assert leased.state == PoolVmState.LEASED
+    assert leased.leased_task_id == owner_task_id
+
+
+@pytest.mark.asyncio
+async def test_mark_pool_vm_retiring_with_leased_source_state(db_session):
+    """source_states=(LEASED,) retires a LEASED member and clears its lease binding."""
+    project = await _make_project(db_session, name="Retire Leased Explicit")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-retire-leased",
+        project_id=project.id,
+        account_id="acct-1",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    owner_task_id = uuid.uuid4()
+    leased = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        account_id="acct-1",
+        leased_task_id=owner_task_id,
+    )
+    await db_session.commit()
+    assert leased.state == PoolVmState.LEASED
+
+    retiring = await mark_pool_vm_retiring(
+        db_session, "vm-retire-leased", source_states=(PoolVmState.LEASED,)
+    )
+    await db_session.commit()
+    assert retiring is not None
+    assert retiring.state == PoolVmState.RETIRING
+    assert retiring.leased_task_id is None
+    assert retiring.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_mark_pool_vm_retiring_from_provisioning(db_session):
+    """Default source_states retires a PROVISIONING member (pre-claim-failure path)."""
+    project = await _make_project(db_session, name="Retire Provisioning")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-retire-prov",
+        project_id=project.id,
+        account_id="acct-1",
+        state=PoolVmState.PROVISIONING,
+    )
+    await db_session.commit()
+
+    retiring = await mark_pool_vm_retiring(db_session, "vm-retire-prov")
+    await db_session.commit()
+    assert retiring is not None
+    assert retiring.state == PoolVmState.RETIRING
+
+
+@pytest.mark.asyncio
+async def test_mark_pool_vm_retiring_cannot_clobber_concurrent_lease(db_session):
+    """Concurrency regression: retire racing a committed lease yields exactly one
+    winner — the lease binding is never silently destroyed by a stale retire."""
+    project = await _make_project(db_session, name="Retire Race")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-race",
+        project_id=project.id,
+        account_id="acct-1",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    # Simulate the race: lease is committed first (orchestrator won the dispatch).
+    owner_task_id = uuid.uuid4()
+    leased = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        account_id="acct-1",
+        leased_task_id=owner_task_id,
+    )
+    await db_session.commit()
+    assert leased.state == PoolVmState.LEASED
+
+    # Now a concurrent retire fires with default source_states (heartbeat
+    # pre-claim-failure path) — it must NOT win because the member is LEASED.
+    result = await mark_pool_vm_retiring(db_session, "vm-race")
+    # retire must lose the race
+    assert result is None
+
+    # The lease binding must still be intact.
+    member = await get_pool_vm(db_session, "vm-race")
+    assert member.state == PoolVmState.LEASED
+    assert member.leased_task_id == owner_task_id
+
+    # The correct retire path (task_completion / orchestrator) passes
+    # source_states=(LEASED,) and must win.
+    retired = await mark_pool_vm_retiring(
+        db_session, "vm-race", source_states=(PoolVmState.LEASED,)
+    )
+    await db_session.commit()
+    assert retired is not None
+    assert retired.state == PoolVmState.RETIRING
+    assert retired.leased_task_id is None
