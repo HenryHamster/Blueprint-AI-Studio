@@ -76,6 +76,7 @@ def _reject_unknown_task_types(
             ),
         )
 
+
 # Every runtime-config key the PATCH /api/admin/settings handler (_apply_settings)
 # knows how to validate + apply. A payload key NOT in this set is a typo or a
 # stale field name — _apply_settings logs it as a WARNING and rejects the whole
@@ -467,9 +468,7 @@ async def get_settings(
                 _runtime_config.get("warm_pool_project_allowlist") or []
             )
         ),
-        "warm_pool_target_size": int(
-            _runtime_config.get("warm_pool_target_size", 2)
-        ),
+        "warm_pool_target_size": int(_runtime_config.get("warm_pool_target_size", 2)),
         "warm_pool_target_size_by_project": _normalize_warm_pool_target_map(
             _runtime_config.get("warm_pool_target_size_by_project") or {}
         ),
@@ -915,9 +914,7 @@ async def _apply_settings(
         if abs(weight_sum - 1.0) > 0.01:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"promotion_weights must sum to ~1.0 (got {weight_sum:.4f})"
-                ),
+                detail=(f"promotion_weights must sum to ~1.0 (got {weight_sum:.4f})"),
             )
         _runtime_config["promotion_weights"] = {
             wk: round(cleaned_weights[wk], 4) for wk in _PROMOTION_WEIGHT_KEYS
@@ -1042,7 +1039,11 @@ async def _apply_settings(
             )
         _runtime_config["review_second_opinion_gate_enabled"] = val
     if "strategic_retirement_challenge_gate_mode" in payload:
-        val = str(payload["strategic_retirement_challenge_gate_mode"] or "").strip().lower()
+        val = (
+            str(payload["strategic_retirement_challenge_gate_mode"] or "")
+            .strip()
+            .lower()
+        )
         if val not in ("observe", "advisory", "enforce"):
             raise HTTPException(
                 status_code=400,
@@ -1739,9 +1740,7 @@ async def _apply_settings(
                     status_code=400,
                     detail="deploy_repo_identity must be 'owner/repo'",
                 )
-            _runtime_config["deploy_repo_identity"] = (
-                f"{owner.strip()}/{repo.strip()}"
-            )
+            _runtime_config["deploy_repo_identity"] = f"{owner.strip()}/{repo.strip()}"
         else:
             raise HTTPException(
                 status_code=400,
@@ -2358,6 +2357,14 @@ async def _apply_settings(
             raise HTTPException(status_code=502, detail=f"Webhook request failed: {e}")
         return {"ok": True, "test_notification_sent": True}
 
+    # Detect a genuine warm_pool_enabled True→False transition. Computed here —
+    # after all config changes but before the DB persist block — so the flag is
+    # available in both the early-return (no DeploymentState row) and normal
+    # (post-commit) code paths.
+    _pool_disable_transition = bool(
+        _config_snapshot.get("warm_pool_enabled", False)
+    ) and not bool(_runtime_config.get("warm_pool_enabled", False))
+
     # Persist to DB so values survive Cloud Run restarts
     # Always persist all runtime config values (not just changed ones) to ensure consistency
     try:
@@ -2378,6 +2385,18 @@ async def _apply_settings(
                 if exists is None:
                     # No DeploymentState row yet — runtime config is in-memory only.
                     # Skip the persist; the next admin/deploy bootstrap will create the row.
+                    # Still drain the pool if the global disable transition fired.
+                    if _pool_disable_transition:
+                        from app.warm_pool_maintainer import drain_global_warm_pool
+
+                        try:
+                            await drain_global_warm_pool()
+                        except Exception:
+                            logger.warning(
+                                "[SETTINGS] global warm-pool drain failed after disable; "
+                                "idle reaper will reclaim any remaining live members",
+                                exc_info=True,
+                            )
                     return _runtime_config
                 raise HTTPException(
                     status_code=409,
@@ -2434,9 +2453,7 @@ async def _apply_settings(
                     # survives a Cloud Run restart (config-sync reads it back on
                     # boot; otherwise the in-memory value reverts to the env
                     # default).
-                    "deploy_repo_identity": _runtime_config.get(
-                        "deploy_repo_identity"
-                    ),
+                    "deploy_repo_identity": _runtime_config.get("deploy_repo_identity"),
                     "provider_settings_defaults": _runtime_config.get(
                         "provider_settings_defaults", {}
                     ),
@@ -2558,9 +2575,7 @@ async def _apply_settings(
                     # back on boot; otherwise the in-memory value reverts to the
                     # True default).
                     "review_second_opinion_gate_enabled": bool(
-                        _runtime_config.get(
-                            "review_second_opinion_gate_enabled", True
-                        )
+                        _runtime_config.get("review_second_opinion_gate_enabled", True)
                     ),
                     "strategic_retirement_challenge_gate_mode": str(
                         _runtime_config.get(
@@ -2581,9 +2596,7 @@ async def _apply_settings(
                         _runtime_config.get("warm_pool_enabled", False)
                     ),
                     "warm_pool_account_retarget_enabled": bool(
-                        _runtime_config.get(
-                            "warm_pool_account_retarget_enabled", False
-                        )
+                        _runtime_config.get("warm_pool_account_retarget_enabled", False)
                     ),
                     "warm_pool_cross_provider_retarget_enabled": bool(
                         _runtime_config.get(
@@ -2624,7 +2637,8 @@ async def _apply_settings(
                         for k, v in (
                             _runtime_config.get(
                                 "max_concurrent_compute_jobs_by_project"
-                            ) or {}
+                            )
+                            or {}
                         ).items()
                         if v and int(v) > 0
                     },
@@ -2717,7 +2731,9 @@ async def _apply_settings(
                     "promotion_threshold": _runtime_config.get("promotion_threshold"),
                     "promotion_weights": _runtime_config.get("promotion_weights"),
                     "diagnostics_after_edit_holdback_fraction": float(
-                        _runtime_config.get("diagnostics_after_edit_holdback_fraction", 0.1)
+                        _runtime_config.get(
+                            "diagnostics_after_edit_holdback_fraction", 0.1
+                        )
                     ),
                     "diagnostics_after_edit_enabled": bool(
                         _runtime_config.get("diagnostics_after_edit_enabled", True)
@@ -2747,6 +2763,21 @@ async def _apply_settings(
         logger.exception("[SETTINGS] DB persist failed, rolling back in-memory config")
         await session.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to persist settings: {e}")
+
+    # If warm_pool_enabled transitioned True→False and the DB commit succeeded,
+    # drain all live pool members fleet-wide. Errors are best-effort — a
+    # partial drain is recoverable by the idle reaper.
+    if _pool_disable_transition:
+        from app.warm_pool_maintainer import drain_global_warm_pool
+
+        try:
+            await drain_global_warm_pool()
+        except Exception:
+            logger.warning(
+                "[SETTINGS] global warm-pool drain failed after disable; "
+                "idle reaper will reclaim any remaining live members",
+                exc_info=True,
+            )
 
     return _runtime_config
 
@@ -3215,8 +3246,10 @@ async def repair_state(
         if test_ids:
             try:
                 rows = (
-                    await session.execute(select(Task).where(Task.id.in_(test_ids)))
-                ).scalars().all()
+                    (await session.execute(select(Task).where(Task.id.in_(test_ids))))
+                    .scalars()
+                    .all()
+                )
                 found_ids = {r.id for r in rows}
             except Exception:
                 pass

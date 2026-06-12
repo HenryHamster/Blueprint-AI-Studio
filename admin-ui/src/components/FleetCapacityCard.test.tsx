@@ -13,6 +13,12 @@ function makeSnapshot(overrides: Partial<FleetUtilizationResponse> = {}): FleetU
     util_avg: 0.4,
     window_hours: 24,
     saturation: 'healthy',
+    vm_cap: 10,
+    active_task_vms: 3,
+    managed_vm_count: 6,
+    idle_pool_vms: 1,
+    vm_slots_available: 5,
+    vm_saturation: 'healthy',
     ...overrides,
   };
 }
@@ -52,10 +58,10 @@ function makeAgentServing(overrides: Partial<AgentServingShasResponse> = {}): Ag
 
 describe('FleetCapacityCard', () => {
   test('renders saturation badge for healthy status', () => {
-    const { getByText } = render(
+    const { getAllByText } = render(
       <FleetCapacityCard data={makeSnapshot({ saturation: 'healthy' })} loading={false} />,
     );
-    expect(getByText('Healthy')).toBeTruthy();
+    expect(getAllByText('Healthy')).toHaveLength(2);
   });
 
   test('renders busy saturation badge', () => {
@@ -99,6 +105,38 @@ describe('FleetCapacityCard', () => {
       <FleetCapacityCard data={makeSnapshot({ cooled_accounts: 2 })} loading={false} />,
     );
     expect(getByText(/rate-limited/)).toBeTruthy();
+  });
+
+  test('shows VM slot utilization values', () => {
+    const { getByText } = render(
+      <FleetCapacityCard
+        data={makeSnapshot({
+          vm_cap: 12,
+          active_task_vms: 4,
+          managed_vm_count: 9,
+          idle_pool_vms: 2,
+          vm_slots_available: 3,
+          vm_saturation: 'busy',
+        })}
+        loading={false}
+      />,
+    );
+    expect(getByText('VM Slots')).toBeTruthy();
+    expect(getByText('12')).toBeTruthy();
+    expect(getByText('4')).toBeTruthy();
+    expect(getByText('9')).toBeTruthy();
+    expect(getByText('2')).toBeTruthy();
+    expect(getByText(/3 · Busy/)).toBeTruthy();
+  });
+
+  test('escalates header badge when VM slots are saturated', () => {
+    const { getAllByText } = render(
+      <FleetCapacityCard
+        data={makeSnapshot({ saturation: 'healthy', vm_saturation: 'saturated', vm_slots_available: 0 })}
+        loading={false}
+      />,
+    );
+    expect(getAllByText('Saturated')).toHaveLength(2);
   });
 
   test('shows skeleton while loading', () => {

@@ -2884,6 +2884,12 @@ export interface FleetUtilizationResponse {
   window_hours: number;
   /** Derived saturation label; null when no enabled accounts are configured. */
   saturation: 'healthy' | 'busy' | 'saturated' | null;
+  vm_cap: number | null;
+  active_task_vms: number | null;
+  managed_vm_count: number | null;
+  idle_pool_vms: number | null;
+  vm_slots_available: number | null;
+  vm_saturation: 'healthy' | 'busy' | 'saturated' | null;
 }
 
 export async function fetchFleetUtilization(): Promise<FleetUtilizationResponse> {

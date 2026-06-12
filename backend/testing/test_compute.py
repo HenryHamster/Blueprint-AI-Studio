@@ -269,6 +269,7 @@ async def test_cleanup_gcp_skips_vm_that_becomes_active_mid_sweep(
 
     mocker.patch("app.compute.LOCAL_MODE", False)
     mocker.patch("app.compute.FALLBACK_ZONES", [("us-central1-a", "subnet-a")])
+    mocker.patch("app.compute.GPU_FALLBACK_ZONES", {})
     mocker.patch(
         "app.compute._list_vms_in_zone",
         return_value=[
@@ -300,6 +301,89 @@ async def test_cleanup_gcp_skips_vm_that_becomes_active_mid_sweep(
     assert "agent-vm-orphan-1" in result.deleted
     assert "agent-vm-flip-1" not in result.deleted
     assert delete_mock.call_args_list == [call("agent-vm-orphan-1", "us-central1-a")]
+
+
+@pytest.mark.asyncio
+async def test_gpu_vm_lifecycle_searches_gpu_zone_ring_after_restart(monkeypatch):
+    """GPU-only zones (e.g. us-east1-d, us-east4-c) must be searched by
+    find_vm_zone, stop_vm, _delete_gcp, and _cleanup_gcp so compute-job VMs
+    provisioned in accelerator-specific zones survive process restarts and are
+    included in orphan cleanup."""
+    # us-east1-d and us-east4-c are in GPU_FALLBACK_ZONES but NOT in FALLBACK_ZONES.
+    cpu_only_zones = [
+        ("us-central1-f", "agent-sandbox-subnet"),
+        ("us-east1-b", "agent-sandbox-subnet-us-east1"),
+    ]
+    gpu_only_zones = {
+        "nvidia-tesla-t4": [
+            ("us-east1-d", "agent-sandbox-subnet-us-east1"),
+            ("us-east4-c", "agent-sandbox-subnet-us-east4"),
+        ]
+    }
+    monkeypatch.setattr(compute, "FALLBACK_ZONES", cpu_only_zones)
+    monkeypatch.setattr(compute, "GPU_FALLBACK_ZONES", gpu_only_zones)
+    monkeypatch.setattr(compute, "_vm_zones", {})
+
+    # --- find_vm_zone discovers a GPU-only zone after restart ---
+    probed: list[str] = []
+
+    def fake_get_vm_status(vm_name: str, zone: str) -> str | None:
+        probed.append(zone)
+        if zone == "us-east1-d" and vm_name == "compute-job-vm-gpu-1":
+            return "RUNNING"
+        return "DELETED"
+
+    monkeypatch.setattr(compute, "get_vm_status", fake_get_vm_status)
+    result_zone = compute.find_vm_zone("compute-job-vm-gpu-1")
+    assert result_zone == "us-east1-d", f"expected us-east1-d, got {result_zone}"
+    # CPU zones searched first, then GPU-only zones
+    assert "us-central1-f" in probed
+    assert "us-east1-d" in probed
+    # Zone repopulated in cache
+    assert compute._vm_zones.get("compute-job-vm-gpu-1") == "us-east1-d"
+
+    # --- _all_managed_zones includes GPU-only zones but not duplicates ---
+    all_zones = compute._all_managed_zones()
+    assert "us-east1-d" in all_zones
+    assert "us-east4-c" in all_zones
+    # CPU zones come first
+    assert all_zones.index("us-central1-f") < all_zones.index("us-east1-d")
+    # No duplicates
+    assert len(all_zones) == len(set(all_zones))
+
+    # --- _cleanup_gcp inventories GPU-only zones ---
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    listed_zones: list[str] = []
+
+    def fake_list_vms(zone: str):
+        listed_zones.append(zone)
+        if zone == "us-east4-c":
+            return [("compute-job-vm-orphan-gpu", zone, "RUNNING")]
+        return []
+
+    monkeypatch.setattr(compute, "_list_vms_in_zone", fake_list_vms)
+    deleted: list[str] = []
+
+    async def fake_refresh_active():
+        return set()
+
+    monkeypatch.setattr(
+        compute, "_refresh_gcp_cleanup_active_vm_ids", fake_refresh_active
+    )
+
+    def fake_delete_single_vm(name, zone):
+        deleted.append(name)
+        return True
+
+    def fake_delete_agent_secret_sync(name):
+        pass
+
+    monkeypatch.setattr(compute, "_delete_single_vm", fake_delete_single_vm)
+    monkeypatch.setattr(compute, "_delete_agent_secret", fake_delete_agent_secret_sync)
+
+    cleanup_result = await compute._cleanup_gcp([])
+    assert "us-east4-c" in listed_zones, "cleanup must scan GPU-only zone us-east4-c"
+    assert "compute-job-vm-orphan-gpu" in cleanup_result.deleted
 
 
 @pytest.mark.asyncio

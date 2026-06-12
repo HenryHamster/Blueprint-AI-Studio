@@ -1552,7 +1552,7 @@ async def test_evaluating_parent_live_vm_lease_is_spared(
         db_session.add_all([task, leased])
         await db_session.commit()
 
-        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+        mocker.patch("app.warm_vm_state.is_pool_vm_alive", return_value=True)
         delete_mock = mocker.patch(
             "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
         )

@@ -56,6 +56,7 @@ from app.warm_pool import (
     LIVE_POOL_STATES,
     count_idle_pool_vms,
     count_live_pool_vms,
+    count_pending_pool_leases,
     is_project_warm_pool_scoped,
     is_warm_pool_enabled,
     list_pool_vms,
@@ -104,9 +105,7 @@ async def _seed_project_pool(
                 select(func.count())
                 .select_from(Task)
                 .where(
-                    Task.status.in_(
-                        [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                    )
+                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
                 )
             )
         ).scalar()
@@ -114,7 +113,10 @@ async def _seed_project_pool(
     )
     idle_pool = await count_idle_pool_vms(session)
     live_pool = await count_live_pool_vms(session)
-    dispatch_slots_remaining = max(0, max_concurrent - active_tasks - idle_pool)
+    pending_leases = await count_pending_pool_leases(session)
+    dispatch_slots_remaining = max(
+        0, max_concurrent - active_tasks - idle_pool - pending_leases
+    )
     pool_budget_remaining = max(0, pool_max - live_pool)
     stale_vm_ids = await _stale_pool_image_ids()
 
@@ -139,7 +141,9 @@ async def _seed_project_pool(
         "seeded": summary["provisioned"],
         "recycled": summary["recycled"],
         "drained": summary["drained"],
-        "reason": "ok" if summary["provisioned"] else "no_provision_headroom_or_at_target",
+        "reason": "ok"
+        if summary["provisioned"]
+        else "no_provision_headroom_or_at_target",
     }
 
 

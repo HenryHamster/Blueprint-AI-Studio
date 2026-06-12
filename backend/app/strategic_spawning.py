@@ -1037,6 +1037,20 @@ def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
     usable = fleet.get("usable_capacity")
     if cooled and usable is not None and usable != cap:
         line += f" — {cooled} acct cooled, {usable} usable"
+    vm_cap = fleet.get("vm_cap")
+    vm_slots_available = fleet.get("vm_slots_available")
+    active_task_vms = fleet.get("active_task_vms")
+    idle_pool_vms = fleet.get("idle_pool_vms")
+    managed_vm_count = fleet.get("managed_vm_count")
+    if vm_cap:
+        effective = None
+        if active_task_vms is not None and managed_vm_count is not None and idle_pool_vms is not None:
+            effective = max(active_task_vms, managed_vm_count - idle_pool_vms)
+        if effective is not None:
+            saturated_marker = " [SATURATED]" if vm_slots_available == 0 else ""
+            line += f" | vm {effective}/{vm_cap}, {vm_slots_available} free{saturated_marker}"
+        elif vm_cap:
+            line += f" | vm cap {vm_cap}"
     return line
 
 

@@ -29,6 +29,7 @@ from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import AsyncSessionLocal
 from app.models import (
@@ -46,8 +47,10 @@ from app.warm_pool import (
     clear_lane_warm_workspace_if_matching_member,
     IDLE_POOL_STATES,
     LIVE_POOL_STATES,
+    WARM_POOL_PIN_KEY,
     count_idle_pool_vms,
     count_live_pool_vms,
+    count_pending_pool_leases,
     is_pool_vm_image_stale,
     is_project_warm_pool_scoped,
     is_warm_pool_enabled,
@@ -152,43 +155,6 @@ def _demand_window_minutes(runtime_config) -> int:
 
 _COST_GUARD_ALERT_TITLE = "Warm pool cost guard engaged: idle spend not amortized"
 
-
-async def _compute_project_pool_hit_rate(
-    session, project_id: uuid.UUID, cutoff: datetime
-) -> dict:
-    """DB-derived warm-pool hit rate for one project within the rolling window.
-
-    Queries Task rows with ``vm_dispatched_at >= cutoff`` for the given project.
-    Counts rows whose ``context['_timing']['warm_claim_origin']`` equals
-    ``WARM_POOL_ORIGIN`` as pool hits; total dispatched tasks as the denominator.
-    Returns ``{"hits": int, "total_dispatches": int, "hit_rate": float | None}``
-    where ``hit_rate`` is None when there are no dispatches in the window.
-    """
-    from app.warm_pool import WARM_POOL_ORIGIN
-
-    tasks = list(
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id,
-                    Task.vm_dispatched_at >= cutoff,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    total = len(tasks)
-    hits = 0
-    for task in tasks:
-        timing = (task.context or {}).get("_timing") or {}
-        if timing.get("warm_claim_origin") == WARM_POOL_ORIGIN:
-            hits += 1
-    return {
-        "hits": hits,
-        "total_dispatches": total,
-        "hit_rate": (hits / total) if total > 0 else None,
-    }
 
 
 def _cost_guard_config(runtime_config) -> dict:
@@ -309,26 +275,34 @@ async def evaluate_project_pool_cost_guard(
     """Per-project warm-pool cost guard: same logic as the fleet guard, scoped to one project.
 
     Uses ``_compute_windowed_idle_cost(session, project_id, cutoff)`` for
-    per-project idle cost and ``_compute_project_pool_hit_rate`` for a
-    DB-derived warm-pool hit rate. Engages when ALL hold over the rolling window:
-    enough dispatches to trust the rate (``min_dispatches``), a hit rate below
-    the floor, and idle cost above the materiality floor. Returns the same shape
-    dict as ``evaluate_pool_cost_guard`` so callers can use either.
+    per-project idle cost and the in-memory per-project pool funnel
+    (``get_project_pool_funnel_snapshot``) for hit-rate measurement.  Engages
+    when ALL hold over the rolling window: enough ELIGIBLE dispatches to trust
+    the rate (``min_dispatches``), an eligible hit rate below the floor, and
+    idle cost above the materiality floor.  Returns the same shape dict as
+    ``evaluate_pool_cost_guard`` so callers can use either.
+
+    Gates on ``eligible_hit_rate`` / ``eligible_dispatches`` — hits + only the
+    misses where the pool was genuinely able to serve the task.  Dependency-
+    pinned, never-consulted cold dispatches, out-of-scope, suppressed, and
+    cost-guard misses are excluded so thin or structurally ineligible demand
+    never triggers a false drain.
 
     Called once per project per maintainer tick, only when the fleet-level guard
     has NOT already engaged (the fleet guard acts as a global safety valve; when
     it fires, all projects drain without individual evaluation).
     """
     from app.efficiency_snapshot import _compute_windowed_idle_cost
+    from app.warm_backlog_reuse import get_project_pool_funnel_snapshot
 
     cfg = _cost_guard_config(runtime_config)
     _guard_cutoff = _utcnow() - timedelta(hours=cfg["window_hours"])
     idle_cost = (await _compute_windowed_idle_cost(session, project_id, _guard_cutoff))[
         "total"
     ]
-    funnel = await _compute_project_pool_hit_rate(session, project_id, _guard_cutoff)
-    hit_rate = funnel["hit_rate"]
-    total = funnel["total_dispatches"]
+    funnel = get_project_pool_funnel_snapshot(project_id, cfg["window_hours"])
+    hit_rate = funnel["eligible_hit_rate"]
+    total = funnel["eligible_dispatches"]
 
     engaged = (
         cfg["enabled"]
@@ -340,9 +314,9 @@ async def evaluate_project_pool_cost_guard(
     reason = None
     if engaged:
         reason = (
-            f"Project pool hit rate {hit_rate:.1%} is below the "
+            f"Project eligible pool hit rate {hit_rate:.1%} is below the "
             f"{cfg['min_hit_rate']:.0%} floor over {cfg['window_hours']}h "
-            f"({total} dispatches) while idle spend is ${idle_cost:.2f} "
+            f"({total} eligible dispatches) while idle spend is ${idle_cost:.2f} "
             f"— draining idle members and pausing provisioning until the hit rate "
             f"recovers."
         )
@@ -567,6 +541,48 @@ async def retire_and_delete_pool_vm(
         "[WARM-POOL] retired pool VM vm_instance_id=%s reason=%s", vm_id, reason
     )
     return True
+
+
+async def drain_global_warm_pool(*, session_factory=AsyncSessionLocal) -> int:
+    """Drain every live pool member fleet-wide (all projects).
+
+    Called when warm_pool_enabled is flipped False via the settings path so the
+    PoolVm registry converges with physical VM cleanup. Retires each live member
+    (PROVISIONING / IDLE / LEASED) via retire_and_delete_pool_vm with the same
+    compare-and-swap safety as the per-project drain: a member claimed by a peer
+    between the scan and the atomic UPDATE is skipped (rowcount==0), not torn
+    down twice. Returns the count of members this call retired.
+    """
+    retired = 0
+    async with session_factory() as session:
+        members = list(
+            (
+                await session.execute(
+                    select(PoolVm).where(PoolVm.state.in_(LIVE_POOL_STATES))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        member_ids = [m.id for m in members]
+        for member_id in member_ids:
+            member = await session.get(PoolVm, member_id)
+            if member is None:
+                continue
+            try:
+                if await retire_and_delete_pool_vm(
+                    session, member, reason="pool_global_disable"
+                ):
+                    retired += 1
+            except Exception:
+                logger.warning(
+                    "[WARM-POOL] global-disable drain failed for member %s",
+                    member_id,
+                    exc_info=True,
+                )
+    if retired:
+        logger.info("[WARM-POOL] global-disable drain retired %d members", retired)
+    return retired
 
 
 async def _default_pool_provision_fn(
@@ -1100,7 +1116,10 @@ async def run_pool_maintainer_cycle(
         )
         idle_pool = await count_idle_pool_vms(session)
         live_pool = await count_live_pool_vms(session)
-        dispatch_slots_remaining = max(0, max_concurrent - active_tasks - idle_pool)
+        pending_leases = await count_pending_pool_leases(session)
+        dispatch_slots_remaining = max(
+            0, max_concurrent - active_tasks - idle_pool - pending_leases
+        )
         pool_budget_remaining = max(0, pool_max - live_pool)
 
         for project_id in project_ids:
@@ -1457,7 +1476,7 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     if not is_warm_pool_enabled():
         return 0
 
-    from app.warm_vm_state import is_vm_alive
+    from app.warm_vm_state import is_pool_vm_alive
 
     idle_ttl = int(runtime_config.get("warm_pool_idle_ttl_seconds", 1800) or 1800)
     hb_stale = int(runtime_config.get("warm_pool_heartbeat_stale_seconds", 300) or 300)
@@ -1674,6 +1693,10 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
         if member is None:
             continue  # retired/deleted by a peer since the lock-free scan
         reason: str | None = None
+        # Captures the id of a QUEUED task whose warm-pool pin must be cleared
+        # after the owning member is reclaimed (so the orchestrator can cold-
+        # dispatch the task). Set only for the QUEUED-pin LEASED reclaim path.
+        _queued_warm_pin_task_id: uuid.UUID | None = None
         if member.state == PoolVmState.RETIRING:
             # Stuck mid-teardown from a prior interrupted sweep — finish it.
             reason = "pool_retiring_cleanup"
@@ -1682,17 +1705,20 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
             # handoff; once it passes, a still-LEASED member is reclaimable ONLY
             # when BOTH (a) its leased task already reached a terminal state (or
             # vanished) — the lease is fulfilled/void — AND (b) its VM is no longer
-            # heartbeating, so we never tear down a VM that is still running its
-            # task OR was deferred and reused for fresh backlog work (the pool/
-            # backlog-reuse intersection). When LEASED rows are never reclaimed a
-            # completed/failed member stays LEASED forever, keeps counting as a
-            # live pool member, and the pool self-exhausts (replenishment halts
-            # once phantom LEASED rows saturate the budget). Reading lease_expires_at
-            # here is the expiry/reclaim path the lease write was always for.
+            # heartbeating (in-memory OR durable stamp), so we never tear down a VM
+            # that is still running its task OR was deferred and reused for fresh
+            # backlog work (the pool/backlog-reuse intersection). When LEASED rows
+            # are never reclaimed a completed/failed member stays LEASED forever,
+            # keeps counting as a live pool member, and the pool self-exhausts
+            # (replenishment halts once phantom LEASED rows saturate the budget).
+            # Reading lease_expires_at here is the expiry/reclaim path the lease
+            # write was always for.
             if (
                 member.lease_expires_at is not None
                 and member.lease_expires_at < now
-                and not is_vm_alive(member.vm_instance_id, max_age_seconds=hb_stale)
+                and not is_pool_vm_alive(
+                    member.vm_instance_id, member.last_heartbeat_at, hb_stale
+                )
             ):
                 leased_task = (
                     await session.get(Task, member.leased_task_id)
@@ -1718,6 +1744,15 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                     TaskStatus.EVALUATING,
                 ):
                     reason = "pool_lease_orphaned"
+                elif leased_task.status == TaskStatus.QUEUED and (
+                    leased_task.context or {}
+                ).get(WARM_POOL_PIN_KEY):
+                    # Handoff window expired, VM is dead, but the task never
+                    # claimed its warm slot — it is still QUEUED with a pin
+                    # pointing at this dead member. Reclaim the member and clear
+                    # the warm-pool pin so the orchestrator can cold-dispatch.
+                    reason = "pool_lease_orphaned"
+                    _queued_warm_pin_task_id = leased_task.id
         elif is_pool_vm_image_stale(member, stale_vm_ids):
             reason = "pool_stale_image"
         elif (
@@ -1738,8 +1773,8 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
             )
         ):
             reason = "pool_idle_ttl"
-        elif zombie_teardown_armed and not is_vm_alive(
-            member.vm_instance_id, max_age_seconds=hb_stale
+        elif zombie_teardown_armed and not is_pool_vm_alive(
+            member.vm_instance_id, member.last_heartbeat_at, hb_stale
         ):
             # Zombie: no heartbeat within the liveness window. Guarded with an
             # idle_since/created_at grace so a member still booting (just
@@ -1763,6 +1798,29 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                 session, member, reason=reason, claim_grace_seconds=claim_grace
             ):
                 retired += 1
+                # Clear the warm-pool pin from a QUEUED task whose handoff window
+                # expired so the orchestrator can cold-dispatch it instead of
+                # waiting indefinitely for a dead VM to claim it.
+                if _queued_warm_pin_task_id is not None:
+                    fresh_queued = await session.get(Task, _queued_warm_pin_task_id)
+                    if (
+                        fresh_queued is not None
+                        and fresh_queued.status == TaskStatus.QUEUED
+                    ):
+                        ctx = dict(fresh_queued.context or {})
+                        ctx.pop("warm_target_vm_id", None)
+                        ctx.pop(WARM_POOL_PIN_KEY, None)
+                        fresh_queued.context = ctx
+                        flag_modified(fresh_queued, "context")
+                        session.add(fresh_queued)
+                        await session.commit()
+                        logger.info(
+                            "[WARM-POOL] cleared warm-pool pin from QUEUED task %s "
+                            "(orphaned lease on vm %s reclaimed; "
+                            "task restored to cold-dispatch queue)",
+                            _queued_warm_pin_task_id,
+                            vm_id,
+                        )
                 # Affinity degradation: reaping a reserved member breaks the
                 # lane's workspace continuity. Silently degrade so the lane's
                 # next resume cold-preps rather than waiting on a VM that is

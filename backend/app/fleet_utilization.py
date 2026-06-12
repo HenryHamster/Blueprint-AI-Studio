@@ -22,6 +22,7 @@ from sqlmodel import select
 
 from app import max_plan_pool
 from app.models import Task, TaskStatus, _utcnow
+from app.runtime_config_state import runtime_config as _runtime_config
 
 
 def _sum_slot_occupancy_seconds(
@@ -104,6 +105,14 @@ async def get_fleet_utilization_snapshot(
     active_now = 0
     util_now: float | None = None
     util_avg: float | None = None
+    active_task_vms: int | None = None
+    managed_vm_count: int | None = None
+    idle_pool_vms: int | None = None
+    vm_slots_available: int | None = None
+    vm_saturation: str | None = None
+
+    vm_cap: int = int(_runtime_config.get("max_concurrent_vms") or 0)
+
     if session is not None:
         active_now = int(
             (
@@ -145,6 +154,43 @@ async def get_fleet_utilization_snapshot(
             util_now = active_now / nominal_capacity
             util_avg = occupancy_seconds / window_seconds / nominal_capacity
 
+        active_task_vms = active_now
+
+        try:
+            from app import vm_lifecycle
+
+            managed_vm_count = await vm_lifecycle._get_actual_gcp_vm_count()
+        except Exception:  # noqa: BLE001 — best-effort, never blank the snapshot
+            managed_vm_count = None
+
+        try:
+            from app.warm_pool import count_idle_pool_vms, is_warm_pool_enabled
+
+            idle_pool_vms = (
+                await count_idle_pool_vms(session) if is_warm_pool_enabled() else 0
+            )
+        except Exception:  # noqa: BLE001 — best-effort, never blank the snapshot
+            idle_pool_vms = None
+
+        if (
+            active_task_vms is not None
+            and managed_vm_count is not None
+            and idle_pool_vms is not None
+            and vm_cap
+        ):
+            effective = max(active_task_vms, managed_vm_count - idle_pool_vms)
+            vm_slots_available = max(0, vm_cap - effective)
+            if vm_slots_available == 0:
+                vm_saturation = "saturated"
+            else:
+                ratio = effective / vm_cap
+                if ratio < 0.70:
+                    vm_saturation = "healthy"
+                elif ratio < 0.90:
+                    vm_saturation = "busy"
+                else:
+                    vm_saturation = "saturated"
+
     return {
         "active_now": active_now,
         "nominal_capacity": nominal_capacity or None,
@@ -153,4 +199,10 @@ async def get_fleet_utilization_snapshot(
         "util_now": round(util_now, 4) if util_now is not None else None,
         "util_avg": round(util_avg, 4) if util_avg is not None else None,
         "window_hours": window_hours,
+        "vm_cap": vm_cap or None,
+        "active_task_vms": active_task_vms,
+        "managed_vm_count": managed_vm_count,
+        "idle_pool_vms": idle_pool_vms,
+        "vm_slots_available": vm_slots_available,
+        "vm_saturation": vm_saturation,
     }

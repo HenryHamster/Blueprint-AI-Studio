@@ -1068,6 +1068,42 @@ async def test_gcp_cleanup_updates_vm_count_cache(gcp_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_gcp_cleanup_caches_post_delete_agent_vm_count(gcp_db, mocker):
+    """After orphan deletion, _last_gcp_vm_count must reflect the remaining inventory
+    (pre-deletion count minus deleted agent VMs), not the pre-deletion total."""
+    project = await _make_project(gcp_db)
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-1")
+
+    # GCP inventory: 2 agent VMs — 1 active (agent-vm-1) + 1 orphan (agent-vm-orphan)
+    mocker.patch("app.compute.LOCAL_MODE", False)
+    mocker.patch("app.compute.FALLBACK_ZONES", [("us-central1-a", "subnet-a")])
+    mocker.patch("app.compute.GPU_FALLBACK_ZONES", {})
+    mocker.patch(
+        "app.compute._list_vms_in_zone",
+        return_value=[
+            ("agent-vm-1", "us-central1-a", "RUNNING"),
+            ("agent-vm-orphan", "us-central1-a", "RUNNING"),
+        ],
+    )
+    mocker.patch("app.compute._delete_single_vm", return_value=True)
+    mocker.patch("app.compute._delete_agent_secret", return_value=None)
+    mocker.patch(
+        "app.compute._refresh_gcp_cleanup_active_vm_ids",
+        AsyncMock(return_value={"agent-vm-1"}),
+    )
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+
+    import app.vm_lifecycle as _vm_lifecycle
+
+    await gcp_cleanup_service()
+
+    # Pre-deletion: 2 agent VMs. Deleted: 1 orphan. Expected cache: 1 (not 2).
+    assert _vm_lifecycle._last_gcp_vm_count == 1
+
+
+@pytest.mark.asyncio
 async def test_gcp_cleanup_logs_partial_failures(gcp_db, mocker):
     """If cleanup_result.failed is non-empty, the service should still run without crashing."""
     project = await _make_project(gcp_db)
@@ -1120,7 +1156,9 @@ async def test_gcp_cleanup_does_not_reap_parked_task_vm(gcp_db, mocker):
     gcp_db.add(plain_queued)
 
     # Active IN_PROGRESS task — must always be exempted
-    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-active-1")
+    await _make_task_with_vm(
+        gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-active-1"
+    )
 
     await gcp_db.commit()
 
@@ -1168,9 +1206,7 @@ async def cost_db(mocker):
     )
 
     # Suppress broadcasts (patched at cost_ceiling where the call actually happens)
-    mocker.patch(
-        "app.cost_ceiling.broadcast_to_project", new_callable=AsyncMock
-    )
+    mocker.patch("app.cost_ceiling.broadcast_to_project", new_callable=AsyncMock)
     # Suppress external notification dispatch (patching where defined so ensure_future gets a real coroutine)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -2782,9 +2818,7 @@ async def test_post_commit_sweep_transient_failure_does_not_bump_attempts(
     await _sweep_post_commit_pending()
 
     await svc_db.refresh(task)
-    attempts = (
-        (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
-    )
+    attempts = (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
     assert attempts == 1, (
         f"transient failure must NOT increment the attempt cap; got {attempts}"
     )
@@ -2818,16 +2852,12 @@ async def test_post_commit_sweep_postcommitlocked_does_not_bump_attempts(
     async def locked(task_id, _payload):
         raise PostCommitLocked(f"task {task_id} row held by peer after 3 retries")
 
-    mocker.patch(
-        "app.routers.agent_status._process_post_commit", side_effect=locked
-    )
+    mocker.patch("app.routers.agent_status._process_post_commit", side_effect=locked)
 
     await _sweep_post_commit_pending()
 
     await svc_db.refresh(task)
-    attempts = (
-        (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
-    )
+    attempts = (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
     assert attempts == 3, (
         f"PostCommitLocked must NOT increment the attempt cap; got {attempts}"
     )
@@ -2859,9 +2889,7 @@ async def test_post_commit_sweep_persistent_failure_still_bumps_attempts(
     await _sweep_post_commit_pending()
 
     await svc_db.refresh(task)
-    attempts = (
-        (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
-    )
+    attempts = (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
     assert attempts == 2, (
         f"persistent failure must still advance the attempt cap; got {attempts}"
     )

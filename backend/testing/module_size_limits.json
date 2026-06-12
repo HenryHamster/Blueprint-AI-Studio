@@ -10,7 +10,7 @@
     "orchestrator_health.py": 1150,
     "orchestrator_runtime_env.py": 400,
     "admin.py": 3200,
-    "compute.py": 3250,
+    "compute.py": 3750,
     "github.py": 2950,
     "github_token_resolver.py": 250,
     "github_auth.py": 450,

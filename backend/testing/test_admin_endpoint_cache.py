@@ -83,6 +83,11 @@ async def test_warm_vm_state_exposes_per_project_pool_guard_and_caches(
     from datetime import timedelta
 
     from app.models import PoolVm, PoolVmState, Project, Task, TaskStatus, _utcnow
+    from app.warm_backlog_reuse import (
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        record_pool_lease_miss,
+    )
 
     fresh_cache = DigestCache(default_ttl=60.0)
     app.dependency_overrides[get_digest_cache] = lambda: fresh_cache
@@ -133,6 +138,10 @@ async def test_warm_vm_state_exposes_per_project_pool_guard_and_caches(
         ]
     )
     await db_session.commit()
+    _pool_lease_hit_events.clear()
+    _pool_lease_miss_events.clear()
+    record_pool_lease_miss("no_idle_member", project_id=bad.id)
+    record_pool_lease_miss("no_idle_member", project_id=bad.id)
 
     old_guard_config = {
         key: _runtime_config.get(key)

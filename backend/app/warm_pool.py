@@ -26,7 +26,7 @@ from typing import Optional
 from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models import PoolVm, PoolVmState, Task
+from app.models import PoolVm, PoolVmState, Task, TaskStatus
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -336,6 +336,34 @@ async def count_live_pool_vms(
         select(func.count())
         .select_from(PoolVm)
         .where(PoolVm.state.in_(LIVE_POOL_STATES))
+    )
+    if project_id is not None:
+        stmt = stmt.where(PoolVm.project_id == project_id)
+    return int((await session.execute(stmt)).scalar() or 0)
+
+
+async def count_pending_pool_leases(
+    session, *, project_id: Optional[uuid.UUID] = None
+) -> int:
+    """Count LEASED pool members whose pinned task is still QUEUED.
+
+    These are pool VMs in the dispatch-to-claim handoff window: the dispatch
+    hook has leased the VM and pinned the task to it, but the task is still
+    QUEUED (the agent has not yet claimed it via /next-role). They occupy a
+    real GCP slot but are invisible to the normal headroom calculation because
+    neither ``active_tasks`` (PROVISIONING/IN_PROGRESS only) nor ``idle_pool``
+    (PROVISIONING/IDLE only) captures them. Subtracting this count from the
+    headroom prevents the maintainer from provisioning into slots already
+    consumed by in-flight warm-pool handoffs.
+    """
+    stmt = (
+        select(func.count())
+        .select_from(PoolVm)
+        .join(Task, PoolVm.leased_task_id == Task.id)
+        .where(
+            PoolVm.state == PoolVmState.LEASED,
+            Task.status == TaskStatus.QUEUED,
+        )
     )
     if project_id is not None:
         stmt = stmt.where(PoolVm.project_id == project_id)
@@ -785,7 +813,10 @@ async def mark_pool_vm_retiring(
     session,
     vm_instance_id: str,
     *,
-    source_states: tuple[PoolVmState, ...] = (PoolVmState.PROVISIONING, PoolVmState.IDLE),
+    source_states: tuple[PoolVmState, ...] = (
+        PoolVmState.PROVISIONING,
+        PoolVmState.IDLE,
+    ),
 ) -> Optional[PoolVm]:
     """Atomically mark a member RETIRING so it is never leased again.
 
@@ -903,11 +934,11 @@ async def try_pool_dispatch(
     # allowlist ⇒ fleet-wide (is_project_warm_pool_scoped returns True for all),
     # so legacy behavior is byte-identical.
     if not is_project_warm_pool_scoped(task.project_id):
-        record_pool_lease_miss("out_of_scope", account=required_account)
+        record_pool_lease_miss("out_of_scope", account=required_account, project_id=task.project_id)
         return None
 
     if is_warm_pool_suppressed():
-        record_pool_lease_miss("suppressed")
+        record_pool_lease_miss("suppressed", project_id=task.project_id)
         return None
 
     # Cost-aware auto-drain: pause leasing while the pool's idle spend is not
@@ -916,7 +947,7 @@ async def try_pool_dispatch(
     # guard reverses on its own (here and in the maintainer) once the hit rate
     # recovers above the configured floor.
     if await is_pool_cost_guard_engaged(session):
-        record_pool_lease_miss("cost_guard")
+        record_pool_lease_miss("cost_guard", project_id=task.project_id)
         return None
 
     # The required identity is the caller's RESOLVED LLM selection (provider /
@@ -968,7 +999,7 @@ async def try_pool_dispatch(
     except Exception:
         logger.exception("[WARM-POOL] lease error during dispatch for task %s", task.id)
         record_pool_claim_failure("lease_error")
-        record_pool_lease_miss("lease_error")
+        record_pool_lease_miss("lease_error", project_id=task.project_id)
         return None
 
     if member is None:
@@ -982,7 +1013,7 @@ async def try_pool_dispatch(
             session, project_id=task.project_id
         )
         reason = "no_compatible_member" if idle_present else "no_idle_member"
-        record_pool_lease_miss(reason, account=required_account)
+        record_pool_lease_miss(reason, account=required_account, project_id=task.project_id)
         # Best-effort workspace-state correction: the lane cannot stay
         # WARM_RESERVED when no compatible member is available — its reservation
         # is stale or already gone. Degrade to COLD so the lane's next phase
@@ -1048,7 +1079,7 @@ async def try_pool_dispatch(
             source_states=(PoolVmState.LEASED,),
         )
         record_pool_claim_failure("doomed_vm")
-        record_pool_lease_miss("doomed_vm")
+        record_pool_lease_miss("doomed_vm", project_id=task.project_id)
         return None
 
     _pin_task_to_pool_vm(

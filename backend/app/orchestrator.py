@@ -3404,7 +3404,8 @@ async def orchestrator_worker():
                                             runtime_selection.account.get("id")
                                             if runtime_selection.account
                                             else None
-                                        )
+                                        ),
+                                        project_id=task.project_id,
                                     )
                                     logger.info(
                                         f"[ORCHESTRATOR] Warm-pool dispatch: task {task.id} "
@@ -3817,7 +3818,10 @@ async def orchestrator_worker():
                                 # selection fell back to env credentials account_id
                                 # is None and the cold dispatch buckets under the
                                 # unattributed account, exactly as before.
-                                record_pool_cold_dispatch(account_id)
+                                record_pool_cold_dispatch(
+                                    account_id,
+                                    project_id=task.project_id,
+                                )
                         except Exception as e:
                             import traceback
 

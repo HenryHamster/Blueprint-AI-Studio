@@ -1136,6 +1136,58 @@ async def test_bootstrap_respects_pool_max_budget(db_session, warm_pool_on):
 
 
 @pytest.mark.asyncio
+async def test_bootstrap_counts_pending_leased_pool_vms_against_headroom(
+    db_session, warm_pool_on
+):
+    """LEASED pool VMs with a QUEUED task must count against dispatch-slot headroom.
+
+    The dispatch-to-claim handoff window creates pool VMs whose task remains
+    QUEUED while the agent claims it via /next-role. These VMs occupy a real
+    GCP slot but are invisible to both ``active_tasks`` (PROVISIONING/IN_PROGRESS
+    only) and ``idle_pool`` (PROVISIONING/IDLE only). Without counting them, the
+    maintainer can provision past max_concurrent_vms during a burst of pool hits.
+    """
+    _runtime_config["warm_pool_target_size"] = 3
+    _runtime_config["warm_pool_max_vms"] = 20
+    # Two slots total: one consumed by an IDLE pool member, one by a LEASED member
+    # whose task is still QUEUED (in the handoff window).
+    _runtime_config["max_concurrent_vms"] = 2
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+
+    project = await _make_project(db_session)
+    # Demand signal so the maintainer considers this project.
+    await _make_task(db_session, project, TaskStatus.QUEUED)
+
+    # An IDLE member already holds one dispatch slot in the headroom formula.
+    await _register(db_session, project, "agent-vm-idle-1", PoolVmState.IDLE)
+
+    # A LEASED member in the handoff window: its task is QUEUED (not yet claimed).
+    queued_task = await _make_task(db_session, project, TaskStatus.QUEUED)
+    leased_member = await _register(
+        db_session, project, "agent-vm-leased-1", PoolVmState.LEASED
+    )
+    leased_member.leased_task_id = queued_task.id
+    db_session.add(leased_member)
+    await db_session.commit()
+
+    calls = {"n": 0}
+
+    async def _stub_provision(session, project_id, **kw):
+        calls["n"] += 1
+        return True
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_stub_provision,
+        session_factory=_factory_for(db_session),
+    )
+    # max_concurrent 2 - 0 active tasks - 1 idle pool - 1 pending lease = 0 slots.
+    # The maintainer must NOT provision any new members.
+    assert totals["provisioned"] == 0
+    assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
 async def test_run_pool_maintainer_cycle_inert_with_demand_when_disabled(
     db_session,
 ):
@@ -1816,6 +1868,108 @@ async def test_demand_weighting_never_exceeds_global_target(db_session, warm_poo
     assert total["n"] == 2
 
 
+# ---------------------------------------------------------------------------
+# Durable pool liveness + QUEUED-pin lease reclaim
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reaper_uses_durable_pool_liveness_and_reclaims_expired_queued_lease(
+    db_session, warm_pool_on, mocker
+):
+    """Dual assertion:
+
+    (a) Durable liveness: a LEASED member with a recent PoolVm.last_heartbeat_at
+        but NO in-memory heartbeat is spared — a process restart (empty cache)
+        must not destroy a live pool member whose durable stamp is within the
+        staleness window.
+
+    (b) QUEUED-pin reclaim: a LEASED member with an expired lease, a dead VM (no
+        in-memory heartbeat AND stale last_heartbeat_at), and a QUEUED task whose
+        context carries warm_pool_pin is reclaimed AND the task's warm_target_vm_id
+        / warm_pool_pin context keys are cleared so the orchestrator can cold-
+        dispatch it instead of waiting indefinitely for the dead VM.
+    """
+    from app.warm_pool import WARM_POOL_PIN_KEY
+
+    mock_del = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+    _runtime_config["warm_pool_heartbeat_stale_seconds"] = 300
+
+    project = await _make_project(db_session)
+
+    # (a) Durable-live member: recent last_heartbeat_at (60s ago, within 300s
+    # window) but NO in-memory heartbeat — simulates a fresh leader whose cache
+    # is empty. The durable stamp alone must keep this member alive.
+    live_task = await _make_task(db_session, project, TaskStatus.COMPLETED)
+    live_member = await _register(
+        db_session, project, "agent-vm-durable-live", PoolVmState.LEASED
+    )
+    live_member.leased_task_id = live_task.id
+    live_member.lease_expires_at = _utcnow() - timedelta(seconds=10)
+    live_member.last_heartbeat_at = _utcnow() - timedelta(seconds=60)  # recent durable
+    db_session.add(live_member)
+
+    # (b) Dead QUEUED-pin member: stale last_heartbeat_at (600s > 300s window),
+    # no in-memory heartbeat → VM is dead. Task is still QUEUED with warm_pool_pin
+    # pointing at this dead member. Must be reclaimed and the task context cleared.
+    pin_task = Task(
+        project_id=project.id,
+        title="pool pin",
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": "agent-vm-dead-lease",
+            WARM_POOL_PIN_KEY: True,
+        },
+    )
+    db_session.add(pin_task)
+    await db_session.commit()
+    await db_session.refresh(pin_task)
+
+    dead_member = await _register(
+        db_session, project, "agent-vm-dead-lease", PoolVmState.LEASED
+    )
+    dead_member.leased_task_id = pin_task.id
+    dead_member.lease_expires_at = _utcnow() - timedelta(seconds=10)
+    dead_member.last_heartbeat_at = _utcnow() - timedelta(seconds=600)  # stale
+    db_session.add(dead_member)
+    await db_session.commit()
+    # No in-memory heartbeat for either VM — only the durable stamp distinguishes them.
+
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+
+    # (a) Durable-live member must be spared — durable heartbeat is within window.
+    assert await db_session.get(PoolVm, live_member.id) is not None, (
+        "member with recent last_heartbeat_at must be spared (durable liveness)"
+    )
+
+    # (b) Dead QUEUED-pin member must be reclaimed (only 1 retire expected).
+    assert retired == 1, f"expected exactly 1 retired member, got {retired}"
+    assert await db_session.get(PoolVm, dead_member.id) is None, (
+        "LEASED member with stale durable hb and QUEUED-pin task must be reclaimed"
+    )
+    mock_del.assert_awaited_once()
+
+    # (b) QUEUED task must stay QUEUED (not terminated) and have its warm-pool
+    # pin fields cleared so the orchestrator can cold-dispatch it.
+    await db_session.refresh(pin_task)
+    assert pin_task.status == TaskStatus.QUEUED, (
+        "reclaimed QUEUED task must remain QUEUED — cold dispatch picks it up"
+    )
+    task_ctx = pin_task.context or {}
+    assert "warm_target_vm_id" not in task_ctx, (
+        "warm_target_vm_id must be cleared from the QUEUED task context after reclaim"
+    )
+    assert WARM_POOL_PIN_KEY not in task_ctx, (
+        "warm_pool_pin must be cleared from the QUEUED task context after reclaim"
+    )
+
+
 @pytest.mark.asyncio
 async def test_default_provision_fn_honors_requested_account(
     db_session, warm_pool_on, mocker
@@ -1932,12 +2086,22 @@ async def _make_dispatched_task(
 async def test_per_project_guard_drains_only_failing_project(
     db_session, warm_pool_on, mocker
 ):
-    """A project with high idle cost and low hit rate has its pool drained
+    """A project with high idle cost and low eligible hit rate has its pool drained
     independently while a co-tenant project with good hit rate is unaffected.
 
-    Project A: all dispatches are warm-pool hits (hit rate 100% — guard off).
-    Project B: no warm-pool hits, high idle cost (hit rate 0% — guard engages).
+    Project A: all dispatches are warm-pool hits (eligible hit rate 100% — guard off).
+    Project B: no warm-pool hits, all eligible misses (eligible hit rate 0% — guard engages).
     Only B's idle member should be drained; A's must survive."""
+    from app.warm_backlog_reuse import (
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        record_pool_lease_hit,
+        record_pool_lease_miss,
+    )
+
+    _pool_lease_hit_events.clear()
+    _pool_lease_miss_events.clear()
+
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch(
         "app.efficiency_snapshot._compute_windowed_idle_cost",
@@ -1956,18 +2120,18 @@ async def test_per_project_guard_drains_only_failing_project(
     project_a = await _make_project(db_session, name="Guard A")
     project_b = await _make_project(db_session, name="Guard B")
 
-    # Project A: 10 warm-pool hits → 100% hit rate → guard stays off.
+    # Project A: 10 eligible hits in the in-memory funnel → 100% eligible hit rate.
     for _ in range(10):
-        await _make_dispatched_task(db_session, project_a, warm_pool_hit=True)
+        record_pool_lease_hit(project_id=project_a.id)
     idle_a = await _register(
         db_session, project_a, "agent-vm-guard-a", PoolVmState.IDLE
     )
     idle_a.idle_since = _utcnow() - timedelta(seconds=300)
     db_session.add(idle_a)
 
-    # Project B: 10 cold dispatches, no hits → 0% hit rate + $5 idle → guard engages.
+    # Project B: 10 eligible misses, no hits → 0% eligible hit rate + $5 idle.
     for _ in range(10):
-        await _make_dispatched_task(db_session, project_b, warm_pool_hit=False)
+        record_pool_lease_miss("no_idle_member", project_id=project_b.id)
     idle_b = await _register(
         db_session, project_b, "agent-vm-guard-b", PoolVmState.IDLE
     )
@@ -1984,7 +2148,7 @@ async def test_per_project_guard_drains_only_failing_project(
         session_factory=_factory_for(db_session),
     )
 
-    # Project A (healthy) survives; Project B (low hit rate) is drained.
+    # Project A (healthy) survives; Project B (low eligible hit rate) is drained.
     assert await db_session.get(PoolVm, idle_a.id) is not None, (
         "project A's idle member must NOT be drained (guard is off for it)"
     )
@@ -1998,8 +2162,17 @@ async def test_per_project_guard_drains_only_failing_project(
 async def test_per_project_guard_does_not_drain_on_insufficient_dispatches(
     db_session, warm_pool_on, mocker
 ):
-    """A project with low hit rate but fewer than min_dispatches dispatches is NOT
-    drained — thin-sample protection mirrors the fleet guard's behavior."""
+    """A project with low hit rate but fewer than min_dispatches eligible dispatches
+    is NOT drained — thin-sample protection mirrors the fleet guard's behavior."""
+    from app.warm_backlog_reuse import (
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        record_pool_lease_miss,
+    )
+
+    _pool_lease_hit_events.clear()
+    _pool_lease_miss_events.clear()
+
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch(
         "app.efficiency_snapshot._compute_windowed_idle_cost",
@@ -2014,9 +2187,9 @@ async def test_per_project_guard_does_not_drain_on_insufficient_dispatches(
     _runtime_config["warm_pool_cost_guard_min_hit_rate"] = 0.10
 
     project = await _make_project(db_session, name="Thin Sample")
-    # Only 3 cold dispatches — below the min_dispatches floor.
+    # Only 3 eligible misses — below the min_dispatches floor.
     for _ in range(3):
-        await _make_dispatched_task(db_session, project, warm_pool_hit=False)
+        record_pool_lease_miss("no_idle_member", project_id=project.id)
     idle = await _register(db_session, project, "agent-vm-thin", PoolVmState.IDLE)
     idle.idle_since = _utcnow() - timedelta(seconds=300)
     db_session.add(idle)
@@ -2030,6 +2203,81 @@ async def test_per_project_guard_does_not_drain_on_insufficient_dispatches(
     )
     assert guard["total_dispatches"] == 3
     assert await db_session.get(PoolVm, idle.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_project_cost_guard_ignores_never_consulted_pool_work(
+    db_session, warm_pool_on, mocker
+):
+    """Never-consulted cold dispatches (recorded without project_id attribution,
+    or with ineligible miss reasons) must NOT count toward a project's eligible
+    denominator — so the project guard cannot be tripped by work the pool was
+    never asked to serve.
+
+    Scenario: a project has 5 eligible hits and 5 eligible misses in its per-project
+    funnel (eligible hit rate = 50%).  Additionally, 100 unattributed cold dispatches
+    (no project_id) and 50 suppressed/cost_guard misses for the same project are
+    recorded — these represent work that never consulted the pool and structurally
+    ineligible demand.  The guard must read eligible_hit_rate = 50% (well above the
+    10% floor) and stay disengaged, ignoring the ineligible noise."""
+    from app.warm_backlog_reuse import (
+        _pool_cold_dispatch_events,
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        record_pool_cold_dispatch,
+        record_pool_lease_hit,
+        record_pool_lease_miss,
+    )
+
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.efficiency_snapshot._compute_windowed_idle_cost",
+        new_callable=mocker.AsyncMock,
+        return_value={"total": 5.0, "by_account": {}},
+    )
+    _runtime_config["warm_pool_cost_guard_min_dispatches"] = 5
+    _runtime_config["warm_pool_cost_guard_min_idle_cost_usd"] = 1.0
+    _runtime_config["warm_pool_cost_guard_min_hit_rate"] = 0.10
+
+    project = await _make_project(db_session, name="Never Consulted")
+
+    # 5 genuine eligible hits + 5 genuine eligible misses for this project.
+    # eligible_hit_rate = 5 / (5 + 5) = 50% — well above the 10% floor.
+    for _ in range(5):
+        record_pool_lease_hit(project_id=project.id)
+    for _ in range(5):
+        record_pool_lease_miss("no_idle_member", project_id=project.id)
+
+    # 100 cold dispatches with NO project_id — work that never consulted the pool.
+    # These must NOT count toward this project's eligible denominator.
+    for _ in range(100):
+        record_pool_cold_dispatch()
+
+    # 50 ineligible miss reasons for this project (suppressed + cost_guard).
+    # These are structurally non-eligible and must be excluded from the denominator.
+    for _ in range(25):
+        record_pool_lease_miss("suppressed", project_id=project.id)
+    for _ in range(25):
+        record_pool_lease_miss("cost_guard", project_id=project.id)
+
+    guard = await evaluate_project_pool_cost_guard(
+        db_session, project.id, runtime_config=_runtime_config
+    )
+
+    # eligible_dispatches = 5 hits + 5 eligible misses = 10; rate = 50%.
+    assert guard["total_dispatches"] == 10, (
+        f"eligible_dispatches must be 10 (hits + eligible misses only), got {guard['total_dispatches']}"
+    )
+    assert guard["hit_rate"] == 0.5, (
+        f"eligible_hit_rate must be 0.5, got {guard['hit_rate']}"
+    )
+    assert guard["engaged"] is False, (
+        "guard must NOT engage when eligible hit rate (50%) is above the floor"
+    )
 
 
 @pytest.mark.asyncio
@@ -3202,7 +3450,7 @@ async def test_actively_reserved_member_not_idle_ttl_reaped(
     # Keep the VM "alive" and arm the zombie gate so the ONLY reaper that could
     # fire on this aged-idle member is the idle-TTL path — isolating the
     # reservation guard under test.
-    mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+    mocker.patch("app.warm_vm_state.is_pool_vm_alive", return_value=True)
     mocker.patch.object(_wpm, "_PROCESS_START_TS", _utcnow() - timedelta(seconds=900))
     try:
         project = await _make_project(db_session, name="Reserved Not Idle Reaped")

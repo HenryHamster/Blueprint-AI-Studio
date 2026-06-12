@@ -9,6 +9,11 @@ const _SAT_STYLE: Record<string, { badge: string; label: string }> = {
   busy:      { badge: 'bg-amber-500/10 border-amber-500/30 text-amber-400',       label: 'Busy' },
   saturated: { badge: 'bg-red-500/10 border-red-500/30 text-red-400',             label: 'Saturated' },
 };
+const _SAT_RANK: Record<NonNullable<FleetUtilizationResponse['saturation']>, number> = {
+  healthy: 0,
+  busy: 1,
+  saturated: 2,
+};
 
 function pct(v: number | null | undefined): string {
   if (v == null) return '—';
@@ -39,6 +44,14 @@ export function FleetCapacityCard({
   loading: boolean;
 }) {
   const satStyle = data?.saturation ? (_SAT_STYLE[data.saturation] ?? _SAT_STYLE.healthy) : null;
+  const vmSatStyle = data?.vm_saturation ? (_SAT_STYLE[data.vm_saturation] ?? _SAT_STYLE.healthy) : null;
+  const headerSatStyle = data
+    ? (
+        data.vm_saturation && (!data.saturation || _SAT_RANK[data.vm_saturation] >= _SAT_RANK[data.saturation])
+          ? vmSatStyle
+          : satStyle
+      )
+    : null;
   const cooldownNote = data && data.cooled_accounts > 0
     ? `${data.cooled_accounts} account${data.cooled_accounts > 1 ? 's' : ''} rate-limited`
     : null;
@@ -49,9 +62,9 @@ export function FleetCapacityCard({
     <section>
       <div className="flex items-center gap-2 mb-2">
         <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Fleet Capacity</h2>
-        {!loading && data && satStyle && (
-          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${satStyle.badge}`}>
-            {satStyle.label}
+        {!loading && data && headerSatStyle && (
+          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${headerSatStyle.badge}`}>
+            {headerSatStyle.label}
           </span>
         )}
         {!loading && data && data.saturation == null && (
@@ -96,6 +109,43 @@ export function FleetCapacityCard({
           </div>
           {cooldownNote && (
             <p className="text-[10px] text-amber-400/80">{cooldownNote} — usable capacity is lower than nominal</p>
+          )}
+          {data.vm_cap != null && (
+            <div className="border-t border-neutral-800/70 pt-2 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">VM Slots</h3>
+                {vmSatStyle && (
+                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${vmSatStyle.badge}`}>
+                    {vmSatStyle.label}
+                  </span>
+                )}
+              </div>
+              <div className="grid gap-x-3 gap-y-1 text-[10px] sm:grid-cols-2">
+                <div className="flex justify-between gap-2">
+                  <span className="text-neutral-500">VM cap</span>
+                  <span className="font-mono text-neutral-300 text-right">{data.vm_cap ?? '—'}</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-neutral-500">Active task VMs</span>
+                  <span className="font-mono text-neutral-300 text-right">{data.active_task_vms ?? '—'}</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-neutral-500">Managed VM inventory</span>
+                  <span className="font-mono text-neutral-300 text-right">{data.managed_vm_count ?? '—'}</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-neutral-500">Idle pool adjustment</span>
+                  <span className="font-mono text-neutral-300 text-right">{data.idle_pool_vms ?? '—'}</span>
+                </div>
+                <div className="flex justify-between gap-2 sm:col-span-2">
+                  <span className="text-neutral-500">Slots available</span>
+                  <span className="font-mono text-neutral-300 text-right">
+                    {data.vm_slots_available ?? '—'}
+                    {data.vm_saturation ? ` · ${_SAT_STYLE[data.vm_saturation]?.label ?? 'Unknown'}` : ''}
+                  </span>
+                </div>
+              </div>
+            </div>
           )}
           {data.saturation == null && (
             <p className="text-[10px] text-neutral-500">No enabled accounts — capacity unknown</p>
