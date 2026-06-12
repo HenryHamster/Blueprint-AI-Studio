@@ -2375,6 +2375,34 @@ describe('pushForceWithLeaseRetrying — concurrent push retry', () => {
     expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'rebase')).toBe(false);
   });
 
+  it.each([
+    [
+      'workflow permission',
+      'remote: refusing to allow a GitHub App to create or update workflow .github/workflows/ci.yml without workflows permission',
+      /cannot create or update workflow files without the workflows permission/,
+    ],
+    [
+      'push protection',
+      'remote: GH013: Repository rule violations found. secret scanning blocked this push',
+      /push protection or secret scanning blocked it/,
+    ],
+    [
+      'protected branch',
+      'remote: GH006: Protected branch update failed for refs/heads/feature/x',
+      /branch is protected/,
+    ],
+  ])('classifies %s push rejections without retrying', async (_label, message, expected) => {
+    vi.mocked(indexMod.gitAsync).mockRejectedValueOnce(new Error(message));
+
+    await expect(pushForceWithLeaseRetrying('feature/x', null))
+      .rejects.toThrow(expected);
+
+    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(1);
+    const gitCalls = vi.mocked(indexMod.git).mock.calls.map(c => c[0]);
+    expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'fetch')).toBe(false);
+    expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'rebase')).toBe(false);
+  });
+
   it('silently ignores a rebase --abort failure and still throws the descriptive conflict error', async () => {
     vi.mocked(indexMod.gitAsync).mockRejectedValueOnce(new Error('stale info'));
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {

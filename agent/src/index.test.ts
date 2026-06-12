@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import {
   __resetTaskCapabilityContractForTesting,
@@ -677,6 +677,14 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
     _setWarmStartForTesting(true);
     resetPerRoleModuleState();
     expect(_getWarmStartForTesting()).toBe(false);
+  });
+
+  it('clears the log buffer so prior-role lines do not appear in the next task\'s stream', () => {
+    appendToLogBuffer('prior-role-line-1');
+    appendToLogBuffer('prior-role-line-2');
+    expect(snapshotLogBuffer().length).toBe(2);
+    resetPerRoleModuleState();
+    expect(snapshotLogBuffer().length).toBe(0);
   });
 });
 
@@ -2747,6 +2755,55 @@ describe('flushLogBuffer', () => {
     flushLogBuffer(ws);
     const remaining = snapshotLogBuffer();
     expect(remaining.map(e => e.content)).toEqual(['b', 'c']);
+  });
+});
+
+// ── replayLogBufferRateLimited ────────────────────────────────────────────────
+describe('replayLogBufferRateLimited', () => {
+  beforeEach(() => {
+    clearLogBuffer();
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    clearLogBuffer();
+  });
+
+  it('sends all buffered entries and empties the buffer for a small batch', async () => {
+    appendToLogBuffer('msg-1');
+    appendToLogBuffer('msg-2');
+    const ws = { send: vi.fn() } as unknown as WebSocket;
+    const replay = replayLogBufferRateLimited(ws);
+    await vi.runAllTimersAsync();
+    await replay;
+    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(2);
+    expect(snapshotLogBuffer().length).toBe(0);
+  });
+
+  it('does not exceed 15 sends before the 1-second throttle window elapses', async () => {
+    for (let i = 0; i < 16; i++) appendToLogBuffer(`msg-${i}`);
+    const ws = { send: vi.fn() } as unknown as WebSocket;
+    const replay = replayLogBufferRateLimited(ws);
+    // After minimal time: first batch of 15 sent, the 16th is still waiting.
+    await vi.advanceTimersByTimeAsync(50);
+    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(15);
+    expect(snapshotLogBuffer().length).toBe(1);
+    // Advance past the throttle window so the second batch fires.
+    await vi.advanceTimersByTimeAsync(1000);
+    await replay;
+    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(16);
+    expect(snapshotLogBuffer().length).toBe(0);
+  });
+
+  it('drains a full 1000-entry buffer fully across multiple batches', async () => {
+    for (let i = 0; i < 1000; i++) appendToLogBuffer(`msg-${i}`);
+    expect(snapshotLogBuffer().length).toBe(1000);
+    const ws = { send: vi.fn() } as unknown as WebSocket;
+    const replay = replayLogBufferRateLimited(ws);
+    await vi.advanceTimersByTimeAsync(100_000);
+    await replay;
+    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1000);
+    expect(snapshotLogBuffer().length).toBe(0);
   });
 });
 

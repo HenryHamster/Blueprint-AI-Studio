@@ -1823,6 +1823,9 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // Workspace-prep outcome recorded by prepareWorkspaceForRole. Reset so a
   // stale outcome from the prior role never rides the next role's payload.
   resetWorkspacePrepOutcome();
+  // Log ring buffer — without clearing, prior-role lines replay on the next
+  // task's websocket connect and can trip the backend's 20 msg/s close-threshold.
+  clearLogBuffer();
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────
@@ -2175,11 +2178,35 @@ export function snapshotLogBuffer(): LogEntry[] {
   return logBuffer.slice();
 }
 
+export function clearLogBuffer(): void {
+  logBuffer.splice(0);
+}
+
 export function flushLogBuffer(ws: WebSocket) {
   while (logBuffer.length > 0) {
     const entry = logBuffer[0];
     try { ws.send(JSON.stringify({ type: 'log', content: entry.content })); } catch { break; }
     logBuffer.shift();
+  }
+}
+
+// Replay the log buffer at a rate ≤15 msgs/s to stay safely under the
+// backend's 20 msg/s close-threshold (routers/projects.py).
+export async function replayLogBufferRateLimited(ws: WebSocket): Promise<void> {
+  const BATCH = 15;
+  while (logBuffer.length > 0) {
+    const batchStart = Date.now();
+    let sent = 0;
+    while (logBuffer.length > 0 && sent < BATCH) {
+      const entry = logBuffer[0];
+      try { ws.send(JSON.stringify({ type: 'log', content: entry.content })); } catch { return; }
+      logBuffer.shift();
+      sent++;
+    }
+    if (logBuffer.length > 0) {
+      const elapsed = Date.now() - batchStart;
+      if (elapsed < 1000) await new Promise(r => setTimeout(r, 1000 - elapsed));
+    }
   }
 }
 
@@ -2215,7 +2242,7 @@ async function connectLogStream(taskId: string): Promise<WebSocket | null> {
         });
       });
       if (ws) {
-        flushLogBuffer(ws);
+        await replayLogBufferRateLimited(ws);
         return ws;
       }
     } catch (err) {
