@@ -14945,3 +14945,111 @@ class TestImprovementLaneSettings:
         )
         assert resp.status_code == 400
         assert "unknown settings key" in resp.text.lower() or "improvement_lanes_enabld" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Spawn-gate census endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnGateCensus:
+    """Tests for GET /api/admin/spawn-gate-census."""
+
+    @pytest.mark.asyncio
+    async def test_spawn_gate_census_returns_aggregate(self, client: AsyncClient, db_session):
+        """Endpoint returns aggregate gate census for research tasks in the window."""
+        from testing.factories import make_project, make_task
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        research_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={
+                "research_spawn_gate_challenged_count": 3,
+                "research_spawn_gate_parse_outcome": "no_verdict_returned",
+                "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 2},
+                "research_spawn_gate_wholesale_retry_exhausted": True,
+            },
+        )
+        db_session.add(research_task)
+        # Non-research task — must be excluded.
+        create_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"research_spawn_gate_challenged_count": 5},
+        )
+        db_session.add(create_task)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/spawn-gate-census?project_id={project.id}&hours=24"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["window_hours"] == 24
+        assert data["cycles_scanned"] == 1
+        assert data["gate_invoked_count"] == 1
+        assert data["graders_attempted_total"] == 3
+        assert data["exhaustion_count"] == 1
+        assert data["give_up_count"] == 0
+        assert data["parse_outcome_distribution"] == {"no_verdict_returned": 1}
+        assert data["cause_distribution"] == {"AGENT_TIMEOUT": 2}
+        rows = data["rows"]
+        assert len(rows) == 1
+        assert rows[0]["gate_invoked"] is True
+        assert rows[0]["exhausted"] is True
+
+    @pytest.mark.asyncio
+    async def test_spawn_gate_census_empty_window(self, client: AsyncClient, db_session):
+        """Endpoint returns zero counts when no tasks exist."""
+        resp = await client.get("/api/admin/spawn-gate-census?hours=24")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cycles_scanned"] == 0
+        assert data["gate_invoked_count"] == 0
+        assert data["rows"] == []
+
+    @pytest.mark.asyncio
+    async def test_spawn_gate_census_project_filter(self, client: AsyncClient, db_session):
+        """project_id filter excludes tasks from other projects."""
+        from testing.factories import make_project, make_task
+
+        proj_a = make_project()
+        proj_b = make_project()
+        db_session.add(proj_a)
+        db_session.add(proj_b)
+        await db_session.commit()
+        await db_session.refresh(proj_a)
+        await db_session.refresh(proj_b)
+
+        db_session.add(
+            make_task(
+                project_id=proj_a.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"research_spawn_gate_challenged_count": 2},
+            )
+        )
+        db_session.add(
+            make_task(
+                project_id=proj_b.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"research_spawn_gate_challenged_count": 4},
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/spawn-gate-census?project_id={proj_a.id}&hours=24"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cycles_scanned"] == 1
+        assert data["graders_attempted_total"] == 2

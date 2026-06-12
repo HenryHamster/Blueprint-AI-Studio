@@ -5886,3 +5886,276 @@ async def test_adversarial_give_up_count_rolls_up_to_spawn_gate_metrics(
     # Give-up count is a separate bucket — legacy refuted/survived counters unchanged.
     assert entry["research_spawn_gate_refuted_count"] == 0
     assert entry["research_spawn_gate_survived_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_scoped_to_owning_direction(db_session: AsyncSession):
+    """Per-direction gate data is not smeared across sibling directions.
+
+    When research_spawn_gate_by_direction is present, direction B's history entry
+    must only carry gate counters from B's own per-direction entry, not the totals
+    that belong to direction A.
+    """
+    direction_a = "d-sg-dir-a"
+    direction_b = "d-sg-dir-b"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    # Direction A had 3 challenges; direction B had none.
+    research_task.context = {
+        "direction_id": direction_a,
+        "research_spawn_gate_challenged_count": 3,
+        "research_spawn_gate_refuted_count": 2,
+        "research_spawn_gate_survived_count": 1,
+        "research_spawn_gate_wholesale_retry_exhausted": True,
+        "research_spawn_gate_by_direction": {
+            direction_a: {
+                "challenged_count": 3,
+                "refuted_count": 2,
+                "survived_count": 1,
+                "explicit_pass_count": 0,
+                "fail_open_count": 1,
+                "unresolved_count": 1,
+                "wholesale_retry_exhausted": True,
+            },
+            direction_b: {
+                "challenged_count": 0,
+                "refuted_count": 0,
+                "survived_count": 0,
+                "explicit_pass_count": 0,
+                "fail_open_count": 0,
+                "unresolved_count": 0,
+                "wholesale_retry_exhausted": False,
+            },
+        },
+    }
+    project.directions = [
+        _make_direction(direction_a, research_task_id, tasks_created=1),
+        _make_direction(direction_b, research_task_id, tasks_created=0),
+    ]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_b,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry_b = next(
+        d["research_history"][0]
+        for d in project.directions
+        if d["id"] == direction_b
+    )
+    # Direction B's entry must reflect B's own (zero) gate activity, not A's.
+    assert entry_b["research_spawn_gate_challenged_count"] == 0
+    assert entry_b["research_spawn_gate_refuted_count"] == 0
+    assert entry_b["research_spawn_gate_survived_count"] == 0
+    assert entry_b["research_spawn_gate_wholesale_retry_exhausted"] is False
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_exhausted_flag_cleared_on_healthy_pass(
+    db_session: AsyncSession,
+):
+    """Per-direction wholesale_retry_exhausted overrides the sticky global flag.
+
+    The global context flag is set on exhaustion and never cleared, so a later
+    healthy-gate cycle still reports exhausted=True globally.  When the per-direction
+    entry says False, the direction's history entry must record False.
+    """
+    direction_id = "d-sg-exhausted-cleared"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    # Global flag is still True (from an earlier cycle), but this direction's
+    # per-direction entry reflects a healthy pass.
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_wholesale_retry_exhausted": True,
+        "research_spawn_gate_parse_outcome": "ok",
+        "research_spawn_gate_by_direction": {
+            direction_id: {
+                "challenged_count": 2,
+                "refuted_count": 0,
+                "survived_count": 2,
+                "explicit_pass_count": 2,
+                "fail_open_count": 0,
+                "unresolved_count": 0,
+                "wholesale_retry_exhausted": False,
+                "parse_outcome": "ok",
+            },
+        },
+    }
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=0)]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["research_spawn_gate_wholesale_retry_exhausted"] is False
+    assert entry["research_spawn_gate_challenged_count"] == 2
+    assert entry["research_spawn_gate_survived_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_challenged_spawned_filtered_by_direction(
+    db_session: AsyncSession,
+):
+    """challenged_spawned / unchallenged_spawned are scoped to the owning direction.
+
+    Two directions share a research task; each has child tasks tagged with their own
+    direction_id. The challenged_spawned and unchallenged_spawned counts for each
+    direction must only count that direction's children, not the combined total.
+    """
+    direction_a = "d-sg-spawn-a"
+    direction_b = "d-sg-spawn-b"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_a,
+        "research_spawn_gate_by_direction": {
+            direction_a: {
+                "challenged_count": 2,
+                "refuted_count": 0,
+                "survived_count": 2,
+                "explicit_pass_count": 2,
+                "fail_open_count": 0,
+                "unresolved_count": 0,
+                "wholesale_retry_exhausted": False,
+            },
+            direction_b: {
+                "challenged_count": 1,
+                "refuted_count": 1,
+                "survived_count": 0,
+                "explicit_pass_count": 0,
+                "fail_open_count": 0,
+                "unresolved_count": 1,
+                "wholesale_retry_exhausted": False,
+            },
+        },
+    }
+    project.directions = [
+        _make_direction(direction_a, research_task_id, tasks_created=3),
+        _make_direction(direction_b, research_task_id, tasks_created=2),
+    ]
+    await db_session.flush()
+
+    # Direction A: 2 challenged children, 1 unchallenged child.
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED, title="a-challenged-1",
+        context={"direction_id": direction_a, "research_spawn_gate_challenged": True,
+                 "pr_merged": True, "landed_on_integration": True},
+    )
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED, title="a-challenged-2",
+        context={"direction_id": direction_a, "research_spawn_gate_challenged": True},
+    )
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED, title="a-unchallenged",
+        context={"direction_id": direction_a, "research_spawn_gate_challenged": False},
+    )
+    # Direction B: 1 challenged child, 1 unchallenged child.
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED, title="b-challenged",
+        context={"direction_id": direction_b, "research_spawn_gate_challenged": True},
+    )
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED, title="b-unchallenged",
+        context={"direction_id": direction_b, "research_spawn_gate_challenged": False},
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_a,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry_a = next(
+        d["research_history"][0]
+        for d in project.directions
+        if d["id"] == direction_a
+    )
+    # Direction A should only count its own children.
+    assert entry_a["research_spawn_gate_challenged_spawned"] == 2
+    assert entry_a["research_spawn_gate_unchallenged_spawned"] == 1
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_b,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry_b = next(
+        d["research_history"][0]
+        for d in project.directions
+        if d["id"] == direction_b
+    )
+    # Direction B should only count its own children.
+    assert entry_b["research_spawn_gate_challenged_spawned"] == 1
+    assert entry_b["research_spawn_gate_unchallenged_spawned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_fallback_when_no_by_direction_key(db_session: AsyncSession):
+    """Global spawn-gate counters are used when research_spawn_gate_by_direction is absent.
+
+    This covers pre-fix cycles (where the per-direction dict was never written) and
+    standalone research tasks that serve only one direction.  The global fallback must
+    preserve the existing behavior so these older history entries remain valid.
+    """
+    direction_id = "d-sg-fallback"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    # No research_spawn_gate_by_direction key — only the global counters.
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_challenged_count": 4,
+        "research_spawn_gate_refuted_count": 1,
+        "research_spawn_gate_survived_count": 3,
+        "research_spawn_gate_explicit_pass_count": 2,
+        "research_spawn_gate_fail_open_count": 1,
+        "research_spawn_gate_unresolved_count": 0,
+        "research_spawn_gate_wholesale_retry_exhausted": False,
+        "research_spawn_gate_refuted_reasons": ["plausible but unverified"],
+    }
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=0)]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Global counters must be forwarded unchanged via the fallback path.
+    assert entry["research_spawn_gate_challenged_count"] == 4
+    assert entry["research_spawn_gate_refuted_count"] == 1
+    assert entry["research_spawn_gate_survived_count"] == 3
+    assert entry["research_spawn_gate_explicit_pass_count"] == 2
+    assert entry["research_spawn_gate_fail_open_count"] == 1
+    assert entry["research_spawn_gate_unresolved_count"] == 0
+    assert entry["research_spawn_gate_wholesale_retry_exhausted"] is False
+    assert entry["research_spawn_gate_refuted_reasons"] == ["plausible but unverified"]

@@ -2154,10 +2154,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if isinstance(f, dict)
             and f.get("type") not in ("direction_proposal", "direction_note")
         ]
-        # Discard findings older than DEFERRED_FINDING_MAX_AGE to prevent stale
+        # Discard findings older than the configured TTL to prevent stale
         # entries from blocking fresh findings (priority inversion) and to bound
         # the deferred list during extended pipeline degradation.
-        _stale_cutoff = _utcnow() - timedelta(hours=48)
+        _deferred_ttl_days = int(_runtime_config.get("deferred_finding_ttl_days", 7))
+        _stale_cutoff = _utcnow() - timedelta(days=_deferred_ttl_days)
         _fresh_actionable: list[dict] = []
         _stale_discarded: list[dict] = []
         for f in prior_actionable:
@@ -2179,7 +2180,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if _stale_discarded:
             logger.warning(
                 f"[RESEARCH] Discarding {len(_stale_discarded)} stale deferred finding(s) "
-                f"(older than 48h) from task {task.id}: "
+                f"(older than {_deferred_ttl_days}d) from task {task.id}: "
                 f"titles={[f.get('title') or f.get('description', '')[:60] for f in _stale_discarded]}"
             )
         prior_actionable = _fresh_actionable
@@ -5017,7 +5018,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     if isinstance(_cycle_cause, dict)
                     else None
                 )
-                if _cause_category:
+                if _cause_category and _spawn_gate_unresolved_count > 0:
                     ctx["research_spawn_gate_cause_counts"] = {
                         _cause_category: _spawn_gate_unresolved_count
                     }

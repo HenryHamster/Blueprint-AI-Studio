@@ -136,7 +136,9 @@ def _viewport_failure_context(task: Task) -> tuple[bool, list[str]]:
         ctx.get("failure_category") or ctx.get("failure_class") or ""
     ).strip()
     viewport_keys = list(_iter_viewport_regression_keys(ctx))
-    return failure_class == _VIEWPORT_FAILURE_CLASS or bool(viewport_keys), viewport_keys
+    return failure_class == _VIEWPORT_FAILURE_CLASS or bool(
+        viewport_keys
+    ), viewport_keys
 
 
 def _viewport_metadata_for_failed_task(
@@ -165,7 +167,9 @@ async def get_provider_cost_summary(
     window_start = _utcnow() - timedelta(hours=hours)
     filters = [
         Task.vm_stopped_at >= window_start,
-        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+        Task.status.in_(
+            [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+        ),
     ]
     if project_id:
         filters.append(Task.project_id == project_id)
@@ -747,9 +751,7 @@ async def _fetch_outer_loop_tasks(
             Task.payloads[0]["type"].as_string().label("_first_payload_type"),
         ).options(load_only(*_OUTER_LOOP_TASK_COLUMNS))
     else:
-        stmt = select(Task).options(
-            load_only(*_OUTER_LOOP_TASK_COLUMNS, Task.payloads)
-        )
+        stmt = select(Task).options(load_only(*_OUTER_LOOP_TASK_COLUMNS, Task.payloads))
     stmt = stmt.where(*where_clauses)
     if order_desc:
         stmt = stmt.order_by(Task.created_at.desc())
@@ -860,9 +862,7 @@ async def get_outer_loop_convergence(
     original_tasks = await _load_outer_loop_original_tasks(
         session, tasks, project_id=project_id
     )
-    await _hydrate_outcome_plan_outputs(
-        session, [*tasks, *original_tasks.values()]
-    )
+    await _hydrate_outcome_plan_outputs(session, [*tasks, *original_tasks.values()])
     alerts = await _load_escalation_alerts(
         session, cutoff=cutoff, project_id=project_id
     )
@@ -919,9 +919,7 @@ async def get_outer_loop_convergence_trend(
     original_tasks = await _load_outer_loop_original_tasks(
         session, tasks, project_id=project_id
     )
-    await _hydrate_outcome_plan_outputs(
-        session, [*tasks, *original_tasks.values()]
-    )
+    await _hydrate_outcome_plan_outputs(session, [*tasks, *original_tasks.values()])
     alerts = await _load_escalation_alerts(
         session, cutoff=cutoff, project_id=project_id
     )
@@ -1090,9 +1088,7 @@ async def get_outer_loop_chains(
         selected = [c for c in chains if c["outcome"] == reason]
     else:
         selected = [
-            c
-            for c in chains
-            if c["outcome"] is not None and c["outcome"] != "merged"
+            c for c in chains if c["outcome"] is not None and c["outcome"] != "merged"
         ]
 
     rows = [
@@ -1682,9 +1678,7 @@ async def get_pipeline_efficiency(
             # this window, plus the pool-origin share. None when no warm starts
             # in the window (nothing to attribute). Lets an operator see whether
             # the pool — not chain-continuity/backlog-reuse — earned its idle cost.
-            "warm_start_origin_breakdown": _compute_warm_start_origin_breakdown(
-                bucket
-            ),
+            "warm_start_origin_breakdown": _compute_warm_start_origin_breakdown(bucket),
             "review_iter_median": _pct(iters, 50),
             "review_iter_p95": _pct(iters, 95),
             "review_iter_sample_n": len(iters),
@@ -1716,3 +1710,77 @@ async def get_pipeline_efficiency(
         "window_24h": _augment(cur_24h, pri_24h),
         "window_7d": _augment(cur_7d, pri_7d),
     }
+
+
+_SPAWN_GATE_CENSUS_TASK_CAP = 5000
+
+
+@router.get("/spawn-gate-census")
+async def get_spawn_gate_census(
+    hours: int = Query(24, ge=1, le=168),
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Project-wide windowed census of spawn-gate activity.
+
+    Returns per-cycle gate invocations, grader attempt counts, parse-outcome
+    and cause-category distributions, exhaustion and give-up totals. Covers
+    undirected research cycles and deduplicates multi-direction cycles naturally
+    (one row per research task.id).
+    """
+    from app.digest_direction_progress import compute_spawn_gate_census  # noqa: PLC0415
+    from app.sr_review_quality_metrics import _stash_projected_task_fields  # noqa: PLC0415
+
+    cutoff = _utcnow() - timedelta(hours=hours)
+
+    where_clauses = [
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        Task.created_at >= cutoff,
+    ]
+    if project_id is not None:
+        where_clauses.append(Task.project_id == project_id)
+
+    use_projection = resolve_dialect_name(session) == "postgresql"
+    if use_projection:
+        stmt = (
+            select(
+                Task,
+                Task.payloads[0]["type"].as_string().label("_first_payload_type"),
+            )
+            .where(*where_clauses)
+            .options(load_only(Task.id, Task.project_id, Task.context, Task.payloads))
+            .limit(_SPAWN_GATE_CENSUS_TASK_CAP)
+        )
+    else:
+        stmt = (
+            select(Task)
+            .where(*where_clauses)
+            .options(load_only(Task.id, Task.project_id, Task.context, Task.payloads))
+            .limit(_SPAWN_GATE_CENSUS_TASK_CAP)
+        )
+
+    if use_projection:
+        tasks: List[Task] = []
+        for row in (await session.execute(stmt)).all():
+            task = row[0]
+            if not hasattr(task, "_projected_first_payload"):
+                _stash_projected_task_fields(
+                    task,
+                    first_payload={"type": row[1]} if row[1] else {},
+                )
+            tasks.append(task)
+    else:
+        tasks = list((await session.execute(stmt)).scalars().all())
+
+    if len(tasks) >= _SPAWN_GATE_CENSUS_TASK_CAP:
+        logger.warning(
+            "[SPAWN-GATE-CENSUS] query hit %d-row cap (hours=%d, project_id=%s); "
+            "census may be incomplete",
+            _SPAWN_GATE_CENSUS_TASK_CAP,
+            hours,
+            project_id,
+        )
+
+    census = compute_spawn_gate_census(tasks, window_start=cutoff)
+    return {"window_hours": hours, **census}

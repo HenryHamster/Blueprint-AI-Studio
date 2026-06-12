@@ -783,77 +783,120 @@ async def _update_direction_research_outcomes(
         if research_task is not None
         else {}
     )
-    spawn_gate_challenged_count = int(
-        research_task_ctx.get("research_spawn_gate_challenged_count")
-        or 0
-    )
-    spawn_gate_refuted_count = int(
-        research_task_ctx.get("research_spawn_gate_refuted_count") or 0
-    )
-    spawn_gate_survived_count = int(
-        research_task_ctx.get("research_spawn_gate_survived_count") or 0
-    )
-    # Decision-quality breakdown of the inclusive survived/refuted buckets
-    # (additive — the legacy counters above are preserved unchanged).
-    spawn_gate_explicit_pass_count = int(
-        research_task_ctx.get("research_spawn_gate_explicit_pass_count") or 0
-    )
-    spawn_gate_fail_open_count = int(
-        research_task_ctx.get("research_spawn_gate_fail_open_count") or 0
-    )
-    spawn_gate_unresolved_count = int(
-        research_task_ctx.get("research_spawn_gate_unresolved_count") or 0
-    )
-    spawn_gate_wholesale_retry_exhausted = bool(
-        research_task_ctx.get("research_spawn_gate_wholesale_retry_exhausted")
-    )
-    spawn_gate_parse_outcome = research_task_ctx.get("research_spawn_gate_parse_outcome")
-    spawn_gate_cause = research_task_ctx.get("research_spawn_gate_cause")
-    spawn_gate_cause_counts = research_task_ctx.get("research_spawn_gate_cause_counts")
-    spawn_gate_manifest_excluded_count = int(
-        research_task_ctx.get(
-            "research_spawn_gate_manifest_excluded_fail_closed_count"
+    # Per-direction breakdown: when research_completion.py writes a
+    # research_spawn_gate_by_direction dict, use the entry for this direction
+    # so a multi-direction cycle does not smear one direction's gate activity
+    # across sibling directions. Fall back to the global (pre-fix) keys when
+    # the per-direction dict is absent (backward compat / single-direction tasks).
+    _per_dir_gate = (
+        research_task_ctx.get("research_spawn_gate_by_direction") or {}
+    ).get(direction_id) or {}
+    if _per_dir_gate:
+        spawn_gate_challenged_count = int(_per_dir_gate.get("challenged_count") or 0)
+        spawn_gate_refuted_count = int(_per_dir_gate.get("refuted_count") or 0)
+        spawn_gate_survived_count = int(_per_dir_gate.get("survived_count") or 0)
+        spawn_gate_explicit_pass_count = int(
+            _per_dir_gate.get("explicit_pass_count") or 0
         )
-        or 0
-    )
-    spawn_gate_manifest_excluded_samples: list[dict] = []
-    _seen_spawn_gate_manifest_excluded: set[tuple[str, str]] = set()
-    for _sg_sample in (
-        research_task_ctx.get(
-            "research_spawn_gate_manifest_excluded_fail_closed_samples"
+        spawn_gate_fail_open_count = int(_per_dir_gate.get("fail_open_count") or 0)
+        spawn_gate_unresolved_count = int(_per_dir_gate.get("unresolved_count") or 0)
+        spawn_gate_wholesale_retry_exhausted = bool(
+            _per_dir_gate.get("wholesale_retry_exhausted")
         )
-        or []
-    ):
-        if not isinstance(_sg_sample, dict):
-            continue
-        _sample = {
-            "hash": str(_sg_sample.get("hash") or "")[:80],
-            "title": str(_sg_sample.get("title") or "")[:120],
-            "reason": str(_sg_sample.get("reason") or "")[
-                :_SPAWN_GATE_REASON_MAX_LEN
-            ],
-        }
-        _sample_key = (_sample["hash"], _sample["title"])
-        if (
-            (_sample["hash"] or _sample["title"])
-            and _sample_key not in _seen_spawn_gate_manifest_excluded
-            and len(spawn_gate_manifest_excluded_samples)
-            < _SPAWN_GATE_REASONS_SAMPLE_CAP
+        spawn_gate_parse_outcome = _per_dir_gate.get("parse_outcome")
+        spawn_gate_cause = _per_dir_gate.get("cause")
+        spawn_gate_cause_counts = _per_dir_gate.get("cause_counts")
+        spawn_gate_manifest_excluded_count = int(
+            _per_dir_gate.get("manifest_excluded_count") or 0
+        )
+        spawn_gate_manifest_excluded_samples: list[dict] = [
+            _s for _s in (_per_dir_gate.get("manifest_excluded_samples") or [])
+            if isinstance(_s, dict)
+        ][: _SPAWN_GATE_REASONS_SAMPLE_CAP]
+        spawn_gate_refuted_reasons: list[str] = [
+            str(_r).strip()[:_SPAWN_GATE_REASON_MAX_LEN]
+            for _r in (_per_dir_gate.get("refuted_reasons") or [])
+            if _r
+        ][: _SPAWN_GATE_REASONS_SAMPLE_CAP]
+    else:
+        # Global (legacy) fallback for pre-fix cycles and single-direction tasks.
+        spawn_gate_challenged_count = int(
+            research_task_ctx.get("research_spawn_gate_challenged_count")
+            or 0
+        )
+        spawn_gate_refuted_count = int(
+            research_task_ctx.get("research_spawn_gate_refuted_count") or 0
+        )
+        spawn_gate_survived_count = int(
+            research_task_ctx.get("research_spawn_gate_survived_count") or 0
+        )
+        # Decision-quality breakdown of the inclusive survived/refuted buckets
+        # (additive — the legacy counters above are preserved unchanged).
+        spawn_gate_explicit_pass_count = int(
+            research_task_ctx.get("research_spawn_gate_explicit_pass_count") or 0
+        )
+        spawn_gate_fail_open_count = int(
+            research_task_ctx.get("research_spawn_gate_fail_open_count") or 0
+        )
+        spawn_gate_unresolved_count = int(
+            research_task_ctx.get("research_spawn_gate_unresolved_count") or 0
+        )
+        spawn_gate_wholesale_retry_exhausted = bool(
+            research_task_ctx.get("research_spawn_gate_wholesale_retry_exhausted")
+        )
+        spawn_gate_parse_outcome = research_task_ctx.get(
+            "research_spawn_gate_parse_outcome"
+        )
+        spawn_gate_cause = research_task_ctx.get("research_spawn_gate_cause")
+        spawn_gate_cause_counts = research_task_ctx.get(
+            "research_spawn_gate_cause_counts"
+        )
+        spawn_gate_manifest_excluded_count = int(
+            research_task_ctx.get(
+                "research_spawn_gate_manifest_excluded_fail_closed_count"
+            )
+            or 0
+        )
+        spawn_gate_manifest_excluded_samples: list[dict] = []
+        _seen_spawn_gate_manifest_excluded: set[tuple[str, str]] = set()
+        for _sg_sample in (
+            research_task_ctx.get(
+                "research_spawn_gate_manifest_excluded_fail_closed_samples"
+            )
+            or []
         ):
-            _seen_spawn_gate_manifest_excluded.add(_sample_key)
-            spawn_gate_manifest_excluded_samples.append(_sample)
-    # Compact, deduped, capped sample of refuted/unresolved challenger reasons.
-    spawn_gate_refuted_reasons: list[str] = []
-    _seen_spawn_gate_reasons: set[str] = set()
-    for _sg_reason in research_task_ctx.get("research_spawn_gate_refuted_reasons") or []:
-        _sg_reason = str(_sg_reason).strip()[:_SPAWN_GATE_REASON_MAX_LEN]
-        if (
-            _sg_reason
-            and _sg_reason not in _seen_spawn_gate_reasons
-            and len(spawn_gate_refuted_reasons) < _SPAWN_GATE_REASONS_SAMPLE_CAP
+            if not isinstance(_sg_sample, dict):
+                continue
+            _sample = {
+                "hash": str(_sg_sample.get("hash") or "")[:80],
+                "title": str(_sg_sample.get("title") or "")[:120],
+                "reason": str(_sg_sample.get("reason") or "")[
+                    :_SPAWN_GATE_REASON_MAX_LEN
+                ],
+            }
+            _sample_key = (_sample["hash"], _sample["title"])
+            if (
+                (_sample["hash"] or _sample["title"])
+                and _sample_key not in _seen_spawn_gate_manifest_excluded
+                and len(spawn_gate_manifest_excluded_samples)
+                < _SPAWN_GATE_REASONS_SAMPLE_CAP
+            ):
+                _seen_spawn_gate_manifest_excluded.add(_sample_key)
+                spawn_gate_manifest_excluded_samples.append(_sample)
+        # Compact, deduped, capped sample of refuted/unresolved challenger reasons.
+        spawn_gate_refuted_reasons: list[str] = []
+        _seen_spawn_gate_reasons: set[str] = set()
+        for _sg_reason in (
+            research_task_ctx.get("research_spawn_gate_refuted_reasons") or []
         ):
-            _seen_spawn_gate_reasons.add(_sg_reason)
-            spawn_gate_refuted_reasons.append(_sg_reason)
+            _sg_reason = str(_sg_reason).strip()[:_SPAWN_GATE_REASON_MAX_LEN]
+            if (
+                _sg_reason
+                and _sg_reason not in _seen_spawn_gate_reasons
+                and len(spawn_gate_refuted_reasons) < _SPAWN_GATE_REASONS_SAMPLE_CAP
+            ):
+                _seen_spawn_gate_reasons.add(_sg_reason)
+                spawn_gate_refuted_reasons.append(_sg_reason)
     # Adversarial give-up: findings permanently discarded after 3 consecutive
     # adversarial-gate deferrals (finding_structural_give_up.by_reason.adversarial_gate).
     _give_up = research_task_ctx.get("finding_structural_give_up") or {}
@@ -1160,14 +1203,14 @@ async def _update_direction_research_outcomes(
         1 for ct in _prev_rows if _counts_as_failure(ct)
     )
     challenged_children = [
-        ct for ct in child_tasks_rows if (ct.context or {}).get(
-            "research_spawn_gate_challenged"
-        ) is True
+        ct for ct in child_tasks_rows
+        if (ct.context or {}).get("research_spawn_gate_challenged") is True
+        and (ct.context or {}).get("direction_id") == direction_id
     ]
     unchallenged_children = [
-        ct for ct in child_tasks_rows if not (ct.context or {}).get(
-            "research_spawn_gate_challenged"
-        )
+        ct for ct in child_tasks_rows
+        if not (ct.context or {}).get("research_spawn_gate_challenged")
+        and (ct.context or {}).get("direction_id") == direction_id
     ]
     challenged_spawned = len(challenged_children)
     unchallenged_spawned = len(unchallenged_children)
