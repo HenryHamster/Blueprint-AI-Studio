@@ -1350,6 +1350,24 @@ export interface LlmCostTaskTypeRow {
   share_of_total_cost: number | null;
 }
 
+export interface ReworkPrEntry {
+  pr_number: number;
+  rework_llm_cost_usd: number;
+  rework_vm_cost_usd: number;
+}
+
+/** Per-window LLM-dollar rework attribution: first-pass vs rework split + top rework PRs. */
+export interface ReworkAttribution {
+  /** Fraction of total LLM spend attributable to rework review-fix chains (null when no priced chain data). */
+  rework_share: number | null;
+  /** LLM spend on first-pass attempts within the window. */
+  first_pass_llm_cost_usd: number;
+  /** LLM spend on rework (retry / review-fix chain) attempts within the window. */
+  rework_llm_cost_usd: number;
+  /** Top PRs ranked by rework LLM spend (descending). */
+  top_rework_prs: ReworkPrEntry[];
+}
+
 export interface LlmCostBreakdownResponse {
   window_days: number;
   generated_at: string;
@@ -1357,6 +1375,8 @@ export interface LlmCostBreakdownResponse {
   by_model: LlmCostModelRow[];
   /** Per-task-type cost attribution — same pricing table as by_model, bucketed by first_payload["type"]. */
   by_task_type: LlmCostTaskTypeRow[];
+  /** Rework attribution: first-pass vs rework LLM spend split and top rework PRs. Absent on older backends. */
+  rework_attribution?: ReworkAttribution;
   totals: {
     total_input_tokens: number;
     total_output_tokens: number;

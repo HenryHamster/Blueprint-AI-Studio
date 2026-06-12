@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { fetchLlmCostBreakdown, type LlmCostBreakdownResponse, type LlmCostTaskTypeRow } from '../api';
+import { fetchLlmCostBreakdown, type LlmCostBreakdownResponse, type LlmCostTaskTypeRow, type ReworkPrEntry } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 function fmtTokens(n: number): string {
@@ -106,6 +106,55 @@ export function LlmCostBreakdownPanel({
         <span className="font-mono">{approximate_priced_combos.join(', ')}</span>
       </div>
     </div>
+  );
+
+  const { rework_attribution } = data;
+  const ReworkSection = rework_attribution && (
+    <section className="mt-4">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+        LLM Cost Rework Attribution <span className="text-neutral-600 normal-case font-normal">· {data.window_days}d</span>
+      </h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-3">
+        <div className="flex flex-wrap gap-x-6 gap-y-1 text-[11px] mb-3">
+          <span className="text-neutral-400">
+            Rework share:{' '}
+            <span className="text-neutral-200 font-semibold tabular-nums">
+              {rework_attribution.rework_share != null
+                ? `${Math.round(rework_attribution.rework_share * 100)}%`
+                : '—'}
+            </span>
+          </span>
+          <span className="text-neutral-400">
+            First-pass:{' '}
+            <span className="text-neutral-200 font-mono tabular-nums">
+              ${rework_attribution.first_pass_llm_cost_usd.toFixed(2)}
+            </span>
+          </span>
+          <span className="text-neutral-400">
+            Rework:{' '}
+            <span className="text-neutral-200 font-mono tabular-nums">
+              ${rework_attribution.rework_llm_cost_usd.toFixed(2)}
+            </span>
+          </span>
+        </div>
+        {rework_attribution.top_rework_prs.length > 0 && (
+          <>
+            <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wider">Top rework PRs</div>
+            <div className="divide-y divide-neutral-800/30">
+              {rework_attribution.top_rework_prs.map((pr: ReworkPrEntry) => (
+                <div key={pr.pr_number} className="flex items-center justify-between py-1 text-[11px]">
+                  <span className="text-neutral-400 font-mono">#{pr.pr_number}</span>
+                  <div className="flex gap-x-4 text-neutral-500">
+                    <span>LLM: <span className="text-neutral-300 font-mono tabular-nums">${pr.rework_llm_cost_usd.toFixed(2)}</span></span>
+                    <span>VM: <span className="text-neutral-300 font-mono tabular-nums">${pr.rework_vm_cost_usd.toFixed(2)}</span></span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </section>
   );
 
   const TaskTypeSection = by_task_type.length > 0 && (
@@ -260,6 +309,7 @@ export function LlmCostBreakdownPanel({
         </table>
       </div>
       {TaskTypeSection}
+      {ReworkSection}
     </section>
   );
 }

@@ -1070,6 +1070,9 @@ async def _compute_digest(
     # operator_action_count fields (already surfaced in DirectionCard).
     overall_type_distribution = _cost_econ["overall_type_distribution"]
     pipeline_filter_funnel = _cost_econ["pipeline_filter_funnel"]
+    total_llm_cost_usd = _cost_econ["total_llm_cost_usd"]
+    llm_share_of_combined_cost = _cost_econ["llm_share_of_combined_cost"]
+    median_llm_cost_per_merged_pr = _cost_econ["median_llm_cost_per_merged_pr"]
 
     # Per-effort-tier / per-actual-model LLM efficiency rollup over the window's
     # finished (terminal) tasks. Additive — answers whether effort-tier scaling
@@ -1779,6 +1782,9 @@ async def _compute_digest(
         "daily_vm_cost_usd": _cost_econ["daily_vm_cost_usd"],
         "daily_compute_cost_usd": _cost_econ["daily_compute_cost_usd"],
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
+        "total_llm_cost_usd": total_llm_cost_usd,
+        "llm_share_of_combined_cost": llm_share_of_combined_cost,
+        "median_llm_cost_per_merged_pr": median_llm_cost_per_merged_pr,
         "narrative_summary": narrative_summary,
         "prev_completed_count": prev_completed_count,
         "prev_failed_count": prev_failed_count,

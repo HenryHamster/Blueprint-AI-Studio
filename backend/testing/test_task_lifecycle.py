@@ -4091,17 +4091,21 @@ async def test_request_changes_empty_issues_ci_green_is_approved_and_merges(
             "details": [],
         },
     )
-    assert captured == [], "Empty-issues REQUEST_CHANGES + green CI must NOT spawn a fix"
+    assert captured == [], (
+        "Empty-issues REQUEST_CHANGES + green CI must NOT spawn a fix"
+    )
     assert merge_mock.await_count >= 1, "must merge via the approve path"
-    assert (
-        review_task.context or {}
-    ).get("review_verdict_reconciled_to_approve") is True
+    assert (review_task.context or {}).get(
+        "review_verdict_reconciled_to_approve"
+    ) is True
     # NOT a verification-only case — the legacy sub-case marker must stay unset.
     assert (review_task.context or {}).get("verification_only_downgrade") is None
 
 
 @pytest.mark.asyncio
-async def test_request_changes_minor_only_ci_green_is_approved_and_merges(tl_db, mocker):
+async def test_request_changes_minor_only_ci_green_is_approved_and_merges(
+    tl_db, mocker
+):
     """REQUEST_CHANGES carrying ONLY MINOR issues + green CI → APPROVE + merge.
 
     Per the review contract MINOR findings are non-blocking ("a PR with only
@@ -4120,9 +4124,9 @@ async def test_request_changes_minor_only_ci_green_is_approved_and_merges(tl_db,
     )
     assert captured == [], "MINOR-only REQUEST_CHANGES + green CI must NOT spawn a fix"
     assert merge_mock.await_count >= 1, "must merge via the approve path"
-    assert (
-        review_task.context or {}
-    ).get("review_verdict_reconciled_to_approve") is True
+    assert (review_task.context or {}).get(
+        "review_verdict_reconciled_to_approve"
+    ) is True
     assert (review_task.context or {}).get("verification_only_downgrade") is None
 
 
@@ -4144,7 +4148,9 @@ async def test_request_changes_no_blocking_issue_ci_pending_still_blocks(tl_db, 
             "details": [],
         },
     )
-    assert captured, "No-blocking-issue + non-green CI must keep REQUEST_CHANGES blocking"
+    assert captured, (
+        "No-blocking-issue + non-green CI must keep REQUEST_CHANGES blocking"
+    )
     merge_mock.assert_not_awaited()
 
 
@@ -9962,4 +9968,294 @@ async def test_requeue_clone_strips_failure_verdict_keys(tl_db, mocker):
     # Durable diagnostic keys must survive so retry guidance renders correctly.
     assert clone_ctx.get("_previous_failure_class") == "CODE_ERROR", (
         "_previous_failure_class must be preserved in requeue clone"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _requeue_parent_task — LLM cost accumulation
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_requeue_clone_carries_prior_attempts_llm_cost(tl_db, mocker):
+    """Clone of a failed task with live LLM tokens carries accumulated
+    LLM rework dollars in _prior_attempts_llm_cost.
+
+    Exercises the symmetric LLM accumulator added alongside _prior_attempts_cost.
+    Uses anthropic/claude-sonnet-4-6 (input: $3/MTok, output: $15/MTok) so the
+    expected cost is deterministic from the pricing table.
+    """
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING
+
+    session, _ = tl_db
+
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    input_tokens = 500_000
+    output_tokens = 100_000
+    expected_cost = round(input_tokens * input_rate + output_tokens * output_rate, 6)
+
+    # Use api_call_summary (a real SQLModel Field) for live token data rather than
+    # the property-backed llm_input_tokens_banked which is not a Pydantic Field and
+    # therefore is not set by SQLModel's generated __init__.
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="Process exited with code 1",
+        context={"failure_category": "claude_code_failed"},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        api_call_summary={
+            "llm_call_count": 10,
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+        },
+    )
+    session.add(child)
+    await session.commit()
+    await session.refresh(child)
+
+    await _requeue_parent_task(parent, session)
+    await session.commit()
+
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(clones) == 1, f"Expected 1 QUEUED clone, got {len(clones)}"
+    clone_ctx = clones[0].context or {}
+    assert "_prior_attempts_llm_cost" in clone_ctx, (
+        "_prior_attempts_llm_cost must be present on clone when child has LLM tokens"
+    )
+    assert clone_ctx["_prior_attempts_llm_cost"] == pytest.approx(
+        expected_cost, rel=1e-6
+    ), f"Expected LLM cost {expected_cost}, got {clone_ctx['_prior_attempts_llm_cost']}"
+
+
+@pytest.mark.asyncio
+async def test_requeue_llm_cost_accumulates_across_two_requeueues(tl_db, mocker):
+    """Second requeue accumulates LLM cost across both prior failed attempts."""
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING
+
+    session, _ = tl_db
+
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    in1, out1 = 200_000, 50_000
+    in2, out2 = 300_000, 80_000
+    cost1 = round(in1 * input_rate + out1 * output_rate, 6)
+    cost2 = round(in2 * input_rate + out2 * output_rate, 6)
+
+    # First failed child — use api_call_summary (a real SQLModel Field) for tokens.
+    child1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="fail 1",
+        context={"failure_category": "claude_code_failed"},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        api_call_summary={
+            "llm_call_count": 5,
+            "total_input_tokens": in1,
+            "total_output_tokens": out1,
+        },
+    )
+    session.add(child1)
+    await session.commit()
+    await session.refresh(child1)
+
+    # First requeue -> produces clone1 (QUEUED)
+    await _requeue_parent_task(parent, session)
+    await session.commit()
+
+    clones1 = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(clones1) == 1
+    clone1 = clones1[0]
+    assert (clone1.context or {}).get("_prior_attempts_llm_cost") == pytest.approx(
+        cost1, rel=1e-6
+    )
+
+    # Now fail clone1 with more LLM spend, and requeue again
+    clone1.status = TaskStatus.FAILED
+    clone1.latest_status_message = "fail 2"
+    clone1.provider = "anthropic"
+    clone1.model = "claude-sonnet-4-6"
+    clone1.api_call_summary = {
+        "llm_call_count": 8,
+        "total_input_tokens": in2,
+        "total_output_tokens": out2,
+    }
+    session.add(clone1)
+    await session.commit()
+    await session.refresh(clone1)
+
+    await session.refresh(parent)
+    await _requeue_parent_task(parent, session)
+    await session.commit()
+
+    clones2 = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(clones2) == 1
+    clone2_ctx = clones2[0].context or {}
+    expected_total = round(cost1 + cost2, 6)
+    assert clone2_ctx.get("_prior_attempts_llm_cost") == pytest.approx(
+        expected_total, rel=1e-6
+    ), (
+        f"Expected accumulated cost {expected_total}, got {clone2_ctx.get('_prior_attempts_llm_cost')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requeue_llm_cost_absent_when_no_llm_data(tl_db, mocker):
+    """Clone of a failed task with no LLM token data omits _prior_attempts_llm_cost."""
+    session, _ = tl_db
+
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="fail no llm",
+        context={"failure_category": "INFRA"},
+        # No provider/model/token fields set
+    )
+    session.add(child)
+    await session.commit()
+    await session.refresh(child)
+
+    await _requeue_parent_task(parent, session)
+    await session.commit()
+
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+    # Key must be absent (or zero) when there are no LLM tokens to price
+    assert clone_ctx.get("_prior_attempts_llm_cost", 0.0) == 0.0, (
+        "_prior_attempts_llm_cost must be absent or 0 when child has no LLM data"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requeue_llm_cost_zero_for_unpriced_provider_model(tl_db, mocker):
+    """Tokens from an unknown provider/model contribute $0 and never block requeue."""
+    session, _ = tl_db
+
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="fail unpriced",
+        context={"failure_category": "claude_code_failed"},
+        provider="unknown-provider",
+        model="unknown-model-xyz",
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 999_000,
+            "total_output_tokens": 200_000,
+        },
+    )
+    session.add(child)
+    await session.commit()
+    await session.refresh(child)
+
+    # Must not raise
+    await _requeue_parent_task(parent, session)
+    await session.commit()
+
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(clones) == 1, "Requeue must succeed even with an unpriced provider/model"
+    clone_ctx = clones[0].context or {}
+    # Unpriced combo yields $0 so key is absent or 0
+    assert clone_ctx.get("_prior_attempts_llm_cost", 0.0) == 0.0, (
+        "Unpriced provider/model must contribute $0, not fail the requeue"
     )

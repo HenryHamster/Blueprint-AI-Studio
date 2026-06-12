@@ -642,6 +642,28 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 "[REQUEUE] Failed to accumulate prior attempt cost for task %s",
                 child.id,
             )
+
+        # Accumulate LLM cost of prior failed attempts (symmetric to VM cost above).
+        # Uses _task_llm_cost from efficiency_snapshot which prices per-attempt tokens
+        # against the attempt's provider/model so multi-model chains are correct.
+        # Unpriced combos contribute $0 rather than blocking the requeue.
+        try:
+            from app.efficiency_snapshot import _task_llm_cost
+
+            _attempt_llm_cost, _ = _task_llm_cost(child)
+            if _attempt_llm_cost > 0.0:
+                _prior_llm_cost = float(
+                    clone_ctx.get("_prior_attempts_llm_cost") or 0.0
+                )
+                clone_ctx["_prior_attempts_llm_cost"] = round(
+                    _prior_llm_cost + _attempt_llm_cost, 6
+                )
+        except Exception:
+            logger.exception(
+                "[REQUEUE] Failed to accumulate prior attempt LLM cost for task %s",
+                child.id,
+            )
+
         clone_ctx["_previous_error"] = (original_status_message or "")[:5000]
         clone_ctx["_previous_failure_class"] = failure_class
         clone_ctx["_failure_class_history"] = append_failure_class_history(
