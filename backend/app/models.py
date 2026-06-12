@@ -4603,3 +4603,120 @@ class TaskWakeRegistration(SQLModel, table=True):
             "deadline_at",
         ),
     )
+
+
+class EvergreenBacklogItem(SQLModel, table=True):
+    """Durable ledger of curated "evergreen" backlog candidates.
+
+    The utilization-triggered evergreen auto-fill mechanism (direction
+    d-2877ddc7) spawns LOW-priority research probes from this ledger when the
+    fleet is idle (low utilization) or all active directions are parked /
+    proof-waiting — additive parallelism that never competes with the
+    release-critical path. Each row is one candidate, project-scoped and keyed
+    by a stable ``finding_key`` so the same latent gap is never enrolled twice.
+
+    Lifecycle (``status`` — closed vocabulary, see
+    ``app.evergreen_backlog.BACKLOG_STATUSES``):
+
+    * ``enrolled``  — eligible for selection, never spawned.
+    * ``spawned``   — a research probe is live (``spawned_task_id`` set).
+    * ``advanced``  — the probe's surviving findings spawned implementation
+                      children through the existing research_completion gates.
+    * ``verified_stale`` — the probe's findings were rejected / non-actionable
+                      by the reproduce-on-HEAD / actionability gates; the gap no
+                      longer reproduces, so the item retires.
+    * ``retired``   — exhausted attempts or operator-retired; no longer eligible.
+
+    NO direct fix/create spawn path touches this table — implementation children
+    come only from research_completion's surviving-finding gates.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # Stable per-project dedup key for the latent gap this item represents.
+    finding_key: str = Field(
+        sa_column=Column(String(128), nullable=False, index=True),
+    )
+
+    title: str = Field(sa_column=Column(String(512), nullable=False))
+    detail: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+
+    # Lifecycle status (closed vocabulary — validated in app.evergreen_backlog).
+    status: str = Field(
+        sa_column=Column(String(32), nullable=False, server_default="enrolled"),
+    )
+    # Terminal/interim outcome reason (closed vocabulary), nullable until set.
+    outcome: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    # How the item was enrolled: e.g. "manual", "deferred_memo".
+    provenance: str = Field(
+        sa_column=Column(String(64), nullable=False, server_default="manual"),
+    )
+
+    # Optional direction this candidate belongs to (free-form id; conflict checks
+    # use it to skip enrolling against a direction that already has live work).
+    direction_id: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True, index=True)
+    )
+
+    attempts: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
+    # The research probe currently representing this item (nullable; SET NULL so
+    # the ledger row outlives the task row for durable provenance).
+    spawned_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    # SHA the most recent probe verified its finding against (reproduce-on-HEAD).
+    verified_against_sha: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        # Project-scoped finding-key uniqueness: the same latent gap can never be
+        # enrolled twice within a project.
+        UniqueConstraint(
+            "project_id",
+            "finding_key",
+            name="uq_evergreenbacklogitem_project_finding",
+        ),
+        # Selection hot path: scan a project's enrolled candidates by status.
+        Index(
+            "ix_evergreenbacklogitem_project_status",
+            "project_id",
+            "status",
+        ),
+    )

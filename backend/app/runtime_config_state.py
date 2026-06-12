@@ -89,6 +89,38 @@ runtime_config: Dict = {
     "max_autonomous_tasks_per_hour": 12,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
+    # --- Utilization-triggered evergreen backlog auto-fill (d-2877ddc7) ---
+    # Phase-0, defaulted OFF. When idle (low utilization) or all active
+    # directions are parked/proof-waiting, spawn ONE low-priority research probe
+    # from the curated EvergreenBacklogItem ledger — additive parallelism that
+    # never competes with the release-critical path.
+    #   off     — never act (default).
+    #   observe — evaluate + record the would-be decision, create nothing.
+    #   enforce — act on a CREATE decision.
+    "evergreen_fill_mode": os.getenv("EVERGREEN_FILL_MODE", "off").lower()
+    if os.getenv("EVERGREEN_FILL_MODE", "off").lower() in ("off", "observe", "enforce")
+    else "off",
+    # Throttle interval for the orchestrator's _check_evergreen_fill() sibling.
+    "evergreen_fill_interval_minutes": int(
+        os.getenv("EVERGREEN_FILL_INTERVAL_MINUTES", "15")
+    ),
+    # Utilization at/above which the fleet is "busy" — no idle-fill trigger.
+    "evergreen_fill_util_threshold": float(
+        os.getenv("EVERGREEN_FILL_UTIL_THRESHOLD", "0.5")
+    ),
+    # Minimum free VM slots required before an evergreen probe may spawn.
+    "evergreen_fill_min_free_slots": int(
+        os.getenv("EVERGREEN_FILL_MIN_FREE_SLOTS", "2")
+    ),
+    # Hard cap on concurrently-live evergreen probes (status == spawned).
+    "evergreen_fill_max_active": int(os.getenv("EVERGREEN_FILL_MAX_ACTIVE", "1")),
+    # Per-project daily cap on evergreen probe spawns.
+    "evergreen_fill_daily_cap": int(os.getenv("EVERGREEN_FILL_DAILY_CAP", "3")),
+    # Allow enrolling backlog items from deferred research memos (provenance).
+    "evergreen_fill_deferred_memo_enrollment": os.getenv(
+        "EVERGREEN_FILL_DEFERRED_MEMO_ENROLLMENT", "false"
+    ).lower()
+    in ("1", "true", "yes"),
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:

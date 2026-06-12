@@ -1501,6 +1501,7 @@ async def orchestrator_worker():
         _check_pause_mode,
     )
     from app.autonomous_research import _check_idle_research
+    from app.evergreen_backlog import check_evergreen_fill as _check_evergreen_fill
     from app.rollup_management import _verify_pr_merged
     from app.review_pipeline import _spawn_pipeline_task
     from app.broadcast import broadcast_to_project, manager as ws_manager
@@ -3068,14 +3069,18 @@ async def orchestrator_worker():
                     # the slot, so the handler can never double-release.
                     _iter_preclaimed_account_id: str | None = None
                     try:
-                        task = await _lock_dispatchable_task_for_mutation(session, _qt_id)
+                        task = await _lock_dispatchable_task_for_mutation(
+                            session, _qt_id
+                        )
                         if task is None:
                             continue
                         if task.requires_approval:
                             await session.rollback()
                             continue
-                        resource_defer_msg = await _project_resource_dispatch_defer_message(
-                            session, task, project_active_counts
+                        resource_defer_msg = (
+                            await _project_resource_dispatch_defer_message(
+                                session, task, project_active_counts
+                            )
                         )
                         if resource_defer_msg:
                             logger.info(
@@ -3206,7 +3211,9 @@ async def orchestrator_worker():
                                     source_states=(_PoolVmState.LEASED,),
                                 )
                                 if _clear_reason != "circuit_breaker":
-                                    _shared_state.record_pool_claim_failure(_clear_reason)
+                                    _shared_state.record_pool_claim_failure(
+                                        _clear_reason
+                                    )
                                 # _pin_task_to_pool_vm stamped this retiring member's
                                 # vm_instance_id onto the task. Reset it so the cold
                                 # fall-through below mints a FRESH agent-vm- id instead
@@ -3271,7 +3278,9 @@ async def orchestrator_worker():
                             if cached_owner is not None:
                                 dispatch_user_id = cached_owner
                             else:
-                                task_project = await session.get(Project, task.project_id)
+                                task_project = await session.get(
+                                    Project, task.project_id
+                                )
                                 dispatch_user_id = (
                                     task_project.user_id if task_project else ""
                                 )
@@ -3299,7 +3308,9 @@ async def orchestrator_worker():
                                 if not _blacklist:
                                     task.context.pop("blacklisted_accounts", None)
                                 session.add(task)
-                        _effective_blacklist = list({*(_blacklist or []), *_sticky}) or None
+                        _effective_blacklist = (
+                            list({*(_blacklist or []), *_sticky}) or None
+                        )
                         runtime_selection = await select_llm_runtime_for_task(
                             user_id=dispatch_user_id,
                             task=task,
@@ -3363,7 +3374,9 @@ async def orchestrator_worker():
                                         "[ORCHESTRATOR] Failed to commit warm-pool lease "
                                         f"for task {task.id}; falling back to cold provision"
                                     )
-                                    _shared_state.record_pool_claim_failure("commit_error")
+                                    _shared_state.record_pool_claim_failure(
+                                        "commit_error"
+                                    )
                                     # Release the slot pre-reserved during runtime
                                     # selection (select_max_plan_account pre-increments
                                     # active_tasks under lock). This early-exit abandons
@@ -3485,12 +3498,14 @@ async def orchestrator_worker():
                             runtime_model = runtime_selection.model or runtime_model
                             runtime_execution_mode = runtime_selection.execution_mode
                             runtime_provider_settings = runtime_selection.settings
-                        account = runtime_selection.account if runtime_selection else None
+                        account = (
+                            runtime_selection.account if runtime_selection else None
+                        )
                         if account:
                             account_id = account["id"]
-                            runtime_secret = account.get("runtime_secret") or account.get(
-                                "oauth_token"
-                            )
+                            runtime_secret = account.get(
+                                "runtime_secret"
+                            ) or account.get("oauth_token")
                             claude_config_json = account.get("claude_config_json")
                             runtime_provider_metadata = (
                                 account.get("provider_metadata") or {}
@@ -3561,7 +3576,9 @@ async def orchestrator_worker():
                                 # is visible, but pool exhaustion is a wait condition — we never
                                 # auto-fail the task; it stays in retry_after until the pool recovers.
                                 try:
-                                    _resets = int(stall_ctx.get("_retry_after_resets") or 0)
+                                    _resets = int(
+                                        stall_ctx.get("_retry_after_resets") or 0
+                                    )
                                     _reset_threshold = _runtime_config.get(
                                         "retry_after_reset_alert_threshold", 8
                                     )
@@ -3570,13 +3587,17 @@ async def orchestrator_worker():
                                     )
                                     if _action == "alert":
                                         from app.models import Alert, AlertSeverity
-                                        from app.max_plan_pool import describe_pool_blockage
+                                        from app.max_plan_pool import (
+                                            describe_pool_blockage,
+                                        )
 
                                         _blockage = describe_pool_blockage(
                                             task_model, user_id=dispatch_user_id
                                         )
                                         _hold_min = (
-                                            (_utcnow() - task.created_at).total_seconds()
+                                            (
+                                                _utcnow() - task.created_at
+                                            ).total_seconds()
                                             / 60
                                             if task.created_at
                                             else 0.0
@@ -3781,7 +3802,9 @@ async def orchestrator_worker():
                             VM_PROVISIONING_MODEL == "SPOT"
                         ) and not _force_standard
                         task.last_heartbeat = None
-                        _shared_state.deploy_monitoring["last_dispatch_time"] = _utcnow()
+                        _shared_state.deploy_monitoring["last_dispatch_time"] = (
+                            _utcnow()
+                        )
                         session.add(task)
                         try:
                             await session.commit()
@@ -3861,7 +3884,9 @@ async def orchestrator_worker():
                             success = False
                             try:
                                 t_type = (
-                                    (payloads[0] or {}).get("type", "") if payloads else ""
+                                    (payloads[0] or {}).get("type", "")
+                                    if payloads
+                                    else ""
                                 )
 
                                 # Upload payload to GCS and store agent credentials in Secret Manager
@@ -3923,8 +3948,10 @@ async def orchestrator_worker():
                                     # If so, this VM is an orphan: delete it immediately.
                                     try:
                                         async with AsyncSessionLocal() as hb_session:
-                                            hb_task = await _lock_provisioning_task_for_vm(
-                                                hb_session, t_id, vm_id
+                                            hb_task = (
+                                                await _lock_provisioning_task_for_vm(
+                                                    hb_session, t_id, vm_id
+                                                )
                                             )
                                             if hb_task is None:
                                                 current_task = await hb_session.get(
@@ -3932,7 +3959,8 @@ async def orchestrator_worker():
                                                 )
                                                 if (
                                                     not current_task
-                                                    or current_task.vm_instance_id != vm_id
+                                                    or current_task.vm_instance_id
+                                                    != vm_id
                                                 ):
                                                     current_vm = (
                                                         current_task.vm_instance_id
@@ -3983,14 +4011,17 @@ async def orchestrator_worker():
                                         120
                                     )  # Wait for GCP thread to finish
                                     await _ensure_vm_deleted(
-                                        orphan_vm_id, reason="cancelled_provision_orphan"
+                                        orphan_vm_id,
+                                        reason="cancelled_provision_orphan",
                                     )
 
                                 _cleanup_key = f"orphan_cleanup_{vm_id}"
                                 _cleanup_task = asyncio.create_task(
                                     _delayed_orphan_cleanup(vm_id)
                                 )
-                                _shared_state.background_tasks[_cleanup_key] = _cleanup_task
+                                _shared_state.background_tasks[_cleanup_key] = (
+                                    _cleanup_task
+                                )
                                 # Drop the dict entry once the task finishes so we don't retain
                                 # completed asyncio.Task objects indefinitely (seen ~100s of these
                                 # accumulating per day of provision churn — direct memory growth).
@@ -4059,7 +4090,9 @@ async def orchestrator_worker():
                                                     ctx["last_serial_log"] = serial_log
 
                                                 # Classify: infra-wide (zone/quota exhaustion) vs task-specific
-                                                err_lower = (provision_err or "").lower()
+                                                err_lower = (
+                                                    provision_err or ""
+                                                ).lower()
                                                 is_infra = (
                                                     any(
                                                         p in err_lower
@@ -4072,7 +4105,8 @@ async def orchestrator_worker():
                                                     # Infrastructure-wide failure — don't burn retry budget
                                                     infra_count = (
                                                         ctx.get(
-                                                            "provision_failures_infra", 0
+                                                            "provision_failures_infra",
+                                                            0,
                                                         )
                                                         + 1
                                                     )
@@ -4081,13 +4115,16 @@ async def orchestrator_worker():
                                                     )
                                                     ctx["_infra_wait"] = True
                                                     bank_task_current_attempt(
-                                                        failed_task, stopped_at=_utcnow()
+                                                        failed_task,
+                                                        stopped_at=_utcnow(),
                                                     )
                                                     ctx = with_task_attempt_banking(
                                                         failed_task, ctx
                                                     )
                                                     failed_task.context = ctx
-                                                    failed_task.status = TaskStatus.QUEUED
+                                                    failed_task.status = (
+                                                        TaskStatus.QUEUED
+                                                    )
                                                     failed_task.vm_instance_id = (
                                                         f"agent-vm-{uuid.uuid4().hex}"
                                                     )
@@ -4100,14 +4137,24 @@ async def orchestrator_worker():
                                                     # naive _utcnow() subtraction here raised
                                                     # TypeError, rolling back this QUEUED status +
                                                     # retry_after_until.
-                                                    recovery_wait = zone_recovery_wait_seconds()
+                                                    recovery_wait = (
+                                                        zone_recovery_wait_seconds()
+                                                    )
                                                     if recovery_wait is not None:
-                                                        wait_sec = max(60, recovery_wait + 60)
-                                                        delay_min = min(wait_sec / 60, 30)
+                                                        wait_sec = max(
+                                                            60, recovery_wait + 60
+                                                        )
+                                                        delay_min = min(
+                                                            wait_sec / 60, 30
+                                                        )
                                                     else:
                                                         delay_min = 10
-                                                    set_retry_after(failed_task, delay_min)
-                                                    ctx = dict(failed_task.context or {})
+                                                    set_retry_after(
+                                                        failed_task, delay_min
+                                                    )
+                                                    ctx = dict(
+                                                        failed_task.context or {}
+                                                    )
                                                     failed_task.latest_status_message = f"Infra-wide provision failure (#{infra_count}), requeued — waiting for zone recovery: {provision_err or 'unknown'}"[
                                                         :500
                                                     ]
@@ -4117,16 +4164,22 @@ async def orchestrator_worker():
                                                 else:
                                                     # Task-specific failure — burn retry budget
                                                     prov_failures = (
-                                                        ctx.get("provision_failures", 0) + 1
+                                                        ctx.get("provision_failures", 0)
+                                                        + 1
                                                     )
                                                     ctx["provision_failures"] = (
                                                         prov_failures
                                                     )
                                                     ctx.pop("_infra_wait", None)
-                                                    max_prov_retries = _runtime_config.get(
-                                                        "max_provision_retries", 3
+                                                    max_prov_retries = (
+                                                        _runtime_config.get(
+                                                            "max_provision_retries", 3
+                                                        )
                                                     )
-                                                    if prov_failures >= max_prov_retries:
+                                                    if (
+                                                        prov_failures
+                                                        >= max_prov_retries
+                                                    ):
                                                         # Exhausted retries — permanent failure
                                                         failed_task.status = (
                                                             TaskStatus.FAILED
@@ -4135,19 +4188,23 @@ async def orchestrator_worker():
                                                         ctx["failure_category"] = (
                                                             "PROVISION_FAILURE"
                                                         )
-                                                        await _maybe_create_failure_alert(
-                                                            failed_task,
-                                                            inner_session,
-                                                            (
-                                                                provision_err
-                                                                or "unknown error"
-                                                            )[:200],
+                                                        await (
+                                                            _maybe_create_failure_alert(
+                                                                failed_task,
+                                                                inner_session,
+                                                                (
+                                                                    provision_err
+                                                                    or "unknown error"
+                                                                )[:200],
+                                                            )
                                                         )
                                                         try:
                                                             record_task_result(
                                                                 success=False,
                                                                 failure_class="PROVISION_FAILURE",
-                                                                task_id=str(failed_task.id),
+                                                                task_id=str(
+                                                                    failed_task.id
+                                                                ),
                                                                 task_type=(
                                                                     failed_task.first_payload
                                                                     or {}
@@ -4195,14 +4252,15 @@ async def orchestrator_worker():
                                                         failed_task.status = (
                                                             TaskStatus.QUEUED
                                                         )
-                                                        failed_task.vm_instance_id = (
-                                                            f"agent-vm-{uuid.uuid4().hex}"
+                                                        failed_task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                                                        failed_task.last_heartbeat = (
+                                                            None
                                                         )
-                                                        failed_task.last_heartbeat = None
                                                         failed_task.started_at = None
                                                         # Back off 2 min per failure to let zones recover
                                                         set_retry_after(
-                                                            failed_task, 2 * prov_failures
+                                                            failed_task,
+                                                            2 * prov_failures,
                                                         )
                                                         ctx = dict(
                                                             failed_task.context or {}
@@ -4212,9 +4270,14 @@ async def orchestrator_worker():
                                                             f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing"
                                                         )
 
-                                                if failed_task.status == TaskStatus.QUEUED:
-                                                    ctx = clear_task_llm_runtime_context(
-                                                        ctx
+                                                if (
+                                                    failed_task.status
+                                                    == TaskStatus.QUEUED
+                                                ):
+                                                    ctx = (
+                                                        clear_task_llm_runtime_context(
+                                                            ctx
+                                                        )
                                                     )
                                                 failed_task.context = ctx
                                                 inner_session.add(failed_task)
@@ -4264,13 +4327,18 @@ async def orchestrator_worker():
                         )
                         _provision_coroutines[str(task.id)] = provision_coro
                         provision_coro.add_done_callback(
-                            lambda _, tid=str(task.id): _provision_coroutines.pop(tid, None)
+                            lambda _, tid=str(task.id): _provision_coroutines.pop(
+                                tid, None
+                            )
                         )
 
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
-                            {"task_id": str(task.id), "status": TaskStatus.PROVISIONING},
+                            {
+                                "task_id": str(task.id),
+                                "status": TaskStatus.PROVISIONING,
+                            },
                         )
                         _cycle_dispatched += 1
                     except Exception as _dispatch_prep_exc:
@@ -6704,6 +6772,10 @@ async def orchestrator_worker():
             # Check autonomous research every cycle — interval gate inside handles throttling.
             # Spawns only when VM slots are available (not tied to queue being empty).
             await _check_idle_research()
+            # Utilization-triggered evergreen backlog auto-fill (d-2877ddc7).
+            # Defaulted OFF; interval gate + mode gate handled inside. Additive
+            # idle-fill parallelism — never competes with the release-critical path.
+            await _check_evergreen_fill()
         except asyncio.CancelledError:
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break

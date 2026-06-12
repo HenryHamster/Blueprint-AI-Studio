@@ -96,6 +96,13 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "autonomous_direction_cooldown_minutes",
         "autonomous_periodic_tasks",
         "autonomous_research_interval_minutes",
+        "evergreen_fill_mode",
+        "evergreen_fill_interval_minutes",
+        "evergreen_fill_util_threshold",
+        "evergreen_fill_min_free_slots",
+        "evergreen_fill_max_active",
+        "evergreen_fill_daily_cap",
+        "evergreen_fill_deferred_memo_enrollment",
         "category_routing",
         "ci_backstop_timeout_minutes",
         "cochange_decomposition_enabled",
@@ -317,6 +324,25 @@ async def get_settings(
         ),
         "autonomous_research_interval_minutes": _runtime_config.get(
             "autonomous_research_interval_minutes", 30
+        ),
+        "evergreen_fill_mode": str(_runtime_config.get("evergreen_fill_mode", "off")),
+        "evergreen_fill_interval_minutes": int(
+            _runtime_config.get("evergreen_fill_interval_minutes", 15)
+        ),
+        "evergreen_fill_util_threshold": float(
+            _runtime_config.get("evergreen_fill_util_threshold", 0.5)
+        ),
+        "evergreen_fill_min_free_slots": int(
+            _runtime_config.get("evergreen_fill_min_free_slots", 2)
+        ),
+        "evergreen_fill_max_active": int(
+            _runtime_config.get("evergreen_fill_max_active", 1)
+        ),
+        "evergreen_fill_daily_cap": int(
+            _runtime_config.get("evergreen_fill_daily_cap", 3)
+        ),
+        "evergreen_fill_deferred_memo_enrollment": bool(
+            _runtime_config.get("evergreen_fill_deferred_memo_enrollment", False)
         ),
         "max_concurrent_auto_remediations": _runtime_config.get(
             "max_concurrent_auto_remediations", 2
@@ -764,6 +790,92 @@ async def _apply_settings(
                 detail="autonomous_research_interval_minutes must be between 1 and 1440",
             )
         _runtime_config["autonomous_research_interval_minutes"] = val
+    if "evergreen_fill_mode" in payload:
+        val = str(payload["evergreen_fill_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["evergreen_fill_mode"] = val
+    if "evergreen_fill_interval_minutes" in payload:
+        try:
+            val = int(payload["evergreen_fill_interval_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_interval_minutes must be a number",
+            )
+        if not (1 <= val <= 1440):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_interval_minutes must be between 1 and 1440",
+            )
+        _runtime_config["evergreen_fill_interval_minutes"] = val
+    if "evergreen_fill_util_threshold" in payload:
+        try:
+            fval = float(payload["evergreen_fill_util_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_util_threshold must be a number",
+            )
+        if not (0.0 <= fval <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_util_threshold must be between 0.0 and 1.0",
+            )
+        _runtime_config["evergreen_fill_util_threshold"] = fval
+    if "evergreen_fill_min_free_slots" in payload:
+        try:
+            val = int(payload["evergreen_fill_min_free_slots"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_min_free_slots must be a number",
+            )
+        if not (0 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_min_free_slots must be between 0 and 100",
+            )
+        _runtime_config["evergreen_fill_min_free_slots"] = val
+    if "evergreen_fill_max_active" in payload:
+        try:
+            val = int(payload["evergreen_fill_max_active"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_max_active must be a number",
+            )
+        if not (0 <= val <= 50):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_max_active must be between 0 and 50",
+            )
+        _runtime_config["evergreen_fill_max_active"] = val
+    if "evergreen_fill_daily_cap" in payload:
+        try:
+            val = int(payload["evergreen_fill_daily_cap"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_daily_cap must be a number",
+            )
+        if not (0 <= val <= 200):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_daily_cap must be between 0 and 200",
+            )
+        _runtime_config["evergreen_fill_daily_cap"] = val
+    if "evergreen_fill_deferred_memo_enrollment" in payload:
+        raw = payload["evergreen_fill_deferred_memo_enrollment"]
+        if not isinstance(raw, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_deferred_memo_enrollment must be a boolean",
+            )
+        _runtime_config["evergreen_fill_deferred_memo_enrollment"] = raw
     if "evaluating_pipeline_timeout_minutes" in payload:
         try:
             val = int(payload["evaluating_pipeline_timeout_minutes"])

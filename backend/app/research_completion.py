@@ -2851,9 +2851,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _passed = _f.get("_adversarial_verdict") != "fail"
             _explicit = bool(_f.get("_adversarial_verdict_explicit"))
             _direction_id = str(
-                _f.get("direction_id")
-                or (task.context or {}).get("direction_id")
-                or ""
+                _f.get("direction_id") or (task.context or {}).get("direction_id") or ""
             )
             if _direction_id:
                 _dir_entry = _spawn_gate_dir_entry(_direction_id)
@@ -2916,7 +2914,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _fh(
                     str(_f.get("title", "")),
                     str(_f.get("description", "") or _f.get("prompt", "")),
-                ): str(_f.get("direction_id") or (task.context or {}).get("direction_id") or "")
+                ): str(
+                    _f.get("direction_id")
+                    or (task.context or {}).get("direction_id")
+                    or ""
+                )
                 for _f in findings
             }
             for _sample in _spawn_gate_manifest_excluded_samples:
@@ -5138,6 +5140,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _impl_spawned + len(_batch_cap_deferred) + len(_degradation_gate_deferred)
     )
     _record_research_survival_signal(task, surviving=_surviving_findings)
+
+    # Evergreen backlog adapter: if this research probe was spawned from the
+    # evergreen ledger, transition its row from the probe's outcome. Children
+    # still come ONLY from the surviving-finding gates above (_impl_spawned) —
+    # this adapter never creates a fix/create task, it only records the verdict.
+    _evergreen_item_id = (task.context or {}).get("evergreen_backlog_item_id")
+    if _evergreen_item_id:
+        try:
+            from app.evergreen_backlog import apply_research_outcome
+
+            await apply_research_outcome(
+                session,
+                item_id=str(_evergreen_item_id),
+                impl_spawned=_impl_spawned,
+                reproduce_rejected=len(_reproduce_rejected),
+                surviving=_surviving_findings,
+            )
+        except Exception as _eg_exc:  # noqa: BLE001 — outcome adapter must not block completion
+            logger.warning(
+                "[EVERGREEN] failed to apply research outcome for item %s: %s",
+                _evergreen_item_id,
+                _eg_exc,
+            )
 
     # Flip the parent to EVALUATING ATOMICALLY with the child-task INSERTs in the
     # commit below, so the durable post-spawn state is never COMPLETED-with-children.
