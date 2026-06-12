@@ -737,7 +737,11 @@ async def get_lane_diag(
             t
             for t in all_terminal_tasks
             if t.created_at is None
-            or (t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at)
+            or (
+                t.created_at.replace(tzinfo=None)
+                if t.created_at.tzinfo
+                else t.created_at
+            )
             < window_end
         ]
     original_tasks = await _load_outer_loop_original_tasks(
@@ -1203,11 +1207,9 @@ async def get_open_prs(
     )
     for t in active_tasks:
         ctx = t.context or {}
-        context_pr_num: int | None = (
-            (ctx.get("review_loop") or {}).get("pr_number") or ctx.get(
-            "rollup_pr_number"
-            )
-        )
+        context_pr_num: int | None = (ctx.get("review_loop") or {}).get(
+            "pr_number"
+        ) or ctx.get("rollup_pr_number")
         if context_pr_num and isinstance(context_pr_num, int):
             pr_task_map.setdefault(context_pr_num, {})[t.id] = t
 
@@ -1381,6 +1383,19 @@ async def get_improvement_lanes(
                 "reserved_idle_cost_usd_total": round(
                     lane.reserved_idle_cost_usd_total or 0.0, 6
                 ),
+                # Reservation expiry-cause telemetry so an operator can see WHY a
+                # lane's warm_resume_fraction is low: how many reservations the
+                # fix actually claimed vs. expired-before-fix vs. force-expired
+                # (hard ceiling / KILL / retire / reaped member).
+                "reservation_claimed_by_fix_count": (
+                    lane.reservation_claimed_by_fix_count or 0
+                ),
+                "reservation_expired_before_fix_count": (
+                    lane.reservation_expired_before_fix_count or 0
+                ),
+                "reservation_force_expired_count": (
+                    lane.reservation_force_expired_count or 0
+                ),
                 "shadow": shadow,
                 "created_at": lane.created_at.isoformat() if lane.created_at else None,
                 "updated_at": lane.updated_at.isoformat() if lane.updated_at else None,
@@ -1426,12 +1441,11 @@ async def get_lane_baselines(
     if proj_doc is None:
         # Distinguish "project not found" from "project has null design_doc"
         exists = (
-            await session.execute(
-                select(Project.id).where(Project.id == project_id)
-            )
+            await session.execute(select(Project.id).where(Project.id == project_id))
         ).scalar_one_or_none()
         if exists is None:
             from fastapi import HTTPException  # noqa: PLC0415
+
             raise HTTPException(status_code=404, detail="Project not found")
 
     raw_baselines: dict = {}
@@ -1487,9 +1501,7 @@ async def drain_improvement_lane_pilot(
         project_id, current_user["user_id"], session, "owner"
     )
 
-    report = await apply_lane_pilot_kill(
-        session, project_id, reason="operator_drain"
-    )
+    report = await apply_lane_pilot_kill(session, project_id, reason="operator_drain")
 
     # Record a durable KILL verdict so the spawn gate survives runtime_config
     # reload. Uses the same evidence_source and verdict shape as the automated
@@ -1510,4 +1522,178 @@ async def drain_improvement_lane_pilot(
     return {
         "project_id": str(project_id),
         **report,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/improvement-lanes/preflight
+# ---------------------------------------------------------------------------
+
+
+@router.get("/improvement-lanes/preflight")
+async def get_lane_pilot_preflight(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return lane-pilot enablement readiness for a project.
+
+    Reports each precondition as a named check: met/unmet, the blocking value
+    (what is currently set), and a short fix_hint for each unmet check.  The
+    overall ``ready`` field is True only when ALL checks pass.
+
+    Checks performed (in display order):
+    - warm_pool_enabled: master switch must be on.
+    - project_in_scope: project must be in warm_pool_project_allowlist, or the
+      allowlist must be empty (fleet-wide mode).
+    - warm_pool_target_nonzero: effective IDLE target must be > 0.
+    - no_kill_verdict: no durable KILL verdict on the pilot capability.
+    - pilot_eligible: project must be the Blueprint self-repo.
+    - pilot_flags_enabled: both improvement_lanes_enabled and
+      review_fix_lane_pilot_enabled must be True.
+
+    This endpoint is read-only and cheap: it reads runtime config (in-memory)
+    plus a single project row lookup.  It does NOT poll or count pool members.
+    """
+    from app.warm_pool import (  # noqa: PLC0415
+        is_warm_pool_enabled,
+        is_project_warm_pool_scoped,
+        resolve_project_warm_pool_target,
+        warm_pool_project_scope,
+    )
+    from app.review_fix_lane_pilot import (  # noqa: PLC0415
+        is_review_fix_lane_killed,
+        is_pilot_eligible_project,
+        LANE_PILOT_CAP_NAME,
+    )
+    from app.runtime_config_state import (  # noqa: PLC0415
+        is_improvement_lanes_enabled,
+        is_review_fix_lane_pilot_enabled,
+    )
+
+    # Load the project row to check KILL verdict and eligibility.
+    project = (
+        await session.execute(select(Project).where(Project.id == project_id))
+    ).scalar_one_or_none()
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    checks: List[Dict[str, Any]] = []
+
+    # ── 1. Warm pool master switch ────────────────────────────────────────────
+    pool_on = is_warm_pool_enabled()
+    checks.append(
+        {
+            "name": "warm_pool_enabled",
+            "met": pool_on,
+            "blocking_value": str(pool_on),
+            "fix_hint": (
+                "Set warm_pool_enabled=true via PATCH /api/admin/settings."
+                if not pool_on
+                else None
+            ),
+        }
+    )
+
+    # ── 2. Project in warm pool scope ─────────────────────────────────────────
+    in_scope = is_project_warm_pool_scoped(project_id)
+    scope_list = sorted(warm_pool_project_scope())
+    scope_display = (
+        ", ".join(scope_list) if scope_list else "(fleet-wide — all projects)"
+    )
+    checks.append(
+        {
+            "name": "project_in_scope",
+            "met": in_scope,
+            "blocking_value": scope_display,
+            "fix_hint": (
+                f"Add {project_id} to warm_pool_project_allowlist, or clear the allowlist for fleet-wide mode."
+                if not in_scope
+                else None
+            ),
+        }
+    )
+
+    # ── 3. Non-zero effective pool target ─────────────────────────────────────
+    target = resolve_project_warm_pool_target(project_id)
+    checks.append(
+        {
+            "name": "warm_pool_target_nonzero",
+            "met": target > 0,
+            "blocking_value": str(target),
+            "fix_hint": (
+                "Set warm_pool_target_size (global) or warm_pool_target_size_by_project for this project to ≥1."
+                if target == 0
+                else None
+            ),
+        }
+    )
+
+    # ── 4. No durable KILL verdict ────────────────────────────────────────────
+    killed = is_review_fix_lane_killed(project)
+    kill_entry: Dict[str, Any] | None = None
+    if killed:
+        verdicts = getattr(project, "capability_adoption_verdicts", None) or {}
+        kill_entry = verdicts.get(LANE_PILOT_CAP_NAME)
+    checks.append(
+        {
+            "name": "no_kill_verdict",
+            "met": not killed,
+            "blocking_value": (
+                kill_entry.get("verdict_reason", "KILL") if kill_entry else "none"
+            ),
+            "fix_hint": (
+                "A durable KILL verdict is recorded. Clear capability_adoption_verdicts[review_fix_lane] via direct DB edit or a future admin endpoint."
+                if killed
+                else None
+            ),
+        }
+    )
+
+    # ── 5. Project is pilot-eligible (Blueprint self-repo) ───────────────────
+    eligible = is_pilot_eligible_project(project)
+    checks.append(
+        {
+            "name": "pilot_eligible",
+            "met": eligible,
+            "blocking_value": str(eligible),
+            "fix_hint": (
+                "Pilot is restricted to the Blueprint self-repo. This project is not eligible."
+                if not eligible
+                else None
+            ),
+        }
+    )
+
+    # ── 6. Pilot feature flags ────────────────────────────────────────────────
+    lanes_flag = is_improvement_lanes_enabled()
+    pilot_flag = is_review_fix_lane_pilot_enabled()
+    flags_on = lanes_flag and pilot_flag
+    checks.append(
+        {
+            "name": "pilot_flags_enabled",
+            "met": flags_on,
+            "blocking_value": f"improvement_lanes_enabled={lanes_flag}, review_fix_lane_pilot_enabled={pilot_flag}",
+            "fix_hint": (
+                "Enable both improvement_lanes_enabled and review_fix_lane_pilot_enabled via PATCH /api/admin/settings."
+                if not flags_on
+                else None
+            ),
+        }
+    )
+
+    ready = all(c["met"] for c in checks)
+
+    # Surface durable verdict (ADOPT/KILL) if any.
+    durable_verdict: str | None = None
+    verdicts_map = getattr(project, "capability_adoption_verdicts", None) or {}
+    entry = verdicts_map.get(LANE_PILOT_CAP_NAME)
+    if isinstance(entry, dict):
+        durable_verdict = entry.get("verdict")
+
+    return {
+        "project_id": str(project_id),
+        "ready": ready,
+        "checks": checks,
+        "durable_verdict": durable_verdict,
     }

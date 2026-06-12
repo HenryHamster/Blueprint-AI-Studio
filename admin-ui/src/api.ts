@@ -715,6 +715,35 @@ export async function drainLanePilot(projectId: string): Promise<LanePilotDrainR
   return res.json();
 }
 
+export interface LanePilotPreflightCheck {
+  name: string;
+  met: boolean;
+  blocking_value: string;
+  fix_hint: string | null;
+}
+
+export interface LanePilotPreflightResponse {
+  project_id: string;
+  ready: boolean;
+  checks: LanePilotPreflightCheck[];
+  durable_verdict: string | null;
+}
+
+export async function fetchLanePilotPreflight(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<LanePilotPreflightResponse> {
+  const res = await apiFetch(
+    `/api/admin/improvement-lanes/preflight?project_id=${encodeURIComponent(projectId)}`,
+    undefined,
+    2,
+    15000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch lane pilot preflight: ${res.status}`);
+  return res.json();
+}
+
 export interface SrMissedRetrospectivesResponse {
   items: SrMissedTask[];
   total: number;

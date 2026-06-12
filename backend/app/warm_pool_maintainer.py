@@ -1483,14 +1483,27 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     stale_vm_ids = await _stale_pool_image_ids()
     idle_cutoff = now - timedelta(seconds=idle_ttl)
 
-    # --- Pass 1: clear EXPIRED lane reservations on IDLE members ---
-    # A reservation that has outlived its TTL is cleared so the member rejoins
-    # the general pool. The reserved idle cost is settled to the fleet ledger
-    # (PoolIdleSpan via settle_pool_vm_idle_cost) AND attributed to the lane's
-    # reserved_idle_cost_usd_total so warm-park overhead is visible in lane
-    # rollups. This is a soft mutation (no reaping, member stays IDLE).
+    # --- Pass 1: liveness-aware lane-reservation sweep on IDLE members ---
+    # A reservation whose SOFT TTL has lapsed is examined. The legacy behavior
+    # (always clear on soft expiry) surrendered the warm member mid-review and
+    # made the review-fix lane pilot un-measurable. Now the soft TTL is RE-STAMPED
+    # forward (the member stays reserved) while the owning lane is still PARKED
+    # awaiting its fix and the HARD absolute ceiling has not elapsed; otherwise the
+    # reservation is cleared and the member rejoins the general pool. In all cases
+    # accrued reserved-idle cost is settled to the fleet ledger (PoolIdleSpan via
+    # settle_pool_vm_idle_cost) AND attributed to the lane's
+    # reserved_idle_cost_usd_total so warm-park overhead stays visible in lane
+    # rollups. Every mutation is a soft one (no reaping, member stays IDLE) under a
+    # FOR UPDATE row re-check so a liveness read can never open a TOCTOU window.
     from app.efficiency_snapshot import settle_pool_vm_idle_cost
+    from app.improvement_lane_ops import _TERMINAL_STATUSES
+    from app.models import ImprovementLaneStatus
     from app.runtime_config_state import is_improvement_lanes_enabled
+    from app.warm_pool import record_lane_reservation_cause
+
+    soft_ttl = int(
+        runtime_config.get("warm_pool_lane_reservation_ttl_seconds", 1800) or 1800
+    )
 
     expired_reserved_candidates = list(
         (
@@ -1507,10 +1520,10 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                     PoolVm.reservation_expires_at <= now,
                 )
             )
-        )
-        .all()
+        ).all()
     )
     cleared_expired_reservations = 0
+    extended_reservations = 0
     for member_id, vm_instance_id, lane_id, expires_at in expired_reserved_candidates:
         locked_member = (
             (
@@ -1532,24 +1545,70 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
         )
         if locked_member is None:
             continue
-        accrued = settle_pool_vm_idle_cost(locked_member, now=now, session=session)
-        locked_member.reserved_lane_id = None
-        locked_member.reservation_expires_at = None
-        session.add(locked_member)
-        cleared_expired_reservations += 1
-        # Attribute the reserved-idle cost to the lane and correct workspace
-        # state: an expired reservation means the lane's WARM_RESERVED claim is
-        # no longer valid — degrade to COLD (mirroring Pass 2's reaped-member
-        # degradation) so the lane's next phase cold-preps rather than expecting
-        # a warm workspace that no longer holds its reservation.
+
+        # Re-read liveness and the hard ceiling UNDER the row lock (no TOCTOU).
         lane = None
         if lane_id is not None and is_improvement_lanes_enabled():
             lane = await session.get(ImprovementLane, lane_id)
+        # The chain is still legitimately awaiting its fix only while the lane is
+        # PARKED (a phase completed; the next/fix phase has not been dispatched).
+        # A terminal/missing/otherwise-non-PARKED lane is no longer awaiting a fix.
+        chain_awaiting_fix = (
+            lane is not None
+            and lane.status == ImprovementLaneStatus.PARKED.value
+            and lane.status not in _TERMINAL_STATUSES
+        )
+        hard_anchor = locked_member.reservation_hard_expires_at
+        hard_elapsed = hard_anchor is None or hard_anchor <= now
+
+        # Settle accrued reserved-idle cost on EVERY touch (extend or clear) and
+        # attribute it to the lane so reserved-idle spend stays honest regardless
+        # of how long the reservation is held.
+        accrued = settle_pool_vm_idle_cost(locked_member, now=now, session=session)
+        if lane is not None and accrued > 0:
+            lane.reserved_idle_cost_usd_total = (
+                lane.reserved_idle_cost_usd_total or 0.0
+            ) + accrued
+            session.add(lane)
+
+        if chain_awaiting_fix and not hard_elapsed:
+            # Liveness extension: keep the member reserved across the long review.
+            # Re-stamp the SOFT TTL forward (so the lease predicate still treats it
+            # as actively reserved and no general request can grab it), bounded by
+            # the hard ceiling which is never re-stamped. settle_pool_vm_idle_cost
+            # already reset idle_since to now, so the idle-TTL reaper won't age it
+            # out during the wait either.
+            extended_to = min(now + timedelta(seconds=soft_ttl), hard_anchor)
+            locked_member.reservation_expires_at = extended_to
+            session.add(locked_member)
+            extended_reservations += 1
+            logger.debug(
+                "[WARM-POOL] extended lane reservation vm=%s lane=%s -> %s "
+                "(hard ceiling %s)",
+                locked_member.vm_instance_id,
+                lane_id,
+                extended_to,
+                hard_anchor,
+            )
+            continue
+
+        # Clear: either the hard ceiling forced release (pool-capacity protection)
+        # or the chain is no longer awaiting its fix. Classify the cause so a low
+        # warm_resume_fraction is diagnosable on the lanes surface.
+        cause = (
+            "force_expired"
+            if hard_elapsed and hard_anchor is not None
+            else ("expired_before_fix")
+        )
+        locked_member.reserved_lane_id = None
+        locked_member.reservation_expires_at = None
+        locked_member.reservation_hard_expires_at = None
+        session.add(locked_member)
+        cleared_expired_reservations += 1
+        # Correct workspace state: the lane's WARM_RESERVED claim is no longer
+        # valid — degrade to COLD (mirroring Pass 2's reaped-member degradation)
+        # so the lane's next phase cold-preps, and record the expiry cause.
         if lane is not None:
-            if accrued > 0:
-                lane.reserved_idle_cost_usd_total = (
-                    lane.reserved_idle_cost_usd_total or 0.0
-                ) + accrued
             if await clear_lane_warm_workspace_if_matching_member(
                 session,
                 lane_id,
@@ -1560,14 +1619,15 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                     locked_member.vm_instance_id,
                     lane_id,
                 )
-            session.add(lane)
+            await record_lane_reservation_cause(session, lane_id, cause)
         logger.debug(
-            "[WARM-POOL] cleared expired lane reservation vm=%s lane=%s accrued=$%.4f",
+            "[WARM-POOL] cleared lane reservation vm=%s lane=%s cause=%s accrued=$%.4f",
             locked_member.vm_instance_id,
             lane_id,
+            cause,
             accrued,
         )
-    if cleared_expired_reservations:
+    if cleared_expired_reservations or extended_reservations:
         await session.commit()
 
     # --- Pass 2: main reaper loop ---
@@ -1664,6 +1724,18 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
             member.state == PoolVmState.IDLE
             and member.idle_since is not None
             and member.idle_since < idle_cutoff
+            # An actively-reserved member (reservation not yet expired) is being
+            # held for a lane's fix across a long review — do NOT idle-TTL-reap it
+            # out from under the reservation. Pass 1 above re-stamps the soft TTL
+            # while the lane stays alive (bounded by the hard ceiling), so once the
+            # hard ceiling elapses Pass 1 clears the reservation and the member
+            # becomes idle-TTL-reapable on the next sweep. Pool capacity is still
+            # protected: the hard ceiling always wins.
+            and not (
+                member.reserved_lane_id is not None
+                and member.reservation_expires_at is not None
+                and member.reservation_expires_at > now
+            )
         ):
             reason = "pool_idle_ttl"
         elif zombie_teardown_armed and not is_vm_alive(
@@ -1697,10 +1769,18 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                 # gone. Affinity is an OPTIMIZATION, never a correctness dep.
                 if reserved_lane_id is not None and is_improvement_lanes_enabled():
                     try:
+                        from app.warm_pool import record_lane_reservation_cause
+
                         lane = await session.get(ImprovementLane, reserved_lane_id)
-                        if lane is not None and lane.workspace_state != "COLD":
-                            lane.workspace_state = "COLD"
-                            session.add(lane)
+                        if lane is not None:
+                            if lane.workspace_state != "COLD":
+                                lane.workspace_state = "COLD"
+                                session.add(lane)
+                            # The warm member vanished before the fix could claim
+                            # it — a forced release of the reservation.
+                            await record_lane_reservation_cause(
+                                session, reserved_lane_id, "force_expired"
+                            )
                             await session.commit()
                             logger.info(
                                 "[WARM-POOL] reserved member %s reaped (reason=%s) — "

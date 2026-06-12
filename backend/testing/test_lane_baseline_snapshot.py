@@ -9,11 +9,13 @@ import pytest
 
 from app.lane_baseline_snapshot import (
     DESIGN_DOC_KEY,
+    _MAX_BASELINES_STORED,
     _compute_relay_medians,
+    backfill_missing_lane_baselines,
     persist_version_lane_baseline,
     read_version_lane_baseline,
 )
-from app.models import TaskStatus
+from app.models import ReleaseVersion, TaskStatus
 from app.time_utils import _utcnow
 from testing.factories import make_project, make_task
 
@@ -245,8 +247,6 @@ class TestPersistVersionLaneBaseline:
     @pytest.mark.asyncio
     async def test_persist_history_cap_evicts_oldest(self, db_session):
         """Storing more than _MAX_BASELINES_STORED evicts the oldest entries."""
-        from app.lane_baseline_snapshot import _MAX_BASELINES_STORED
-
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -295,3 +295,155 @@ class TestPersistVersionLaneBaseline:
             terminal_status="promoted",
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Backfill tests
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillMissingLaneBaselines:
+    @pytest.mark.asyncio
+    async def test_backfill_persists_missing_baselines(self, db_session):
+        """backfill_missing_lane_baselines writes baselines for closed versions."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        v9_opened = now - timedelta(days=14)
+        v9_promoted = now - timedelta(days=7)
+
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=9,
+            status="promoted",
+            opened_at=v9_opened,
+            promoted_at=v9_promoted,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        backfilled = await backfill_missing_lane_baselines(project_id=project.id)
+
+        assert backfilled == [9]
+
+        await db_session.refresh(project)
+        stored = read_version_lane_baseline(project, 9)
+        assert stored is not None
+        assert stored["version_number"] == 9
+        assert stored["terminal_status"] == "promoted"
+        assert "relay_medians" in stored
+
+    @pytest.mark.asyncio
+    async def test_backfill_skips_already_stored_version(self, db_session):
+        """backfill_missing_lane_baselines is a no-op for versions with existing baselines."""
+        project = make_project()
+        project.design_doc = {
+            DESIGN_DOC_KEY: {
+                "9": {"version_number": 9, "captured_at": "2026-01-01T00:00:00"}
+            }
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=9,
+            status="promoted",
+            opened_at=now - timedelta(days=14),
+            promoted_at=now - timedelta(days=7),
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        backfilled = await backfill_missing_lane_baselines(project_id=project.id)
+
+        assert backfilled == []
+        # Original entry must be unchanged (first-write-wins)
+        await db_session.refresh(project)
+        stored = read_version_lane_baseline(project, 9)
+        assert stored["captured_at"] == "2026-01-01T00:00:00"
+
+    @pytest.mark.asyncio
+    async def test_backfill_respects_max_versions_cap(self, db_session):
+        """backfill only processes the most recent max_versions closed versions."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        for vn in range(1, 6):  # 5 closed versions
+            v = ReleaseVersion(
+                project_id=project.id,
+                version_number=vn,
+                status="promoted",
+                opened_at=now - timedelta(days=10 + vn),
+                promoted_at=now - timedelta(days=vn),
+            )
+            db_session.add(v)
+        await db_session.commit()
+
+        # Backfill with max_versions=3 — should only process the 3 most recent
+        backfilled = await backfill_missing_lane_baselines(
+            project_id=project.id, max_versions=3
+        )
+
+        assert len(backfilled) == 3
+        assert set(backfilled) == {3, 4, 5}
+
+    @pytest.mark.asyncio
+    async def test_backfill_handles_abandoned_version_closed_at(self, db_session):
+        """backfill derives closed_at from last_qualification["abandoned_at"] for abandoned versions."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        abandoned_iso = (now - timedelta(days=3)).isoformat()
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=7,
+            status="abandoned",
+            opened_at=now - timedelta(days=10),
+            last_qualification={"abandoned_at": abandoned_iso, "reason": "operator"},
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        backfilled = await backfill_missing_lane_baselines(project_id=project.id)
+
+        assert backfilled == [7]
+        await db_session.refresh(project)
+        stored = read_version_lane_baseline(project, 7)
+        assert stored is not None
+        assert stored["terminal_status"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_backfill_no_closed_versions_is_noop(self, db_session):
+        """backfill returns an empty list when the project has no closed versions."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Only an open version
+        now = _utcnow()
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            status="open",
+            opened_at=now - timedelta(days=3),
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        backfilled = await backfill_missing_lane_baselines(project_id=project.id)
+
+        assert backfilled == []
+
+    @pytest.mark.asyncio
+    async def test_backfill_unknown_project_returns_empty(self, db_session):
+        """backfill returns an empty list without error for a nonexistent project."""
+        backfilled = await backfill_missing_lane_baselines(project_id=uuid.uuid4())
+        assert backfilled == []

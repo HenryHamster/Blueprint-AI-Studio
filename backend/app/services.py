@@ -83,7 +83,9 @@ class _DeployPauseSnapshot:
         "total_manual_paused_seconds",
     )
 
-    def __init__(self, paused_at, total_manual_paused_seconds, total_auto_paused_seconds):
+    def __init__(
+        self, paused_at, total_manual_paused_seconds, total_auto_paused_seconds
+    ):
         self.paused_at = paused_at
         self.total_manual_paused_seconds = total_manual_paused_seconds
         self.total_auto_paused_seconds = total_auto_paused_seconds
@@ -683,4 +685,5 @@ from app.recovery_sweeps import (  # noqa: F401
     _recover_orphaned_tasks,
     _sweep_stranded_sidecar_sources,
     _sweep_bootstrap_recovery,
+    _sweep_lane_baseline_backfill,
 )

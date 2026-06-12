@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset } from 'lucide-react';
-import { drainLanePilot, fetchImprovementLanes, type ImprovementLaneRow, type LanePilotDrainReport } from '../api';
+import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset, XCircle } from 'lucide-react';
+import { drainLanePilot, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, formatDurationSec, parseTimestamp } from '../utils/time';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -64,15 +64,20 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
   const [draining, setDraining] = useState(false);
   const [drainResult, setDrainResult] = useState<LanePilotDrainReport | null>(null);
   const [drainError, setDrainError] = useState<string | null>(null);
+  const [preflight, setPreflight] = useState<LanePilotPreflightResponse | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     if (!projectId) return;
     setLoading(true);
     setFetchError(null);
     try {
-      const data = await fetchImprovementLanes(projectId, 50, 0, signal);
+      const [lanesData, preflightData] = await Promise.all([
+        fetchImprovementLanes(projectId, 50, 0, signal),
+        fetchLanePilotPreflight(projectId, signal).catch(() => null),
+      ]);
       if (signal?.aborted) return;
-      setLanes(data.lanes ?? []);
+      setLanes(lanesData.lanes ?? []);
+      setPreflight(preflightData);
     } catch (e) {
       if (e instanceof Error && e.name === 'AbortError') return;
       setLanes([]);
@@ -102,6 +107,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
   useEffect(() => {
     setLanes([]);
     setFetchError(null);
+    setPreflight(null);
     setLoading(Boolean(projectId));
   }, [projectId]);
 
@@ -175,6 +181,44 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
 
       {!collapsed && (
         <div className="mt-1 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-xs">
+          {preflight && (
+            <div
+              data-testid="lane-pilot-preflight"
+              className={`mb-3 rounded border p-2 ${preflight.ready ? 'border-emerald-500/30 bg-emerald-500/10' : 'border-amber-500/30 bg-amber-500/10'}`}
+            >
+              <div className="mb-1.5 flex items-center gap-1.5">
+                {preflight.ready
+                  ? <CheckCircle className="h-3 w-3 shrink-0 text-emerald-400" />
+                  : <AlertTriangle className="h-3 w-3 shrink-0 text-amber-400" />}
+                <span className={`font-semibold ${preflight.ready ? 'text-emerald-300' : 'text-amber-300'}`}>
+                  {preflight.ready ? 'Pilot ready to enable' : 'Prerequisites unmet'}
+                </span>
+                {preflight.durable_verdict && (
+                  <span className={`ml-auto rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${preflight.durable_verdict === 'KILL' ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'}`}>
+                    {preflight.durable_verdict}
+                  </span>
+                )}
+              </div>
+              <div className="space-y-0.5">
+                {preflight.checks.map((check) => (
+                  <div key={check.name} className="flex items-start gap-1.5">
+                    {check.met
+                      ? <CheckCircle className="mt-0.5 h-2.5 w-2.5 shrink-0 text-emerald-500" />
+                      : <XCircle className="mt-0.5 h-2.5 w-2.5 shrink-0 text-red-400" />}
+                    <span className={`min-w-0 ${check.met ? 'text-neutral-400' : 'text-neutral-200'}`}>
+                      <span className="font-mono">{check.name}</span>
+                      {!check.met && check.fix_hint && (
+                        <span className="ml-1 text-amber-400/80">{check.fix_hint}</span>
+                      )}
+                      {!check.met && (
+                        <span className="ml-1 text-neutral-500">({check.blocking_value})</span>
+                      )}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="mb-2 flex items-center justify-between gap-2">
             <button
               type="button"

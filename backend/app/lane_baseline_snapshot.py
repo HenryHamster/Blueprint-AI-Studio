@@ -242,6 +242,101 @@ async def persist_version_lane_baseline(
     return result["stored"]
 
 
+async def backfill_missing_lane_baselines(
+    *,
+    project_id: uuid.UUID,
+    max_versions: int = _MAX_BASELINES_STORED,
+) -> List[int]:
+    """Backfill lane baselines for recently-closed versions that lack a stored entry.
+
+    Queries up to ``max_versions`` closed (promoted or abandoned) ReleaseVersions
+    for the project, skips any version whose key already exists in
+    ``design_doc["lane_baselines"]``, and calls ``persist_version_lane_baseline``
+    for each gap.
+
+    Uses its own ``AsyncSessionLocal`` sessions per version so each persist
+    commits independently and the populate_existing lock does not overwrite
+    an earlier write in the same transaction.  Safe to run repeatedly:
+    ``persist_version_lane_baseline`` is first-write-wins idempotent.
+
+    Returns the list of version_numbers for which a baseline was written.
+    Failures on individual versions are logged and skipped (non-fatal).
+    """
+    from app.database import AsyncSessionLocal
+    from app.models import Project, ReleaseVersion
+
+    # Read the project and list of closed versions in one pass to determine gaps.
+    async with AsyncSessionLocal() as session:
+        project_row = (
+            await session.execute(select(Project).where(Project.id == project_id))
+        ).scalar_one_or_none()
+        if project_row is None:
+            return []
+
+        existing_keys = set(
+            (project_row.design_doc or {}).get(DESIGN_DOC_KEY, {}).keys()
+        )
+
+        versions = list(
+            (
+                await session.execute(
+                    select(ReleaseVersion)
+                    .where(
+                        ReleaseVersion.project_id == project_id,
+                        ReleaseVersion.status.in_(["promoted", "abandoned"]),
+                    )
+                    .order_by(ReleaseVersion.version_number.desc())
+                    .limit(max_versions)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    # Persist each missing baseline in its own session so commits are atomic
+    # and independent (mirrors the terminal-hook pattern in release_promotion /
+    # release_version).
+    backfilled: List[int] = []
+    for version in versions:
+        if str(version.version_number) in existing_keys:
+            continue
+
+        if version.status == "promoted":
+            closed_at = version.promoted_at or _utcnow()
+        else:
+            abandoned_at_str = (version.last_qualification or {}).get("abandoned_at")
+            if abandoned_at_str:
+                try:
+                    closed_at = datetime.fromisoformat(abandoned_at_str)
+                except (ValueError, TypeError):
+                    closed_at = _utcnow()
+            else:
+                closed_at = _utcnow()
+
+        try:
+            async with AsyncSessionLocal() as _snap_session:
+                result = await persist_version_lane_baseline(
+                    _snap_session,
+                    project_id=project_id,
+                    version_number=version.version_number,
+                    opened_at=version.opened_at,
+                    closed_at=closed_at,
+                    terminal_status=version.status,
+                )
+                await _snap_session.commit()
+            if result is not None:
+                backfilled.append(version.version_number)
+        except Exception:
+            logger.warning(
+                "[LANE_BASELINE] backfill: persist failed for project=%s v%d (non-fatal)",
+                project_id,
+                version.version_number,
+                exc_info=True,
+            )
+
+    return backfilled
+
+
 def read_version_lane_baseline(
     project: "Project",
     version_number: int,

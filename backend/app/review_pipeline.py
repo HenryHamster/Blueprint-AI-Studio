@@ -3356,6 +3356,7 @@ async def _spawn_pipeline_task(
         ensure_chain_lane,
         get_chain_lane,
         is_review_fix_lane_pilot_active_for_project,
+        is_review_fix_lane_shadow_active_for_project,
         lane_arm_of,
         record_lane_arm_assignment,
         strip_transient_lane_context,
@@ -3367,29 +3368,44 @@ async def _spawn_pipeline_task(
     lane_review_force_cold = False
     lane_fix_task_id: uuid.UUID | None = None
     lane_fix_to_activate = None
+    lane_fix_lease_workspace = True
     # Fetch the project for the project-aware pilot gate. The gate consults both
     # the runtime flag AND the durable persisted KILL/ADOPT verdict so a KILL
     # that survived a runtime_config reload is still honored.
     _pilot_project = await session.get(_Project, source_task.project_id)
-    if is_review_fix_lane_pilot_active_for_project(_pilot_project):
+    _lane_pilot_active = is_review_fix_lane_pilot_active_for_project(_pilot_project)
+    _lane_shadow_active = is_review_fix_lane_shadow_active_for_project(_pilot_project)
+    if _lane_pilot_active or _lane_shadow_active:
+        if _lane_shadow_active:
+            # Shadow chains must not write or forward the ITT assignment key:
+            # compute_lane_pilot_aggregates treats it as a trial sample.
+            propagated_ctx.pop(LANE_PILOT_ASSIGNMENT_KEY, None)
+            if LANE_PILOT_ASSIGNMENT_KEY in source_ctx:
+                source_ctx = dict(source_ctx)
+                source_ctx.pop(LANE_PILOT_ASSIGNMENT_KEY, None)
+                source_task.context = source_ctx
+                _flag_modified(source_task, "context")
         # Record the intent-to-treat arm ONCE for the chain (BOTH arms), keyed on
         # the immutable original create-task id, so arm membership is decided
         # before any fix-side treatment. Persisted on the source task (durable,
         # read by the measurement on terminal rows) AND propagated forward.
-        _seed = resolved_original_id or str(source_task.id)
-        record_lane_arm_assignment(source_ctx, _seed, _pilot_project)
-        _arm = lane_arm_of(source_ctx)
-        if _arm is not None:
-            propagated_ctx[LANE_PILOT_ASSIGNMENT_KEY] = _arm
-            if (source_task.context or {}).get(LANE_PILOT_ASSIGNMENT_KEY) != _arm:
-                source_task.context = source_ctx
-                _flag_modified(source_task, "context")
-        if _arm == "lane":
+        _arm = None
+        if _lane_pilot_active:
+            _seed = resolved_original_id or str(source_task.id)
+            record_lane_arm_assignment(source_ctx, _seed, _pilot_project)
+            _arm = lane_arm_of(source_ctx)
+            if _arm is not None:
+                propagated_ctx[LANE_PILOT_ASSIGNMENT_KEY] = _arm
+                if (source_task.context or {}).get(LANE_PILOT_ASSIGNMENT_KEY) != _arm:
+                    source_task.context = source_ctx
+                    _flag_modified(source_task, "context")
+        if _lane_shadow_active or _arm == "lane":
             if task_type == "review":
                 # Implement/fix phase just completed -> checkpoint the lane and
-                # move its workspace to WARM_RESERVED, then spawn the review COLD
-                # (lane ctx already stripped, warm handoff suppressed below).
-                lane_review_force_cold = True
+                # in full-pilot mode move its workspace to WARM_RESERVED, then
+                # spawn the review COLD. Shadow writes the same checkpoint/CAS
+                # evidence but leaves classic review spawning untouched.
+                lane_review_force_cold = _lane_pilot_active
                 _lane = await ensure_chain_lane(
                     session,
                     project_id=source_task.project_id,
@@ -3399,6 +3415,7 @@ async def _spawn_pipeline_task(
                     base_branch=base_branch,
                     direction_id=propagated_ctx.get("direction_id"),
                     current_task_id=source_task.id,
+                    pilot_arm="lane" if _lane_pilot_active else None,
                 )
                 _chain_lane_id = source_ctx.get(LANE_CHAIN_ID_KEY)
                 if _chain_lane_id:
@@ -3423,6 +3440,9 @@ async def _spawn_pipeline_task(
                     _lane,
                     sha=_phase_sha,
                     summary=f"lane phase complete PR #{pr_number}",
+                    reserve_workspace=_lane_pilot_active,
+                    enable_recovery=_lane_pilot_active,
+                    record_miss_marker=_lane_shadow_active,
                 )
                 if _ckpt_outcome == CHECKPOINT_PHASE_RECOVER:
                     return await _handle_lane_checkpoint_recovery(
@@ -3442,10 +3462,26 @@ async def _spawn_pipeline_task(
                 # lane ACTIVE for this phase and attach warm-resume directives +
                 # use receipts. The reviewer never reaches this branch.
                 _lane = await get_chain_lane(session, source_ctx)
-                if _lane is not None and _lane.status == ImprovementLaneStatus.PARKED.value:
-                    lane_fix_task_id = uuid.uuid4()
+                _expected_pilot_arm = "lane" if _lane_pilot_active else None
+                if (
+                    _lane is not None
+                    and _lane.status == ImprovementLaneStatus.PARKED.value
+                    and _lane.pilot_arm == _expected_pilot_arm
+                ):
+                    if _lane_pilot_active:
+                        lane_fix_task_id = uuid.uuid4()
                     lane_fix_to_activate = _lane
-                    wire_fix_lane_context(propagated_ctx, _lane)
+                    lane_fix_lease_workspace = _lane_pilot_active
+                    if _lane_pilot_active:
+                        wire_fix_lane_context(propagated_ctx, _lane)
+                elif _lane is not None:
+                    logger.info(
+                        "[LANE-PILOT] chain lane %s has pilot_arm=%s but fix mode "
+                        "expects %s; skipping lane reuse for this spawn",
+                        _lane.id,
+                        _lane.pilot_arm,
+                        _expected_pilot_arm,
+                    )
 
     # Phase 2c: warm-VM continuity pin. When the runtime flag is on AND the
     # source task's VM is still alive (IN_PROGRESS or completed within the
@@ -3543,7 +3579,12 @@ async def _spawn_pipeline_task(
     )
     session.add(new_task)
     if lane_fix_to_activate is not None:
-        await activate_lane_for_fix(session, lane_fix_to_activate, task_id=new_task.id)
+        await activate_lane_for_fix(
+            session,
+            lane_fix_to_activate,
+            task_id=new_task.id,
+            lease_workspace=lane_fix_lease_workspace,
+        )
     try:
         await session.commit()
     except IntegrityError:

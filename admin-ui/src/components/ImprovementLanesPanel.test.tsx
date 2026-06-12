@@ -6,10 +6,12 @@ const STORAGE_KEY = 'blueprint-admin:improvementLanesPanelCollapsed';
 
 const fetchImprovementLanes = vi.fn();
 const drainLanePilot = vi.fn();
+const fetchLanePilotPreflight = vi.fn().mockResolvedValue(null);
 
 vi.mock('../api', () => ({
   fetchImprovementLanes: (...args: unknown[]) => fetchImprovementLanes(...args),
   drainLanePilot: (...args: unknown[]) => drainLanePilot(...args),
+  fetchLanePilotPreflight: (...args: unknown[]) => fetchLanePilotPreflight(...args),
 }));
 
 const LANE_RESPONSE = {
@@ -78,6 +80,8 @@ describe('ImprovementLanesPanel', () => {
     cleanup();
     fetchImprovementLanes.mockReset();
     drainLanePilot.mockReset();
+    fetchLanePilotPreflight.mockReset();
+    fetchLanePilotPreflight.mockResolvedValue(null);
     localStorage.clear();
   });
 

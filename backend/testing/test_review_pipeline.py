@@ -13249,6 +13249,15 @@ def _lane_pilot_on(mocker):
     )
 
 
+def _lane_shadow_on(mocker):
+    """Enable checkpoint-only shadow mode for improvement lanes."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": False},
+        clear=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
     """Lane-arm chain: implement completion checkpoints + reserves the warm
@@ -13801,6 +13810,558 @@ async def test_lane_pilot_flag_off_classic_spawn_unchanged(db_session, mocker):
         )
     ).scalars().all()
     assert lanes == []
+
+
+@pytest.mark.asyncio
+async def test_lane_shadow_mode_creates_armless_lane_without_reservation(
+    db_session, mocker
+):
+    """Shadow mode writes real checkpoints on an armless lane without taking
+    warm-pool reservations or attaching full-pilot dispatch/prompt context."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_shadow_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    from app.models import (
+        ImprovementLane,
+        ImprovementLaneStatus,
+        PoolVm,
+        PoolVmState,
+    )
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_RESUME_CONTEXT_KEY,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    vm_id = "pool-vm-shadow-1"
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=vm_id,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 610,
+                "branch": "feat/shadow",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "abc1234def5678",
+            # Simulate a chain that was assigned before the operator switched
+            # from full pilot to shadow; shadow spawns must scrub this key.
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "_pr_changed_files": ["backend/app/shadow.py"],
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    member = PoolVm(
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        leased_task_id=source_task.id,
+    )
+    db_session.add_all([source_task, member])
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    existing_lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="shadow-old-lane",
+        goal="stale full-pilot lane",
+        branch_name="feat/shadow",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    await db_session.flush()
+    await cas_transition(
+        db_session,
+        existing_lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=source_task.id,
+    )
+    existing_lane.workspace_state = "WARM_RESERVED"
+    existing_lane.workspace_vm_instance_id = vm_id
+    db_session.add(existing_lane)
+    source_task.context = {
+        **(source_task.context or {}),
+        LANE_CHAIN_ID_KEY: str(existing_lane.id),
+    }
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=610,
+        branch="feat/shadow",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    assert review is not None
+    rctx = review.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in rctx
+    assert "improvement_lane_id" not in rctx
+    assert rctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in rctx
+    assert LANE_RESUME_CONTEXT_KEY not in rctx
+    assert rctx.get(LANE_CHAIN_ID_KEY) != str(existing_lane.id)
+    # Shadow does not force the reviewer cold: warm-continuity behaves like the
+    # classic path when the source VM is live.
+    assert rctx.get("warm_target_vm_id") == vm_id
+    assert review.vm_instance_id is None
+
+    lane_id = uuid.UUID(str(rctx[LANE_CHAIN_ID_KEY]))
+    lane = await db_session.get(ImprovementLane, lane_id)
+    assert lane is not None
+    assert lane.pilot_arm is None
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.last_checkpoint_sha == "abc1234def5678"
+    assert lane.checkpoint_seq == 1
+    assert lane.workspace_state == "COLD"
+    assert lane.workspace_vm_instance_id is None
+    assert lane.vm_cost_usd_total == 0
+    await db_session.refresh(existing_lane)
+    assert existing_lane.pilot_arm == "lane"
+    assert existing_lane.workspace_state == "WARM_RESERVED"
+    await db_session.refresh(member)
+    assert member.reserved_lane_id is None
+    assert member.state == PoolVmState.LEASED
+
+    review.status = TaskStatus.COMPLETED
+    review.vm_instance_id = "shadow-review-vm"
+    db_session.add(review)
+    await db_session.commit()
+    await db_session.refresh(review)
+    await db_session.refresh(source_task)
+    assert (source_task.context or {}).get(LANE_PILOT_ASSIGNMENT_KEY) is None
+    assert (source_task.context or {}).get(LANE_CHAIN_ID_KEY) == str(lane_id)
+
+    fix, fix_created = await _spawn_pipeline_task(
+        review,
+        "fix",
+        db_session,
+        pr_number=610,
+        branch="feat/shadow",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the review feedback",
+        current_feedback="Tighten the guard",
+        fix_reason="code_review",
+    )
+    assert fix_created is True
+    assert fix is not None
+    fctx = fix.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in fctx
+    assert fctx.get(LANE_CHAIN_ID_KEY) == str(lane_id)
+    assert "improvement_lane_id" not in fctx
+    assert fctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in fctx
+    assert LANE_RESUME_CONTEXT_KEY not in fctx
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.current_task_id == fix.id
+    assert lane.workspace_state == "COLD"
+
+    fix.status = TaskStatus.EVALUATING
+    fix.context = {
+        **fctx,
+        "head_sha": "def5678abc1234",
+        "_pr_changed_files": ["backend/app/shadow.py", "backend/app/next.py"],
+        "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+    }
+    db_session.add(fix)
+    await db_session.commit()
+    await db_session.refresh(fix)
+
+    rereview, rereview_created = await _spawn_pipeline_task(
+        fix,
+        "review",
+        db_session,
+        pr_number=610,
+        branch="feat/shadow",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert rereview_created is True
+    assert rereview is not None
+    rrctx = rereview.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in rrctx
+    assert "improvement_lane_id" not in rrctx
+    assert "lane_checkpoint_sha" not in rrctx
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.last_checkpoint_sha == "def5678abc1234"
+    assert lane.checkpoint_seq == 2
+    assert lane.pilot_arm is None
+    assert lane.workspace_state == "COLD"
+    phase_log = (lane.manifest or {}).get("phase_log") or []
+    assert len(phase_log) == 2
+    assert any("create PR#610" in entry for entry in phase_log)
+    assert any("fix PR#610" in entry for entry in phase_log)
+
+
+@pytest.mark.asyncio
+async def test_lane_fix_spawn_skips_lane_when_mode_switches_to_shadow(
+    db_session, mocker
+):
+    """A lane created while full pilot is on must not be reused if fix spawn
+    happens after the chain switches to shadow mode."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_pilot_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    from app.models import (
+        ImprovementLane,
+        ImprovementLaneStatus,
+        PoolVm,
+        PoolVmState,
+    )
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        LANE_PILOT_ASSIGNMENT_KEY,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    vm_id = "pool-vm-lane-switch-1"
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id=vm_id,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 611,
+                "branch": "feat/lane-switch",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "abc1234def5678",
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    member = PoolVm(
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        leased_task_id=source_task.id,
+    )
+    db_session.add_all([source_task, member])
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=611,
+        branch="feat/lane-switch",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    assert review is not None
+    rctx = review.context or {}
+    assert rctx.get(LANE_PILOT_ASSIGNMENT_KEY) == "lane"
+    lane_id = uuid.UUID(str(rctx[LANE_CHAIN_ID_KEY]))
+
+    lane = await db_session.get(ImprovementLane, lane_id)
+    assert lane is not None
+    assert lane.pilot_arm == "lane"
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.workspace_state == "WARM_RESERVED"
+
+    _lane_shadow_on(mocker)
+
+    review.status = TaskStatus.COMPLETED
+    review.vm_instance_id = "lane-review-vm"
+    db_session.add(review)
+    await db_session.commit()
+    await db_session.refresh(review)
+
+    fix, fix_created = await _spawn_pipeline_task(
+        review,
+        "fix",
+        db_session,
+        pr_number=611,
+        branch="feat/lane-switch",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the review feedback",
+        current_feedback="Tighten the guard",
+        fix_reason="code_review",
+    )
+    assert fix_created is True
+    assert fix is not None
+    fctx = fix.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in fctx
+    assert "improvement_lane_id" not in fctx
+    assert fctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in fctx
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.workspace_state == "WARM_RESERVED"
+
+
+@pytest.mark.asyncio
+async def test_lane_shadow_chains_do_not_contribute_to_pilot_aggregates(
+    db_session,
+):
+    """Armless shadow lanes and tasks without ITT assignment remain invisible
+    to compute_lane_pilot_aggregates."""
+    from app.improvement_lane_ops import create_lane
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        compute_lane_pilot_aggregates,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="shadow-lane",
+        goal="shadow aggregate exclusion",
+        branch_name="feat/shadow-agg",
+        base_branch="main",
+        pilot_arm=None,
+    )
+    lane.phase_requeues = 2
+    shadow_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={LANE_CHAIN_ID_KEY: str(lane.id), "pr_merged": True},
+        estimated_cost_usd=9.0,
+    )
+    db_session.add(shadow_task)
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+    assert agg["n_lane"] == 0
+    assert agg["n_control"] == 0
+    assert agg["lane_merge_rate"] is None
+    assert agg["control_merge_rate"] is None
+    assert agg["checkpoint_loss_rate"] is None
+    assert agg["lane_fix_tasks_sampled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lane_shadow_checkpoint_miss_records_reason_without_recovery_spawn(
+    db_session, mocker
+):
+    """Shadow checkpoint misses are visible but never redirect to recovery."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_shadow_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    from app.models import ImprovementLane, ImprovementLaneStatus
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY, LANE_PILOT_ASSIGNMENT_KEY
+    from app.review_pipeline import SPAWN_REASON_LANE_RECOVERY
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id="vm-shadow-miss-1",
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 611,
+                "branch": "feat/shadow-miss",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "deadbeef12345678",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=611,
+        branch="feat/shadow-miss",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    assert review is not None
+    assert review.first_payload.get("type") == "review"
+    rctx = review.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in rctx
+    assert "improvement_lane_id" not in rctx
+    lane_id = uuid.UUID(str(rctx[LANE_CHAIN_ID_KEY]))
+
+    lane = await db_session.get(ImprovementLane, lane_id)
+    assert lane is not None
+    assert lane.pilot_arm is None
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.phase_requeues == 1
+    assert lane.workspace_state == "COLD"
+    recovery_state = (lane.manifest or {}).get("recovery") or {}
+    assert recovery_state.get("reason") == "sha_not_reachable"
+    assert recovery_state.get("attempt") == 1
+    assert recovery_state.get("exhausted") is False
+
+    await db_session.refresh(source_task)
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) != SPAWN_REASON_LANE_RECOVERY
+
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    recovery_tasks = [
+        t for t in tasks
+        if (t.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_LANE_RECOVERY
+    ]
+    assert recovery_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_lane_shadow_checkpoint_owner_conflict_records_visible_reason(
+    db_session,
+):
+    """A shadow CAS owner conflict records an operator-visible marker without
+    consuming the checkpoint-miss requeue budget."""
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.models import ImprovementLaneStatus
+    from app.review_fix_lane_pilot import (
+        CHECKPOINT_PHASE_OK,
+        checkpoint_or_recover_phase,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="shadow-owner-conflict",
+        goal="record visible CAS conflict",
+        branch_name="feat/shadow-owner",
+        base_branch="main",
+        pilot_arm=None,
+    )
+    await db_session.flush()
+    owner_task_id = uuid.uuid4()
+    await cas_transition(
+        db_session,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=owner_task_id,
+    )
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={"head_sha": "abc1234def5678"},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    await db_session.refresh(lane)
+
+    outcome = await checkpoint_or_recover_phase(
+        db_session,
+        source_task,
+        lane,
+        sha="abc1234def5678",
+        summary="shadow owner conflict",
+        reserve_workspace=False,
+        enable_recovery=False,
+        record_miss_marker=True,
+    )
+
+    assert outcome == CHECKPOINT_PHASE_OK
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.current_task_id == owner_task_id
+    assert lane.phase_requeues == 0
+    recovery_state = (lane.manifest or {}).get("recovery") or {}
+    assert recovery_state.get("reason") == "owner_mismatch"
+    assert recovery_state.get("attempt") == 0
+    assert recovery_state.get("exhausted") is False
 
 
 @pytest.mark.asyncio

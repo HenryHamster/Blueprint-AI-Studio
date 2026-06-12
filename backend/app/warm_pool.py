@@ -530,6 +530,18 @@ async def lease_idle_pool_vm(
         and member.reservation_expires_at <= now
         else None
     )
+    # Claimed-by-fix: the lane is leasing a member STILL actively reserved to it
+    # (reservation not expired) — the warm-resume success path. Captured before the
+    # reservation fields are cleared so the expiry-cause telemetry can attribute it.
+    claimed_own_reservation_lane_id = (
+        member.reserved_lane_id
+        if lane_id is not None
+        and member.reserved_lane_id is not None
+        and member.reserved_lane_id == uuid.UUID(str(lane_id))
+        and member.reservation_expires_at is not None
+        and member.reservation_expires_at > now
+        else None
+    )
     member.state = PoolVmState.LEASED
     member.leased_task_id = leased_task_id
     member.lease_expires_at = now + timedelta(seconds=ttl)
@@ -545,8 +557,20 @@ async def lease_idle_pool_vm(
     # Clear any reservation — a leased member holds no reservation.
     member.reserved_lane_id = None
     member.reservation_expires_at = None
-    object.__setattr__(member, "_expired_reservation_lane_id", expired_reservation_lane_id)
+    member.reservation_hard_expires_at = None
+    object.__setattr__(
+        member, "_expired_reservation_lane_id", expired_reservation_lane_id
+    )
     session.add(member)
+    if claimed_own_reservation_lane_id is not None:
+        from app.runtime_config_state import is_improvement_lanes_enabled
+
+        if is_improvement_lanes_enabled():
+            await record_lane_reservation_cause(
+                session,
+                claimed_own_reservation_lane_id,
+                "claimed_by_fix",
+            )
     if expired_reservation_lane_id is not None:
         from app.runtime_config_state import is_improvement_lanes_enabled
 
@@ -662,13 +686,23 @@ async def release_pool_vm(
     member.idle_since = now
     if lane_id is not None:
         ttl = int(
-            _runtime_config.get("warm_pool_lane_reservation_ttl_seconds", 900) or 900
+            _runtime_config.get("warm_pool_lane_reservation_ttl_seconds", 1800) or 1800
+        )
+        hard_cap = int(
+            _runtime_config.get("warm_pool_lane_reservation_hard_cap_seconds", 5400)
+            or 5400
         )
         member.reserved_lane_id = uuid.UUID(str(lane_id))
         member.reservation_expires_at = now + timedelta(seconds=ttl)
+        # Stamp the HARD absolute ceiling ONCE, here at reservation creation, with
+        # its own anchor that survives the soft TTL being re-stamped by the
+        # liveness sweep. The cap can never be exceeded, so a stuck lane cannot
+        # pin a warm VM forever.
+        member.reservation_hard_expires_at = now + timedelta(seconds=max(hard_cap, ttl))
     else:
         member.reserved_lane_id = None
         member.reservation_expires_at = None
+        member.reservation_hard_expires_at = None
     session.add(member)
     logger.info(
         "[WARM-POOL] released pool VM vm_instance_id=%s task=%s -> IDLE "
@@ -678,6 +712,41 @@ async def release_pool_vm(
         lane_id,
     )
     return member
+
+
+# Expiry-cause -> ImprovementLane counter column. Each warm reservation ends
+# exactly one way; these counters make a low warm_resume_fraction diagnosable on
+# the lanes analytics surface.
+_LANE_RESERVATION_CAUSE_COLUMNS = {
+    "claimed_by_fix": "reservation_claimed_by_fix_count",
+    "expired_before_fix": "reservation_expired_before_fix_count",
+    "force_expired": "reservation_force_expired_count",
+}
+
+
+async def record_lane_reservation_cause(
+    session, lane_id: uuid.UUID | str, cause: str
+) -> bool:
+    """Increment the lane's expiry-cause counter for how a reservation ended.
+
+    ``cause`` is one of ``claimed_by_fix`` / ``expired_before_fix`` /
+    ``force_expired``. Implemented as a single atomic ``col = col + 1`` UPDATE so
+    concurrent reservation lifecycle events never lose a count to a read-modify-
+    write race. A no-op (returns False) for an unknown cause or a missing lane.
+    The caller owns the transaction (commit).
+    """
+    column = _LANE_RESERVATION_CAUSE_COLUMNS.get(cause)
+    if column is None:
+        return False
+    from app.models import ImprovementLane
+
+    col = getattr(ImprovementLane, column)
+    result = await session.execute(
+        update(ImprovementLane)
+        .where(ImprovementLane.id == uuid.UUID(str(lane_id)))
+        .values({column: col + 1})
+    )
+    return bool(result.rowcount)
 
 
 async def clear_lane_warm_workspace(session, lane_id: uuid.UUID | str) -> bool:
@@ -1013,7 +1082,10 @@ async def try_pool_dispatch(
                 .scalars()
                 .first()
             )
-            if expired_reservation_lane_id is not None and _lane_uuid == expired_reservation_lane_id:
+            if (
+                expired_reservation_lane_id is not None
+                and _lane_uuid == expired_reservation_lane_id
+            ):
                 logger.debug(
                     "[WARM-POOL] lane %s claimed expired reservation on vm=%s — left workspace COLD",
                     lane_id,

@@ -12,14 +12,15 @@ reviewer onto the implementer's workspace would destroy the independence the
 review provides — that is the single strongest quality signal the system has.
 Only the FIX task resumes warm onto the lane workspace.
 
-Flag-off purity
----------------
-With the pilot flag off (or the project not the Blueprint self-repo) every
-chain runs the classic path byte-for-byte unchanged: no intent-to-treat
-assignment is written, no lane context is attached, and no reservation is
-taken. The only unconditional action is stripping transient per-phase lane
-directives that must never be inherited — a no-op on a classic chain that
-never carried them.
+Flag states
+-----------
+Off (``improvement_lanes_enabled`` False): every chain runs the classic path
+byte-for-byte unchanged. Shadow (master True, pilot False): eligible self-repo
+chains create armless lanes (``pilot_arm=None``) and exercise the real
+SHA-verified checkpoint/CAS contract, but write no ITT assignment, take no warm
+reservation, attach no fix prompt/dispatch context, force no cold reviewer, and
+spawn no recovery tasks. Full pilot (both flags True): today's lane/control
+intent-to-treat trial with fix-side warm resume and bounded recovery.
 
 Intent-to-treat
 ---------------
@@ -149,6 +150,13 @@ def is_review_fix_lane_pilot_enabled() -> bool:
     return _enabled()
 
 
+def is_review_fix_lane_shadow_enabled() -> bool:
+    """True when review-fix lanes are in checkpoint-only shadow mode."""
+    from app.runtime_config_state import is_review_fix_lane_shadow_enabled as _enabled
+
+    return _enabled()
+
+
 def is_pilot_eligible_project(project: Any) -> bool:
     """True when *project* is in scope for the pilot (Blueprint self-repo)."""
     from app.branch_resolution import _is_blueprint_self_repo
@@ -255,19 +263,30 @@ async def ensure_chain_lane(
     base_branch: str,
     direction_id: str | None,
     current_task_id: uuid.UUID | None,
+    pilot_arm: str | None = "lane",
 ) -> Any | None:
-    """Look up (or lazily create+activate) the lane for a lane-arm chain.
+    """Look up (or lazily create+activate) the lane for a lane chain.
 
     The lane is created in PROPOSED then advanced to ACTIVE and bound to the
     running phase task, so the next checkpoint can CAS ACTIVE -> PARKED. The
-    chain remembers its lane via ``LANE_CHAIN_ID_KEY`` in *ctx*.
+    chain remembers its lane via ``LANE_CHAIN_ID_KEY`` in *ctx*. Full pilot uses
+    ``pilot_arm="lane"``; shadow uses ``pilot_arm=None`` so trial aggregates stay
+    untouched.
     """
     from app.improvement_lane_ops import cas_transition, create_lane
     from app.models import ImprovementLaneStatus
 
     lane = await get_chain_lane(session, ctx)
-    if lane is not None:
+    if lane is not None and lane.pilot_arm == pilot_arm:
         return lane
+    if lane is not None:
+        logger.info(
+            "[LANE-PILOT] chain lane %s has pilot_arm=%s but requested %s; "
+            "creating a fresh lane for the new mode",
+            lane.id,
+            lane.pilot_arm,
+            pilot_arm,
+        )
 
     lane = await create_lane(
         session,
@@ -277,7 +296,7 @@ async def ensure_chain_lane(
         goal=title,
         branch_name=branch_name,
         base_branch=base_branch,
-        pilot_arm="lane",
+        pilot_arm=pilot_arm,
     )
     await session.flush()  # assign lane.id
     try:
@@ -462,13 +481,17 @@ async def checkpoint_and_reserve_on_phase_complete(
     *,
     sha: str | None,
     summary: str,
+    reserve_workspace: bool = True,
+    record_miss_marker: bool = False,
 ) -> bool:
-    """Checkpoint the lane and move its workspace to WARM_RESERVED.
+    """Checkpoint the lane and optionally move its workspace to WARM_RESERVED.
 
     Called when a lane-arm implement/fix phase completes and a COLD review is
     about to spawn. Appends a verified checkpoint (CAS ACTIVE -> PARKED) and
-    reserves the just-freed warm-pool member to the lane so the next fix phase
-    can resume warm. Returns True when a checkpoint was written.
+    in full-pilot mode reserves the just-freed warm-pool member to the lane so
+    the next fix phase can resume warm. Shadow passes ``reserve_workspace=False``
+    to exercise checkpointing while leaving workspace_state COLD. Returns True
+    when a checkpoint was written.
 
     A missing/invalid SHA degrades to ``mark_checkpoint_missing`` rather than
     fabricating a checkpoint. The bounded recovery (suppress the review, requeue
@@ -509,7 +532,16 @@ async def checkpoint_and_reserve_on_phase_complete(
 
     if not sha or len(str(sha)) < 7:
         with contextlib.suppress(LaneCheckpointError):
-            await mark_checkpoint_missing(session, lane.id, reason="no_phase_sha")
+            missed_lane, _ = await mark_checkpoint_missing(
+                session, lane.id, reason="no_phase_sha"
+            )
+            if record_miss_marker:
+                _record_lane_recovery_state(
+                    missed_lane,
+                    reason="no_phase_sha",
+                    attempt=missed_lane.phase_requeues or 0,
+                    exhausted=False,
+                )
         return False
 
     # Verify the SHA is actually reachable on the lane branch before recording
@@ -543,9 +575,16 @@ async def checkpoint_and_reserve_on_phase_complete(
             exc,
         )
         with contextlib.suppress(LaneCheckpointError):
-            await mark_checkpoint_missing(
+            missed_lane, _ = await mark_checkpoint_missing(
                 session, lane.id, reason="sha_verification_unavailable"
             )
+            if record_miss_marker:
+                _record_lane_recovery_state(
+                    missed_lane,
+                    reason="sha_verification_unavailable",
+                    attempt=missed_lane.phase_requeues or 0,
+                    exhausted=False,
+                )
         return False
 
     if reachable is False:
@@ -557,7 +596,16 @@ async def checkpoint_and_reserve_on_phase_complete(
             lane.id,
         )
         with contextlib.suppress(LaneCheckpointError):
-            await mark_checkpoint_missing(session, lane.id, reason="sha_not_reachable")
+            missed_lane, _ = await mark_checkpoint_missing(
+                session, lane.id, reason="sha_not_reachable"
+            )
+            if record_miss_marker:
+                _record_lane_recovery_state(
+                    missed_lane,
+                    reason="sha_not_reachable",
+                    attempt=missed_lane.phase_requeues or 0,
+                    exhausted=False,
+                )
         return False
 
     if reachable is None:
@@ -568,9 +616,16 @@ async def checkpoint_and_reserve_on_phase_complete(
             str(sha)[:8],
         )
         with contextlib.suppress(LaneCheckpointError):
-            await mark_checkpoint_missing(
+            missed_lane, _ = await mark_checkpoint_missing(
                 session, lane.id, reason="sha_verification_unavailable"
             )
+            if record_miss_marker:
+                _record_lane_recovery_state(
+                    missed_lane,
+                    reason="sha_verification_unavailable",
+                    attempt=missed_lane.phase_requeues or 0,
+                    exhausted=False,
+                )
         return False
 
     payload = LaneCheckpointPayload(
@@ -604,12 +659,23 @@ async def checkpoint_and_reserve_on_phase_complete(
     except LaneCheckpointError as exc:
         logger.warning("[LANE-PILOT] checkpoint failed for lane %s: %s", lane.id, exc)
         with contextlib.suppress(LaneCheckpointError):
-            await mark_checkpoint_missing(session, lane.id, reason="checkpoint_error")
+            missed_lane, _ = await mark_checkpoint_missing(
+                session, lane.id, reason="checkpoint_error"
+            )
+            if record_miss_marker:
+                _record_lane_recovery_state(
+                    missed_lane,
+                    reason="checkpoint_error",
+                    attempt=missed_lane.phase_requeues or 0,
+                    exhausted=False,
+                )
         return False
 
     # Reserve the freed warm-pool member to the lane (best-effort: only engages
     # when the source ran on a pool member). The lane's workspace_state mirrors
     # the reservation so operators see WARM_RESERVED on the lane row.
+    if not reserve_workspace:
+        return True
     vm_id = getattr(source_task, "vm_instance_id", None)
     if vm_id:
         try:
@@ -702,10 +768,14 @@ async def close_lane_checkpoint_exhausted(
         .scalars()
         .all()
     )
+    from app.warm_pool import record_lane_reservation_cause
+
     for member in reserved:
         member.reserved_lane_id = None
         member.reservation_expires_at = None
+        member.reservation_hard_expires_at = None
         session.add(member)
+        await record_lane_reservation_cause(session, lane.id, "force_expired")
     session.add(lane)
     logger.warning(
         "[LANE-PILOT] lane %s KILLED — checkpoint recovery exhausted "
@@ -724,6 +794,9 @@ async def checkpoint_or_recover_phase(
     *,
     sha: str | None,
     summary: str,
+    reserve_workspace: bool = True,
+    enable_recovery: bool = True,
+    record_miss_marker: bool = False,
 ) -> str:
     """Checkpoint a completed lane phase, classifying a MISS into bounded recovery.
 
@@ -747,9 +820,23 @@ async def checkpoint_or_recover_phase(
 
     try:
         written = await checkpoint_and_reserve_on_phase_complete(
-            session, source_task, lane, sha=sha, summary=summary
+            session,
+            source_task,
+            lane,
+            sha=sha,
+            summary=summary,
+            reserve_workspace=reserve_workspace,
+            record_miss_marker=record_miss_marker,
         )
     except LaneOwnerMismatchError:
+        if record_miss_marker and lane is not None:
+            _record_lane_recovery_state(
+                lane,
+                reason="owner_mismatch",
+                attempt=lane.phase_requeues or 0,
+                exhausted=False,
+            )
+            session.add(lane)
         return CHECKPOINT_PHASE_OK
     if written or lane is None:
         return CHECKPOINT_PHASE_OK
@@ -758,6 +845,8 @@ async def checkpoint_or_recover_phase(
     # False paths (lane None handled above, or an already-PARKED no-op) leave a
     # non-ACTIVE lane and must NOT trigger recovery.
     if lane.status != ImprovementLaneStatus.ACTIVE.value:
+        return CHECKPOINT_PHASE_OK
+    if not enable_recovery:
         return CHECKPOINT_PHASE_OK
     if (lane.phase_requeues or 0) > _LANE_MAX_PHASE_REQUEUES:
         await close_lane_checkpoint_exhausted(
@@ -793,13 +882,19 @@ async def rebind_lane_to_recovery(
 
 # ── Fix-side warm resume wiring ───────────────────────────────────────────────
 async def activate_lane_for_fix(
-    session: AsyncSession, lane: Any, *, task_id: uuid.UUID | None = None
+    session: AsyncSession,
+    lane: Any,
+    *,
+    task_id: uuid.UUID | None = None,
+    lease_workspace: bool = True,
 ) -> None:
     """Resume a PARKED lane to ACTIVE for the fix phase (best-effort).
 
-    Binds the fix to the lane and flips the workspace to LEASED so the next
-    re-review boundary can checkpoint ACTIVE -> PARKED again. A lane already
-    ACTIVE (or in a terminal state) is left unchanged.
+    Binds the fix to the lane and, in full-pilot mode, flips the workspace to
+    LEASED so the next re-review boundary can checkpoint ACTIVE -> PARKED again.
+    Shadow passes ``lease_workspace=False`` to exercise CAS without changing
+    dispatch/workspace state. A lane already ACTIVE (or in a terminal state) is
+    left unchanged.
     """
     from app.improvement_lane_ops import LaneCASError, cas_transition
     from app.models import ImprovementLaneStatus
@@ -814,8 +909,9 @@ async def activate_lane_for_fix(
             ImprovementLaneStatus.ACTIVE,
             current_task_id=task_id,
         )
-        lane.workspace_state = WORKSPACE_LEASED
-        session.add(lane)
+        if lease_workspace:
+            lane.workspace_state = WORKSPACE_LEASED
+            session.add(lane)
     except LaneCASError as exc:
         logger.warning(
             "[LANE-PILOT] could not resume lane %s for fix: %s", lane.id, exc
@@ -877,9 +973,8 @@ def record_workspace_prep_outcome(
     if not (bool(ctx.get("is_lane_phase")) and task_type in {"fix", "implement"}):
         return
 
-    warm_reuse_succeeded = (
-        workspace_prep.get("path") == "warm"
-        and bool(workspace_prep.get("warm_reuse_succeeded"))
+    warm_reuse_succeeded = workspace_prep.get("path") == "warm" and bool(
+        workspace_prep.get("warm_reuse_succeeded")
     )
     if not warm_reuse_succeeded:
         ctx.pop(LANE_PILOT_WARM_RESUME_RECEIPT_KEY, None)
@@ -927,11 +1022,17 @@ async def force_expire_lane_reservations(
         .scalars()
         .all()
     )
+    from app.warm_pool import record_lane_reservation_cause
+
     cleared = 0
     for member in members:
+        cause_lane_id = member.reserved_lane_id
         member.reserved_lane_id = None
         member.reservation_expires_at = None
+        member.reservation_hard_expires_at = None
         session.add(member)
+        if cause_lane_id is not None:
+            await record_lane_reservation_cause(session, cause_lane_id, "force_expired")
         cleared += 1
     if cleared:
         logger.info(
@@ -984,10 +1085,14 @@ async def retire_chain_lane(
             .scalars()
             .all()
         )
+        from app.warm_pool import record_lane_reservation_cause
+
         for member in reserved_members:
             member.reserved_lane_id = None
             member.reservation_expires_at = None
+            member.reservation_hard_expires_at = None
             session.add(member)
+            await record_lane_reservation_cause(session, lane.id, "force_expired")
         return True
     except LaneCASError as exc:
         logger.debug(
@@ -1203,6 +1308,15 @@ def is_review_fix_lane_pilot_active_for_project(project: Any) -> bool:
     )
 
 
+def is_review_fix_lane_shadow_active_for_project(project: Any) -> bool:
+    """True when checkpoint-only shadow lanes should attach for *project*."""
+    return (
+        is_review_fix_lane_shadow_enabled()
+        and is_pilot_eligible_project(project)
+        and not is_review_fix_lane_killed(project)
+    )
+
+
 # ── Lane-arm time medians (feeds lane_relay_comparison in digest) ──────────────
 async def compute_lane_arm_time_medians(
     session: AsyncSession,
@@ -1357,8 +1471,9 @@ async def compute_lane_pilot_aggregates(
 
     task_rows = (
         await session.execute(
-            select(Task.id, Task.estimated_cost_usd, _arm_expr, _merged_expr, _orig_id_expr)
-            .where(
+            select(
+                Task.id, Task.estimated_cost_usd, _arm_expr, _merged_expr, _orig_id_expr
+            ).where(
                 Task.project_id == project_id,
                 Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
                 _arm_expr.in_(["lane", "control"]),
@@ -1395,11 +1510,13 @@ async def compute_lane_pilot_aggregates(
 
     lane_merge_rate: float | None = (
         arm_merged_count["lane"] / arm_chain_total["lane"]
-        if arm_chain_total["lane"] > 0 else None
+        if arm_chain_total["lane"] > 0
+        else None
     )
     control_merge_rate: float | None = (
         arm_merged_count["control"] / arm_chain_total["control"]
-        if arm_chain_total["control"] > 0 else None
+        if arm_chain_total["control"] > 0
+        else None
     )
     lane_cost_per_merged: float | None = (
         arm_cost_merged["lane"] / arm_merged_count["lane"]
@@ -1467,29 +1584,25 @@ async def compute_lane_pilot_aggregates(
             Task.context, f"$.{LANE_PILOT_CHECKPOINT_RECEIPT_KEY}"
         )
         _fix_payload_type_expr = func.json_extract(Task.payloads, "$[0].type")
-        _engagement_stmt = (
-            select(Task.id, _orig_id_expr, _warm_receipt_expr, _ckpt_receipt_expr)
-            .where(
-                Task.project_id == project_id,
-                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-                func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}") == "lane",
-                _fix_payload_type_expr.in_(["fix", "implement"]),
-            )
+        _engagement_stmt = select(
+            Task.id, _orig_id_expr, _warm_receipt_expr, _ckpt_receipt_expr
+        ).where(
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}") == "lane",
+            _fix_payload_type_expr.in_(["fix", "implement"]),
         )
     else:
-        _engagement_stmt = (
-            select(
-                Task.id,
-                _orig_id_expr,
-                Task.context[LANE_PILOT_WARM_RESUME_RECEIPT_KEY].astext,
-                Task.context[LANE_PILOT_CHECKPOINT_RECEIPT_KEY].astext,
-            )
-            .where(
-                Task.project_id == project_id,
-                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-                Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext == "lane",
-                Task.payloads[0]["type"].as_string().in_(["fix", "implement"]),
-            )
+        _engagement_stmt = select(
+            Task.id,
+            _orig_id_expr,
+            Task.context[LANE_PILOT_WARM_RESUME_RECEIPT_KEY].astext,
+            Task.context[LANE_PILOT_CHECKPOINT_RECEIPT_KEY].astext,
+        ).where(
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext == "lane",
+            Task.payloads[0]["type"].as_string().in_(["fix", "implement"]),
         )
 
     engagement_rows = (await session.execute(_engagement_stmt)).all()

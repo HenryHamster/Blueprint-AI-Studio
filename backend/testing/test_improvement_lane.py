@@ -952,6 +952,55 @@ async def test_chain_terminal_retires_lane_and_releases_reservation(db: AsyncSes
 
 
 @pytest.mark.asyncio
+async def test_retire_chain_lane_records_force_expired_and_clears_hard_anchor(
+    db: AsyncSession,
+):
+    """Retiring a chain force-expires the lane's reservation: the hard ceiling
+    anchor is cleared AND the force-expired expiry-cause counter is incremented so
+    a low warm_resume_fraction stays diagnosable."""
+    from app.time_utils import _utcnow
+    from datetime import timedelta
+
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id="d-retire-cause",
+        title="Retire records cause",
+        goal="goal",
+        branch_name="lane/retire-cause",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    member = PoolVm(
+        vm_instance_id="pool-vm-retire-cause",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+        reservation_expires_at=_utcnow() + timedelta(seconds=300),
+        reservation_hard_expires_at=_utcnow() + timedelta(seconds=3600),
+    )
+    db.add(member)
+    await db.commit()
+
+    ctx = {LANE_CHAIN_ID_KEY: str(lane.id)}
+    assert await retire_chain_lane(db, ctx) is True
+    await db.commit()
+
+    await db.refresh(member)
+    assert member.reserved_lane_id is None
+    assert member.reservation_expires_at is None
+    assert member.reservation_hard_expires_at is None, (
+        "the hard ceiling anchor must be cleared on force-expiry"
+    )
+
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.reservation_force_expired_count == 1
+    assert refreshed.reservation_claimed_by_fix_count == 0
+    assert refreshed.reservation_expired_before_fix_count == 0
+
+
+@pytest.mark.asyncio
 async def test_retire_chain_lane_parked_becomes_retired(db: AsyncSession):
     """retire_chain_lane CASes PARKED -> RETIRED as well."""
     project_id = await _make_project(db)

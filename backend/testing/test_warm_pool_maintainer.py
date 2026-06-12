@@ -2154,9 +2154,7 @@ async def test_lane_reserved_member_skipped_by_non_lane_request(
 
 
 @pytest.mark.asyncio
-async def test_lane_workspace_correction_stays_project_scoped(
-    db_session, warm_pool_on
-):
+async def test_lane_workspace_correction_stays_project_scoped(db_session, warm_pool_on):
     """A task must not be able to downgrade or rewrite another project's lane
     workspace just by copying its lane UUID into task context."""
     prior_lanes = _runtime_config.get("improvement_lanes_enabled")
@@ -2960,6 +2958,287 @@ async def test_expired_reservation_sweep_skips_concurrently_leased_member(
 
         await db_session.refresh(lane)
         assert lane.reserved_idle_cost_usd_total == 0.0
+    finally:
+        if prior_lanes is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes
+
+
+# ---------------------------------------------------------------------------
+# Lane reservation survives a spanning review phase (hard ceiling + telemetry)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lane_reservation_survives_long_review_then_fix_claims(
+    db_session, warm_pool_on
+):
+    """implement -> long review (soft TTL elapsed while the lane is still PARKED
+    awaiting its fix, hard ceiling NOT elapsed) -> fix.
+
+    The maintainer sweep must EXTEND the reservation rather than clear it, so the
+    fix STILL claims the reserved member warm (warm-resume receipt path reachable)
+    and the claimed-by-fix telemetry records the success.
+    """
+    prior_lanes = _runtime_config.get("improvement_lanes_enabled")
+    _runtime_config["improvement_lanes_enabled"] = True
+    try:
+        project = await _make_project(db_session, name="Survive Long Review")
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="long review lane",
+            goal="span the review",
+            branch_name="lane-branch",
+            base_branch="main",
+            status=ImprovementLaneStatus.PARKED.value,
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="agent-vm-long-review",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        member = await _register(
+            db_session, project, "agent-vm-long-review", PoolVmState.IDLE
+        )
+        member.idle_since = _utcnow() - timedelta(seconds=120)
+        member.reserved_lane_id = lane.id
+        # SOFT TTL already lapsed (a long cold review is in flight) ...
+        member.reservation_expires_at = _utcnow() - timedelta(seconds=30)
+        # ... but the HARD ceiling still has plenty of headroom.
+        member.reservation_hard_expires_at = _utcnow() + timedelta(seconds=3600)
+        db_session.add(member)
+        await db_session.commit()
+
+        # Sweep must NOT clear the reservation — it extends the soft TTL forward.
+        await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+
+        await db_session.refresh(member)
+        assert member.state == PoolVmState.IDLE, "member must not be reaped"
+        assert member.reserved_lane_id == lane.id, (
+            "reservation must survive the long review (not cleared by the sweep)"
+        )
+        assert (
+            member.reservation_expires_at is not None
+            and member.reservation_expires_at > _utcnow()
+        ), "soft TTL must be re-stamped forward so the member stays protected"
+        assert member.reservation_hard_expires_at is not None, (
+            "hard ceiling anchor must be preserved across extension"
+        )
+
+        await db_session.refresh(lane)
+        assert lane.workspace_state == "WARM_RESERVED", (
+            "lane must stay WARM_RESERVED while the reservation is extended"
+        )
+
+        # Now the fix phase claims its reserved member warm.
+        leased = await lease_idle_pool_vm(
+            db_session,
+            project_id=project.id,
+            account_id="acct-1",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            leased_task_id=uuid.uuid4(),
+            lane_id=str(lane.id),
+        )
+        await db_session.commit()
+        assert leased is not None, "fix must STILL claim the reserved member"
+        assert leased.vm_instance_id == "agent-vm-long-review"
+        assert leased.state == PoolVmState.LEASED
+
+        await db_session.refresh(lane)
+        assert lane.reservation_claimed_by_fix_count == 1, (
+            "claimed-by-fix telemetry must record the warm resume"
+        )
+        assert lane.reservation_expired_before_fix_count == 0
+        assert lane.reservation_force_expired_count == 0
+    finally:
+        if prior_lanes is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes
+
+
+@pytest.mark.asyncio
+async def test_lane_reservation_hard_ceiling_frees_pinned_member(
+    db_session, warm_pool_on
+):
+    """The HARD absolute ceiling ALWAYS frees a reserved member — even while the
+    owning lane still looks alive (PARKED) — so a stuck/zombie lane can never pin a
+    warm VM indefinitely. Recorded as force-expired."""
+    prior_lanes = _runtime_config.get("improvement_lanes_enabled")
+    _runtime_config["improvement_lanes_enabled"] = True
+    try:
+        project = await _make_project(db_session, name="Hard Ceiling Frees")
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="pinned lane",
+            goal="never finishes",
+            branch_name="pinned-branch",
+            base_branch="main",
+            status=ImprovementLaneStatus.PARKED.value,
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="agent-vm-pinned",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        member = await _register(
+            db_session, project, "agent-vm-pinned", PoolVmState.IDLE
+        )
+        member.idle_since = _utcnow() - timedelta(seconds=120)
+        member.reserved_lane_id = lane.id
+        # Both the soft TTL and the HARD ceiling have elapsed — capacity protection
+        # must win even though the lane is still PARKED.
+        member.reservation_expires_at = _utcnow() - timedelta(seconds=600)
+        member.reservation_hard_expires_at = _utcnow() - timedelta(seconds=30)
+        db_session.add(member)
+        await db_session.commit()
+
+        await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+
+        await db_session.refresh(member)
+        assert member.state == PoolVmState.IDLE, "member stays IDLE (not reaped)"
+        assert member.reserved_lane_id is None, (
+            "hard ceiling must free the member even while the lane looks alive"
+        )
+        assert member.reservation_expires_at is None
+        assert member.reservation_hard_expires_at is None
+
+        # A general (non-lane) request can now claim the freed member.
+        leased = await lease_idle_pool_vm(
+            db_session, project_id=project.id, leased_task_id=uuid.uuid4()
+        )
+        await db_session.commit()
+        assert leased is not None and leased.vm_instance_id == "agent-vm-pinned", (
+            "freed member must be generally claimable (pool not pinned)"
+        )
+
+        await db_session.refresh(lane)
+        assert lane.reservation_force_expired_count == 1, (
+            "hard-ceiling release must record force-expired"
+        )
+        assert lane.reservation_claimed_by_fix_count == 0
+        assert lane.reservation_expired_before_fix_count == 0
+    finally:
+        if prior_lanes is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes
+
+
+@pytest.mark.asyncio
+async def test_lane_reservation_expired_before_fix_when_chain_dies(
+    db_session, warm_pool_on
+):
+    """When the chain dies mid-review (the lane is no longer PARKED-awaiting-fix)
+    before the hard ceiling, the sweep frees the member and records
+    expired-before-fix — the diagnostic signal for low warm_resume_fraction."""
+    prior_lanes = _runtime_config.get("improvement_lanes_enabled")
+    _runtime_config["improvement_lanes_enabled"] = True
+    try:
+        project = await _make_project(db_session, name="Chain Dies Mid Review")
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="dead chain lane",
+            goal="review failed",
+            branch_name="dead-branch",
+            base_branch="main",
+            # Chain died: the lane is terminal (KILLED), no longer awaiting a fix.
+            status=ImprovementLaneStatus.KILLED.value,
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="agent-vm-dead-chain",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        member = await _register(
+            db_session, project, "agent-vm-dead-chain", PoolVmState.IDLE
+        )
+        member.idle_since = _utcnow() - timedelta(seconds=120)
+        member.reserved_lane_id = lane.id
+        member.reservation_expires_at = _utcnow() - timedelta(seconds=30)
+        # Hard ceiling NOT elapsed: the clear is driven by chain death, not the cap.
+        member.reservation_hard_expires_at = _utcnow() + timedelta(seconds=3600)
+        db_session.add(member)
+        await db_session.commit()
+
+        await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+
+        await db_session.refresh(member)
+        assert member.state == PoolVmState.IDLE
+        assert member.reserved_lane_id is None, (
+            "a dead chain's reservation must be freed (pool not pinned)"
+        )
+        assert member.reservation_expires_at is None
+        assert member.reservation_hard_expires_at is None
+
+        await db_session.refresh(lane)
+        assert lane.reservation_expired_before_fix_count == 1, (
+            "chain-death clear must record expired-before-fix"
+        )
+        assert lane.reservation_force_expired_count == 0
+        assert lane.reservation_claimed_by_fix_count == 0
+    finally:
+        if prior_lanes is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes
+
+
+@pytest.mark.asyncio
+async def test_actively_reserved_member_not_idle_ttl_reaped(
+    db_session, warm_pool_on, mocker
+):
+    """An actively-reserved member older than the idle TTL must NOT be reaped while
+    its reservation is still live — otherwise a long review loses the warm member
+    out from under the reservation."""
+    prior_lanes = _runtime_config.get("improvement_lanes_enabled")
+    _runtime_config["improvement_lanes_enabled"] = True
+    _runtime_config["warm_pool_idle_ttl_seconds"] = 60
+    # Keep the VM "alive" and arm the zombie gate so the ONLY reaper that could
+    # fire on this aged-idle member is the idle-TTL path — isolating the
+    # reservation guard under test.
+    mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+    mocker.patch.object(_wpm, "_PROCESS_START_TS", _utcnow() - timedelta(seconds=900))
+    try:
+        project = await _make_project(db_session, name="Reserved Not Idle Reaped")
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="reserved lane",
+            goal="goal",
+            branch_name="rsv-branch",
+            base_branch="main",
+            status=ImprovementLaneStatus.PARKED.value,
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="agent-vm-reserved-old",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        member = await _register(
+            db_session, project, "agent-vm-reserved-old", PoolVmState.IDLE
+        )
+        # Idle far longer than the idle TTL, but the reservation is still LIVE
+        # (soft TTL not yet expired) and within the hard ceiling.
+        member.idle_since = _utcnow() - timedelta(seconds=600)
+        member.reserved_lane_id = lane.id
+        member.reservation_expires_at = _utcnow() + timedelta(seconds=300)
+        member.reservation_hard_expires_at = _utcnow() + timedelta(seconds=3600)
+        db_session.add(member)
+        await db_session.commit()
+
+        await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+
+        # Member must survive: still IDLE and still reserved to the lane.
+        refreshed = await db_session.get(PoolVm, member.id)
+        assert refreshed is not None, "reserved member must not be idle-TTL reaped"
+        assert refreshed.state == PoolVmState.IDLE
+        assert refreshed.reserved_lane_id == lane.id
     finally:
         if prior_lanes is None:
             _runtime_config.pop("improvement_lanes_enabled", None)

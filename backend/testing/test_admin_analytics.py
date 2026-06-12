@@ -9,7 +9,14 @@ import pytest
 from httpx import AsyncClient
 
 from app import shared_state
-from app.models import Artifact, ArtifactType, ImprovementLane, ImprovementLaneStatus, PoolVm, PoolVmState
+from app.models import (
+    Artifact,
+    ArtifactType,
+    ImprovementLane,
+    ImprovementLaneStatus,
+    PoolVm,
+    PoolVmState,
+)
 from app.routers import admin_analytics
 from app.time_utils import _utcnow
 from app.models import TaskStatus
@@ -247,7 +254,13 @@ class TestTaskDurationStats:
 class TestLaneDiag:
     @staticmethod
     def _add_review_loop_task(
-        db_session, project_id, pr_number, task_type, created_at, active_seconds, fix_reason=None
+        db_session,
+        project_id,
+        pr_number,
+        task_type,
+        created_at,
+        active_seconds,
+        fix_reason=None,
     ) -> None:
         context: dict = {}
         if pr_number is not None:
@@ -363,9 +376,7 @@ class TestLaneDiag:
         await db_session.commit()
 
         base = _utcnow() - timedelta(hours=1)
-        self._add_review_loop_task(
-            db_session, project.id, 101, "review", base, 300
-        )
+        self._add_review_loop_task(db_session, project.id, 101, "review", base, 300)
         self._add_review_loop_task(
             db_session,
             project.id,
@@ -511,22 +522,39 @@ class TestLaneDiag:
 
         # In-window task (created during v9)
         self._add_review_loop_task(
-            db_session, project.id, 901, "review",
-            v9_opened + timedelta(days=1), 600,
+            db_session,
+            project.id,
+            901,
+            "review",
+            v9_opened + timedelta(days=1),
+            600,
         )
         self._add_review_loop_task(
-            db_session, project.id, 901, "fix",
-            v9_opened + timedelta(days=2), 1200, "ci_failure",
+            db_session,
+            project.id,
+            901,
+            "fix",
+            v9_opened + timedelta(days=2),
+            1200,
+            "ci_failure",
         )
         # Out-of-window task (created before v9 opened)
         self._add_review_loop_task(
-            db_session, project.id, 800, "review",
-            v9_opened - timedelta(days=2), 300,
+            db_session,
+            project.id,
+            800,
+            "review",
+            v9_opened - timedelta(days=2),
+            300,
         )
         # Out-of-window task (created after v9 promoted)
         self._add_review_loop_task(
-            db_session, project.id, 950, "review",
-            v9_promoted + timedelta(days=1), 300,
+            db_session,
+            project.id,
+            950,
+            "review",
+            v9_promoted + timedelta(days=1),
+            300,
         )
         await db_session.commit()
 
@@ -623,15 +651,25 @@ class TestLaneDiag:
 
         # One in-window task for the closed version
         self._add_review_loop_task(
-            db_session, project.id, 901, "fix",
-            v9_opened + timedelta(days=1), 600, "ci_failure",
+            db_session,
+            project.id,
+            901,
+            "fix",
+            v9_opened + timedelta(days=1),
+            600,
+            "ci_failure",
         )
 
         # Newer out-of-window tasks that would fill a small max_tasks cap
         for i in range(5):
             self._add_review_loop_task(
-                db_session, project.id, 999 + i, "fix",
-                v9_promoted + timedelta(days=i + 1), 300, "ci_failure",
+                db_session,
+                project.id,
+                999 + i,
+                "fix",
+                v9_promoted + timedelta(days=i + 1),
+                300,
+                "ci_failure",
             )
         await db_session.commit()
 
@@ -684,13 +722,22 @@ class TestLaneDiag:
 
         # In-window task (created during v10, before abandonment)
         self._add_review_loop_task(
-            db_session, project.id, 1001, "review",
-            v10_opened + timedelta(days=1), 600,
+            db_session,
+            project.id,
+            1001,
+            "review",
+            v10_opened + timedelta(days=1),
+            600,
         )
         # Out-of-window task (created after v10 was abandoned — successor work)
         self._add_review_loop_task(
-            db_session, project.id, 1002, "fix",
-            v10_abandoned + timedelta(hours=1), 300, "ci_failure",
+            db_session,
+            project.id,
+            1002,
+            "fix",
+            v10_abandoned + timedelta(hours=1),
+            300,
+            "ci_failure",
         )
         await db_session.commit()
 
@@ -749,15 +796,25 @@ class TestLaneDiag:
 
         # One in-window task for the abandoned version
         self._add_review_loop_task(
-            db_session, project.id, 2001, "fix",
-            v10_opened + timedelta(days=1), 600, "ci_failure",
+            db_session,
+            project.id,
+            2001,
+            "fix",
+            v10_opened + timedelta(days=1),
+            600,
+            "ci_failure",
         )
 
         # Successor tasks created after abandonment that would fill a small cap
         for i in range(5):
             self._add_review_loop_task(
-                db_session, project.id, 3000 + i, "fix",
-                v10_abandoned + timedelta(hours=i + 1), 300, "ci_failure",
+                db_session,
+                project.id,
+                3000 + i,
+                "fix",
+                v10_abandoned + timedelta(hours=i + 1),
+                300,
+                "ci_failure",
             )
         await db_session.commit()
 
@@ -868,53 +925,95 @@ class TestLaneWasteDiag:
 
         # Chain A (PR 501) — cap-exhausted, mixed waste, infra + stale-head excluded.
         self._add_chain_task(
-            db_session, project.id, pr_number=501, original_task_id=oid_a,
-            iteration=1, task_type="review", created_at=base,
+            db_session,
+            project.id,
+            pr_number=501,
+            original_task_id=oid_a,
+            iteration=1,
+            task_type="review",
+            created_at=base,
         )  # review_ambiguity (LANE_REVIEW_CONVERGENCE, iter≤2), cap-counted
         self._add_chain_task(
-            db_session, project.id, pr_number=501, original_task_id=oid_a,
-            iteration=2, task_type="fix", fix_reason="ci_failure",
+            db_session,
+            project.id,
+            pr_number=501,
+            original_task_id=oid_a,
+            iteration=2,
+            task_type="fix",
+            fix_reason="ci_failure",
             created_at=base + timedelta(minutes=10),
         )  # ci_churn, cap-counted
         self._add_chain_task(
-            db_session, project.id, pr_number=501, original_task_id=oid_a,
-            iteration=3, task_type="fix", status=TaskStatus.FAILED,
-            failure_category="AGENT_TIMEOUT", created_at=base + timedelta(minutes=20),
+            db_session,
+            project.id,
+            pr_number=501,
+            original_task_id=oid_a,
+            iteration=3,
+            task_type="fix",
+            status=TaskStatus.FAILED,
+            failure_category="AGENT_TIMEOUT",
+            created_at=base + timedelta(minutes=20),
         )  # infra, NOT cap-counted, terminal FAILED included
         self._add_chain_task(
-            db_session, project.id, pr_number=501, original_task_id=oid_a,
-            iteration=4, task_type="fix", fix_reason="merge_conflict",
+            db_session,
+            project.id,
+            pr_number=501,
+            original_task_id=oid_a,
+            iteration=4,
+            task_type="fix",
+            fix_reason="merge_conflict",
             failure_detail="review_cap_exhausted",
             created_at=base + timedelta(minutes=30),
         )  # merge_conflict, cap-counted, marks the chain cap-exhausted
         self._add_chain_task(
-            db_session, project.id, pr_number=501, original_task_id=oid_a,
-            iteration=5, task_type="review", stale_head=True,
+            db_session,
+            project.id,
+            pr_number=501,
+            original_task_id=oid_a,
+            iteration=5,
+            task_type="review",
+            stale_head=True,
             created_at=base + timedelta(minutes=40),
         )  # lost_reasoning (LANE_REVIEW_CONVERGENCE, iter≥3), NOT cap-counted (stale-head discard)
         self._add_original(db_session, project.id, oid_a, base - timedelta(minutes=5))
 
         # Chain B (PR 502) — merged via original hydration; lost-state lanes.
         self._add_chain_task(
-            db_session, project.id, pr_number=502, original_task_id=oid_b,
-            iteration=1, task_type="review", drift={"drift_in": ["a.py"]},
+            db_session,
+            project.id,
+            pr_number=502,
+            original_task_id=oid_b,
+            iteration=1,
+            task_type="review",
+            drift={"drift_in": ["a.py"]},
             created_at=base + timedelta(minutes=5),
         )  # lost_repo_state
         self._add_chain_task(
-            db_session, project.id, pr_number=502, original_task_id=oid_b,
-            iteration=2, task_type="fix",
+            db_session,
+            project.id,
+            pr_number=502,
+            original_task_id=oid_b,
+            iteration=2,
+            task_type="fix",
             fix_loop_history={
                 "test": [
-                    {"loop": "test", "iteration": 1,
-                     "exit_reason": "divergence_oscillation",
-                     "ended_at": "2026-06-01T00:00:00"}
+                    {
+                        "loop": "test",
+                        "iteration": 1,
+                        "exit_reason": "divergence_oscillation",
+                        "ended_at": "2026-06-01T00:00:00",
+                    }
                 ]
             },
             created_at=base + timedelta(minutes=15),
         )  # lost_reasoning
         self._add_chain_task(
-            db_session, project.id, pr_number=502, original_task_id=oid_b,
-            iteration=3, task_type="panel_review",
+            db_session,
+            project.id,
+            pr_number=502,
+            original_task_id=oid_b,
+            iteration=3,
+            task_type="panel_review",
             created_at=base + timedelta(minutes=25),
         )  # review_ambiguity
         self._add_original(
@@ -976,7 +1075,11 @@ class TestLaneWasteDiag:
         assert chain_b["terminal_outcome"] == "merged"
         assert chain_b["cap_exhausted"] is False
         b_cats = {t["iteration"]: t["waste_category"] for t in chain_b["tasks"]}
-        assert b_cats == {1: "lost_repo_state", 2: "lost_reasoning", 3: "review_ambiguity"}
+        assert b_cats == {
+            1: "lost_repo_state",
+            2: "lost_reasoning",
+            3: "review_ambiguity",
+        }
 
     @pytest.mark.asyncio
     async def test_additive_contract_preserves_legacy_keys_and_includes_terminal_tasks(
@@ -990,18 +1093,34 @@ class TestLaneWasteDiag:
         oid = uuid.UUID("33333333-3333-3333-3333-333333333333")
         # Two COMPLETED iterations + one terminal FAILED (non-infra) on the same PR.
         self._add_chain_task(
-            db_session, project.id, pr_number=601, original_task_id=oid,
-            iteration=1, task_type="review", created_at=base,
+            db_session,
+            project.id,
+            pr_number=601,
+            original_task_id=oid,
+            iteration=1,
+            task_type="review",
+            created_at=base,
         )
         self._add_chain_task(
-            db_session, project.id, pr_number=601, original_task_id=oid,
-            iteration=2, task_type="fix", fix_reason="code_review",
+            db_session,
+            project.id,
+            pr_number=601,
+            original_task_id=oid,
+            iteration=2,
+            task_type="fix",
+            fix_reason="code_review",
             created_at=base + timedelta(minutes=10),
         )
         self._add_chain_task(
-            db_session, project.id, pr_number=601, original_task_id=oid,
-            iteration=3, task_type="fix", status=TaskStatus.FAILED,
-            failure_category="CODE_ERROR", created_at=base + timedelta(minutes=20),
+            db_session,
+            project.id,
+            pr_number=601,
+            original_task_id=oid,
+            iteration=3,
+            task_type="fix",
+            status=TaskStatus.FAILED,
+            failure_category="CODE_ERROR",
+            created_at=base + timedelta(minutes=20),
         )
         await db_session.commit()
 
@@ -1057,24 +1176,44 @@ class TestLaneWasteDiag:
 
         # Two COMPLETED tasks (older) — must always appear in legacy surface.
         self._add_chain_task(
-            db_session, project.id, pr_number=701, original_task_id=oid,
-            iteration=1, task_type="review", created_at=base,
+            db_session,
+            project.id,
+            pr_number=701,
+            original_task_id=oid,
+            iteration=1,
+            task_type="review",
+            created_at=base,
         )
         self._add_chain_task(
-            db_session, project.id, pr_number=702, original_task_id=oid,
-            iteration=1, task_type="review", created_at=base + timedelta(minutes=5),
+            db_session,
+            project.id,
+            pr_number=702,
+            original_task_id=oid,
+            iteration=1,
+            task_type="review",
+            created_at=base + timedelta(minutes=5),
         )
         # Two FAILED tasks (more recent) — with a shared max_tasks=2 query these
         # would evict the COMPLETED tasks, eroding the legacy surface.
         self._add_chain_task(
-            db_session, project.id, pr_number=703, original_task_id=oid,
-            iteration=1, task_type="review", status=TaskStatus.FAILED,
+            db_session,
+            project.id,
+            pr_number=703,
+            original_task_id=oid,
+            iteration=1,
+            task_type="review",
+            status=TaskStatus.FAILED,
             failure_category="CODE_ERROR",
             created_at=base + timedelta(minutes=20),
         )
         self._add_chain_task(
-            db_session, project.id, pr_number=704, original_task_id=oid,
-            iteration=1, task_type="review", status=TaskStatus.FAILED,
+            db_session,
+            project.id,
+            pr_number=704,
+            original_task_id=oid,
+            iteration=1,
+            task_type="review",
+            status=TaskStatus.FAILED,
             failure_category="CODE_ERROR",
             created_at=base + timedelta(minutes=25),
         )
@@ -1144,7 +1283,9 @@ class TestLaneWasteDiag:
         )
         await db_session.commit()
 
-        resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}&max_tasks=2")
+        resp = await client.get(
+            f"/api/admin/lane-diag?project_id={project.id}&max_tasks=2"
+        )
         assert resp.status_code == 200
         waste = resp.json()["lane_waste"]
         chains = {c["pr_number"]: c for c in waste["chains"]}
@@ -1879,7 +2020,9 @@ class TestOpenPrs:
 
         token_mock = AsyncMock(return_value="token")
         prs_mock = AsyncMock(
-            return_value=[self._github_pr(99, title="Legacy PR", branch="legacy-branch")]
+            return_value=[
+                self._github_pr(99, title="Legacy PR", branch="legacy-branch")
+            ]
         )
         monkeypatch.setattr(services, "_get_project_github_token", token_mock)
         monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
@@ -2064,6 +2207,7 @@ class TestAdminRecordFailureResult:
         assert results[0][2] == "AGENT_TIMEOUT"
         shared_state.direction_failure_streaks.pop(direction_id, None)
 
+
 # ---------------------------------------------------------------------------
 # TestImprovementLanes
 # ---------------------------------------------------------------------------
@@ -2154,9 +2298,7 @@ class TestImprovementLanes:
         db_session.add(pool_vm)
         await db_session.commit()
 
-        resp = await client.get(
-            f"/api/admin/improvement-lanes?project_id={project.id}"
-        )
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
         assert resp.status_code == 200
         body = resp.json()
         assert body["total_returned"] == 1
@@ -2263,9 +2405,7 @@ class TestImprovementLanes:
         db_session.add(lane)
         await db_session.commit()
 
-        resp = await client.get(
-            f"/api/admin/improvement-lanes?project_id={project.id}"
-        )
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
         assert resp.status_code == 200
         body = resp.json()
         row = body["lanes"][0]
@@ -2286,17 +2426,30 @@ class TestImprovementLanes:
             project.id,
             checkpoint_seq=55,
             checkpoints=[
-                {"seq": 53, "phase": "fix", "created_at": (now - timedelta(seconds=300)).isoformat(), "sha": "a1"},
-                {"seq": 54, "phase": "review", "created_at": (now - timedelta(seconds=200)).isoformat(), "sha": "b2"},
-                {"seq": 55, "phase": "fix", "created_at": (now - timedelta(seconds=100)).isoformat(), "sha": "c3"},
+                {
+                    "seq": 53,
+                    "phase": "fix",
+                    "created_at": (now - timedelta(seconds=300)).isoformat(),
+                    "sha": "a1",
+                },
+                {
+                    "seq": 54,
+                    "phase": "review",
+                    "created_at": (now - timedelta(seconds=200)).isoformat(),
+                    "sha": "b2",
+                },
+                {
+                    "seq": 55,
+                    "phase": "fix",
+                    "created_at": (now - timedelta(seconds=100)).isoformat(),
+                    "sha": "c3",
+                },
             ],
         )
         db_session.add(lane)
         await db_session.commit()
 
-        resp = await client.get(
-            f"/api/admin/improvement-lanes?project_id={project.id}"
-        )
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
         assert resp.status_code == 200
         row = resp.json()["lanes"][0]
         # 55 written, 3 in window → 52 lost.
@@ -2314,8 +2467,18 @@ class TestImprovementLanes:
             project.id,
             checkpoint_seq=2,
             checkpoints=[
-                {"seq": 1, "phase": "fix", "created_at": (now - timedelta(seconds=200)).isoformat(), "sha": "x1"},
-                {"seq": 2, "phase": "review", "created_at": (now - timedelta(seconds=100)).isoformat(), "sha": "x2"},
+                {
+                    "seq": 1,
+                    "phase": "fix",
+                    "created_at": (now - timedelta(seconds=200)).isoformat(),
+                    "sha": "x1",
+                },
+                {
+                    "seq": 2,
+                    "phase": "review",
+                    "created_at": (now - timedelta(seconds=100)).isoformat(),
+                    "sha": "x2",
+                },
             ],
             workspace_state="COLD",
             pilot_arm=None,
@@ -2323,15 +2486,15 @@ class TestImprovementLanes:
         db_session.add(lane)
         await db_session.commit()
 
-        resp = await client.get(
-            f"/api/admin/improvement-lanes?project_id={project.id}"
-        )
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
         assert resp.status_code == 200
         row = resp.json()["lanes"][0]
         assert row["shadow"] is True
 
     @pytest.mark.asyncio
-    async def test_unauthenticated_caller_gets_403(self, override_get_session, db_session):
+    async def test_unauthenticated_caller_gets_403(
+        self, override_get_session, db_session
+    ):
         """A caller without admin privileges receives 403."""
         from fastapi import HTTPException
         from app.auth import get_current_user, require_admin
@@ -2492,7 +2655,9 @@ class TestImprovementLanesDrain:
 
         project = make_project()
         db_session.add(project)
-        db_session.add(make_membership(project.id, user_id="test-user-123", role="owner"))
+        db_session.add(
+            make_membership(project.id, user_id="test-user-123", role="owner")
+        )
         await db_session.commit()
 
         lane = _make_lane(
@@ -2554,7 +2719,9 @@ class TestImprovementLanesDrain:
 
         project = make_project()
         db_session.add(project)
-        db_session.add(make_membership(project.id, user_id="test-user-123", role="owner"))
+        db_session.add(
+            make_membership(project.id, user_id="test-user-123", role="owner")
+        )
         await db_session.commit()
 
         resp = await client.post(
@@ -2573,7 +2740,9 @@ class TestImprovementLanesDrain:
         """A project member without owner role receives 403."""
         project = make_project()
         db_session.add(project)
-        db_session.add(make_membership(project.id, user_id="test-user-123", role="member"))
+        db_session.add(
+            make_membership(project.id, user_id="test-user-123", role="member")
+        )
         await db_session.commit()
 
         resp = await client.post(
@@ -2588,5 +2757,232 @@ class TestImprovementLanesDrain:
         """A project_id that does not exist returns HTTP 404."""
         resp = await client.post(
             f"/api/admin/improvement-lanes/drain?project_id={uuid.uuid4()}"
+        )
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# TestLanePilotPreflight
+# ---------------------------------------------------------------------------
+
+
+class TestLanePilotPreflight:
+    """Tests for GET /api/admin/improvement-lanes/preflight."""
+
+    @pytest.mark.asyncio
+    async def test_preflight_all_checks_met(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """All preconditions met → ready=True and every check met=True."""
+        from app.shared_state import runtime_config
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        mocker.patch(
+            "app.warm_pool.is_warm_pool_enabled",
+            return_value=True,
+        )
+        mocker.patch(
+            "app.warm_pool.is_project_warm_pool_scoped",
+            return_value=True,
+        )
+        mocker.patch(
+            "app.warm_pool.warm_pool_project_scope",
+            return_value=set(),
+        )
+        mocker.patch(
+            "app.warm_pool.resolve_project_warm_pool_target",
+            return_value=2,
+        )
+        mocker.patch(
+            "app.review_fix_lane_pilot.is_review_fix_lane_killed",
+            return_value=False,
+        )
+        mocker.patch(
+            "app.review_fix_lane_pilot.is_pilot_eligible_project",
+            return_value=True,
+        )
+        mocker.patch.dict(
+            runtime_config,
+            {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": True},
+        )
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/preflight?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ready"] is True
+        assert body["project_id"] == str(project.id)
+        assert body["durable_verdict"] is None
+        for check in body["checks"]:
+            assert check["met"] is True, f"Expected {check['name']} to be met"
+
+    @pytest.mark.asyncio
+    async def test_preflight_warm_pool_disabled(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """warm_pool_enabled=False → ready=False, warm_pool_enabled check unmet."""
+        from app.shared_state import runtime_config
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        mocker.patch("app.warm_pool.is_warm_pool_enabled", return_value=False)
+        mocker.patch("app.warm_pool.is_project_warm_pool_scoped", return_value=True)
+        mocker.patch("app.warm_pool.warm_pool_project_scope", return_value=set())
+        mocker.patch("app.warm_pool.resolve_project_warm_pool_target", return_value=2)
+        mocker.patch(
+            "app.review_fix_lane_pilot.is_review_fix_lane_killed", return_value=False
+        )
+        mocker.patch(
+            "app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True
+        )
+        mocker.patch.dict(
+            runtime_config,
+            {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": True},
+        )
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/preflight?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ready"] is False
+        check_map = {c["name"]: c for c in body["checks"]}
+        assert check_map["warm_pool_enabled"]["met"] is False
+        assert check_map["warm_pool_enabled"]["fix_hint"] is not None
+
+    @pytest.mark.asyncio
+    async def test_preflight_project_not_in_scope(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Project outside warm pool scope → project_in_scope check unmet."""
+        from app.shared_state import runtime_config
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        other_id = str(uuid.uuid4())
+        mocker.patch("app.warm_pool.is_warm_pool_enabled", return_value=True)
+        mocker.patch("app.warm_pool.is_project_warm_pool_scoped", return_value=False)
+        mocker.patch("app.warm_pool.warm_pool_project_scope", return_value={other_id})
+        mocker.patch("app.warm_pool.resolve_project_warm_pool_target", return_value=2)
+        mocker.patch(
+            "app.review_fix_lane_pilot.is_review_fix_lane_killed", return_value=False
+        )
+        mocker.patch(
+            "app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True
+        )
+        mocker.patch.dict(
+            runtime_config,
+            {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": True},
+        )
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/preflight?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ready"] is False
+        check_map = {c["name"]: c for c in body["checks"]}
+        assert check_map["project_in_scope"]["met"] is False
+        assert other_id in check_map["project_in_scope"]["blocking_value"]
+
+    @pytest.mark.asyncio
+    async def test_preflight_kill_verdict_blocks(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Durable KILL verdict → no_kill_verdict check unmet and durable_verdict=KILL."""
+        from app.capability_trial_verdict import (
+            LANE_PILOT_CAP_NAME,
+            record_trial_verdict,
+        )
+        from app.shared_state import runtime_config
+        from app.time_utils import _utcnow
+
+        project = make_project()
+        record_trial_verdict(
+            project,
+            LANE_PILOT_CAP_NAME,
+            {
+                "verdict": "KILL",
+                "verdict_reason": "test_kill",
+                "evidence_source": "test",
+                "evaluated_at": _utcnow().isoformat(),
+            },
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        mocker.patch("app.warm_pool.is_warm_pool_enabled", return_value=True)
+        mocker.patch("app.warm_pool.is_project_warm_pool_scoped", return_value=True)
+        mocker.patch("app.warm_pool.warm_pool_project_scope", return_value=set())
+        mocker.patch("app.warm_pool.resolve_project_warm_pool_target", return_value=2)
+        mocker.patch(
+            "app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True
+        )
+        mocker.patch.dict(
+            runtime_config,
+            {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": True},
+        )
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/preflight?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ready"] is False
+        assert body["durable_verdict"] == "KILL"
+        check_map = {c["name"]: c for c in body["checks"]}
+        assert check_map["no_kill_verdict"]["met"] is False
+
+    @pytest.mark.asyncio
+    async def test_preflight_zero_pool_target(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Effective pool target=0 → warm_pool_target_nonzero check unmet."""
+        from app.shared_state import runtime_config
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        mocker.patch("app.warm_pool.is_warm_pool_enabled", return_value=True)
+        mocker.patch("app.warm_pool.is_project_warm_pool_scoped", return_value=True)
+        mocker.patch("app.warm_pool.warm_pool_project_scope", return_value=set())
+        mocker.patch("app.warm_pool.resolve_project_warm_pool_target", return_value=0)
+        mocker.patch(
+            "app.review_fix_lane_pilot.is_review_fix_lane_killed", return_value=False
+        )
+        mocker.patch(
+            "app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True
+        )
+        mocker.patch.dict(
+            runtime_config,
+            {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": True},
+        )
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/preflight?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ready"] is False
+        check_map = {c["name"]: c for c in body["checks"]}
+        assert check_map["warm_pool_target_nonzero"]["met"] is False
+        assert check_map["warm_pool_target_nonzero"]["blocking_value"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_preflight_unknown_project_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Unknown project_id → HTTP 404."""
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/preflight?project_id={uuid.uuid4()}"
         )
         assert resp.status_code == 404

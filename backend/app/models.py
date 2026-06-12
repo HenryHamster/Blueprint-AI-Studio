@@ -2012,7 +2012,18 @@ class PoolVm(SQLModel, table=True):
     reserved_lane_id: uuid.UUID | None = Field(
         default=None, sa_column=Column(GUID(), nullable=True)
     )
+    # SOFT reservation expiry. The maintainer's liveness-aware sweep may RE-STAMP
+    # this forward (extend) while the owning lane is still awaiting its fix, so it
+    # is NOT a reliable anchor for the absolute lifetime cap.
     reservation_expires_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    # HARD absolute ceiling on a reservation's total lifetime. Stamped ONCE at
+    # reservation creation (release_pool_vm) and never re-stamped, so liveness
+    # extension of reservation_expires_at can never exceed it. The sweep ALWAYS
+    # frees the member once this elapses, so a stuck/zombie lane can never pin a
+    # warm VM indefinitely (pool-capacity protection).
+    reservation_hard_expires_at: datetime | None = Field(
         default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
     )
 
@@ -4409,6 +4420,30 @@ class ImprovementLane(SQLModel, table=True):
     reserved_idle_cost_usd_total: float = Field(
         default=0.0,
         sa_column=Column(Float, nullable=False, server_default=text("0.0")),
+    )
+
+    # Reservation expiry-cause telemetry (warm-resume diagnosability). Each warm
+    # reservation this lane held ends exactly one way; these counters make a low
+    # warm_resume_fraction explainable on the lanes analytics surface:
+    #   * claimed_by_fix       — the fix phase actually leased the reserved member
+    #                            (the GOOD outcome that lifts warm_resume_fraction).
+    #   * expired_before_fix   — the soft TTL lapsed and the sweep reclaimed the
+    #                            member because the chain stopped awaiting its fix
+    #                            (lane no longer PARKED) before the hard ceiling.
+    #   * force_expired        — released by the hard absolute ceiling, a pilot
+    #                            KILL, a chain RETIRE, a checkpoint-exhausted close,
+    #                            or a reaped member.
+    reservation_claimed_by_fix_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    reservation_expired_before_fix_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    reservation_force_expired_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
 
     # Pilot arm: "lane" | "control" | None (intent-to-treat assignment)

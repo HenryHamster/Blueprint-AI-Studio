@@ -398,6 +398,7 @@ _last_evaluating_timeout_check: datetime = _utcnow()
 _last_post_commit_sweep: datetime = _utcnow()
 _last_sidecar_sweep: datetime = _utcnow()
 _last_bootstrap_recovery_sweep: datetime = _utcnow()
+_last_lane_baseline_backfill: datetime = _utcnow()
 _last_deadlock_check: float = 0.0
 _last_zone_exhaustion_log: datetime | None = None
 _last_concurrency_broadcast: float = 0.0
@@ -788,7 +789,9 @@ async def _project_resource_dispatch_defer_message(
         if project_cache is not None:
             project_cache[task.project_id] = project
     if project is None:
-        return "Waiting for project resource envelope check — project record unavailable"
+        return (
+            "Waiting for project resource envelope check — project record unavailable"
+        )
 
     vm_cap = resolve_project_vm_cap(project)
     if vm_cap is not None:
@@ -1252,9 +1255,7 @@ async def _recover_stale_dependency_deadlocks(
         broad_dep_rows = await session.execute(
             select(Task).where(Task.id.in_(all_dep_ids_broad))
         )
-        broad_dep_tasks_by_id = {
-            dt.id: dt for dt in broad_dep_rows.scalars().all()
-        }
+        broad_dep_tasks_by_id = {dt.id: dt for dt in broad_dep_rows.scalars().all()}
 
     broad_classified = await _classify_stuck_tasks(
         broad_stuck,
@@ -1401,11 +1402,7 @@ async def _mark_unblocked_dependents(completed_task: Task, verify_pr_merged) -> 
         return 0
     async with AsyncSessionLocal() as stamp_session:
         for r in (
-            (
-                await stamp_session.execute(
-                    select(Task).where(Task.id.in_(eligible_ids))
-                )
-            )
+            (await stamp_session.execute(select(Task).where(Task.id.in_(eligible_ids))))
             .scalars()
             .all()
         ):
@@ -1512,6 +1509,7 @@ async def orchestrator_worker():
         _sweep_post_commit_pending,
         _sweep_stranded_sidecar_sources,
         _sweep_bootstrap_recovery,
+        _sweep_lane_baseline_backfill,
     )
     from app.routers.agent import get_github_token_for_task
     from app.github import (
@@ -1525,7 +1523,12 @@ async def orchestrator_worker():
 
     global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
-    global _last_orphan_check, _last_post_commit_sweep, _last_sidecar_sweep, _last_bootstrap_recovery_sweep
+    global \
+        _last_orphan_check, \
+        _last_post_commit_sweep, \
+        _last_sidecar_sweep, \
+        _last_bootstrap_recovery_sweep, \
+        _last_lane_baseline_backfill
     while True:
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
@@ -2172,13 +2175,17 @@ async def orchestrator_worker():
                 # limit — the resource-envelope filter then defers every
                 # candidate and no other project dispatches that cycle.
                 _per_project_cap = max(slots_available * 2, 20)
-                _rn_col = _func.row_number().over(
-                    partition_by=Task.project_id,
-                    order_by=[
-                        Task.priority.desc().nullslast(),
-                        Task.created_at.asc(),
-                    ],
-                ).label("row_num")
+                _rn_col = (
+                    _func.row_number()
+                    .over(
+                        partition_by=Task.project_id,
+                        order_by=[
+                            Task.priority.desc().nullslast(),
+                            Task.created_at.asc(),
+                        ],
+                    )
+                    .label("row_num")
+                )
                 _cand_id_sq = (
                     select(Task.id, _rn_col)
                     # Exclude tasks owned by an archived OR paused project — both
@@ -2316,6 +2323,7 @@ async def orchestrator_worker():
                 from app.failure_classification import (
                     SCOPE_EMPTY as _SCOPE_EMPTY,
                 )
+
                 for task in candidate_tasks:
                     # Skip tasks held back due to retry_after hold (audit W1:
                     # ``retry_after_until`` is a column now, so a stale
@@ -2381,9 +2389,7 @@ async def orchestrator_worker():
                         continue  # Don't dispatch — deps can't be validated
                     # Look the dep rows up from the single batch fetched above
                     # (was one SELECT per candidate — the N+1 this fix removes).
-                    dep_tasks = [
-                        _dep_by_id[du] for du in dep_uuids if du in _dep_by_id
-                    ]
+                    dep_tasks = [_dep_by_id[du] for du in dep_uuids if du in _dep_by_id]
 
                     # Detect deleted dependencies — treat as failed to prevent premature dispatch
                     if len(dep_tasks) < len(dep_uuids):
@@ -2460,8 +2466,7 @@ async def orchestrator_worker():
                         # dependency is recognized as landed. No-op for tasks with
                         # no landed cross-base code-dep (returns True immediately).
                         effective_dep_tasks = [
-                            await _effective_dep_task(dt, session)
-                            for dt in dep_tasks
+                            await _effective_dep_task(dt, session) for dt in dep_tasks
                         ]
                         if not await ensure_dependent_base_recut(
                             task, effective_dep_tasks, session
@@ -2637,9 +2642,7 @@ async def orchestrator_worker():
                                     Task.status == TaskStatus.BLOCKED,
                                     Task.blocker_kind == "file_conflict",
                                 )
-                                .options(
-                                    load_only(*BLOCKED_CONFLICT_LIGHT_COLUMNS)
-                                )
+                                .options(load_only(*BLOCKED_CONFLICT_LIGHT_COLUMNS))
                             )
                         )
                         .scalars()
@@ -2734,9 +2737,9 @@ async def orchestrator_worker():
                 for _t in active_tasks_result:
                     _pid = _t.project_id
                     _active_by_project[_pid] = _active_by_project.get(_pid, 0) + 1
-                _cap_by_project_raw = _runtime_config.get(
-                    "max_concurrent_tasks_by_project"
-                ) or {}
+                _cap_by_project_raw = (
+                    _runtime_config.get("max_concurrent_tasks_by_project") or {}
+                )
                 _cap_by_project: dict = {}
                 for _pid_str, _cap_val in _cap_by_project_raw.items():
                     try:
@@ -2781,12 +2784,9 @@ async def orchestrator_worker():
                 # Weight is derived from each project's highest queued priority
                 # (no dedicated tier column exists) so urgent projects still get
                 # proportionally more turns without monopolizing the window.
-                _project_by_id = {
-                    t.id: t.project_id for t in candidate_tasks
-                }
+                _project_by_id = {t.id: t.project_id for t in candidate_tasks}
                 _fairness_weight = {
-                    t.id: _project_fairness_weight(t.priority)
-                    for t in candidate_tasks
+                    t.id: _project_fairness_weight(t.priority) for t in candidate_tasks
                 }
                 eligible_ids = apply_project_fairness(
                     eligible_ids, _project_by_id, _fairness_weight
@@ -5756,8 +5756,11 @@ async def orchestrator_worker():
                                 # False) — otherwise (CI-gated repo, checks merely
                                 # not registered yet) keep polling. See
                                 # Project.proceed_on_no_checks.
-                                if _ci_proj is not None and ci_resolution.proceed_on_no_checks(
-                                    _ci_proj, _ci_base_ref
+                                if (
+                                    _ci_proj is not None
+                                    and ci_resolution.proceed_on_no_checks(
+                                        _ci_proj, _ci_base_ref
+                                    )
                                 ):
                                     _is_staging = _ci_proj.is_staging_branch(
                                         _ci_base_ref
@@ -5976,8 +5979,7 @@ async def orchestrator_worker():
                                 if ci_task is None:
                                     continue
                                 ci_loop = dict(
-                                    (ci_task.context or {}).get("review_loop", {})
-                                    or {}
+                                    (ci_task.context or {}).get("review_loop", {}) or {}
                                 )
                                 ci_loop["ci_checks_seen"] = True
                                 if _verify_task is not None:
@@ -6083,12 +6085,10 @@ async def orchestrator_worker():
                                 # exhausted-retry UNVERIFIED merge for operators.
                                 _verify_setup_failed = False
                                 if _verify_task.status == TaskStatus.FAILED:
-                                    _failed_artifact = (
-                                        await _latest_artifact_logs(
-                                            session,
-                                            _verify_task.id,
-                                            ArtifactType.MERGE_TEST_RESULT,
-                                        )
+                                    _failed_artifact = await _latest_artifact_logs(
+                                        session,
+                                        _verify_task.id,
+                                        ArtifactType.MERGE_TEST_RESULT,
                                     )
                                     # Either an all-runners setup failure
                                     # (setupFailed) or a partial one
@@ -6122,9 +6122,7 @@ async def orchestrator_worker():
                                     ):
                                         _verdict = _failed_artifact
                                 _outcome, _detail = (
-                                    ci_resolution.classify_merge_test_verdict(
-                                        _verdict
-                                    )
+                                    ci_resolution.classify_merge_test_verdict(_verdict)
                                 )
                                 # Crash vs. genuinely-undetected split. A FAILED/
                                 # CANCELLED verify task — or a COMPLETED one that
@@ -6164,9 +6162,7 @@ async def orchestrator_worker():
                                         f"failing open"
                                     )
                                     ci_loop["ci_poll_interval"] = _v_poll_interval
-                                    ci_loop["ci_last_polled"] = (
-                                        _utcnow().isoformat()
-                                    )
+                                    ci_loop["ci_last_polled"] = _utcnow().isoformat()
                                     ci_loop["head_sha"] = ci_head_sha
                                     ci_task.latest_status_message = (
                                         f"PR #{ci_pr_number} — verify_tests crashed, "
@@ -6261,8 +6257,7 @@ async def orchestrator_worker():
                                     #     ``_VERIFY_TESTS_MAX_RETRIES`` re-spawns.
                                     _crash_exhausted = (
                                         _is_verify_crash
-                                        and _verify_retries
-                                        >= _VERIFY_TESTS_MAX_RETRIES
+                                        and _verify_retries >= _VERIFY_TESTS_MAX_RETRIES
                                     )
                                     # A setup-failure crash (suite exists but
                                     # could not run) gets a distinct operator
@@ -6276,18 +6271,14 @@ async def orchestrator_worker():
                                             f"{_VERIFY_TESTS_MAX_RETRIES}) — could "
                                             f"not run an existing suite"
                                         )
-                                        _unverified_merge_reason = (
-                                            "verify_setup_failed"
-                                        )
+                                        _unverified_merge_reason = "verify_setup_failed"
                                     elif _crash_exhausted:
                                         _reason_phrase = (
                                             f"verify_tests crashed and retries "
                                             f"exhausted ({_verify_retries}/"
                                             f"{_VERIFY_TESTS_MAX_RETRIES})"
                                         )
-                                        _unverified_merge_reason = (
-                                            "undetected_runtime"
-                                        )
+                                        _unverified_merge_reason = "undetected_runtime"
                                     else:
                                         # detected=false fall-open. Refine the
                                         # operator-visible reason: a suite that
@@ -6654,6 +6645,17 @@ async def orchestrator_worker():
                     await _sweep_bootstrap_recovery()
                 except Exception:
                     logger.exception("[ORCHESTRATOR] Bootstrap recovery sweep error")
+            # Lane-baseline backfill sweep — every 600s. Finds closed versions
+            # lacking a stored baseline and persists one retroactively.
+            # First-write-wins idempotent; best-effort/non-fatal.
+            if (_utcnow() - _last_lane_baseline_backfill).total_seconds() >= 600:
+                _last_lane_baseline_backfill = _utcnow()
+                try:
+                    await _sweep_lane_baseline_backfill()
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Lane-baseline backfill sweep error"
+                    )
             # Drain the deferred missing-branch alert queue into durable,
             # idempotent operator Alerts. The synchronous branch resolvers
             # record intent off the hot path (no DB I/O); the durable persist
@@ -6667,9 +6669,7 @@ async def orchestrator_worker():
                     ):
                         await _branch_alert_session.commit()
             except Exception:
-                logger.exception(
-                    "[ORCHESTRATOR] Failed to flush pending branch alerts"
-                )
+                logger.exception("[ORCHESTRATOR] Failed to flush pending branch alerts")
             _orchestrator_consecutive_monitoring_errors = 0
         except Exception as e:
             _orchestrator_consecutive_monitoring_errors += 1

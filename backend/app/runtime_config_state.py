@@ -642,17 +642,19 @@ runtime_config: Dict = {
     # warm_continuity_enabled / warm_backlog_reuse_enabled.
     "warm_pool_enabled": False,
     # Master switch for the v10 persistent improvement lane substrate (knowledge
-    # doc 18840e55). Default False so ALL lane code is INERT until the full
-    # substrate lands and the flag is flipped. First enabled mode is SHADOW:
-    # lanes attach to eligible create-chains and checkpoint enforcement runs,
-    # but no workspace reservations and no prompt changes — validating the
-    # checkpoint contract with zero pool impact.
+    # doc 18840e55). Default False so ALL lane code is INERT. When this is True
+    # and review_fix_lane_pilot_enabled is False, the review-fix path runs in
+    # SHADOW: eligible self-repo chains create armless lanes and exercise real
+    # SHA-verified checkpoint/CAS transitions, but take no workspace reservation,
+    # attach no warm-resume prompt/dispatch context, and do not alter spawning.
     "improvement_lanes_enabled": False,
     # Review-fix lane pilot (knowledge doc 18840e55, pilot/matched-control/kill
     # sections). Lane-izes ONLY the fix side of the review -> fix -> re-review
-    # loop for the Blueprint self-repo. Requires improvement_lanes_enabled too;
-    # a KILL verdict flips this back to False so every chain degrades to classic.
-    # Default False — fully inert (classic spawn path byte-for-byte unchanged).
+    # loop for the Blueprint self-repo. Requires improvement_lanes_enabled too.
+    # False means either fully inert (master off) or SHADOW (master on); True
+    # means full pilot with ITT arm assignment, warm reservation, fix-side lane
+    # dispatch/prompt context, recovery requeues, and KILL/ADOPT measurement.
+    # A KILL verdict flips this back to False so every chain leaves full pilot.
     "review_fix_lane_pilot_enabled": False,
     # Account-agnostic lease: when True, a same-tenant IDLE pool member may be
     # leased for a task whose resolved account (and model) differ from the
@@ -738,13 +740,29 @@ runtime_config: Dict = {
     # project (no recent demand, no members) is never seeded. Read by
     # warm_pool_maintainer._demand_active_projects.
     "warm_pool_demand_window_minutes": 30,
-    # TTL (seconds) for a lane-scoped workspace reservation set on pool member
-    # release. A member returned to IDLE with a lane id is held for the matching
-    # lane's next phase for this window; after expiry it becomes generally
-    # claimable by any request. Defaults to 15 min — enough to span the gap
-    # between a phase completing (lane parks) and the next phase being dispatched.
-    # Inert when improvement_lanes_enabled is False.
-    "warm_pool_lane_reservation_ttl_seconds": 900,
+    # SOFT TTL (seconds) for a lane-scoped workspace reservation set on pool
+    # member release. A member returned to IDLE with a lane id is held for the
+    # matching lane's next phase for this window. The maintainer's liveness-aware
+    # sweep RE-STAMPS this forward while the owning lane is still PARKED awaiting
+    # its fix (bounded by warm_pool_lane_reservation_hard_cap_seconds), so a soft
+    # expiry no longer immediately surrenders the member mid-review. Re-grounded
+    # from 15 min to 30 min: a lane-arm review is deliberately forced COLD, so the
+    # reservation must span cold VM provisioning + a full review agent run +
+    # evaluation + the fix's queue/dispatch latency. The admin lane-diag endpoint
+    # (GET /api/admin/lane-diag) per-PR ``review_seconds`` medians show that cold
+    # window routinely exceeds 15 min; 30 min comfortably spans a real cold review
+    # before the liveness sweep even has to extend it. Inert when
+    # improvement_lanes_enabled is False.
+    "warm_pool_lane_reservation_ttl_seconds": 1800,
+    # HARD absolute ceiling (seconds) on a lane reservation's TOTAL lifetime. The
+    # liveness-aware sweep may re-stamp the soft TTL above to keep a member
+    # reserved across a long review, but it can NEVER extend past this cap (anchored
+    # by PoolVm.reservation_hard_expires_at, stamped once at reservation creation
+    # and never re-stamped). Once the cap elapses the sweep ALWAYS frees the member
+    # even when the lane still looks alive, so a stuck/zombie lane cannot pin a warm
+    # VM indefinitely. Defaults to 90 min — generous headroom over the re-grounded
+    # 30 min soft TTL for a worst-case slow review while still bounding the pin.
+    "warm_pool_lane_reservation_hard_cap_seconds": 5400,
     # Circuit-breaker thresholds for POOL-served claims. When pool leases or
     # pool-leased tasks fail (lease/finalize error, a leased VM found tearing
     # down, or a FAILED pool task) more than the threshold within a 1h rolling
@@ -1685,3 +1703,15 @@ def is_review_fix_lane_pilot_enabled() -> bool:
     if not is_improvement_lanes_enabled():
         return False
     return bool(runtime_config.get("review_fix_lane_pilot_enabled", False))
+
+
+def is_review_fix_lane_shadow_enabled() -> bool:
+    """Return True for checkpoint-only review-fix lane shadow mode.
+
+    Shadow is the first enabled state of the substrate: the master switch is on
+    but the full pilot flag is off. Callers must still apply project eligibility
+    and durable KILL checks before creating shadow lanes.
+    """
+    return is_improvement_lanes_enabled() and not bool(
+        runtime_config.get("review_fix_lane_pilot_enabled", False)
+    )
