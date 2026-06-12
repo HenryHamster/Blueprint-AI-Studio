@@ -3438,6 +3438,59 @@ async def test_is_ancestor_of_returns_none_on_unparseable_response(mocker):
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_list_recent_commit_messages_extracts_messages_caps_and_does_not_paginate(
+    mocker,
+):
+    """Recent commit-message scan is bounded to one capped commits API call."""
+    from app.github import list_recent_commit_messages
+
+    request_mock = mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(
+            200,
+            [
+                {"commit": {"message": "rollup body\n\n- task one"}},
+                {"commit": {"message": "plain commit subject"}},
+            ],
+            links={"next": {"url": "https://api.github.com/next"}},
+        ),
+    )
+
+    result = await list_recent_commit_messages(
+        "tok", "owner", "repo", "feature/rollup", limit=999
+    )
+
+    assert result == ["rollup body\n\n- task one", "plain commit subject"]
+    assert request_mock.call_count == 1
+    assert request_mock.call_args.args[0] == "GET"
+    assert request_mock.call_args.args[1].endswith(
+        "/repos/owner/repo/commits?sha=feature%2Frollup&per_page=50"
+    )
+
+
+@pytest.mark.parametrize("response_kind", ["api-error", "unparseable"])
+@pytest.mark.asyncio
+async def test_list_recent_commit_messages_returns_none_on_failure(
+    mocker, response_kind
+):
+    """Failures are indeterminate rather than empty evidence."""
+    from app.github import list_recent_commit_messages
+
+    response = MockResponse(404, {})
+    if response_kind == "unparseable":
+        response = MockResponse(200, None)
+
+        def _raise():
+            raise ValueError("no JSON")
+
+        response.json = _raise
+    mocker.patch("httpx.AsyncClient.request", return_value=response)
+
+    result = await list_recent_commit_messages("tok", "owner", "repo", "automain")
+    assert result is None
+
+
 # ---------------------------------------------------------------------------
 # pr_is_not_behind — GitHub-clean / ancestor-of-base detector
 # ---------------------------------------------------------------------------

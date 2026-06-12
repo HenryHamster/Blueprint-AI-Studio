@@ -776,6 +776,7 @@ from app.github_refs import (  # noqa: F401
     get_commit_date,
     list_pull_requests_for_commit,
     is_ancestor_of,
+    list_recent_commit_messages,
     get_files_changed_between_refs,
     agent_image_rebake_expected,
     AGENT_IMAGE_BAKE_PATHS,

@@ -2601,6 +2601,29 @@ def _rollup_body_is_trivial(body: str | None) -> bool:
     return bool(re.match(r"^\s*Rollup of \d+ subtasks?\b", body))
 
 
+def _recent_commit_messages_match_task(
+    messages: list[str],
+    *,
+    title: str,
+    pr_numbers: set[int],
+) -> bool:
+    """Return True when a bounded commit-message sample names this task."""
+    import re
+
+    normalized_messages = [" ".join(m.casefold().split()) for m in messages]
+    normalized_title = " ".join((title or "").casefold().split())
+    if len(normalized_title) >= 8 and any(
+        normalized_title in message for message in normalized_messages
+    ):
+        return True
+
+    for pr_number in pr_numbers:
+        pr_ref_re = re.compile(rf"(?<![\w#])#{pr_number}(?!\d)")
+        if any(pr_ref_re.search(message) for message in messages):
+            return True
+    return False
+
+
 async def _build_recent_interventions(
     project: Project,
     session: AsyncSession,
@@ -2867,8 +2890,26 @@ async def _build_recent_interventions(
         # (multiple children share one parent rollup PR) and lets us fan the
         # per-PR ancestry checks out concurrently without redundant fetches.
         _tasks_by_pr: dict[int, list[uuid.UUID]] = {}
+        _rollup_message_evidence_by_task: dict[
+            uuid.UUID, tuple[str, set[int]]
+        ] = {}
         for _t in (t for t in merged_tasks if t.id in _to_verify_ids):
             _ctx_t = _t.context or {}
+            _task_pr_numbers: set[int] = set()
+            for _raw_task_pr in (
+                _ctx_t.get("pr_number"),
+                _ctx_t.get("original_pr_number"),
+            ):
+                if not _raw_task_pr:
+                    continue
+                try:
+                    _task_pr_numbers.add(int(_raw_task_pr))
+                except (TypeError, ValueError):
+                    continue
+            _rollup_message_evidence_by_task[_t.id] = (
+                _t.title or "",
+                _task_pr_numbers,
+            )
             if _t.parent_task_id is not None:
                 _pr_num_raw = _parent_rollup_pr.get(_t.parent_task_id)
             else:
@@ -2981,6 +3022,89 @@ async def _build_recent_interventions(
                         _automain_verified[_tid] = _automain_landed
                     if _on_main_landed is not None:
                         _on_main_verified[_tid] = _on_main_landed
+
+        # One bounded squash-body scan can rescue rollup-rewritten work from a
+        # false NOT-landed verdict. Scan failure degrades those negatives to
+        # unverifiable so merge accounting does not manufacture a conflict.
+        _ancestry_false_task_ids = [
+            _tid for _tid, _landed in _automain_verified.items() if _landed is False
+        ]
+        if _ancestry_false_task_ids:
+            try:
+                _recent_commit_messages = await asyncio.wait_for(
+                    _github_ss.list_recent_commit_messages(
+                        _gh_token_ss,
+                        _gh_owner_ss,
+                        _gh_repo_ss,
+                        _integration_branch_ss,
+                        project_id=str(project.id),
+                    ),
+                    timeout=_ANCESTRY_CALL_TIMEOUT_S,
+                )
+            except Exception as _exc_rollup:  # noqa: BLE001 — degrade to unverifiable
+                logger.debug(
+                    "[STRATEGIC] rollup squash message scan failed: %s",
+                    _exc_rollup,
+                )
+                _recent_commit_messages = None
+
+            if _recent_commit_messages is None:
+                for _tid in _ancestry_false_task_ids:
+                    _automain_verified.pop(_tid, None)
+            else:
+                _message_rescued_task_ids: list[uuid.UUID] = []
+                for _tid in _ancestry_false_task_ids:
+                    _title, _task_pr_numbers = _rollup_message_evidence_by_task.get(
+                        _tid, ("", set())
+                    )
+                    if _recent_commit_messages_match_task(
+                        _recent_commit_messages,
+                        title=_title,
+                        pr_numbers=_task_pr_numbers,
+                    ):
+                        _automain_verified[_tid] = True
+                        _message_rescued_task_ids.append(_tid)
+
+                # If the project uses an LTS split, exact-SHA ancestry can be
+                # equally false on the promotion target after a rollup squash.
+                # Apply the same commit-message evidence there before calling
+                # the merge integration-only; otherwise promoted rollup squash
+                # work is incorrectly reported as undeployed.
+                if (
+                    _message_rescued_task_ids
+                    and _promotion_target_ss != _integration_branch_ss
+                ):
+                    try:
+                        _recent_promotion_messages = await asyncio.wait_for(
+                            _github_ss.list_recent_commit_messages(
+                                _gh_token_ss,
+                                _gh_owner_ss,
+                                _gh_repo_ss,
+                                _promotion_target_ss,
+                                project_id=str(project.id),
+                            ),
+                            timeout=_ANCESTRY_CALL_TIMEOUT_S,
+                        )
+                    except Exception as _exc_rollup_main:  # noqa: BLE001
+                        logger.debug(
+                            "[STRATEGIC] promotion-target squash message scan failed: %s",
+                            _exc_rollup_main,
+                        )
+                        _recent_promotion_messages = None
+
+                    if _recent_promotion_messages is not None:
+                        for _tid in _message_rescued_task_ids:
+                            _title, _task_pr_numbers = (
+                                _rollup_message_evidence_by_task.get(
+                                    _tid, ("", set())
+                                )
+                            )
+                            if _recent_commit_messages_match_task(
+                                _recent_promotion_messages,
+                                title=_title,
+                                pr_numbers=_task_pr_numbers,
+                            ):
+                                _on_main_verified[_tid] = True
 
     def _on_automain(task: Task) -> bool:
         # Prefer the GitHub-verified result when available.

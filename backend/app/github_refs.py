@@ -5,6 +5,7 @@ existing imports keep working.
 """
 
 from datetime import datetime
+from urllib.parse import quote
 
 from fastapi import HTTPException, status
 
@@ -13,6 +14,9 @@ from app.github import logger
 # Keep `datetime` referenced so linters don't strip it; it is only used as a
 # forward reference in `get_commit_date(...) -> "datetime | None"`.
 _DATETIME = datetime
+
+_RECENT_COMMIT_MESSAGES_DEFAULT_LIMIT = 30
+_RECENT_COMMIT_MESSAGES_MAX_LIMIT = 50
 
 
 def _github_request(*args, **kwargs):
@@ -643,6 +647,73 @@ async def is_ancestor_of(
     return compare_status in ("identical", "ahead")
 
 
+async def list_recent_commit_messages(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    limit: int = _RECENT_COMMIT_MESSAGES_DEFAULT_LIMIT,
+    project_id: str | None = None,
+) -> list[str] | None:
+    """Return recent commit messages from ``branch`` using one bounded API call."""
+    try:
+        per_page = max(1, min(int(limit), _RECENT_COMMIT_MESSAGES_MAX_LIMIT))
+    except (TypeError, ValueError):
+        per_page = _RECENT_COMMIT_MESSAGES_DEFAULT_LIMIT
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_branch = quote(branch, safe="")
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/commits"
+        f"?sha={encoded_branch}&per_page={per_page}",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] list_recent_commit_messages: %s/%s@%s returned %s",
+            owner,
+            repo,
+            branch,
+            response.status_code,
+        )
+        return None
+    try:
+        commits = response.json()
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "[GITHUB] list_recent_commit_messages: unparseable response for "
+            "%s/%s@%s: %s",
+            owner,
+            repo,
+            branch,
+            exc,
+        )
+        return None
+    if not isinstance(commits, list):
+        logger.warning(
+            "[GITHUB] list_recent_commit_messages: expected list for %s/%s@%s, got %s",
+            owner,
+            repo,
+            branch,
+            type(commits).__name__,
+        )
+        return None
+
+    messages: list[str] = []
+    for entry in commits:
+        commit = entry.get("commit") if isinstance(entry, dict) else None
+        message = commit.get("message") if isinstance(commit, dict) else None
+        if isinstance(message, str):
+            messages.append(message)
+    return messages
+
+
 async def get_files_changed_between_refs(
     token: str,
     owner: str,
@@ -698,5 +769,3 @@ async def get_files_changed_between_refs(
             exc,
         )
         return None
-
-

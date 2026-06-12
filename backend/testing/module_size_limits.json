@@ -17,7 +17,7 @@
     "github_checks.py": 800,
     "hotfix_backmerge.py": 2000,
     "github_issues.py": 500,
-    "github_refs.py": 730,
+    "github_refs.py": 1000,
     "github_pulls.py": 1000,
     "github_merge_summary.py": 350,
     "routers/admin_settings.py": 3550,

@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 from sqlalchemy import select
 
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
@@ -8078,6 +8078,10 @@ async def test_on_automain_false_when_commit_not_ancestor(db_session, mocker):
         "app.github.is_ancestor_of",
         new=AsyncMock(return_value=False),
     )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
+    )
 
     result = await _build_recent_interventions(project, db_session)
     merges = result["merges"]
@@ -8311,6 +8315,10 @@ async def test_on_automain_child_false_when_parent_rollup_pr_not_ancestor(
         "app.github.is_ancestor_of",
         new=AsyncMock(return_value=False),
     )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
+    )
 
     result = await _build_recent_interventions(project, db_session)
     by_title = {m["pr_title"]: m for m in result["merges"]}
@@ -8473,6 +8481,10 @@ async def test_recent_merged_titles_carry_tristate_merge_verdict(db_session, moc
         "app.github.is_ancestor_of",
         new=AsyncMock(side_effect=_anc_side_effect),
     )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
+    )
 
     result = await _build_recent_interventions(project, db_session)
     delta = next(
@@ -8483,6 +8495,161 @@ async def test_recent_merged_titles_carry_tristate_merge_verdict(db_session, moc
     }
     assert verdicts["Landed on automain"] == "verified_landed"
     assert verdicts["Badge says merged but stranded"] == "verified_not_landed"
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_verdict", "expected_not_landed_titles"),
+    [
+        (
+            ["Rollup squash\n\nIncluded work:\n- Honor rollup squash bodies"],
+            "verified_landed",
+            None,
+        ),
+        (
+            ["Rollup squash\n\nIncluded PRs: #9635, #9639"],
+            "verified_landed",
+            None,
+        ),
+        (
+            ["Rollup squash\n\nIncluded PRs: #1111"],
+            "verified_not_landed",
+            ["Honor rollup squash bodies"],
+        ),
+        (None, "unverifiable", None),
+    ],
+    ids=["title-evidence", "pr-evidence", "absent", "scan-failure"],
+)
+@pytest.mark.asyncio
+async def test_rollup_squash_body_evidence_prevents_not_landed_verdict(
+    db_session, mocker, messages, expected_verdict, expected_not_landed_titles
+):
+    """Recent rollup squash bodies can upgrade false ancestry before accounting."""
+    direction_id = "dir-rollup-evidence"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "merge accounting dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Honor rollup squash bodies",
+        description="merge commit was rewritten by a rollup squash",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 9635, "direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merge_commit_sha": "rewritten-child-sha",
+                "head": {"sha": "head-sha"},
+            }
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    commit_messages_mock = mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=messages),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+
+    assert delta["recent_merged_titles"] == [
+        {
+            "title": "Honor rollup squash bodies",
+            "on_automain": expected_verdict == "verified_landed",
+            "merge_verdict": expected_verdict,
+        }
+    ]
+    if expected_not_landed_titles:
+        assert delta["recent_not_landed_titles"] == expected_not_landed_titles
+    else:
+        assert "recent_not_landed_titles" not in delta
+    assert delta["recent_merge_verdict_counts"][expected_verdict] == 1
+    assert sum(delta["recent_merge_verdict_counts"].values()) == 1
+    commit_messages_mock.assert_any_await(
+        "tok", "owner", "repo", "automain", project_id=str(project.id)
+    )
+    expected_scan_count = 2 if expected_verdict == "verified_landed" else 1
+    assert commit_messages_mock.await_count == expected_scan_count
+
+
+@pytest.mark.asyncio
+async def test_rollup_squash_body_evidence_applies_to_promotion_target(
+    db_session, mocker
+):
+    """Squash-body evidence on the promotion target marks rescued work deployed."""
+    direction_id = "dir-rollup-main-evidence"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "merge accounting dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Promoted rollup squash body",
+        description="merge commit was rewritten by a promoted rollup squash",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 9635, "direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"merge_commit_sha": "rewritten-child-sha"}),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    commit_messages_mock = mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(
+            side_effect=[
+                ["Rollup squash\n\nIncluded PRs: #9635"],
+                ["Promoted rollup\n\nIncluded work: Promoted rollup squash body"],
+            ]
+        ),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+
+    merge = result["merges"][0]
+    assert merge["on_automain"] is True
+    assert merge["on_main"] is True
+    assert result["undeployed_directions"] == []
+    assert commit_messages_mock.await_args_list == [
+        call("tok", "owner", "repo", "automain", project_id=str(project.id)),
+        call("tok", "owner", "repo", "main", project_id=str(project.id)),
+    ]
 
 
 @pytest.mark.asyncio
@@ -8553,6 +8720,10 @@ async def test_recent_merged_titles_cap_preserves_full_merge_accounting_counts(
     mocker.patch(
         "app.github.is_ancestor_of",
         new=AsyncMock(side_effect=_anc_side_effect),
+    )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
     )
 
     result = await _build_recent_interventions(project, db_session)
