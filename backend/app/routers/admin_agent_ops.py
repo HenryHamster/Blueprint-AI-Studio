@@ -2726,6 +2726,12 @@ _AUDIT_FINDING_RESOLUTION_TASK_TYPES: frozenset[str] = frozenset(
 
 _VALID_RESOLUTION_STATES: frozenset[str] = frozenset({"resolved", "stale"})
 
+# Task types that carry a stable release_version_id in their context (stamped
+# at spawn time) and must be checked for version staleness before writing.
+_AUDIT_BOUND_VERSION_TASK_TYPES: frozenset[str] = frozenset(
+    {"release_audit", "release_audit_challenge"}
+)
+
 
 class AuditFindingResolutionOp(BaseModel):
     task_id: uuid.UUID
@@ -2785,12 +2791,40 @@ async def agent_audit_finding_resolution(
             detail="No open release version",
         )
 
+    # release_audit and release_audit_challenge tasks carry a stable
+    # release_version_id in their context (stamped at spawn time).  Use that
+    # binding to attribute the resolution to the correct version, and reject
+    # the write if the task's bound version is no longer the open one — an
+    # older candidate must not mark findings resolved on a later open version.
+    task_type = token.get("task_type")
+    resolution_version_id = open_version.id
+    if task_type in _AUDIT_BOUND_VERSION_TASK_TYPES:
+        bound_str = (task.context or {}).get("release_version_id")
+        if bound_str:
+            try:
+                bound_id = uuid.UUID(bound_str)
+            except (ValueError, AttributeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid release_version_id in task context",
+                )
+            if bound_id != open_version.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Task is bound to release version {bound_id} "
+                        f"but the current open version is {open_version.id}; "
+                        "resolution rejected to prevent cross-version attribution"
+                    ),
+                )
+            resolution_version_id = bound_id
+
     from app.release_readiness import apply_finding_resolution  # noqa: PLC0415
 
     await apply_finding_resolution(
         session,
         project.id,
-        open_version.id,
+        resolution_version_id,
         payload.finding_key,
         payload.state,
         severity=payload.severity,
@@ -2804,17 +2838,17 @@ async def agent_audit_finding_resolution(
         "[AUDIT_FINDING] task %s (%s) marked finding '%s' as '%s' "
         "for project %s version %s",
         task.id,
-        token.get("task_type", "?"),
+        task_type or "?",
         payload.finding_key,
         payload.state,
         project.id,
-        open_version.id,
+        resolution_version_id,
     )
     return {
         "status": "ok",
         "finding_key": payload.finding_key,
         "state": payload.state,
-        "release_version_id": str(open_version.id),
+        "release_version_id": str(resolution_version_id),
     }
 
 

@@ -14,7 +14,16 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.models import AuditFindingResolution, MessageType, Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, TaskStatus
+from app.models import (
+    AuditFindingResolution,
+    MessageType,
+    Project,
+    ProjectMessage,
+    QualificationVerdict,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+)
 from app.auth import create_agent_token
 
 
@@ -38,7 +47,9 @@ async def _add_message(db_session, project, **kwargs):
     return msg
 
 
-async def _add_ambiguous_messages(db_session, project, *, shared_prefix: str = "abcdef12"):
+async def _add_ambiguous_messages(
+    db_session, project, *, shared_prefix: str = "abcdef12"
+):
     """Create two messages whose UUIDs share the same 8-hex prefix."""
     import uuid as _uuid
 
@@ -294,6 +305,7 @@ async def test_agent_fetch_design_doc_section_returns_full_and_grounds(
     against the integration branch exactly like the design-doc get op — a
     present-status systems entry whose backing files are absent downgrades to
     ``missing`` before it reaches the agent."""
+
     # Drive grounding through the GitHub-backed branch path (the local-HEAD
     # fallback degrades to a no-op without a real checkout) and report every
     # backing file absent so the present-status entry deterministically
@@ -682,7 +694,9 @@ async def test_agent_fetch_problem_model_both_spellings_return_same_body(
     # Both must return identical bodies
     assert body_underscore == body_hyphen
     assert body_underscore["data"]["revision"] == 5
-    assert body_underscore["data"]["intent"]["purpose"] == "Image rollover compatibility"
+    assert (
+        body_underscore["data"]["intent"]["purpose"] == "Image rollover compatibility"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1066,7 +1080,9 @@ async def test_strategic_create_message_mixed_present_citation_is_flagged(
     )
     mocker.patch(
         "app.source_ref_validation._file_exists_at_head",
-        new=AsyncMock(side_effect=lambda path, **_: True if "alive.py" in path else False),
+        new=AsyncMock(
+            side_effect=lambda path, **_: True if "alive.py" in path else False
+        ),
     )
     token = create_agent_token(
         str(task.id), task.vm_instance_id, task_type="strategic_review"
@@ -1172,11 +1188,25 @@ async def test_agent_fetch_qualification_returns_latest_verdict_findings(
     project, task, version = await _make_project_with_version(db_session)
 
     findings = [
-        {"severity": "HIGH", "summary": "Missing auth check", "file": "backend/app/auth.py"},
-        {"severity": "MEDIUM", "summary": "N+1 query in loop", "file": "backend/app/admin.py"},
+        {
+            "severity": "HIGH",
+            "summary": "Missing auth check",
+            "file": "backend/app/auth.py",
+        },
+        {
+            "severity": "MEDIUM",
+            "summary": "N+1 query in loop",
+            "file": "backend/app/admin.py",
+        },
     ]
     excluded = [{"severity": "LOW", "summary": "Cosmetic warning"}]
-    challenger_refuted = [{"severity": "MEDIUM", "summary": "False positive", "challenger_reason": "not applicable"}]
+    challenger_refuted = [
+        {
+            "severity": "MEDIUM",
+            "summary": "False positive",
+            "challenger_reason": "not applicable",
+        }
+    ]
 
     verdict = QualificationVerdict(
         id=uuid.uuid4(),
@@ -1217,7 +1247,9 @@ async def test_agent_fetch_qualification_returns_latest_verdict_findings(
     assert len(body["excluded_findings"]) == 1
     assert body["excluded_findings"][0]["summary"] == "Cosmetic warning"
     assert len(body["challenger_refuted_findings"]) == 1
-    assert body["challenger_refuted_findings"][0]["challenger_reason"] == "not applicable"
+    assert (
+        body["challenger_refuted_findings"][0]["challenger_reason"] == "not applicable"
+    )
     # Additive re-qualification signal: keys are present and shaped. These findings
     # carry no resolution-ledger rows, so the gating (HIGH+MEDIUM) findings read as
     # unresolved and the trigger is not met.
@@ -1413,7 +1445,9 @@ async def test_agent_fetch_qualification_rejects_cross_project(
 # ---------------------------------------------------------------------------
 
 
-async def _setup_audit_project_task(db_session, *, vm="agent-vm-audit", task_type="release_audit"):
+async def _setup_audit_project_task(
+    db_session, *, vm="agent-vm-audit", task_type="release_audit"
+):
     project = Project(name="Audit Test", user_id="test-user-audit")
     db_session.add(project)
     await db_session.commit()
@@ -1457,13 +1491,17 @@ async def test_audit_finding_resolution_resolved_state(client: AsyncClient, db_s
     assert body["release_version_id"] == str(version.id)
 
     row = (
-        await db_session.execute(
-            select(AuditFindingResolution).where(
-                AuditFindingResolution.project_id == project.id,
-                AuditFindingResolution.finding_key == "abcdef1234567890",
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.project_id == project.id,
+                    AuditFindingResolution.finding_key == "abcdef1234567890",
+                )
             )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     assert row is not None
     assert row.state == "resolved"
     assert row.resolving_ref == "https://github.com/org/repo/pull/42"
@@ -1499,19 +1537,25 @@ async def test_audit_finding_resolution_stale_state(client: AsyncClient, db_sess
     assert body["release_version_id"] == str(version.id)
 
     row = (
-        await db_session.execute(
-            select(AuditFindingResolution).where(
-                AuditFindingResolution.finding_key == "deadbeef12345678",
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.finding_key == "deadbeef12345678",
+                )
             )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     assert row is not None
     assert row.state == "stale"
     assert row.verified_against_sha == "abc1234"
 
 
 @pytest.mark.asyncio
-async def test_audit_finding_resolution_uses_open_version(client: AsyncClient, db_session):
+async def test_audit_finding_resolution_uses_open_version(
+    client: AsyncClient, db_session
+):
     """When version_number is omitted the endpoint resolves the open ReleaseVersion."""
     project, task, token = await _setup_audit_project_task(
         db_session, vm="agent-vm-openver", task_type="release_audit_challenge"
@@ -1536,12 +1580,16 @@ async def test_audit_finding_resolution_uses_open_version(client: AsyncClient, d
     assert body["release_version_id"] == str(version.id)
 
     row = (
-        await db_session.execute(
-            select(AuditFindingResolution).where(
-                AuditFindingResolution.finding_key == "cafebabe12345678",
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.finding_key == "cafebabe12345678",
+                )
             )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     assert row is not None
     assert row.release_version_id == version.id
 
@@ -1643,19 +1691,149 @@ async def test_audit_finding_resolution_upserts_on_second_write(
     # Second write: resolved
     r2 = await client.post(
         "/api/agent/audit-finding-resolution",
-        json={"task_id": str(task.id), "finding_key": fkey, "state": "resolved", "note": "now fixed"},
+        json={
+            "task_id": str(task.id),
+            "finding_key": fkey,
+            "state": "resolved",
+            "note": "now fixed",
+        },
         headers={"x-agent-token": token},
     )
     assert r2.status_code == 200, r2.text
 
     rows = (
-        await db_session.execute(
-            select(AuditFindingResolution).where(
-                AuditFindingResolution.finding_key == fkey,
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.finding_key == fkey,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     # Must upsert, not insert a duplicate
     assert len(rows) == 1
     assert rows[0].state == "resolved"
     assert rows[0].note == "now fixed"
+
+
+@pytest.mark.asyncio
+async def test_audit_finding_resolution_bound_version_used(
+    client: AsyncClient, db_session
+):
+    """release_audit task with context-bound version uses that version for the ledger."""
+    project = Project(name="Bound Ver Test", user_id="test-user-bv")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(
+        project_id=project.id, version_number=11, status="open", phase="build"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-bv",
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), "agent-vm-bv", task_type="release_audit")
+
+    res = await client.post(
+        "/api/agent/audit-finding-resolution",
+        json={
+            "task_id": str(task.id),
+            "finding_key": "aabbccdd11223344",
+            "state": "resolved",
+            "note": "fixed",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "ok"
+    assert body["release_version_id"] == str(version.id)
+
+    row = (
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.finding_key == "aabbccdd11223344",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert row is not None
+    assert row.release_version_id == version.id
+    assert row.state == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_audit_finding_resolution_rejects_stale_task_version(
+    client: AsyncClient, db_session
+):
+    """release_audit task bound to an old version returns 409 when a newer version is open."""
+    project = Project(name="Stale Ver Test", user_id="test-user-sv")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_version = ReleaseVersion(
+        project_id=project.id, version_number=9, status="closed", phase="build"
+    )
+    db_session.add(old_version)
+    await db_session.commit()
+    await db_session.refresh(old_version)
+
+    new_version = ReleaseVersion(
+        project_id=project.id, version_number=10, status="open", phase="build"
+    )
+    db_session.add(new_version)
+    await db_session.commit()
+    await db_session.refresh(new_version)
+
+    # Task was spawned against old_version and still carries that binding.
+    task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-sv",
+        context={"release_version_id": str(old_version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), "agent-vm-sv", task_type="release_audit")
+
+    res = await client.post(
+        "/api/agent/audit-finding-resolution",
+        json={
+            "task_id": str(task.id),
+            "finding_key": "stalefinding1234",
+            "state": "resolved",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 409, res.text
+
+    # No AuditFindingResolution row must have been created.
+    row = (
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.finding_key == "stalefinding1234",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert row is None
