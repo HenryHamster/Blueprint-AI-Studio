@@ -6393,6 +6393,118 @@ class TestCompletedFoundationSatisfiesPrereqAtSpawn:
                 "ghost-merge escalation must set no_live_or_deferred_provider reason"
             )
 
+    async def test_recent_terminal_duplicate_finding_is_suppressed_by_history(
+        self, mocker, db_session
+    ):
+        """A reworded finding should be suppressed once a recent terminal task already
+        explored the same direction and evidence."""
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _make_research_task,
+            _patch_research_externals,
+        )
+
+        direction = _active_direction("d-terminal-history", "Terminal history test")
+        project = _Project(
+            name="Terminal History Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        current_task = await _make_research_task(project, direction, db_session)
+
+        terminal_finding = _make_finding(
+            title="measure duplicate retry inflation drivers",
+            direction_id=direction["id"],
+        )
+        terminal_finding["sources"] = [
+            {"type": "file", "ref": "backend/app/cache.py:42"},
+            {"type": "file", "ref": "backend/app/models.py#L100-L200"},
+        ]
+        terminal_finding["claims"] = [
+            "retry inflation is caused by duplicate spawning",
+        ]
+        terminal_task = _Task(
+            project_id=project.id,
+            title="Research: terminal history",
+            payloads=[
+                {"type": "research", "directions": [direction], "base_branch": "main"}
+            ],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={
+                "finding_hash": "terminal-history-hash",
+                "direction_id": direction["id"],
+                "pr_merged": True,
+            },
+            plan_output=[terminal_finding],
+        )
+        db_session.add(terminal_task)
+        await db_session.commit()
+        await db_session.refresh(terminal_task)
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[
+                {
+                    **_make_finding(
+                        title="track duplicate retry inflation causes",
+                        direction_id=direction["id"],
+                    ),
+                    "description": "reworded desc",
+                    "sources": [
+                        {"type": "file", "ref": "backend/app/cache.py"},
+                        {"type": "file", "ref": "backend/app/models.py:200"},
+                    ],
+                    "claims": [
+                        "retry inflation is caused by duplicate spawning",
+                    ],
+                }
+            ],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_head_commit",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.research_completion.cited_paths_changed_since",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch("app.research_completion._has_validation_backend", return_value=True)
+        mocker.patch(
+            "app.research_completion._summarize_ungrounded_claims_grounded",
+            new=AsyncMock(return_value=None),
+        )
+
+        await _handle_research_completion(current_task, "", db_session)
+        await db_session.refresh(current_task)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == current_task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert children == []
+        assert (current_task.context or {}).get("research_surviving_findings") == 0
+
     async def test_sibling_dedup_against_completed_merged_not_cancelled(
         self, mocker, db_session
     ):

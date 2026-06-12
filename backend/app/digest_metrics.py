@@ -4589,6 +4589,127 @@ def compute_retry_analytics(
     }
 
 
+def compute_llm_rework_cost(
+    failed_tasks: List[Task],
+    cancelled_tasks: List[Task],
+    completed_tasks: List[Task],
+    window_start: "datetime",
+) -> Dict[str, Any]:
+    """LLM-dollar cost attributable to rework, priced from Task.attempt_history.
+
+    Three buckets:
+      (a) retry_overhead_llm_usd — LLM tokens burned by prior attempts on tasks
+          that were retried (attempt_number > 1), covering both failed retries
+          (still failing) and successful retries (eventually completed).
+      (b) admin_cancel_llm_usd — total LLM spend on non-genuinely-cancelled tasks
+          (superseded by fix, cascade-killed, deduplicated by the orchestrator).
+          These tasks consumed tokens but produced no merge. When the ADMIN_CANCEL
+          failure class lands, bucket (b) should key off that class instead.
+      (c) terminal_failed_llm_usd — total LLM spend on tasks that failed and never
+          produced a merged PR.
+
+    Attempts whose (provider, model) pair is absent or has no entry in
+    LLM_TOKEN_PRICING accumulate to unattributed_input_tokens /
+    unattributed_output_tokens rather than being silently dropped.
+
+    Pure function — no database calls.
+    """
+    from app.efficiency_snapshot import (
+        LLM_TOKEN_PRICING,
+        _llm_attempt_nonnegative_int,
+        _task_llm_attempts,
+    )
+    from app.direction_outcomes import _is_non_genuine_cancelled
+
+    def _price_attempts(attempts):
+        cost = 0.0
+        ua_input = 0
+        ua_output = 0
+        for provider, model, it, ot, _ in attempts:
+            if not provider or not model:
+                ua_input += it
+                ua_output += ot
+                continue
+            key = (provider.lower(), model.lower())
+            pricing = LLM_TOKEN_PRICING.get(key)
+            if pricing:
+                cost += it * pricing[0] + ot * pricing[1]
+            else:
+                ua_input += it
+                ua_output += ot
+        return cost, ua_input, ua_output
+
+    def _prior_attempts(task):
+        """Attempt tuples for banked prior attempts only (not the current attempt)."""
+        history = task.attempt_history or []
+        result = []
+        for attempt in history:
+            ap = attempt.get("provider")
+            am = attempt.get("model")
+            if ap and am:
+                pass
+            elif not ap and not am:
+                ap, am = task.provider, task.model
+            else:
+                ap, am = None, None  # chimera degrade — mirrors _task_llm_attempts
+            it = _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens"))
+            ot = _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens"))
+            ct = _llm_attempt_nonnegative_int(attempt.get("llm_call_count"))
+            result.append((ap, am, it, ot, ct))
+        return result
+
+    # Bucket (a): prior attempts on retried tasks
+    retry_cost = 0.0
+    retry_ua_input = 0
+    retry_ua_output = 0
+    for t in failed_tasks + completed_tasks:
+        if (t.context or {}).get("_attempt_number", 0) > 1:
+            c, ui, uo = _price_attempts(_prior_attempts(t))
+            retry_cost += c
+            retry_ua_input += ui
+            retry_ua_output += uo
+
+    # Bucket (b): non-genuinely-cancelled tasks (superseded/deduplicated/cascade)
+    cancel_cost = 0.0
+    cancel_ua_input = 0
+    cancel_ua_output = 0
+    for t in cancelled_tasks:
+        if _is_non_genuine_cancelled(t):
+            c, ui, uo = _price_attempts(_task_llm_attempts(t))
+            cancel_cost += c
+            cancel_ua_input += ui
+            cancel_ua_output += uo
+
+    # Bucket (c): terminal failures that never produced a merged PR.
+    # For retried tasks (attempt_number > 1), prior attempts are already counted
+    # in bucket (a); only price the current attempt here to avoid double-counting.
+    failed_cost = 0.0
+    failed_ua_input = 0
+    failed_ua_output = 0
+    for t in failed_tasks:
+        if not has_landed_signal(t):
+            prior = _prior_attempts(t)
+            all_attempts = _task_llm_attempts(t)
+            current_only = all_attempts[len(prior):]
+            c, ui, uo = _price_attempts(current_only)
+            failed_cost += c
+            failed_ua_input += ui
+            failed_ua_output += uo
+
+    total_attributed = retry_cost + cancel_cost + failed_cost
+    total_ua_input = retry_ua_input + cancel_ua_input + failed_ua_input
+    total_ua_output = retry_ua_output + cancel_ua_output + failed_ua_output
+
+    return {
+        "retry_overhead_llm_usd": round(retry_cost, 6),
+        "admin_cancel_llm_usd": round(cancel_cost, 6),
+        "terminal_failed_llm_usd": round(failed_cost, 6),
+        "unattributed_input_tokens": total_ua_input,
+        "unattributed_output_tokens": total_ua_output,
+        "total_attributed_llm_usd": round(total_attributed, 6),
+    }
+
+
 async def compute_release_qualifier_infra_metrics(
     session: AsyncSession,
     *,

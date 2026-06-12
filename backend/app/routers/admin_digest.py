@@ -81,6 +81,7 @@ from app.digest_metrics import (
     compute_remediation_and_patterns,  # noqa: F401  re-exported for external importers
     compute_remediation_funnel,  # noqa: F401  re-exported for external importers
     compute_resurrection_outcome_summary,  # noqa: F401  re-exported for external importers
+    compute_llm_rework_cost,
     compute_retry_analytics,  # noqa: F401  re-exported for external importers
     compute_retry_pattern_summary,  # noqa: F401  re-exported for external importers
     compute_review_cap_exhaustion_summary,  # noqa: F401  re-exported for external importers
@@ -803,6 +804,13 @@ async def _compute_digest(
     avg_retries_before_failure = _retry_analytics["avg_retries_before_failure"]
     retry_success_rate_by_class = _retry_analytics["retry_success_rate_by_class"]
     retry_wasted_rate = _retry_analytics["retry_wasted_rate"]
+
+    _llm_rework = compute_llm_rework_cost(
+        failed_tasks=failed_tasks,
+        cancelled_tasks=cancelled_tasks,
+        completed_tasks=completed_tasks,
+        window_start=window_start,
+    )
 
     # Taxonomy distribution (4-category: scope/review/infra/code_defect)
     _tax_keys = (
@@ -1841,4 +1849,5 @@ async def _compute_digest(
         "research_output_quality": _research_output_quality,
         "problem_model_gc_health": problem_model_gc_health,
         "stale_heartbeat_count": stale_heartbeat_count,
+        "llm_rework_cost": _llm_rework,
     }

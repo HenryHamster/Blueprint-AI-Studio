@@ -61,6 +61,7 @@ from app.failure_classification import (
 )
 from app.finding_deduplication import (
     build_dedup_state,
+    extract_recent_terminal_finding_history,
     deduplicate_findings,
     extract_retired_failed_approaches,
     extract_archived_diagnoses,
@@ -3284,6 +3285,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         failed_parent_ids,
         previously_filtered_hashes=_previously_filtered_hashes,
     )
+    recent_terminal_findings = extract_recent_terminal_finding_history(
+        [t for t in recent_tasks_for_dedup if t.id != task.id],
+        failed_parent_ids,
+    )
 
     # Query open PR artifacts to detect file-scope conflicts with in-flight work
     open_pr_stmt = (
@@ -3342,6 +3347,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         retired_failed_approaches=_retired_failed_approaches,
         archived_diagnoses=_archived_diagnoses,
         direction_categories=_direction_categories,
+        recent_terminal_findings=recent_terminal_findings,
     )
     deduplicated = _dedup_outcome.deduplicated
     hash_dedup_count = _dedup_outcome.hash_dedup_count

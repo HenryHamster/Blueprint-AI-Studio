@@ -6390,3 +6390,203 @@ async def test_problem_model_gc_health_no_cycles(db_session):
     assert result["directions_dropped_cycles"] == 0
     assert result["gap_memory_trimmed_cycles"] == 0
     assert result["trend"] == "healthy"
+
+
+# ── compute_llm_rework_cost ────────────────────────────────────────────────────
+
+
+def _rw_task(
+    *,
+    status=None,
+    provider="anthropic",
+    model="claude-sonnet-4-6",
+    input_tokens=0,
+    output_tokens=0,
+    attempt_number=1,
+    attempt_history=None,
+    context=None,
+    latest_status_message=None,
+):
+    """Build a task for llm_rework_cost tests."""
+    from app.models import TaskStatus
+
+    if status is None:
+        status = TaskStatus.FAILED
+    ctx = dict(context or {})
+    if attempt_number > 1:
+        ctx["_attempt_number"] = attempt_number
+    kwargs = {}
+    if attempt_history is not None:
+        kwargs["attempt_history_db"] = attempt_history
+    return make_task(
+        status=status,
+        provider=provider,
+        model=model,
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+            "llm_call_count": 1,
+        },
+        context=ctx,
+        latest_status_message=latest_status_message,
+        **kwargs,
+    )
+
+
+def test_llm_rework_cost_rollup_prices_retries_and_admin_cancels():
+    """Core acceptance test: retry-attempt tokens and admin-cancel tokens are
+    priced using LLM_TOKEN_PRICING; the rollup keys are non-zero and correct."""
+    from app.models import TaskStatus
+    from app.digest_metrics import compute_llm_rework_cost
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+
+    # Retried task: prior attempt banked 1000 in / 500 out at sonnet rates.
+    # sonnet-4-6: $3e-6 input, $15e-6 output → 1000*3e-6 + 500*15e-6 = 0.0105
+    retried = _rw_task(
+        status=TaskStatus.FAILED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=200,
+        output_tokens=100,
+        attempt_number=2,
+        attempt_history=[
+            {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "llm_input_tokens": 1000,
+                "llm_output_tokens": 500,
+                "llm_call_count": 3,
+            }
+        ],
+    )
+
+    # Admin-cancelled task: superseded by fix, 2000 in / 1000 out at sonnet rates.
+    # 2000*3e-6 + 1000*15e-6 = 0.021
+    admin_cancel = _rw_task(
+        status=TaskStatus.CANCELLED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=2000,
+        output_tokens=1000,
+        latest_status_message="Superseded by fix #123",
+    )
+
+    result = compute_llm_rework_cost(
+        failed_tasks=[retried],
+        cancelled_tasks=[admin_cancel],
+        completed_tasks=[],
+        window_start=window_start,
+    )
+
+    # Bucket (a): 1000 in * 3e-6 + 500 out * 15e-6 = 0.0105
+    assert result["retry_overhead_llm_usd"] == pytest.approx(0.0105, rel=1e-4)
+    # Bucket (b): 2000 in * 3e-6 + 1000 out * 15e-6 = 0.021
+    assert result["admin_cancel_llm_usd"] == pytest.approx(0.021, rel=1e-4)
+    # Bucket (c): retried task's current attempt only (prior attempts already in
+    # bucket a) — 200 in * 3e-6 + 100 out * 15e-6 = 0.0006 + 0.0015 = 0.0021
+    assert result["terminal_failed_llm_usd"] == pytest.approx(0.0021, rel=1e-4)
+    # Total must be disjoint: 0.0105 + 0.021 + 0.0021 = 0.0336 (no double-counting)
+    assert result["total_attributed_llm_usd"] == pytest.approx(0.0336, rel=1e-4)
+    assert result["unattributed_input_tokens"] == 0
+    assert result["unattributed_output_tokens"] == 0
+
+
+def test_llm_rework_cost_retry_bucket_prices_only_prior_attempts():
+    """Bucket (a) uses attempt_history entries only, not the current attempt."""
+    from app.models import TaskStatus
+    from app.digest_metrics import compute_llm_rework_cost
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+
+    # Prior attempt: 500 in / 200 out → 500*3e-6 + 200*15e-6 = 0.0045
+    # Current attempt: 1000 in / 400 out — must NOT be counted in retry bucket
+    task = _rw_task(
+        status=TaskStatus.FAILED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=1000,
+        output_tokens=400,
+        attempt_number=2,
+        attempt_history=[
+            {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "llm_input_tokens": 500,
+                "llm_output_tokens": 200,
+                "llm_call_count": 2,
+            }
+        ],
+    )
+
+    result = compute_llm_rework_cost(
+        failed_tasks=[task],
+        cancelled_tasks=[],
+        completed_tasks=[],
+        window_start=window_start,
+    )
+
+    # Only prior attempt: 500*3e-6 + 200*15e-6 = 0.0045
+    assert result["retry_overhead_llm_usd"] == pytest.approx(0.0045, rel=1e-4)
+
+
+def test_llm_rework_cost_terminal_failed_bucket():
+    """Bucket (c) prices all attempts on tasks that failed and never merged."""
+    from app.models import TaskStatus
+    from app.digest_metrics import compute_llm_rework_cost
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+
+    # Failed task: 3000 in / 1500 out → 3000*3e-6 + 1500*15e-6 = 0.031500
+    failed = _rw_task(
+        status=TaskStatus.FAILED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=3000,
+        output_tokens=1500,
+    )
+
+    result = compute_llm_rework_cost(
+        failed_tasks=[failed],
+        cancelled_tasks=[],
+        completed_tasks=[],
+        window_start=window_start,
+    )
+
+    assert result["terminal_failed_llm_usd"] == pytest.approx(0.0315, rel=1e-4)
+    assert result["retry_overhead_llm_usd"] == 0.0
+    assert result["admin_cancel_llm_usd"] == 0.0
+
+
+def test_llm_rework_cost_unattributed_remainder_for_unpriced_model():
+    """Attempts with an unknown (provider, model) key accumulate to unattributed
+    token counts, never silently dropped and never attributed as $0 cost."""
+    from app.models import TaskStatus
+    from app.digest_metrics import compute_llm_rework_cost
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+
+    # Unpriced model — not in LLM_TOKEN_PRICING
+    failed = _rw_task(
+        status=TaskStatus.FAILED,
+        provider="anthropic",
+        model="claude-unknown-model-99",
+        input_tokens=5000,
+        output_tokens=2000,
+    )
+
+    result = compute_llm_rework_cost(
+        failed_tasks=[failed],
+        cancelled_tasks=[],
+        completed_tasks=[],
+        window_start=window_start,
+    )
+
+    assert result["terminal_failed_llm_usd"] == 0.0
+    assert result["unattributed_input_tokens"] == 5000
+    assert result["unattributed_output_tokens"] == 2000
+    assert result["total_attributed_llm_usd"] == 0.0
