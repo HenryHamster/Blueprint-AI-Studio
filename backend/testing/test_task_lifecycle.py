@@ -3916,6 +3916,117 @@ async def test_request_changes_verification_only_check_runs_raises_still_blocks(
     merge_mock.assert_not_awaited()
 
 
+# REQUEST_CHANGES whose decision field is DECOUPLED from its own structured
+# evidence — the PR #9678 non-convergence root cause. The reviewer emits the
+# REQUEST_CHANGES token but lists no blocking (CRITICAL/MAJOR) issue, so the fix
+# loop has nothing actionable to fix and churns to the iteration cap on a green,
+# mergeable PR. The reconciliation records APPROVE instead.
+
+_EMPTY_ISSUES_VERDICT = json.dumps(
+    {
+        "verdict": "REQUEST_CHANGES",
+        "feedback": (
+            "Verified the iteration-5 delta against the prior blockers. No "
+            "remaining blocking correctness, security, or coverage issue found "
+            "in this pass."
+        ),
+        "issues": [],
+    }
+)
+
+_MINOR_ONLY_VERDICT = json.dumps(
+    {
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "A couple of optional polish notes.",
+        "issues": [
+            {"description": "Rename this variable for clarity", "severity": "minor"},
+            {"description": "Add a docstring to the helper", "severity": "minor"},
+        ],
+    }
+)
+
+
+@pytest.mark.asyncio
+async def test_request_changes_empty_issues_ci_green_is_approved_and_merges(
+    tl_db, mocker
+):
+    """REQUEST_CHANGES with an EMPTY issues array + green CI → APPROVE + merge.
+
+    The exact PR #9678 shape: the reviewer's prose CLEARS the PR ("no remaining
+    blocking … issue") while it stamps the REQUEST_CHANGES token, and the issues
+    array is empty. Recording that token verbatim spawned a fix with nothing to
+    fix → loop churned to the global iteration cap and the task FAILED on a
+    green, mergeable PR. The decision must follow the structured evidence: no
+    blocking issue on authoritative-green CI → APPROVE through the normal path.
+    """
+    captured, merge_mock, review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_EMPTY_ISSUES_VERDICT,
+        ci_check_runs={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+    )
+    assert captured == [], "Empty-issues REQUEST_CHANGES + green CI must NOT spawn a fix"
+    assert merge_mock.await_count >= 1, "must merge via the approve path"
+    assert (
+        review_task.context or {}
+    ).get("review_verdict_reconciled_to_approve") is True
+    # NOT a verification-only case — the legacy sub-case marker must stay unset.
+    assert (review_task.context or {}).get("verification_only_downgrade") is None
+
+
+@pytest.mark.asyncio
+async def test_request_changes_minor_only_ci_green_is_approved_and_merges(tl_db, mocker):
+    """REQUEST_CHANGES carrying ONLY MINOR issues + green CI → APPROVE + merge.
+
+    Per the review contract MINOR findings are non-blocking ("a PR with only
+    MINOR findings should APPROVE"); they must not drive a fix iteration.
+    """
+    captured, merge_mock, review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_MINOR_ONLY_VERDICT,
+        ci_check_runs={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+    )
+    assert captured == [], "MINOR-only REQUEST_CHANGES + green CI must NOT spawn a fix"
+    assert merge_mock.await_count >= 1, "must merge via the approve path"
+    assert (
+        review_task.context or {}
+    ).get("review_verdict_reconciled_to_approve") is True
+    assert (review_task.context or {}).get("verification_only_downgrade") is None
+
+
+@pytest.mark.asyncio
+async def test_request_changes_no_blocking_issue_ci_pending_still_blocks(tl_db, mocker):
+    """No blocking issue but CI NOT green → fail-safe: keep REQUEST_CHANGES.
+
+    The reconciliation only ever flips toward APPROVE under authoritative-green
+    CI — a non-green PR keeps blocking and spawns a fix exactly as before.
+    """
+    captured, merge_mock, _review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_MINOR_ONLY_VERDICT,
+        ci_check_runs={
+            "status": "in_progress",
+            "conclusion": None,
+            "failed_logs": "",
+            "details": [],
+        },
+    )
+    assert captured, "No-blocking-issue + non-green CI must keep REQUEST_CHANGES blocking"
+    merge_mock.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_process_post_commit_completed_child_triggers_rollup_check(tl_db, mocker):
     """A COMPLETED child task with a parent causes _check_and_trigger_rollup to be called."""

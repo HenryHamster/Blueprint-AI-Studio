@@ -48,6 +48,7 @@ from app.review_pipeline import (
     fix_all_occurrences_directive,
     _feedback_jaccard,
     _feedback_token_set,
+    _genuine_blocking_issue_exists,
     _is_cross_cutting_pr,
     _is_pipeline_task_stale,
     _is_test_file,
@@ -11355,6 +11356,111 @@ class TestIsVerificationOnlyRejection:
             )
             is True
         )
+
+
+# ── _genuine_blocking_issue_exists ─────────────────────────────────────────────
+
+
+class TestGenuineBlockingIssueExists:
+    """Pure-unit coverage for the structured-evidence blocker check that drives
+    the REQUEST_CHANGES→APPROVE reconciliation.
+
+    True ONLY when a structured issue is BOTH blocking-severity (CRITICAL/MAJOR,
+    or a blank/unknown severity that cannot be proven non-blocking) AND not purely
+    verification-class. Encodes the review contract: REQUEST_CHANGES requires a
+    real CRITICAL/MAJOR defect; MINOR-only / empty / verification-only do not.
+    """
+
+    def _issue(self, desc, severity="major"):
+        return {"description": desc, "severity": severity}
+
+    # ── False: the cases that reconcile to APPROVE on green CI ────────────
+
+    def test_empty_issues_is_not_a_blocker(self):
+        # The exact PR #9678 shape: REQUEST_CHANGES with an empty issues array.
+        assert _genuine_blocking_issue_exists([]) is False
+        assert _genuine_blocking_issue_exists(None) is False
+
+    def test_only_minor_issues_is_not_a_blocker(self):
+        issues = [
+            self._issue("Rename this variable for clarity", "minor"),
+            self._issue("Add a docstring here", "minor"),
+        ]
+        assert _genuine_blocking_issue_exists(issues) is False
+
+    def test_minor_synonyms_are_non_blocking(self):
+        for sev in ("nit", "nitpick", "low", "info", "trivial", "style", "suggestion"):
+            assert (
+                _genuine_blocking_issue_exists([self._issue("polish", sev)]) is False
+            ), sev
+
+    def test_verification_only_major_is_not_a_blocker(self):
+        # Severity is MAJOR but the content is purely could-not-verify: the
+        # prompt tells reviewers to flag unverifiable steps as MAJOR, so severity
+        # alone cannot distinguish a tooling gap from a real defect.
+        issues = [
+            self._issue("Could not run ./check — command not found in sandbox"),
+            self._issue("CI probe returned 401 Unauthorized; unable to verify"),
+        ]
+        assert _genuine_blocking_issue_exists(issues) is False
+
+    def test_blank_description_is_skipped(self):
+        assert _genuine_blocking_issue_exists([self._issue("   ", "critical")]) is False
+
+    def test_non_dict_entries_are_skipped(self):
+        assert _genuine_blocking_issue_exists(["junk", None, 42]) is False
+
+    # ── True: genuine blockers keep REQUEST_CHANGES ───────────────────────
+
+    def test_critical_concrete_defect_is_a_blocker(self):
+        issues = [self._issue("SQL injection: user input is interpolated", "critical")]
+        assert _genuine_blocking_issue_exists(issues) is True
+
+    def test_major_concrete_defect_is_a_blocker(self):
+        issues = [self._issue("Race condition between claim and commit", "major")]
+        assert _genuine_blocking_issue_exists(issues) is True
+
+    def test_concrete_defect_among_minors_is_a_blocker(self):
+        issues = [
+            self._issue("rename for clarity", "minor"),
+            self._issue("Off-by-one error reads past the array", "major"),
+        ]
+        assert _genuine_blocking_issue_exists(issues) is True
+
+    def test_minor_severity_governs_even_for_defect_like_text(self):
+        # A defect-like phrase the agent itself classified MINOR is, by the
+        # contract's severity semantics, non-blocking — the agent's own
+        # classification governs. The reconciliation does not second-guess
+        # severity downward.
+        issues = [self._issue("null pointer deref when payload is empty", "minor")]
+        assert _genuine_blocking_issue_exists(issues) is False
+
+    def test_opaque_major_issue_is_a_blocker(self):
+        # Not verification-class, not a recognized defect cue, but CRITICAL/MAJOR:
+        # cannot prove non-blocking → keep blocking (fail-safe).
+        issues = [self._issue("Please rework this approach", "major")]
+        assert _genuine_blocking_issue_exists(issues) is True
+
+    def test_unknown_severity_with_text_is_a_blocker(self):
+        issues = [self._issue("something is off here", "")]
+        assert _genuine_blocking_issue_exists(issues) is True
+
+    def test_defect_and_verify_phrase_in_same_issue_is_a_blocker(self):
+        issues = [
+            self._issue(
+                "build failed but also a null pointer deref when payload is empty"
+            )
+        ]
+        assert _genuine_blocking_issue_exists(issues) is True
+
+    def test_one_opaque_among_verification_is_a_blocker(self):
+        # A single non-verification, non-defect-cue MAJOR issue among
+        # verification noise keeps blocking (cannot prove it non-blocking).
+        issues = [
+            self._issue("could not run the verify gate"),
+            self._issue("this needs substantial rework before it can land"),
+        ]
+        assert _genuine_blocking_issue_exists(issues) is True
 
 
 @pytest.mark.asyncio
