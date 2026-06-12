@@ -376,7 +376,9 @@ def test_get_metrics_reader_routes_are_explicit_read_only_allowlisted(monkeypatc
                 "api_url": env_url,
                 "api_key": env_key,
                 "default_repo": os.environ.get("BLUEPRINT_DEFAULT_REPO", ""),
-                "default_base_branch": os.environ.get("BLUEPRINT_DEFAULT_BASE_BRANCH", "main"),
+                "default_base_branch": os.environ.get(
+                    "BLUEPRINT_DEFAULT_BASE_BRANCH", "main"
+                ),
             }
             return config_cache
         bootstrapped = bootstrap_from_gcloud()
@@ -390,7 +392,9 @@ def test_get_metrics_reader_routes_are_explicit_read_only_allowlisted(monkeypatc
                 "api_url": orchestrator_url,
                 "api_key": agent_token,
                 "default_repo": os.environ.get("BLUEPRINT_DEFAULT_REPO", ""),
-                "default_base_branch": os.environ.get("BLUEPRINT_DEFAULT_BASE_BRANCH", "main"),
+                "default_base_branch": os.environ.get(
+                    "BLUEPRINT_DEFAULT_BASE_BRANCH", "main"
+                ),
                 "read_only": True,
             }
             return config_cache
@@ -1512,6 +1516,101 @@ class TestSchemaRevisionSync:
             + "\n  ".join(offenders)
             + "\n\nEither implement a real rollback or `raise NotImplementedError(...)` "
             "to mark the migration as intentionally irreversible."
+        )
+
+    def test_no_new_unguarded_duplicate_indexes_across_migrations(self):
+        """A migration that creates an index name already created by an earlier
+        migration must guard its create with IF NOT EXISTS (or be Postgres-only).
+        Without the guard a SQLite windowed replay that spans both migrations
+        fails with 'index <name> already exists'.
+
+        The two historical unguarded pairs pre-date this invariant and are
+        explicitly exempted.  Any NEW duplicate must be guarded.
+        """
+        import glob as globmod
+
+        # Historical pairs that existed before this invariant was introduced.
+        # Do NOT extend this set — new duplicates must use IF NOT EXISTS.
+        _KNOWN_UNGUARDED_DUPLICATES: set[tuple[str, str]] = {
+            ("0045", "ix_task_post_commit_pending"),
+            ("0117", "ix_task_post_commit_pending"),
+            # 0138 SQLite branch uses bare op.create_index; 0141 re-asserts it
+            # with guarded SQL for the back-merge reconcile (both pre-date invariant).
+            ("0138", "ix_task_blocked_recheck"),
+            ("0236", "ix_task_project_status_updated"),
+            ("0237", "ix_task_project_status_updated"),
+        }
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
+
+        # op.create_index("name", ...) with optional if_not_exists=True within
+        # ~200 chars of the call site.
+        op_create_re = re.compile(r'op\.create_index\(\s*[\'"](\w+)[\'"]')
+        op_guard_re = re.compile(r"if_not_exists\s*=\s*True")
+        # Raw SQL: CREATE INDEX [CONCURRENTLY] [IF NOT EXISTS] name
+        raw_create_re = re.compile(
+            r"CREATE\s+INDEX\s+(?:CONCURRENTLY\s+)?"
+            r"(?P<guard>IF\s+NOT\s+EXISTS\s+)?(?P<name>ix_\w+)",
+            re.IGNORECASE,
+        )
+
+        # Accumulate worst-case guardedness per (revision, index_name).
+        # A migration that uses both Postgres raw-SQL (guarded) and a SQLite
+        # op.create_index branch (unguarded) for the same index is unguarded on
+        # the non-Postgres path — track False (unguarded) as the dominant state.
+        # {(revision, name): all_creates_guarded}
+        per_rev_name: dict[tuple[str, str], bool] = {}
+
+        for path in files:
+            revision = os.path.basename(path).split("_")[0]
+            with open(path) as f:
+                source = f.read()
+            # Only examine upgrade() (drops in downgrade must not cancel creates)
+            upgrade_body = source.split("def downgrade", 1)[0]
+            if "def upgrade" in upgrade_body:
+                upgrade_body = upgrade_body.split("def upgrade", 1)[1]
+
+            for m in op_create_re.finditer(upgrade_body):
+                name = m.group(1)
+                snippet = upgrade_body[m.start() : m.start() + 200]
+                guarded = bool(op_guard_re.search(snippet))
+                key = (revision, name)
+                per_rev_name[key] = per_rev_name.get(key, True) and guarded
+
+            for m in raw_create_re.finditer(upgrade_body):
+                name = m.group("name")
+                guarded = bool(m.group("guard"))
+                key = (revision, name)
+                per_rev_name[key] = per_rev_name.get(key, True) and guarded
+
+        # Group by index name across revisions.
+        index_creates: dict[str, list[tuple[str, bool]]] = {}
+        for (revision, name), all_guarded in per_rev_name.items():
+            index_creates.setdefault(name, []).append((revision, all_guarded))
+
+        violations: list[str] = []
+        for name, creates in index_creates.items():
+            if len(creates) < 2:
+                continue
+            other_revs = sorted(r for r, _ in creates)
+            for revision, guarded in creates:
+                if not guarded and (revision, name) not in _KNOWN_UNGUARDED_DUPLICATES:
+                    others = ", ".join(r for r in other_revs if r != revision)
+                    violations.append(
+                        f"{revision}: creates '{name}' without IF NOT EXISTS guard "
+                        f"(also created by: {others})"
+                    )
+
+        assert not violations, (
+            "Duplicate index name(s) created without IF NOT EXISTS guard "
+            "across migrations — breaks SQLite windowed replay:\n  "
+            + "\n  ".join(sorted(violations))
+            + "\n\nUse op.create_index(..., if_not_exists=True) or raw SQL "
+            "'CREATE INDEX IF NOT EXISTS' for any migration that re-asserts "
+            "an index name an earlier migration already created."
         )
 
 
