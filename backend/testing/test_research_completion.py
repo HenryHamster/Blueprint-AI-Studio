@@ -5334,7 +5334,6 @@ async def test_batch_cap_deferred_foundation_co_defers_dependent(db_session, moc
     dependent->foundation edge silently, spawning the dependent ungated. Instead
     the dependent is co-deferred alongside its foundation (mirroring the same-cycle
     prerequisite co-deferral) so the pair re-surfaces together next cycle."""
-    import app.shared_state as _ss
     from app.research_completion import _finding_hash
     from test_autonomous_research import _make_finding, _patch_research_externals
 
@@ -5355,9 +5354,10 @@ async def test_batch_cap_deferred_foundation_co_defers_dependent(db_session, moc
     dependent["depends_on_indices"] = [0]
 
     _patch_research_externals(mocker)
-    # Force _effective_cap == 1: zero free VM slots floors _cap_by_slots to 1.
-    mocker.patch.object(_ss, "tasks_active_gauge", 999)
-    mocker.patch.object(_ss, "tasks_queued_gauge", 0)
+    # Force the per-cycle cap to 1 so the 2-finding batch exercises the co-defer
+    # path. The cap is a flat constant now (real capacity is gated at dispatch),
+    # so drive it directly rather than through the VM-slot gauges.
+    mocker.patch("app.research_completion._MAX_FINDINGS_PER_CYCLE", 1)
     mocker.patch(
         "app.research_completion._parse_research_findings",
         return_value=[foundation, dependent],
@@ -5397,6 +5397,66 @@ async def test_batch_cap_deferred_foundation_co_defers_dependent(db_session, moc
     assert dependent_hash in by_hash, "the co-deferred dependent must be shelved"
     assert by_hash[dependent_hash]["deferred_reason"] == "batch_cap", (
         "the dependent must be co-deferred under the batch_cap reason, not spawned"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_batch_cap_does_not_shrink_under_fleet_load(db_session, mocker):
+    """The per-cycle finding cap is a flat ceiling, not a capacity throttle. A
+    saturated fleet (every VM busy, deep global queue) must NOT shrink it: spawned
+    children are QUEUED rows the dispatcher drains as slots free, so a busy fleet
+    that previously throttled this to ~1-3 spawns now spawns every finding up to
+    the flat ceiling. Genuine overload is handled separately by
+    _assess_project_spawn_health, not by starving spawn on instantaneous load."""
+    import app.shared_state as _ss
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-bcapload")
+    # Eight independent findings (distinct titles → no dedup collapse, no deps).
+    findings = [
+        _make_finding(
+            title=f"Independent improvement {i}", direction_id=direction["id"]
+        )
+        for i in range(8)
+    ]
+
+    _patch_research_externals(mocker)
+    # Saturated fleet: under the old slots*2 / 15-queued math this floored the cap
+    # to 1. The flat ceiling ignores the gauges entirely.
+    mocker.patch.object(_ss, "tasks_active_gauge", 999)
+    mocker.patch.object(_ss, "tasks_queued_gauge", 999)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=findings,
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    live = {
+        TaskStatus.QUEUED,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.PROVISIONING,
+        TaskStatus.EVALUATING,
+    }
+    live_children = [c for c in children if c.status in live]
+    assert len(live_children) == len(findings), (
+        f"all {len(findings)} findings must spawn under a saturated fleet; the cap "
+        f"no longer shrinks with load — got {len(live_children)} live children"
+    )
+    # Nothing was shelved by the batch cap (the flat ceiling was not exceeded).
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert not any(f.get("deferred_reason") == "batch_cap" for f in deferred), (
+        "no finding may be deferred by the batch cap below the flat ceiling"
     )
 
 
@@ -7348,10 +7408,10 @@ class TestAcceptanceEvidencePropagation:
             return_value=(False, None),
         )
         if force_cap_one:
-            # Saturate the VM gauge so _cap_by_slots floors the batch cap to 1 —
-            # exercises the truncation path deterministically.
-            mocker.patch("app.shared_state.tasks_active_gauge", 100)
-            mocker.patch("app.shared_state.tasks_queued_gauge", 0)
+            # Force the per-cycle finding cap to 1 to exercise the truncation path
+            # deterministically. The cap is a flat constant now (real capacity is
+            # gated at dispatch), so drive it directly rather than via the gauges.
+            mocker.patch("app.research_completion._MAX_FINDINGS_PER_CYCLE", 1)
         for path, value in (
             ("app.research_completion.resolve_branch_verification_context", {}),
             ("app.research_completion.resolve_head_commit", None),

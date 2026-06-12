@@ -192,6 +192,18 @@ MEDIUM_EXPLORATION_FLOOR = 0.05
 # than stampeding memo creation.
 MEMO_SPAWN_CAP_PER_CYCLE = 5
 
+# Per-cycle ceiling on implementation tasks spawned from one research cycle's
+# findings. This is a flat backlog guard, NOT a capacity throttle: real capacity
+# is enforced where it actually binds — the dispatcher only starts as many VMs as
+# there are free slots (orchestrator's max_concurrent_vms gate), and
+# _assess_project_spawn_health clamps spawning to _DEGRADED_SPAWN_CAP when the
+# fleet is genuinely degraded (zones in cooldown, no accounts, per-project backlog
+# over budget, high recent failure rate). A spawned child is just a QUEUED row
+# that costs nothing until dispatched, so throttling spawn on instantaneous fleet
+# load only suppresses healthy research yield and pushes findings into lossy
+# deferral. Findings beyond this ceiling are deferred to the next cycle.
+_MAX_FINDINGS_PER_CYCLE = 15
+
 # Drop reason stamped on the memo a reproduce-on-HEAD rejection spawns. Distinct
 # from the capacity/quality drop reasons (low_actionability / degradation_gate)
 # so strategic review can tell "the cited code is unambiguously gone" — the
@@ -2921,48 +2933,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 if len(_dir_samples) < _SPAWN_GATE_REASONS_SAMPLE_CAP:
                     _dir_samples.append(_sample)
 
-    # Compute capacity-aware batch cap — no DB queries, uses in-memory state only
-    from app import shared_state as _ss
-    from app import max_plan_pool as _pool_mod
-
-    _max_vms = _runtime_config.get("max_concurrent_vms", 8)
-    _available_slots = max(0, _max_vms - _ss.tasks_active_gauge)
-    _queued_count = _ss.tasks_queued_gauge
-    _all_pool_accounts = _pool_mod._all_accounts()
-    if _all_pool_accounts:
-        _healthy_accounts = sum(
-            1
-            for a in _all_pool_accounts
-            if _pool_mod._account_available_for_model(a, "claude-opus-4-8")
-        )
-        _cap_by_accounts = _healthy_accounts * 3
-    else:
-        _healthy_accounts = -1  # sentinel: pool unconfigured, don't constrain
-        _cap_by_accounts = 15
-    _cap_by_slots = _available_slots * 2
-    _cap_by_queue = max(3, 15 - _queued_count)
-    # Floor slots and accounts at 1 so a saturated-but-recovering system (all VMs
-    # busy, or all accounts temporarily rate-limited) doesn't zero out the cap and
-    # permanently discard this research cycle's findings.  Queue depth already has
-    # its own max(3, …) floor; consistent treatment here prevents _effective_cap=0.
-    _effective_cap = min(
-        15, max(1, _cap_by_slots), max(1, _cap_by_accounts), _cap_by_queue
-    )
-    _cap_factors = {
-        "max_findings": 15,
-        "vm_slots": _cap_by_slots,
-        "healthy_accounts": _cap_by_accounts,
-        "queue_depth": _cap_by_queue,
-    }
-    _limiting_factor = min(_cap_factors, key=lambda k: _cap_factors[k])
-    logger.info(
-        "[RESEARCH] Batch cap: %d (limited_by=%s, available_slots=%d, healthy_accounts=%s, queue_depth=%d)",
-        _effective_cap,
-        _limiting_factor,
-        _available_slots,
-        _healthy_accounts if _healthy_accounts >= 0 else "n/a",
-        _queued_count,
-    )
+    # Per-cycle finding ceiling. Capacity is NOT throttled here — see
+    # _MAX_FINDINGS_PER_CYCLE: the dispatcher gates real VM starts on free slots
+    # and _assess_project_spawn_health (below) clamps to _DEGRADED_SPAWN_CAP on a
+    # genuinely degraded fleet. The previous slots*2 / accounts*3 / 15-queued
+    # math throttled queue admission on instantaneous (fleet-global) dispatch
+    # capacity the dispatcher already owns, suppressing healthy research yield and
+    # pushing findings into lossy deferral. Spawned children are cheap QUEUED rows.
+    _effective_cap = _MAX_FINDINGS_PER_CYCLE
     # Select the top _effective_cap findings by priority so high-priority
     # findings survive capacity-limited cycles regardless of the agent's
     # output ordering. We preserve agent order among survivors and remap

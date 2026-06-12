@@ -812,6 +812,9 @@ class TestSchemaRevisionSync:
         # Read-only GitHub helpers the planner legitimately needs to reconstruct
         # and validate the migration chain across the two heads:
         #   get_pr_files / get_pull_request_diff — read the rollup/back-merge diff
+        #   get_pull_request — read PR detail (head SHA) so migration sources can
+        #       be fetched at the PR head when the whole-PR diff is over GitHub's
+        #       size cap (a pure GET; it cannot push to a branch)
         #   list_versions_at_ref — list alembic/versions filenames at a ref
         #   get_file_text_at_ref — fetch a single migration file's source at a ref
         # No branch-write helper may appear: the planner computes a renumber plan,
@@ -819,6 +822,7 @@ class TestSchemaRevisionSync:
         ALLOWED_PLANNER_GITHUB_HELPERS = {
             "get_pr_files",
             "get_pull_request_diff",
+            "get_pull_request",
             "list_versions_at_ref",
             "get_file_text_at_ref",
         }

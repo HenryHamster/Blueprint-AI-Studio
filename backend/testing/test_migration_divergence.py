@@ -571,3 +571,110 @@ async def test_premerge_guard_defers_when_promotion_target_fetch_fails(mocker):
     assert status == "defer"
     assert "promotion target" in reason
     assert "GitHub 503 on promotion target" in reason
+
+
+# ===========================================================================
+# Empty-diff fallback — GitHub 406s the whole-PR ``.diff`` media type (-> empty
+# body) once a PR exceeds its diff size cap, which a large release rollup
+# routinely does (v10: 107 files / 20k+ lines). Treating that as a ``defer``
+# wedged EVERY migration-carrying promotion forever (the rollup only grows, so
+# it never self-heals). The guard now falls back to reading each touched
+# migration's source directly at the PR head — immune to the diff size cap.
+# ===========================================================================
+
+
+def _mock_empty_diff_head_sources(
+    mocker, sources_by_path: dict[str, str], *, head_sha: str = "deadbeefcafe0001"
+):
+    """Drive the empty-diff fallback: an empty whole-PR diff plus readable
+    per-file migration sources at the PR head. ``sources_by_path`` maps a repo
+    path to its migration source (a missing path reads as unreadable -> None)."""
+    mocker.patch("app.github.get_pull_request_diff", new=AsyncMock(return_value=""))
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"head": {"sha": head_sha}}),
+    )
+
+    async def _text(path, *, token, owner, repo, ref, project_id=None):
+        assert ref == head_sha  # sources must be read at the PR head, not a branch
+        return sources_by_path.get(path)
+
+    mocker.patch("app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_text))
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_empty_diff_falls_back_and_passes_clean(mocker):
+    """THE WEDGE REGRESSION: a valid migration-carrying release PR whose whole-PR
+    diff is empty (too large -> 406) must no longer ``defer`` forever — the
+    per-file head read supplies the source and the clean addition returns
+    ('ok', None) so the promotion can land."""
+    path = f"{_VERSIONS_DIR}/0151_new_feature.py"
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=_files(path)))
+    _mock_empty_diff_head_sources(mocker, {path: _migration_source("0151", "0150")})
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=[f"{n:04d}_step.py" for n in range(141, 151)],
+            promotion=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
+        ),
+    )
+    assert await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    ) == ("ok", None)
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_empty_diff_fallback_still_blocks_reuse(mocker):
+    """The fallback path is not a weaker check: with the whole-PR diff empty, the
+    head-read source still drives the cross-branch revision-identity guard, so
+    the revision-0143 reuse class is BLOCKED, not waved through."""
+    path = f"{_VERSIONS_DIR}/0143_add_compute_job_persistence.py"
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=_files(path)))
+    _mock_empty_diff_head_sources(mocker, {path: _migration_source("0143", "0142")})
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=["0141_x.py", "0142_parent.py"],
+            promotion=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0143" in reason and "promotion target" in reason
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_empty_diff_defers_when_head_source_unreadable(mocker):
+    """Fail-safe preserved through the fallback: an empty diff AND an unreadable
+    migration source at the head HOLDS the merge (defer), never 'ok'."""
+    path = f"{_VERSIONS_DIR}/0151_new_feature.py"
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=_files(path)))
+    _mock_empty_diff_head_sources(mocker, {})  # no source -> get_file_text returns None
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(return_value=["0150_parent.py"]),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "defer"
+    assert "0151_new_feature.py" in reason
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_empty_diff_defers_when_pr_head_sha_missing(mocker):
+    """Fail-safe: an empty diff and a PR detail with no head SHA cannot read the
+    migration sources, so the guard defers rather than guessing."""
+    path = f"{_VERSIONS_DIR}/0151_new_feature.py"
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=_files(path)))
+    mocker.patch("app.github.get_pull_request_diff", new=AsyncMock(return_value=""))
+    mocker.patch(
+        "app.github.get_pull_request", new=AsyncMock(return_value={"head": {}})
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "defer"
+    assert "head SHA" in reason
