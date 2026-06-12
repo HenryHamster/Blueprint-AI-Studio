@@ -27,6 +27,7 @@ from app.release_reconciliation import (
     _promotion_pending_timeout_seconds,
     _reconcile_if_not_promoted_but_pr_merged,
     _reconcile_if_pending_auto_merge_landed,
+    _reconcile_if_pending_qualification_superseded,
     _reconcile_if_promotion_failed_landed,
     _reconcile_if_promotion_pending_timed_out,
 )
@@ -4425,3 +4426,254 @@ async def test_confirm_unobservable_required_row_stays_pending_within_deadline(
     )
     assert artifact is not None
     assert artifact_is_unconfirmed(artifact)
+
+
+# ===========================================================================
+# Out-of-band supersession reconciliation:
+# _reconcile_if_pending_qualification_superseded
+#
+# Covers the v10 force-promotion incident: a version is open+pending with NO
+# promotion_pending sub-key (the qualifier never reached the promotion phase),
+# but the candidate sha is already reachable from the promotion target — an
+# operator force-merged it directly.  The reconciler detects this and stamps
+# not_promoted/qualification_superseded promptly, preserving candidate_sha and
+# audit findings so the re-qualify steering and finding ledger can act on them.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_pending_qualification_superseded_out_of_band_reconciles(
+    db_session, mocker
+):
+    """_reconcile_if_pending_qualification_superseded: a pending qualification
+    with no promotion_pending whose candidate is already on the promotion target
+    reconciles with blocker='qualification_superseded' and returns the version
+    to stabilize (the v10 force-promotion incident class)."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "beef" * 10
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate_sha,
+        "confidence": 0.82,
+        "audit_findings": [{"severity": "high", "summary": "stale dependency"}],
+        "started_at": _utcnow().isoformat(),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_qualification_superseded(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    is_ancestor.assert_awaited_once()
+    # Ancestry check was against the promotion target, not the integration branch.
+    assert is_ancestor.await_args.args[4] == "release"
+    await db_session.refresh(version)
+    # Version stays open — superseded does NOT auto-promote.
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    qual = version.last_qualification
+    assert qual["status"] == "not_promoted"
+    assert qual["blocker"] == "qualification_superseded"
+    # candidate_sha and audit_findings must be preserved for the finding ledger.
+    assert qual["candidate_sha"] == candidate_sha
+    assert qual["confidence"] == pytest.approx(0.82)
+    assert qual["audit_findings"] == [{"severity": "high", "summary": "stale dependency"}]
+    assert "finalized_at" in qual
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_superseded_skips_when_candidate_not_on_main(
+    db_session, mocker
+):
+    """When the candidate is NOT yet reachable from the promotion target,
+    the superseded reconciler is a no-op — the qualification legitimately
+    continues until a real terminal signal arrives."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "started_at": _utcnow().isoformat(),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_qualification_superseded(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    is_ancestor.assert_awaited_once()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_superseded_skips_on_single_branch(db_session, mocker):
+    """On a single-branch repo (integration_branch == promotion_target) the
+    superseded reconciler is inert: no GitHub I/O and the version is untouched.
+    _candidate_already_on_main would always return True for every pending
+    qualification on such a repo, so bailing out is mandatory."""
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="main", promotion_target="main"
+    )
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "started_at": _utcnow().isoformat(),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_qualification_superseded(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    is_ancestor.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_superseded_skips_with_promotion_pending(
+    db_session, mocker
+):
+    """A pending qualification WITH a promotion_pending sub-key is NOT handled
+    by the superseded reconciler — that path belongs to
+    _reconcile_if_pending_auto_merge_landed and
+    _reconcile_if_promotion_pending_timed_out."""
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "pr_number": 77,
+            "pr_url": "https://github.com/acme/widget/pull/77",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_qualification_superseded(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    is_ancestor.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    assert "promotion_pending" in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_superseded_skips_when_not_pending(db_session, mocker):
+    """The superseded reconciler gates on status=='pending' — a version already
+    in any other qualification state (not_promoted, promotion_failed, etc.) is
+    left entirely untouched."""
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "qualification_timeout",
+        "candidate_sha": "abcd" * 10,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_qualification_superseded(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    is_ancestor.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_superseded_credential_failure_leaves_untouched(
+    db_session, mocker
+):
+    """Fail-closed: when GitHub credential resolution fails, the superseded
+    reconciler returns False and the version is left untouched for the normal
+    qualification_timeout backstop — we never fabricate a supersession verdict
+    based on an unverifiable ancestry probe."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(side_effect=RuntimeError("github 500")),
+    )
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate_sha,
+        "started_at": _utcnow().isoformat(),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_qualification_superseded(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    is_ancestor.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha

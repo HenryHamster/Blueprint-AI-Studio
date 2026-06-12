@@ -216,6 +216,162 @@ async def test_lane_pilot_kill_survives_digest_session_rollback(db_session):
 
 
 @pytest.mark.asyncio
+async def test_request_path_digest_persists_trial_verdict_and_alert_without_caller_commit(
+    db_session, mocker
+):
+    """Request-path digest compute durably persists BOTH a capability trial
+    verdict AND a gate-integrity alert even when the caller rolls back / closes
+    the request session WITHOUT committing.
+
+    Regression guard for the original bug: ``_compute_digest`` recorded verdicts
+    + alerts onto the early-fetched request-session row and only ``flush()``ed,
+    so the FastAPI session dependency closing without a commit silently rolled
+    them back on every on-demand request-path compute. Durability must now come
+    from ``persist_trial_verdicts_in_transaction``'s own write-owned session.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Force a DECIDED (adopt) verdict for the generic capability trials without
+    # needing 30+ real per-arm task rows: the assignment-based arm composition
+    # satisfies min_n so evaluate_trial_verdict returns adopt.
+    mocker.patch(
+        "app.routers.admin_digest.compute_trial_arm_accumulation",
+        new_callable=AsyncMock,
+        return_value={
+            "lift": 0.25,
+            "with_n": 40,
+            "without_n": 40,
+            "arm_composition": {
+                "with_assigned": 40,
+                "without_assigned": 40,
+                "with_receipt": 0,
+                "without_receipt": 0,
+            },
+        },
+    )
+    # Lane verdict: CONTINUE but immediate_alert → the gate-integrity alert is
+    # routed through the durable write-owned helper (NOT the request session).
+    mocker.patch(
+        "app.review_fix_lane_pilot.compute_lane_pilot_aggregates",
+        new_callable=AsyncMock,
+        return_value={},
+    )
+    mocker.patch(
+        "app.routers.admin_digest.evaluate_lane_pilot_verdict",
+        return_value={
+            "verdict": "CONTINUE",
+            "verdict_reason": "treatment_not_engaging",
+            "immediate_alert": True,
+        },
+    )
+
+    Session = async_sessionmaker(
+        db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    async with Session() as digest_session:
+        result = await _compute_digest(
+            hours=24, project_id=project.id, session=digest_session
+        )
+        # The decided verdict surfaces in the response payload...
+        _resp_verdicts = result["capability_adoption_verdicts"]
+        assert any(
+            isinstance(v, dict) and v.get("verdict") in ("adopt", "reject")
+            for k, v in _resp_verdicts.items()
+            if k != LANE_PILOT_CAP_NAME
+        )
+        # ...and the caller closes WITHOUT committing.
+        await digest_session.rollback()
+
+    # Re-open a fresh session: both the trial verdict and the alert must survive.
+    async with Session() as fresh:
+        stored_project = await fresh.get(Project, project.id)
+        stored = stored_project.capability_adoption_verdicts or {}
+        decided = [
+            (k, v)
+            for k, v in stored.items()
+            if k != LANE_PILOT_CAP_NAME
+            and isinstance(v, dict)
+            and v.get("verdict") in ("adopt", "reject")
+        ]
+        assert decided, f"no decided trial verdict durably persisted: {stored}"
+
+        messages = (
+            await fresh.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalars().all()
+        assert any(
+            (m.context or {}).get("dedupe_key")
+            == "review_fix_lane_gate_integrity_violation"
+            for m in messages
+        ), "gate-integrity alert was not durably persisted"
+
+
+@pytest.mark.asyncio
+async def test_precompute_persists_verdicts_when_l2_cache_write_fails(db_session, mocker):
+    """A precompute tick whose L2 cache write (write_shared) FAILS still durably
+    persists the trial verdicts.
+
+    Before the fix, verdict durability on the precompute path was a side effect
+    of ``write_shared`` committing the request session for its DigestCacheEntry
+    upsert — and write_shared rolls back on any L2 write failure, discarding the
+    verdicts with it. The write-owned helper makes durability independent of L2.
+    """
+    from app.digest_precompute import _precompute_one
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.routers.admin_digest.compute_trial_arm_accumulation",
+        new_callable=AsyncMock,
+        return_value={
+            "lift": 0.25,
+            "with_n": 40,
+            "without_n": 40,
+            "arm_composition": {
+                "with_assigned": 40,
+                "without_assigned": 40,
+                "with_receipt": 0,
+                "without_receipt": 0,
+            },
+        },
+    )
+    # Force the L2 merge to raise so write_shared rolls back the request session
+    # and returns False — exactly the failure mode that used to discard verdicts.
+    mocker.patch.object(
+        db_session,
+        "merge",
+        new=AsyncMock(side_effect=RuntimeError("forced L2 merge failure")),
+    )
+
+    # Should not raise: write_shared is fail-open.
+    await _precompute_one(db_session, hours=24, project_id=project.id)
+
+    Session = async_sessionmaker(
+        db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    async with Session() as fresh:
+        stored_project = await fresh.get(Project, project.id)
+        stored = stored_project.capability_adoption_verdicts or {}
+        decided = [
+            (k, v)
+            for k, v in stored.items()
+            if k != LANE_PILOT_CAP_NAME
+            and isinstance(v, dict)
+            and v.get("verdict") in ("adopt", "reject")
+        ]
+        assert decided, (
+            "trial verdicts were lost when the L2 cache write failed: " f"{stored}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_lane_pilot_immediate_alert_on_continue_is_not_dropped(db_session, mocker):
     """A CONTINUE verdict with immediate_alert still raises the operator alert."""
     project = make_project()
@@ -247,9 +403,13 @@ async def test_lane_pilot_immediate_alert_on_continue_is_not_dropped(db_session,
 
     await _compute_digest(hours=24, project_id=project.id, session=db_session)
 
-    raise_alert.assert_awaited_once_with(
-        db_session, project.id, detail="treatment_not_engaging"
-    )
+    # The alert is now raised durably through persist_trial_verdicts_in_transaction's
+    # OWN write-owned session (not the rollback-prone request session), so we assert
+    # on the project_id + detail rather than binding to the request session object.
+    raise_alert.assert_awaited_once()
+    _alert_call = raise_alert.await_args
+    assert _alert_call.args[1] == project.id
+    assert _alert_call.kwargs["detail"] == "treatment_not_engaging"
     kill_lane.assert_not_awaited()
 
 

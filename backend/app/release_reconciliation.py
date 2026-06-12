@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version
 from app.database import AsyncSessionLocal
@@ -21,6 +22,8 @@ from app.models import (
     Project,
     QualificationVerdict,
     ReleaseDeployArtifact,
+    Task,
+    TaskStatus,
 )
 from app.deploy_identity import deploy_repo_identity
 from app.release_artifacts import (
@@ -882,6 +885,199 @@ async def _reconcile_if_pending_auto_merge_landed(
             except Exception:
                 logger.exception(
                     "[RELEASE_QUALIFIER] reconcile pending_auto_merge: rollback "
+                    "failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
+async def _reconcile_if_pending_qualification_superseded(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+) -> bool:
+    """Reconcile an open version whose pending qualification candidate landed out-of-band.
+
+    When an operator force-promotes a candidate to the promotion target without
+    going through the normal qualification -> promotion_pending -> auto-merge
+    path, the version is left with ``last_qualification.status == "pending"``
+    and NO ``promotion_pending`` sub-key.  The 6h qualification_timeout backstop
+    eventually fires, but stamps ``blocker='qualification_timeout'`` — wrong
+    provenance that loses the out-of-band landing signal.
+
+    This reconciler detects that case promptly: for a ``pending`` qualification
+    with no ``promotion_pending`` sub-key, it checks whether the candidate is
+    already reachable from the promotion target.  If it is, it records
+    ``not_promoted/qualification_superseded`` (preserving ``candidate_sha`` and
+    any carried audit findings so the re-qualify steering and finding ledger can
+    act on them) and returns the version to stabilize immediately.
+
+    Fail-closed: a GitHub credential/API failure leaves the version untouched so
+    the normal qualification-timeout backstop still fires — we never fabricate a
+    supersession verdict.  Returns True iff the version was reconciled.
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            if version.status != "open":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "pending":
+                return False
+            # promotion_pending means the qualifier itself initiated a promotion
+            # PR — that path is owned by _reconcile_if_pending_auto_merge_landed
+            # and _reconcile_if_promotion_pending_timed_out.
+            if qual.get("promotion_pending"):
+                return False
+            candidate_sha: str | None = qual.get("candidate_sha")
+            if not candidate_sha:
+                return False
+
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+
+            # Single-branch repo guard — mirrors promote().  When the integration
+            # branch IS the promotion target there is no separate release trunk,
+            # so _candidate_already_on_main would always be True and this
+            # reconciler would spuriously supersede every pending qualification.
+            # Bail out inert, mirroring the other reconcilers' "lts_inactive" skip.
+            integration_branch, promotion_target = _lts_branch_names(project)
+            if integration_branch == promotion_target:
+                logger.debug(
+                    "[RELEASE_QUALIFIER] reconcile pending_superseded: v%d "
+                    "integration branch (%s) is the promotion target — "
+                    "single-branch repo, LTS inactive; nothing to reconcile",
+                    version.version_number,
+                    promotion_target,
+                )
+                return False
+
+            # In-flight qualification guard.  While required children are still
+            # non-terminal the normal completion path
+            # (_required_children_terminal → _finalize_qualification) will fire
+            # once they finish — no need for the superseded reconciler to race
+            # ahead or mis-classify an in-progress qualification as superseded.
+            # Only proceed when children are absent OR have reached a terminal
+            # state without the normal finalizer running (the stuck-qualification
+            # scenario this reconciler exists to resolve).
+            _TERMINAL = frozenset(
+                {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED}
+            )
+            smoketest_required = bool(qual.get("smoketest_enabled", True))
+            audit_task_id_raw = qual.get("audit_task_id")
+            smoketest_task_id_raw = qual.get("smoketest_task_id")
+            if audit_task_id_raw:
+                try:
+                    audit_t = await session.get(Task, uuid.UUID(str(audit_task_id_raw)))
+                    if audit_t is not None and audit_t.status not in _TERMINAL:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+            if smoketest_required and smoketest_task_id_raw:
+                try:
+                    smoke_t = await session.get(Task, uuid.UUID(str(smoketest_task_id_raw)))
+                    if smoke_t is not None and smoke_t.status not in _TERMINAL:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+
+            # Release the row lock before GitHub I/O (mirrors the other reconcilers).
+            try:
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile pending_superseded: failed to "
+                    "release row lock for v%d before GitHub I/O — skipping",
+                    version.version_number,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RELEASE_QUALIFIER] reconcile pending_superseded: rollback "
+                        "failed for v%d after commit error",
+                        version.version_number,
+                    )
+                return False
+
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile pending_superseded: no GitHub "
+                    "credentials for v%d — skipping (fail-closed)",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+
+            if not await _candidate_already_on_main(
+                token, owner, repo, candidate_sha, version, project=project
+            ):
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] reconcile pending_superseded: candidate "
+                "%s for v%d is on %s without a promotion_pending marker — "
+                "force-promoted out of band; recording qualification_superseded",
+                candidate_sha[:8],
+                version.version_number,
+                promotion_target,
+            )
+
+            # Write supersession directly — mirroring _force_finalize_timed_out_qualification.
+            # Preserve all existing qual fields (candidate_sha, audit findings, etc.)
+            # so the re-qualify steering and finding ledger can act on them.
+            qual = dict(version.last_qualification or {})
+            record = {
+                **qual,
+                "status": "not_promoted",
+                "blocker": "qualification_superseded",
+                "detail": (
+                    f"candidate {candidate_sha[:12]} is already reachable from "
+                    f"{promotion_target} without a qualifier-initiated promotion — "
+                    f"force-promoted out of band; returning to stabilize"
+                ),
+                "finalized_at": _utcnow().isoformat(),
+            }
+            version.last_qualification = record
+            flag_modified(version, "last_qualification")
+            release_version.set_version_phase(
+                version,
+                "stabilize",
+                reasoning=(
+                    f"qualification v{version.version_number} superseded out of band "
+                    f"(candidate {candidate_sha[:8]} on {promotion_target} without "
+                    f"promotion_pending) — returning to stabilize"
+                ),
+            )
+            session.add(version)
+            await session.commit()
+            return True
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile pending_superseded: unexpected "
+                "error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile pending_superseded: rollback "
                     "failed for version %s after unexpected error",
                     version_id,
                 )

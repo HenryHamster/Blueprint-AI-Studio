@@ -56,7 +56,7 @@
     "failure_layer_classifier.py": 400,
     "pipeline_alert_scan.py": 600,
     "release_qualifier.py": 3950,
-    "release_reconciliation.py": 1800,
+    "release_reconciliation.py": 2100,
     "release_stall_alerts.py": 800,
     "release_promotion.py": 2000,
     "sr_analytics.py": 150,
@@ -92,7 +92,8 @@
     "release_scoring.py": 2100,
     "runtime_config_state.py": 1750,
     "routers/directions.py": 1750,
-    "warm_pool_maintainer.py": 1950
+    "warm_pool_maintainer.py": 1950,
+    "review_fix_lane_pilot.py": 1800
   },
   "agent": {
     "index.ts": 4600,

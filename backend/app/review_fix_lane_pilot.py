@@ -221,11 +221,13 @@ def record_lane_arm_assignment(
 
 
 # ── Lane lookup / lazy creation ───────────────────────────────────────────────
-async def get_chain_lane(
-    session: AsyncSession, ctx: dict | None
-) -> Any | None:
-    """Return the ImprovementLane bound to a chain via LANE_CHAIN_ID_KEY, or None."""
-    from app.models import ImprovementLane
+async def get_chain_lane(session: AsyncSession, ctx: dict | None) -> Any | None:
+    """Return the ImprovementLane bound to a chain via LANE_CHAIN_ID_KEY, or None.
+
+    Returns None for lanes not in ACTIVE or PARKED status — a PROPOSED lane
+    that failed activation must never be used as a valid chain lane.
+    """
+    from app.models import ImprovementLane, ImprovementLaneStatus
 
     if not isinstance(ctx, dict):
         return None
@@ -236,7 +238,11 @@ async def get_chain_lane(
         lane_id = uuid.UUID(str(raw))
     except (ValueError, TypeError):
         return None
-    return await session.get(ImprovementLane, lane_id)
+    lane = await session.get(ImprovementLane, lane_id)
+    _usable = {ImprovementLaneStatus.ACTIVE.value, ImprovementLaneStatus.PARKED.value}
+    if lane is not None and lane.status not in _usable:
+        return None
+    return lane
 
 
 async def ensure_chain_lane(
@@ -284,6 +290,18 @@ async def ensure_chain_lane(
         )
     except Exception as exc:  # noqa: BLE001 - lane creation is best-effort
         logger.warning("[LANE-PILOT] could not activate lane %s: %s", lane.id, exc)
+        # Best-effort cleanup: retire the orphaned PROPOSED lane so it doesn't
+        # linger until the stranded-lane sweep ages it out.
+        with contextlib.suppress(Exception):
+            await cas_transition(
+                session,
+                lane.id,
+                ImprovementLaneStatus.PROPOSED,
+                ImprovementLaneStatus.RETIRED,
+            )
+        # Do NOT bind the chain to an unactivated lane — the chain falls through
+        # to classic relay behavior for this phase.
+        return None
     ctx[LANE_CHAIN_ID_KEY] = str(lane.id)
     return lane
 
@@ -422,9 +440,7 @@ def build_fix_resume_block(lane: Any) -> dict[str, Any] | None:
     ):
         value = manifest.get(field) if isinstance(manifest, dict) else None
         if isinstance(value, list) and value:
-            block[field] = [
-                _clip(x) for x in value[-_RESUME_LIST_MAX_ITEMS:]
-            ]
+            block[field] = [_clip(x) for x in value[-_RESUME_LIST_MAX_ITEMS:]]
 
     # Nothing to resume from: no accumulated manifest content and no checkpoint.
     if not block and not last_sha:
@@ -512,7 +528,11 @@ async def checkpoint_and_reserve_on_phase_complete(
             source_task.id, session
         )
         reachable = await is_ancestor_of(
-            gh_token, gh_owner, gh_repo, str(sha), lane.branch_name,
+            gh_token,
+            gh_owner,
+            gh_repo,
+            str(sha),
+            lane.branch_name,
             project_id=str(source_task.project_id),
         )
     except Exception as exc:  # noqa: BLE001 - verification is best-effort
@@ -537,9 +557,7 @@ async def checkpoint_and_reserve_on_phase_complete(
             lane.id,
         )
         with contextlib.suppress(LaneCheckpointError):
-            await mark_checkpoint_missing(
-                session, lane.id, reason="sha_not_reachable"
-            )
+            await mark_checkpoint_missing(session, lane.id, reason="sha_not_reachable")
         return False
 
     if reachable is None:
@@ -799,7 +817,9 @@ async def activate_lane_for_fix(
         lane.workspace_state = WORKSPACE_LEASED
         session.add(lane)
     except LaneCASError as exc:
-        logger.warning("[LANE-PILOT] could not resume lane %s for fix: %s", lane.id, exc)
+        logger.warning(
+            "[LANE-PILOT] could not resume lane %s for fix: %s", lane.id, exc
+        )
 
 
 def wire_fix_lane_context(ctx: dict, lane: Any) -> None:
@@ -937,7 +957,11 @@ async def retire_chain_lane(
     terminal state promptly.  Best-effort: LaneCASError (concurrent retirement
     by another worker) is suppressed.  Returns True when a transition was made.
     """
-    from app.improvement_lane_ops import LaneCASError, _TERMINAL_STATUSES, cas_transition
+    from app.improvement_lane_ops import (
+        LaneCASError,
+        _TERMINAL_STATUSES,
+        cas_transition,
+    )
     from app.models import ImprovementLaneStatus, PoolVm
 
     lane = await get_chain_lane(session, ctx)
@@ -952,17 +976,23 @@ async def retire_chain_lane(
         # Release any warm-pool member still reserved for this lane so it
         # rejoins the general pool immediately rather than waiting for TTL.
         reserved_members = (
-            await session.execute(
-                select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+            (
+                await session.execute(
+                    select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for member in reserved_members:
             member.reserved_lane_id = None
             member.reservation_expires_at = None
             session.add(member)
         return True
     except LaneCASError as exc:
-        logger.debug("[LANE-PILOT] retire_chain_lane CAS miss lane=%s: %s", lane.id, exc)
+        logger.debug(
+            "[LANE-PILOT] retire_chain_lane CAS miss lane=%s: %s", lane.id, exc
+        )
         return False
 
 
@@ -981,23 +1011,33 @@ async def kill_project_lanes(
     apply_lane_pilot_kill so the KILL operation closes all lane rows rather
     than leaving them ACTIVE/PARKED after the pilot flag is disabled.
     """
-    from app.improvement_lane_ops import LaneCASError, _TERMINAL_STATUSES, cas_transition
+    from app.improvement_lane_ops import (
+        LaneCASError,
+        _TERMINAL_STATUSES,
+        cas_transition,
+    )
     from app.models import ImprovementLane, ImprovementLaneStatus
 
     rows = (
-        await session.execute(
-            select(ImprovementLane).where(
-                ImprovementLane.project_id == project_id,
-                ImprovementLane.status.not_in(list(_TERMINAL_STATUSES)),
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.project_id == project_id,
+                    ImprovementLane.status.not_in(list(_TERMINAL_STATUSES)),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     killed = 0
     for lane in rows:
         try:
             current = ImprovementLaneStatus(lane.status)
-            await cas_transition(session, lane.id, current, ImprovementLaneStatus.KILLED)
+            await cas_transition(
+                session, lane.id, current, ImprovementLaneStatus.KILLED
+            )
             killed += 1
         except LaneCASError as exc:  # noqa: PERF203 — CAS miss per iteration is intentional
             logger.debug(
@@ -1080,7 +1120,9 @@ async def apply_lane_pilot_kill_in_transaction(
 
             result = await apply_lane_pilot_kill(session, project_id, reason=reason)
             if alert_detail is not None:
-                await raise_gate_integrity_alert(session, project_id, detail=alert_detail)
+                await raise_gate_integrity_alert(
+                    session, project_id, detail=alert_detail
+                )
             await session.commit()
             return result
         except Exception:
@@ -1101,16 +1143,18 @@ async def raise_gate_integrity_alert(
 
     dedupe_key = "review_fix_lane_gate_integrity_violation"
     existing = (
-        await session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.project_id == project_id,
-                ProjectMessage.status == "open",
+        (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == "open",
+                )
             )
         )
-    ).scalars().all()
-    already = any(
-        (m.context or {}).get("dedupe_key") == dedupe_key for m in existing
+        .scalars()
+        .all()
     )
+    already = any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing)
     if already:
         return
     session.add(
@@ -1188,8 +1232,9 @@ async def compute_lane_arm_time_medians(
 
     rows = (
         await session.execute(
-            select(Task.created_at, Task.started_at, Task.updated_at, Task.context)
-            .where(
+            select(
+                Task.created_at, Task.started_at, Task.updated_at, Task.context
+            ).where(
                 Task.project_id == project_id,
                 Task.status.in_(
                     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
@@ -1202,7 +1247,9 @@ async def compute_lane_arm_time_medians(
     def _strip_tz(dt: Any) -> Any:
         if dt is None:
             return None
-        return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) is not None else dt
+        return (
+            dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) is not None else dt
+        )
 
     pr_buckets: dict[str, list[tuple]] = {}
     for created_at, started_at, updated_at, ctx in rows:
@@ -1217,7 +1264,9 @@ async def compute_lane_arm_time_medians(
         key = str(pr_number)
         if key not in pr_buckets:
             pr_buckets[key] = []
-        pr_buckets[key].append((_strip_tz(created_at), _strip_tz(started_at), _strip_tz(updated_at)))
+        pr_buckets[key].append(
+            (_strip_tz(created_at), _strip_tz(started_at), _strip_tz(updated_at))
+        )
 
     if not pr_buckets:
         return {
@@ -1354,11 +1403,13 @@ async def compute_lane_pilot_aggregates(
     )
     lane_cost_per_merged: float | None = (
         arm_cost_merged["lane"] / arm_merged_count["lane"]
-        if arm_merged_count["lane"] > 0 else None
+        if arm_merged_count["lane"] > 0
+        else None
     )
     control_cost_per_merged: float | None = (
         arm_cost_merged["control"] / arm_merged_count["control"]
-        if arm_merged_count["control"] > 0 else None
+        if arm_merged_count["control"] > 0
+        else None
     )
 
     # ── Checkpoint-loss rate from ImprovementLane rows ────────────────────────
@@ -1388,28 +1439,20 @@ async def compute_lane_pilot_aggregates(
     # Reading ProjectMessages written by raise_gate_integrity_alert is circular:
     # the alert writer requires the violation count to already exceed the threshold.
     if is_sqlite:
-        _gate_stmt = (
-            select(func.count(Task.id))
-            .where(
-                Task.project_id == project_id,
-                func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}") == "lane",
-                func.json_extract(Task.context, "$.improvement_lane_id").isnot(None),
-                func.json_extract(Task.payloads, "$[0].type").in_(["review", "audit"]),
-            )
+        _gate_stmt = select(func.count(Task.id)).where(
+            Task.project_id == project_id,
+            func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}") == "lane",
+            func.json_extract(Task.context, "$.improvement_lane_id").isnot(None),
+            func.json_extract(Task.payloads, "$[0].type").in_(["review", "audit"]),
         )
     else:
-        _gate_stmt = (
-            select(func.count(Task.id))
-            .where(
-                Task.project_id == project_id,
-                Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext == "lane",
-                Task.context["improvement_lane_id"].isnot(None),
-                Task.payloads[0]["type"].as_string().in_(["review", "audit"]),
-            )
+        _gate_stmt = select(func.count(Task.id)).where(
+            Task.project_id == project_id,
+            Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext == "lane",
+            Task.context["improvement_lane_id"].isnot(None),
+            Task.payloads[0]["type"].as_string().in_(["review", "audit"]),
         )
-    gate_integrity_violations = int(
-        (await session.execute(_gate_stmt)).scalar() or 0
-    )
+    gate_integrity_violations = int((await session.execute(_gate_stmt)).scalar() or 0)
 
     # ── Treatment-engagement receipts (warm-resume + checkpoint) ─────────────
     # Among terminal lane-arm fix-phase tasks, count chains where at least one
@@ -1467,10 +1510,14 @@ async def compute_lane_pilot_aggregates(
     checkpoint_count = sum(1 for c in _engagement_chains.values() if c["ckpt"])
 
     warm_resume_fraction: float | None = (
-        warm_resume_count / lane_fix_tasks_sampled if lane_fix_tasks_sampled > 0 else None
+        warm_resume_count / lane_fix_tasks_sampled
+        if lane_fix_tasks_sampled > 0
+        else None
     )
     checkpoint_fraction: float | None = (
-        checkpoint_count / lane_fix_tasks_sampled if lane_fix_tasks_sampled > 0 else None
+        checkpoint_count / lane_fix_tasks_sampled
+        if lane_fix_tasks_sampled > 0
+        else None
     )
 
     return {

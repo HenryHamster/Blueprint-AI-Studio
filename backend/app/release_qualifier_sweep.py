@@ -32,6 +32,7 @@ from app.release_reconciliation import (
     _reconcile_if_deploy_failed_recovered,
     _reconcile_if_not_promoted_but_pr_merged,
     _reconcile_if_pending_auto_merge_landed,
+    _reconcile_if_pending_qualification_superseded,
     _reconcile_if_promotion_failed_landed,
     _reconcile_if_promotion_pending_timed_out,
 )
@@ -460,6 +461,35 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep reconciled version %s "
                 "(pending_auto_merge drove to terminal state)",
+                version_id,
+            )
+
+    # Reconcile open versions whose pending qualification candidate landed
+    # out-of-band (operator force-promotion).  A pending qualification with no
+    # promotion_pending sub-key has no scheduled finalizer: if the candidate is
+    # already reachable from the promotion target, record the correct supersession
+    # provenance promptly rather than waiting for the 6h qualification_timeout
+    # backstop which would stamp the wrong blocker.  Runs AFTER the
+    # pending_auto_merge loop (which handles pending WITH promotion_pending) so a
+    # normally-landed auto-merge is never mis-classified as superseded.
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_pending_qualification_superseded(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: pending_superseded reconcile check "
+                "failed for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep reconciled version %s "
+                "(pending qualification superseded out of band)",
                 version_id,
             )
 

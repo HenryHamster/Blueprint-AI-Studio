@@ -470,7 +470,7 @@ async def get_all_tasks(
         }
         result_list.append(task_dict)
 
-    # Global counts (not affected by pagination/filters) — single query via CASE/WHEN
+    # Global counts scoped to the caller's member projects — single query via CASE/WHEN
     _counts_row = (
         await session.execute(
             select(
@@ -486,7 +486,9 @@ async def get_all_tasks(
                 ),
                 func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
                 func.count(case((Task.status == TaskStatus.QUEUED, 1))),
-            ).select_from(Task)
+            )
+            .select_from(Task)
+            .where(Task.project_id.in_(_user_project_ids(current_user["user_id"])))
         )
     ).one()
     active_count, evaluating_count, queued_count = _counts_row

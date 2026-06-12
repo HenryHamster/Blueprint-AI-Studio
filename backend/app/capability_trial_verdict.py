@@ -513,6 +513,69 @@ def record_trial_verdict(
         )
 
 
+async def persist_trial_verdicts_in_transaction(
+    source_session: Any,
+    project_id: Any,
+    *,
+    pending_verdicts: list[tuple[str, dict[str, Any]]],
+    gate_alert_detail: str | None = None,
+) -> dict[str, Any]:
+    """Durably persist a batch of trial verdicts (and an optional gate alert).
+
+    Digest computation runs on read/request sessions that may be rolled back by
+    the caller after the response payload is built (the FastAPI session
+    dependency closes WITHOUT committing; the precompute path's commit is
+    contingent on the L2 cache write succeeding). Verdict recording and
+    gate-integrity alerts are durable controls, so — exactly like
+    ``apply_lane_pilot_kill_in_transaction`` — they must not depend on that
+    outer session committing.
+
+    This opens its OWN committing session, RE-FETCHES the project fresh inside
+    it (so ``record_trial_verdict``'s KILL-survival and insufficient-data
+    self-revert guards evaluate against current committed state, never a stale
+    early-fetched row), applies every pending verdict, raises the gate-integrity
+    alert when ``gate_alert_detail`` is provided, then commits. On any exception
+    it rolls back and re-raises.
+
+    Returns a snapshot dict of the project's adoption verdicts after the commit,
+    so callers can build a display payload that mirrors exactly what is durably
+    persisted (rather than what was naively computed).
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.database import resolve_async_engine
+    from app.models import Project
+
+    factory = async_sessionmaker(
+        resolve_async_engine(source_session),
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with factory() as session:
+        try:
+            project = await session.get(Project, project_id)
+            if project is None:
+                raise ValueError(
+                    f"Project {project_id} not found for durable trial-verdict persist"
+                )
+            for cap_name, entry in pending_verdicts:
+                record_trial_verdict(project, cap_name, entry)
+            if gate_alert_detail is not None:
+                # Lazy import to avoid an import cycle: review_fix_lane_pilot
+                # imports record_trial_verdict from this module.
+                from app.review_fix_lane_pilot import raise_gate_integrity_alert
+
+                await raise_gate_integrity_alert(
+                    session, project_id, detail=gate_alert_detail
+                )
+            await session.commit()
+            verdicts = get_trial_verdicts(project)
+            return dict(verdicts) if isinstance(verdicts, dict) else {}
+        except Exception:
+            await session.rollback()
+            raise
+
+
 def get_trial_verdicts(project: Any) -> dict[str, Any]:
     """Return the current adoption-verdict dict from a project, or empty dict."""
     verdicts = getattr(project, "capability_adoption_verdicts", None)

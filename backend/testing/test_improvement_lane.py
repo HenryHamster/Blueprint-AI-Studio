@@ -31,6 +31,8 @@ from app.models import (
 from app.payload_schemas import LaneCheckpointPayload, LaneCheckpointValidated
 from app.review_fix_lane_pilot import (
     LANE_CHAIN_ID_KEY,
+    ensure_chain_lane,
+    get_chain_lane,
     kill_project_lanes,
     retire_chain_lane,
 )
@@ -470,7 +472,9 @@ async def test_checkpoint_lane_rolling_window(db: AsyncSession):
     await db.commit()
 
     # Seed the checkpoints list with _LANE_CHECKPOINT_LIMIT existing entries.
-    lane.checkpoints = [{"seq": i, "sha": f"sha{i:04d}"} for i in range(_LANE_CHECKPOINT_LIMIT)]
+    lane.checkpoints = [
+        {"seq": i, "sha": f"sha{i:04d}"} for i in range(_LANE_CHECKPOINT_LIMIT)
+    ]
     lane.checkpoint_seq = _LANE_CHECKPOINT_LIMIT
     await db.commit()
 
@@ -616,7 +620,9 @@ def test_merge_manifest_patch_bounded():
 
     merged = _merge_manifest_patch(existing, patch)
     size = len(json.dumps(merged, default=str).encode())
-    assert size <= _LANE_MANIFEST_MAX_BYTES, f"merged manifest exceeds 8KB: {size} bytes"
+    assert size <= _LANE_MANIFEST_MAX_BYTES, (
+        f"merged manifest exceeds 8KB: {size} bytes"
+    )
 
 
 def test_merge_manifest_patch_bounded_with_all_append_only_lists():
@@ -641,7 +647,9 @@ def test_merge_manifest_patch_bounded_with_all_append_only_lists():
 
     merged = _merge_manifest_patch(existing, patch)
     size = len(json.dumps(merged, default=str).encode())
-    assert size <= _LANE_MANIFEST_MAX_BYTES, f"merged manifest exceeds 8KB: {size} bytes"
+    assert size <= _LANE_MANIFEST_MAX_BYTES, (
+        f"merged manifest exceeds 8KB: {size} bytes"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +677,9 @@ def test_lane_checkpoint_payload_manifest_patch_too_large():
     """manifest_patch > 8KB should raise a validation error."""
     big_data = {"key": "x" * 9000}
     with pytest.raises(Exception, match="8KB"):
-        LaneCheckpointPayload(sha="abc1234", summary="overflow", manifest_patch=big_data)
+        LaneCheckpointPayload(
+            sha="abc1234", summary="overflow", manifest_patch=big_data
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -701,7 +711,15 @@ def test_build_lane_manifest_patch_uses_known_list_fields():
             "review_loop": {
                 "iteration": 2,
                 "review_history": [
-                    {"issues": [{"severity": "major", "description": "null case", "file": "a.ts"}]},
+                    {
+                        "issues": [
+                            {
+                                "severity": "major",
+                                "description": "null case",
+                                "file": "a.ts",
+                            }
+                        ]
+                    },
                 ],
                 "fix_agent_responses": [
                     {"response_type": "disputed", "claim": "flag is intentional"},
@@ -714,12 +732,21 @@ def test_build_lane_manifest_patch_uses_known_list_fields():
 
     # Only the bounded list-field keys the merge understands appear.
     assert set(patch).issubset(
-        {"progress", "remaining", "critical_files", "failing_tests", "risks", "phase_log"}
+        {
+            "progress",
+            "remaining",
+            "critical_files",
+            "failing_tests",
+            "risks",
+            "phase_log",
+        }
     )
     assert patch["phase_log"] == ["fix PR#42 iter2: addressed review"]
     # changed + investigated files, deduped, order-preserving.
     assert patch["critical_files"] == [
-        "backend/app/foo.py", "agent/src/bar.ts", "backend/app/baz.py",
+        "backend/app/foo.py",
+        "agent/src/bar.ts",
+        "backend/app/baz.py",
     ]
     assert patch["failing_tests"] == ["test_foo failed: AssertionError"]
     assert patch["remaining"] == ["[MAJOR] [a.ts] null case"]
@@ -739,14 +766,22 @@ def test_build_lane_manifest_patch_is_size_bounded():
     """A pathological set of long strings is trimmed under the patch byte bound."""
     import json
 
-    from app.review_fix_lane_pilot import _MANIFEST_PATCH_MAX_BYTES, build_lane_manifest_patch
+    from app.review_fix_lane_pilot import (
+        _MANIFEST_PATCH_MAX_BYTES,
+        build_lane_manifest_patch,
+    )
 
     task = _FakeTask(
         context={
             "_pr_changed_files": ["x" * 500 for _ in range(40)],
             "review_loop": {
                 "review_history": [
-                    {"issues": [{"severity": "major", "description": "y" * 500} for _ in range(40)]},
+                    {
+                        "issues": [
+                            {"severity": "major", "description": "y" * 500}
+                            for _ in range(40)
+                        ]
+                    },
                 ],
                 "fix_agent_responses": [{"claim": "z" * 500} for _ in range(40)],
             },
@@ -773,7 +808,8 @@ def test_build_lane_manifest_patch_accumulates_under_8kb_across_phases():
         task = _FakeTask(
             context={
                 "_pr_changed_files": [
-                    f"deeply/nested/path/{i}/file_{j}_" + "x" * 160 + ".py" for j in range(6)
+                    f"deeply/nested/path/{i}/file_{j}_" + "x" * 160 + ".py"
+                    for j in range(6)
                 ],
                 "review_loop": {
                     "iteration": i,
@@ -835,7 +871,10 @@ def test_build_fix_resume_block_none_when_empty():
 
     assert build_fix_resume_block(None) is None
     empty = SimpleNamespace(
-        manifest={}, last_checkpoint_sha=None, last_checkpoint_phase=None, checkpoint_seq=0,
+        manifest={},
+        last_checkpoint_sha=None,
+        last_checkpoint_phase=None,
+        checkpoint_seq=0,
     )
     assert build_fix_resume_block(empty) is None
 
@@ -845,7 +884,10 @@ def test_build_fix_resume_block_is_size_bounded():
     import json
     from types import SimpleNamespace
 
-    from app.review_fix_lane_pilot import _RESUME_BLOCK_MAX_BYTES, build_fix_resume_block
+    from app.review_fix_lane_pilot import (
+        _RESUME_BLOCK_MAX_BYTES,
+        build_fix_resume_block,
+    )
 
     lane = SimpleNamespace(
         manifest={
@@ -1042,8 +1084,12 @@ async def test_kill_project_lanes_skips_already_terminal(db: AsyncSession):
 
     assert count == 0
     # Statuses unchanged.
-    assert (await db.get(ImprovementLane, lane_retired.id)).status == ImprovementLaneStatus.RETIRED.value
-    assert (await db.get(ImprovementLane, lane_killed.id)).status == ImprovementLaneStatus.KILLED.value
+    assert (
+        await db.get(ImprovementLane, lane_retired.id)
+    ).status == ImprovementLaneStatus.RETIRED.value
+    assert (
+        await db.get(ImprovementLane, lane_killed.id)
+    ).status == ImprovementLaneStatus.KILLED.value
 
 
 # ---------------------------------------------------------------------------
@@ -1096,15 +1142,90 @@ async def test_sweep_exhausted_lane_budgets_kills_over_budget(db: AsyncSession):
 
     await db.commit()
 
-    with patch("app.runtime_config_state.is_improvement_lanes_enabled", return_value=True):
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
         count = await sweep_exhausted_lane_budgets(db)
     await db.commit()
 
     assert count == 1
-    assert (await db.get(ImprovementLane, lane_over.id)).status == ImprovementLaneStatus.KILLED.value
+    assert (
+        await db.get(ImprovementLane, lane_over.id)
+    ).status == ImprovementLaneStatus.KILLED.value
     # at-budget and under-budget lanes must not be touched
-    assert (await db.get(ImprovementLane, lane_at.id)).status == ImprovementLaneStatus.ACTIVE.value
-    assert (await db.get(ImprovementLane, lane_under.id)).status == ImprovementLaneStatus.ACTIVE.value
+    assert (
+        await db.get(ImprovementLane, lane_at.id)
+    ).status == ImprovementLaneStatus.ACTIVE.value
+    assert (
+        await db.get(ImprovementLane, lane_under.id)
+    ).status == ImprovementLaneStatus.ACTIVE.value
+
+
+# ---------------------------------------------------------------------------
+# ensure_chain_lane — activation failure must not bind the chain
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_lane_activation_does_not_bind_chain(db: AsyncSession):
+    """ensure_chain_lane must not write LANE_CHAIN_ID_KEY when CAS PROPOSED->ACTIVE
+    fails.  The function must return None so the chain falls through to classic relay.
+    No PROPOSED lane must remain referenced by the chain context."""
+    from app.improvement_lane_ops import LaneCASError
+
+    project_id = await _make_project(db)
+    ctx: dict = {}
+
+    async def _fail_on_activate(session, lane_id, expected, next_status, **kw):
+        if next_status == ImprovementLaneStatus.ACTIVE:
+            raise LaneCASError("simulated CAS race on activation")
+        # Cleanup call (PROPOSED->RETIRED) — best-effort, may be suppressed.
+
+    with patch(
+        "app.improvement_lane_ops.cas_transition", side_effect=_fail_on_activate
+    ):
+        result = await ensure_chain_lane(
+            db,
+            project_id=project_id,
+            ctx=ctx,
+            title="Test lane",
+            branch_name="lane/test-activation-fail",
+            base_branch="main",
+            direction_id=None,
+            current_task_id=None,
+        )
+
+    # Return must be None — activation failed so no lane is usable.
+    assert result is None
+
+    # Chain context must not carry a lane binding — no PROPOSED lane referenced.
+    assert LANE_CHAIN_ID_KEY not in ctx
+
+    # get_chain_lane must also return None for the empty ctx.
+    lane_via_get = await get_chain_lane(db, ctx)
+    assert lane_via_get is None
+
+
+@pytest.mark.asyncio
+async def test_get_chain_lane_ignores_proposed_lane(db: AsyncSession):
+    """get_chain_lane returns None for a PROPOSED lane — only ACTIVE/PARKED are valid."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/proposed-guard",
+        base_branch="main",
+    )
+    await db.commit()
+    # Lane is in PROPOSED status (the default from create_lane).
+    assert lane.status == ImprovementLaneStatus.PROPOSED.value
+
+    ctx = {LANE_CHAIN_ID_KEY: str(lane.id)}
+    result = await get_chain_lane(db, ctx)
+    assert result is None, "get_chain_lane must not return a PROPOSED lane"
 
 
 @pytest.mark.asyncio
@@ -1127,9 +1248,13 @@ async def test_sweep_exhausted_lane_budgets_inert_when_disabled(db: AsyncSession
     lane_over.phase_requeues = _LANE_MAX_PHASE_REQUEUES + 1
     await db.commit()
 
-    with patch("app.runtime_config_state.is_improvement_lanes_enabled", return_value=False):
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=False
+    ):
         count = await sweep_exhausted_lane_budgets(db)
 
     assert count == 0
     # Lane must remain ACTIVE — the sweep was entirely inert.
-    assert (await db.get(ImprovementLane, lane_over.id)).status == ImprovementLaneStatus.ACTIVE.value
+    assert (
+        await db.get(ImprovementLane, lane_over.id)
+    ).status == ImprovementLaneStatus.ACTIVE.value

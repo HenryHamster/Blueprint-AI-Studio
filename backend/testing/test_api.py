@@ -1221,8 +1221,8 @@ async def test_admin_tasks_project_id_filter_returns_scoped_counts(
     assert resp.status_code == 200
     data = resp.json()
 
-    # Global fleet counts include tasks from both projects
-    assert data["active_count"] >= 2, "global active_count should include both projects"
+    # Global counts include tasks from both member projects
+    assert data["active_count"] >= 2, "global active_count should include both member projects"
 
     # Scoped counts are present and only reflect project A
     assert "scoped_active_count" in data
@@ -1306,3 +1306,77 @@ async def test_admin_tasks_no_project_id_omits_scoped_counts(
     assert "scoped_active_count" not in data
     assert "scoped_evaluating_count" not in data
     assert "scoped_queued_count" not in data
+
+
+@pytest.mark.asyncio
+async def test_task_counts_scoped_to_member_projects(
+    client: AsyncClient, db_session
+):
+    """Global counts only aggregate projects the caller is a member of.
+    A non-member project's tasks must not appear in active_count or
+    scoped counts, even when that project_id is passed as a filter."""
+    # Caller's own project
+    member_project = Project(
+        name="Member Project",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(member_project)
+    await db_session.commit()
+    await db_session.refresh(member_project)
+    db_session.add(
+        ProjectMember(project_id=member_project.id, user_id="test-user-123", role="owner")
+    )
+
+    # A foreign project — a different user owns it, caller is NOT a member
+    foreign_project = Project(
+        name="Foreign Project",
+        user_id="other-user-999",
+        status=ProjectStatus.DEPLOYING,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(foreign_project)
+    await db_session.commit()
+    await db_session.refresh(foreign_project)
+    db_session.add(
+        ProjectMember(project_id=foreign_project.id, user_id="other-user-999", role="owner")
+    )
+
+    # One active task in the caller's project
+    member_task = Task(
+        project_id=member_project.id,
+        title="member active",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+    )
+    # One active task in the foreign project — must NOT appear in any counts
+    foreign_task = Task(
+        project_id=foreign_project.id,
+        title="foreign active",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add_all([member_task, foreign_task])
+    await db_session.commit()
+
+    # 1. Global counts without project_id: should only include member project
+    resp = await client.get("/api/admin/tasks", params={"archived": "false"})
+    assert resp.status_code == 200
+    data = resp.json()
+    # The member project has exactly 1 active task; foreign project must not contribute
+    assert data["active_count"] >= 1, "member project tasks should be counted"
+    # Verify foreign task is excluded by checking the task list excludes it
+    task_ids = [t["id"] for t in data["tasks"]]
+    assert str(foreign_task.id) not in task_ids, "foreign task must not appear in task list"
+
+    # 2. Scoped counts for foreign project_id: non-member gets zero scoped counts
+    resp2 = await client.get(
+        "/api/admin/tasks",
+        params={"project_id": str(foreign_project.id), "archived": "false"},
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["scoped_active_count"] == 0, "non-member must see zero scoped_active_count"
+    assert data2["scoped_evaluating_count"] == 0
+    assert data2["scoped_queued_count"] == 0

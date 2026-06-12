@@ -46,8 +46,7 @@ from app.capability_trial_verdict import (
     evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
     get_trial_definitions,
-    get_trial_verdicts,
-    record_trial_verdict,
+    persist_trial_verdicts_in_transaction,
 )
 from app.digest_metrics import (
     _compute_edges_considered_metrics,  # noqa: F401  re-exported for external importers
@@ -1431,6 +1430,10 @@ async def _compute_digest(
         from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
         _verdict_evaluated_at = _tv_utcnow().isoformat()
         _pending_trial_verdicts: list[tuple[str, dict[str, Any]]] = []
+        # Collected gate-integrity alert detail (if any) — persisted durably in
+        # the write-owned helper alongside the verdicts, NOT on the request
+        # session, which the caller may roll back.
+        _gate_alert_detail: str | None = None
         for _td in get_trial_definitions():
             _cap = _td["cap_name"]
             # Lane pilot uses its own multi-axis evaluator (KILL/ADOPT thresholds
@@ -1466,7 +1469,6 @@ async def _compute_digest(
         from app.review_fix_lane_pilot import (  # noqa: PLC0415
             apply_lane_pilot_kill_in_transaction,
             compute_lane_pilot_aggregates,
-            raise_gate_integrity_alert,
             compute_lane_arm_time_medians,
         )
         if project_id is not None:
@@ -1532,21 +1534,34 @@ async def _compute_digest(
                     ),
                 )
             elif _lane_verdict.get("immediate_alert"):
-                await raise_gate_integrity_alert(
-                    session,
-                    project_id,
-                    detail=str(_lane_verdict.get("verdict_reason", "")),
-                )
-            record_trial_verdict(_digest_project, LANE_PILOT_CAP_NAME, _lane_verdict)
+                # Route the alert through the durable write-owned helper below
+                # instead of the request session, which the caller may roll back.
+                _gate_alert_detail = str(_lane_verdict.get("verdict_reason", ""))
             _pending_trial_verdicts.append((LANE_PILOT_CAP_NAME, _lane_verdict))
 
-        for _cap, _verdict_entry in _pending_trial_verdicts:
-            record_trial_verdict(_digest_project, _cap, _verdict_entry)
-
+        # Persist ALL collected trial verdicts AND any gate-integrity alert in an
+        # explicit write-owned transaction whose commit is INDEPENDENT of the
+        # request session. On the request path the caller's session is closed
+        # without committing; on the precompute path the request session's commit
+        # is contingent on the L2 cache write (write_shared) succeeding. The
+        # helper re-fetches the project fresh inside its own session so
+        # record_trial_verdict's KILL-survival / self-revert guards see current
+        # committed state — and so a lane-pilot KILL already committed by
+        # apply_lane_pilot_kill_in_transaction is never clobbered by a stale
+        # re-record of the early-fetched _digest_project row.
+        _persisted_verdicts: dict = {}
         try:
-            await session.flush()
+            _persisted_verdicts = await persist_trial_verdicts_in_transaction(
+                session,
+                project_id,
+                pending_verdicts=_pending_trial_verdicts,
+                gate_alert_detail=_gate_alert_detail,
+            )
         except Exception:
-            logger.warning("[CAPABILITY_TRIAL] failed to flush verdicts", exc_info=True)
+            logger.warning(
+                "[CAPABILITY_TRIAL] failed to durably persist verdicts", exc_info=True
+            )
+            _persisted_verdicts = {}
 
         # --- Per-trial accrual projection (ephemeral, NOT persisted) ---
         # Augment the verdict entries returned in the response with a recent
@@ -1555,13 +1570,17 @@ async def _compute_digest(
         # the current rate. Only assignment-based trials (an ``assignment_key``) have
         # a randomized holdback arm to project; receipt-only trials get no projection.
         #
-        # This is read-only display compute. We deliberately do NOT mutate the live
-        # ``project.capability_adoption_verdicts`` entries (which ``get_trial_verdicts``
-        # returns by reference) — mutating them would risk a later autoflush
-        # persisting ``accrual_projection`` to the JSONB column. Instead we build a
-        # response-only copy with the projection grafted on.
+        # This is read-only display compute. We build the response payload from
+        # ``_persisted_verdicts`` — the snapshot returned by the durable helper,
+        # which mirrors EXACTLY what was committed (after record_trial_verdict's
+        # KILL-survival / self-revert guards ran against fresh committed state).
+        # We deliberately do NOT read off the early-fetched ``_digest_project``
+        # row: it is stale relative to the helper's commit, and mutating it would
+        # risk a later autoflush persisting ``accrual_projection`` to the JSONB
+        # column. Instead we build a response-only copy with the projection
+        # grafted on.
         _accrual_window_days = 7
-        _stored_verdicts = get_trial_verdicts(_digest_project)
+        _stored_verdicts = _persisted_verdicts
         _augmented_verdicts = {
             _k: (dict(_v) if isinstance(_v, dict) else _v)
             for _k, _v in _stored_verdicts.items()
