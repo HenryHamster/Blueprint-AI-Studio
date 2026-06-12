@@ -4153,3 +4153,69 @@ async def test_commit_file_changes_raises_on_bad_status(mocker):
             "t", "o", "r", "staging",
             upserts={"f.py": "x"}, deletes=[], message="m",
         )
+
+
+# ── get_pr_files pagination ─────────────────────────────────────────────────
+# The files endpoint caps at 100 per page; a large release rollup exceeds that.
+# Truncating to page 1 would hide a migration file on a later page from the
+# Alembic chain guard, which reads as "no migrations" and skips the gate.
+
+
+@pytest.mark.asyncio
+async def test_get_pr_files_pages_beyond_one_hundred(mocker):
+    """A PR with >100 changed files is paged fully — a migration file on page 2
+    is returned, not truncated away with the rest of page 2."""
+    from app.github_pulls import get_pr_files
+
+    from urllib.parse import parse_qs, urlparse
+
+    page1 = [{"filename": f"src/f{i}.py", "status": "modified"} for i in range(100)]
+    page2 = [{"filename": f"src/g{i}.py", "status": "modified"} for i in range(6)] + [
+        {"filename": "backend/alembic/versions/0237_x.py", "status": "added"}
+    ]
+
+    async def _req(method, url, headers, project_id=None, **kwargs):
+        page = int(parse_qs(urlparse(url).query)["page"][0])
+        if page == 1:
+            return MockResponse(200, json_data=page1)
+        if page == 2:
+            return MockResponse(200, json_data=page2)
+        raise AssertionError(f"unexpected extra page fetch: page {page}")
+
+    mocker.patch("app.github_pulls._github_request", new=AsyncMock(side_effect=_req))
+    files = await get_pr_files("tok", "o", "r", 1)
+    assert len(files) == 107
+    assert any(f["filename"] == "backend/alembic/versions/0237_x.py" for f in files)
+
+
+@pytest.mark.asyncio
+async def test_get_pr_files_stops_after_short_page(mocker):
+    """A PR with fewer than 100 files makes exactly one request — no needless
+    second-page fetch."""
+    from app.github_pulls import get_pr_files
+
+    calls = []
+
+    async def _req(method, url, headers, project_id=None, **kwargs):
+        calls.append(url)
+        return MockResponse(200, json_data=[{"filename": "a.py", "status": "added"}])
+
+    mocker.patch("app.github_pulls._github_request", new=AsyncMock(side_effect=_req))
+    files = await get_pr_files("tok", "o", "r", 1)
+    assert len(files) == 1
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_pr_files_first_page_error_still_raises(mocker):
+    """Pagination preserves the transient-vs-empty contract: a non-200 on the
+    first page raises (never silently returns []) so callers can distinguish a
+    GitHub hiccup from a genuinely empty PR."""
+    from app.github_pulls import get_pr_files
+
+    mocker.patch(
+        "app.github_pulls._github_request",
+        new=AsyncMock(return_value=MockResponse(502, text="bad gateway")),
+    )
+    with pytest.raises(HTTPException):
+        await get_pr_files("tok", "o", "r", 1)
