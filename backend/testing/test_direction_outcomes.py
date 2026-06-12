@@ -5926,15 +5926,7 @@ async def test_spawn_gate_scoped_to_owning_direction(db_session: AsyncSession):
                 "unresolved_count": 1,
                 "wholesale_retry_exhausted": True,
             },
-            direction_b: {
-                "challenged_count": 0,
-                "refuted_count": 0,
-                "survived_count": 0,
-                "explicit_pass_count": 0,
-                "fail_open_count": 0,
-                "unresolved_count": 0,
-                "wholesale_retry_exhausted": False,
-            },
+            direction_b: {},
         },
     }
     project.directions = [
@@ -5960,6 +5952,62 @@ async def test_spawn_gate_scoped_to_owning_direction(db_session: AsyncSession):
     assert entry_b["research_spawn_gate_challenged_count"] == 0
     assert entry_b["research_spawn_gate_refuted_count"] == 0
     assert entry_b["research_spawn_gate_survived_count"] == 0
+    assert entry_b["research_spawn_gate_wholesale_retry_exhausted"] is False
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_missing_direction_entry_stays_zero(
+    db_session: AsyncSession,
+):
+    """A missing per-direction entry must not fall back to sibling globals."""
+    direction_a = "d-sg-dir-a"
+    direction_b = "d-sg-dir-b"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_a,
+        "research_spawn_gate_challenged_count": 3,
+        "research_spawn_gate_refuted_count": 2,
+        "research_spawn_gate_survived_count": 1,
+        "research_spawn_gate_wholesale_retry_exhausted": True,
+        "research_spawn_gate_by_direction": {
+            direction_a: {
+                "challenged_count": 3,
+                "refuted_count": 2,
+                "survived_count": 1,
+                "explicit_pass_count": 0,
+                "fail_open_count": 1,
+                "unresolved_count": 1,
+                "wholesale_retry_exhausted": True,
+            }
+        },
+    }
+    project.directions = [
+        _make_direction(direction_a, research_task_id, tasks_created=1),
+        _make_direction(direction_b, research_task_id, tasks_created=0),
+    ]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_b,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry_b = next(
+        d["research_history"][0]
+        for d in project.directions
+        if d["id"] == direction_b
+    )
+    assert entry_b["research_spawn_gate_challenged_count"] == 0
+    assert entry_b["research_spawn_gate_refuted_count"] == 0
+    assert entry_b["research_spawn_gate_survived_count"] == 0
+    assert entry_b["research_spawn_gate_explicit_pass_count"] == 0
+    assert entry_b["research_spawn_gate_fail_open_count"] == 0
+    assert entry_b["research_spawn_gate_unresolved_count"] == 0
     assert entry_b["research_spawn_gate_wholesale_retry_exhausted"] is False
 
 

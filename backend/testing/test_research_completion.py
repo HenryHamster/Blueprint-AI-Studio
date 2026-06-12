@@ -9146,6 +9146,8 @@ async def test_adversarial_fail_closed_no_child_on_absent_hash(db_session, mocke
     assert matching[0].get("adversarial_gate_reason") == "no_hash_matches"
     assert task.context.get("research_spawn_gate_wholesale_retry_exhausted") is True
     assert task.context.get("research_spawn_gate_parse_outcome") == "no_hash_matches"
+    scoped = task.context.get("research_spawn_gate_by_direction") or {}
+    assert scoped[direction["id"]]["wholesale_retry_exhausted"] is True
 
 
 @_pytest.mark.asyncio
@@ -9406,6 +9408,186 @@ async def test_adversarial_gate_real_pass_resolver_spawns_child_with_telemetry(
 
 
 @_pytest.mark.asyncio
+async def test_spawn_gate_exhausted_flag_cleared_on_later_pass_and_scoped_by_direction(
+    db_session, mocker
+):
+    from app.research_completion import (
+        _ADVERSARIAL_TARGETED_RETRY_KEY,
+        _ADVERSARIAL_WHOLESALE_RETRY_KEY,
+        _finding_hash,
+    )
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-adv-later-pass"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs1 = _high_stakes_finding(direction["id"], "Recovered pass one")
+    hs2 = _high_stakes_finding(direction["id"], "Recovered pass two")
+    hash1 = _finding_hash(hs1["title"], hs1.get("description", ""))
+    hash2 = _finding_hash(hs2["title"], hs2.get("description", ""))
+
+    task.plan_output = [hs1, hs2]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                hash1: {"passed": True, "reason": "grounded", "explicit": True},
+                hash2: {"passed": True, "reason": "still valid", "explicit": True},
+            },
+            "grader_task_id": "test-grader-later-pass",
+            "parse_outcome": "ok",
+        },
+        "_adversarial_challenged_hashes": [hash1, hash2],
+        "research_spawn_gate_wholesale_retry_exhausted": True,
+        "research_spawn_gate_refusal_skip_retry": True,
+        "research_spawn_gate_last_wholesale_parse_outcome": "no_hash_matches",
+        _ADVERSARIAL_WHOLESALE_RETRY_KEY: 1,
+        _ADVERSARIAL_TARGETED_RETRY_KEY: 1,
+        "_adversarial_original_challenged_hashes": [hash1, hash2],
+    }
+    db_session.add(task)
+    await db_session.commit()
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs1, hs2],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    ctx = task.context or {}
+    assert "research_spawn_gate_wholesale_retry_exhausted" not in ctx
+    assert "research_spawn_gate_refusal_skip_retry" not in ctx
+    assert "research_spawn_gate_last_wholesale_parse_outcome" not in ctx
+    assert _ADVERSARIAL_WHOLESALE_RETRY_KEY not in ctx
+    assert _ADVERSARIAL_TARGETED_RETRY_KEY not in ctx
+    assert "_adversarial_original_challenged_hashes" not in ctx
+
+    scoped = ctx.get("research_spawn_gate_by_direction") or {}
+    assert scoped == {
+        direction["id"]: {
+            "challenged_count": 2,
+            "refuted_count": 0,
+            "survived_count": 2,
+            "explicit_pass_count": 2,
+            "fail_open_count": 0,
+            "unresolved_count": 0,
+            "wholesale_retry_exhausted": False,
+            "parse_outcome": "ok",
+        }
+    }
+
+
+@_pytest.mark.asyncio
+async def test_spawn_gate_scoped_by_direction_keeps_sibling_directions_separate(
+    db_session, mocker
+):
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import (
+        _active_direction,
+        _make_research_task,
+        _patch_research_externals,
+    )
+
+    direction_a = _active_direction("d-adv-sibling-a", "Sibling direction A")
+    direction_b = _active_direction("d-adv-sibling-b", "Sibling direction B")
+    project = _Project(
+        name="Sibling Direction Gate",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction_a, direction_b],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = await _make_research_task(project, direction_a, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_a["id"]}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs_a = _high_stakes_finding(direction_a["id"], "Sibling direction A finding")
+    hs_b = _high_stakes_finding(direction_b["id"], "Sibling direction B finding")
+    hash_a = _finding_hash(hs_a["title"], hs_a.get("description", ""))
+    hash_b = _finding_hash(hs_b["title"], hs_b.get("description", ""))
+
+    task.plan_output = [hs_a, hs_b]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {
+                hash_a: {
+                    "passed": False,
+                    "reason": "stale premise",
+                    "explicit": True,
+                },
+                hash_b: {
+                    "passed": True,
+                    "reason": "well-grounded",
+                    "explicit": True,
+                },
+            },
+            "grader_task_id": "test-grader-sibling-001",
+            "parse_outcome": "ok",
+        },
+        "_adversarial_challenged_hashes": [hash_a, hash_b],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs_a, hs_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    ctx = task.context or {}
+    assert ctx.get("research_spawn_gate_challenged_count") == 2
+    assert ctx.get("research_spawn_gate_refuted_count") == 1
+    assert ctx.get("research_spawn_gate_survived_count") == 1
+    assert ctx.get("research_spawn_gate_explicit_pass_count") == 1
+    assert ctx.get("research_spawn_gate_fail_open_count") == 0
+    assert ctx.get("research_spawn_gate_unresolved_count") == 0
+
+    scoped = ctx.get("research_spawn_gate_by_direction") or {}
+    assert set(scoped) == {direction_a["id"], direction_b["id"]}
+    assert scoped[direction_a["id"]] == {
+        "challenged_count": 1,
+        "refuted_count": 1,
+        "survived_count": 0,
+        "explicit_pass_count": 0,
+        "fail_open_count": 0,
+        "unresolved_count": 0,
+        "wholesale_retry_exhausted": False,
+        "parse_outcome": "ok",
+        "refuted_reasons": ["stale premise"],
+    }
+    assert scoped[direction_b["id"]] == {
+        "challenged_count": 1,
+        "refuted_count": 0,
+        "survived_count": 1,
+        "explicit_pass_count": 1,
+        "fail_open_count": 0,
+        "unresolved_count": 0,
+        "wholesale_retry_exhausted": False,
+        "parse_outcome": "ok",
+    }
+
+
+@_pytest.mark.asyncio
 async def test_spawn_gate_decision_quality_breakdown_recorded(db_session, mocker):
     """Explicit-pass, fail-open, unresolved, and refuted outcomes get distinct counts.
 
@@ -9522,6 +9704,18 @@ async def test_spawn_gate_decision_quality_breakdown_recorded(db_session, mocker
     assert "no_hash_matches" in reasons
     assert len(reasons) == len(set(reasons)), "reasons sample must be deduped"
     assert len(reasons) <= 5
+    scoped = ctx.get("research_spawn_gate_by_direction") or {}
+    scoped_entry = scoped[direction["id"]]
+    assert scoped_entry["challenged_count"] == 4
+    assert scoped_entry["refuted_count"] == 2
+    assert scoped_entry["survived_count"] == 2
+    assert scoped_entry["explicit_pass_count"] == 1
+    assert scoped_entry["fail_open_count"] == 1
+    assert scoped_entry["unresolved_count"] == 1
+    assert scoped_entry["parse_outcome"] == "no_hash_matches"
+    assert scoped_entry["wholesale_retry_exhausted"] is False
+    assert "stale premise" in scoped_entry["refuted_reasons"]
+    assert "no_hash_matches" in scoped_entry["refuted_reasons"]
 
     # Deferred findings (refuted + unresolved) carry their verdict-keyed
     # finding_hash alongside the title so downstream consumers can match by hash.
@@ -9628,6 +9822,10 @@ async def test_spawn_gate_records_manifest_excluded_fail_closed_category(
             ),
         }
     ]
+    scoped = ctx.get("research_spawn_gate_by_direction") or {}
+    scoped_entry = scoped[direction["id"]]
+    assert scoped_entry["manifest_excluded_count"] == 1
+    assert scoped_entry["manifest_excluded_samples"] == samples
 
     deferred = {
         d.get("title"): d
@@ -11237,6 +11435,10 @@ async def test_unresolved_finding_and_cycle_summary_carry_cause(db_session, mock
     assert isinstance(counts, dict) and counts, (
         "research_spawn_gate_cause_counts must be exported"
     )
+    scoped = (task.context or {}).get("research_spawn_gate_by_direction") or {}
+    scoped_entry = scoped[direction["id"]]
+    assert scoped_entry["cause"] == cause
+    assert scoped_entry["cause_counts"] == counts
 
 
 @_pytest.mark.asyncio
@@ -11460,6 +11662,8 @@ async def test_spawn_gate_targeted_retry_routes_by_cause(db_session, mocker):
     assert task_c.context.get("research_spawn_gate_refusal_skip_retry") is True, (
         "refusal cause must set refusal_skip_retry flag"
     )
+    scoped_c = task_c.context.get("research_spawn_gate_by_direction") or {}
+    assert scoped_c[_dir_c["id"]]["wholesale_retry_exhausted"] is True
     # Both findings must be deferred fail-closed.
     deferred_c = task_c.context.get("deferred_findings") or []
     assert fhash1_c or fhash2_c  # just ensure hashes were computed

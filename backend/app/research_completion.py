@@ -2436,7 +2436,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _spawn_gate_refuted_reasons: list[str] = []
     _spawn_gate_manifest_excluded_count = 0
     _spawn_gate_manifest_excluded_samples: list[dict] = []
+    _spawn_gate_by_direction: dict[str, dict] = {}
     _spawn_gate_parse_outcome = None
+    _spawn_gate_healthy_cycle = False
     if _adversarial_verdict_raw is not None:
         _spawn_gate_parse_outcome = _adversarial_verdict_raw.get("parse_outcome")
         # Machine-readable non-response cause from the resolution-time diagnostic
@@ -2476,6 +2478,27 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             and not _explicit_verdicts
             and _wholesale_parse_outcome in ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES
         )
+        _spawn_gate_healthy_cycle = not _wholesale_non_response
+
+        def _spawn_gate_dir_entry(_direction_id: str) -> dict:
+            return _spawn_gate_by_direction.setdefault(
+                _direction_id,
+                {
+                    "challenged_count": 0,
+                    "refuted_count": 0,
+                    "survived_count": 0,
+                    "explicit_pass_count": 0,
+                    "fail_open_count": 0,
+                    "unresolved_count": 0,
+                    "wholesale_retry_exhausted": bool(
+                        _wholesale_non_response
+                        and (task.context or {}).get(
+                            "research_spawn_gate_wholesale_retry_exhausted"
+                        )
+                    ),
+                },
+            )
+
         if _wholesale_non_response:
             # Dispatch on the diagnosed non-response cause so the retry
             # strategy matches the failure mode rather than always doing the
@@ -2815,16 +2838,58 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for _f in _high_stakes_challenged:
             _passed = _f.get("_adversarial_verdict") != "fail"
             _explicit = bool(_f.get("_adversarial_verdict_explicit"))
+            _direction_id = str(
+                _f.get("direction_id")
+                or (task.context or {}).get("direction_id")
+                or ""
+            )
+            if _direction_id:
+                _dir_entry = _spawn_gate_dir_entry(_direction_id)
+                _dir_entry["challenged_count"] += 1
+                if _spawn_gate_parse_outcome:
+                    _dir_entry["parse_outcome"] = _spawn_gate_parse_outcome
+                if _spawn_gate_cause:
+                    _dir_entry["cause"] = _spawn_gate_cause
             if _passed and _explicit:
                 _spawn_gate_explicit_pass_count += 1
+                if _direction_id:
+                    _dir_entry["explicit_pass_count"] += 1
+                    _dir_entry["survived_count"] += 1
             elif _passed and not _explicit:
                 _spawn_gate_fail_open_count += 1
+                if _direction_id:
+                    _dir_entry["fail_open_count"] += 1
+                    _dir_entry["survived_count"] += 1
             elif not _passed and not _explicit:
                 _spawn_gate_unresolved_count += 1
+                if _direction_id:
+                    _dir_entry["unresolved_count"] += 1
+                    _dir_entry["refuted_count"] += 1
+                    if _spawn_gate_cause:
+                        _cause_category = (
+                            _spawn_gate_cause.get("category")
+                            if isinstance(_spawn_gate_cause, dict)
+                            else None
+                        )
+                        if _cause_category:
+                            _cause_counts = _dir_entry.setdefault("cause_counts", {})
+                            _cause_counts[_cause_category] = (
+                                int(_cause_counts.get(_cause_category) or 0) + 1
+                            )
+            elif not _passed:
+                if _direction_id:
+                    _dir_entry["refuted_count"] += 1
             if not _passed:
                 _reason = str(_f.get("_adversarial_verdict_reason") or "").strip()[
                     :_SPAWN_GATE_REASON_MAX_LEN
                 ]
+                if _direction_id and _reason:
+                    _dir_reasons = _dir_entry.setdefault("refuted_reasons", [])
+                    if (
+                        _reason not in _dir_reasons
+                        and len(_dir_reasons) < _SPAWN_GATE_REASONS_SAMPLE_CAP
+                    ):
+                        _dir_reasons.append(_reason)
                 if (
                     _reason
                     and _reason not in _seen_reasons
@@ -2833,6 +2898,28 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ):
                     _seen_reasons.add(_reason)
                     _spawn_gate_refuted_reasons.append(_reason)
+
+        if _spawn_gate_manifest_excluded_samples:
+            _finding_direction_by_hash = {
+                _fh(
+                    str(_f.get("title", "")),
+                    str(_f.get("description", "") or _f.get("prompt", "")),
+                ): str(_f.get("direction_id") or (task.context or {}).get("direction_id") or "")
+                for _f in findings
+            }
+            for _sample in _spawn_gate_manifest_excluded_samples:
+                _sample_direction_id = _finding_direction_by_hash.get(
+                    _sample.get("hash")
+                )
+                if not _sample_direction_id:
+                    continue
+                _dir_entry = _spawn_gate_dir_entry(_sample_direction_id)
+                _dir_entry["manifest_excluded_count"] = (
+                    int(_dir_entry.get("manifest_excluded_count") or 0) + 1
+                )
+                _dir_samples = _dir_entry.setdefault("manifest_excluded_samples", [])
+                if len(_dir_samples) < _SPAWN_GATE_REASONS_SAMPLE_CAP:
+                    _dir_samples.append(_sample)
 
     # Compute capacity-aware batch cap — no DB queries, uses in-memory state only
     from app import shared_state as _ss
@@ -4990,6 +5077,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # from the surviving-finding signal (neutral, not success/failure).
             ctx["research_reproduce_rejected"] = len(_reproduce_rejected)
         if _spawn_gate_challenged_count:
+            if _spawn_gate_healthy_cycle:
+                for _retry_key in (
+                    "research_spawn_gate_wholesale_retry_exhausted",
+                    "research_spawn_gate_refusal_skip_retry",
+                    "research_spawn_gate_last_wholesale_parse_outcome",
+                    _ADVERSARIAL_WHOLESALE_RETRY_KEY,
+                    _ADVERSARIAL_TARGETED_RETRY_KEY,
+                    "_adversarial_original_challenged_hashes",
+                ):
+                    ctx.pop(_retry_key, None)
             ctx["research_spawn_gate_challenged_count"] = _spawn_gate_challenged_count
             ctx["research_spawn_gate_refuted_count"] = _spawn_gate_refuted_count
             ctx["research_spawn_gate_survived_count"] = _spawn_gate_survived_count
@@ -5022,6 +5119,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     ctx["research_spawn_gate_cause_counts"] = {
                         _cause_category: _spawn_gate_unresolved_count
                     }
+        if _spawn_gate_by_direction:
+            ctx["research_spawn_gate_by_direction"] = _spawn_gate_by_direction
         if _spawn_gate_manifest_excluded_count:
             ctx["research_spawn_gate_manifest_excluded_fail_closed_count"] = (
                 _spawn_gate_manifest_excluded_count
