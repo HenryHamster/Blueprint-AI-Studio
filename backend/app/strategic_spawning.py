@@ -5117,7 +5117,10 @@ async def _spawn_strategic_review(
         _qual_state = _summarize_qual_state(_open_version.last_qualification)
         if _qual_state and _qual_state.get("state") in {
             "promotion_in_flight",
+            "promotion_check_wait",
             "promotion_failed",
+            "required_check_failed",
+            "protection_blocked_review",
         }:
             _qual_hint = (
                 f"Qualification sub-state: {_qual_state['state'].upper()} — "

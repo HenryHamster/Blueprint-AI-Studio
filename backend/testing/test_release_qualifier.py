@@ -5444,6 +5444,77 @@ async def test_run_qualification_promotion_in_flight_is_noop(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_managed_check_wait_is_noop(db_session, mocker):
+    """A version whose migration-carrying promotion PR is held in
+    managed_check_wait (status='pending' + promotion_pending.managed_check_wait)
+    must ALSO block a duplicate qualify — re-qualifying would clobber the
+    check-wait provenance the reconciler retries on. run_qualification refuses
+    with the distinct promotion_check_wait status and spawns nothing."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-done",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-cw",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "feed" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-20T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "smoketest_enabled": False,
+        "promotion_pending": {
+            "pr_number": 4343,
+            "pr_url": "https://github.com/o/r/pull/4343",
+            "auto_merge_enabled": False,
+            "migration_carrying": True,
+            "managed_check_wait": True,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="cafe" * 10),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # The managed check-wait hold blocks the duplicate qualify with its own
+    # distinct status (NOT promotion_in_flight, NOT a fresh audit spawn).
+    assert result["status"] == "promotion_check_wait"
+    assert result["promotion_pr_number"] == 4343
+    assert result["promotion_pr_url"] == "https://github.com/o/r/pull/4343"
+    sha_mock.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.last_qualification["promotion_pending"]["pr_number"] == 4343
+    assert version.qualification_attempts == attempts_before
+
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_pending_but_children_terminal_runs_fresh(
     db_session, mocker
 ):
@@ -14703,11 +14774,10 @@ async def test_promote_pending_ci_migration_pr_skips_auto_merge(db_session, mock
     no conflict) must NOT be handed to GitHub native auto-merge — that would
     reopen the dual-head TOCTOU window (the promotion target can advance while
     checks are pending, so the eventual native merge could land against a
-    different migration chain than the one Blueprint validated). Parity with the
-    task-PR and rollup auto-merge sites: promote() holds the version in its
-    existing retryable state (open + stabilize, no promotion_pending sub-state)
-    so the next strategic cycle re-runs the pre-merge guard against the live
-    promotion target before merging."""
+    different migration chain than the one Blueprint validated). Instead, promote()
+    persists a durable managed_check_wait sub-state and keeps the branch open so
+    the reconciler can re-validate the Alembic guard and retry the merge once CI
+    passes."""
     _project, version = await _make_project_and_version(db_session)
     candidate = "m1grat10" * 5
 
@@ -14766,21 +14836,21 @@ async def test_promote_pending_ci_migration_pr_skips_auto_merge(db_session, mock
 
     # Native auto-merge was NEVER delegated.
     am_mock.assert_not_called()
-    # Retryable hold recorded instead of pending_auto_merge.
-    assert result["status"] == "promotion_failed"
-    assert result["error"] == "migration_pending_no_automerge"
+    # managed_check_wait hold recorded — reconciler owns the retry.
+    assert result["status"] == "pending_managed_check_wait"
+    assert result["managed_check_wait"] is True
+    assert result["pr_number"] == 99
 
     await db_session.refresh(version)
-    # Version stays open + stabilize so it re-qualifies next cycle.
+    # Version stays open so the managed_check_wait reconciler can retry.
     assert version.status == "open"
-    assert version.phase == "stabilize"
-    assert version.last_qualification["status"] == "promotion_failed"
-    assert version.last_qualification["error"] == "migration_pending_no_automerge"
-    # No promotion_pending sub-state was written — there is no native auto-merge
-    # in flight for the reaper to reconcile.
-    assert "promotion_pending" not in version.last_qualification
-    # The release branch was cleaned up since the merge never ran.
-    delete_branch_mock.assert_awaited()
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["migration_carrying"] is True
+    assert pending["pr_number"] == 99
+    # The release branch was NOT deleted — it must stay for the reconciler.
+    delete_branch_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

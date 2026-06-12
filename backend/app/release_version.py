@@ -73,6 +73,16 @@ _PHASE_REASONING_MAX = 500
 # before the reconciliation sweep force-reverts it to stabilize).
 _PROMOTION_NEARING_TIMEOUT_FRACTION = 0.8
 
+# Qualification sub-states that mean "a promotion PR is open and the version is
+# mid-promotion" — re-qualifying, cutting, or flipping phase here would clobber
+# the promotion-pending provenance the reconciler relies on, so every operator
+# lever (qualify duplicate-block, phase-flip 409, version-cut 409) refuses on
+# this set.  ``promotion_in_flight`` is native GitHub auto-merge; the
+# ``promotion_check_wait`` member is the managed migration-carrying wait whose
+# merge the reconciler retries after required checks pass.  Exporting one
+# frozenset keeps all guards in agreement by construction.
+PROMOTION_BLOCKING_STATES = frozenset({"promotion_in_flight", "promotion_check_wait"})
+
 # Cap on the persisted version ``goal`` — a snapshot of intent.current_focus,
 # which is meant to be a concise statement.  Mirrors _PHASE_REASONING_MAX.
 _GOAL_MAX = 500
@@ -595,6 +605,52 @@ def summarize_qualification_state(
         return None
     if status == "pending":
         promo = lq.get("promotion_pending")
+        if isinstance(promo, dict) and promo.get("managed_check_wait"):
+            # Migration-carrying promotion PR held in managed check-wait: the
+            # merge is NOT delegated to native auto-merge (that would skip the
+            # Alembic dual-head guard). Blueprint is waiting for the promotion
+            # target's required status checks and the reconciler retries the
+            # merge itself once they pass — this is NOT "still auditing" and
+            # does NOT need a fresh qualification.
+            freshness = _promotion_in_flight_freshness(promo)
+            summary = (
+                "Audit PASSED; a migration-carrying promotion PR is open. "
+                "Blueprint is WAITING for the promotion target's required status "
+                "checks to pass and will retry the merge AUTOMATICALLY once they "
+                "do — this does NOT need a fresh qualification and is NOT a "
+                "pending audit. The required checks (e.g. CI) can take 45-60+ "
+                "minutes; the reconciler re-validates the Alembic chain and "
+                "merges when CI is green."
+            )
+            if freshness:
+                age_str = _humanize_seconds(freshness["promotion_age_seconds"])
+                cap_str = _humanize_seconds(freshness["promotion_timeout_seconds"])
+                summary += f" Waiting ~{age_str} (auto-timeout cap {cap_str})."
+                if freshness["promotion_past_timeout"]:
+                    summary += (
+                        " It has PASSED the auto-timeout — the reconciliation "
+                        "sweep will force-fail it back to stabilize."
+                    )
+                elif freshness["promotion_nearing_timeout"]:
+                    summary += (
+                        " It is NEARING the auto-timeout that reverts it to "
+                        "stabilize."
+                    )
+            result: dict[str, Any] = {
+                "state": "promotion_check_wait",
+                "summary": summary,
+                "promotion_pr_number": promo.get("pr_number"),
+                "promotion_pr_url": promo.get("pr_url"),
+                "migration_carrying": bool(promo.get("migration_carrying", True)),
+                **freshness,
+            }
+            # Forward any check snapshot / CI classification the reconciler has
+            # persisted (additive — absent on the spawn-time record).
+            if promo.get("check_snapshot") is not None:
+                result["check_snapshot"] = promo.get("check_snapshot")
+            if promo.get("ci_state") is not None:
+                result["ci_state"] = promo.get("ci_state")
+            return result
         if isinstance(promo, dict):
             armed = promo.get("auto_merge_enabled")
             summary = (
@@ -646,6 +702,43 @@ def summarize_qualification_state(
         }
     if status == "promotion_failed":
         reason = lq.get("error")
+        detail = lq.get("detail")
+        if reason == "required_check_failed":
+            # The managed check-wait reconciler observed RED required checks on
+            # the promotion PR. The failing check names are in ``detail``. A
+            # fresh qualify will not help unless the underlying check failure is
+            # fixed first.
+            return {
+                "state": "required_check_failed",
+                "summary": (
+                    "The promotion PR's REQUIRED status checks FAILED"
+                    + (f" — {detail}" if detail else "")
+                    + ". The version is back in stabilize. This needs the FAILING "
+                    "checks fixed on a fresh candidate, then a re-qualify — "
+                    "re-qualifying without addressing the failing checks will not "
+                    "unblock it."
+                ),
+                "error": reason,
+                "detail": detail,
+            }
+        if reason == "protection_blocked_review":
+            # Green required checks but the merge was refused by branch
+            # protection (e.g. a required approving review is missing). This is
+            # a HUMAN action — re-qualifying cannot satisfy it.
+            return {
+                "state": "protection_blocked_review",
+                "summary": (
+                    "The promotion PR passed its required checks but the merge "
+                    "was REFUSED by branch protection"
+                    + (f" — {detail}" if detail else "")
+                    + ". A HUMAN branch-protection action is required (e.g. an "
+                    "approving review). Re-qualifying will NOT help and will not "
+                    "unblock the merge — resolve the branch-protection condition "
+                    "in GitHub."
+                ),
+                "error": reason,
+                "detail": detail,
+            }
         return {
             "state": "promotion_failed",
             "summary": (
@@ -656,7 +749,7 @@ def summarize_qualification_state(
                 "promotion target; waiting for a verdict will not unblock it."
             ),
             "error": reason,
-            "detail": lq.get("detail"),
+            "detail": detail,
         }
     if status == "not_promoted":
         conf = lq.get("confidence")
@@ -1181,7 +1274,7 @@ async def abandon_current_version(
         return None, None
 
     qual_state = summarize_qualification_state(locked.last_qualification)
-    if qual_state and qual_state.get("state") == "promotion_in_flight":
+    if qual_state and qual_state.get("state") in PROMOTION_BLOCKING_STATES:
         raise VersionCutBlockedByPromotion(
             qual_state.get("promotion_pr_number"),
             qual_state.get("promotion_pr_url"),

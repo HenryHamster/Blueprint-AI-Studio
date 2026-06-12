@@ -30,6 +30,7 @@ from app.release_promotion import _notify_operator
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
     _reconcile_if_deploy_failed_recovered,
+    _reconcile_if_managed_check_wait,
     _reconcile_if_not_promoted_but_pr_merged,
     _reconcile_if_pending_auto_merge_landed,
     _reconcile_if_pending_qualification_superseded,
@@ -461,6 +462,38 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep reconciled version %s "
                 "(pending_auto_merge drove to terminal state)",
+                version_id,
+            )
+
+    # Reconcile open versions with a migration-carrying promotion PR in
+    # managed_check_wait mode.  These versions have
+    # last_qualification.promotion_pending.managed_check_wait=True and were NOT
+    # delegated to GitHub native auto-merge (because the pre-merge Alembic guard
+    # must be re-run after CI passes).  This rung: (a) records success when the
+    # candidate lands out-of-band, (b) re-runs the guard and retries the merge
+    # when CI turns green, and (c) records terminal failures for red CI,
+    # migration guard blocks, and non-check protection blocks.  Runs BEFORE the
+    # pending-superseded loop (which handles pending WITHOUT promotion_pending)
+    # and BEFORE the timeout backstop so a just-merged PR is never mis-classified
+    # as timed-out in the same sweep.
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_managed_check_wait(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: managed_check_wait reconcile failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep reconciled version %s "
+                "(managed_check_wait reached terminal state)",
                 version_id,
             )
 

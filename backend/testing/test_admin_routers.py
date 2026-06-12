@@ -7367,6 +7367,73 @@ class TestSetVersionPhase:
         assert version.phase == "stabilize"
 
     @pytest.mark.asyncio
+    async def test_set_phase_rejects_managed_check_wait(
+        self, client: AsyncClient, db_session
+    ):
+        """A phase flip while a migration-carrying promotion PR is held in
+        managed check-wait is ALSO rejected with a 409, with copy distinct from
+        native auto-merge (waiting for required checks, auto-retry)."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version.last_qualification = {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 8643,
+                "pr_url": "https://example/pr/8643",
+                "auto_merge_enabled": False,
+                "migration_carrying": True,
+                "managed_check_wait": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "build"},
+        )
+        assert resp.status_code == 409
+        assert "waiting for required checks" in resp.text
+        assert "retry the merge automatically" in resp.text
+        assert "#8643" in resp.text
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+
+    @pytest.mark.asyncio
+    async def test_version_cut_rejects_managed_check_wait(
+        self, client: AsyncClient, db_session
+    ):
+        """A version cut while a migration-carrying promotion PR is held in
+        managed check-wait is rejected with a 409 carrying distinct copy."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version.last_qualification = {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 8644,
+                "pr_url": "https://example/pr/8644",
+                "auto_merge_enabled": False,
+                "migration_carrying": True,
+                "managed_check_wait": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "operator cut attempt"},
+        )
+        assert resp.status_code == 409
+        assert "waiting for required checks" in resp.text
+        assert "#8644" in resp.text
+
+        # The version was NOT abandoned — still the same open version.
+        await db_session.refresh(version)
+        assert version.status == "open"
+
+    @pytest.mark.asyncio
     async def test_set_phase_no_open_version_returns_404(
         self, client: AsyncClient, db_session
     ):

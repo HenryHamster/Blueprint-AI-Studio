@@ -207,7 +207,17 @@ const QUAL_STATE_STYLE: Record<string, string> = {
   // badge in agreement with the audit-findings section's 'audit crashed' cue.
   audit_crashed: 'bg-red-500/10 border-red-500/30 text-red-400',
   promotion_in_flight: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
+  // Managed migration-carrying promotion PR waiting on required checks —
+  // Blueprint retries the merge automatically. Blue (waiting/in-progress),
+  // distinct from the green native auto-merge look so operators can tell the
+  // two promotion holds apart.
+  promotion_check_wait: 'bg-blue-500/10 border-blue-500/30 text-blue-400',
   promotion_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
+  // Promotion PR's required status checks failed — loud red, like promotion_failed.
+  required_check_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
+  // Green checks but branch protection refused the merge (a human action is
+  // required) — orange to signal "needs a human", distinct from a check failure.
+  protection_blocked_review: 'bg-orange-500/10 border-orange-500/30 text-orange-400',
   dry_run: 'bg-blue-500/10 border-blue-500/30 text-blue-400',
   promoted: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
   // Promotion is merged but serving is not yet confirmed — provisional, amber.
@@ -845,6 +855,12 @@ function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDir
           {promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — this cut will be rejected until it lands or is canceled.
         </p>
       )}
+      {qualState?.state === 'promotion_check_wait' && (
+        <p className={promotionFreshness?.toneClassName ?? 'text-blue-300'}>
+          Migration-carrying promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and waiting for required checks
+          {promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — Blueprint retries the merge automatically; this cut will be rejected until it lands or is canceled.
+        </p>
+      )}
     </div>
   );
 }
@@ -929,8 +945,25 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // the controls here so the panel presents the same truth, consistent with how
   // the cut lever already surfaces this state.
   const promotionInFlight = cv?.qualification_state?.state === 'promotion_in_flight';
+  // Managed migration-carrying promotion PR waiting on required checks. It is
+  // ALSO a promotion-blocking state (the backend refuses qualify / phase-flip /
+  // cut on it), but its copy must be distinct from native auto-merge: Blueprint
+  // is waiting for required checks and retries the merge automatically.
+  const promotionCheckWait = cv?.qualification_state?.state === 'promotion_check_wait';
+  // Either promotion hold locks the qualify + phase-flip levers.
+  const promotionLocked = promotionInFlight || promotionCheckWait;
   const promotionFreshness = formatPromotionFreshnessContext(cv?.qualification_state);
   const promotionLockContext = promotionFreshness ? ` (${promotionFreshness.detailText})` : '';
+  const phaseLockTitle = promotionCheckWait
+    ? `A migration-carrying promotion PR is open and waiting for required checks${promotionLockContext} — Blueprint retries the merge automatically; wait for it to land or cancel it before changing the phase`
+    : promotionInFlight
+      ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before changing the phase`
+      : undefined;
+  const qualifyLockTitle = promotionCheckWait
+    ? `A migration-carrying promotion PR is open and waiting for required checks${promotionLockContext} — Blueprint retries the merge automatically; wait for it to land or cancel it before re-qualifying`
+    : promotionInFlight
+      ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before re-qualifying`
+      : undefined;
   const auditEvidenceState = cv?.audit_evidence_state ?? (cv?.latest_audit ? 'current' : 'none');
   // Admin-only lever: a promoted version latched to deploy_failed (current open
   // version after promotion, or a recent promoted one) can be cleared once the
@@ -1054,6 +1087,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         : null,
       qualState?.state === 'promotion_in_flight'
         ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging${cutPromotionFreshness ? ` (${cutPromotionFreshness.detailText})` : ''}`
+        : null,
+      qualState?.state === 'promotion_check_wait'
+        ? `migration-carrying promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and waiting for required checks${cutPromotionFreshness ? ` (${cutPromotionFreshness.detailText})` : ''} (Blueprint retries automatically)`
         : null,
     ].filter(Boolean);
     const msg = consequences.length
@@ -1327,6 +1363,22 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     Promotion PR{cv.qualification_state.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging ({promotionFreshness.detailText})
                   </p>
                 )}
+                {cv.qualification_state.state === 'promotion_check_wait' && (
+                  <p
+                    data-testid="promotion-check-wait-freshness"
+                    className={`text-[10px] ${promotionFreshness?.toneClassName ?? 'text-blue-400'}`}
+                  >
+                    Migration-carrying promotion PR{cv.qualification_state.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} waiting for required checks{promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — Blueprint retries the merge automatically
+                  </p>
+                )}
+                {(cv.qualification_state.state === 'required_check_failed' || cv.qualification_state.state === 'protection_blocked_review') && cv.qualification_state.detail && (
+                  <p
+                    data-testid="promotion-blocker-detail"
+                    className={`text-[10px] ${cv.qualification_state.state === 'protection_blocked_review' ? 'text-orange-400' : 'text-red-400'}`}
+                  >
+                    {cv.qualification_state.detail}
+                  </p>
+                )}
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
                 <ArtifactEvidenceList artifacts={cv.artifacts} />
               </div>
@@ -1415,8 +1467,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 {cv.phase === 'build' ? (
                   <button
                     onClick={() => handleSetPhase('stabilize')}
-                    disabled={actionLoading !== null || promotionInFlight}
-                    title={promotionInFlight ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before changing the phase` : undefined}
+                    disabled={actionLoading !== null || promotionLocked}
+                    title={phaseLockTitle}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ stabilize'}
@@ -1424,8 +1476,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 ) : (
                   <button
                     onClick={() => handleSetPhase('build')}
-                    disabled={actionLoading !== null || promotionInFlight}
-                    title={promotionInFlight ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before changing the phase` : undefined}
+                    disabled={actionLoading !== null || promotionLocked}
+                    title={phaseLockTitle}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ build'}
@@ -1434,8 +1486,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 {cv.phase === 'stabilize' && (
                   <button
                     onClick={handleQualify}
-                    disabled={actionLoading !== null || promotionInFlight}
-                    title={promotionInFlight ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before re-qualifying` : undefined}
+                    disabled={actionLoading !== null || promotionLocked}
+                    title={qualifyLockTitle}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
@@ -1447,6 +1499,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     className={`text-[10px] italic ${promotionFreshness?.toneClassName ?? 'text-emerald-300'}`}
                   >
                     Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging{promotionLockContext} — qualify & phase locked until it lands or is canceled
+                  </span>
+                )}
+                {promotionCheckWait && (
+                  <span
+                    data-testid="promotion-check-wait-note"
+                    className={`text-[10px] italic ${promotionFreshness?.toneClassName ?? 'text-blue-300'}`}
+                  >
+                    Migration-carrying promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open — waiting for required checks{promotionLockContext}; Blueprint retries the merge automatically. Qualify &amp; phase locked until it lands or is canceled — no fresh qualification needed.
                   </span>
                 )}
                 {cuttingVersion ? (
