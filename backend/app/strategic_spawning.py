@@ -5215,10 +5215,43 @@ async def _spawn_strategic_review(
                 _version_phase_block["last_qualification_candidate_currency"] = (
                     _currency
                 )
+            # Trigger-based re-qualification steering.  The candidate-behind heuristic
+            # alone is not enough to recommend a blanket re-qualification: the
+            # pre-registered trigger is "every gating high+medium carried finding
+            # resolved-or-stale".  Consult the per-finding resolution ledger so the
+            # steer matches what was actually resolved — re-qualify ONLY when the
+            # signal is met; otherwise drive the outstanding fix-first work.  This is
+            # only relevant on the behind-head path; on the live/indeterminate path
+            # the findings may genuinely still block, handled by the else branch.
+            # Best-effort: a failure to compute the ledger signal degrades to the
+            # prior blanket re-qualify steer so the strategic spawn never breaks.
+            _readiness: dict | None = None
+            _requal_ready = True
+            if _candidate_behind:
+                try:
+                    from app.release_readiness import (  # noqa: PLC0415
+                        compute_requalification_readiness,
+                    )
+
+                    _readiness = await compute_requalification_readiness(
+                        session, project.id
+                    )
+                    _requal_ready = bool(_readiness.get("requalification_ready"))
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] requalification readiness compute failed; "
+                        "defaulting to blanket re-qualify steer"
+                    )
+                    _readiness = None
+                    _requal_ready = True
+            # Re-qualification is the highest-leverage steer ONLY on the behind-head
+            # path with the readiness trigger met; everywhere else there is fix work
+            # to dispatch (so the create-a-direction escalation below should fire).
+            _prefer_requalify = _candidate_behind and _requal_ready
             if _candidate_behind:
                 _cand_short = _currency["candidate_sha"][:8]
                 _head_short = _currency["head_sha"][:8]
-                _stabilize_hint += (
+                _stale_preamble = (
                     f" The last qualification flagged {len(_carried_findings)} "
                     f"audit finding(s), but it scored them against candidate "
                     f"commit {_cand_short}, which is now BEHIND the live "
@@ -5226,14 +5259,52 @@ async def _spawn_strategic_review(
                     f"are POSSIBLY-STALE: they were scored against a superseded "
                     f"snapshot and may already be resolved by commits that landed "
                     f"afterward — do NOT treat them as confirmed current promotion "
-                    f"blockers. Before scoping brand-new hardening work directly at "
-                    f"them, PREFER emitting a fresh qualify_request to re-qualify "
-                    f"the current HEAD; a new audit against the current snapshot "
-                    f"will report which finding(s), if any, genuinely remain. Prior "
-                    f"list (against {_cand_short}) in "
-                    f"version_phase.last_qualification.audit_findings. Top prior "
-                    f"findings: {_top}."
+                    f"blockers."
                 )
+                if _readiness is None:
+                    # Graceful degradation: ledger signal unavailable → preserve the
+                    # prior blanket steer toward a fresh re-qualification.
+                    _stabilize_hint += _stale_preamble + (
+                        f" Before scoping brand-new hardening work directly at them, "
+                        f"PREFER emitting a fresh qualify_request to re-qualify the "
+                        f"current HEAD; a new audit against the current snapshot will "
+                        f"report which finding(s), if any, genuinely remain. Prior "
+                        f"list (against {_cand_short}) in "
+                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"findings: {_top}."
+                    )
+                elif _requal_ready:
+                    _stabilize_hint += _stale_preamble + (
+                        f" The finding-resolution ledger shows every gating "
+                        f"high/medium finding is resolved-or-stale "
+                        f"({_readiness.get('gating_resolved', 0)}/"
+                        f"{_readiness.get('gating_total', 0)}), so the pre-registered "
+                        f"re-qualification trigger is MET. PREFER emitting a fresh "
+                        f"qualify_request to re-qualify the current HEAD; a new audit "
+                        f"against the current snapshot will confirm the findings are "
+                        f"cleared. Prior list (against {_cand_short}) in "
+                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"findings: {_top}."
+                    )
+                else:
+                    _gating_total = _readiness.get("gating_total", 0)
+                    _gating_resolved = _readiness.get("gating_resolved", 0)
+                    _outstanding = max(_gating_total - _gating_resolved, 0)
+                    _stabilize_hint += _stale_preamble + (
+                        f" The finding-resolution ledger shows {_outstanding} of "
+                        f"{_gating_total} gating high/medium finding(s) still "
+                        f"UNRESOLVED, so the re-qualification trigger is NOT met. Do "
+                        f"NOT emit a blanket qualify_request yet — it would just "
+                        f"re-flag the unresolved finding(s). Instead, prioritize the "
+                        f"outstanding fix-first work: scope audit/fundamentals-mode "
+                        f"remediation at the unresolved finding(s) and record each as "
+                        f"resolved or code-verified stale in the resolution ledger. "
+                        f"Once every gating finding is resolved-or-stale the readiness "
+                        f"signal flips and a fresh qualify_request becomes the right "
+                        f"move. Prior list (against {_cand_short}) in "
+                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"findings: {_top}."
+                    )
             else:
                 _stabilize_hint += (
                     f" The last qualification's audit flagged "
@@ -5249,13 +5320,14 @@ async def _spawn_strategic_review(
                         "already landed, a fresh qualify_request will confirm what "
                         "genuinely remains.)"
                     )
-            # When the carried findings are POSSIBLY-STALE, the highest-leverage
-            # action is a fresh re-qualification, NOT scoping new remediation
-            # directly at a superseded snapshot — so skip the create-a-direction
-            # escalation below (which would churn fix work at already-resolved
-            # findings).  The escalation only applies on the live/indeterminate
-            # path where the findings may genuinely still block promotion.
-            if not _candidate_behind:
+            # The create-a-direction escalation dispatches fix-first remediation, so
+            # it fires on every path EXCEPT behind-head + readiness-met (where a fresh
+            # re-qualification — not new remediation at a superseded snapshot — is the
+            # highest-leverage move).  That deliberately INCLUDES the behind-head +
+            # NOT-ready path: gating findings are still unresolved there, so the agent
+            # must dispatch the fix work — and the live/indeterminate path where the
+            # findings may genuinely still block promotion.
+            if not _prefer_requalify:
                 # Only audit/fundamentals-mode directions do remediation work; a
                 # ship/pause direction that merely mentions the audit topic does
                 # not dispatch fixes.  When no remediation-mode direction is

@@ -2710,6 +2710,115 @@ async def strategic_operation(
 
 
 # ---------------------------------------------------------------------------
+# Agent write op: audit finding resolution
+# ---------------------------------------------------------------------------
+
+# Task types that perform fix-first verification and are authorized to record
+# audit finding resolution state.
+_AUDIT_FINDING_RESOLUTION_TASK_TYPES: frozenset[str] = frozenset(
+    {
+        "release_audit",
+        "release_audit_challenge",
+        "research",
+        "strategic_review",
+    }
+)
+
+_VALID_RESOLUTION_STATES: frozenset[str] = frozenset({"resolved", "stale"})
+
+
+class AuditFindingResolutionOp(BaseModel):
+    task_id: uuid.UUID
+    finding_key: str
+    state: str  # 'resolved' | 'stale'
+    severity: str | None = None
+    note: str | None = None
+    resolving_ref: str | None = None
+    verified_against_sha: str | None = None
+
+
+@router.post("/api/agent/audit-finding-resolution")
+@limiter.limit("30/minute")
+async def agent_audit_finding_resolution(
+    request: Request,
+    payload: AuditFindingResolutionOp,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Agent endpoint to mark a release audit finding resolved or stale."""
+    if str(payload.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    if token.get("task_type") not in _AUDIT_FINDING_RESOLUTION_TASK_TYPES:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Task type '{token.get('task_type')}' is not authorized "
+                "for audit finding resolution"
+            ),
+        )
+
+    if payload.state not in _VALID_RESOLUTION_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid state '{payload.state}'; must be one of {sorted(_VALID_RESOLUTION_STATES)}",
+        )
+
+    if not payload.finding_key or len(payload.finding_key) > 64:
+        raise HTTPException(
+            status_code=400,
+            detail="finding_key is required and must be at most 64 characters",
+        )
+
+    task = await session.get(Task, payload.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    project = await _lock_project_or_429(session, task.project_id)
+
+    from app.release_version import current_open_version  # noqa: PLC0415
+
+    open_version = await current_open_version(session, project.id)
+    if open_version is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No open release version",
+        )
+
+    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415
+
+    await apply_finding_resolution(
+        session,
+        project.id,
+        open_version.id,
+        payload.finding_key,
+        payload.state,
+        severity=payload.severity,
+        note=payload.note,
+        resolving_ref=payload.resolving_ref,
+        verified_against_sha=payload.verified_against_sha,
+    )
+    await session.commit()
+
+    logger.info(
+        "[AUDIT_FINDING] task %s (%s) marked finding '%s' as '%s' "
+        "for project %s version %s",
+        task.id,
+        token.get("task_type", "?"),
+        payload.finding_key,
+        payload.state,
+        project.id,
+        open_version.id,
+    )
+    return {
+        "status": "ok",
+        "finding_key": payload.finding_key,
+        "state": payload.state,
+        "release_version_id": str(open_version.id),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Admin read endpoint: build-config confirmed commands
 # ---------------------------------------------------------------------------
 

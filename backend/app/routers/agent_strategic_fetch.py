@@ -17,6 +17,7 @@ the route paths stay byte-identical and the agent-side fetch script needs
 no change.
 """
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -34,6 +35,8 @@ from app.source_ref_validation import (
 )
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+logger = logging.getLogger(__name__)
 
 _RESEARCH_HISTORY_KEEP_ON_FETCH = 20
 
@@ -253,6 +256,36 @@ async def agent_fetch_qualification(
     if open_row is None:
         return {"source": "no_open_version"}
 
+    # Re-qualification readiness signal + per-finding resolution view (ADDITIVE).
+    # The fix-first triage workflow needs to know, from the same read it already
+    # makes, whether every gating high+medium carried finding is resolved-or-stale
+    # (the pre-registered re-qualification trigger) and the per-finding ledger
+    # state for each. Best-effort: a failure to compute the ledger-backed signal
+    # must never break this read or change the existing response shape, so it
+    # degrades to ``requalification_ready: None`` + an empty resolution view.
+    requalification_extra: dict = {
+        "requalification_ready": None,
+        "finding_resolution": [],
+    }
+    try:
+        from app.release_readiness import (  # noqa: PLC0415
+            compute_requalification_readiness,
+        )
+
+        readiness = await compute_requalification_readiness(session, project_id)
+        requalification_extra = {
+            "requalification_ready": readiness["requalification_ready"],
+            # Per-finding resolution view: each gating carried finding's key,
+            # severity, summary, and resolution state (resolved|stale|unresolved).
+            "finding_resolution": readiness["findings"],
+        }
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] requalification readiness compute failed for project %s; "
+            "serving qualification without the readiness signal",
+            project_id,
+        )
+
     verdict = (
         (
             await session.execute(
@@ -280,6 +313,7 @@ async def agent_fetch_qualification(
             "excluded_findings": verdict.excluded_audit_findings or [],
             "challenger_refuted_findings": verdict.challenger_refuted_audit_findings or [],
             "source": "qualification_verdict",
+            **requalification_extra,
         }
 
     qual = open_row.last_qualification or {}
@@ -293,6 +327,7 @@ async def agent_fetch_qualification(
         "excluded_findings": qual.get("excluded_audit_findings") or [],
         "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings") or [],
         "source": "last_qualification",
+        **requalification_extra,
     }
 
 

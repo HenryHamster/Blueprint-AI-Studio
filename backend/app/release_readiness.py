@@ -34,11 +34,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import release_version
 from app.acceptance_gate import ACCEPTANCE_AGGREGATE_BUCKETS
-from app.models import QualificationVerdict, ReleaseVersion
+from app.models import AuditFindingResolution, QualificationVerdict, ReleaseVersion
 from app.release_scoring import compute_challenged_vs_unchallenged_telemetry
 from app.shared_state import resolve_project_promotion_enabled
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+# Resolution states a ledger row may carry.  A high/medium carried finding counts
+# as resolved-for-requalification when its ledger row is in EITHER of these.
+_RESOLVED_LEDGER_STATES = frozenset({"resolved", "stale"})
+
+# Carried-finding severities that GATE re-qualification readiness.  Low/info
+# findings are advisory and ignored by the readiness computation.
+_REQUALIFICATION_GATING_SEVERITIES = frozenset({"high", "critical", "medium"})
 
 # Maps the internal last_qualification status code to a human-readable label
 # for the version-lifecycle panel.
@@ -274,7 +283,9 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
     """Return an operator-facing summary of a ``last_qualification`` record."""
     status = qual.get("status")
     _recon = qual.get("audit_reconciliation")
-    _audit_leg_proof = _recon.get("audit_leg_proof") if isinstance(_recon, dict) else None
+    _audit_leg_proof = (
+        _recon.get("audit_leg_proof") if isinstance(_recon, dict) else None
+    )
     _recon_out = (
         {k: v for k, v in _recon.items() if k != "audit_leg_proof"}
         if isinstance(_recon, dict)
@@ -303,8 +314,12 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "audit_findings_total": qual.get("audit_findings_total"),
         "audit_findings_truncated": qual.get("audit_findings_truncated"),
         "excluded_audit_findings_total": qual.get("excluded_audit_findings_total"),
-        "excluded_audit_findings_truncated": qual.get("excluded_audit_findings_truncated"),
-        "challenger_refuted_audit_findings": qual.get("challenger_refuted_audit_findings"),
+        "excluded_audit_findings_truncated": qual.get(
+            "excluded_audit_findings_truncated"
+        ),
+        "challenger_refuted_audit_findings": qual.get(
+            "challenger_refuted_audit_findings"
+        ),
         "test_erosion_detail": qual.get("test_erosion_detail"),
         "smoketest_detail": qual.get("smoketest_detail"),
         "audit_reconciliation": _recon_out,
@@ -683,3 +698,255 @@ async def compute_promotion_readiness(
     if acceptance_caveat:
         out["acceptance_caveat"] = acceptance_caveat
     return _annotate_regime(out, promotion_enabled)
+
+
+# --------------------------------------------------------------------------- #
+# Audit-finding resolution ledger + re-qualification readiness signal
+#
+# The re-qualification trigger ("all high+medium carried audit findings
+# merged-fixed or code-verified stale") needs per-finding resolution state that
+# SURVIVES qualification finalize.  ``apply_finding_resolution`` upserts a durable
+# ledger row (in its own AuditFindingResolution table, never in last_qualification),
+# and ``compute_requalification_readiness`` reads the latest carried findings and
+# joins them against the ledger to decide whether every gating finding is resolved.
+# --------------------------------------------------------------------------- #
+
+
+async def apply_finding_resolution(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    finding_key: str,
+    state: str,
+    *,
+    severity: str | None = None,
+    note: str | None = None,
+    resolving_ref: str | None = None,
+    verified_against_sha: str | None = None,
+) -> AuditFindingResolution:
+    """Upsert a resolution-ledger row for one ``(release_version, finding_key)``.
+
+    Latest write wins: a repeat write for the same ``(release_version_id,
+    finding_key)`` UPDATES the existing row (state/severity/note/ref/sha +
+    ``updated_at``) rather than inserting a duplicate, honoring the unique
+    constraint ``uq_auditfindingresolution_version_key``.  This is the seam the
+    agent write endpoint calls.  The caller owns the commit.
+
+    The upsert is performed as a dialect-agnostic select-then-update/insert so it
+    works identically under the SQLite test engine and production Postgres.
+    """
+    if state not in _RESOLVED_LEDGER_STATES:
+        raise ValueError(
+            f"invalid resolution state {state!r}; "
+            f"expected one of {sorted(_RESOLVED_LEDGER_STATES)}"
+        )
+
+    existing = (
+        (
+            await session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == release_version_id,
+                    AuditFindingResolution.finding_key == finding_key,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    if existing is not None:
+        existing.state = state
+        if severity is not None:
+            existing.severity = severity
+        existing.note = note
+        existing.resolving_ref = resolving_ref
+        existing.verified_against_sha = verified_against_sha
+        existing.updated_at = _utcnow()
+        session.add(existing)
+        return existing
+
+    row = AuditFindingResolution(
+        project_id=project_id,
+        release_version_id=release_version_id,
+        finding_key=finding_key,
+        severity=severity,
+        state=state,
+        note=note,
+        resolving_ref=resolving_ref,
+        verified_against_sha=verified_against_sha,
+    )
+    session.add(row)
+    return row
+
+
+async def _latest_carried_audit_findings(
+    session: AsyncSession,
+    version: ReleaseVersion,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Resolve the open version's latest carried audit findings + truncation flag.
+
+    Mirrors the agent qualification fetch: prefer the latest immutable
+    ``QualificationVerdict`` row that carries ``audit_findings`` (it survives
+    re-qualification overwrites), falling back to the version's mutable
+    ``last_qualification.audit_findings`` blob for legacy rows.  The truncation
+    flag is read from ``last_qualification`` (the verdict row does not store it as
+    a column) so consumers can treat a clipped list conservatively.
+    """
+    from app.release_qualifier_audit import (  # noqa: PLC0415 — avoid import cycle
+        get_latest_qualification_audit_findings,
+    )
+
+    verdict = (
+        (
+            await session.execute(
+                select(QualificationVerdict)
+                .where(
+                    QualificationVerdict.release_version_id == version.id,
+                    QualificationVerdict.audit_findings.is_not(None),
+                )
+                .order_by(QualificationVerdict.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    findings = get_latest_qualification_audit_findings(version, verdict)
+    qual = version.last_qualification or {}
+    truncated = (
+        bool(qual.get("audit_findings_truncated")) if isinstance(qual, dict) else False
+    )
+    return findings, truncated
+
+
+async def compute_requalification_readiness(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Decide whether the project's open version is ready to re-qualify.
+
+    Resolves the LATEST qualification's carried audit findings for the open
+    release version (preferring the latest QualificationVerdict row, falling back
+    to ``last_qualification``), filters to the gating severities (critical/high +
+    medium — low/info are advisory and ignored), and joins each against the
+    resolution ledger by ``finding_key`` scoped to that ``release_version``.
+
+    ``requalification_ready`` is TRUE exactly when every gating carried finding
+    has a ledger row in state ``resolved`` OR ``stale``.  Convention for the
+    zero-gating-findings case: ready=True (nothing carried blocks re-qualification).
+
+    Truncation-safe: if the carried list was clipped at the cap
+    (``audit_findings_truncated``), readiness is NOT claimed on the partial list —
+    ``requalification_ready`` is forced False and ``audit_findings_truncated`` is
+    surfaced so consumers can treat readiness conservatively.
+
+    Returns a dict shaped:
+        {
+          "requalification_ready": bool,
+          "open_version_id": str | None,
+          "audit_findings_truncated": bool,
+          "gating_total": int,
+          "gating_resolved": int,
+          "reason": str,
+          "findings": [
+            {"key", "severity", "summary", "state": resolved|stale|unresolved}, ...
+          ],
+        }
+    ``requalification_ready`` is False with an explanatory reason when there is
+    no open version (nothing to re-qualify).
+    """
+    version = await release_version.current_open_version(session, project_id)
+    if version is None:
+        return {
+            "requalification_ready": False,
+            "open_version_id": None,
+            "audit_findings_truncated": False,
+            "gating_total": 0,
+            "gating_resolved": 0,
+            "reason": "no open release version — nothing to re-qualify",
+            "findings": [],
+        }
+
+    carried, truncated = await _latest_carried_audit_findings(session, version)
+
+    # Load the ledger for this version once, keyed by finding_key.
+    ledger_rows = list(
+        (
+            await session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ledger_by_key: dict[str, AuditFindingResolution] = {
+        row.finding_key: row for row in ledger_rows
+    }
+
+    gating: list[dict[str, Any]] = []
+    for f in carried:
+        if not isinstance(f, dict):
+            continue
+        severity = str(f.get("severity") or "").lower()
+        if severity not in _REQUALIFICATION_GATING_SEVERITIES:
+            continue
+        key = f.get("key")
+        if not key:
+            # No content key (legacy carried finding) — cannot be matched against
+            # the ledger, so it must read as unresolved (conservative).
+            key = ""
+        ledger = ledger_by_key.get(key) if key else None
+        state = (
+            ledger.state
+            if ledger is not None and ledger.state in _RESOLVED_LEDGER_STATES
+            else "unresolved"
+        )
+        gating.append(
+            {
+                "key": key,
+                "severity": severity,
+                "summary": f.get("summary"),
+                "state": state,
+            }
+        )
+
+    gating_total = len(gating)
+    gating_resolved = sum(1 for g in gating if g["state"] in _RESOLVED_LEDGER_STATES)
+    all_resolved = gating_resolved == gating_total
+
+    if truncated:
+        # The carried list was clipped at the cap: we cannot see every gating
+        # finding, so readiness must not be claimed on a partial list.
+        ready = False
+        reason = (
+            "carried audit findings were truncated at the cap — readiness cannot "
+            f"be asserted on a partial list ({gating_resolved}/{gating_total} "
+            "visible gating findings resolved)"
+        )
+    elif gating_total == 0:
+        ready = True
+        reason = "no carried high/medium audit findings — ready to re-qualify"
+    elif all_resolved:
+        ready = True
+        reason = (
+            f"all {gating_total} carried high/medium audit finding(s) resolved or "
+            "code-verified stale — ready to re-qualify"
+        )
+    else:
+        ready = False
+        reason = (
+            f"{gating_total - gating_resolved} of {gating_total} carried "
+            "high/medium audit finding(s) still unresolved"
+        )
+
+    return {
+        "requalification_ready": ready,
+        "open_version_id": str(version.id),
+        "audit_findings_truncated": truncated,
+        "gating_total": gating_total,
+        "gating_resolved": gating_resolved,
+        "reason": reason,
+        "findings": gating,
+    }

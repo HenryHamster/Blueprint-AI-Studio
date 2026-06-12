@@ -15,6 +15,7 @@ import {
   type CiResolution,
   type CurrentVersion,
   type LatestAudit,
+  type OutOfBandPromotion,
   type QualificationVerdictRecord,
   type ReleaseArtifactEvidence,
   type StagedDirection,
@@ -88,6 +89,20 @@ function PostPromotionOutcomeBadge({
       title="post-promotion outcome not yet recorded"
     >
       awaiting outcome
+    </span>
+  );
+}
+
+function OutOfBandPromotionBadge({ oob }: { oob: OutOfBandPromotion }) {
+  return (
+    <span
+      data-testid="out-of-band-promotion-badge"
+      className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-violet-500/10 border-violet-500/30 text-violet-400"
+      title={`Promoted out-of-band (operator override) recorded ${oob.recorded_at}`}
+    >
+      ⚑ promoted out-of-band (operator override)
+      <span className="font-mono text-violet-500/90">{oob.candidate_sha.slice(0, 7)}→{oob.promoted_sha.slice(0, 7)}</span>
+      <span className="text-violet-600/90">{timeAgo(oob.recorded_at)}</span>
     </span>
   );
 }
@@ -1284,6 +1299,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 Set goal
               </button>
             ) : null}
+            {cv.out_of_band_promotion && (
+              <OutOfBandPromotionBadge oob={cv.out_of_band_promotion} />
+            )}
             {cv.phase_reasoning && (
               <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
             )}
@@ -1552,6 +1570,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       </span>
                     )}
                   </div>
+                  {v.out_of_band_promotion && (
+                    <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
+                  )}
                   <ArtifactEvidenceList artifacts={v.artifacts} />
                 </div>
               ))}

@@ -1480,6 +1480,13 @@ export interface QualificationState {
   deploy_failure_reason?: string | null;
 }
 
+export interface OutOfBandPromotion {
+  source: string;
+  recorded_at: string;
+  candidate_sha: string;
+  promoted_sha: string;
+}
+
 export interface CurrentVersion {
   version_number: number;
   phase: string;
@@ -1536,6 +1543,9 @@ export interface CurrentVersion {
   // resolves serving_status to confirmed/failed when this elapses; the panel
   // computes remaining/overdue at render time.
   deploy_confirm_deadline?: string | null;
+  // Out-of-band promotion provenance. Non-null only when an operator force-merged
+  // this version outside the normal qualification flow.
+  out_of_band_promotion?: OutOfBandPromotion | null;
 }
 
 export interface RecentVersion {
@@ -1562,6 +1572,8 @@ export interface RecentVersion {
   // CurrentVersion. Present on the recently-promoted history row whose
   // serving_status is still 'unconfirmed'.
   deploy_confirm_deadline?: string | null;
+  // Out-of-band promotion provenance — see CurrentVersion.
+  out_of_band_promotion?: OutOfBandPromotion | null;
 }
 
 export interface PromotionReadinessConfidence {

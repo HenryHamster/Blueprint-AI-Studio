@@ -5870,8 +5870,16 @@ def _patch_candidate_currency(mocker, *, resolved, head_sha):
 
 def _make_stabilize_version_with_candidate(candidate_sha):
     from app.models import ReleaseVersion
+    from app.release_scoring import _audit_finding_key
 
     now = datetime.utcnow().replace(tzinfo=None)
+    # Carried findings stamped with the deterministic content key the resolution
+    # ledger joins against (release_scoring._audit_finding_key) so readiness can be
+    # computed exactly as it is for real carried findings.
+    _high = {"severity": "high", "summary": "Token baked into VM image."}
+    _high["key"] = _audit_finding_key(_high["summary"], None)
+    _low = {"severity": "low", "summary": "Private cross-module import."}
+    _low["key"] = _audit_finding_key(_low["summary"], None)
     return ReleaseVersion(
         version_number=4,
         phase="stabilize",
@@ -5884,12 +5892,36 @@ def _make_stabilize_version_with_candidate(candidate_sha):
             "blocker": None,
             "sub_scores": {"audit": 0.74, "test_erosion": 1.0},
             "candidate_sha": candidate_sha,
-            "audit_findings": [
-                {"severity": "high", "summary": "Token baked into VM image."},
-                {"severity": "low", "summary": "Private cross-module import."},
-            ],
+            "audit_findings": [_high, _low],
         },
     )
+
+
+async def _ensure_audit_finding_resolution_table(session):
+    """Create the AuditFindingResolution ledger table idempotently."""
+    from app.models import AuditFindingResolution as _AFR
+
+    conn = await session.connection()
+    await conn.run_sync(lambda c: _AFR.__table__.create(c, checkfirst=True))
+    await session.commit()
+
+
+async def _resolve_finding_in_ledger(
+    session, project_id, release_version_id, *, summary, severity, state="resolved"
+):
+    """Insert a resolution-ledger row for the carried finding keyed by summary."""
+    from app.models import AuditFindingResolution
+    from app.release_scoring import _audit_finding_key
+
+    row = AuditFindingResolution(
+        project_id=project_id,
+        release_version_id=release_version_id,
+        finding_key=_audit_finding_key(summary, None),
+        severity=severity,
+        state=state,
+    )
+    session.add(row)
+    await session.commit()
 
 
 @pytest.mark.asyncio
@@ -5897,10 +5929,12 @@ async def test_stabilize_carried_findings_marked_stale_when_candidate_behind_hea
     db_session, mocker, _lts_split_active
 ):
     """When the qualification's candidate commit is BEHIND the live integration
-    HEAD, the carried findings are framed POSSIBLY-STALE, the agent is steered
-    toward a fresh qualify_request, and they are NOT asserted as a current
+    HEAD AND the resolution ledger marks every gating finding resolved-or-stale,
+    the carried findings are framed POSSIBLY-STALE, the agent is steered toward a
+    fresh qualify_request (trigger MET), and they are NOT asserted as a current
     binding blocker nor escalated into a new audit direction."""
     await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
     project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
     db_session.add(project)
     await db_session.commit()
@@ -5911,6 +5945,18 @@ async def test_stabilize_carried_findings_marked_stale_when_candidate_behind_hea
     version.project_id = project.id
     db_session.add(version)
     await db_session.commit()
+    await db_session.refresh(version)
+
+    # Mark the single gating (high) carried finding resolved in the ledger so the
+    # pre-registered re-qualification trigger is MET and the re-qualify steer applies.
+    await _resolve_finding_in_ledger(
+        db_session,
+        project.id,
+        version.id,
+        summary="Token baked into VM image.",
+        severity="high",
+        state="resolved",
+    )
 
     _patch_spawning_deps(mocker)
     _patch_candidate_currency(
@@ -5920,11 +5966,85 @@ async def test_stabilize_carried_findings_marked_stale_when_candidate_behind_hea
 
     assert "POSSIBLY-STALE" in suffix
     assert "qualify_request" in suffix
+    assert "trigger is MET" in suffix
     assert candidate[:8] in suffix
     # Must NOT assert the stale findings are a current binding blocker, and must
     # NOT churn a fresh remediation direction at a superseded snapshot.
     assert "the audit sub-score is the binding constraint on promotion" not in suffix
     assert "MUST create a new direction" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_requalify_only_when_readiness_signaled(
+    db_session, mocker, _lts_split_active
+):
+    """Trigger-based stabilize steering (the pre-registered re-qualification trigger).
+
+    On the behind-head path the hint steers toward a fresh qualify_request ONLY
+    when the finding-resolution ledger marks every gating high/medium finding
+    resolved-or-stale. When a gating finding remains UNRESOLVED, the hint instead
+    steers toward the outstanding fix-first work (and escalates to create a
+    remediation direction) rather than a blanket re-qualification.
+    """
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha="b" * 40
+    )
+
+    # ---- Scenario A: gating finding RESOLVED in the ledger → trigger MET ----
+    ready_project = _make_project(is_self_repo=True, vision={"purpose": "p"})
+    db_session.add(ready_project)
+    await db_session.commit()
+    await db_session.refresh(ready_project)
+
+    ready_version = _make_stabilize_version_with_candidate("a" * 40)
+    ready_version.project_id = ready_project.id
+    db_session.add(ready_version)
+    await db_session.commit()
+    await db_session.refresh(ready_version)
+    await _resolve_finding_in_ledger(
+        db_session,
+        ready_project.id,
+        ready_version.id,
+        summary="Token baked into VM image.",
+        severity="high",
+        state="resolved",
+    )
+
+    ready_suffix = await _spawn_and_get_stabilize_suffix(ready_project, db_session)
+    # Re-qualify steer engaged; fix-first / escalation NOT engaged.
+    assert "trigger is MET" in ready_suffix
+    assert "PREFER emitting a fresh qualify_request" in ready_suffix
+    assert "UNRESOLVED" not in ready_suffix
+    assert "trigger is NOT met" not in ready_suffix
+    assert "MUST create a new direction" not in ready_suffix
+
+    # ---- Scenario B: gating finding UNRESOLVED (no ledger row) → trigger NOT met --
+    notready_project = _make_project(is_self_repo=True, vision={"purpose": "p"})
+    db_session.add(notready_project)
+    await db_session.commit()
+    await db_session.refresh(notready_project)
+
+    notready_version = _make_stabilize_version_with_candidate("c" * 40)
+    notready_version.project_id = notready_project.id
+    db_session.add(notready_version)
+    await db_session.commit()
+    await db_session.refresh(notready_version)
+    # No resolution-ledger row → the high gating finding reads as unresolved.
+
+    notready_suffix = await _spawn_and_get_stabilize_suffix(
+        notready_project, db_session
+    )
+    # Fix-first steer engaged; the blanket re-qualify trigger is explicitly NOT met.
+    assert "trigger is NOT met" in notready_suffix
+    assert "UNRESOLVED" in notready_suffix
+    assert "fix-first work" in notready_suffix
+    assert "trigger is MET" not in notready_suffix
+    # The carried finding still needs fixing, so the create-a-direction escalation
+    # fires (there is no active audit/fundamentals-mode direction on this project).
+    assert "MUST create a new direction" in notready_suffix
 
 
 @pytest.mark.asyncio

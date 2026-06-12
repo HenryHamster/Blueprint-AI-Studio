@@ -4091,6 +4091,99 @@ class QualificationVerdict(SQLModel, table=True):
     )
 
 
+class AuditFindingResolution(SQLModel, table=True):
+    """Durable per-finding resolution ledger for carried qualification audit findings.
+
+    The re-qualification trigger ("all high+medium carried audit findings
+    merged-fixed or code-verified stale") needs per-finding resolution state that
+    SURVIVES qualification finalize.  Today nothing tracks it: every finalize
+    overwrites ``ReleaseVersion.last_qualification`` wholesale, and each immutable
+    ``QualificationVerdict`` row is a point-in-time snapshot, not a mutable
+    resolution record.  This table records ONE row per
+    ``(release_version, finding_key)`` resolution, keyed on the deterministic
+    content key ``release_scoring._audit_finding_key`` attaches to every carried
+    finding.  It lives in its OWN table — never inside ``last_qualification`` —
+    so it is never clobbered by a subsequent finalize overwrite.
+
+    A unique constraint on ``(release_version_id, finding_key)`` makes a repeat
+    write an UPSERT (latest write wins) rather than a duplicate; the write helper
+    ``release_readiness.apply_finding_resolution`` performs that upsert.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # Deterministic content key (release_scoring._audit_finding_key — sha256 of
+    # normalized file|summary, 16 hex) of the carried finding this row resolves.
+    finding_key: str = Field(
+        sa_column=Column(String(64), nullable=False, index=True),
+    )
+
+    # The carried finding's severity at resolution time (low/medium/high/critical/...).
+    severity: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+
+    # Resolution state: "resolved" (a merged fix addressed it) or "stale" (it was
+    # code-verified to no longer apply on the candidate).
+    state: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+
+    # Optional human/agent note explaining the resolution.
+    note: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    # Optional resolving reference — e.g. the merged PR number or URL that fixed it.
+    resolving_ref: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True),
+    )
+
+    # The candidate SHA the resolution/staleness verification was performed against.
+    verified_against_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "release_version_id",
+            "finding_key",
+            name="uq_auditfindingresolution_version_key",
+        ),
+    )
+
+
 class MigrationReservation(SQLModel, table=True):
     """A provisional Alembic revision id reserved for a migration-producing task.
 

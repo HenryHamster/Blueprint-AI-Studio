@@ -10133,6 +10133,118 @@ class TestVersionLifecycleChallengedVsUnchallenged:
         assert "challenge_refuted_count" not in tel["unchallenged"]
 
 
+class TestVersionLifecycleOutOfBandPromotion:
+    """Serializer unit-tests for out_of_band_promotion provenance.
+
+    The DB column is added by a sibling PR; these tests validate the serializer
+    functions directly using mock version objects so they work before the column
+    lands on this branch. Uses getattr-based access so a missing column degrades
+    gracefully to null on real DB rows.
+    """
+
+    _OOB = {
+        "source": "operator_override",
+        "recorded_at": "2026-06-01T12:00:00",
+        "candidate_sha": "abc1234567890def",
+        "promoted_sha": "def7890abc123456",
+    }
+
+    def _make_mock_version(self, oob=None, status="promoted"):
+        """Return a minimal mock ReleaseVersion object suitable for the serializer."""
+        from datetime import datetime
+        from unittest.mock import MagicMock
+
+        v = MagicMock(spec=ReleaseVersion)
+        v.version_number = 1
+        v.status = status
+        v.opened_at = datetime(2026, 1, 1)
+        v.promoted_at = datetime(2026, 6, 1) if status == "promoted" else None
+        v.qualification_attempts = 0
+        v.last_qualification = None
+        v.serving_status = None
+        v.served_sha = None
+        v.served_at = None
+        v.deploy_failure_reason = None
+        v.deploy_confirm_deadline = None
+        v.deploy_artifacts = []
+        v.out_of_band_promotion = oob
+        return v
+
+    def test_serialize_history_entry_includes_oob_when_set(self):
+        """_serialize_version_history_entry passes out_of_band_promotion through
+        verbatim when it is present on the version object."""
+        from app.routers.admin_release_version import _serialize_version_history_entry
+
+        v = self._make_mock_version(oob=self._OOB)
+        with patch(
+            "app.routers.admin_release_version._version_serving_summary",
+            return_value=({"serving_status": None, "reason_code": None}, []),
+        ), patch(
+            "app.release_version.summarize_qualification_state",
+            return_value=None,
+        ):
+            result = _serialize_version_history_entry(v)
+
+        assert result["out_of_band_promotion"] == self._OOB
+
+    def test_serialize_history_entry_null_when_absent(self):
+        """_serialize_version_history_entry emits null for out_of_band_promotion
+        when the attribute is not set (degrades gracefully before column lands)."""
+        from app.routers.admin_release_version import _serialize_version_history_entry
+
+        v = self._make_mock_version(oob=None)
+        with patch(
+            "app.routers.admin_release_version._version_serving_summary",
+            return_value=({"serving_status": None, "reason_code": None}, []),
+        ), patch(
+            "app.release_version.summarize_qualification_state",
+            return_value=None,
+        ):
+            result = _serialize_version_history_entry(v)
+
+        assert result["out_of_band_promotion"] is None
+
+    @pytest.mark.asyncio
+    async def test_endpoint_returns_null_oob_for_normal_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Integration smoke: a version row without the column returns null for
+        out_of_band_promotion in both current_version and recent_versions."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        readiness = patch(
+            "app.release_qualifier.compute_promotion_readiness",
+            new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+        )
+        audit = patch(
+            "app.release_qualifier.resolve_lifecycle_audit_evidence",
+            new=AsyncMock(
+                return_value={"state": "none", "latest_audit": None, "stale_audit": None}
+            ),
+        )
+        merged = patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=0),
+        )
+        with readiness, audit, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        cv = resp.json()["current_version"]
+        # Column absent on this branch → getattr default → null in response.
+        assert cv.get("out_of_band_promotion") is None
+
+
 class TestQualificationVerdictsAuditMissingReason:
     """GET /api/admin/projects/{id}/qualification-verdicts exposes audit_missing_reason."""
 

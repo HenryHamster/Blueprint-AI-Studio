@@ -2552,4 +2552,100 @@ describe('VersionLifecyclePanel', () => {
       expect(panel).not.toHaveTextContent('refuted');
     });
   });
+
+  describe('out-of-band promotion badge', () => {
+    const oobPromotion: api.OutOfBandPromotion = {
+      source: 'operator_override',
+      recorded_at: '2026-06-01T12:00:00Z',
+      candidate_sha: 'abc1234567890def',
+      promoted_sha: 'def7890abc123456',
+    };
+
+    it('renders badge on current_version when out_of_band_promotion is set', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ out_of_band_promotion: oobPromotion }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('out-of-band-promotion-badge');
+      expect(badge).toBeInTheDocument();
+      expect(badge).toHaveTextContent('promoted out-of-band (operator override)');
+      expect(badge).toHaveTextContent('abc1234');
+      expect(badge).toHaveTextContent('def7890');
+    });
+
+    it('does not render badge on current_version when out_of_band_promotion is null', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ out_of_band_promotion: null }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('out-of-band-promotion-badge')).not.toBeInTheDocument();
+    });
+
+    it('renders badge on a recent_versions history row when out_of_band_promotion is set', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      const recentVersion: api.RecentVersion = {
+        version_number: 1,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        out_of_band_promotion: oobPromotion,
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 2 }),
+            recent_versions: [recentVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('out-of-band-promotion-badge');
+      expect(badge).toBeInTheDocument();
+      expect(badge).toHaveTextContent('promoted out-of-band (operator override)');
+      expect(badge).toHaveTextContent('abc1234');
+      expect(badge).toHaveTextContent('def7890');
+    });
+
+    it('does not render badge on history row when out_of_band_promotion is absent', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      const recentVersion: api.RecentVersion = {
+        version_number: 1,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 2 }),
+            recent_versions: [recentVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('out-of-band-promotion-badge')).not.toBeInTheDocument();
+    });
+  });
 });
