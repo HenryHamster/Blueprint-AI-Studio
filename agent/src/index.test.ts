@@ -70,6 +70,7 @@ vi.mock('ws', () => ({
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
 import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import {
   __resetTaskCapabilityContractForTesting,
   isReadOnlyTaskType,
@@ -2851,6 +2852,86 @@ describe('persistAndPostStatus telemetry enrichment', () => {
       (fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}',
     ) as { handler_duration_secs?: number };
     expect(body.handler_duration_secs).toBeUndefined();
+  });
+});
+
+describe('persistAndPostStatus workspace_prep shipping', () => {
+  let fetchMock: FetchMock;
+
+  beforeEach(() => {
+    resetWorkspacePrepOutcome();
+    fetchMock = makeFetchMock().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true }),
+      text: () => Promise.resolve(''),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    resetWorkspacePrepOutcome();
+    delete process.env.BLUEPRINT_WARM_HANDOFF;
+    delete process.env.BLUEPRINT_LANE_MODE;
+  });
+
+  it('includes the recorded workspace prep outcome in /api/agent/status', async () => {
+    const existsSpy = vi.mocked(fs.existsSync);
+    existsSpy.mockImplementation(path => path === '/ws/.git');
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    process.env.BLUEPRINT_LANE_MODE = '1';
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'feature/warm',
+    });
+
+    await persistAndPostStatus('task-wp', { task_id: 'task-wp', status: 'COMPLETED' });
+
+    const body = JSON.parse(
+      (fetchMock.mock.calls.at(-1)?.[1] as { body?: string }).body ?? '{}',
+    ) as {
+      workspace_prep?: {
+        path?: string;
+        warm_reuse_succeeded?: boolean;
+        checkpoint_reset_applied?: boolean;
+        lane_phase?: boolean;
+      };
+    };
+    expect(body.workspace_prep).toMatchObject({
+      path: 'warm',
+      warm_reuse_succeeded: true,
+      checkpoint_reset_applied: false,
+      lane_phase: true,
+    });
+  });
+
+  it('resetPerRoleModuleState clears stale workspace_prep before the next role ships', async () => {
+    const existsSpy = vi.mocked(fs.existsSync);
+    existsSpy.mockImplementation(path => path === '/ws/.git');
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    process.env.BLUEPRINT_LANE_MODE = '1';
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'feature/warm',
+    });
+    resetPerRoleModuleState({ warmStart: false });
+
+    await persistAndPostStatus('task-wp-reset', {
+      task_id: 'task-wp-reset',
+      status: 'COMPLETED',
+    });
+
+    const body = JSON.parse(
+      (fetchMock.mock.calls.at(-1)?.[1] as { body?: string }).body ?? '{}',
+    ) as { workspace_prep?: unknown };
+    expect(body.workspace_prep).toBeUndefined();
   });
 });
 

@@ -23,7 +23,7 @@ import uuid
 from datetime import timedelta
 from typing import Optional
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import PoolVm, PoolVmState, Task
@@ -487,10 +487,25 @@ async def lease_idle_pool_vm(
             )
         )
 
+    # When a lane_id is given, sort own-reserved members FIRST (CASE sort key 0)
+    # before falling back to oldest-idle ordering. This ensures a lane's own
+    # reserved member is always preferred over an older-idle generic member so
+    # the warm workspace it checkpointed into is actually reused. The single
+    # SELECT + FOR UPDATE SKIP LOCKED atomicity is fully preserved.
+    if lane_id is not None:
+        _lane_uuid = uuid.UUID(str(lane_id))
+        _order_exprs = [
+            case((PoolVm.reserved_lane_id == _lane_uuid, 0), else_=1).asc(),
+            PoolVm.idle_since.asc().nullsfirst(),
+            PoolVm.created_at.asc(),
+        ]
+    else:
+        _order_exprs = [PoolVm.idle_since.asc().nullsfirst(), PoolVm.created_at.asc()]
+
     stmt = (
         select(PoolVm)
         .where(*filters)
-        .order_by(PoolVm.idle_since.asc().nullsfirst(), PoolVm.created_at.asc())
+        .order_by(*_order_exprs)
         .with_for_update(skip_locked=True)
         .limit(1)
     )
@@ -508,6 +523,13 @@ async def lease_idle_pool_vm(
         return None
 
     ttl = lease_ttl_secs if lease_ttl_secs is not None else _DEFAULT_LEASE_TTL_SECS
+    expired_reservation_lane_id = (
+        member.reserved_lane_id
+        if member.reserved_lane_id is not None
+        and member.reservation_expires_at is not None
+        and member.reservation_expires_at <= now
+        else None
+    )
     member.state = PoolVmState.LEASED
     member.leased_task_id = leased_task_id
     member.lease_expires_at = now + timedelta(seconds=ttl)
@@ -523,7 +545,17 @@ async def lease_idle_pool_vm(
     # Clear any reservation — a leased member holds no reservation.
     member.reserved_lane_id = None
     member.reservation_expires_at = None
+    object.__setattr__(member, "_expired_reservation_lane_id", expired_reservation_lane_id)
     session.add(member)
+    if expired_reservation_lane_id is not None:
+        from app.runtime_config_state import is_improvement_lanes_enabled
+
+        if is_improvement_lanes_enabled():
+            await clear_lane_warm_workspace_if_matching_member(
+                session,
+                expired_reservation_lane_id,
+                member.vm_instance_id,
+            )
     logger.info(
         "[WARM-POOL] leased pool VM vm_instance_id=%s project=%s task=%s "
         "lease_expires_at=%s",
@@ -665,6 +697,38 @@ async def release_pool_vm(
         lane_id,
     )
     return member
+
+
+async def clear_lane_warm_workspace(session, lane_id: uuid.UUID | str) -> bool:
+    """Force a lane workspace back to COLD and clear its warm-resume VM pointer."""
+    from app.models import ImprovementLane
+
+    result = await session.execute(
+        update(ImprovementLane)
+        .where(ImprovementLane.id == uuid.UUID(str(lane_id)))
+        .values(workspace_state="COLD", workspace_vm_instance_id=None)
+    )
+    return bool(result.rowcount)
+
+
+async def clear_lane_warm_workspace_if_matching_member(
+    session,
+    lane_id: uuid.UUID | str,
+    workspace_vm_instance_id: str | None,
+) -> bool:
+    """Clear a lane workspace only while it still advertises a warm reservation."""
+    from app.models import ImprovementLane
+
+    result = await session.execute(
+        update(ImprovementLane)
+        .where(
+            ImprovementLane.id == uuid.UUID(str(lane_id)),
+            ImprovementLane.workspace_state == "WARM_RESERVED",
+            ImprovementLane.workspace_vm_instance_id == workspace_vm_instance_id,
+        )
+        .values(workspace_state="COLD", workspace_vm_instance_id=None)
+    )
+    return bool(result.rowcount)
 
 
 async def mark_pool_vm_retiring(session, vm_instance_id: str) -> Optional[PoolVm]:
@@ -844,6 +908,49 @@ async def try_pool_dispatch(
         )
         reason = "no_compatible_member" if idle_present else "no_idle_member"
         record_pool_lease_miss(reason, account=required_account)
+        # Best-effort workspace-state correction: the lane cannot stay
+        # WARM_RESERVED when no compatible member is available — its reservation
+        # is stale or already gone. Degrade to COLD so the lane's next phase
+        # cold-preps instead of waiting on a VM that is no longer there. Mirrors
+        # the degradation pattern in sweep_idle_pool_vms Pass 2.
+        if lane_id is not None and is_improvement_lanes_enabled():
+            try:
+                from app.models import ImprovementLane as _ImprovementLane
+
+                _lane_vm_instance_id = (
+                    (
+                        await session.execute(
+                            select(_ImprovementLane.workspace_vm_instance_id).where(
+                                _ImprovementLane.id == uuid.UUID(lane_id),
+                                _ImprovementLane.project_id == task.project_id,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if await clear_lane_warm_workspace_if_matching_member(
+                    session,
+                    lane_id,
+                    _lane_vm_instance_id,
+                ):
+                    # Commit here: this is the miss path — we return None below
+                    # so the caller never commits. The caller's only pending
+                    # mutation on this path is task.context (blacklist update in
+                    # orchestrator.py:3243-3249); that field is idempotent and
+                    # expire_on_commit=False avoids the MissingGreenlet hazard,
+                    # so committing ahead of the caller is safe on this branch.
+                    await session.commit()
+                    logger.debug(
+                        "[WARM-POOL] lane %s has no compatible member — degraded to COLD",
+                        lane_id,
+                    )
+            except Exception:
+                logger.debug(
+                    "[WARM-POOL] lane workspace-state correction failed lane=%s",
+                    lane_id,
+                    exc_info=True,
+                )
         return None
 
     # In-flight-delete guard: never land a lease on a VM the orchestrator already
@@ -873,6 +980,54 @@ async def try_pool_dispatch(
         resolved_auth_mode=required_auth_mode,
         resolved_model=required_model,
     )
+    # Best-effort: if the lane dispatched to a VM other than its reserved one,
+    # update workspace_vm_instance_id so the lane row reflects the actual VM
+    # the task is running on (the caller's commit will persist this).
+    if lane_id is not None and is_improvement_lanes_enabled():
+        try:
+            from app.models import ImprovementLane as _ImprovementLane
+
+            expired_reservation_lane_id = getattr(
+                member, "_expired_reservation_lane_id", None
+            )
+            _lane_uuid = uuid.UUID(lane_id)
+            _lane_obj = (
+                (
+                    await session.execute(
+                        select(_ImprovementLane).where(
+                            _ImprovementLane.id == _lane_uuid,
+                            _ImprovementLane.project_id == task.project_id,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if expired_reservation_lane_id is not None and _lane_uuid == expired_reservation_lane_id:
+                logger.debug(
+                    "[WARM-POOL] lane %s claimed expired reservation on vm=%s — left workspace COLD",
+                    lane_id,
+                    member.vm_instance_id,
+                )
+            elif (
+                _lane_obj is not None
+                and _lane_obj.workspace_vm_instance_id != member.vm_instance_id
+            ):
+                _prior_vm = _lane_obj.workspace_vm_instance_id
+                _lane_obj.workspace_vm_instance_id = member.vm_instance_id
+                session.add(_lane_obj)
+                logger.debug(
+                    "[WARM-POOL] lane %s dispatched to vm=%s (was %s) — updated workspace_vm_instance_id",
+                    lane_id,
+                    member.vm_instance_id,
+                    _prior_vm,
+                )
+        except Exception:
+            logger.debug(
+                "[WARM-POOL] lane workspace-vm correction failed lane=%s",
+                lane_id,
+                exc_info=True,
+            )
     logger.info(
         "[WARM-POOL] dispatch hook leased member %s for task %s (project %s) — "
         "skipping cold provision",

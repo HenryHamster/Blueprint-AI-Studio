@@ -224,6 +224,7 @@ vi.mock('../api', () => ({
     limit: 10,
     evicted_findings: [],
   })),
+  drainLanePilot: vi.fn(),
   fetchDirectionSrBreakdown: vi.fn(async () => ({ directions: [] })),
   fetchEfficiencyAxes: vi.fn(async () => ({
     axes: {

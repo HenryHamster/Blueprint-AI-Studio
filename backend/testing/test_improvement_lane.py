@@ -15,6 +15,7 @@ from sqlmodel import SQLModel, select
 from app.improvement_lane_ops import (
     LaneCASError,
     LaneCheckpointError,
+    LaneOwnerMismatchError,
     cas_transition,
     checkpoint_lane,
     create_lane,
@@ -370,11 +371,11 @@ async def test_checkpoint_lane_appends_record_and_parks(db: AsyncSession):
         branch_name="lane/chk1",
         base_branch="main",
     )
+    task_id = uuid.uuid4()
     lane.status = ImprovementLaneStatus.ACTIVE.value
-    lane.current_task_id = uuid.uuid4()
+    lane.current_task_id = task_id
     await db.commit()
 
-    task_id = uuid.uuid4()
     cp = LaneCheckpointPayload(
         sha="abc1234",
         summary="Implement login endpoint",
@@ -505,6 +506,43 @@ async def test_checkpoint_lane_not_active_raises(db: AsyncSession):
     cp = LaneCheckpointPayload(sha="abc1234", summary="bad checkpoint attempt")
     with pytest.raises(LaneCheckpointError, match="must be ACTIVE"):
         await checkpoint_lane(db, lane.id, "create", uuid.uuid4(), cp)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_lane_rejects_non_owner_task(db: AsyncSession):
+    """checkpoint_lane raises LaneOwnerMismatchError when task_id != current_task_id.
+
+    The lane's status, current_task_id, and last_checkpoint_sha must remain
+    unchanged after the rejection — the new owner is unaffected.
+    """
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/owner1",
+        base_branch="main",
+    )
+    owner_id = uuid.uuid4()
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    lane.current_task_id = owner_id
+    lane.last_checkpoint_sha = "original_sha"
+    await db.commit()
+
+    stale_task_id = uuid.uuid4()
+    cp = LaneCheckpointPayload(sha="stale_sha", summary="stale checkpoint attempt")
+    with pytest.raises(LaneOwnerMismatchError, match=str(owner_id)):
+        await checkpoint_lane(db, lane.id, "create", stale_task_id, cp)
+
+    # Verify the lane is untouched — the DB session may have partial state,
+    # so re-fetch to confirm.
+    await db.rollback()
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
+    assert refreshed.current_task_id == owner_id
+    assert refreshed.last_checkpoint_sha == "original_sha"
 
 
 # ---------------------------------------------------------------------------

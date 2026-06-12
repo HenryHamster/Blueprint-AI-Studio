@@ -3,7 +3,7 @@
 import re
 import uuid
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -111,6 +111,17 @@ class ReproduceVerdict(BaseModel):
         return v
 
 
+class WorkspacePrepOutcome(BaseModel):
+    """Bounded agent-reported workspace-preparation outcome for lane telemetry."""
+
+    model_config = ConfigDict(extra="ignore")
+    path: Literal["warm", "cold"]
+    warm_reuse_succeeded: bool
+    checkpoint_reset_applied: bool
+    cold_fallback_reason: str | None = Field(None, max_length=500)
+    lane_phase: bool
+
+
 class TaskParkRequest(BaseModel):
     """An agent's request to PARK a task waiting on an external, non-agent signal.
 
@@ -180,6 +191,7 @@ class AgentStatusPayload(BaseModel):
     # payload. Persisted into task.context so the completion handler can write
     # it into project.design_doc under the durable repo_overview section.
     repo_overview: RepoBootstrapOverview | None = None
+    workspace_prep: WorkspacePrepOutcome | None = None
     diff_summary: List[Dict[str, Any]] | None = Field(None, max_length=50)
     file_change_details: List[Dict[str, Any]] | None = Field(None, max_length=50)
     analysis_plan: str | None = Field(None, max_length=5000)

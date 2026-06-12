@@ -11,6 +11,7 @@ import logging
 import re
 import uuid
 from datetime import timedelta
+from typing import Any
 
 from sqlalchemy import func
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -496,6 +497,10 @@ SPAWN_REASON_NONCONVERGENCE = "early_nonconvergence"
 # debt, toolchain layer) rather than a code defect. Halt the chain and let
 # the strategic agent (or operator) decide whether to spawn an infra fix.
 SPAWN_REASON_BLOCKED_REPEAT = "blocked_repeat_fingerprint"
+# A lane-arm review boundary found the lane checkpoint missing/unverifiable and,
+# while still under the requeue budget, suppressed the cold review and requeued
+# the failed phase as a lane-aware recovery task (see _handle_lane_checkpoint_recovery).
+SPAWN_REASON_LANE_RECOVERY = "lane_checkpoint_recovery"
 
 # Grace window for the mid-retry defer: when a same-PR fix is FAILED/CANCELLED
 # with an infra failure_category and the failure is younger than this many minutes,
@@ -1231,6 +1236,155 @@ def task_counts_toward_review_cap(task: Task) -> bool:
     if (task.context or {}).get("_review_stale_head"):
         return False
     return True
+
+
+async def _handle_lane_checkpoint_recovery(
+    session: AsyncSession,
+    *,
+    source_task: Task,
+    lane: Any,
+    pr_number: int,
+    branch: str,
+    base_branch: str,
+    resolved_original_id: str,
+    propagated_ctx: dict,
+    parent_id: uuid.UUID | None,
+    inherited_priority: Any,
+) -> tuple[Task | None, bool]:
+    """Bounded recovery for a lane checkpoint that went missing at a review boundary.
+
+    Replaces the old silent "spawn the cold review anyway" behavior on a
+    checkpoint miss that is still under the requeue budget: suppress the review
+    and spawn a lane-aware retry of the failed phase carrying ONLY durable chain
+    metadata (lane chain id, arm assignment, PR/branch/review_loop state, and the
+    recovery reason). It deliberately carries NO stale warm-handoff pin, lane
+    checkpoint SHA, or lane-reserved VM directive — the warm workspace could not
+    be trusted, so the recovery runs cold from a fresh clone. The active lane is
+    rebound to the recovery task so chain continuity and the operator view follow
+    the retry. Returns ``(recovery_task, True)``; the caller treats a truthy task
+    as "the chain advanced" (not an iteration-cap escalation).
+
+    The exhausted-budget case is handled upstream by ``checkpoint_or_recover_phase``
+    (lane CAS to KILLED + reservation release) and is NOT routed here — an
+    exhausted lane falls back to a classic cold review.
+    """
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_RECOVERY_ATTEMPT_KEY,
+        LANE_RECOVERY_REASON_KEY,
+        rebind_lane_to_recovery,
+        strip_transient_lane_context,
+    )
+
+    attempt = (lane.phase_requeues or 0) if lane is not None else 0
+
+    # Durable-only recovery context: carry the chain's review_loop (PR/branch/
+    # iteration/original_task_id), the intent-to-treat arm, and the chain lane id,
+    # then defensively strip any transient lane dispatch directive so no stale
+    # checkpoint SHA / lane-reserved VM directive can ride the recovery task.
+    recovery_ctx: dict[str, Any] = {}
+    for key in ("review_loop", LANE_PILOT_ASSIGNMENT_KEY, LANE_CHAIN_ID_KEY):
+        if propagated_ctx.get(key) is not None:
+            recovery_ctx[key] = propagated_ctx[key]
+    strip_transient_lane_context(recovery_ctx)
+    recovery_ctx[LANE_RECOVERY_REASON_KEY] = "checkpoint_missing"
+    recovery_ctx[LANE_RECOVERY_ATTEMPT_KEY] = attempt
+
+    recovery_prompt = (
+        f"Lane checkpoint recovery for PR #{pr_number}. The prior phase completed "
+        f"but its lane checkpoint could not be verified on branch {branch}, so the "
+        f"warm lane workspace cannot be trusted. Starting from a FRESH clone of "
+        f"{branch} (assume no local workspace state), re-verify the work on this "
+        f"PR, address any outstanding review feedback carried in context, and push "
+        f"your changes so the review re-runs against a verifiable head."
+    )
+    recovery_payload = validate_internal_payload(
+        {
+            "type": "fix",
+            "pr_number": pr_number,
+            "branch": branch,
+            "base_branch": base_branch,
+            "prompt": recovery_prompt,
+            "original_task_id": resolved_original_id,
+        },
+        "lane_checkpoint_recovery",
+    )
+    # Dedup per requeue attempt: a second review-boundary entry for the same
+    # missing checkpoint maps to the same key, so the active-idempotency index
+    # prevents a duplicate recovery for the same attempt.
+    idempotency_key = _pipeline_task_idempotency_key(
+        project_id=source_task.project_id,
+        task_type="lane_recovery",
+        pr_number=pr_number,
+        original_task_id=resolved_original_id,
+        iteration=attempt,
+        is_rollup=False,
+    )
+    recovery_task = Task(
+        project_id=source_task.project_id,
+        title=f"Lane checkpoint recovery PR #{pr_number}",
+        description=recovery_prompt,
+        parent_task_id=parent_id,
+        priority=inherited_priority,
+        payloads=[recovery_payload],
+        context=recovery_ctx,
+        idempotency_key=idempotency_key,
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(recovery_task)
+    await session.flush()  # assign recovery_task.id for the lane rebind
+    await rebind_lane_to_recovery(
+        session, lane, task_id=recovery_task.id, reason="checkpoint_missing"
+    )
+    source_task.latest_status_message = (
+        f"Lane checkpoint missing for PR #{pr_number} — review suppressed; "
+        f"requeued failed phase as recovery task {str(recovery_task.id)[:8]} "
+        f"(attempt {attempt})"
+    )
+    _set_spawn_reason(source_task, SPAWN_REASON_LANE_RECOVERY)
+    session.add(source_task)
+    session.add(
+        TaskHistory(
+            task_id=recovery_task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "REVIEW_PIPELINE",
+                "type": "lane_checkpoint_recovery",
+                "pr_number": pr_number,
+                "attempt": attempt,
+            },
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        # A concurrent recovery for the same attempt already exists (idempotency
+        # collision). Roll back and treat as a benign dedup — the sibling
+        # recovery drives the chain.
+        await session.rollback()
+        logger.warning(
+            "[PIPELINE] lane recovery for PR #%s hit idempotency key; "
+            "sibling recovery already active",
+            pr_number,
+        )
+        return (None, False)
+    await session.refresh(recovery_task)
+    await broadcast_to_project(
+        str(source_task.project_id),
+        "task_updated",
+        {"task_id": str(recovery_task.id), "status": TaskStatus.QUEUED},
+    )
+    logger.info(
+        "[PIPELINE] lane checkpoint recovery: requeued failed phase for PR #%s "
+        "as task %s (attempt %d); cold review suppressed",
+        pr_number,
+        recovery_task.id,
+        attempt,
+    )
+    return (recovery_task, True)
 
 
 async def _spawn_pipeline_task(
@@ -2900,10 +3054,11 @@ async def _spawn_pipeline_task(
 
     from app.models import Project as _Project
     from app.review_fix_lane_pilot import (
+        CHECKPOINT_PHASE_RECOVER,
         LANE_CHAIN_ID_KEY,
         LANE_PILOT_ASSIGNMENT_KEY,
         activate_lane_for_fix,
-        checkpoint_and_reserve_on_phase_complete,
+        checkpoint_or_recover_phase,
         ensure_chain_lane,
         get_chain_lane,
         is_review_fix_lane_pilot_active_for_project,
@@ -2912,6 +3067,7 @@ async def _spawn_pipeline_task(
         strip_transient_lane_context,
         wire_fix_lane_context,
     )
+    from app.models import ImprovementLaneStatus
 
     strip_transient_lane_context(propagated_ctx)
     lane_review_force_cold = False
@@ -2960,19 +3116,39 @@ async def _spawn_pipeline_task(
                 )
                 if not _phase_sha and orig is not None:
                     _phase_sha = (orig.context or {}).get("head_sha")
-                await checkpoint_and_reserve_on_phase_complete(
+                # Act on the checkpoint outcome instead of ignoring it. A
+                # missing/unverifiable checkpoint under budget deterministically
+                # suppresses this cold review and requeues the failed phase as a
+                # lane-aware recovery task; an exhausted budget closes the lane
+                # inline (KILLED + reservation released) and falls back to a
+                # classic cold review. A written checkpoint (or a benign no-op)
+                # proceeds to the cold review unchanged.
+                _ckpt_outcome = await checkpoint_or_recover_phase(
                     session,
                     source_task,
                     _lane,
                     sha=_phase_sha,
                     summary=f"lane phase complete PR #{pr_number}",
                 )
+                if _ckpt_outcome == CHECKPOINT_PHASE_RECOVER:
+                    return await _handle_lane_checkpoint_recovery(
+                        session,
+                        source_task=source_task,
+                        lane=_lane,
+                        pr_number=pr_number,
+                        branch=branch,
+                        base_branch=base_branch,
+                        resolved_original_id=resolved_original_id,
+                        propagated_ctx=propagated_ctx,
+                        parent_id=parent_id,
+                        inherited_priority=inherited_priority,
+                    )
             elif task_type == "fix":
                 # Fix side resumes warm on the lane-reserved member: bind the
                 # lane ACTIVE for this phase and attach warm-resume directives +
                 # use receipts. The reviewer never reaches this branch.
                 _lane = await get_chain_lane(session, source_ctx)
-                if _lane is not None:
+                if _lane is not None and _lane.status == ImprovementLaneStatus.PARKED.value:
                     lane_fix_task_id = uuid.uuid4()
                     lane_fix_to_activate = _lane
                     wire_fix_lane_context(propagated_ctx, _lane)

@@ -43,6 +43,7 @@ from app.models import (
 )
 from app.time_utils import _utcnow
 from app.warm_pool import (
+    clear_lane_warm_workspace_if_matching_member,
     IDLE_POOL_STATES,
     LIVE_POOL_STATES,
     count_idle_pool_vms,
@@ -1195,10 +1196,13 @@ async def pool_maintainer_service():
 async def sweep_exhausted_lane_budgets(session) -> int:
     """Kill ACTIVE ImprovementLane rows whose phase_requeues budget is exhausted.
 
-    mark_checkpoint_missing leaves over-budget lanes ACTIVE "so the sweep can
-    surface them to the strategist" — this is that sweep.  CAS each matching
-    lane to KILLED so the rows reach a terminal state and stop polluting the
-    warm-resume and checkpoint-loss denominators.
+    The live review-spawn path now closes an exhausted lane INLINE the moment the
+    requeue budget is crossed (review_fix_lane_pilot.close_lane_checkpoint_exhausted
+    via checkpoint_or_recover_phase), so this sweep is a BACKSTOP for any
+    over-budget lane that escaped inline handling (e.g. a row whose budget was
+    bumped past the cap by an out-of-band path, or a lane left ACTIVE by an older
+    code version).  CAS each matching lane to KILLED so the rows reach a terminal
+    state and stop polluting the warm-resume and checkpoint-loss denominators.
 
     Returns the count of lanes killed.  Inert when improvement_lanes_enabled
     is False.
@@ -1493,6 +1497,7 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
             await session.execute(
                 select(
                     PoolVm.id,
+                    PoolVm.vm_instance_id,
                     PoolVm.reserved_lane_id,
                     PoolVm.reservation_expires_at,
                 ).where(
@@ -1506,7 +1511,7 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
         .all()
     )
     cleared_expired_reservations = 0
-    for member_id, lane_id, expires_at in expired_reserved_candidates:
+    for member_id, vm_instance_id, lane_id, expires_at in expired_reserved_candidates:
         locked_member = (
             (
                 await session.execute(
@@ -1527,21 +1532,35 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
         )
         if locked_member is None:
             continue
-        # Settle idle cost for the fleet ledger; this also advances idle_since
-        # to `now` so the same span is never billed twice.
         accrued = settle_pool_vm_idle_cost(locked_member, now=now, session=session)
         locked_member.reserved_lane_id = None
         locked_member.reservation_expires_at = None
         session.add(locked_member)
         cleared_expired_reservations += 1
-        # Attribute the reserved-idle cost to the lane (additional write).
-        if accrued > 0 and lane_id is not None and is_improvement_lanes_enabled():
+        # Attribute the reserved-idle cost to the lane and correct workspace
+        # state: an expired reservation means the lane's WARM_RESERVED claim is
+        # no longer valid — degrade to COLD (mirroring Pass 2's reaped-member
+        # degradation) so the lane's next phase cold-preps rather than expecting
+        # a warm workspace that no longer holds its reservation.
+        lane = None
+        if lane_id is not None and is_improvement_lanes_enabled():
             lane = await session.get(ImprovementLane, lane_id)
-            if lane is not None:
+        if lane is not None:
+            if accrued > 0:
                 lane.reserved_idle_cost_usd_total = (
                     lane.reserved_idle_cost_usd_total or 0.0
                 ) + accrued
-                session.add(lane)
+            if await clear_lane_warm_workspace_if_matching_member(
+                session,
+                lane_id,
+                vm_instance_id,
+            ):
+                logger.debug(
+                    "[WARM-POOL] expired reservation vm=%s — degraded lane %s to COLD",
+                    locked_member.vm_instance_id,
+                    lane_id,
+                )
+            session.add(lane)
         logger.debug(
             "[WARM-POOL] cleared expired lane reservation vm=%s lane=%s accrued=$%.4f",
             locked_member.vm_instance_id,

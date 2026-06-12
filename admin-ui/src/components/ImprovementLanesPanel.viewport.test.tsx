@@ -9,6 +9,7 @@ import {
 } from '../test/viewport';
 
 vi.mock('../api', () => ({
+  drainLanePilot: vi.fn(),
   fetchImprovementLanes: vi.fn(async () => ({
     total: 2,
     lanes: [

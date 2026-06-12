@@ -5,9 +5,11 @@ import { ImprovementLanesPanel } from './ImprovementLanesPanel';
 const STORAGE_KEY = 'blueprint-admin:improvementLanesPanelCollapsed';
 
 const fetchImprovementLanes = vi.fn();
+const drainLanePilot = vi.fn();
 
 vi.mock('../api', () => ({
   fetchImprovementLanes: (...args: unknown[]) => fetchImprovementLanes(...args),
+  drainLanePilot: (...args: unknown[]) => drainLanePilot(...args),
 }));
 
 const LANE_RESPONSE = {
@@ -75,6 +77,7 @@ describe('ImprovementLanesPanel', () => {
   afterEach(() => {
     cleanup();
     fetchImprovementLanes.mockReset();
+    drainLanePilot.mockReset();
     localStorage.clear();
   });
 
@@ -137,5 +140,79 @@ describe('ImprovementLanesPanel', () => {
 
     expect(await screen.findByText('boom')).toBeTruthy();
     await waitFor(() => expect(screen.queryAllByTestId('improvement-lane-row')).toHaveLength(0));
+  });
+
+  test('renders Drain/Kill Pilot button in expanded panel', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    expect(screen.getByTestId('drain-lane-pilot-button')).toBeTruthy();
+    expect(screen.getByTestId('drain-lane-pilot-button').textContent).toBe('Drain / Kill Pilot');
+  });
+
+  test('shows ConfirmDialog when Drain/Kill Pilot button is clicked', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(screen.getByTestId('drain-lane-pilot-button'));
+
+    expect(await screen.findByText('Drain / Kill Lane Pilot')).toBeTruthy();
+    expect(screen.getByText(/stops all future lane assignment/)).toBeTruthy();
+  });
+
+  test('dismisses ConfirmDialog on cancel', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(screen.getByTestId('drain-lane-pilot-button'));
+    expect(await screen.findByText('Drain / Kill Lane Pilot')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('Cancel'));
+    await waitFor(() => expect(screen.queryByText('Drain / Kill Lane Pilot')).toBeNull());
+    expect(drainLanePilot).not.toHaveBeenCalled();
+  });
+
+  test('calls drainLanePilot and displays result summary on confirm', async () => {
+    fetchImprovementLanes.mockResolvedValue(LANE_RESPONSE);
+    drainLanePilot.mockResolvedValueOnce({
+      project_id: 'proj-1',
+      flag_disabled: true,
+      reservations_cleared: 2,
+      lanes_killed: 1,
+      reason: 'operator_drain',
+    });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(screen.getByTestId('drain-lane-pilot-button'));
+    expect(await screen.findByText('Drain / Kill Lane Pilot')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('Drain & Kill'));
+
+    expect(await screen.findByTestId('drain-result-summary')).toBeTruthy();
+    expect(screen.getByTestId('drain-result-summary').textContent).toBe(
+      'Pilot drained: 2 reservations released, 1 lane killed',
+    );
+    expect(drainLanePilot).toHaveBeenCalledWith('proj-1');
+  });
+
+  test('shows error banner on drain failure', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    drainLanePilot.mockRejectedValueOnce(new Error('drain failed'));
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(screen.getByTestId('drain-lane-pilot-button'));
+    fireEvent.click(await screen.findByText('Drain & Kill'));
+
+    expect(await screen.findByText('drain failed')).toBeTruthy();
   });
 });

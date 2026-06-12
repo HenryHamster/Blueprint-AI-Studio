@@ -694,6 +694,27 @@ export async function fetchImprovementLanes(
   return res.json();
 }
 
+export interface LanePilotDrainReport {
+  project_id: string;
+  flag_disabled: boolean;
+  reservations_cleared: number;
+  lanes_killed: number;
+  reason: string;
+}
+
+export async function drainLanePilot(projectId: string): Promise<LanePilotDrainReport> {
+  const res = await apiFetch(
+    `/api/admin/improvement-lanes/drain?project_id=${encodeURIComponent(projectId)}`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || data?.error?.message || `Failed to drain lane pilot: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to drain lane pilot: ${res.status}`);
+  }
+  return res.json();
+}
+
 export interface SrMissedRetrospectivesResponse {
   items: SrMissedTask[];
   total: number;

@@ -39,6 +39,10 @@ class LaneCheckpointError(Exception):
     """Raised when a checkpoint cannot be appended (bad sha, budget, etc.)."""
 
 
+class LaneOwnerMismatchError(LaneCheckpointError):
+    """Raised when the completing task does not own the active lane."""
+
+
 _TERMINAL_STATUSES = frozenset(
     {ImprovementLaneStatus.RETIRED.value, ImprovementLaneStatus.KILLED.value}
 )
@@ -204,6 +208,11 @@ async def checkpoint_lane(
         raise LaneCheckpointError(
             f"Lane {lane_id} must be ACTIVE to checkpoint, got {lane.status}"
         )
+    if lane.current_task_id is not None and lane.current_task_id != task_id:
+        raise LaneOwnerMismatchError(
+            f"Lane {lane_id} is owned by task {lane.current_task_id}, "
+            f"but checkpoint was attempted by task {task_id}"
+        )
 
     now = _utcnow()
     seq = lane.checkpoint_seq + 1
@@ -269,7 +278,10 @@ async def mark_checkpoint_missing(
     Returns ``(lane, should_requeue)``.  ``should_requeue=True`` when
     ``phase_requeues`` is still under the budget; the caller is responsible
     for actually creating the requeue task.  When the budget is exhausted
-    the lane is left ACTIVE so the sweep can surface it to the strategist.
+    the lane is left ACTIVE here — the live review-spawn path
+    (``review_fix_lane_pilot.checkpoint_or_recover_phase``) closes it inline
+    (KILLED + reservation released), with ``sweep_exhausted_lane_budgets`` as a
+    backstop for any over-budget lane that escaped inline handling.
     """
     result = await session.execute(
         select(ImprovementLane)

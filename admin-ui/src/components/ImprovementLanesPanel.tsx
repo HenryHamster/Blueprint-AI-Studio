@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset } from 'lucide-react';
-import { fetchImprovementLanes, type ImprovementLaneRow } from '../api';
+import { drainLanePilot, fetchImprovementLanes, type ImprovementLaneRow, type LanePilotDrainReport } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, formatDurationSec, parseTimestamp } from '../utils/time';
+import { ConfirmDialog } from './ConfirmDialog';
 
 const STORAGE_KEY = 'blueprint-admin:improvementLanesPanelCollapsed';
 
@@ -59,6 +60,10 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [collapsedPref, setCollapsedPref] = useState<boolean | null>(() => readCollapsedPreference());
+  const [showDrainConfirm, setShowDrainConfirm] = useState(false);
+  const [draining, setDraining] = useState(false);
+  const [drainResult, setDrainResult] = useState<LanePilotDrainReport | null>(null);
+  const [drainError, setDrainError] = useState<string | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     if (!projectId) return;
@@ -76,6 +81,23 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
       if (!signal?.aborted) setLoading(false);
     }
   }, [projectId]);
+
+  const handleDrainConfirm = useCallback(async () => {
+    if (!projectId) return;
+    setShowDrainConfirm(false);
+    setDraining(true);
+    setDrainError(null);
+    setDrainResult(null);
+    try {
+      const report = await drainLanePilot(projectId);
+      setDrainResult(report);
+      await load();
+    } catch (e) {
+      setDrainError(e instanceof Error ? e.message : 'Failed to drain lane pilot');
+    } finally {
+      setDraining(false);
+    }
+  }, [projectId, load]);
 
   useEffect(() => {
     setLanes([]);
@@ -141,8 +163,42 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
         )}
       </button>
 
+      {showDrainConfirm && (
+        <ConfirmDialog
+          title="Drain / Kill Lane Pilot"
+          message="This stops all future lane assignment for this project, releases warm-pool reservations held by lanes, and kills all in-flight lanes (terminal KILLED state). This is the durable operator equivalent of an automated pilot KILL — not a reversible flag toggle."
+          confirmLabel="Drain & Kill"
+          onConfirm={handleDrainConfirm}
+          onCancel={() => setShowDrainConfirm(false)}
+        />
+      )}
+
       {!collapsed && (
         <div className="mt-1 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-xs">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <button
+              type="button"
+              data-testid="drain-lane-pilot-button"
+              disabled={draining || !projectId}
+              onClick={() => setShowDrainConfirm(true)}
+              className="min-h-[44px] rounded border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-semibold text-red-400 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {draining ? 'Draining…' : 'Drain / Kill Pilot'}
+            </button>
+            {drainResult && (
+              <span className="text-[11px] text-emerald-400" data-testid="drain-result-summary">
+                Pilot drained: {drainResult.reservations_cleared} reservation{drainResult.reservations_cleared !== 1 ? 's' : ''} released, {drainResult.lanes_killed} lane{drainResult.lanes_killed !== 1 ? 's' : ''} killed
+              </span>
+            )}
+          </div>
+
+          {drainError && (
+            <div className="mb-2 flex items-start gap-2 rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-red-300">
+              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+              <span className="min-w-0 break-words">{drainError}</span>
+            </div>
+          )}
+
           {fetchError && (
             <div className="flex items-start gap-2 rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-red-300">
               <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />

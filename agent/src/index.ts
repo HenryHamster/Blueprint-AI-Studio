@@ -3,6 +3,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
+import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { handlers, resolveHandler } from './handlers/index.js';
 import {
   loadTaskCapabilityContract,
@@ -1083,6 +1084,7 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
     const report = getLastProviderRunErrorReport();
     if (report && report.task_id === taskId) errorReport = report;
   }
+  const workspacePrepOutcome = getLastWorkspacePrepOutcome();
   return {
     provider: PROVIDER,
     auth_mode: AUTH_MODE,
@@ -1093,6 +1095,7 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
     ...(errorReport ? { error_report: errorReport } : {}),
     ...payload,
     ...statusFlagsForTask(taskId),
+    ...(workspacePrepOutcome !== null ? { workspace_prep: workspacePrepOutcome } : {}),
     ...(mergedFixLoopEvents !== undefined ? { fix_loop_events: mergedFixLoopEvents } : {}),
   };
 }
@@ -1817,6 +1820,9 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // attachment by task_id, but clear between roles anyway so a warm role can
   // never observe the prior role's run report through the getter.
   clearLastProviderRunErrorReport();
+  // Workspace-prep outcome recorded by prepareWorkspaceForRole. Reset so a
+  // stale outcome from the prior role never rides the next role's payload.
+  resetWorkspacePrepOutcome();
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────

@@ -11486,6 +11486,149 @@ def test_reproduce_verdict_schema_validation():
         AgentStatusPayload(**base, reproduce_verdict={"status": "maybe"})
 
 
+def test_workspace_prep_schema_validation():
+    """AgentStatusPayload.workspace_prep accepts the bounded lane outcome shape."""
+    from app.schemas import AgentStatusPayload
+    from pydantic import ValidationError
+
+    base = {"task_id": str(uuid.uuid4()), "status": "FAILED"}
+    assert AgentStatusPayload(**base).workspace_prep is None
+
+    parsed = AgentStatusPayload(
+        **base,
+        workspace_prep={
+            "path": "warm",
+            "warm_reuse_succeeded": True,
+            "checkpoint_reset_applied": False,
+            "cold_fallback_reason": None,
+            "lane_phase": True,
+        },
+    )
+    assert parsed.workspace_prep is not None
+    assert parsed.workspace_prep.path == "warm"
+    assert parsed.workspace_prep.warm_reuse_succeeded is True
+    assert parsed.workspace_prep.checkpoint_reset_applied is False
+    assert parsed.workspace_prep.cold_fallback_reason is None
+    assert parsed.workspace_prep.lane_phase is True
+
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(
+            **base,
+            workspace_prep={
+                "path": "sideways",
+                "warm_reuse_succeeded": True,
+                "checkpoint_reset_applied": True,
+                "cold_fallback_reason": None,
+                "lane_phase": True,
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_status_records_workspace_prep_and_reconciles_lane_receipts(
+    client: AsyncClient, db_session, mocker
+):
+    """Cold fallback clears receipts; successful warm reuse keeps them."""
+    from app.review_fix_lane_pilot import compute_lane_pilot_aggregates
+
+    async def _post_case(
+        *,
+        project_name: str,
+        user_id: str,
+        vm_id: str,
+        status: TaskStatus,
+        workspace_prep: dict[str, object],
+        logs: str,
+    ):
+        project = Project(name=project_name, user_id=user_id)
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "prompt": "patch lane bug"}],
+            vm_instance_id=vm_id,
+            status=TaskStatus.IN_PROGRESS,
+            context={
+                "_review_fix_lane_arm": "lane",
+                "is_lane_phase": True,
+                "improvement_lane_id": str(uuid.uuid4()),
+                "_review_fix_warm_resume": True,
+                "_review_fix_checkpoint": True,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), vm_id)
+        resp = await client.post(
+            "/api/agent/status",
+            json={
+                "task_id": str(task.id),
+                "status": status.value,
+                "logs": logs,
+                "workspace_prep": workspace_prep,
+            },
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(task)
+        agg = await compute_lane_pilot_aggregates(db_session, project.id)
+        return task, agg
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    cold_task, cold_agg = await _post_case(
+        project_name="Workspace Prep Cold",
+        user_id="test-user-workspace-cold",
+        vm_id="agent-vm-workspace-cold",
+        status=TaskStatus.COMPLETED,
+        workspace_prep={
+            "path": "cold", "warm_reuse_succeeded": False,
+            "checkpoint_reset_applied": False,
+            "cold_fallback_reason": "warm git reset failed", "lane_phase": True,
+        },
+        logs="warm path failed, fell back to cold clone, then completed",
+    )
+    cold_ctx = cold_task.context or {}
+    assert cold_ctx["_workspace_prep"] == {
+        "path": "cold", "warm_reuse_succeeded": False,
+        "checkpoint_reset_applied": False,
+        "cold_fallback_reason": "warm git reset failed", "lane_phase": True,
+    }
+    assert "_review_fix_warm_resume" not in cold_ctx
+    assert "_review_fix_checkpoint" not in cold_ctx
+    assert cold_agg["lane_fix_tasks_sampled"] == 1
+    assert cold_agg["warm_resume_fraction"] == 0.0
+    assert cold_agg["checkpoint_fraction"] == 0.0
+
+    warm_task, warm_agg = await _post_case(
+        project_name="Workspace Prep Warm",
+        user_id="test-user-workspace-warm",
+        vm_id="agent-vm-workspace-warm",
+        status=TaskStatus.COMPLETED,
+        workspace_prep={
+            "path": "warm", "warm_reuse_succeeded": True,
+            "checkpoint_reset_applied": True,
+            "cold_fallback_reason": None, "lane_phase": True,
+        },
+        logs="warm reuse and checkpoint reset completed",
+    )
+    warm_ctx = warm_task.context or {}
+    assert warm_ctx["_workspace_prep"] == {
+        "path": "warm", "warm_reuse_succeeded": True,
+        "checkpoint_reset_applied": True,
+        "cold_fallback_reason": None, "lane_phase": True,
+    }
+    assert warm_ctx["_review_fix_warm_resume"] is True
+    assert warm_ctx["_review_fix_checkpoint"] is True
+    assert warm_agg["lane_fix_tasks_sampled"] == 1
+    assert warm_agg["warm_resume_fraction"] == 1.0
+    assert warm_agg["checkpoint_fraction"] == 1.0
+
+
 @pytest.mark.asyncio
 async def test_playbook_recent_outcomes_flipped_on_first_attempt_success(
     client: AsyncClient, db_session, mocker

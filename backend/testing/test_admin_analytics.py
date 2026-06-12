@@ -13,7 +13,7 @@ from app.models import Artifact, ArtifactType, ImprovementLane, ImprovementLaneS
 from app.routers import admin_analytics
 from app.time_utils import _utcnow
 from app.models import TaskStatus
-from testing.factories import make_alert, make_project, make_task
+from testing.factories import make_alert, make_membership, make_project, make_task
 
 
 @pytest.fixture
@@ -2461,3 +2461,132 @@ class TestLaneBaselines:
         assert resp.status_code == 200
         versions = [b["version_number"] for b in resp.json()["baselines"]]
         assert versions == [3, 2, 1]
+
+
+# ---------------------------------------------------------------------------
+# TestImprovementLanesDrain
+# ---------------------------------------------------------------------------
+
+
+class TestImprovementLanesDrain:
+    """Tests for POST /api/admin/improvement-lanes/drain."""
+
+    @pytest.mark.asyncio
+    async def test_operator_drain_lane_pilot_uses_kill_cleanup_semantics(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Drain endpoint uses apply_lane_pilot_kill semantics: clears reservation,
+        kills lane rows, disables runtime flag, and records a durable KILL verdict
+        so is_review_fix_lane_killed returns True after reload.
+
+        This is the named acceptance test: same cleanup semantics as the automated
+        KILL path, not a bare boolean flip.
+        """
+        from app.review_fix_lane_pilot import is_review_fix_lane_killed
+        from app.shared_state import runtime_config
+
+        mocker.patch.dict(
+            runtime_config,
+            {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": True},
+        )
+
+        project = make_project()
+        db_session.add(project)
+        db_session.add(make_membership(project.id, user_id="test-user-123", role="owner"))
+        await db_session.commit()
+
+        lane = _make_lane(
+            project.id,
+            status=ImprovementLaneStatus.ACTIVE.value,
+            pilot_arm="lane",
+        )
+        db_session.add(lane)
+        await db_session.flush()
+
+        pool_vm = PoolVm(
+            vm_instance_id="drain-test-vm-1",
+            project_id=project.id,
+            state=PoolVmState.IDLE,
+            reserved_lane_id=lane.id,
+        )
+        db_session.add(pool_vm)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/drain?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["project_id"] == str(project.id)
+        assert body["flag_disabled"] is True
+        assert body["reservations_cleared"] == 1
+        assert body["lanes_killed"] == 1
+        assert body["reason"] == "operator_drain"
+
+        # VM reservation must be cleared.
+        await db_session.refresh(pool_vm)
+        assert pool_vm.reserved_lane_id is None
+        assert pool_vm.reservation_expires_at is None
+
+        # Lane row must be KILLED.
+        await db_session.refresh(lane)
+        assert lane.status == ImprovementLaneStatus.KILLED.value
+
+        # Runtime flag must be disabled.
+        assert runtime_config.get("review_fix_lane_pilot_enabled") is False
+
+        # Durable KILL verdict must be recorded so the spawn gate blocks after reload.
+        await db_session.refresh(project)
+        assert is_review_fix_lane_killed(project) is True
+
+    @pytest.mark.asyncio
+    async def test_drain_idempotent_second_call_returns_zero_counts(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A second drain on an already-drained pilot succeeds with zero counts."""
+        from app.shared_state import runtime_config
+
+        mocker.patch.dict(
+            runtime_config,
+            {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": False},
+        )
+
+        project = make_project()
+        db_session.add(project)
+        db_session.add(make_membership(project.id, user_id="test-user-123", role="owner"))
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/drain?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["reservations_cleared"] == 0
+        assert body["lanes_killed"] == 0
+        assert body["flag_disabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_drain_non_owner_member_returns_403(
+        self, client: AsyncClient, db_session
+    ):
+        """A project member without owner role receives 403."""
+        project = make_project()
+        db_session.add(project)
+        db_session.add(make_membership(project.id, user_id="test-user-123", role="member"))
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/drain?project_id={project.id}"
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_drain_unknown_project_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """A project_id that does not exist returns HTTP 404."""
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/drain?project_id={uuid.uuid4()}"
+        )
+        assert resp.status_code == 404

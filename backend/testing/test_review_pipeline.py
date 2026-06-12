@@ -13096,6 +13096,304 @@ async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_lane_checkpoint_missing_under_budget_spawns_recovery_instead_of_review(
+    db_session, mocker
+):
+    """Lane-arm review boundary with a missing/unverifiable checkpoint, under the
+    requeue budget: the cold review is SUPPRESSED and a lane-aware recovery of the
+    failed phase is requeued instead.
+
+    The recovery task carries ONLY durable chain metadata (lane chain id, arm,
+    review_loop, recovery reason) and NONE of the stale warm-resume directives
+    (no improvement_lane_id, no lane_checkpoint_sha, no warm-handoff pin). The
+    active lane is rebound to the recovery task, phase_requeues is incremented,
+    and a visible recovery reason is recorded on the lane manifest. No review task
+    is created. Exercises checkpoint_or_recover_phase ->
+    _handle_lane_checkpoint_recovery -> rebind_lane_to_recovery.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_pilot_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    # SHA NOT reachable on the lane branch → checkpoint degrades to missing.
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    from app.models import ImprovementLane, ImprovementLaneStatus
+    from app.review_pipeline import SPAWN_REASON_LANE_RECOVERY
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_RECOVERY_ATTEMPT_KEY,
+        LANE_RECOVERY_REASON_KEY,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id="vm-lane-recover-1",
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 510,
+                "branch": "feat/lane-recover",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "deadbeef12345678",
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Implement completion → review boundary, but the checkpoint is unverifiable.
+    recovery, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=510,
+        branch="feat/lane-recover",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    # A recovery task was created in place of the review.
+    assert created is True
+    assert recovery is not None
+    assert recovery.first_payload.get("type") == "fix"
+    assert recovery.id != source_task.id
+
+    rctx = recovery.context or {}
+    # Durable chain metadata rides forward.
+    assert rctx.get(LANE_PILOT_ASSIGNMENT_KEY) == "lane"
+    lane_id_raw = rctx.get(LANE_CHAIN_ID_KEY)
+    assert lane_id_raw
+    assert rctx.get(LANE_RECOVERY_REASON_KEY) == "checkpoint_missing"
+    assert rctx.get(LANE_RECOVERY_ATTEMPT_KEY) == 1
+    assert (rctx.get("review_loop") or {}).get("original_task_id") == str(
+        original_task.id
+    )
+    # No stale warm-resume / lane-reserved-VM directives on the recovery task.
+    assert "improvement_lane_id" not in rctx
+    assert "lane_checkpoint_sha" not in rctx
+    assert rctx.get("is_lane_phase") is None
+    assert "warm_target_vm_id" not in rctx
+    # Recovery runs cold (fresh clone) — not pinned to the implementer VM.
+    assert recovery.vm_instance_id is None
+
+    # The lane is rebound to the recovery task, still ACTIVE, miss counted.
+    lane_id = uuid.UUID(str(lane_id_raw))
+    lane = await db_session.get(ImprovementLane, lane_id)
+    assert lane is not None
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.current_task_id == recovery.id
+    assert lane.phase_requeues == 1
+    # Operator-visible recovery reason recorded on the manifest.
+    recovery_state = (lane.manifest or {}).get("recovery") or {}
+    assert recovery_state.get("reason") == "checkpoint_missing"
+    assert recovery_state.get("exhausted") is False
+    assert recovery_state.get("attempt") == 1
+
+    # No review task was created for this chain.
+    all_tasks = (
+        await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+    ).scalars().all()
+    review_tasks = [
+        t for t in all_tasks if t.first_payload.get("type") == "review"
+    ]
+    assert review_tasks == []
+
+    # Source carries the visible recovery spawn reason.
+    await db_session.refresh(source_task)
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_LANE_RECOVERY
+
+
+@pytest.mark.asyncio
+async def test_lane_checkpoint_missing_over_budget_kills_lane_and_falls_back(
+    db_session, mocker
+):
+    """Lane-arm review boundary with a checkpoint miss that EXHAUSTS the requeue
+    budget: the lane is closed (KILLED) inline, any lane-held reservation is
+    released, a visible exhaustion reason is recorded, and the pipeline falls back
+    to a classic cold review (the PR is not orphaned).
+
+    Exercises checkpoint_or_recover_phase -> close_lane_checkpoint_exhausted.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_pilot_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.models import (
+        ImprovementLaneStatus,
+        PoolVm,
+        PoolVmState,
+        _LANE_MAX_PHASE_REQUEUES,
+    )
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY, LANE_PILOT_ASSIGNMENT_KEY
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Pre-existing lane already AT the requeue budget — one more miss exhausts it.
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="lane-exhausted",
+        goal="exhaust requeues",
+        branch_name="feat/lane-exhaust",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    await db_session.flush()
+    await cas_transition(
+        db_session,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=None,
+    )
+    lane.phase_requeues = _LANE_MAX_PHASE_REQUEUES
+    # A warm-pool member reserved for the lane must be released on exhaustion.
+    member = PoolVm(
+        vm_instance_id="pool-vm-exhaust-1",
+        project_id=project.id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+    )
+    db_session.add(member)
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id="vm-lane-exhaust-src",
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 511,
+                "branch": "feat/lane-exhaust",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "feedface87654321",
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=511,
+        branch="feat/lane-exhaust",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    # Classic cold review fallback — the PR is still reviewed.
+    assert created is True
+    assert review is not None
+    assert review.first_payload.get("type") == "review"
+    rctx = review.context or {}
+    assert "improvement_lane_id" not in rctx
+    assert rctx.get("is_lane_phase") is None
+
+    # Lane closed (KILLED) with a visible exhaustion reason; reservation released.
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.KILLED.value
+    assert lane.phase_requeues == _LANE_MAX_PHASE_REQUEUES + 1
+    recovery_state = (lane.manifest or {}).get("recovery") or {}
+    assert recovery_state.get("exhausted") is True
+    await db_session.refresh(member)
+    assert member.reserved_lane_id is None
+
+    # The next fix spawn must stay classic: the exhausted lane is terminal and
+    # must not be re-wired into the fix task even though the durable chain id
+    # still exists on the cold review.
+    review.status = TaskStatus.COMPLETED
+    db_session.add(review)
+    await db_session.commit()
+    await db_session.refresh(review)
+
+    fix, fix_created = await _spawn_pipeline_task(
+        review,
+        "fix",
+        db_session,
+        pr_number=511,
+        branch="feat/lane-exhaust",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Resume after exhausted lane",
+    )
+    assert fix_created is True
+    assert fix is not None
+    fctx = fix.context or {}
+    assert "improvement_lane_id" not in fctx
+    assert fctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in fctx
+
+
+@pytest.mark.asyncio
 async def test_lane_pilot_flag_off_classic_spawn_unchanged(db_session, mocker):
     """Flag off: no intent-to-treat assignment, no lane context, no lane row,
     no reservation — the classic spawn path is unchanged."""
@@ -13431,6 +13729,112 @@ async def test_lane_pilot_aggregates_checkpoint_loss_rate(db_session):
     assert agg["n_control"] == 1
     # One lane row had a requeue → 1.0 checkpoint-loss rate.
     assert agg["checkpoint_loss_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_aggregates_count_original_chains_not_iterations(db_session):
+    """compute_lane_pilot_aggregates counts chains (original PRs), not tasks.
+
+    A 3-task chain (create + review + fix) sharing one original_task_id must
+    contribute exactly ONE lane sample, not three.  Merge outcome is True if ANY
+    task in the chain has pr_merged=True.  Cost is summed across all tasks.
+    Engagement receipts (warm_resume_fraction, checkpoint_fraction) are also
+    chain-level: a chain is considered engaged if any fix task in it had the
+    receipt stamped.
+    """
+    from app.capability_trial_verdict import (
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import compute_lane_pilot_aggregates
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+
+    # ── Chain A: lane arm, 3 tasks sharing same original_task_id ────────────
+    # The root create task (no original_task_id in payload).
+    root_task_id = uuid.uuid4()
+    root_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_task.id = root_task_id
+
+    # Review iteration task — not merged.
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{
+            "type": "review",
+            "prompt": "review",
+            "base_branch": "main",
+            "original_task_id": str(root_task_id),
+        }],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane", "pr_merged": False},
+        estimated_cost_usd=1.0,
+    )
+
+    # Fix iteration task — merged, has warm-resume + checkpoint receipts.
+    fix_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{
+            "type": "fix",
+            "prompt": "fix",
+            "base_branch": "main",
+            "original_task_id": str(root_task_id),
+        }],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": True,
+            LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+            LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=2.0,
+    )
+
+    # ── Chain B: control arm, single task ───────────────────────────────────
+    control_root_id = uuid.uuid4()
+    control_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "control", "pr_merged": False},
+        estimated_cost_usd=1.5,
+    )
+    control_task.id = control_root_id
+
+    db_session.add_all([root_task, review_task, fix_task, control_task])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+
+    # Chain A contributes 1 lane sample (not 3 tasks), chain B contributes 1 control.
+    assert agg["n_lane"] == 1, f"expected 1 lane chain, got {agg['n_lane']}"
+    assert agg["n_control"] == 1, f"expected 1 control chain, got {agg['n_control']}"
+
+    # Merge outcome: chain A is merged (fix_task had pr_merged=True).
+    assert agg["lane_merge_rate"] == 1.0, f"expected lane merged, got {agg['lane_merge_rate']}"
+    assert agg["control_merge_rate"] == 0.0, f"expected control not merged, got {agg['control_merge_rate']}"
+
+    # Cost: chain A cost = review_task(1.0) + fix_task(2.0) = 3.0 for merged chain.
+    # root_task has no estimated_cost_usd set, defaults to 0.
+    assert agg["lane_cost_per_merged"] == pytest.approx(3.0, abs=0.01), (
+        f"expected chain-summed cost 3.0, got {agg['lane_cost_per_merged']}"
+    )
+
+    # Engagement: chain A fix task had both receipts → 1 warm chain / 1 fix chain.
+    assert agg["lane_fix_tasks_sampled"] == 1, (
+        f"expected 1 engagement chain (not task count), got {agg['lane_fix_tasks_sampled']}"
+    )
+    assert agg["warm_resume_fraction"] == 1.0, (
+        f"expected warm_resume_fraction=1.0, got {agg['warm_resume_fraction']}"
+    )
+    assert agg["checkpoint_fraction"] == 1.0, (
+        f"expected checkpoint_fraction=1.0, got {agg['checkpoint_fraction']}"
+    )
 
 
 @pytest.mark.asyncio
@@ -13928,6 +14332,43 @@ class TestLaneCheckpointShaVerification:
         assert result is True
         await db_session.refresh(lane)
         assert lane.last_checkpoint_sha == "abc1234def5678"
+
+    @pytest.mark.asyncio
+    async def test_lane_checkpoint_owner_mismatch_is_stale_noop(
+        self, db_session, mocker
+    ):
+        """A stale task that no longer owns the ACTIVE lane must not consume the
+        checkpoint-miss budget or trigger recovery, even on a short SHA."""
+        mock_mark_checkpoint_missing = mocker.patch(
+            "app.improvement_lane_ops.mark_checkpoint_missing",
+            new_callable=AsyncMock,
+        )
+
+        from app.models import ImprovementLaneStatus
+        from app.review_fix_lane_pilot import (
+            CHECKPOINT_PHASE_OK,
+            checkpoint_or_recover_phase,
+        )
+
+        lane, source_task = await self._setup_lane_and_task(db_session)
+        lane.current_task_id = uuid.uuid4()
+        await db_session.commit()
+        await db_session.refresh(lane)
+        initial_requeues = lane.phase_requeues or 0
+
+        result = await checkpoint_or_recover_phase(
+            db_session,
+            source_task,
+            lane,
+            sha="abc",
+            summary="phase complete",
+        )
+
+        assert result == CHECKPOINT_PHASE_OK
+        await db_session.refresh(lane)
+        assert lane.status == ImprovementLaneStatus.ACTIVE.value
+        assert (lane.phase_requeues or 0) == initial_requeues
+        mock_mark_checkpoint_missing.assert_not_called()
 
 
 @pytest.mark.asyncio

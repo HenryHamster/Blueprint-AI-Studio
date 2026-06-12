@@ -11,6 +11,7 @@ Plus registry CRUD transitions and the taskless manifest variant.
 """
 
 import uuid
+from datetime import timedelta
 
 import pytest
 
@@ -26,7 +27,8 @@ from app.compute_manifest import (
     build_warm_claim_retarget_manifest,
     POOL_MODE_ENV_VAR,
 )
-from app.models import PoolVmState, Project, Task, TaskStatus
+from app.models import ImprovementLane, PoolVmState, Project, Task, TaskStatus
+from app.time_utils import _utcnow
 from app.warm_pool import (
     count_idle_state_pool_vms,
     get_pool_vm,
@@ -244,6 +246,104 @@ async def test_lease_wildcard_requirement_matches_any_idle_in_tenant(db_session)
     leased = await lease_idle_pool_vm(db_session, project_id=project.id)
     assert leased is not None
     assert leased.vm_instance_id == "vm-any"
+
+
+@pytest.mark.asyncio
+async def test_lane_reserved_member_is_preferred_over_older_generic_idle(
+    db_session,
+):
+    """A lane-scoped lease must prefer its own reserved member over an older
+    generic idle member so checkpointed warm workspaces are reused."""
+    project = await _make_project(db_session, name="Lease Lane Preferred")
+    lane_id = uuid.uuid4()
+
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-generic-old",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+        state=PoolVmState.IDLE,
+    )
+    generic = await get_pool_vm(db_session, "vm-generic-old")
+    generic.idle_since = _utcnow() - timedelta(seconds=120)
+
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-lane-reserved",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+        state=PoolVmState.IDLE,
+    )
+    reserved = await get_pool_vm(db_session, "vm-lane-reserved")
+    reserved.idle_since = _utcnow() - timedelta(seconds=30)
+    reserved.reserved_lane_id = lane_id
+    reserved.reservation_expires_at = _utcnow() + timedelta(seconds=300)
+    db_session.add(generic)
+    db_session.add(reserved)
+    await db_session.commit()
+
+    leased = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        leased_task_id=uuid.uuid4(),
+        lane_id=str(lane_id),
+    )
+    assert leased is not None
+    assert leased.vm_instance_id == "vm-lane-reserved"
+
+
+@pytest.mark.asyncio
+async def test_expired_reservation_claim_does_not_clobber_live_lane_workspace(
+    db_session,
+):
+    """Leasing a stale expired reservation must not overwrite a live lane workspace."""
+    project = await _make_project(db_session, name="Lease Live Lane")
+    lane = ImprovementLane(
+        project_id=project.id,
+        title="live lane",
+        goal="live goal",
+        branch_name="live-branch",
+        base_branch="main",
+        workspace_state="LEASED",
+        workspace_vm_instance_id="live-vm",
+    )
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
+
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-stale-expired",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+        state=PoolVmState.IDLE,
+    )
+    member = await get_pool_vm(db_session, "vm-stale-expired")
+    member.reserved_lane_id = lane.id
+    member.reservation_expires_at = _utcnow() - timedelta(seconds=5)
+    db_session.add(member)
+    await db_session.commit()
+
+    leased = await lease_idle_pool_vm(
+        db_session,
+        project_id=project.id,
+        leased_task_id=uuid.uuid4(),
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+    )
+
+    assert leased is not None
+    assert leased.vm_instance_id == "vm-stale-expired"
+    await db_session.refresh(lane)
+    assert lane.workspace_state == "LEASED"
+    assert lane.workspace_vm_instance_id == "live-vm"
 
 
 # ---------------------------------------------------------------------------

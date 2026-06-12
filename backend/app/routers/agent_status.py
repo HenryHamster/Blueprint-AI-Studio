@@ -1156,6 +1156,18 @@ async def update_agent_status(
             ctx["prompt_fingerprint"] = payload.prompt_fingerprint
             task.context = ctx
 
+    if payload.workspace_prep is not None:
+        from app.review_fix_lane_pilot import record_workspace_prep_outcome
+
+        ctx = dict(task.context or {})
+        record_workspace_prep_outcome(
+            ctx,
+            payload.workspace_prep.model_dump(),
+            task_type=str((task.first_payload or {}).get("type") or ""),
+        )
+        task.context = ctx
+        flag_modified(task, "context")
+
     if payload.status == TaskStatus.COMPLETED:
         await record_artifact_consumptions_for_task(
             task, session, payload.consumed_artifact_ids, modern_agent=True

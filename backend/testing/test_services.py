@@ -1443,6 +1443,8 @@ async def test_cost_ceiling_disabled_ignores_compute_spend(cost_db, mocker):
 async def test_cost_ceiling_alert_when_pool_idle_pushes_over(cost_db, mocker):
     """Pool idle cost alone is enough to breach the ceiling if VM and compute are under."""
     from app.vm_cost_rates import idle_cost_usd
+    from app.models import Task, TaskStatus
+    from app.cost_ceiling import check_daily_cost_ceiling as _check_ceiling_impl
 
     project = await _make_project(cost_db)
 
@@ -1452,24 +1454,29 @@ async def test_cost_ceiling_alert_when_pool_idle_pushes_over(cost_db, mocker):
         dispatch_mock,
     )
 
-    # VM cost only: 5 minutes on-demand ≈ $0.006 — under a $0.10 ceiling.
-    task = _make_cost_task(project.id, vm_secs=300, is_spot=False)
-    cost_db.add(task)
+    fixed_now = datetime(2026, 6, 12, 12, 0, 0, tzinfo=timezone.utc)
 
-    # Pool VM that has been IDLE since midnight today (1 hour = 3600s idle).
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    idle_seconds = 3600.0
-    idle_since = now - timedelta(seconds=idle_seconds)
-    # Ensure idle_since is within today (not before midnight).
-    if idle_since < today_start:
-        idle_since = today_start + timedelta(seconds=1)
-        idle_seconds = (now - idle_since).total_seconds()
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+    # VM cost only: 5 minutes on-demand ≈ $0.006 — under the ceiling we set below.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_provisioned_at=fixed_now.replace(tzinfo=None) - timedelta(minutes=5),
+        vm_stopped_at=fixed_now.replace(tzinfo=None),
+        vm_spot=False,
+    )
+    cost_db.add(task)
 
     pool_vm = PoolVm(
         project_id=project.id,
         state=PoolVmState.IDLE,
-        idle_since=idle_since,
+        idle_since=fixed_now.replace(tzinfo=None) - timedelta(hours=1),
         vm_instance_id="pool-vm-test-idle",
         machine_type="e2-standard-2",
     )
@@ -1477,12 +1484,13 @@ async def test_cost_ceiling_alert_when_pool_idle_pushes_over(cost_db, mocker):
     await cost_db.commit()
     await cost_db.refresh(task)
 
-    # idle_cost_usd for idle_seconds (1h ≈ $0.067) must exceed our chosen ceiling.
-    expected_idle = idle_cost_usd(idle_seconds)
+    expected_idle = idle_cost_usd(3600.0)
     assert expected_idle > 0.05, f"Expected pool idle cost > $0.05, got {expected_idle}"
 
+    mocker.patch("app.cost_ceiling.datetime", _FixedDateTime)
+    mocker.patch("app.efficiency_snapshot._utcnow", return_value=fixed_now.replace(tzinfo=None))
     with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.05}):
-        await _check_daily_cost_ceiling(task, cost_db)
+        await _check_ceiling_impl(task, cost_db)
 
     await cost_db.flush()
     alerts = (

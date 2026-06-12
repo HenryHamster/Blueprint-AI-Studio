@@ -586,6 +586,20 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             "blacklisted_accounts",
             "provision_failed_accounts",
             "_slot_released",
+            # Transient lane-phase dispatch directives — must never be inherited
+            # by a clone. A requeued child that carries improvement_lane_id would
+            # claim the lane-reserved warm VM and expose stale lane_resume context;
+            # these are re-attached freshly only when a lane-aware spawn path
+            # deliberately reattaches them.
+            "improvement_lane_id",
+            "is_lane_phase",
+            "lane_checkpoint_sha",
+            "lane_resume",
+            # Warm handoff directives — per-attempt VM routing that must not
+            # carry over; the clone will receive a fresh warm assignment if eligible.
+            "warm_target_vm_id",
+            "warm_target_pr",
+            "warm_handoff_deadline",
         }
         clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
 

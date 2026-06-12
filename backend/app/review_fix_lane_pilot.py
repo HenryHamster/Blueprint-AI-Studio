@@ -44,6 +44,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.time_utils import _utcnow
+
 # Canonical keys/constants are OWNED by the measurement subtask — import them
 # verbatim, never re-type the literals (a drifted key silently de-populates the
 # trial's arm/receipt subpopulations).
@@ -62,6 +64,7 @@ logger = logging.getLogger(__name__)
 # lane. It rides the chain on EVERY task (including the cold review) so the
 # binding survives, while the active dispatch directive does not.
 LANE_CHAIN_ID_KEY = "_review_fix_lane_id"
+WORKSPACE_PREP_CONTEXT_KEY = "_workspace_prep"
 
 # Transient lane-resume block attached ONLY to a fix-task context. Carries the
 # accumulated chain knowledge (prior phase summaries, changed/critical files,
@@ -101,6 +104,35 @@ WORKSPACE_WARM_RESERVED = "WARM_RESERVED"
 WORKSPACE_LEASED = "LEASED"
 
 _VALID_ARMS = ("lane", "control")
+
+# ── Checkpoint-phase recovery classification ──────────────────────────────────
+# Returned by ``checkpoint_or_recover_phase`` so the review-spawn path can act on
+# a missing/unverifiable checkpoint instead of silently letting a cold review
+# proceed (the old behavior, where a miss only showed up as ``phase_requeues``).
+#   OK        → checkpoint written, or a benign no-op (lane None / already
+#               PARKED). The caller spawns the cold review normally.
+#   RECOVER   → checkpoint MISSING and the requeue budget is intact. The caller
+#               MUST suppress the review and spawn a lane-aware retry of the
+#               failed phase from durable context.
+#   EXHAUSTED → checkpoint MISSING and the requeue budget is exhausted. The lane
+#               has been closed (KILLED) inline and its reservation released; the
+#               caller falls back to a classic cold review (the lane treatment is
+#               over) — the visible exhaustion reason lives on the lane row.
+CHECKPOINT_PHASE_OK = "ok"
+CHECKPOINT_PHASE_RECOVER = "recover"
+CHECKPOINT_PHASE_EXHAUSTED = "exhausted"
+
+# Manifest key carrying the operator-visible checkpoint-recovery state (reason,
+# attempt, exhausted). Surfaced on the admin improvement-lanes row so a recovered
+# or killed lane explains *why* rather than only incrementing a counter.
+LANE_RECOVERY_MANIFEST_KEY = "recovery"
+
+# Durable context keys placed on a recovery task so the rebound lane chain can
+# explain itself. They are inert to warm dispatch (carry no improvement_lane_id /
+# checkpoint SHA / warm-handoff pin — the whole point of recovery is that the
+# warm workspace could not be trusted).
+LANE_RECOVERY_REASON_KEY = "_lane_recovery_reason"
+LANE_RECOVERY_ATTEMPT_KEY = "_lane_recovery_attempt"
 
 
 # ── Flag gating ───────────────────────────────────────────────────────────────
@@ -422,11 +454,17 @@ async def checkpoint_and_reserve_on_phase_complete(
     reserves the just-freed warm-pool member to the lane so the next fix phase
     can resume warm. Returns True when a checkpoint was written.
 
-    A missing/invalid SHA degrades to ``mark_checkpoint_missing`` (the lane is
-    left for the sweep to requeue) rather than fabricating a checkpoint.
+    A missing/invalid SHA degrades to ``mark_checkpoint_missing`` rather than
+    fabricating a checkpoint. The bounded recovery (suppress the review, requeue
+    the failed phase, or close the lane when exhausted) is driven inline by the
+    review-spawn path via ``checkpoint_or_recover_phase`` — not deferred to a
+    sweep. This function still returns a bare ``bool`` (True iff a checkpoint was
+    written) so existing callers/tests are unchanged; the recovery classifier
+    wraps it.
     """
     from app.improvement_lane_ops import (
         LaneCheckpointError,
+        LaneOwnerMismatchError,
         checkpoint_lane,
         mark_checkpoint_missing,
     )
@@ -440,6 +478,18 @@ async def checkpoint_and_reserve_on_phase_complete(
     # (e.g. a re-review spawned twice) is a no-op, not a loss — do not requeue.
     if lane.status != ImprovementLaneStatus.ACTIVE.value:
         return False
+
+    current_task_id = getattr(lane, "current_task_id", None)
+    if current_task_id is not None and current_task_id != source_task.id:
+        logger.info(
+            "[LANE-PILOT] stale checkpoint skipped for lane %s by non-owner task %s",
+            lane.id,
+            source_task.id,
+        )
+        raise LaneOwnerMismatchError(
+            f"Lane {lane.id} is owned by task {current_task_id}, "
+            f"but checkpoint was attempted by task {source_task.id}"
+        )
 
     if not sha or len(str(sha)) < 7:
         with contextlib.suppress(LaneCheckpointError):
@@ -526,6 +576,13 @@ async def checkpoint_and_reserve_on_phase_complete(
             task_id=source_task.id,
             checkpoint=payload,
         )
+    except LaneOwnerMismatchError:
+        logger.info(
+            "[LANE-PILOT] stale checkpoint skipped for lane %s by non-owner task %s",
+            lane.id,
+            source_task.id,
+        )
+        raise
     except LaneCheckpointError as exc:
         logger.warning("[LANE-PILOT] checkpoint failed for lane %s: %s", lane.id, exc)
         with contextlib.suppress(LaneCheckpointError):
@@ -558,6 +615,162 @@ async def checkpoint_and_reserve_on_phase_complete(
                 exc,
             )
     return True
+
+
+# ── Checkpoint-miss bounded recovery ──────────────────────────────────────────
+def _record_lane_recovery_state(
+    lane: Any, *, reason: str, attempt: int, exhausted: bool
+) -> None:
+    """Stamp an operator-visible recovery marker into the lane manifest.
+
+    Written on BOTH the under-budget requeue and the budget-exhausted close so
+    the admin lane view shows *why* a checkpoint-missing lane requeued or was
+    killed, not just an incremented ``phase_requeues`` counter. Reassigns
+    ``lane.manifest`` (rather than mutating in place) so SQLAlchemy persists the
+    JSONB change. The marker is a small scalar field — the bounded list-field
+    merge/resume logic never touches it.
+    """
+    manifest = dict(lane.manifest or {})
+    manifest[LANE_RECOVERY_MANIFEST_KEY] = {
+        "reason": str(reason)[:200],
+        "attempt": int(attempt),
+        "exhausted": bool(exhausted),
+        "at": _utcnow().isoformat(),
+    }
+    lane.manifest = manifest
+
+
+async def close_lane_checkpoint_exhausted(
+    session: AsyncSession, lane: Any, *, reason: str
+) -> bool:
+    """CAS a checkpoint-recovery-exhausted lane to KILLED and free its reservation.
+
+    Called when ``phase_requeues`` has crossed the budget so the lane reaches a
+    terminal state inline (rather than idling ACTIVE until the exhausted-budget
+    sweep) and any warm-pool member still reserved for it rejoins the general
+    pool immediately. Records a visible exhaustion reason in the manifest.
+    Best-effort: a non-ACTIVE lane is left unchanged. Returns True when closed.
+    """
+    from app.improvement_lane_ops import LaneCASError, cas_transition
+    from app.models import ImprovementLaneStatus, PoolVm
+
+    if lane is None or lane.status != ImprovementLaneStatus.ACTIVE.value:
+        return False
+    try:
+        await cas_transition(
+            session,
+            lane.id,
+            ImprovementLaneStatus.ACTIVE,
+            ImprovementLaneStatus.KILLED,
+        )
+    except LaneCASError as exc:
+        logger.warning(
+            "[LANE-PILOT] could not KILL checkpoint-exhausted lane %s: %s",
+            lane.id,
+            exc,
+        )
+        return False
+    _record_lane_recovery_state(
+        lane, reason=reason, attempt=lane.phase_requeues or 0, exhausted=True
+    )
+    lane.workspace_state = WORKSPACE_COLD
+    lane.workspace_vm_instance_id = None
+    reserved = (
+        (
+            await session.execute(
+                select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for member in reserved:
+        member.reserved_lane_id = None
+        member.reservation_expires_at = None
+        session.add(member)
+    session.add(lane)
+    logger.warning(
+        "[LANE-PILOT] lane %s KILLED — checkpoint recovery exhausted "
+        "(phase_requeues=%d) reason=%s",
+        lane.id,
+        lane.phase_requeues or 0,
+        reason,
+    )
+    return True
+
+
+async def checkpoint_or_recover_phase(
+    session: AsyncSession,
+    source_task: Any,
+    lane: Any,
+    *,
+    sha: str | None,
+    summary: str,
+) -> str:
+    """Checkpoint a completed lane phase, classifying a MISS into bounded recovery.
+
+    Wraps :func:`checkpoint_and_reserve_on_phase_complete` (whose bare-``bool``
+    return is preserved for existing callers/tests) and inspects the lane to
+    decide what the review-spawn path should do — replacing the old behavior
+    where a missing/unverifiable checkpoint silently let a cold review proceed
+    and only showed up as a ``phase_requeues`` increment.
+
+    Returns one of ``CHECKPOINT_PHASE_OK`` / ``CHECKPOINT_PHASE_RECOVER`` /
+    ``CHECKPOINT_PHASE_EXHAUSTED``:
+
+    * checkpoint written, or a benign no-op (lane None / already PARKED) → OK.
+    * checkpoint MISSING (lane still ACTIVE, ``phase_requeues`` bumped by
+      ``mark_checkpoint_missing``) and budget intact → RECOVER.
+    * checkpoint MISSING and budget exhausted → the lane is closed inline via
+      :func:`close_lane_checkpoint_exhausted` and EXHAUSTED is returned.
+    """
+    from app.improvement_lane_ops import LaneOwnerMismatchError
+    from app.models import ImprovementLaneStatus, _LANE_MAX_PHASE_REQUEUES
+
+    try:
+        written = await checkpoint_and_reserve_on_phase_complete(
+            session, source_task, lane, sha=sha, summary=summary
+        )
+    except LaneOwnerMismatchError:
+        return CHECKPOINT_PHASE_OK
+    if written or lane is None:
+        return CHECKPOINT_PHASE_OK
+    # ``checkpoint_lane`` advances a written checkpoint to PARKED; a lane still
+    # ACTIVE here means ``mark_checkpoint_missing`` recorded a miss. The other
+    # False paths (lane None handled above, or an already-PARKED no-op) leave a
+    # non-ACTIVE lane and must NOT trigger recovery.
+    if lane.status != ImprovementLaneStatus.ACTIVE.value:
+        return CHECKPOINT_PHASE_OK
+    if (lane.phase_requeues or 0) > _LANE_MAX_PHASE_REQUEUES:
+        await close_lane_checkpoint_exhausted(
+            session, lane, reason="checkpoint_recovery_exhausted"
+        )
+        return CHECKPOINT_PHASE_EXHAUSTED
+    return CHECKPOINT_PHASE_RECOVER
+
+
+async def rebind_lane_to_recovery(
+    session: AsyncSession, lane: Any, *, task_id: uuid.UUID, reason: str
+) -> None:
+    """Rebind an ACTIVE lane to a freshly-spawned checkpoint-recovery task.
+
+    The lane stays ACTIVE (the failed phase is being retried, not parked) and its
+    ``current_task_id`` points at the recovery task so chain continuity and the
+    operator lane view follow the retry. The workspace drops to COLD — the
+    recovery runs from a fresh clone because the warm checkpoint could not be
+    trusted. Records a visible recovery marker in the manifest. Best-effort: a
+    non-ACTIVE lane is left unchanged.
+    """
+    from app.models import ImprovementLaneStatus
+
+    if lane is None or lane.status != ImprovementLaneStatus.ACTIVE.value:
+        return
+    lane.current_task_id = task_id
+    lane.workspace_state = WORKSPACE_COLD
+    _record_lane_recovery_state(
+        lane, reason=reason, attempt=lane.phase_requeues or 0, exhausted=False
+    )
+    session.add(lane)
 
 
 # ── Fix-side warm resume wiring ───────────────────────────────────────────────
@@ -631,6 +844,33 @@ def confirm_lane_warm_resume(ctx: dict, *, has_checkpoint: bool) -> None:
     """
     ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] = True
     ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] = has_checkpoint
+
+
+def record_workspace_prep_outcome(
+    ctx: dict,
+    workspace_prep: dict[str, Any],
+    *,
+    task_type: str | None = None,
+) -> None:
+    """Persist the agent's actual workspace-prep outcome and reconcile receipts."""
+    ctx[WORKSPACE_PREP_CONTEXT_KEY] = workspace_prep
+    if not (bool(ctx.get("is_lane_phase")) and task_type in {"fix", "implement"}):
+        return
+
+    warm_reuse_succeeded = (
+        workspace_prep.get("path") == "warm"
+        and bool(workspace_prep.get("warm_reuse_succeeded"))
+    )
+    if not warm_reuse_succeeded:
+        ctx.pop(LANE_PILOT_WARM_RESUME_RECEIPT_KEY, None)
+        ctx.pop(LANE_PILOT_CHECKPOINT_RECEIPT_KEY, None)
+        return
+
+    ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] = True
+    if bool(workspace_prep.get("checkpoint_reset_applied")):
+        ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] = True
+    else:
+        ctx.pop(LANE_PILOT_CHECKPOINT_RECEIPT_KEY, None)
 
 
 # ── KILL mechanics ────────────────────────────────────────────────────────────
@@ -1045,19 +1285,30 @@ async def compute_lane_pilot_aggregates(
     from app.models import ImprovementLane, Task, TaskStatus
 
     # ── Durable per-arm sample counts + merge/cost from Task rows ─────────────
-    # Use intent-to-treat assignment, not lane rows: control chains never create
-    # an ImprovementLane row, so lane-row counts would permanently undercount it.
+    # The trial unit is the CHAIN (original PR / create task), not the individual
+    # iteration task. A multi-phase chain (create → review → fix → re-review →
+    # re-fix …) must contribute exactly ONE sample regardless of how many terminal
+    # tasks it spawns.  Chain identity: payloads[0].original_task_id when present
+    # (set on every spawned iteration task); the task's own id for the root create
+    # task (which has no original_task_id).
+    #
+    # Per-chain aggregation rules:
+    #   arm      — taken from the task row (consistent across a chain via ITT key)
+    #   merged   — True if ANY task in the chain has pr_merged=True
+    #   cost     — SUM across all tasks in the chain
     is_sqlite = resolve_dialect_name(session) == "sqlite"
     if is_sqlite:
         _arm_expr = func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}")
         _merged_expr = func.json_extract(Task.context, "$.pr_merged")
+        _orig_id_expr = func.json_extract(Task.payloads, "$[0].original_task_id")
     else:
         _arm_expr = Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext
         _merged_expr = Task.context["pr_merged"].astext
+        _orig_id_expr = Task.payloads[0]["original_task_id"].as_string()
 
     task_rows = (
         await session.execute(
-            select(Task.estimated_cost_usd, _arm_expr, _merged_expr)
+            select(Task.id, Task.estimated_cost_usd, _arm_expr, _merged_expr, _orig_id_expr)
             .where(
                 Task.project_id == project_id,
                 Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
@@ -1066,30 +1317,40 @@ async def compute_lane_pilot_aggregates(
         )
     ).all()
 
-    arm_merged_count: dict[str, int] = {"lane": 0, "control": 0}
-    arm_cost_merged: dict[str, float] = {"lane": 0.0, "control": 0.0}
-    arm_task_total: dict[str, int] = {"lane": 0, "control": 0}
-
-    for cost, arm_val, merged_val in task_rows:
+    # Group rows by chain, then compute per-arm counts.
+    _chains: dict[str, dict[str, Any]] = {}
+    for task_id_val, cost, arm_val, merged_val, orig_id_val in task_rows:
         arm = str(arm_val) if arm_val is not None else None
         if arm not in ("lane", "control"):
             continue
-        arm_task_total[arm] += 1
-        is_merged = merged_val in (True, 1, "true", "True") if merged_val is not None else False
-        if is_merged:
-            arm_merged_count[arm] += 1
-            arm_cost_merged[arm] += float(cost or 0.0)
+        chain_id = str(orig_id_val).strip() if orig_id_val else str(task_id_val)
+        if chain_id not in _chains:
+            _chains[chain_id] = {"arm": arm, "merged": False, "cost": 0.0}
+        _chains[chain_id]["cost"] += float(cost or 0.0)
+        if merged_val in (True, 1, "true", "True"):
+            _chains[chain_id]["merged"] = True
 
-    n_lane = arm_task_total["lane"]
-    n_control = arm_task_total["control"]
+    arm_merged_count: dict[str, int] = {"lane": 0, "control": 0}
+    arm_cost_merged: dict[str, float] = {"lane": 0.0, "control": 0.0}
+    arm_chain_total: dict[str, int] = {"lane": 0, "control": 0}
+
+    for chain in _chains.values():
+        arm = chain["arm"]
+        arm_chain_total[arm] += 1
+        if chain["merged"]:
+            arm_merged_count[arm] += 1
+            arm_cost_merged[arm] += chain["cost"]
+
+    n_lane = arm_chain_total["lane"]
+    n_control = arm_chain_total["control"]
 
     lane_merge_rate: float | None = (
-        arm_merged_count["lane"] / arm_task_total["lane"]
-        if arm_task_total["lane"] > 0 else None
+        arm_merged_count["lane"] / arm_chain_total["lane"]
+        if arm_chain_total["lane"] > 0 else None
     )
     control_merge_rate: float | None = (
-        arm_merged_count["control"] / arm_task_total["control"]
-        if arm_task_total["control"] > 0 else None
+        arm_merged_count["control"] / arm_chain_total["control"]
+        if arm_chain_total["control"] > 0 else None
     )
     lane_cost_per_merged: float | None = (
         arm_cost_merged["lane"] / arm_merged_count["lane"]
@@ -1151,9 +1412,10 @@ async def compute_lane_pilot_aggregates(
     )
 
     # ── Treatment-engagement receipts (warm-resume + checkpoint) ─────────────
-    # Among terminal lane-arm fix-phase tasks, count how many carried each
-    # durable receipt.  Receipt keys are stamped only at the actual warm-claim
-    # or checkpoint site, so absence means the treatment was not delivered.
+    # Among terminal lane-arm fix-phase tasks, count chains where at least one
+    # fix task in the chain carried each durable receipt.  Grouping by chain
+    # (via original_task_id) keeps engagement fractions consistent with the
+    # chain-level n_lane count computed above.
     if is_sqlite:
         _warm_receipt_expr = func.json_extract(
             Task.context, f"$.{LANE_PILOT_WARM_RESUME_RECEIPT_KEY}"
@@ -1163,7 +1425,7 @@ async def compute_lane_pilot_aggregates(
         )
         _fix_payload_type_expr = func.json_extract(Task.payloads, "$[0].type")
         _engagement_stmt = (
-            select(_warm_receipt_expr, _ckpt_receipt_expr)
+            select(Task.id, _orig_id_expr, _warm_receipt_expr, _ckpt_receipt_expr)
             .where(
                 Task.project_id == project_id,
                 Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
@@ -1174,6 +1436,8 @@ async def compute_lane_pilot_aggregates(
     else:
         _engagement_stmt = (
             select(
+                Task.id,
+                _orig_id_expr,
                 Task.context[LANE_PILOT_WARM_RESUME_RECEIPT_KEY].astext,
                 Task.context[LANE_PILOT_CHECKPOINT_RECEIPT_KEY].astext,
             )
@@ -1186,15 +1450,21 @@ async def compute_lane_pilot_aggregates(
         )
 
     engagement_rows = (await session.execute(_engagement_stmt)).all()
-    lane_fix_tasks_sampled = len(engagement_rows)
-    warm_resume_count = 0
-    checkpoint_count = 0
     _TRUTHY = (True, 1, "true", "True", "1")
-    for warm_val, ckpt_val in engagement_rows:
+    # Group by chain: chain is warm/checkpoint-engaged if ANY fix task in it was.
+    _engagement_chains: dict[str, dict[str, bool]] = {}
+    for task_id_val, orig_id_val, warm_val, ckpt_val in engagement_rows:
+        chain_id = str(orig_id_val).strip() if orig_id_val else str(task_id_val)
+        if chain_id not in _engagement_chains:
+            _engagement_chains[chain_id] = {"warm": False, "ckpt": False}
         if warm_val in _TRUTHY:
-            warm_resume_count += 1
+            _engagement_chains[chain_id]["warm"] = True
         if ckpt_val in _TRUTHY:
-            checkpoint_count += 1
+            _engagement_chains[chain_id]["ckpt"] = True
+
+    lane_fix_tasks_sampled = len(_engagement_chains)
+    warm_resume_count = sum(1 for c in _engagement_chains.values() if c["warm"])
+    checkpoint_count = sum(1 for c in _engagement_chains.values() if c["ckpt"])
 
     warm_resume_fraction: float | None = (
         warm_resume_count / lane_fix_tasks_sampled if lane_fix_tasks_sampled > 0 else None

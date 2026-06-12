@@ -27,6 +27,7 @@ from app.models import (
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
 )
+from app.admin import _get_user_project_with_role
 from app.auth import get_current_user, require_admin
 from app.vm_cost_rates import get_vm_rate_per_second, VM_COST_RATES
 from app.shared_state import (
@@ -1369,6 +1370,11 @@ async def get_improvement_lanes(
                 "reserved_vm_instance_id": reserved_vm_instance_id,
                 "pilot_arm": lane.pilot_arm,
                 "phase_requeues": lane.phase_requeues,
+                # Operator-visible checkpoint-recovery state (reason/attempt/
+                # exhausted) so a requeued or KILLED lane explains *why* rather
+                # than surfacing only a phase_requeues counter. None until a
+                # checkpoint miss drives the bounded-recovery path.
+                "recovery": (lane.manifest or {}).get("recovery"),
                 "llm_input_tokens_total": lane.llm_input_tokens_total,
                 "llm_output_tokens_total": lane.llm_output_tokens_total,
                 "vm_cost_usd_total": round(lane.vm_cost_usd_total or 0.0, 6),
@@ -1443,4 +1449,65 @@ async def get_lane_baselines(
         "project_id": str(project_id),
         "count": len(sorted_baselines),
         "baselines": [v for _, v in sorted_baselines],
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/improvement-lanes/drain
+# ---------------------------------------------------------------------------
+
+
+@router.post("/improvement-lanes/drain")
+async def drain_improvement_lane_pilot(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Disable and drain the review-fix lane pilot for a project.
+
+    Distinct from the raw settings toggle: this action communicates the full
+    impact, requires owner authorization, stops future lane assignment, releases
+    lane-held warm-pool reservations, and transitions in-flight ACTIVE/PARKED lane
+    rows to the terminal KILLED state. It also records a durable KILL verdict so
+    the spawn gate (is_review_fix_lane_pilot_active_for_project) keeps blocking
+    new lane assignment after a runtime_config reload.
+
+    Idempotent: calling drain on an already-drained pilot returns zero counts and
+    succeeds. Returns the kill report (flag_disabled, reservations_cleared,
+    lanes_killed, reason) plus the project_id.
+    """
+    from app.capability_trial_verdict import (  # noqa: PLC0415
+        LANE_PILOT_CAP_NAME,
+        record_trial_verdict,
+    )
+    from app.review_fix_lane_pilot import apply_lane_pilot_kill  # noqa: PLC0415
+    from app.time_utils import _utcnow  # noqa: PLC0415
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    report = await apply_lane_pilot_kill(
+        session, project_id, reason="operator_drain"
+    )
+
+    # Record a durable KILL verdict so the spawn gate survives runtime_config
+    # reload. Uses the same evidence_source and verdict shape as the automated
+    # digest path so is_review_fix_lane_killed(project) returns True after reload.
+    record_trial_verdict(
+        project,
+        LANE_PILOT_CAP_NAME,
+        {
+            "verdict": "KILL",
+            "verdict_reason": "operator_drain",
+            "evidence_source": "operator",
+            "evaluated_at": _utcnow().isoformat(),
+        },
+    )
+
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        **report,
     }

@@ -9478,3 +9478,78 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
     assert not (review_task.context or {}).get("_review_stale_head"), (
         "_review_stale_head must not be set when reviewed_head_sha is absent"
     )
+
+
+@pytest.mark.asyncio
+async def test_requeue_clone_strips_lane_transient_context(tl_db, mocker):
+    """Requeued clone must not inherit transient lane or warm handoff directives.
+
+    A clone carrying improvement_lane_id would silently claim the lane-reserved
+    warm VM and expose stale lane_resume context. Warm handoff directives are
+    per-attempt routing that the clone must not inherit. Durable chain keys
+    (_review_fix_lane_arm / _review_fix_lane_id) must survive so measurement
+    continuity is preserved.
+    """
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+
+    transient_keys = {
+        "improvement_lane_id": "lane-abc-123",
+        "is_lane_phase": True,
+        "lane_checkpoint_sha": "deadbeef",
+        "lane_resume": {"prior_phases": ["phase1"], "critical_files": ["foo.py"]},
+        "warm_target_vm_id": "vm-warm-xyz",
+        "warm_target_pr": "https://github.com/o/r/pull/99",
+        "warm_handoff_deadline": "2099-01-01T00:00:00Z",
+    }
+    durable_keys = {
+        "_review_fix_lane_arm": "lane",
+        "_review_fix_lane_id": "chain-uuid-456",
+    }
+
+    await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "_attempt_number": 1,
+            **transient_keys,
+            **durable_keys,
+        },
+        latest_status_message="Build failed",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+    assert result == 1
+
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    # All transient lane + warm handoff keys must be absent from the clone
+    for key in transient_keys:
+        assert key not in clone_ctx, (
+            f"Transient key {key!r} must not be inherited by requeue clone"
+        )
+
+    # Durable chain keys must survive for measurement continuity
+    assert clone_ctx.get("_review_fix_lane_arm") == "lane", (
+        "_review_fix_lane_arm must be preserved in requeue clone"
+    )
+    assert clone_ctx.get("_review_fix_lane_id") == "chain-uuid-456", (
+        "_review_fix_lane_id must be preserved in requeue clone"
+    )
