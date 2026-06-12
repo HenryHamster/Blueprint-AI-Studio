@@ -26,6 +26,7 @@ from app.retry_budget import (
     compute_effective_max_requeues,
 )
 from app.retry_prompt import _build_retry_prompt_suffix, merge_retry_prompt_suffix
+from app.task_blocked import strip_fresh_attempt_context
 
 logger = logging.getLogger(__name__)
 
@@ -580,45 +581,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         _raw_agent_cat = (child_ctx.get("failure_category") or "").lower()
         if failure_class == "CODE_ERROR" and _raw_agent_cat == "scope_overflow":
             failure_class = "SCOPE_OVERFLOW"
-        _ctx_keys_to_strip = {
-            "max_plan_account_id",
-            "llm_account_id",
-            "llm_provider",
-            "llm_auth_mode",
-            "llm_model",
-            "llm_execution_mode",
-            "provision_failures",
-            "provision_failures_infra",
-            "_infra_wait",
-            "blacklisted_accounts",
-            "provision_failed_accounts",
-            "_slot_released",
-            # Transient lane-phase dispatch directives — must never be inherited
-            # by a clone. A requeued child that carries improvement_lane_id would
-            # claim the lane-reserved warm VM and expose stale lane_resume context;
-            # these are re-attached freshly only when a lane-aware spawn path
-            # deliberately reattaches them.
-            "improvement_lane_id",
-            "is_lane_phase",
-            "lane_checkpoint_sha",
-            "lane_resume",
-            # Warm handoff directives — per-attempt VM routing that must not
-            # carry over; the clone will receive a fresh warm assignment if eligible.
-            "warm_target_vm_id",
-            "warm_target_pr",
-            "warm_handoff_deadline",
-            # Stale failure verdict and blocker state — written for the failed child
-            # attempt; must not be inherited by the clone or it would short-circuit
-            # fresh classification and route the first BLOCKED episode into the
-            # already-escalated branch.
-            "failure_class",
-            "failure_category",
-            "blocker",
-            "_blocked_escalated",
-            "_precondition_escalated_key",
-            "_blocked_optimistic_retries",
-        }
-        clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
+        clone_ctx = strip_fresh_attempt_context(child_ctx)
 
         # Preserve the prior attempt's provider/model under a non-stripped key
         # so retry guidance can branch on what actually failed (e.g. emit

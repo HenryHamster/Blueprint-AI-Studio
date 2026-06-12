@@ -15,6 +15,7 @@ import importlib
 import json
 import os
 import uuid
+from datetime import datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -1084,6 +1085,8 @@ def test_unblock_to_queued_clears_metadata_and_requeues():
         project_id=uuid.uuid4(),
         payloads=[{"type": "create", "prompt": "x"}],
         status=TaskStatus.IN_PROGRESS,
+        retry_after_until=datetime.utcnow() + timedelta(minutes=15),
+        context={"_retry_after_resets": 2, "_blocked_optimistic_retries": 3},
     )
     enter_blocked_state(task, waiting_on="dep", reason="blocked")
     assert task.status == TaskStatus.BLOCKED
@@ -1098,6 +1101,9 @@ def test_unblock_to_queued_clears_metadata_and_requeues():
     # recovered task does not carry them into its next run.
     assert "failure_class" not in (task.context or {})
     assert "failure_category" not in (task.context or {})
+    assert task.retry_after_until is None
+    assert "_retry_after_resets" not in (task.context or {})
+    assert "_blocked_optimistic_retries" not in (task.context or {})
     assert task.blocker_kind is None
     assert task.blocked_reason is None
     assert task.blocked_at is None
@@ -1113,6 +1119,8 @@ def test_clear_blocker_metadata_preserves_authoritative_verdict():
         project_id=uuid.uuid4(),
         payloads=[{"type": "create", "prompt": "x"}],
         status=TaskStatus.IN_PROGRESS,
+        retry_after_until=datetime.utcnow() + timedelta(minutes=20),
+        context={"_retry_after_resets": 1},
     )
     enter_blocked_state(task, waiting_on="dep", reason="blocked")
     # A later authoritative classifier overwrites the failure class.
@@ -1148,6 +1156,70 @@ def test_mark_blocker_escalated_sets_marker():
     assert meta["escalation_detail"] == "deadline elapsed"
 
 
+def test_fresh_attempt_context_strip_preserves_retry_guidance_history():
+    from app.task_blocked import strip_fresh_attempt_context
+
+    ctx = strip_fresh_attempt_context(
+        {
+            "failure_class": "CODE_ERROR",
+            "failure_category": "CODE_ERROR",
+            "blocker": {"source": "agent"},
+            "_blocked_escalated": True,
+            "_precondition_escalated_key": "dep",
+            "_blocked_optimistic_retries": 2,
+            "_retry_after_resets": 4,
+            "_dispatch_prep_failures": 3,
+            "provision_failures": 2,
+            "llm_account_id": "acct-1",
+            "_previous_failure_class": "SCOPE_OVERFLOW",
+            "_failure_class_history": ["SCOPE_OVERFLOW"],
+        }
+    )
+
+    assert "failure_class" not in ctx
+    assert "failure_category" not in ctx
+    assert "blocker" not in ctx
+    assert "_blocked_escalated" not in ctx
+    assert "_precondition_escalated_key" not in ctx
+    assert "_blocked_optimistic_retries" not in ctx
+    assert "_retry_after_resets" not in ctx
+    assert "_dispatch_prep_failures" not in ctx
+    assert "provision_failures" not in ctx
+    assert "llm_account_id" not in ctx
+    assert ctx["_previous_failure_class"] == "SCOPE_OVERFLOW"
+    assert ctx["_failure_class_history"] == ["SCOPE_OVERFLOW"]
+
+
+def test_clear_blocker_metadata_allows_clean_reescalation():
+    from app.task_blocked import (
+        clear_blocker_metadata,
+        enter_blocked_state,
+        mark_blocker_escalated,
+    )
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    enter_blocked_state(task, waiting_on="dep", reason="blocked")
+    mark_blocker_escalated(task, detail="first deadline")
+
+    clear_blocker_metadata(task)
+    ctx = task.context or {}
+    assert "blocker" not in ctx
+    assert "_blocked_escalated" not in ctx
+    assert "_precondition_escalated_key" not in ctx
+    assert task.retry_after_until is None
+    assert "_retry_after_resets" not in ctx
+
+    enter_blocked_state(task, waiting_on="dep", reason="blocked again")
+    mark_blocker_escalated(task, detail="second deadline")
+
+    assert (task.context or {})["blocker"]["escalation_detail"] == "second deadline"
+    assert (task.context or {})["failure_class"] == "BLOCKED_PRECONDITION"
+
+
 @pytest.mark.asyncio
 async def test_requeue_parent_blocked_when_child_in_blocked_state(tl_db, mocker):
     """A parent whose only unsucceeded child is in the first-class BLOCKED state
@@ -1171,6 +1243,55 @@ async def test_requeue_parent_blocked_when_child_in_blocked_state(tl_db, mocker)
     assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
     # Requeue budget untouched — this was not a retry.
     assert (parent.context or {}).get("_requeue_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_clone_strips_dispatch_prep_failures(tl_db, mocker):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    child = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "failure_category": "CODE_ERROR",
+            "_dispatch_prep_failures": 3,
+            "_blocked_escalated": True,
+            "_previous_failure_class": "SCOPE_OVERFLOW",
+            "_failure_class_history": ["SCOPE_OVERFLOW"],
+        },
+        latest_status_message="tests failed",
+    )
+
+    retried = await _requeue_parent_task(parent, session)
+    assert retried == 1
+
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.id != child.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+    assert "_dispatch_prep_failures" not in clone_ctx
+    assert "_blocked_escalated" not in clone_ctx
+    assert "failure_category" not in clone_ctx
+    assert clone_ctx["_previous_failure_class"] == "CODE_ERROR"
+    history_classes = [
+        entry.get("class") if isinstance(entry, dict) else entry
+        for entry in clone_ctx["_failure_class_history"]
+    ]
+    assert history_classes == ["SCOPE_OVERFLOW", "CODE_ERROR"]
 
 
 @pytest.mark.asyncio
@@ -7272,7 +7393,22 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
         task_type="compute_experiment",
         status=TaskStatus.IN_PROGRESS,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        context={
+            "failure_class": "CODE_ERROR",
+            "failure_category": "CODE_ERROR",
+            "blocker": {"source": "agent"},
+            "_blocked_escalated": True,
+            "_precondition_escalated_key": "dep",
+            "_blocked_optimistic_retries": 2,
+            "_retry_after_resets": 3,
+            "_dispatch_prep_failures": 3,
+            "provision_failures": 1,
+            "llm_account_id": "acct-1",
+            "_previous_failure_class": "SCOPE_OVERFLOW",
+            "_failure_class_history": ["SCOPE_OVERFLOW"],
+        },
     )
+    task.retry_after_until = datetime(2099, 1, 1)
 
     # --- Park the task on the compute-job-terminal source. -------------------
     reg = await park_task(
@@ -7325,6 +7461,20 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
     assert task.status == TaskStatus.QUEUED  # RESUME re-queues for dispatch
     assert task.parked_at is None
     assert task.vm_instance_id is None
+    ctx = task.context or {}
+    assert "failure_class" not in ctx
+    assert "failure_category" not in ctx
+    assert "blocker" not in ctx
+    assert "_blocked_escalated" not in ctx
+    assert "_precondition_escalated_key" not in ctx
+    assert "_blocked_optimistic_retries" not in ctx
+    assert "_retry_after_resets" not in ctx
+    assert "_dispatch_prep_failures" not in ctx
+    assert "provision_failures" not in ctx
+    assert "llm_account_id" not in ctx
+    assert task.retry_after_until is None
+    assert ctx["_previous_failure_class"] == "SCOPE_OVERFLOW"
+    assert ctx["_failure_class_history"] == ["SCOPE_OVERFLOW"]
     assert reg.delivery_state == WakeDeliveryState.DELIVERED
     assert reg.result_state == "resumed"
     assert reg.attempt_count == 1

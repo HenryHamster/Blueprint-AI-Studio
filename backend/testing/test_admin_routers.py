@@ -13018,6 +13018,8 @@ class TestBulkRetrySessionFactory:
             status=TaskStatus.FAILED,
             vm_instance_id="agent-vm-old",
             attempt_count=3,
+            retry_after_until=datetime(2099, 1, 1),
+            context={"_retry_after_resets": 5},
         )
         db_session.add(task)
         await db_session.commit()
@@ -13039,6 +13041,8 @@ class TestBulkRetrySessionFactory:
         assert task.status == TaskStatus.QUEUED
         assert task.attempt_count == 0
         assert task.vm_instance_id != "agent-vm-old"
+        assert task.retry_after_until is None
+        assert "_retry_after_resets" not in (task.context or {})
 
 
 class TestRequeueClearsBlockerMetadata:
@@ -13064,6 +13068,8 @@ class TestRequeueClearsBlockerMetadata:
             status=TaskStatus.IN_PROGRESS,
             vm_instance_id="agent-vm-old",
             attempt_count=2,
+            retry_after_until=datetime(2099, 1, 1),
+            context={"_retry_after_resets": 7},
         )
         db_session.add(task)
         await db_session.commit()
@@ -13101,6 +13107,8 @@ class TestRequeueClearsBlockerMetadata:
         assert task.blocked_reason is None
         assert task.blocked_at is None
         assert task.recheck_after is None
+        assert task.retry_after_until is None
+        assert "_retry_after_resets" not in (task.context or {})
         # Clean attempt: counter reset like any leaf requeue.
         assert task.attempt_count == 0
 

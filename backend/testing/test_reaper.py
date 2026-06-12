@@ -59,7 +59,9 @@ from app.reaper import (
     _ORPHAN_PRIORITY_SPOT,
     _ORPHAN_PRIORITY_PROVISION,
     _ORPHAN_PRIORITY_DEFAULT,
+    _normalize_reaper_retry_failure_class,
 )
+from app.retry_prompt import _build_retry_prompt_suffix
 from app.shared_state import runtime_config as _runtime_config
 import app.reaper_sweeps as _rs
 from app.reaper_sweeps import event_driven_unblock_on_knowledge
@@ -90,6 +92,23 @@ def test_heartbeat_stale_cutoff_respects_runtime_config_override():
             _runtime_config.pop("heartbeat_stale_seconds_by_scope", None)
         else:
             _runtime_config["heartbeat_stale_seconds_by_scope"] = original
+
+
+def test_reaper_restart_scope_overflow_raw_lowercase_label_escalates():
+    retry_ctx = {"failure_category": "scope_overflow", "scope": "small"}
+
+    retry_class = _normalize_reaper_retry_failure_class("CODE_ERROR", retry_ctx)
+    guidance, scope_override = _build_retry_prompt_suffix(
+        retry_class,
+        "agent reported lower-case scope_overflow",
+        1,
+        "small",
+        retry_ctx,
+    )
+
+    assert retry_class == "SCOPE_OVERFLOW"
+    assert scope_override == "medium"
+    assert "file-count budget" in guidance
 
 
 def test_heartbeat_stale_cutoff_effort_floor_extends_small_scope_max_effort():

@@ -80,6 +80,8 @@ from app.admin_task_mutations import (
     _handle_task_pr_approval,
     modify_task_apply,
 )
+from app.task_blocked import strip_fresh_attempt_context
+from app.time_utils import clear_retry_after
 from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
     router as _operator_triggers_router,
@@ -700,25 +702,10 @@ async def _bulk_retry_one_task(
                 task.attempt_count = 0
                 task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                 task.last_heartbeat = None
-                # Reset retry counters for a clean slate — matches single-task admin retry
-                bulk_ctx = dict(task.context or {})
-                bulk_ctx.pop("provision_failures", None)
-                bulk_ctx.pop("retry_after", None)
-                bulk_ctx.pop("max_plan_account_id", None)
-                bulk_ctx.pop("llm_account_id", None)
-                bulk_ctx.pop("llm_provider", None)
-                bulk_ctx.pop("llm_auth_mode", None)
-                bulk_ctx.pop("llm_model", None)
-                bulk_ctx.pop("llm_execution_mode", None)
-                bulk_ctx.pop("blacklisted_accounts", None)
-                bulk_ctx.pop("provision_failed_accounts", None)
-                bulk_ctx.pop("_slot_released", None)
-                bulk_ctx.pop("_api_failure_retries", None)
-                # Clear the previous attempt's failure verdict — see the
-                # single-task requeue path (admin_task_mutations.py) for why a
-                # stale failure_class/failure_category poisons reclassification.
-                bulk_ctx.pop("failure_class", None)
-                bulk_ctx.pop("failure_category", None)
+                # Reset attempt-scoped state for a clean slate — matches
+                # single-task admin retry.
+                clear_retry_after(task)
+                bulk_ctx = strip_fresh_attempt_context(task.context or {})
                 task.context = bulk_ctx
             history = TaskHistory(
                 task_id=task.id,

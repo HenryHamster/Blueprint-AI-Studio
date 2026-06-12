@@ -78,10 +78,22 @@ from app.failure_classification import (
     _persist_stuck_call_reclassification,
 )
 from app.retry_budget import append_failure_class_history
+from app.task_blocked import strip_fresh_attempt_context
 from app.time_utils import _utcnow, set_retry_after
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_reaper_retry_failure_class(
+    failure_class: str, context: object
+) -> str:
+    """Match clone retry classification for raw lowercase scope-overflow labels."""
+    if failure_class != "CODE_ERROR" or not isinstance(context, dict):
+        return failure_class
+    if str(context.get("failure_category") or "").lower() == "scope_overflow":
+        return "SCOPE_OVERFLOW"
+    return failure_class
 
 
 async def _relock_orphan_task(
@@ -2482,7 +2494,8 @@ async def reaper_service():
                             # failure_class is already persisted in context: that verdict was
                             # written at the failure instant and must not be demoted to
                             # AGENT_TIMEOUT just because logs are empty in this reaper cycle.
-                            _ctx_persisted_verdict = (task.context or {}).get(
+                            _ctx_for_classification = task.context or {}
+                            _ctx_persisted_verdict = _ctx_for_classification.get(
                                 "failure_class"
                             )
                             reap_failure_class = classify_failure(
@@ -2494,6 +2507,9 @@ async def reaper_service():
                                 and not _ctx_persisted_verdict
                             ):
                                 reap_failure_class = "AGENT_TIMEOUT"
+                            reap_failure_class = _normalize_reaper_retry_failure_class(
+                                reap_failure_class, _ctx_for_classification
+                            )
                             persist_authoritative_verdict(task, reap_failure_class)
                             task_scope = (task.context or {}).get("scope")
                             class_budget = resolve_retry_budget(
@@ -2830,24 +2846,32 @@ async def reaper_service():
                                 task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                                 task.last_heartbeat = None
                                 task.started_at = None
-                                reaper_ctx = dict(task.context or {})
-                                # Clear account so dispatcher does fresh selection (respects blacklist)
-                                reaper_ctx = clear_task_llm_runtime_context(reaper_ctx)
-                                reaper_ctx.pop("_slot_released", None)
-                                # Clear stale failure verdict and blocker state — these were
-                                # written for the attempt that just died and must not carry into
-                                # the retry attempt where they would short-circuit fresh
-                                # classification (failure_class) or route the first BLOCKED episode
-                                # directly into the already-escalated branch (_blocked_escalated).
-                                for _stale_key in (
-                                    "failure_class",
-                                    "failure_category",
-                                    "blocker",
-                                    "_blocked_escalated",
-                                    "_precondition_escalated_key",
-                                    "_blocked_optimistic_retries",
-                                ):
-                                    reaper_ctx.pop(_stale_key, None)
+                                _pre_strip_reaper_ctx = task.context or {}
+                                reaper_ctx = strip_fresh_attempt_context(
+                                    _pre_strip_reaper_ctx
+                                )
+                                # provision_failures is a task-lifetime counter
+                                # that must survive ALL reap retries — only
+                                # admin/clone resurrects should get a clean slate.
+                                if "provision_failures" in _pre_strip_reaper_ctx:
+                                    reaper_ctx["provision_failures"] = (
+                                        _pre_strip_reaper_ctx["provision_failures"]
+                                    )
+                                if is_provision_failure:
+                                    # Provision retry counters and account
+                                    # tracking survive into the retry so repeated
+                                    # infrastructure failures still converge and
+                                    # the account blacklist is enforced.
+                                    for _provision_key in (
+                                        "provision_failures_infra",
+                                        "_infra_wait",
+                                        "blacklisted_accounts",
+                                        "provision_failed_accounts",
+                                    ):
+                                        if _provision_key in _pre_strip_reaper_ctx:
+                                            reaper_ctx[_provision_key] = (
+                                                _pre_strip_reaper_ctx[_provision_key]
+                                            )
                                 # Enrich with failure diagnosis for retry guidance
                                 try:
                                     from app.anomaly_detection import (

@@ -48,6 +48,8 @@ from app.task_capabilities import (
     get_task_capability,
     strategic_phase_for,
 )
+from app.task_blocked import strip_fresh_attempt_context
+from app.time_utils import clear_retry_after
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
@@ -6519,11 +6521,8 @@ async def deliver_wake(
         task.parked_at = None
         task.park_reason = None
         task.vm_instance_id = None
-        # Clear the slot-released marker so re-dispatch acquires a fresh slot.
-        if (task.context or {}).get("_slot_released"):
-            ctx = dict(task.context or {})
-            ctx.pop("_slot_released", None)
-            task.context = ctx
+        clear_retry_after(task)
+        task.context = strip_fresh_attempt_context(task.context or {})
         task.latest_status_message = (
             f"Woken by {registration.wake_source_kind}: re-queued for dispatch"
         )[:500]
