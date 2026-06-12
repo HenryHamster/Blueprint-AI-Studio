@@ -365,6 +365,21 @@ async def _lock_provisioning_task_for_vm(
     return task
 
 
+def _clear_dispatch_prep_failures(task: Task) -> None:
+    """Drop the contained dispatch-crash counter ahead of a dispatch commit.
+
+    Called on the dispatch paths whose commit moves the task out of the
+    crash-prone prep window (warm-pool lease, PROVISIONING). The cleared
+    counter is persisted by that same commit — if the commit (or anything
+    before it) still crashes, the rollback restores the counter so quarantine
+    progress is never lost to a partially-successful attempt.
+    """
+    if "_dispatch_prep_failures" in (task.context or {}):
+        ctx = dict(task.context)
+        ctx.pop("_dispatch_prep_failures", None)
+        task.context = ctx
+
+
 # ---------------------------------------------------------------------------
 # Module-level globals managed by orchestrator_worker
 # ---------------------------------------------------------------------------
@@ -524,6 +539,16 @@ _orchestrator_consecutive_monitoring_errors: int = 0
 
 # Configurable throttle sleep when high failure rate detected
 ORCHESTRATOR_THROTTLE_SECONDS = int(os.getenv("ORCHESTRATOR_THROTTLE_SECONDS", "30"))
+
+# A task whose dispatch preparation crashes this many consecutive times
+# (contained per-task failures, counted in context["_dispatch_prep_failures"])
+# is quarantined: FAILED + PROVISION_FAILURE classification + operator alert.
+# Without the bound, a deterministic prep crash (malformed payload/context)
+# re-occupies the same ranked dispatch slot every cycle and the per-type
+# failure gate never engages because the task never reaches FAILED.
+DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD = int(
+    os.getenv("DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD", "3")
+)
 
 # How long the worker may go without a progress heartbeat before /health
 # reports it as wedged (→ Cloud Run liveness restart). Must comfortably exceed
@@ -3022,1180 +3047,1357 @@ async def orchestrator_worker():
                         )
                         continue
 
-                    task = await _lock_dispatchable_task_for_mutation(session, _qt_id)
-                    if task is None:
-                        continue
-                    if task.requires_approval:
-                        await session.rollback()
-                        continue
-                    resource_defer_msg = await _project_resource_dispatch_defer_message(
-                        session, task, project_active_counts
-                    )
-                    if resource_defer_msg:
-                        logger.info(
-                            "[ORCHESTRATOR] Deferring task %s for project %s: %s",
-                            task.id,
-                            task.project_id,
-                            resource_defer_msg,
-                        )
-                        if task.latest_status_message != resource_defer_msg:
-                            task.latest_status_message = resource_defer_msg
-                            session.add(task)
-                            await broadcast_to_project(
-                                str(task.project_id),
-                                "task_updated",
-                                {
-                                    "task_id": str(task.id),
-                                    "status": task.status,
-                                    "message": resource_defer_msg,
-                                },
-                            )
-                        await session.commit()
-                        continue
-
-                    # Phase 2c: warm-VM continuity skip-provision branch.
-                    # Three outcomes when warm_target_vm_id is set on the task:
-                    #   (a) deadline expired → clear warm fields, fall through
-                    #       to provision (cold path).
-                    #   (b) target VM heartbeated within 90s → skip provision
-                    #       entirely. Task stays QUEUED and the agent on the
-                    #       target VM will pick it up via /api/agent/next-role.
-                    #   (c) target VM unresponsive → clear warm fields, fall
-                    #       through to provision (cold path).
-                    _warm_ctx = task.context or {}
-                    _warm_target_vm_id = _warm_ctx.get("warm_target_vm_id")
-                    # A pool pin (warm_pool dispatch hook) reuses the warm_target_vm_id
-                    # machinery but is gated on the warm-pool flag/breaker, not
-                    # warm-continuity, and releases its leased PoolVm row on clear.
-                    _is_pool_pin = bool(_warm_ctx.get("warm_pool_pin"))
-                    # A parked-for-retarget task holds the parked VM id in
-                    # vm_instance_id (agent_status stamps it there so the reaper
-                    # can tear it down if the park budget expires). When the
-                    # orchestrator gives up on the warm pin it must reset
-                    # vm_instance_id just like pool pins do, so the cold
-                    # fall-through mints a FRESH id instead of re-creating a GCP
-                    # instance with a stale parked-VM name (name-collision hazard).
-                    _is_parked_retarget = bool(_warm_ctx.get("parked_for_retarget"))
-                    if _warm_target_vm_id:
-                        _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
-                        _warm_expired = False
-                        if _warm_deadline_iso:
-                            try:
-                                _warm_deadline = datetime.fromisoformat(
-                                    str(_warm_deadline_iso)
-                                )
-                                if _warm_deadline.tzinfo is not None:
-                                    _warm_deadline = _warm_deadline.astimezone(
-                                        timezone.utc
-                                    ).replace(tzinfo=None)
-                                _warm_expired = _utcnow() > _warm_deadline
-                            except (ValueError, TypeError):
-                                _warm_expired = True
-                        else:
-                            _warm_expired = True
-
-                        if _is_pool_pin:
-                            _cb_suppressed = (
-                                not is_warm_pool_enabled()
-                            ) or _shared_state.is_warm_pool_suppressed()
-                        else:
-                            _cb_suppressed = (
-                                _shared_state.is_warm_continuity_suppressed()
-                            )
-                        if (
-                            not _warm_expired
-                            and not _cb_suppressed
-                            and _shared_state.is_vm_alive(_warm_target_vm_id)
-                        ):
-                            # (b) Skip provision: the warm VM is alive and the
-                            # circuit breaker is not tripped. Leave the task
-                            # QUEUED — the agent's /next-role poll will claim it
-                            # without a fresh provision.
-                            logger.info(
-                                f"[ORCHESTRATOR] Warm-pin skip-provision for task {task.id}: "
-                                f"target_vm={_warm_target_vm_id} (heartbeat fresh, deadline {_warm_deadline_iso})"
-                            )
+                    # Per-task dispatch containment: everything from the
+                    # dispatch claim to the provision launch runs inside this
+                    # boundary. A crash preparing ONE task is logged, the
+                    # iteration's pre-claimed LLM-account slot is released, the
+                    # session is rolled back, and the loop continues — so
+                    # later-ranked tasks and the post-loop stages (CI polling,
+                    # stall detection) still run this cycle instead of starving
+                    # behind a deterministic poison task. Repeated crashes are
+                    # bounded by the quarantine in the handler below. The
+                    # cycle-level handler still owns genuinely cycle-wide
+                    # failures (this `except Exception` lets CancelledError —
+                    # a BaseException — propagate for clean shutdown).
+                    #
+                    # _iter_preclaimed_account_id tracks the slot
+                    # select_max_plan_account pre-increments during
+                    # select_llm_runtime_for_task. It is cleared at every point
+                    # ownership transfers (warm-pool lease commit, PROVISIONING
+                    # commit) or an existing early-exit path already released
+                    # the slot, so the handler can never double-release.
+                    _iter_preclaimed_account_id: str | None = None
+                    try:
+                        task = await _lock_dispatchable_task_for_mutation(session, _qt_id)
+                        if task is None:
+                            continue
+                        if task.requires_approval:
                             await session.rollback()
                             continue
-
-                        # (a), (c), or (d): clear warm fields and fall through.
-                        _park_keys = (
-                            {"parked_for_retarget", "park_deadline"}
-                            if _is_parked_retarget
-                            else set()
+                        resource_defer_msg = await _project_resource_dispatch_defer_message(
+                            session, task, project_active_counts
                         )
-                        _new_ctx = {
-                            k: v
-                            for k, v in _warm_ctx.items()
-                            if k
-                            not in (
-                                "warm_target_vm_id",
-                                "warm_target_pr",
-                                "warm_handoff_deadline",
-                                "warm_pool_pin",
-                                *_park_keys,
-                            )
-                        }
-                        task.context = _new_ctx
-                        from sqlalchemy.orm.attributes import flag_modified
-
-                        flag_modified(task, "context")
-                        if _cb_suppressed:
-                            _clear_reason = "circuit_breaker"
-                        elif _warm_expired:
-                            _clear_reason = "deadline_expired"
-                        else:
-                            _clear_reason = "vm_unresponsive"
-                        # A pool pin we give up on releases its leased PoolVm row
-                        # (retired so it is never re-leased — it failed to serve
-                        # the pinned task in time / is unresponsive). Pool clears
-                        # feed the pool breaker, NOT the warm-continuity pin-clear
-                        # metric, so the two breakers stay independent.
-                        if _is_pool_pin:
-                            from app.models import PoolVmState as _PoolVmState
-
-                            await mark_pool_vm_retiring(
-                                session,
-                                _warm_target_vm_id,
-                                source_states=(_PoolVmState.LEASED,),
-                            )
-                            if _clear_reason != "circuit_breaker":
-                                _shared_state.record_pool_claim_failure(_clear_reason)
-                            # _pin_task_to_pool_vm stamped this retiring member's
-                            # vm_instance_id onto the task. Reset it so the cold
-                            # fall-through below mints a FRESH agent-vm- id instead
-                            # of re-creating a GCP instance named after the VM we
-                            # just scheduled for teardown (name collision racing the
-                            # reaper's delete). Chain pins leave vm_instance_id None
-                            # so they are unaffected; only pool pins set it.
-                            task.vm_instance_id = None
-                        elif _is_parked_retarget:
-                            # Park-and-retarget stamped the held VM id onto
-                            # vm_instance_id (agent_status.py) so the reaper can
-                            # track it. When the warm pin is given up (VM
-                            # unresponsive, deadline expired, or circuit-breaker
-                            # suppressed), reset vm_instance_id so the cold
-                            # fall-through below mints a FRESH id — otherwise the
-                            # stale parked-VM name races the reaper's delete on GCP.
-                            task.vm_instance_id = None
-                        # Phase 2e observability: track clear-out rate so we
-                        # can detect warm-VM instability. Sustained >5/hour
-                        # means the warm chain is failing more than expected.
-                        # Defer record_warm_pin_clear until AFTER the commit
-                        # that persists the warm-field clear lands — if the
-                        # commit fails and we retry next cycle we'd otherwise
-                        # double-count the metric (Issue 11).
-                        # Circuit-breaker suppressions are not counted as pin-clear
-                        # events to avoid a feedback loop that deepens suppression.
-                        _pending_warm_pin_clear: tuple[str, str] | None = (
-                            None
-                            if (_clear_reason == "circuit_breaker" or _is_pool_pin)
-                            else (_warm_target_vm_id, _clear_reason)
-                        )
-                        logger.info(
-                            f"[ORCHESTRATOR] Warm-pin cleared for task {task.id}: "
-                            f"target_vm={_warm_target_vm_id} reason={_clear_reason}"
-                        )
-                    else:
-                        _pending_warm_pin_clear = None
-
-                    # Resolve the task's LLM runtime identity and select an eligible
-                    # account BEFORE consulting the warm pool, so the pool lease gate
-                    # enforces the SAME compatibility the cold path would (provider
-                    # preference, category/quality routing, account availability, and
-                    # the rate-limit blacklist). Two sources feed the effective
-                    # blacklist:
-                    #  - blacklisted_accounts: pruneable (rate-limit recovers → reusable)
-                    #  - provision_failed_accounts: sticky (silent pre-claim deaths stay
-                    #    unavailable for this task — prune logic below would otherwise
-                    #    reselect the same broken account every attempt).
-                    _blacklist = (task.context or {}).get("blacklisted_accounts")
-                    _sticky = (task.context or {}).get(
-                        "provision_failed_accounts"
-                    ) or []
-                    # Launcher pays; fall back to project owner for autonomous tasks.
-                    # R6-W3-D: reuse the cycle-local _project_user_cache built during
-                    # eligibility filtering so we don't re-issue a Project SELECT per
-                    # dispatched task (extends R5-W5 MED-5 from the eligibility scan
-                    # to the dispatch site).
-                    if task.launched_by_user_id:
-                        dispatch_user_id = task.launched_by_user_id
-                    else:
-                        cached_owner = _project_user_cache.get(task.project_id)
-                        if cached_owner is not None:
-                            dispatch_user_id = cached_owner
-                        else:
-                            task_project = await session.get(Project, task.project_id)
-                            dispatch_user_id = (
-                                task_project.user_id if task_project else ""
-                            )
-                            _project_user_cache[task.project_id] = dispatch_user_id
-                    task_model = _extract_task_model(task)
-                    # Prune stale blacklist entries — accounts whose model cooldown has expired
-                    # should be eligible again, otherwise rate-limited tasks get stuck forever
-                    if _blacklist:
-                        async with _max_plan_pool_lock:
-                            _blacklist = [
-                                aid
-                                for aid in _blacklist
-                                if aid in _account_by_id
-                                and not _account_available_for_model(
-                                    _account_by_id[aid], task_model
-                                )
-                            ]
-                        if _blacklist != (task.context or {}).get(
-                            "blacklisted_accounts"
-                        ):
-                            task.context = {
-                                **(task.context or {}),
-                                "blacklisted_accounts": _blacklist or None,
-                            }
-                            if not _blacklist:
-                                task.context.pop("blacklisted_accounts", None)
-                            session.add(task)
-                    _effective_blacklist = list({*(_blacklist or []), *_sticky}) or None
-                    runtime_selection = await select_llm_runtime_for_task(
-                        user_id=dispatch_user_id,
-                        task=task,
-                        runtime_config=_runtime_config,
-                        blacklist=_effective_blacklist,
-                    )
-
-                    # Warm-pool dispatch hook (efficiency direction d-5fd69fe1):
-                    # BEFORE cold-provisioning, consult the pre-provisioned idle
-                    # pool. If a compatible, same-tenant IDLE member is free, lease
-                    # it atomically (FOR UPDATE SKIP LOCKED) and pin this task to
-                    # it, then skip cold provisioning entirely — the member's agent
-                    # claims the task warm via /next-role (origin "warm_pool"),
-                    # converting a cold dispatch into a warm-start claim. Inert when
-                    # warm_pool_enabled is off. Scoped to fresh, non-pinned,
-                    # no-dependency tasks (a task already carrying a warm pin is
-                    # handled by the skip-provision branch above). The required
-                    # identity passed in is the RESOLVED selection (runtime_selection)
-                    # — honoring provider preference, category/quality routing AND the
-                    # rate-limit blacklist — NOT the task's raw context, so a member
-                    # pinned to a blacklisted account or a non-routed model is never
-                    # leased. Skipped entirely when no runtime identity resolves
-                    # (runtime_selection is None — the cold path's no-account handling
-                    # takes over). On no lease, fall through to the existing cold path
-                    # and count it as a cold dispatch.
-                    if (
-                        not _warm_target_vm_id
-                        and not task.depends_on
-                        and is_warm_pool_enabled()
-                        and runtime_selection is not None
-                    ):
-                        _leased_member = await try_pool_dispatch(
-                            session,
-                            task,
-                            required_provider=runtime_selection.provider,
-                            required_model=runtime_selection.model or task_model,
-                            required_account=(
-                                runtime_selection.account.get("id")
-                                if runtime_selection.account
-                                else None
-                            ),
-                            required_auth_mode=runtime_selection.auth_mode,
-                            excluded_account_ids=_effective_blacklist,
-                        )
-                        if _leased_member is not None:
-                            try:
-                                await session.commit()
-                            except Exception:
-                                logger.exception(
-                                    "[ORCHESTRATOR] Failed to commit warm-pool lease "
-                                    f"for task {task.id}; falling back to cold provision"
-                                )
-                                _shared_state.record_pool_claim_failure("commit_error")
-                                # Release the slot pre-reserved during runtime
-                                # selection (select_max_plan_account pre-increments
-                                # active_tasks under lock). This early-exit abandons
-                                # the dispatch without launching, so the reservation
-                                # would otherwise leak until the next per-cycle
-                                # reconciliation re-bases the counter from the DB —
-                                # mirroring the cold-provision commit-failure release.
-                                # Guarded so it is a no-op when selection resolved to
-                                # an env-credential fallback with no pooled account;
-                                # the release helper also floors at zero. Use the
-                                # account carried on the resolved selection, not the
-                                # loop-local account_id (only assigned later, below).
-                                if runtime_selection and runtime_selection.account:
-                                    await release_max_plan_account(
-                                        runtime_selection.account["id"],
-                                        revert_daily_task_count=True,
-                                    )
-                                await session.rollback()
-                                # session.rollback() expires every session-bound
-                                # instance (independent of expire_on_commit=False),
-                                # so the fall-through reads of this task below
-                                # (task.depends_on/project_id/vm_instance_id) would
-                                # trigger a sync lazy-load -> MissingGreenlet and
-                                # abort the whole cycle (the hazard documented at
-                                # the top of this loop). The lease was rolled back,
-                                # so the task is still QUEUED — retry it cleanly
-                                # next cycle, exactly like every other rollback
-                                # site in this loop.
-                                continue
-                            else:
-                                record_pool_lease_hit(
-                                    account=(
-                                        runtime_selection.account.get("id")
-                                        if runtime_selection.account
-                                        else None
-                                    )
-                                )
-                                logger.info(
-                                    f"[ORCHESTRATOR] Warm-pool dispatch: task {task.id} "
-                                    f"leased pool VM {_leased_member.vm_instance_id} "
-                                    "(skipping cold provision)"
-                                )
-                                continue
-
-                    # Backlog-reuse first-refusal (efficiency direction d-91d8dede):
-                    # if an idle warm VM is actively polling /next-role for this
-                    # project, hold off cold-provisioning this eligible backlog task
-                    # for a bounded window so the warm VM can claim it first. Scoped
-                    # to non-chain-pinned tasks that the /next-role backlog branch
-                    # will actually claim: either no dependencies, or dependencies
-                    # the orchestrator already resolved and stamped
-                    # ``_deps_satisfied`` on above — exactly the warm-eligible set.
-                    # A task with still-unresolved deps carries no marker and is
-                    # never held (it cold-dispatches as before). The atomic
-                    # SKIP-LOCKED claim in /next-role still guarantees no
-                    # double-provision if both race; this only biases the race
-                    # toward reuse. The window auto-expires, so a VM that dies
-                    # mid-poll delays this task by at most that bound.
-                    if (
-                        _runtime_config.get("warm_backlog_reuse_enabled", False)
-                        and not _warm_target_vm_id
-                        and (
-                            not task.depends_on
-                            or (task.context or {}).get("_deps_satisfied")
-                        )
-                        and _shared_state.is_backlog_first_refusal_active(
-                            str(task.project_id)
-                        )
-                    ):
-                        logger.info(
-                            f"[ORCHESTRATOR] Backlog-reuse first-refusal: holding off "
-                            f"cold-provision of task {task.id} (project {task.project_id}) "
-                            f"— idle warm VM has first claim"
-                        )
-                        # Release the slot pre-reserved during runtime selection
-                        # (select_max_plan_account pre-increments active_tasks). This
-                        # hold abandons the dispatch so the warm VM can claim the task
-                        # via /next-role; without releasing, the reservation leaks for
-                        # the rest of the cycle and repeated holds compound the drift.
-                        # Mirrors the cold-provision commit-failure release; guarded for
-                        # the env-credential fallback (no pooled account) and floored at
-                        # zero by the helper. Targets the resolved selection's account,
-                        # not the loop-local account_id (assigned later, below).
-                        if runtime_selection and runtime_selection.account:
-                            await release_max_plan_account(
-                                runtime_selection.account["id"],
-                                revert_daily_task_count=True,
-                            )
-                        await session.rollback()
-                        continue
-
-                    # Ensure VM ID exists (cleared during stale PROVISIONING recovery
-                    # OR set to None for warm-pinned tasks whose pin was just cleared).
-                    if not task.vm_instance_id:
-                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                    logger.info(
-                        f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})"
-                    )
-
-                    runtime_secret = None
-                    claude_config_json = None
-                    account_id = None
-                    runtime_provider = None
-                    runtime_auth_mode = None
-                    runtime_model = task_model
-                    runtime_execution_mode = None
-                    runtime_provider_metadata = None
-                    runtime_provider_settings: dict | None = None
-                    if runtime_selection:
-                        runtime_provider = runtime_selection.provider
-                        runtime_auth_mode = runtime_selection.auth_mode
-                        runtime_model = runtime_selection.model or runtime_model
-                        runtime_execution_mode = runtime_selection.execution_mode
-                        runtime_provider_settings = runtime_selection.settings
-                    account = runtime_selection.account if runtime_selection else None
-                    if account:
-                        account_id = account["id"]
-                        runtime_secret = account.get("runtime_secret") or account.get(
-                            "oauth_token"
-                        )
-                        claude_config_json = account.get("claude_config_json")
-                        runtime_provider_metadata = (
-                            account.get("provider_metadata") or {}
-                        )
-                        logger.info(
-                            f"[ORCHESTRATOR] Using LLM account '{account['name']}' "
-                            f"(provider={runtime_provider}, auth_mode={runtime_auth_mode}, model={runtime_model})"
-                        )
-                    else:
-                        # No available account — either all disabled/blacklisted or none configured
-                        user_pool = _max_plan_pools.get(dispatch_user_id, [])
-                        provider_accounts = user_pool
-                        if user_pool and runtime_provider:
-                            provider_handler = get_provider(runtime_provider)
-                            provider_accounts = [
-                                acct
-                                for acct in user_pool
-                                if str(acct.get("provider") or "anthropic")
-                                == runtime_provider
-                            ]
-                            ready_provider_accounts = [
-                                acct
-                                for acct in provider_accounts
-                                if acct.get("enabled", True)
-                                and provider_handler.account_has_credentials(acct)
-                            ]
-                        else:
-                            ready_provider_accounts = list(provider_accounts)
-                        if user_pool and ready_provider_accounts:
-                            # Accounts exist but all blocked — notify user and skip
+                        if resource_defer_msg:
                             logger.info(
-                                f"[ORCHESTRATOR] All accounts blocked for task {task.id} — skipping (will retry next cycle)"
+                                "[ORCHESTRATOR] Deferring task %s for project %s: %s",
+                                task.id,
+                                task.project_id,
+                                resource_defer_msg,
                             )
-                            from app.max_plan_pool import (
-                                summarize_pool_state,
-                                describe_pool_blockage,
-                            )
-
-                            _pool_summary = summarize_pool_state(
-                                task_model, user_id=dispatch_user_id
-                            )
-                            earliest_recovery = _pool_summary["earliest_recovery"]
-                            stall_msg = describe_pool_blockage(
-                                task_model, user_id=dispatch_user_id
-                            )
-                            _cycle_blockage_reasons.add(stall_msg)
-                            if earliest_recovery:
-                                stall_delay_minutes = rate_limit_retry_minutes(
-                                    earliest_recovery
-                                )
-                            else:
-                                stall_delay_minutes = 2
-                            logger.info(
-                                "[ORCHESTRATOR] pool_exhausted task=%s model=%s %s",
-                                str(task.id)[:8],
-                                task_model,
-                                _pool_summary,
-                            )
-                            # Retry delay based on earliest known recovery to avoid
-                            # hot-looping every 2 min when recovery is hours away.
-                            # set_retry_after clamps to RETRY_AFTER_MAX_MINUTES.
-                            stall_ctx = dict(task.context or {})
-                            set_retry_after(stall_ctx, stall_delay_minutes)
-                            task.context = stall_ctx
-                            # Escalate visibility when a task is stuck cycling through retry_after holds.
-                            # Each reset is up to RETRY_AFTER_MAX_MINUTES (30m). At the alert
-                            # threshold (default 8 resets ≈ 4h) we fire a WARNING so the situation
-                            # is visible, but pool exhaustion is a wait condition — we never
-                            # auto-fail the task; it stays in retry_after until the pool recovers.
-                            try:
-                                _resets = int(stall_ctx.get("_retry_after_resets") or 0)
-                                _reset_threshold = _runtime_config.get(
-                                    "retry_after_reset_alert_threshold", 8
-                                )
-                                _action = _compute_retry_after_escalation_action(
-                                    _resets, _reset_threshold, 0
-                                )
-                                if _action == "alert":
-                                    from app.models import Alert, AlertSeverity
-                                    from app.max_plan_pool import describe_pool_blockage
-
-                                    _blockage = describe_pool_blockage(
-                                        task_model, user_id=dispatch_user_id
-                                    )
-                                    _hold_min = (
-                                        (_utcnow() - task.created_at).total_seconds()
-                                        / 60
-                                        if task.created_at
-                                        else 0.0
-                                    )
-                                    _stuck_title = f"Task stuck in retry_after cycle: {task.title or str(task.id)[:8]}"
-                                    _existing_stuck = (
-                                        (
-                                            await session.execute(
-                                                select(Alert).where(
-                                                    Alert.task_id == task.id,
-                                                    Alert.title == _stuck_title,
-                                                    Alert.dismissed_at.is_(None),
-                                                )
-                                            )
-                                        )
-                                        .scalars()
-                                        .first()
-                                    )
-                                    if _existing_stuck is None:
-                                        _stuck_msg = (
-                                            f"Task {task.id} has been cycling through retry_after holds "
-                                            f"{_resets} times (threshold {_reset_threshold}); held for "
-                                            f"{_hold_min:.0f}m total. Pool state: {_blockage}."
-                                        )
-                                        _stuck_alert = Alert(
-                                            project_id=task.project_id,
-                                            severity=AlertSeverity.WARNING,
-                                            title=_stuck_title,
-                                            message=_stuck_msg,
-                                            task_id=task.id,
-                                        )
-                                        session.add(_stuck_alert)
-                                        await broadcast_to_project(
-                                            str(task.project_id),
-                                            "alert_created",
-                                            {
-                                                "alert_id": str(_stuck_alert.id),
-                                                "severity": "WARNING",
-                                                "title": _stuck_title,
-                                            },
-                                        )
-                                        logger.warning(
-                                            f"[ORCHESTRATOR] Retry-after escalation alert for task {task.id} "
-                                            f"(resets={_resets}, blockage={_blockage})"
-                                        )
-                            except Exception:
-                                logger.exception(
-                                    f"[ORCHESTRATOR] Failed to evaluate retry_after escalation for task {task.id}"
-                                )
-                            if task.latest_status_message != stall_msg:
-                                # Update directly on the locked task object (separate session would deadlock)
-                                task.latest_status_message = stall_msg
+                            if task.latest_status_message != resource_defer_msg:
+                                task.latest_status_message = resource_defer_msg
+                                session.add(task)
                                 await broadcast_to_project(
                                     str(task.project_id),
                                     "task_updated",
                                     {
                                         "task_id": str(task.id),
                                         "status": task.status,
-                                        "message": stall_msg,
+                                        "message": resource_defer_msg,
                                     },
                                 )
-                            session.add(task)
-                            _cycle_accounts_blocked += 1
-                            if earliest_recovery and (
-                                _cycle_earliest_recovery is None
-                                or earliest_recovery < _cycle_earliest_recovery
-                            ):
-                                _cycle_earliest_recovery = earliest_recovery
                             await session.commit()
-                            if _pending_warm_pin_clear is not None:
-                                _shared_state.record_warm_pin_clear(
-                                    *_pending_warm_pin_clear
-                                )
-                                _pending_warm_pin_clear = None
                             continue
-                        # No accounts at all — fall back to raw provider credentials when present
-                        (
-                            runtime_secret,
-                            runtime_provider,
-                            runtime_auth_mode,
-                            runtime_model,
-                            runtime_execution_mode,
-                            runtime_provider_metadata,
-                        ) = _resolve_env_runtime_fallback(
-                            provider=runtime_provider,
-                            model=runtime_model or task_model,
-                            execution_mode=runtime_execution_mode,
+
+                        # Phase 2c: warm-VM continuity skip-provision branch.
+                        # Three outcomes when warm_target_vm_id is set on the task:
+                        #   (a) deadline expired → clear warm fields, fall through
+                        #       to provision (cold path).
+                        #   (b) target VM heartbeated within 90s → skip provision
+                        #       entirely. Task stays QUEUED and the agent on the
+                        #       target VM will pick it up via /api/agent/next-role.
+                        #   (c) target VM unresponsive → clear warm fields, fall
+                        #       through to provision (cold path).
+                        _warm_ctx = task.context or {}
+                        _warm_target_vm_id = _warm_ctx.get("warm_target_vm_id")
+                        # A pool pin (warm_pool dispatch hook) reuses the warm_target_vm_id
+                        # machinery but is gated on the warm-pool flag/breaker, not
+                        # warm-continuity, and releases its leased PoolVm row on clear.
+                        _is_pool_pin = bool(_warm_ctx.get("warm_pool_pin"))
+                        # A parked-for-retarget task holds the parked VM id in
+                        # vm_instance_id (agent_status stamps it there so the reaper
+                        # can tear it down if the park budget expires). When the
+                        # orchestrator gives up on the warm pin it must reset
+                        # vm_instance_id just like pool pins do, so the cold
+                        # fall-through mints a FRESH id instead of re-creating a GCP
+                        # instance with a stale parked-VM name (name-collision hazard).
+                        _is_parked_retarget = bool(_warm_ctx.get("parked_for_retarget"))
+                        if _warm_target_vm_id:
+                            _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
+                            _warm_expired = False
+                            if _warm_deadline_iso:
+                                try:
+                                    _warm_deadline = datetime.fromisoformat(
+                                        str(_warm_deadline_iso)
+                                    )
+                                    if _warm_deadline.tzinfo is not None:
+                                        _warm_deadline = _warm_deadline.astimezone(
+                                            timezone.utc
+                                        ).replace(tzinfo=None)
+                                    _warm_expired = _utcnow() > _warm_deadline
+                                except (ValueError, TypeError):
+                                    _warm_expired = True
+                            else:
+                                _warm_expired = True
+
+                            if _is_pool_pin:
+                                _cb_suppressed = (
+                                    not is_warm_pool_enabled()
+                                ) or _shared_state.is_warm_pool_suppressed()
+                            else:
+                                _cb_suppressed = (
+                                    _shared_state.is_warm_continuity_suppressed()
+                                )
+                            if (
+                                not _warm_expired
+                                and not _cb_suppressed
+                                and _shared_state.is_vm_alive(_warm_target_vm_id)
+                            ):
+                                # (b) Skip provision: the warm VM is alive and the
+                                # circuit breaker is not tripped. Leave the task
+                                # QUEUED — the agent's /next-role poll will claim it
+                                # without a fresh provision.
+                                logger.info(
+                                    f"[ORCHESTRATOR] Warm-pin skip-provision for task {task.id}: "
+                                    f"target_vm={_warm_target_vm_id} (heartbeat fresh, deadline {_warm_deadline_iso})"
+                                )
+                                await session.rollback()
+                                continue
+
+                            # (a), (c), or (d): clear warm fields and fall through.
+                            _park_keys = (
+                                {"parked_for_retarget", "park_deadline"}
+                                if _is_parked_retarget
+                                else set()
+                            )
+                            _new_ctx = {
+                                k: v
+                                for k, v in _warm_ctx.items()
+                                if k
+                                not in (
+                                    "warm_target_vm_id",
+                                    "warm_target_pr",
+                                    "warm_handoff_deadline",
+                                    "warm_pool_pin",
+                                    *_park_keys,
+                                )
+                            }
+                            task.context = _new_ctx
+                            from sqlalchemy.orm.attributes import flag_modified
+
+                            flag_modified(task, "context")
+                            if _cb_suppressed:
+                                _clear_reason = "circuit_breaker"
+                            elif _warm_expired:
+                                _clear_reason = "deadline_expired"
+                            else:
+                                _clear_reason = "vm_unresponsive"
+                            # A pool pin we give up on releases its leased PoolVm row
+                            # (retired so it is never re-leased — it failed to serve
+                            # the pinned task in time / is unresponsive). Pool clears
+                            # feed the pool breaker, NOT the warm-continuity pin-clear
+                            # metric, so the two breakers stay independent.
+                            if _is_pool_pin:
+                                from app.models import PoolVmState as _PoolVmState
+
+                                await mark_pool_vm_retiring(
+                                    session,
+                                    _warm_target_vm_id,
+                                    source_states=(_PoolVmState.LEASED,),
+                                )
+                                if _clear_reason != "circuit_breaker":
+                                    _shared_state.record_pool_claim_failure(_clear_reason)
+                                # _pin_task_to_pool_vm stamped this retiring member's
+                                # vm_instance_id onto the task. Reset it so the cold
+                                # fall-through below mints a FRESH agent-vm- id instead
+                                # of re-creating a GCP instance named after the VM we
+                                # just scheduled for teardown (name collision racing the
+                                # reaper's delete). Chain pins leave vm_instance_id None
+                                # so they are unaffected; only pool pins set it.
+                                task.vm_instance_id = None
+                            elif _is_parked_retarget:
+                                # Park-and-retarget stamped the held VM id onto
+                                # vm_instance_id (agent_status.py) so the reaper can
+                                # track it. When the warm pin is given up (VM
+                                # unresponsive, deadline expired, or circuit-breaker
+                                # suppressed), reset vm_instance_id so the cold
+                                # fall-through below mints a FRESH id — otherwise the
+                                # stale parked-VM name races the reaper's delete on GCP.
+                                task.vm_instance_id = None
+                            # Phase 2e observability: track clear-out rate so we
+                            # can detect warm-VM instability. Sustained >5/hour
+                            # means the warm chain is failing more than expected.
+                            # Defer record_warm_pin_clear until AFTER the commit
+                            # that persists the warm-field clear lands — if the
+                            # commit fails and we retry next cycle we'd otherwise
+                            # double-count the metric (Issue 11).
+                            # Circuit-breaker suppressions are not counted as pin-clear
+                            # events to avoid a feedback loop that deepens suppression.
+                            _pending_warm_pin_clear: tuple[str, str] | None = (
+                                None
+                                if (_clear_reason == "circuit_breaker" or _is_pool_pin)
+                                else (_warm_target_vm_id, _clear_reason)
+                            )
+                            logger.info(
+                                f"[ORCHESTRATOR] Warm-pin cleared for task {task.id}: "
+                                f"target_vm={_warm_target_vm_id} reason={_clear_reason}"
+                            )
+                        else:
+                            _pending_warm_pin_clear = None
+
+                        # Resolve the task's LLM runtime identity and select an eligible
+                        # account BEFORE consulting the warm pool, so the pool lease gate
+                        # enforces the SAME compatibility the cold path would (provider
+                        # preference, category/quality routing, account availability, and
+                        # the rate-limit blacklist). Two sources feed the effective
+                        # blacklist:
+                        #  - blacklisted_accounts: pruneable (rate-limit recovers → reusable)
+                        #  - provision_failed_accounts: sticky (silent pre-claim deaths stay
+                        #    unavailable for this task — prune logic below would otherwise
+                        #    reselect the same broken account every attempt).
+                        _blacklist = (task.context or {}).get("blacklisted_accounts")
+                        _sticky = (task.context or {}).get(
+                            "provision_failed_accounts"
+                        ) or []
+                        # Launcher pays; fall back to project owner for autonomous tasks.
+                        # R6-W3-D: reuse the cycle-local _project_user_cache built during
+                        # eligibility filtering so we don't re-issue a Project SELECT per
+                        # dispatched task (extends R5-W5 MED-5 from the eligibility scan
+                        # to the dispatch site).
+                        if task.launched_by_user_id:
+                            dispatch_user_id = task.launched_by_user_id
+                        else:
+                            cached_owner = _project_user_cache.get(task.project_id)
+                            if cached_owner is not None:
+                                dispatch_user_id = cached_owner
+                            else:
+                                task_project = await session.get(Project, task.project_id)
+                                dispatch_user_id = (
+                                    task_project.user_id if task_project else ""
+                                )
+                                _project_user_cache[task.project_id] = dispatch_user_id
+                        task_model = _extract_task_model(task)
+                        # Prune stale blacklist entries — accounts whose model cooldown has expired
+                        # should be eligible again, otherwise rate-limited tasks get stuck forever
+                        if _blacklist:
+                            async with _max_plan_pool_lock:
+                                _blacklist = [
+                                    aid
+                                    for aid in _blacklist
+                                    if aid in _account_by_id
+                                    and not _account_available_for_model(
+                                        _account_by_id[aid], task_model
+                                    )
+                                ]
+                            if _blacklist != (task.context or {}).get(
+                                "blacklisted_accounts"
+                            ):
+                                task.context = {
+                                    **(task.context or {}),
+                                    "blacklisted_accounts": _blacklist or None,
+                                }
+                                if not _blacklist:
+                                    task.context.pop("blacklisted_accounts", None)
+                                session.add(task)
+                        _effective_blacklist = list({*(_blacklist or []), *_sticky}) or None
+                        runtime_selection = await select_llm_runtime_for_task(
+                            user_id=dispatch_user_id,
                             task=task,
                             runtime_config=_runtime_config,
+                            blacklist=_effective_blacklist,
                         )
-                        if runtime_secret:
+                        # From here until ownership transfers, the containment
+                        # handler owns releasing the slot this selection
+                        # pre-incremented (select_max_plan_account).
+                        if runtime_selection and runtime_selection.account:
+                            _iter_preclaimed_account_id = runtime_selection.account.get(
+                                "id"
+                            )
+
+                        # Warm-pool dispatch hook (efficiency direction d-5fd69fe1):
+                        # BEFORE cold-provisioning, consult the pre-provisioned idle
+                        # pool. If a compatible, same-tenant IDLE member is free, lease
+                        # it atomically (FOR UPDATE SKIP LOCKED) and pin this task to
+                        # it, then skip cold provisioning entirely — the member's agent
+                        # claims the task warm via /next-role (origin "warm_pool"),
+                        # converting a cold dispatch into a warm-start claim. Inert when
+                        # warm_pool_enabled is off. Scoped to fresh, non-pinned,
+                        # no-dependency tasks (a task already carrying a warm pin is
+                        # handled by the skip-provision branch above). The required
+                        # identity passed in is the RESOLVED selection (runtime_selection)
+                        # — honoring provider preference, category/quality routing AND the
+                        # rate-limit blacklist — NOT the task's raw context, so a member
+                        # pinned to a blacklisted account or a non-routed model is never
+                        # leased. Skipped entirely when no runtime identity resolves
+                        # (runtime_selection is None — the cold path's no-account handling
+                        # takes over). On no lease, fall through to the existing cold path
+                        # and count it as a cold dispatch.
+                        if (
+                            not _warm_target_vm_id
+                            and not task.depends_on
+                            and is_warm_pool_enabled()
+                            and runtime_selection is not None
+                        ):
+                            _leased_member = await try_pool_dispatch(
+                                session,
+                                task,
+                                required_provider=runtime_selection.provider,
+                                required_model=runtime_selection.model or task_model,
+                                required_account=(
+                                    runtime_selection.account.get("id")
+                                    if runtime_selection.account
+                                    else None
+                                ),
+                                required_auth_mode=runtime_selection.auth_mode,
+                                excluded_account_ids=_effective_blacklist,
+                            )
+                            if _leased_member is not None:
+                                # A dispatch that reaches a lease commit resets
+                                # the contained-crash counter (persisted by that
+                                # commit; rolled back with it on failure).
+                                _clear_dispatch_prep_failures(task)
+                                try:
+                                    await session.commit()
+                                except Exception:
+                                    logger.exception(
+                                        "[ORCHESTRATOR] Failed to commit warm-pool lease "
+                                        f"for task {task.id}; falling back to cold provision"
+                                    )
+                                    _shared_state.record_pool_claim_failure("commit_error")
+                                    # Release the slot pre-reserved during runtime
+                                    # selection (select_max_plan_account pre-increments
+                                    # active_tasks under lock). This early-exit abandons
+                                    # the dispatch without launching, so the reservation
+                                    # would otherwise leak until the next per-cycle
+                                    # reconciliation re-bases the counter from the DB —
+                                    # mirroring the cold-provision commit-failure release.
+                                    # Guarded so it is a no-op when selection resolved to
+                                    # an env-credential fallback with no pooled account;
+                                    # the release helper also floors at zero. Use the
+                                    # account carried on the resolved selection, not the
+                                    # loop-local account_id (only assigned later, below).
+                                    if runtime_selection and runtime_selection.account:
+                                        await release_max_plan_account(
+                                            runtime_selection.account["id"],
+                                            revert_daily_task_count=True,
+                                        )
+                                    _iter_preclaimed_account_id = None
+                                    await session.rollback()
+                                    # session.rollback() expires every session-bound
+                                    # instance (independent of expire_on_commit=False),
+                                    # so the fall-through reads of this task below
+                                    # (task.depends_on/project_id/vm_instance_id) would
+                                    # trigger a sync lazy-load -> MissingGreenlet and
+                                    # abort the whole cycle (the hazard documented at
+                                    # the top of this loop). The lease was rolled back,
+                                    # so the task is still QUEUED — retry it cleanly
+                                    # next cycle, exactly like every other rollback
+                                    # site in this loop.
+                                    continue
+                                else:
+                                    # Slot ownership transferred to the leased
+                                    # warm task — the containment handler must
+                                    # not release it past this point.
+                                    _iter_preclaimed_account_id = None
+                                    record_pool_lease_hit(
+                                        account=(
+                                            runtime_selection.account.get("id")
+                                            if runtime_selection.account
+                                            else None
+                                        )
+                                    )
+                                    logger.info(
+                                        f"[ORCHESTRATOR] Warm-pool dispatch: task {task.id} "
+                                        f"leased pool VM {_leased_member.vm_instance_id} "
+                                        "(skipping cold provision)"
+                                    )
+                                    continue
+
+                        # Backlog-reuse first-refusal (efficiency direction d-91d8dede):
+                        # if an idle warm VM is actively polling /next-role for this
+                        # project, hold off cold-provisioning this eligible backlog task
+                        # for a bounded window so the warm VM can claim it first. Scoped
+                        # to non-chain-pinned tasks that the /next-role backlog branch
+                        # will actually claim: either no dependencies, or dependencies
+                        # the orchestrator already resolved and stamped
+                        # ``_deps_satisfied`` on above — exactly the warm-eligible set.
+                        # A task with still-unresolved deps carries no marker and is
+                        # never held (it cold-dispatches as before). The atomic
+                        # SKIP-LOCKED claim in /next-role still guarantees no
+                        # double-provision if both race; this only biases the race
+                        # toward reuse. The window auto-expires, so a VM that dies
+                        # mid-poll delays this task by at most that bound.
+                        if (
+                            _runtime_config.get("warm_backlog_reuse_enabled", False)
+                            and not _warm_target_vm_id
+                            and (
+                                not task.depends_on
+                                or (task.context or {}).get("_deps_satisfied")
+                            )
+                            and _shared_state.is_backlog_first_refusal_active(
+                                str(task.project_id)
+                            )
+                        ):
                             logger.info(
-                                f"[ORCHESTRATOR] No LLM pool account available, using env credential fallback "
+                                f"[ORCHESTRATOR] Backlog-reuse first-refusal: holding off "
+                                f"cold-provision of task {task.id} (project {task.project_id}) "
+                                f"— idle warm VM has first claim"
+                            )
+                            # Release the slot pre-reserved during runtime selection
+                            # (select_max_plan_account pre-increments active_tasks). This
+                            # hold abandons the dispatch so the warm VM can claim the task
+                            # via /next-role; without releasing, the reservation leaks for
+                            # the rest of the cycle and repeated holds compound the drift.
+                            # Mirrors the cold-provision commit-failure release; guarded for
+                            # the env-credential fallback (no pooled account) and floored at
+                            # zero by the helper. Targets the resolved selection's account,
+                            # not the loop-local account_id (assigned later, below).
+                            if runtime_selection and runtime_selection.account:
+                                await release_max_plan_account(
+                                    runtime_selection.account["id"],
+                                    revert_daily_task_count=True,
+                                )
+                            _iter_preclaimed_account_id = None
+                            await session.rollback()
+                            continue
+
+                        # Ensure VM ID exists (cleared during stale PROVISIONING recovery
+                        # OR set to None for warm-pinned tasks whose pin was just cleared).
+                        if not task.vm_instance_id:
+                            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                        logger.info(
+                            f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})"
+                        )
+
+                        runtime_secret = None
+                        claude_config_json = None
+                        account_id = None
+                        runtime_provider = None
+                        runtime_auth_mode = None
+                        runtime_model = task_model
+                        runtime_execution_mode = None
+                        runtime_provider_metadata = None
+                        runtime_provider_settings: dict | None = None
+                        if runtime_selection:
+                            runtime_provider = runtime_selection.provider
+                            runtime_auth_mode = runtime_selection.auth_mode
+                            runtime_model = runtime_selection.model or runtime_model
+                            runtime_execution_mode = runtime_selection.execution_mode
+                            runtime_provider_settings = runtime_selection.settings
+                        account = runtime_selection.account if runtime_selection else None
+                        if account:
+                            account_id = account["id"]
+                            runtime_secret = account.get("runtime_secret") or account.get(
+                                "oauth_token"
+                            )
+                            claude_config_json = account.get("claude_config_json")
+                            runtime_provider_metadata = (
+                                account.get("provider_metadata") or {}
+                            )
+                            logger.info(
+                                f"[ORCHESTRATOR] Using LLM account '{account['name']}' "
                                 f"(provider={runtime_provider}, auth_mode={runtime_auth_mode}, model={runtime_model})"
                             )
                         else:
-                            logger.warning(
-                                f"[ORCHESTRATOR] No credentials available — skipping task {task.id}"
+                            # No available account — either all disabled/blacklisted or none configured
+                            user_pool = _max_plan_pools.get(dispatch_user_id, [])
+                            provider_accounts = user_pool
+                            if user_pool and runtime_provider:
+                                provider_handler = get_provider(runtime_provider)
+                                provider_accounts = [
+                                    acct
+                                    for acct in user_pool
+                                    if str(acct.get("provider") or "anthropic")
+                                    == runtime_provider
+                                ]
+                                ready_provider_accounts = [
+                                    acct
+                                    for acct in provider_accounts
+                                    if acct.get("enabled", True)
+                                    and provider_handler.account_has_credentials(acct)
+                                ]
+                            else:
+                                ready_provider_accounts = list(provider_accounts)
+                            if user_pool and ready_provider_accounts:
+                                # Accounts exist but all blocked — notify user and skip
+                                logger.info(
+                                    f"[ORCHESTRATOR] All accounts blocked for task {task.id} — skipping (will retry next cycle)"
+                                )
+                                from app.max_plan_pool import (
+                                    summarize_pool_state,
+                                    describe_pool_blockage,
+                                )
+
+                                _pool_summary = summarize_pool_state(
+                                    task_model, user_id=dispatch_user_id
+                                )
+                                earliest_recovery = _pool_summary["earliest_recovery"]
+                                stall_msg = describe_pool_blockage(
+                                    task_model, user_id=dispatch_user_id
+                                )
+                                _cycle_blockage_reasons.add(stall_msg)
+                                if earliest_recovery:
+                                    stall_delay_minutes = rate_limit_retry_minutes(
+                                        earliest_recovery
+                                    )
+                                else:
+                                    stall_delay_minutes = 2
+                                logger.info(
+                                    "[ORCHESTRATOR] pool_exhausted task=%s model=%s %s",
+                                    str(task.id)[:8],
+                                    task_model,
+                                    _pool_summary,
+                                )
+                                # Retry delay based on earliest known recovery to avoid
+                                # hot-looping every 2 min when recovery is hours away.
+                                # set_retry_after clamps to RETRY_AFTER_MAX_MINUTES.
+                                stall_ctx = dict(task.context or {})
+                                set_retry_after(stall_ctx, stall_delay_minutes)
+                                task.context = stall_ctx
+                                # Escalate visibility when a task is stuck cycling through retry_after holds.
+                                # Each reset is up to RETRY_AFTER_MAX_MINUTES (30m). At the alert
+                                # threshold (default 8 resets ≈ 4h) we fire a WARNING so the situation
+                                # is visible, but pool exhaustion is a wait condition — we never
+                                # auto-fail the task; it stays in retry_after until the pool recovers.
+                                try:
+                                    _resets = int(stall_ctx.get("_retry_after_resets") or 0)
+                                    _reset_threshold = _runtime_config.get(
+                                        "retry_after_reset_alert_threshold", 8
+                                    )
+                                    _action = _compute_retry_after_escalation_action(
+                                        _resets, _reset_threshold, 0
+                                    )
+                                    if _action == "alert":
+                                        from app.models import Alert, AlertSeverity
+                                        from app.max_plan_pool import describe_pool_blockage
+
+                                        _blockage = describe_pool_blockage(
+                                            task_model, user_id=dispatch_user_id
+                                        )
+                                        _hold_min = (
+                                            (_utcnow() - task.created_at).total_seconds()
+                                            / 60
+                                            if task.created_at
+                                            else 0.0
+                                        )
+                                        _stuck_title = f"Task stuck in retry_after cycle: {task.title or str(task.id)[:8]}"
+                                        _existing_stuck = (
+                                            (
+                                                await session.execute(
+                                                    select(Alert).where(
+                                                        Alert.task_id == task.id,
+                                                        Alert.title == _stuck_title,
+                                                        Alert.dismissed_at.is_(None),
+                                                    )
+                                                )
+                                            )
+                                            .scalars()
+                                            .first()
+                                        )
+                                        if _existing_stuck is None:
+                                            _stuck_msg = (
+                                                f"Task {task.id} has been cycling through retry_after holds "
+                                                f"{_resets} times (threshold {_reset_threshold}); held for "
+                                                f"{_hold_min:.0f}m total. Pool state: {_blockage}."
+                                            )
+                                            _stuck_alert = Alert(
+                                                project_id=task.project_id,
+                                                severity=AlertSeverity.WARNING,
+                                                title=_stuck_title,
+                                                message=_stuck_msg,
+                                                task_id=task.id,
+                                            )
+                                            session.add(_stuck_alert)
+                                            await broadcast_to_project(
+                                                str(task.project_id),
+                                                "alert_created",
+                                                {
+                                                    "alert_id": str(_stuck_alert.id),
+                                                    "severity": "WARNING",
+                                                    "title": _stuck_title,
+                                                },
+                                            )
+                                            logger.warning(
+                                                f"[ORCHESTRATOR] Retry-after escalation alert for task {task.id} "
+                                                f"(resets={_resets}, blockage={_blockage})"
+                                            )
+                                except Exception:
+                                    logger.exception(
+                                        f"[ORCHESTRATOR] Failed to evaluate retry_after escalation for task {task.id}"
+                                    )
+                                if task.latest_status_message != stall_msg:
+                                    # Update directly on the locked task object (separate session would deadlock)
+                                    task.latest_status_message = stall_msg
+                                    await broadcast_to_project(
+                                        str(task.project_id),
+                                        "task_updated",
+                                        {
+                                            "task_id": str(task.id),
+                                            "status": task.status,
+                                            "message": stall_msg,
+                                        },
+                                    )
+                                session.add(task)
+                                _cycle_accounts_blocked += 1
+                                if earliest_recovery and (
+                                    _cycle_earliest_recovery is None
+                                    or earliest_recovery < _cycle_earliest_recovery
+                                ):
+                                    _cycle_earliest_recovery = earliest_recovery
+                                await session.commit()
+                                if _pending_warm_pin_clear is not None:
+                                    _shared_state.record_warm_pin_clear(
+                                        *_pending_warm_pin_clear
+                                    )
+                                    _pending_warm_pin_clear = None
+                                continue
+                            # No accounts at all — fall back to raw provider credentials when present
+                            (
+                                runtime_secret,
+                                runtime_provider,
+                                runtime_auth_mode,
+                                runtime_model,
+                                runtime_execution_mode,
+                                runtime_provider_metadata,
+                            ) = _resolve_env_runtime_fallback(
+                                provider=runtime_provider,
+                                model=runtime_model or task_model,
+                                execution_mode=runtime_execution_mode,
+                                task=task,
+                                runtime_config=_runtime_config,
                             )
-                            stall_msg = _missing_runtime_credentials_stall_reason(
-                                user_pool_count=len(user_pool),
-                                provider_account_count=len(provider_accounts),
-                                ready_provider_account_count=len(
-                                    ready_provider_accounts
-                                ),
-                                runtime_provider=runtime_provider,
-                            )
-                            _cycle_blockage_reasons.add(stall_msg)
-                            _cycle_accounts_blocked += 1
-                            # Update directly on the locked task object (separate session would deadlock)
-                            task.latest_status_message = (
-                                "Waiting for credentials — add an LLM account or set "
-                                f"{_provider_env_credential_hint(runtime_provider)}"
-                            )
+                            if runtime_secret:
+                                logger.info(
+                                    f"[ORCHESTRATOR] No LLM pool account available, using env credential fallback "
+                                    f"(provider={runtime_provider}, auth_mode={runtime_auth_mode}, model={runtime_model})"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[ORCHESTRATOR] No credentials available — skipping task {task.id}"
+                                )
+                                stall_msg = _missing_runtime_credentials_stall_reason(
+                                    user_pool_count=len(user_pool),
+                                    provider_account_count=len(provider_accounts),
+                                    ready_provider_account_count=len(
+                                        ready_provider_accounts
+                                    ),
+                                    runtime_provider=runtime_provider,
+                                )
+                                _cycle_blockage_reasons.add(stall_msg)
+                                _cycle_accounts_blocked += 1
+                                # Update directly on the locked task object (separate session would deadlock)
+                                task.latest_status_message = (
+                                    "Waiting for credentials — add an LLM account or set "
+                                    f"{_provider_env_credential_hint(runtime_provider)}"
+                                )
+                                session.add(task)
+                                await session.commit()
+                                if _pending_warm_pin_clear is not None:
+                                    _shared_state.record_warm_pin_clear(
+                                        *_pending_warm_pin_clear
+                                    )
+                                    _pending_warm_pin_clear = None
+                                continue
+
+                        if _sync_task_payload_runtime_fields(
+                            task,
+                            model=runtime_model,
+                            execution_mode=runtime_execution_mode,
+                        ):
+                            from sqlalchemy.orm.attributes import flag_modified
+
+                            flag_modified(task, "payloads")
                             session.add(task)
+
+                        task.context = apply_task_llm_runtime_context(
+                            task.context,
+                            account_id=account_id,
+                            provider=runtime_provider,
+                            auth_mode=runtime_auth_mode,
+                            model=runtime_model,
+                            execution_mode=runtime_execution_mode,
+                        )
+                        # A dispatch that reaches the PROVISIONING commit resets
+                        # the contained-crash counter (persisted by that commit;
+                        # rolled back with everything else if prep still crashes
+                        # between here and the commit).
+                        _clear_dispatch_prep_failures(task)
+
+                        # Launch-time staleness recompute: for finding-derived tasks
+                        # that have been QUEUED while the integration branch advanced,
+                        # re-check whether any cited file changed since the finding was
+                        # generated — against the CURRENT branch tip, not the inert
+                        # ingestion HEAD. Best-effort: the helper never raises and only
+                        # an affirmative change verdict annotates the context, so it can
+                        # never block or delay dispatch. The mutation is persisted by
+                        # the PROVISIONING commit below.
+                        from app.research_completion import recompute_launch_staleness
+
+                        if await recompute_launch_staleness(session, task):
+                            from sqlalchemy.orm.attributes import flag_modified
+
+                            flag_modified(task, "context")
+
+                        # Mark as PROVISIONING to prevent other workers from picking it up.
+                        # last_heartbeat is intentionally NOT set here — it must reflect real
+                        # agent activity only. The reaper uses vm_provisioned_at as the clock
+                        # for the pre-claim window so it can distinguish "VM created but agent
+                        # never claimed" from "agent claimed and crashed".
+                        task.status = TaskStatus.PROVISIONING
+                        task.started_at = _utcnow()
+                        # Write-once dispatch timestamp — anchors vm_cold_start_ms
+                        # to the full dispatch->agent-ready interval (includes GCE
+                        # boot latency). Never re-stamped on provision-confirm.
+                        if task.vm_dispatched_at is None:
+                            task.vm_dispatched_at = _utcnow()
+                        task.vm_provisioned_at = _utcnow()
+                        # Cold dispatch: this is a fresh provision, so vm_warm_start
+                        # is False. The warm-claim / backlog-reuse path stamps True
+                        # instead (routers/agent_warm_continuity._finalize_warm_claim),
+                        # which is also where the vm_reuse_rate signal
+                        # (context['_timing']['warm_start']) is written. See
+                        # compute.provision_agent_vm for the corresponding marker.
+                        task.vm_warm_start = False
+                        # vm_spot must be written here — it's read by ~30 cost-rate sites
+                        # (admin_digest, ci_completion, task_completion, etc.) gating
+                        # SPOT_RATE vs ON_DEMAND_RATE. Without this write every cost
+                        # dashboard overstates by ~3.3x when the orchestrator runs in
+                        # SPOT mode. compute.VM_PROVISIONING_MODEL is the source of truth
+                        # (env-driven; STANDARD by default).
+                        # Tasks with >=2 prior spot preemptions are forced to STANDARD
+                        # to avoid a third preemption on the same task.
+                        _spot_preemption_count = (task.context or {}).get(
+                            "spot_preemption_count", 0
+                        )
+                        _force_standard = (VM_PROVISIONING_MODEL == "SPOT") and (
+                            _spot_preemption_count >= 2
+                        )
+                        if _force_standard:
+                            logger.info(
+                                f"[ORCHESTRATOR] Task {task.id} forced to STANDARD VM after {_spot_preemption_count} spot preemptions"
+                            )
+                        task.vm_spot = (
+                            VM_PROVISIONING_MODEL == "SPOT"
+                        ) and not _force_standard
+                        task.last_heartbeat = None
+                        _shared_state.deploy_monitoring["last_dispatch_time"] = _utcnow()
+                        session.add(task)
+                        try:
                             await session.commit()
+                            # Slot ownership transfers to _provision_and_handle
+                            # (acct_id_for_release) once the PROVISIONING commit
+                            # lands — the containment handler must not release it.
+                            _iter_preclaimed_account_id = None
+                            # active_tasks already pre-incremented in select_max_plan_account()
+                            project_active_counts[task.project_id] = (
+                                project_active_counts.get(task.project_id, 0) + 1
+                            )
+                            logger.info(
+                                f"[ORCHESTRATOR] Task {task.id} committed as PROVISIONING — launching VM"
+                            )
+                            # Issue 11: emit warm-pin-clear metric ONLY after the
+                            # commit that persists the warm-field clear succeeds.
+                            # On commit failure → rollback path below, the metric
+                            # stays unrecorded so the next dispatch cycle can fire
+                            # it cleanly without double-counting.
                             if _pending_warm_pin_clear is not None:
                                 _shared_state.record_warm_pin_clear(
                                     *_pending_warm_pin_clear
                                 )
                                 _pending_warm_pin_clear = None
+                            # Pool-hit-vs-cold-dispatch funnel: this task was cold-
+                            # provisioned (no compatible pool member was leased above).
+                            # Recorded only when the pool feature is on so the funnel
+                            # denominator reflects the period the pool was actually live.
+                            if is_warm_pool_enabled():
+                                # Attribute the cold dispatch to the same resolved
+                                # account as the lease hit/miss recorded earlier in
+                                # this iteration so the per-account funnel
+                                # denominator reconciles with fleet totals. When
+                                # selection fell back to env credentials account_id
+                                # is None and the cold dispatch buckets under the
+                                # unattributed account, exactly as before.
+                                record_pool_cold_dispatch(account_id)
+                        except Exception as e:
+                            import traceback
+
+                            logger.error(
+                                f"[ORCHESTRATOR] FAILED to commit PROVISIONING for task {task.id}: {e}",
+                                exc_info=True,
+                            )
+                            traceback.print_exc()
+                            # Release the pre-incremented slot on commit failure
+                            if account_id:
+                                await release_max_plan_account(
+                                    account_id, revert_daily_task_count=True
+                                )
+                            _iter_preclaimed_account_id = None
+                            task.context = clear_task_llm_runtime_context(task.context)
+                            await session.rollback()
                             continue
 
-                    if _sync_task_payload_runtime_fields(
-                        task,
-                        model=runtime_model,
-                        execution_mode=runtime_execution_mode,
-                    ):
-                        from sqlalchemy.orm.attributes import flag_modified
+                        # Trigger GCP Compute Engine provisioning in the background
+                        # All values passed as args to avoid stale closure captures across loop iterations
+                        async def _provision_and_handle(
+                            vm_id: str,
+                            t_id: uuid.UUID,
+                            p_id: uuid.UUID,
+                            payloads: list,
+                            secret_value: str | None,
+                            config_json: str | None,
+                            acct_id_for_release: str,
+                            llm_provider: str | None,
+                            llm_auth_mode: str | None,
+                            llm_model: str | None,
+                            llm_execution_mode: str | None,
+                            llm_provider_metadata: dict | None,
+                            llm_provider_settings: dict | None,
+                            force_standard: bool = False,
+                        ):
+                            success = False
+                            try:
+                                t_type = (
+                                    (payloads[0] or {}).get("type", "") if payloads else ""
+                                )
 
-                        flag_modified(task, "payloads")
-                        session.add(task)
+                                # Upload payload to GCS and store agent credentials in Secret Manager
+                                # concurrently — both are independent I/O operations (~500ms each)
+                                # that produce inputs for the VM startup script.
+                                async def _upload_payload_safe() -> str | None:
+                                    if not payloads:
+                                        return None
+                                    try:
+                                        return await upload_json_payload(
+                                            str(t_id), payloads
+                                        )
+                                    except Exception as e:
+                                        logger.error(
+                                            f"[ORCHESTRATOR] Failed to upload payload for task {t_id}: {e}",
+                                            exc_info=True,
+                                        )
+                                        return None
 
-                    task.context = apply_task_llm_runtime_context(
-                        task.context,
-                        account_id=account_id,
-                        provider=runtime_provider,
-                        auth_mode=runtime_auth_mode,
-                        model=runtime_model,
-                        execution_mode=runtime_execution_mode,
-                    )
+                                payload_uri, secret_version_name = await asyncio.gather(
+                                    _upload_payload_safe(),
+                                    prepare_and_store_agent_secret(
+                                        vm_id,
+                                        t_id,
+                                        secret_value,
+                                        config_json,
+                                        t_type,
+                                        provider=llm_provider,
+                                        auth_mode=llm_auth_mode,
+                                        model=llm_model,
+                                        execution_mode=llm_execution_mode,
+                                        provider_metadata=llm_provider_metadata,
+                                        provider_settings=llm_provider_settings,
+                                        project_id=str(task.project_id),  # audit W3/E10
+                                    ),
+                                )
 
-                    # Launch-time staleness recompute: for finding-derived tasks
-                    # that have been QUEUED while the integration branch advanced,
-                    # re-check whether any cited file changed since the finding was
-                    # generated — against the CURRENT branch tip, not the inert
-                    # ingestion HEAD. Best-effort: the helper never raises and only
-                    # an affirmative change verdict annotates the context, so it can
-                    # never block or delay dispatch. The mutation is persisted by
-                    # the PROVISIONING commit below.
-                    from app.research_completion import recompute_launch_staleness
-
-                    if await recompute_launch_staleness(session, task):
-                        from sqlalchemy.orm.attributes import flag_modified
-
-                        flag_modified(task, "context")
-
-                    # Mark as PROVISIONING to prevent other workers from picking it up.
-                    # last_heartbeat is intentionally NOT set here — it must reflect real
-                    # agent activity only. The reaper uses vm_provisioned_at as the clock
-                    # for the pre-claim window so it can distinguish "VM created but agent
-                    # never claimed" from "agent claimed and crashed".
-                    task.status = TaskStatus.PROVISIONING
-                    task.started_at = _utcnow()
-                    # Write-once dispatch timestamp — anchors vm_cold_start_ms
-                    # to the full dispatch->agent-ready interval (includes GCE
-                    # boot latency). Never re-stamped on provision-confirm.
-                    if task.vm_dispatched_at is None:
-                        task.vm_dispatched_at = _utcnow()
-                    task.vm_provisioned_at = _utcnow()
-                    # Cold dispatch: this is a fresh provision, so vm_warm_start
-                    # is False. The warm-claim / backlog-reuse path stamps True
-                    # instead (routers/agent_warm_continuity._finalize_warm_claim),
-                    # which is also where the vm_reuse_rate signal
-                    # (context['_timing']['warm_start']) is written. See
-                    # compute.provision_agent_vm for the corresponding marker.
-                    task.vm_warm_start = False
-                    # vm_spot must be written here — it's read by ~30 cost-rate sites
-                    # (admin_digest, ci_completion, task_completion, etc.) gating
-                    # SPOT_RATE vs ON_DEMAND_RATE. Without this write every cost
-                    # dashboard overstates by ~3.3x when the orchestrator runs in
-                    # SPOT mode. compute.VM_PROVISIONING_MODEL is the source of truth
-                    # (env-driven; STANDARD by default).
-                    # Tasks with >=2 prior spot preemptions are forced to STANDARD
-                    # to avoid a third preemption on the same task.
-                    _spot_preemption_count = (task.context or {}).get(
-                        "spot_preemption_count", 0
-                    )
-                    _force_standard = (VM_PROVISIONING_MODEL == "SPOT") and (
-                        _spot_preemption_count >= 2
-                    )
-                    if _force_standard:
-                        logger.info(
-                            f"[ORCHESTRATOR] Task {task.id} forced to STANDARD VM after {_spot_preemption_count} spot preemptions"
-                        )
-                    task.vm_spot = (
-                        VM_PROVISIONING_MODEL == "SPOT"
-                    ) and not _force_standard
-                    task.last_heartbeat = None
-                    _shared_state.deploy_monitoring["last_dispatch_time"] = _utcnow()
-                    session.add(task)
-                    try:
-                        await session.commit()
-                        # active_tasks already pre-incremented in select_max_plan_account()
-                        project_active_counts[task.project_id] = (
-                            project_active_counts.get(task.project_id, 0) + 1
-                        )
-                        logger.info(
-                            f"[ORCHESTRATOR] Task {task.id} committed as PROVISIONING — launching VM"
-                        )
-                        # Issue 11: emit warm-pin-clear metric ONLY after the
-                        # commit that persists the warm-field clear succeeds.
-                        # On commit failure → rollback path below, the metric
-                        # stays unrecorded so the next dispatch cycle can fire
-                        # it cleanly without double-counting.
-                        if _pending_warm_pin_clear is not None:
-                            _shared_state.record_warm_pin_clear(
-                                *_pending_warm_pin_clear
-                            )
-                            _pending_warm_pin_clear = None
-                        # Pool-hit-vs-cold-dispatch funnel: this task was cold-
-                        # provisioned (no compatible pool member was leased above).
-                        # Recorded only when the pool feature is on so the funnel
-                        # denominator reflects the period the pool was actually live.
-                        if is_warm_pool_enabled():
-                            # Attribute the cold dispatch to the same resolved
-                            # account as the lease hit/miss recorded earlier in
-                            # this iteration so the per-account funnel
-                            # denominator reconciles with fleet totals. When
-                            # selection fell back to env credentials account_id
-                            # is None and the cold dispatch buckets under the
-                            # unattributed account, exactly as before.
-                            record_pool_cold_dispatch(account_id)
-                    except Exception as e:
-                        import traceback
-
-                        logger.error(
-                            f"[ORCHESTRATOR] FAILED to commit PROVISIONING for task {task.id}: {e}",
-                            exc_info=True,
-                        )
-                        traceback.print_exc()
-                        # Release the pre-incremented slot on commit failure
-                        if account_id:
-                            await release_max_plan_account(
-                                account_id, revert_daily_task_count=True
-                            )
-                        task.context = clear_task_llm_runtime_context(task.context)
-                        await session.rollback()
-                        continue
-
-                    # Trigger GCP Compute Engine provisioning in the background
-                    # All values passed as args to avoid stale closure captures across loop iterations
-                    async def _provision_and_handle(
-                        vm_id: str,
-                        t_id: uuid.UUID,
-                        p_id: uuid.UUID,
-                        payloads: list,
-                        secret_value: str | None,
-                        config_json: str | None,
-                        acct_id_for_release: str,
-                        llm_provider: str | None,
-                        llm_auth_mode: str | None,
-                        llm_model: str | None,
-                        llm_execution_mode: str | None,
-                        llm_provider_metadata: dict | None,
-                        llm_provider_settings: dict | None,
-                        force_standard: bool = False,
-                    ):
-                        success = False
-                        try:
-                            t_type = (
-                                (payloads[0] or {}).get("type", "") if payloads else ""
-                            )
-
-                            # Upload payload to GCS and store agent credentials in Secret Manager
-                            # concurrently — both are independent I/O operations (~500ms each)
-                            # that produce inputs for the VM startup script.
-                            async def _upload_payload_safe() -> str | None:
-                                if not payloads:
-                                    return None
-                                try:
-                                    return await upload_json_payload(
-                                        str(t_id), payloads
-                                    )
-                                except Exception as e:
-                                    logger.error(
-                                        f"[ORCHESTRATOR] Failed to upload payload for task {t_id}: {e}",
-                                        exc_info=True,
-                                    )
-                                    return None
-
-                            payload_uri, secret_version_name = await asyncio.gather(
-                                _upload_payload_safe(),
-                                prepare_and_store_agent_secret(
+                                success = await provision_agent_vm(
                                     vm_id,
                                     t_id,
-                                    secret_value,
-                                    config_json,
-                                    t_type,
+                                    payload_uri,
+                                    oauth_token=secret_value,
+                                    claude_config_json=config_json,
+                                    task_type=t_type,
+                                    secret_version_name=secret_version_name,
                                     provider=llm_provider,
                                     auth_mode=llm_auth_mode,
                                     model=llm_model,
                                     execution_mode=llm_execution_mode,
                                     provider_metadata=llm_provider_metadata,
                                     provider_settings=llm_provider_settings,
-                                    project_id=str(task.project_id),  # audit W3/E10
-                                ),
-                            )
-
-                            success = await provision_agent_vm(
-                                vm_id,
-                                t_id,
-                                payload_uri,
-                                oauth_token=secret_value,
-                                claude_config_json=config_json,
-                                task_type=t_type,
-                                secret_version_name=secret_version_name,
-                                provider=llm_provider,
-                                auth_mode=llm_auth_mode,
-                                model=llm_model,
-                                execution_mode=llm_execution_mode,
-                                provider_metadata=llm_provider_metadata,
-                                provider_settings=llm_provider_settings,
-                                provisioning_model="STANDARD"
-                                if force_standard
-                                else None,
-                            )
-                            if success:
-                                # Verify the task still wants this VM — stale recovery may have
-                                # requeued the task with a new vm_id while we were provisioning.
-                                # If so, this VM is an orphan: delete it immediately.
-                                try:
-                                    async with AsyncSessionLocal() as hb_session:
-                                        hb_task = await _lock_provisioning_task_for_vm(
-                                            hb_session, t_id, vm_id
-                                        )
-                                        if hb_task is None:
-                                            current_task = await hb_session.get(
-                                                Task, t_id
-                                            )
-                                            if (
-                                                not current_task
-                                                or current_task.vm_instance_id != vm_id
-                                            ):
-                                                current_vm = (
-                                                    current_task.vm_instance_id
-                                                    if current_task
-                                                    else "gone"
-                                                )
-                                                logger.warning(
-                                                    f"[ORCHESTRATOR] VM {vm_id} created but task {t_id} now has vm_id={current_vm} — deleting orphan"
-                                                )
-                                                await _ensure_vm_deleted(
-                                                    vm_id, reason="vm_id_mismatch"
-                                                )
-                                                success = False
-                                                return
-                                        else:
-                                            # Refresh vm_provisioned_at to the point the GCE API
-                                            # confirmed the VM is running. This gives the agent a
-                                            # fresh window to claim before the reaper considers it
-                                            # a silent startup failure. last_heartbeat is left alone
-                                            # so only real agent activity writes it.
-                                            hb_task.vm_provisioned_at = _utcnow()
-                                            # vm_spot mirrors orchestrator-mode at provision-confirm time;
-                                            # see comment at the dispatch-site write above.
-                                            hb_task.vm_spot = (
-                                                VM_PROVISIONING_MODEL == "SPOT"
-                                            ) and not force_standard
-                                            # Save provision zone for diagnostics
-                                            prov_zone = get_vm_zone(vm_id)
-                                            hb_task.context = {
-                                                **(hb_task.context or {}),
-                                                "provision_zone": prov_zone,
-                                            }
-                                            hb_session.add(hb_task)
-                                            await hb_session.commit()
-                                except Exception as e:
-                                    logger.warning(
-                                        f"[ORCHESTRATOR] Failed to verify/touch heartbeat after provision for {t_id}: {e}"
-                                    )
-                        except asyncio.CancelledError:
-                            # Stale recovery cancelled us, but the underlying GCP thread may
-                            # still create the VM. Schedule a delayed cleanup to catch it.
-                            logger.warning(
-                                f"[ORCHESTRATOR] Provision for {vm_id} cancelled — scheduling orphan cleanup"
-                            )
-
-                            async def _delayed_orphan_cleanup(orphan_vm_id: str):
-                                await asyncio.sleep(
-                                    120
-                                )  # Wait for GCP thread to finish
-                                await _ensure_vm_deleted(
-                                    orphan_vm_id, reason="cancelled_provision_orphan"
+                                    provisioning_model="STANDARD"
+                                    if force_standard
+                                    else None,
                                 )
-
-                            _cleanup_key = f"orphan_cleanup_{vm_id}"
-                            _cleanup_task = asyncio.create_task(
-                                _delayed_orphan_cleanup(vm_id)
-                            )
-                            _shared_state.background_tasks[_cleanup_key] = _cleanup_task
-                            # Drop the dict entry once the task finishes so we don't retain
-                            # completed asyncio.Task objects indefinitely (seen ~100s of these
-                            # accumulating per day of provision churn — direct memory growth).
-                            _cleanup_task.add_done_callback(
-                                lambda _t, _k=_cleanup_key: (
-                                    _shared_state.background_tasks.pop(_k, None)
-                                )
-                            )
-                            raise
-                        except Exception as e:
-                            logger.error(
-                                f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}",
-                                exc_info=True,
-                            )
-                            success = False
-                        finally:
-                            # Always release the Max Plan account slot on failure, even if an
-                            # exception escapes the try/except above (e.g. from record_task_result)
-                            if not success and acct_id_for_release:
-                                await release_max_plan_account(
-                                    acct_id_for_release,
-                                    revert_daily_task_count=True,
-                                )
-                        if not success:
-                            provision_err = get_provision_error(vm_id)
-                            logger.error(
-                                f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}: {provision_err}"
-                            )
-                            try:
-                                record_task_result(
-                                    success=False,
-                                    failure_class="PROVISION_FAILURE",
-                                    task_id=str(t_id),
-                                    task_type=t_type,
-                                )
-                                # Hoist zone lookup so it can be saved to context and used for zone failure recording
-                                prov_zone = get_vm_zone(vm_id)
-                                # Capture serial port logs before VM deletion (best-effort)
-                                serial_log = None
-                                try:
-                                    if prov_zone and prov_zone != "unknown":
-                                        serial_log = await asyncio.to_thread(
-                                            _capture_serial_for_vm, vm_id, prov_zone
-                                        )
-                                        if serial_log:
-                                            logger.error(
-                                                f"[ORCHESTRATOR] Serial log for failed VM {vm_id}:\n{serial_log}"
+                                if success:
+                                    # Verify the task still wants this VM — stale recovery may have
+                                    # requeued the task with a new vm_id while we were provisioning.
+                                    # If so, this VM is an orphan: delete it immediately.
+                                    try:
+                                        async with AsyncSessionLocal() as hb_session:
+                                            hb_task = await _lock_provisioning_task_for_vm(
+                                                hb_session, t_id, vm_id
                                             )
-                                except Exception:
-                                    logger.exception(
-                                        f"[ORCHESTRATOR] Failed to capture serial log for VM {vm_id}"
-                                    )
-                                # Requeue with retry tracking — zone exhaustion is transient
-                                try:
-                                    async with AsyncSessionLocal() as inner_session:
-                                        failed_task = (
-                                            await _lock_provisioning_task_for_vm(
-                                                inner_session, t_id, vm_id
-                                            )
-                                        )
-                                        if failed_task:
-                                            ctx = dict(failed_task.context or {})
-                                            if prov_zone:
-                                                ctx["provision_zone"] = prov_zone
-                                            if serial_log:
-                                                ctx["last_serial_log"] = serial_log
-
-                                            # Classify: infra-wide (zone/quota exhaustion) vs task-specific
-                                            err_lower = (provision_err or "").lower()
-                                            is_infra = (
-                                                any(
-                                                    p in err_lower
-                                                    for p in INFRA_PROVISION_PATTERNS
+                                            if hb_task is None:
+                                                current_task = await hb_session.get(
+                                                    Task, t_id
                                                 )
-                                                or not any_zone_available()
-                                            )
-
-                                            if is_infra:
-                                                # Infrastructure-wide failure — don't burn retry budget
-                                                infra_count = (
-                                                    ctx.get(
-                                                        "provision_failures_infra", 0
+                                                if (
+                                                    not current_task
+                                                    or current_task.vm_instance_id != vm_id
+                                                ):
+                                                    current_vm = (
+                                                        current_task.vm_instance_id
+                                                        if current_task
+                                                        else "gone"
                                                     )
-                                                    + 1
-                                                )
-                                                ctx["provision_failures_infra"] = (
-                                                    infra_count
-                                                )
-                                                ctx["_infra_wait"] = True
-                                                bank_task_current_attempt(
-                                                    failed_task, stopped_at=_utcnow()
-                                                )
-                                                ctx = with_task_attempt_banking(
-                                                    failed_task, ctx
-                                                )
-                                                failed_task.context = ctx
-                                                failed_task.status = TaskStatus.QUEUED
-                                                failed_task.vm_instance_id = (
-                                                    f"agent-vm-{uuid.uuid4().hex}"
-                                                )
-                                                failed_task.last_heartbeat = None
-                                                failed_task.started_at = None
-                                                # Align retry with zone recovery; cap at 30 min.
-                                                # Audit C10: zone_recovery_wait_seconds() does
-                                                # the tz-AWARE subtraction internally (matches
-                                                # the reaper's infra-requeue path). The previous
-                                                # naive _utcnow() subtraction here raised
-                                                # TypeError, rolling back this QUEUED status +
-                                                # retry_after_until.
-                                                recovery_wait = zone_recovery_wait_seconds()
-                                                if recovery_wait is not None:
-                                                    wait_sec = max(60, recovery_wait + 60)
-                                                    delay_min = min(wait_sec / 60, 30)
-                                                else:
-                                                    delay_min = 10
-                                                set_retry_after(failed_task, delay_min)
-                                                ctx = dict(failed_task.context or {})
-                                                failed_task.latest_status_message = f"Infra-wide provision failure (#{infra_count}), requeued — waiting for zone recovery: {provision_err or 'unknown'}"[
-                                                    :500
-                                                ]
-                                                logger.warning(
-                                                    f"[ORCHESTRATOR] Task {t_id} infra provision failure — requeuing without burning retry budget (delay {delay_min:.0f}min)"
-                                                )
+                                                    logger.warning(
+                                                        f"[ORCHESTRATOR] VM {vm_id} created but task {t_id} now has vm_id={current_vm} — deleting orphan"
+                                                    )
+                                                    await _ensure_vm_deleted(
+                                                        vm_id, reason="vm_id_mismatch"
+                                                    )
+                                                    success = False
+                                                    return
                                             else:
-                                                # Task-specific failure — burn retry budget
-                                                prov_failures = (
-                                                    ctx.get("provision_failures", 0) + 1
-                                                )
-                                                ctx["provision_failures"] = (
-                                                    prov_failures
-                                                )
-                                                ctx.pop("_infra_wait", None)
-                                                max_prov_retries = _runtime_config.get(
-                                                    "max_provision_retries", 3
-                                                )
-                                                if prov_failures >= max_prov_retries:
-                                                    # Exhausted retries — permanent failure
-                                                    failed_task.status = (
-                                                        TaskStatus.FAILED
-                                                    )
-                                                    failed_task.latest_status_message = f"VM provisioning failed {prov_failures} times — giving up: {provision_err or 'unknown error'}"
-                                                    ctx["failure_category"] = (
-                                                        "PROVISION_FAILURE"
-                                                    )
-                                                    await _maybe_create_failure_alert(
-                                                        failed_task,
-                                                        inner_session,
-                                                        (
-                                                            provision_err
-                                                            or "unknown error"
-                                                        )[:200],
-                                                    )
-                                                    try:
-                                                        record_task_result(
-                                                            success=False,
-                                                            failure_class="PROVISION_FAILURE",
-                                                            task_id=str(failed_task.id),
-                                                            task_type=(
-                                                                failed_task.first_payload
-                                                                or {}
-                                                            ).get("type", ""),
-                                                        )
-                                                        _direction_id = str(
-                                                            (
-                                                                failed_task.context
-                                                                or {}
-                                                            ).get("direction_id")
-                                                            or ""
-                                                        )
-                                                        if _direction_id:
-                                                            from app.shared_state import (
-                                                                record_direction_result as _rdr,
-                                                            )
+                                                # Refresh vm_provisioned_at to the point the GCE API
+                                                # confirmed the VM is running. This gives the agent a
+                                                # fresh window to claim before the reaper considers it
+                                                # a silent startup failure. last_heartbeat is left alone
+                                                # so only real agent activity writes it.
+                                                hb_task.vm_provisioned_at = _utcnow()
+                                                # vm_spot mirrors orchestrator-mode at provision-confirm time;
+                                                # see comment at the dispatch-site write above.
+                                                hb_task.vm_spot = (
+                                                    VM_PROVISIONING_MODEL == "SPOT"
+                                                ) and not force_standard
+                                                # Save provision zone for diagnostics
+                                                prov_zone = get_vm_zone(vm_id)
+                                                hb_task.context = {
+                                                    **(hb_task.context or {}),
+                                                    "provision_zone": prov_zone,
+                                                }
+                                                hb_session.add(hb_task)
+                                                await hb_session.commit()
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"[ORCHESTRATOR] Failed to verify/touch heartbeat after provision for {t_id}: {e}"
+                                        )
+                            except asyncio.CancelledError:
+                                # Stale recovery cancelled us, but the underlying GCP thread may
+                                # still create the VM. Schedule a delayed cleanup to catch it.
+                                logger.warning(
+                                    f"[ORCHESTRATOR] Provision for {vm_id} cancelled — scheduling orphan cleanup"
+                                )
 
-                                                            _rdr(
-                                                                _direction_id,
-                                                                success=False,
-                                                                failure_class="PROVISION_FAILURE",
-                                                                project_id=str(
-                                                                    failed_task.project_id
-                                                                )
-                                                                if failed_task.project_id
-                                                                else "",
-                                                            )
-                                                    except Exception:
-                                                        logger.exception(
-                                                            f"[ORCHESTRATOR] Failed to record provision-exhaustion result for task {t_id}"
-                                                        )
-                                                    logger.error(
-                                                        f"[ORCHESTRATOR] Task {t_id} provision failed {prov_failures} times — permanent failure"
+                                async def _delayed_orphan_cleanup(orphan_vm_id: str):
+                                    await asyncio.sleep(
+                                        120
+                                    )  # Wait for GCP thread to finish
+                                    await _ensure_vm_deleted(
+                                        orphan_vm_id, reason="cancelled_provision_orphan"
+                                    )
+
+                                _cleanup_key = f"orphan_cleanup_{vm_id}"
+                                _cleanup_task = asyncio.create_task(
+                                    _delayed_orphan_cleanup(vm_id)
+                                )
+                                _shared_state.background_tasks[_cleanup_key] = _cleanup_task
+                                # Drop the dict entry once the task finishes so we don't retain
+                                # completed asyncio.Task objects indefinitely (seen ~100s of these
+                                # accumulating per day of provision churn — direct memory growth).
+                                _cleanup_task.add_done_callback(
+                                    lambda _t, _k=_cleanup_key: (
+                                        _shared_state.background_tasks.pop(_k, None)
+                                    )
+                                )
+                                raise
+                            except Exception as e:
+                                logger.error(
+                                    f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}",
+                                    exc_info=True,
+                                )
+                                success = False
+                            finally:
+                                # Always release the Max Plan account slot on failure, even if an
+                                # exception escapes the try/except above (e.g. from record_task_result)
+                                if not success and acct_id_for_release:
+                                    await release_max_plan_account(
+                                        acct_id_for_release,
+                                        revert_daily_task_count=True,
+                                    )
+                            if not success:
+                                provision_err = get_provision_error(vm_id)
+                                logger.error(
+                                    f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}: {provision_err}"
+                                )
+                                try:
+                                    record_task_result(
+                                        success=False,
+                                        failure_class="PROVISION_FAILURE",
+                                        task_id=str(t_id),
+                                        task_type=t_type,
+                                    )
+                                    # Hoist zone lookup so it can be saved to context and used for zone failure recording
+                                    prov_zone = get_vm_zone(vm_id)
+                                    # Capture serial port logs before VM deletion (best-effort)
+                                    serial_log = None
+                                    try:
+                                        if prov_zone and prov_zone != "unknown":
+                                            serial_log = await asyncio.to_thread(
+                                                _capture_serial_for_vm, vm_id, prov_zone
+                                            )
+                                            if serial_log:
+                                                logger.error(
+                                                    f"[ORCHESTRATOR] Serial log for failed VM {vm_id}:\n{serial_log}"
+                                                )
+                                    except Exception:
+                                        logger.exception(
+                                            f"[ORCHESTRATOR] Failed to capture serial log for VM {vm_id}"
+                                        )
+                                    # Requeue with retry tracking — zone exhaustion is transient
+                                    try:
+                                        async with AsyncSessionLocal() as inner_session:
+                                            failed_task = (
+                                                await _lock_provisioning_task_for_vm(
+                                                    inner_session, t_id, vm_id
+                                                )
+                                            )
+                                            if failed_task:
+                                                ctx = dict(failed_task.context or {})
+                                                if prov_zone:
+                                                    ctx["provision_zone"] = prov_zone
+                                                if serial_log:
+                                                    ctx["last_serial_log"] = serial_log
+
+                                                # Classify: infra-wide (zone/quota exhaustion) vs task-specific
+                                                err_lower = (provision_err or "").lower()
+                                                is_infra = (
+                                                    any(
+                                                        p in err_lower
+                                                        for p in INFRA_PROVISION_PATTERNS
                                                     )
-                                                else:
-                                                    # Requeue for retry
+                                                    or not any_zone_available()
+                                                )
+
+                                                if is_infra:
+                                                    # Infrastructure-wide failure — don't burn retry budget
+                                                    infra_count = (
+                                                        ctx.get(
+                                                            "provision_failures_infra", 0
+                                                        )
+                                                        + 1
+                                                    )
+                                                    ctx["provision_failures_infra"] = (
+                                                        infra_count
+                                                    )
+                                                    ctx["_infra_wait"] = True
                                                     bank_task_current_attempt(
-                                                        failed_task,
-                                                        stopped_at=_utcnow(),
+                                                        failed_task, stopped_at=_utcnow()
                                                     )
                                                     ctx = with_task_attempt_banking(
                                                         failed_task, ctx
                                                     )
                                                     failed_task.context = ctx
-                                                    failed_task.status = (
-                                                        TaskStatus.QUEUED
-                                                    )
+                                                    failed_task.status = TaskStatus.QUEUED
                                                     failed_task.vm_instance_id = (
                                                         f"agent-vm-{uuid.uuid4().hex}"
                                                     )
                                                     failed_task.last_heartbeat = None
                                                     failed_task.started_at = None
-                                                    # Back off 2 min per failure to let zones recover
-                                                    set_retry_after(
-                                                        failed_task, 2 * prov_failures
-                                                    )
-                                                    ctx = dict(
-                                                        failed_task.context or {}
-                                                    )
-                                                    failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
+                                                    # Align retry with zone recovery; cap at 30 min.
+                                                    # Audit C10: zone_recovery_wait_seconds() does
+                                                    # the tz-AWARE subtraction internally (matches
+                                                    # the reaper's infra-requeue path). The previous
+                                                    # naive _utcnow() subtraction here raised
+                                                    # TypeError, rolling back this QUEUED status +
+                                                    # retry_after_until.
+                                                    recovery_wait = zone_recovery_wait_seconds()
+                                                    if recovery_wait is not None:
+                                                        wait_sec = max(60, recovery_wait + 60)
+                                                        delay_min = min(wait_sec / 60, 30)
+                                                    else:
+                                                        delay_min = 10
+                                                    set_retry_after(failed_task, delay_min)
+                                                    ctx = dict(failed_task.context or {})
+                                                    failed_task.latest_status_message = f"Infra-wide provision failure (#{infra_count}), requeued — waiting for zone recovery: {provision_err or 'unknown'}"[
+                                                        :500
+                                                    ]
                                                     logger.warning(
-                                                        f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing"
+                                                        f"[ORCHESTRATOR] Task {t_id} infra provision failure — requeuing without burning retry budget (delay {delay_min:.0f}min)"
                                                     )
+                                                else:
+                                                    # Task-specific failure — burn retry budget
+                                                    prov_failures = (
+                                                        ctx.get("provision_failures", 0) + 1
+                                                    )
+                                                    ctx["provision_failures"] = (
+                                                        prov_failures
+                                                    )
+                                                    ctx.pop("_infra_wait", None)
+                                                    max_prov_retries = _runtime_config.get(
+                                                        "max_provision_retries", 3
+                                                    )
+                                                    if prov_failures >= max_prov_retries:
+                                                        # Exhausted retries — permanent failure
+                                                        failed_task.status = (
+                                                            TaskStatus.FAILED
+                                                        )
+                                                        failed_task.latest_status_message = f"VM provisioning failed {prov_failures} times — giving up: {provision_err or 'unknown error'}"
+                                                        ctx["failure_category"] = (
+                                                            "PROVISION_FAILURE"
+                                                        )
+                                                        await _maybe_create_failure_alert(
+                                                            failed_task,
+                                                            inner_session,
+                                                            (
+                                                                provision_err
+                                                                or "unknown error"
+                                                            )[:200],
+                                                        )
+                                                        try:
+                                                            record_task_result(
+                                                                success=False,
+                                                                failure_class="PROVISION_FAILURE",
+                                                                task_id=str(failed_task.id),
+                                                                task_type=(
+                                                                    failed_task.first_payload
+                                                                    or {}
+                                                                ).get("type", ""),
+                                                            )
+                                                            _direction_id = str(
+                                                                (
+                                                                    failed_task.context
+                                                                    or {}
+                                                                ).get("direction_id")
+                                                                or ""
+                                                            )
+                                                            if _direction_id:
+                                                                from app.shared_state import (
+                                                                    record_direction_result as _rdr,
+                                                                )
 
-                                            if failed_task.status == TaskStatus.QUEUED:
-                                                ctx = clear_task_llm_runtime_context(
-                                                    ctx
+                                                                _rdr(
+                                                                    _direction_id,
+                                                                    success=False,
+                                                                    failure_class="PROVISION_FAILURE",
+                                                                    project_id=str(
+                                                                        failed_task.project_id
+                                                                    )
+                                                                    if failed_task.project_id
+                                                                    else "",
+                                                                )
+                                                        except Exception:
+                                                            logger.exception(
+                                                                f"[ORCHESTRATOR] Failed to record provision-exhaustion result for task {t_id}"
+                                                            )
+                                                        logger.error(
+                                                            f"[ORCHESTRATOR] Task {t_id} provision failed {prov_failures} times — permanent failure"
+                                                        )
+                                                    else:
+                                                        # Requeue for retry
+                                                        bank_task_current_attempt(
+                                                            failed_task,
+                                                            stopped_at=_utcnow(),
+                                                        )
+                                                        ctx = with_task_attempt_banking(
+                                                            failed_task, ctx
+                                                        )
+                                                        failed_task.context = ctx
+                                                        failed_task.status = (
+                                                            TaskStatus.QUEUED
+                                                        )
+                                                        failed_task.vm_instance_id = (
+                                                            f"agent-vm-{uuid.uuid4().hex}"
+                                                        )
+                                                        failed_task.last_heartbeat = None
+                                                        failed_task.started_at = None
+                                                        # Back off 2 min per failure to let zones recover
+                                                        set_retry_after(
+                                                            failed_task, 2 * prov_failures
+                                                        )
+                                                        ctx = dict(
+                                                            failed_task.context or {}
+                                                        )
+                                                        failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
+                                                        logger.warning(
+                                                            f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing"
+                                                        )
+
+                                                if failed_task.status == TaskStatus.QUEUED:
+                                                    ctx = clear_task_llm_runtime_context(
+                                                        ctx
+                                                    )
+                                                failed_task.context = ctx
+                                                inner_session.add(failed_task)
+                                                await inner_session.commit()
+                                                await broadcast_to_project(
+                                                    str(p_id),
+                                                    "task_updated",
+                                                    {
+                                                        "task_id": str(t_id),
+                                                        "status": failed_task.status,
+                                                    },
                                                 )
-                                            failed_task.context = ctx
-                                            inner_session.add(failed_task)
-                                            await inner_session.commit()
-                                            await broadcast_to_project(
-                                                str(p_id),
-                                                "task_updated",
-                                                {
-                                                    "task_id": str(t_id),
-                                                    "status": failed_task.status,
-                                                },
-                                            )
-                                            # Record zone failure so the zone health system avoids this zone
-                                            if prov_zone and prov_zone != "unknown":
-                                                record_zone_failure(
-                                                    prov_zone,
-                                                    reason="PROVISION_INLINE_FAILURE",
-                                                )
-                                except Exception as e:
-                                    logger.error(
-                                        f"[ORCHESTRATOR] Error handling provision failure for task {t_id}: {e}",
-                                        exc_info=True,
+                                                # Record zone failure so the zone health system avoids this zone
+                                                if prov_zone and prov_zone != "unknown":
+                                                    record_zone_failure(
+                                                        prov_zone,
+                                                        reason="PROVISION_INLINE_FAILURE",
+                                                    )
+                                    except Exception as e:
+                                        logger.error(
+                                            f"[ORCHESTRATOR] Error handling provision failure for task {t_id}: {e}",
+                                            exc_info=True,
+                                        )
+                                finally:
+                                    # ALWAYS delete partially-created VM, even if requeue logic crashes
+                                    await _ensure_vm_deleted(
+                                        vm_id, reason="provision_failure"
                                     )
-                            finally:
-                                # ALWAYS delete partially-created VM, even if requeue logic crashes
-                                await _ensure_vm_deleted(
-                                    vm_id, reason="provision_failure"
-                                )
 
-                    provision_coro = asyncio.create_task(
-                        _provision_and_handle(
-                            task.vm_instance_id,
-                            task.id,
-                            task.project_id,
-                            task.payloads,
-                            runtime_secret,
-                            claude_config_json,
-                            account_id,
-                            runtime_provider,
-                            runtime_auth_mode,
-                            runtime_model,
-                            runtime_execution_mode,
-                            runtime_provider_metadata,
-                            runtime_provider_settings,
-                            force_standard=_force_standard,
+                        provision_coro = asyncio.create_task(
+                            _provision_and_handle(
+                                task.vm_instance_id,
+                                task.id,
+                                task.project_id,
+                                task.payloads,
+                                runtime_secret,
+                                claude_config_json,
+                                account_id,
+                                runtime_provider,
+                                runtime_auth_mode,
+                                runtime_model,
+                                runtime_execution_mode,
+                                runtime_provider_metadata,
+                                runtime_provider_settings,
+                                force_standard=_force_standard,
+                            )
                         )
-                    )
-                    _provision_coroutines[str(task.id)] = provision_coro
-                    provision_coro.add_done_callback(
-                        lambda _, tid=str(task.id): _provision_coroutines.pop(tid, None)
-                    )
+                        _provision_coroutines[str(task.id)] = provision_coro
+                        provision_coro.add_done_callback(
+                            lambda _, tid=str(task.id): _provision_coroutines.pop(tid, None)
+                        )
 
-                    await broadcast_to_project(
-                        str(task.project_id),
-                        "task_updated",
-                        {"task_id": str(task.id), "status": TaskStatus.PROVISIONING},
-                    )
-                    _cycle_dispatched += 1
+                        await broadcast_to_project(
+                            str(task.project_id),
+                            "task_updated",
+                            {"task_id": str(task.id), "status": TaskStatus.PROVISIONING},
+                        )
+                        _cycle_dispatched += 1
+                    except Exception as _dispatch_prep_exc:
+                        # NEVER touch the loop's `task` ORM object in here — the
+                        # rollback below expires every session-bound instance
+                        # and attribute access would fire a sync lazy-load
+                        # (MissingGreenlet, the hazard documented at the
+                        # gate-info snapshot above). Use the snapshot tuple
+                        # (_qt_id, _task_type_for_gate) instead.
+                        logger.error(
+                            f"[ORCHESTRATOR] Dispatch prep crashed for task {_qt_id} "
+                            f"(type={_task_type_for_gate or '?'}): {_dispatch_prep_exc!r} "
+                            "— contained; continuing with next task",
+                            exc_info=True,
+                        )
+                        try:
+                            await session.rollback()
+                        except Exception:
+                            logger.exception(
+                                f"[ORCHESTRATOR] Containment rollback failed for task {_qt_id}"
+                            )
+                        if _iter_preclaimed_account_id:
+                            try:
+                                await release_max_plan_account(
+                                    _iter_preclaimed_account_id,
+                                    revert_daily_task_count=True,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "[ORCHESTRATOR] Failed to release pre-claimed account "
+                                    f"{_iter_preclaimed_account_id} after dispatch crash "
+                                    f"for task {_qt_id}"
+                                )
+                        try:
+                            _crashed_task = await _lock_dispatchable_task_for_mutation(
+                                session, _qt_id
+                            )
+                            if _crashed_task is not None:
+                                _crash_ctx = dict(_crashed_task.context or {})
+                                _prep_failures = (
+                                    int(_crash_ctx.get("_dispatch_prep_failures") or 0)
+                                    + 1
+                                )
+                                if (
+                                    _prep_failures
+                                    >= DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD
+                                ):
+                                    # Quarantine: take the poison task out of the
+                                    # dispatch path. FAILED is operator-recoverable
+                                    # (retry) and record_task_result engages the
+                                    # per-type failure gate — the gate that never
+                                    # fired while the task crashed pre-FAILED.
+                                    # Dependents are reclaimed by the existing
+                                    # failed-foundation cascade sweep.
+                                    _crash_ctx["_dispatch_prep_failures"] = (
+                                        _prep_failures
+                                    )
+                                    _crashed_task.context = _crash_ctx
+                                    _crashed_task.status = TaskStatus.FAILED
+                                    if _crashed_task.vm_provisioned_at:
+                                        _crashed_task.vm_stopped_at = _utcnow()
+                                    _crashed_task.latest_status_message = (
+                                        f"Dispatch preparation crashed {_prep_failures} "
+                                        "consecutive cycles — quarantined: "
+                                        f"{_dispatch_prep_exc!r}"
+                                    )[:500]
+                                    from app.failure_classification import (
+                                        persist_failure_category as _pfc_dispatch,
+                                    )
+
+                                    _pfc_dispatch(_crashed_task, "PROVISION_FAILURE")
+                                    record_task_result(
+                                        success=False,
+                                        failure_class="PROVISION_FAILURE",
+                                        task_id=str(_qt_id),
+                                        task_type=_task_type_for_gate or "",
+                                    )
+                                    await _maybe_create_failure_alert(
+                                        _crashed_task,
+                                        session,
+                                        (
+                                            f"Dispatch preparation crashed {_prep_failures} "
+                                            f"times — task quarantined. Last error: "
+                                            f"{_dispatch_prep_exc!r}"
+                                        )[:200],
+                                    )
+                                    logger.exception(
+                                        f"[ORCHESTRATOR] Task {_qt_id} quarantined after "
+                                        f"{_prep_failures} dispatch prep crashes"
+                                    )
+                                else:
+                                    _crash_ctx["_dispatch_prep_failures"] = (
+                                        _prep_failures
+                                    )
+                                    _crashed_task.context = _crash_ctx
+                                    _crashed_task.latest_status_message = (
+                                        "Dispatch preparation crashed (attempt "
+                                        f"{_prep_failures}/"
+                                        f"{DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD}"
+                                        f"), will retry: {_dispatch_prep_exc!r}"
+                                    )[:500]
+                                session.add(_crashed_task)
+                                _crash_proj_id = str(_crashed_task.project_id)
+                                _crash_status = _crashed_task.status
+                                await session.commit()
+                                await broadcast_to_project(
+                                    _crash_proj_id,
+                                    "task_updated",
+                                    {
+                                        "task_id": str(_qt_id),
+                                        "status": _crash_status,
+                                    },
+                                )
+                        except Exception:
+                            # Containment must never re-crash the cycle: if
+                            # persisting the counter/quarantine fails the task
+                            # simply stays QUEUED for the next cycle (the
+                            # pre-containment behavior). Mirrors the CI-poll
+                            # error recovery's nested handler below.
+                            logger.exception(
+                                "[ORCHESTRATOR] Failed to persist dispatch-crash "
+                                f"state for task {_qt_id}"
+                            )
+                            try:
+                                await session.rollback()
+                            except Exception:
+                                logger.exception(
+                                    "[ORCHESTRATOR] Containment rollback also "
+                                    f"failed for task {_qt_id}"
+                                )
+                        continue
 
                 # All-accounts-blocked stall detection: if at least one task was
                 # skipped for rate-limited accounts and nothing dispatched, the

@@ -103,9 +103,7 @@ async def _resolve_terminal_parent_verdict(
     blocked_children = [c for c in children if c.status == TaskStatus.BLOCKED]
     cancelled_children = [c for c in children if c.status == TaskStatus.CANCELLED]
     genuine_cancelled_children = [
-        c
-        for c in cancelled_children
-        if not _is_non_genuine_cancelled(c)
+        c for c in cancelled_children if not _is_non_genuine_cancelled(c)
     ]
     non_genuine_cancelled_children = [
         c for c in cancelled_children if _is_non_genuine_cancelled(c)
@@ -191,13 +189,10 @@ async def _terminate_all_non_genuine_cancelled(
     """
     from app.failure_classification import SCOPE_EMPTY, persist_failure_category
 
-    cancelled_count = len(
-        [c for c in children if c.status == TaskStatus.CANCELLED]
-    )
+    cancelled_count = len([c for c in children if c.status == TaskStatus.CANCELLED])
     parent.status = TaskStatus.FAILED
     parent.latest_status_message = (
-        f"All {cancelled_count} subtask(s) superseded/cancelled — "
-        f"nothing to roll up"
+        f"All {cancelled_count} subtask(s) superseded/cancelled — nothing to roll up"
     )
     persist_failure_category(parent, SCOPE_EMPTY)
     session.add(parent)
@@ -263,6 +258,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     Leaves COMPLETED, CANCELLED, and active (QUEUED/IN_PROGRESS) children untouched.
     Sets parent back to EVALUATING — no VM needed."""
     from app.alert_dispatch import _maybe_create_failure_alert
+
     # Deferred imports so test patches on app.task_lifecycle.* apply
     from app.task_lifecycle import broadcast_to_project, classify_failure
 
@@ -289,7 +285,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # visible to the blocked-vs-failed verdict — the old FAILED-only query made
         # them invisible and force-failed parents that were merely blocked.
         children = (
-            (await session.execute(select(Task).where(Task.parent_task_id == parent.id)))
+            (
+                await session.execute(
+                    select(Task).where(Task.parent_task_id == parent.id)
+                )
+            )
             .scalars()
             .all()
         )
@@ -573,6 +573,13 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         child_ctx = child.context or {}
         task_scope = child_ctx.get("scope", DEFAULT_TASK_SCOPE)
         attempt = child_ctx.get("_attempt_number", 1)
+        # Normalize raw lowercase 'scope_overflow' — defensive path where classify_failure
+        # returned CODE_ERROR but the agent's raw failure_category indicates scope overflow.
+        # failure_category is stripped from clone_ctx before _build_retry_prompt_suffix
+        # runs, so normalize failure_class here to ensure scope escalation fires correctly.
+        _raw_agent_cat = (child_ctx.get("failure_category") or "").lower()
+        if failure_class == "CODE_ERROR" and _raw_agent_cat == "scope_overflow":
+            failure_class = "SCOPE_OVERFLOW"
         _ctx_keys_to_strip = {
             "max_plan_account_id",
             "llm_account_id",
@@ -600,6 +607,16 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             "warm_target_vm_id",
             "warm_target_pr",
             "warm_handoff_deadline",
+            # Stale failure verdict and blocker state — written for the failed child
+            # attempt; must not be inherited by the clone or it would short-circuit
+            # fresh classification and route the first BLOCKED episode into the
+            # already-escalated branch.
+            "failure_class",
+            "failure_category",
+            "blocker",
+            "_blocked_escalated",
+            "_precondition_escalated_key",
+            "_blocked_optimistic_retries",
         }
         clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
 

@@ -3200,6 +3200,14 @@ def test_non_genuine_cancelled_excludes_new_markers():
     assert not _counts_as_failure(
         _cancelled_task({"failure_detail": "cap_exhausted_after_approve"})
     )
+    # Supersession churn cancellations are non-genuine too, even though they
+    # keep failure_category=AGENT_TIMEOUT for the infra bucket.
+    assert _is_non_genuine_cancelled(
+        _cancelled_task({"failure_detail": "superseded_by_review_pipeline"})
+    )
+    assert not _counts_as_failure(
+        _cancelled_task({"failure_detail": "superseded_by_review_pipeline"})
+    )
     # FIX H: REASSIGNED handoff (and the SCOPE_EMPTY no-op) lands CANCELLED.
     assert _is_non_genuine_cancelled(
         _cancelled_task({"failure_category": "REASSIGNED"})

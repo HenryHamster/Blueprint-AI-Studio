@@ -86,6 +86,7 @@ _NON_GENUINE_CANCELLED_DETAILS = frozenset(
     {
         "pr_closed_non_rejection",
         "cap_exhausted_after_approve",
+        "superseded_by_review_pipeline",
     }
 )
 

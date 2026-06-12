@@ -6230,6 +6230,239 @@ async def test_fix_prompt_does_not_duplicate_prior_review_feedback(db_session, m
         assert f"LEGACY-PRIOR-FEEDBACK-{i}" not in spawned_prompt
 
 
+@pytest.mark.asyncio
+async def test_supersede_churn_halts_after_limit(db_session, mocker):
+    """Two consecutive supersessions with no counted run in between must stop
+    respawning and escalate the chain original."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.review_pipeline._REVIEW_SUPERSEDE_CHURN_LIMIT", 2)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    stale_started = _utcnow_for_test() - timedelta(
+        minutes=PIPELINE_TASK_STALE_MINUTES + 5
+    )
+    stale_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 701,
+                "branch": "feat/s",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        started_at=stale_started,
+    )
+    db_session.add(stale_review)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 701,
+                "branch": "feat/s",
+                "base_branch": "main",
+                "prompt": "Build X",
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(stale_review)
+    await db_session.refresh(source_task)
+
+    first_result, first_created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=701,
+        branch="feat/s",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert first_created is True and first_result is not None
+    await db_session.commit()
+
+    await db_session.refresh(stale_review)
+    assert stale_review.status == TaskStatus.CANCELLED
+    assert (stale_review.context or {}).get("failure_detail") == (
+        "superseded_by_review_pipeline"
+    )
+
+    first_result.started_at = stale_started
+    first_result.last_heartbeat = None
+    db_session.add(first_result)
+    await db_session.commit()
+    await db_session.refresh(first_result)
+
+    second_result, second_created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=701,
+        branch="feat/s",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+
+    assert second_created is False
+    assert second_result is None
+    await db_session.refresh(original_task)
+    assert (original_task.context or {}).get("_review_supersede_churn_count") == 2
+    assert (original_task.context or {}).get("review_loop_terminal_outcome", {}).get(
+        "kind"
+    ) == "supersession_churn_halt"
+    assert original_task.requires_approval is True
+    alerts = (
+        await db_session.execute(
+            select(Alert).where(Alert.task_id == original_task.id)
+        )
+    ).scalars().all()
+    assert len(alerts) == 1
+    assert "supersession-churn" in alerts[0].title
+    assert "PR #701" in alerts[0].title
+    assert (original_task.context or {}).get("review_loop_terminal_outcome", {}).get(
+        "detail"
+    )
+
+
+@pytest.mark.asyncio
+async def test_supersede_churn_resets_after_counted_run(db_session, mocker):
+    """A cap-counted non-infra run between supersessions must reset the streak."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.review_pipeline._REVIEW_SUPERSEDE_CHURN_LIMIT", 2)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    stale_started = _utcnow_for_test() - timedelta(
+        minutes=PIPELINE_TASK_STALE_MINUTES + 5
+    )
+    stale_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 702,
+                "branch": "feat/r",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        started_at=stale_started,
+    )
+    db_session.add(stale_review)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 702,
+                "branch": "feat/r",
+                "base_branch": "main",
+                "prompt": "Build X",
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(stale_review)
+    await db_session.refresh(source_task)
+
+    first_result, first_created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=702,
+        branch="feat/r",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert first_created is True and first_result is not None
+    await db_session.commit()
+
+    counted_source = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 702,
+                "branch": "feat/r",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(counted_source)
+    await db_session.commit()
+    await db_session.refresh(counted_source)
+
+    first_result.started_at = stale_started
+    first_result.last_heartbeat = None
+    db_session.add(first_result)
+    await db_session.commit()
+    await db_session.refresh(first_result)
+
+    second_result, second_created = await _spawn_pipeline_task(
+        counted_source,
+        "review",
+        db_session,
+        pr_number=702,
+        branch="feat/r",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+
+    assert second_created is True and second_result is not None
+    await db_session.refresh(original_task)
+    assert (original_task.context or {}).get("_review_supersede_churn_count") == 1
+    assert (original_task.context or {}).get("review_loop_terminal_outcome") is None
+
+
 def _utcnow_for_test():
     """Naive UTC timestamp matching app/time_utils.py _utcnow()."""
     from datetime import datetime, timezone
@@ -11360,7 +11593,9 @@ def test_clear_gate_releases_stuck_hold_and_stamps_resolution():
     assert outcome["iterations"] == 4
 
 
-@pytest.mark.parametrize("kind", ["standoff", "repeat_fingerprint_halt"])
+@pytest.mark.parametrize(
+    "kind", ["standoff", "repeat_fingerprint_halt", "supersession_churn_halt"]
+)
 def test_clear_gate_releases_other_resolvable_escalation_kinds(kind):
     from app.review_loop_convergence import clear_review_escalation_approval_gate
 

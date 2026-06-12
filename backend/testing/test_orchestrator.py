@@ -7085,3 +7085,524 @@ class TestFinishBeforeStartPriority:
         assert len(new_work_dispatched) >= 1, (
             f"reserved floor must admit at least one create/research; dispatched={dispatched}"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Per-task dispatch crash containment + poison-task quarantine
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestDispatchCrashContainment:
+    """The dispatch loop wraps each task's prep in a per-task containment
+    boundary: a crash preparing one task must not abort the cycle (later
+    tasks still dispatch, post-loop CI polling still runs), the iteration's
+    pre-claimed LLM-account slot is released, and a task whose prep crashes
+    DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD consecutive times is
+    quarantined (FAILED + PROVISION_FAILURE + alert) instead of starving the
+    queue every cycle. Harness mirrors TestProjectConcurrencyCap: one real
+    orchestrator cycle against in-memory SQLite, provisioning mocked.
+    """
+
+    @staticmethod
+    def _naive_utcnow():
+        from datetime import timezone as _tz
+
+        return datetime.now(_tz.utc).replace(tzinfo=None)
+
+    @pytest.fixture()
+    def orch_crash_db(self, mocker):
+        """In-memory SQLite DB wired into the orchestrator, plus essential mocks."""
+        import asyncio
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+        from sqlalchemy.dialects.sqlite.base import (
+            SQLiteTypeCompiler as _SQLiteTypeCompiler,
+        )
+
+        if not hasattr(_SQLiteTypeCompiler, "visit_JSONB"):
+            _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+                type_, **kw
+            )
+        import app.orchestrator as _orch_module
+
+        async def _build():
+            _engine = create_async_engine(
+                "sqlite+aiosqlite:///:memory:",
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+            )
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.create_all)
+            _Session = sessionmaker(
+                bind=_engine,
+                class_=AsyncSession,
+                autocommit=False,
+                autoflush=False,
+                expire_on_commit=False,
+            )
+            mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+            mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+            mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+            mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)
+            mocker.patch("app.main.load_max_plan_pool", new_callable=AsyncMock)
+            mocker.patch("app.main.recheck_disabled_accounts", new_callable=AsyncMock)
+            mocker.patch("app.routers.agent_status.record_task_result")
+            mocker.patch(
+                "app.deploy_health._check_monitoring_window", new_callable=AsyncMock
+            )
+            mocker.patch(
+                "app.deploy_health._check_external_health", new_callable=AsyncMock
+            )
+            mocker.patch("app.deploy_health._check_pause_mode", new_callable=AsyncMock)
+            mocker.patch(
+                "app.autonomous_research._check_idle_research", new_callable=AsyncMock
+            )
+            mocker.patch("app.services._recover_orphaned_tasks", new_callable=AsyncMock)
+            mocker.patch(
+                "app.alert_dispatch._create_orchestrator_error_alerts",
+                new_callable=AsyncMock,
+            )
+            mocker.patch(
+                "app.orchestrator._persist_zone_health", new_callable=AsyncMock
+            )
+            mocker.patch(
+                "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+            )
+            # Provision wrapper reaches Secret Manager / GCS before the
+            # (separately mocked) provision_agent_vm call — patch both so the
+            # success path is hermetic in CI (no ambient Google credentials).
+            mocker.patch(
+                "app.orchestrator.prepare_and_store_agent_secret",
+                new_callable=AsyncMock,
+                return_value="projects/test/secrets/agent/versions/1",
+            )
+            mocker.patch(
+                "app.orchestrator.upload_json_payload",
+                new_callable=AsyncMock,
+                return_value="gs://test-bucket/payloads/test.json",
+            )
+
+            now = self._naive_utcnow()
+            _orch_module._last_pool_refresh = now
+            _orch_module._last_zone_health_persist = now
+            _orch_module._last_orphan_check = now
+            _orch_module._last_evaluating_timeout_check = now
+            _shared_state.deploy_monitoring["task_results"].clear()
+            return _Session, _engine
+
+        loop = asyncio.new_event_loop()
+        try:
+            _Session, _engine = loop.run_until_complete(_build())
+        finally:
+            loop.close()
+        try:
+            yield _Session
+        finally:
+            import contextlib
+
+            async def _teardown():
+                with contextlib.suppress(Exception):
+                    await _engine.dispose()
+
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_teardown())
+            finally:
+                loop.close()
+
+    @staticmethod
+    async def _run_one_cycle(mocker):
+        import asyncio
+        import contextlib
+        import app.orchestrator as _orch_module
+        import app.pipeline_health_state as _pipeline_state
+
+        mocker.patch("asyncio.sleep", side_effect=asyncio.CancelledError())
+        with contextlib.suppress(asyncio.CancelledError):
+            await _orch_module.orchestrator_worker()
+
+        # Drain background provisioning coroutines (see orch_cap_db's
+        # _run_one_cycle for why we await rather than cancel).
+        _orphan_keys_before = set(_pipeline_state.background_tasks)
+        for _coro in list(_orch_module._provision_coroutines.values()):
+            _loop = _coro.get_loop()
+            if _loop.is_closed():
+                continue
+            with contextlib.suppress(BaseException):
+                await _coro
+        _orch_module._provision_coroutines.clear()
+        for _key in set(_pipeline_state.background_tasks) - _orphan_keys_before:
+            _orphan = _pipeline_state.background_tasks.pop(_key, None)
+            if _orphan is not None:
+                _orphan.cancel()
+                with contextlib.suppress(BaseException):
+                    await _orphan
+
+    @staticmethod
+    def _mock_dispatch_runtime(mocker, account_id="acct-crash-test"):
+        """Standard dispatch-path mocks: account-backed selection, instant
+        provisioning, no warm pool, inert runtime-config sync."""
+        from app.max_plan_pool import LLMSelectionResult
+
+        provision_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": account_id,
+                    "name": "Crash Test Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        return provision_mock
+
+    @staticmethod
+    def _poison_staleness_recompute(mocker, poison_task_id):
+        """Make recompute_launch_staleness (a dispatch-prep step that runs
+        just before the PROVISIONING commit) crash for ONE task and behave
+        normally (no context change) for every other task."""
+
+        async def _poisoned(session, task):
+            if task.id == poison_task_id:
+                raise ValueError("poisoned dispatch prep")
+            return False
+
+        return mocker.patch(
+            "app.research_completion.recompute_launch_staleness",
+            side_effect=_poisoned,
+        )
+
+    @staticmethod
+    def _set_slots(_orch_module, n=4):
+        _orch_module._runtime_config["max_concurrent_vms"] = n
+        _orch_module._runtime_config["warm_pool_enabled"] = False
+
+    @staticmethod
+    def _clear_slots(_orch_module):
+        _orch_module._runtime_config.pop("max_concurrent_vms", None)
+        _orch_module._runtime_config.pop("warm_pool_enabled", None)
+
+    @pytest.mark.asyncio
+    async def test_prep_crash_contained_and_next_task_dispatches(
+        self, orch_crash_db, mocker
+    ):
+        """A mid-loop dispatch-prep crash on the FIRST-ranked task must not
+        abort the cycle: the later-ranked task still dispatches and the
+        crashed task stays QUEUED with its containment counter persisted.
+
+        Assertions here are committed-DB-state only: the healthy task's
+        background provision coroutine shares this harness's single sqlite
+        connection with the cycle's post-loop stages, so cycle-shared globals
+        (e.g. _orchestrator_consecutive_errors) are asserted in the
+        poison-only CI-poll test below where no such race exists."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._mock_dispatch_runtime(mocker)
+        self._set_slots(_orch_module)
+
+        stale = self._naive_utcnow() - timedelta(minutes=5)
+        async with orch_crash_db() as session:
+            project = make_project(name="Crash Containment", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            poison = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=10,
+                payloads=[{"type": "create", "prompt": "poison task"}],
+                created_at=stale,
+            )
+            healthy = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=1,
+                payloads=[{"type": "create", "prompt": "healthy task"}],
+            )
+            session.add(poison)
+            session.add(healthy)
+            await session.commit()
+            await session.refresh(poison)
+            await session.refresh(healthy)
+            poison_id, healthy_id = poison.id, healthy.id
+
+        self._poison_staleness_recompute(mocker, poison_id)
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            self._clear_slots(_orch_module)
+
+        async with orch_crash_db() as verify:
+            poison_row = (
+                (await verify.execute(_select(Task).where(Task.id == poison_id)))
+                .scalars()
+                .first()
+            )
+            healthy_row = (
+                (await verify.execute(_select(Task).where(Task.id == healthy_id)))
+                .scalars()
+                .first()
+            )
+
+        assert healthy_row is not None
+        assert healthy_row.status == TaskStatus.PROVISIONING, (
+            "Task ranked after the crashing one must still dispatch in the "
+            f"same cycle, got {healthy_row.status}"
+        )
+        assert poison_row is not None
+        assert poison_row.status == TaskStatus.QUEUED, (
+            f"Contained crash must leave the task QUEUED, got {poison_row.status}"
+        )
+        assert (poison_row.context or {}).get("_dispatch_prep_failures") == 1, (
+            "Containment must persist the per-task crash counter, got "
+            f"{(poison_row.context or {}).get('_dispatch_prep_failures')!r}"
+        )
+        assert "Dispatch preparation crashed" in (
+            poison_row.latest_status_message or ""
+        )
+
+    @pytest.mark.asyncio
+    async def test_post_dispatch_ci_poll_still_reached(self, orch_crash_db, mocker):
+        """The post-loop CI polling stage must still run — and the cycle must
+        complete without feeding the consecutive-error backoff — in a cycle
+        where a task's dispatch prep crashed (previously the exception
+        aborted the whole try block and CI-waiting tasks starved).
+
+        Poison-only setup: nothing dispatches, so no background provision
+        coroutine races the cycle and the consecutive-error assertion is
+        deterministic."""
+        import app.orchestrator as _orch_module
+
+        self._mock_dispatch_runtime(mocker)
+        self._set_slots(_orch_module)
+        _orch_module._orchestrator_consecutive_errors = 0
+        ci_filter_spy = mocker.spy(_orch_module, "_ci_waiting_sql_filter")
+
+        async with orch_crash_db() as session:
+            project = make_project(name="CI Poll Survives", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            poison = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "poison task"}],
+            )
+            session.add(poison)
+            await session.commit()
+            await session.refresh(poison)
+            poison_id = poison.id
+
+        self._poison_staleness_recompute(mocker, poison_id)
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            self._clear_slots(_orch_module)
+
+        assert ci_filter_spy.called, (
+            "tasks-waiting-on-CI poll must execute even when a task's "
+            "dispatch prep crashed earlier in the cycle"
+        )
+        assert _orch_module._orchestrator_consecutive_errors == 0, (
+            "A contained per-task crash must not feed the cycle-level "
+            "consecutive-error backoff"
+        )
+
+    @pytest.mark.asyncio
+    async def test_prep_crash_releases_preclaimed_account(self, orch_crash_db, mocker):
+        """The LLM-account slot pre-incremented by runtime selection must be
+        released (with the daily counter reverted) when dispatch prep crashes
+        after selection."""
+        import app.orchestrator as _orch_module
+
+        self._mock_dispatch_runtime(mocker, account_id="acct-poison-release")
+        release_mock = mocker.patch(
+            "app.max_plan_pool.release_max_plan_account",
+            new_callable=AsyncMock,
+        )
+        self._set_slots(_orch_module)
+
+        async with orch_crash_db() as session:
+            project = make_project(name="Account Release", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            poison = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "poison task"}],
+            )
+            session.add(poison)
+            await session.commit()
+            await session.refresh(poison)
+            poison_id = poison.id
+
+        self._poison_staleness_recompute(mocker, poison_id)
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            self._clear_slots(_orch_module)
+
+        release_mock.assert_any_await(
+            "acct-poison-release", revert_daily_task_count=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_poison_task_quarantined_at_threshold(self, orch_crash_db, mocker):
+        """At the quarantine threshold the repeatedly-crashing task is taken
+        out of the dispatch path: FAILED, PROVISION_FAILURE classification,
+        per-type failure gate fed via record_task_result, and an operator
+        alert — instead of re-crashing the cycle forever."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._mock_dispatch_runtime(mocker)
+        # Re-patch to get test-local handles (fixture already patched both).
+        record_result_mock = mocker.patch("app.routers.agent_status.record_task_result")
+        alert_mock = mocker.patch(
+            "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+        )
+        self._set_slots(_orch_module)
+
+        threshold = _orch_module.DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD
+        async with orch_crash_db() as session:
+            project = make_project(name="Quarantine", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            poison = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "poison task"}],
+                context={"_dispatch_prep_failures": threshold - 1},
+            )
+            session.add(poison)
+            await session.commit()
+            await session.refresh(poison)
+            poison_id = poison.id
+
+        self._poison_staleness_recompute(mocker, poison_id)
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            self._clear_slots(_orch_module)
+
+        async with orch_crash_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == poison_id)))
+                .scalars()
+                .first()
+            )
+
+        assert row is not None
+        assert row.status == TaskStatus.FAILED, (
+            f"Task crashing {threshold} consecutive cycles must be "
+            f"quarantined FAILED, got {row.status}"
+        )
+        assert (row.context or {}).get("failure_category") == "PROVISION_FAILURE"
+        assert (row.context or {}).get("_dispatch_prep_failures") == threshold, (
+            "Quarantine must persist the final crash count"
+        )
+        assert "quarantined" in (row.latest_status_message or "")
+        record_result_mock.assert_any_call(
+            success=False,
+            failure_class="PROVISION_FAILURE",
+            task_id=str(poison_id),
+            task_type="create",
+        )
+        assert alert_mock.await_count >= 1, (
+            "Quarantine must create an operator-visible failure alert"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failure_counter_cleared_on_successful_dispatch(
+        self, orch_crash_db, mocker
+    ):
+        """A task that previously crashed (counter > 0) and then dispatches
+        cleanly must have its containment counter dropped by the PROVISIONING
+        commit, so old transient crashes never accumulate into a spurious
+        quarantine."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._mock_dispatch_runtime(mocker)
+        # No poison: staleness recompute is a benign no-op for every task.
+        mocker.patch(
+            "app.research_completion.recompute_launch_staleness",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        self._set_slots(_orch_module)
+
+        async with orch_crash_db() as session:
+            project = make_project(name="Counter Reset", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "recovered task"}],
+                context={"_dispatch_prep_failures": 1},
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            self._clear_slots(_orch_module)
+
+        async with orch_crash_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+
+        assert row is not None
+        assert row.status == TaskStatus.PROVISIONING, (
+            f"Clean dispatch expected, got {row.status}"
+        )
+        assert "_dispatch_prep_failures" not in (row.context or {}), (
+            "Successful dispatch must clear the containment counter, got "
+            f"{(row.context or {}).get('_dispatch_prep_failures')!r}"
+        )

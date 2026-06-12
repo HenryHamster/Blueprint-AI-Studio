@@ -308,9 +308,7 @@ async def _post_reaper_halt_alert(crash_count: int, last_error: str) -> None:
             # Bound the fan-out scan and fan-out insert: a single capped SELECT
             # plus one bulk INSERT instead of an unbounded full-table scan and
             # one ORM add() per project in the error-recovery hot path.
-            proj_ids = (
-                await s.execute(select(Project.id).limit(1000))
-            ).scalars().all()
+            proj_ids = (await s.execute(select(Project.id).limit(1000))).scalars().all()
             if not proj_ids:
                 return
             message = (
@@ -343,9 +341,7 @@ async def _post_reaper_recovery_alert(probe_failures: int) -> None:
 
         async with AsyncSessionLocal() as s:
             # Bound the fan-out scan and fan-out insert (see _post_reaper_halt_alert).
-            proj_ids = (
-                await s.execute(select(Project.id).limit(1000))
-            ).scalars().all()
+            proj_ids = (await s.execute(select(Project.id).limit(1000))).scalars().all()
             if not proj_ids:
                 return
             message = (
@@ -1940,7 +1936,11 @@ async def reaper_service():
                         # agent_status.py already applies on the agent-reported path.
                         # Skip DB rate-limit fallback when dead-auth is already
                         # confirmed — the account needs a hard-disable, not a cooldown.
-                        if not is_rate_limited and not is_dead_auth and not is_spot_preemption:
+                        if (
+                            not is_rate_limited
+                            and not is_dead_auth
+                            and not is_spot_preemption
+                        ):
                             _db_rl_acct = get_task_llm_account_id(fresh_task)
                             _at_time_rl = (
                                 fresh_task.last_heartbeat or fresh_task.started_at
@@ -2043,7 +2043,9 @@ async def reaper_service():
                                     _da_pattern,
                                 )
                                 try:
-                                    await disable_account_for_auth(da_acct_id, _da_reason)
+                                    await disable_account_for_auth(
+                                        da_acct_id, _da_reason
+                                    )
                                 except Exception as _da_err:  # noqa: BLE001
                                     logger.warning(
                                         "[REAPER] disable_account_for_auth failed for %s: %s; retrying in 1s",
@@ -2052,7 +2054,9 @@ async def reaper_service():
                                     )
                                     await asyncio.sleep(1)
                                     try:
-                                        await disable_account_for_auth(da_acct_id, _da_reason)
+                                        await disable_account_for_auth(
+                                            da_acct_id, _da_reason
+                                        )
                                     except Exception as _da_err2:  # noqa: BLE001
                                         logger.error(  # noqa: TRY400
                                             "[REAPER] disable_account_for_auth retry also failed for %s: %s. "
@@ -2474,13 +2478,20 @@ async def reaper_service():
                             # Use agent-reported error logs as the primary signal. If the agent
                             # left no error context (pure heartbeat timeout), fall back to
                             # AGENT_TIMEOUT rather than the default CODE_ERROR — a silent death
-                            # is not a code defect.
+                            # is not a code defect. Skip the override when an authoritative
+                            # failure_class is already persisted in context: that verdict was
+                            # written at the failure instant and must not be demoted to
+                            # AGENT_TIMEOUT just because logs are empty in this reaper cycle.
+                            _ctx_persisted_verdict = (task.context or {}).get(
+                                "failure_class"
+                            )
                             reap_failure_class = classify_failure(
                                 task, logs=combined_logs, at_time=task.last_heartbeat
                             )
                             if (
                                 reap_failure_class == "CODE_ERROR"
                                 and not combined_logs.strip()
+                                and not _ctx_persisted_verdict
                             ):
                                 reap_failure_class = "AGENT_TIMEOUT"
                             persist_authoritative_verdict(task, reap_failure_class)
@@ -2823,6 +2834,20 @@ async def reaper_service():
                                 # Clear account so dispatcher does fresh selection (respects blacklist)
                                 reaper_ctx = clear_task_llm_runtime_context(reaper_ctx)
                                 reaper_ctx.pop("_slot_released", None)
+                                # Clear stale failure verdict and blocker state — these were
+                                # written for the attempt that just died and must not carry into
+                                # the retry attempt where they would short-circuit fresh
+                                # classification (failure_class) or route the first BLOCKED episode
+                                # directly into the already-escalated branch (_blocked_escalated).
+                                for _stale_key in (
+                                    "failure_class",
+                                    "failure_category",
+                                    "blocker",
+                                    "_blocked_escalated",
+                                    "_precondition_escalated_key",
+                                    "_blocked_optimistic_retries",
+                                ):
+                                    reaper_ctx.pop(_stale_key, None)
                                 # Enrich with failure diagnosis for retry guidance
                                 try:
                                     from app.anomaly_detection import (
@@ -4077,9 +4102,7 @@ async def reaper_service():
                         delivery_stalled=(
                             _wake_result.delivery_stalled if _wake_result else False
                         ),
-                        stall_cycles=(
-                            _wake_result.stall_cycles if _wake_result else 0
-                        ),
+                        stall_cycles=(_wake_result.stall_cycles if _wake_result else 0),
                     )
                 except Exception as e:
                     logger.error(

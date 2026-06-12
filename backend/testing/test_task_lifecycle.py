@@ -1526,7 +1526,9 @@ async def test_requeue_terminal_all_non_genuine_cancelled_multiple_kinds(tl_db, 
 
 
 @pytest.mark.asyncio
-async def test_requeue_limit_all_non_death_cancelled_terminates_cancelled(tl_db, mocker):
+async def test_requeue_limit_all_non_death_cancelled_terminates_cancelled(
+    tl_db, mocker
+):
     """Requeue-LIMIT path: parent at the cap whose only unsucceeded child is a
     non-death cancel terminates CANCELLED (kept in lockstep with the
     all-children-terminal path) without a direction-health ding.
@@ -6392,6 +6394,7 @@ class TestRequeueExtractionTripwire:
 # clears the poison and the chain finishes cleanly.
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 async def _poison_session(session) -> None:
     """Put ``session`` into a real aborted / PendingRollback transaction via a
     genuine DRIVER-level error — an ORM flush that hits a PK UNIQUE violation
@@ -6607,9 +6610,7 @@ async def test_strategic_backstop_skips_advanced_cycle(
     'strategic review complete … but FAILED' reports. A cycle still in
     phase1_running IS a genuine stall and must still be caught."""
     session, factory = tl_db
-    mocker.patch(
-        "app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock
-    )
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     # Force the phase-1 label regardless of task type (a real design_doc_update
     # would take the strategic pair-lock path the SQLite harness can't honor).
     mocker.patch("app.task_lifecycle.strategic_phase_for", return_value="phase1")
@@ -6620,9 +6621,7 @@ async def test_strategic_backstop_skips_advanced_cycle(
     mocker.patch(
         "app.strategic_cycle.get", new_callable=AsyncMock, return_value=_Cycle()
     )
-    mark = mocker.patch(
-        "app.strategic_cycle.mark_failure", new_callable=AsyncMock
-    )
+    mark = mocker.patch("app.strategic_cycle.mark_failure", new_callable=AsyncMock)
 
     project = await _make_project(session)
     task = await _make_task(
@@ -7269,7 +7268,9 @@ async def test_park_task_vm_instance_id_invariant(tl_db):
 
     # Capture before parking — mirrors the agent_status endpoint's pattern.
     captured_vm_id = task.vm_instance_id
-    assert captured_vm_id == original_vm_id, "precondition: vm_instance_id set before park"
+    assert captured_vm_id == original_vm_id, (
+        "precondition: vm_instance_id set before park"
+    )
 
     await park_task(
         session,
@@ -7695,11 +7696,14 @@ async def test_resolve_challenge_writes_verdict_and_releases_gate(tl_db):
     )
 
     import app.shared_state as shared_state
+
     shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
     await _resolve_safeguard_challenge_completion(challenge, payload, session)
 
     await session.refresh(safeguard)
-    assert safeguard.status == TaskStatus.COMPLETED, "Safeguard must be restored to COMPLETED"
+    assert safeguard.status == TaskStatus.COMPLETED, (
+        "Safeguard must be restored to COMPLETED"
+    )
     verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
     assert verdict is not None, "Verdict must be written to safeguard context"
     assert verdict["outcome"] == "rejected"
@@ -7710,7 +7714,9 @@ async def test_resolve_challenge_writes_verdict_and_releases_gate(tl_db):
     )
 
     await session.refresh(orig)
-    assert orig.requires_approval is False, "Gate must be released on 'rejected' verdict"
+    assert orig.requires_approval is False, (
+        "Gate must be released on 'rejected' verdict"
+    )
 
 
 @pytest.mark.asyncio
@@ -7741,6 +7747,7 @@ async def test_resolve_challenge_confirmed_maintains_gate(tl_db):
     )
 
     import app.shared_state as shared_state
+
     shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
     await _resolve_safeguard_challenge_completion(challenge, payload, session)
 
@@ -7750,7 +7757,9 @@ async def test_resolve_challenge_confirmed_maintains_gate(tl_db):
     assert verdict["outcome"] == "confirmed"
 
     await session.refresh(orig)
-    assert orig.requires_approval is True, "Gate must remain closed on 'confirmed' verdict"
+    assert orig.requires_approval is True, (
+        "Gate must remain closed on 'confirmed' verdict"
+    )
 
 
 @pytest.mark.asyncio
@@ -7781,6 +7790,7 @@ async def test_resolve_challenge_failed_challenger_fails_closed(tl_db):
     )
 
     import app.shared_state as shared_state
+
     shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
     await _resolve_safeguard_challenge_completion(challenge, payload, session)
 
@@ -7793,7 +7803,9 @@ async def test_resolve_challenge_failed_challenger_fails_closed(tl_db):
     assert safeguard.status == TaskStatus.COMPLETED
 
     await session.refresh(orig)
-    assert orig.requires_approval is True, "Gate must remain closed when challenger failed"
+    assert orig.requires_approval is True, (
+        "Gate must remain closed when challenger failed"
+    )
 
 
 @pytest.mark.asyncio
@@ -7859,6 +7871,8 @@ async def test_resolve_challenge_source_gone_early_return(tl_db):
 
     # Must not raise even when the source safeguard is missing from the DB.
     await _resolve_safeguard_challenge_completion(challenge, payload, session)
+
+
 # Default-on second-opinion gate for ordinary review verdicts
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -8341,7 +8355,9 @@ async def test_second_opinion_replay_commits_before_post_commit(tl_db, mocker):
         order.append("commit")
         return await real_commit(*a, **k)
 
-    mocker.patch.object(session, "commit", new_callable=AsyncMock, side_effect=_spy_commit)
+    mocker.patch.object(
+        session, "commit", new_callable=AsyncMock, side_effect=_spy_commit
+    )
 
     async def _spy_ppc(task_id, payload, *a, **k):
         order.append("post_commit")
@@ -8440,7 +8456,8 @@ async def test_second_opinion_single_shot_no_double_spawn(tl_db, mocker):
         )
         .scalars()
         .all()
-        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY) == str(review_task.id)
+        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY)
+        == str(review_task.id)
     ]
     assert len(challengers) == 1, "single-shot guard must prevent a second challenger"
 
@@ -8459,7 +8476,8 @@ async def test_second_opinion_single_shot_no_double_spawn(tl_db, mocker):
         )
         .scalars()
         .all()
-        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY) == str(review_task.id)
+        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY)
+        == str(review_task.id)
     ]
     assert len(challengers_after) == 1, "challenger must not recursively spawn the gate"
 
@@ -8473,7 +8491,9 @@ async def test_second_opinion_single_shot_no_double_spawn(tl_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-async def _make_research_source_and_grader(session, *, terminal_status=TaskStatus.FAILED):
+async def _make_research_source_and_grader(
+    session, *, terminal_status=TaskStatus.FAILED
+):
     """EVALUATING research source + adversarial grader in a terminal state (no status POST).
 
     Mirrors the real spawn path: source carries ``awaiting_adversarial_grader`` (the
@@ -8485,7 +8505,9 @@ async def _make_research_source_and_grader(session, *, terminal_status=TaskStatu
     project = await _make_project(session)
     source = Task(
         project_id=project.id,
-        payloads=[{"type": "research", "prompt": "investigate X", "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "prompt": "investigate X", "base_branch": "main"}
+        ],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         plan_output=[
@@ -8641,7 +8663,9 @@ async def test_reaper_terminal_grader_resolves_parked_source_fail_closed(tl_db, 
 
     This is the named acceptance criterion for this task.
     """
-    from app.services import _sweep_stranded_sidecar_sources  # triggers services→recovery_sweeps load order
+    from app.services import (
+        _sweep_stranded_sidecar_sources,
+    )  # triggers services→recovery_sweeps load order
 
     session, Session = tl_db
     mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
@@ -8655,7 +8679,9 @@ async def test_reaper_terminal_grader_resolves_parked_source_fail_closed(tl_db, 
 
     _project, source, grader = await _make_research_source_and_grader(session)
 
-    assert source.status == TaskStatus.EVALUATING, "source must be EVALUATING before sweep"
+    assert source.status == TaskStatus.EVALUATING, (
+        "source must be EVALUATING before sweep"
+    )
     assert grader.status == TaskStatus.FAILED, "grader must be FAILED (reaper-killed)"
 
     await _sweep_stranded_sidecar_sources()
@@ -8718,9 +8744,12 @@ async def test_resolver_uses_grader_hashes_when_source_hashes_are_missing(
 
     verdict = (source.context or {}).get("adversarial_gate") or {}
     assert verdict.get("parse_outcome") == "ok"
-    assert verdict.get("finding_verdicts", {}).get("grader-only-hash-001", {}).get(
-        "passed"
-    ) is True
+    assert (
+        verdict.get("finding_verdicts", {})
+        .get("grader-only-hash-001", {})
+        .get("passed")
+        is True
+    )
     assert "awaiting_adversarial_grader" not in (source.context or {})
 
 
@@ -8768,6 +8797,7 @@ async def test_sweep_stranded_safeguard_challenge_cancelled(tl_db, mocker):
     await session.refresh(challenge)
 
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
     safeguard.context = {"awaiting_safeguard_challenge": str(challenge.id)}
     _flag_modified(safeguard, "context")
     session.add(safeguard)
@@ -8800,7 +8830,9 @@ async def test_sweep_stranded_finding_challenge_failed(tl_db, mocker):
 
     source = Task(
         project_id=project.id,
-        payloads=[{"type": "research", "prompt": "investigate Y", "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "prompt": "investigate Y", "base_branch": "main"}
+        ],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         plan_output=[],
@@ -8812,7 +8844,9 @@ async def test_sweep_stranded_finding_challenge_failed(tl_db, mocker):
 
     challenge = Task(
         project_id=project.id,
-        payloads=[{"type": "investigate", "prompt": "challenge", "base_branch": "main"}],
+        payloads=[
+            {"type": "investigate", "prompt": "challenge", "base_branch": "main"}
+        ],
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
         context={
@@ -8828,6 +8862,7 @@ async def test_sweep_stranded_finding_challenge_failed(tl_db, mocker):
     await session.refresh(challenge)
 
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
     source.context = {"awaiting_finding_challenge": str(challenge.id)}
     _flag_modified(source, "context")
     session.add(source)
@@ -8857,7 +8892,9 @@ async def test_sweep_stranded_skips_non_terminal_sidecar(tl_db, mocker):
 
     source = Task(
         project_id=project.id,
-        payloads=[{"type": "research", "prompt": "investigate Z", "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "prompt": "investigate Z", "base_branch": "main"}
+        ],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -8879,6 +8916,7 @@ async def test_sweep_stranded_skips_non_terminal_sidecar(tl_db, mocker):
     await session.refresh(grader)
 
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
     source.context = {"awaiting_quality_grader": str(grader.id)}
     _flag_modified(source, "context")
     session.add(source)
@@ -9097,15 +9135,16 @@ async def test_adversarial_gate_provenance_lookup_failure_doesnt_prevent_verdict
         "verdict must be written even when provenance lookup fails"
     )
     assert gate_record.get("parse_outcome") == "ok"
-    assert gate_record.get("finding_verdicts", {}).get("finding-hash-3", {}).get("passed") is True
+    assert (
+        gate_record.get("finding_verdicts", {}).get("finding-hash-3", {}).get("passed")
+        is True
+    )
     # Provenance fields may or may not be present, but absence is OK.
     # (The exception is caught and logged at debug level)
 
 
 @pytest.mark.asyncio
-async def test_second_opinion_inherited_record_does_not_clobber_verdict(
-    tl_db, mocker
-):
+async def test_second_opinion_inherited_record_does_not_clobber_verdict(tl_db, mocker):
     """Regression (PR #9243): a reconciliation record inherited from an EARLIER
     review iteration (leaked via the review→fix→review context copy) must NOT
     override this review's fresh verdict. Pre-fix, the inherited iteration-1
@@ -9203,7 +9242,12 @@ async def test_second_opinion_inherited_record_does_not_clobber_verdict(
 
 
 async def _run_stale_head_branch(
-    tl_db, mocker, *, reviewed_head_sha: str, live_head_sha: str, prior_discard_count: int = 0
+    tl_db,
+    mocker,
+    *,
+    reviewed_head_sha: str,
+    live_head_sha: str,
+    prior_discard_count: int = 0,
 ):
     """Drive _process_post_commit through a REQUEST_CHANGES verdict that carries
     ``reviewed_head_sha``.  Returns (captured_spawn_calls, review_task) where
@@ -9225,7 +9269,11 @@ async def _run_stale_head_branch(
         {"review_second_opinion_gate_enabled": False},
     )
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
-    mocker.patch("app.task_lifecycle._merge_with_retry", new_callable=AsyncMock, return_value={"merged": True})
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
     mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
@@ -9244,7 +9292,9 @@ async def _run_stale_head_branch(
             "merged": False,
         },
     )
-    mocker.patch("app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1})
+    mocker.patch(
+        "app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1}
+    )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch(
         "app.github.get_pr_files",
@@ -9254,7 +9304,12 @@ async def _run_stale_head_branch(
     mocker.patch(
         "app.github.get_check_runs_cached",
         new_callable=AsyncMock,
-        return_value={"status": "completed", "conclusion": "success", "failed_logs": "", "details": []},
+        return_value={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
     )
 
     session, factory = tl_db
@@ -9301,12 +9356,14 @@ async def _run_stale_head_branch(
     await session.commit()
     await session.refresh(review_task)
 
-    verdict_json = json.dumps({
-        "verdict": "REQUEST_CHANGES",
-        "feedback": "Found a real bug.",
-        "issues": [{"description": "Real bug", "severity": "major"}],
-        "reviewed_head_sha": reviewed_head_sha,
-    })
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Found a real bug.",
+            "issues": [{"description": "Real bug", "severity": "major"}],
+            "reviewed_head_sha": reviewed_head_sha,
+        }
+    )
 
     payload = AgentStatusPayload(
         task_id=review_task.id,
@@ -9328,7 +9385,8 @@ async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker
     must set _review_stale_head=True on the task context, and must increment
     stale_head_consecutive_discards to 1.  This is the first discard path."""
     calls, review_task = await _run_stale_head_branch(
-        tl_db, mocker,
+        tl_db,
+        mocker,
         reviewed_head_sha="oldsha0000000",
         live_head_sha="newsha1111111",
     )
@@ -9343,16 +9401,21 @@ async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker
     # Context flags.
     ctx = review_task.context or {}
     assert ctx.get("_review_stale_head") is True, "_review_stale_head must be set"
-    assert ctx.get("stale_head_consecutive_discards") == 1, "stale_head_consecutive_discards must be 1"
+    assert ctx.get("stale_head_consecutive_discards") == 1, (
+        "stale_head_consecutive_discards must be 1"
+    )
 
 
 @pytest.mark.asyncio
-async def test_stale_head_second_consecutive_accepts_verdict_with_annotation(tl_db, mocker):
+async def test_stale_head_second_consecutive_accepts_verdict_with_annotation(
+    tl_db, mocker
+):
     """On the 2nd consecutive stale-head discard (stale_head_consecutive_discards already 2),
     the verdict is accepted (a fix IS spawned) and the feedback is annotated with
     the head-mismatch note instead of discarding."""
     calls, _review_task = await _run_stale_head_branch(
-        tl_db, mocker,
+        tl_db,
+        mocker,
         reviewed_head_sha="oldsha0000000",
         live_head_sha="newsha1111111",
         prior_discard_count=2,
@@ -9360,7 +9423,9 @@ async def test_stale_head_second_consecutive_accepts_verdict_with_annotation(tl_
 
     # A fix must have been spawned (verdict accepted despite stale head).
     fix_calls = [c for c in calls if c[0][1] == "fix"]
-    assert fix_calls, "2nd consecutive stale-head discard must accept verdict and spawn a fix"
+    assert fix_calls, (
+        "2nd consecutive stale-head discard must accept verdict and spawn a fix"
+    )
 
     # No review respawn (the verdict was accepted, not discarded).
     review_respawn_calls = [c for c in calls if c[0][1] == "review"]
@@ -9382,7 +9447,11 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
         {"review_second_opinion_gate_enabled": False},
     )
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
-    mocker.patch("app.task_lifecycle._merge_with_retry", new_callable=AsyncMock, return_value={"merged": True})
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
     mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
@@ -9401,7 +9470,9 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
             "merged": False,
         },
     )
-    mocker.patch("app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1})
+    mocker.patch(
+        "app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1}
+    )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch(
         "app.github.get_pr_files",
@@ -9411,7 +9482,12 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
     mocker.patch(
         "app.github.get_check_runs_cached",
         new_callable=AsyncMock,
-        return_value={"status": "completed", "conclusion": "success", "failed_logs": "", "details": []},
+        return_value={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
     )
 
     session, factory = tl_db
@@ -9455,11 +9531,13 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
     await session.refresh(review_task)
 
     # Old verdict without reviewed_head_sha.
-    verdict_json = json.dumps({
-        "verdict": "REQUEST_CHANGES",
-        "feedback": "Found a bug.",
-        "issues": [{"description": "Real bug", "severity": "major"}],
-    })
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Found a bug.",
+            "issues": [{"description": "Real bug", "severity": "major"}],
+        }
+    )
 
     payload = AgentStatusPayload(
         task_id=review_task.id,
@@ -9552,4 +9630,75 @@ async def test_requeue_clone_strips_lane_transient_context(tl_db, mocker):
     )
     assert clone_ctx.get("_review_fix_lane_id") == "chain-uuid-456", (
         "_review_fix_lane_id must be preserved in requeue clone"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requeue_clone_strips_failure_verdict_keys(tl_db, mocker):
+    """Requeue clone must not inherit the failed child's authoritative failure verdict
+    or blocker-escalation markers.
+
+    A clone carrying failure_class would short-circuit classify_failure on its
+    first death, reporting the predecessor's class rather than its own evidence.
+    A clone carrying _blocked_escalated would route its very first BLOCKED episode
+    into the already-escalated branch, skipping the fresh-episode alert/cadence.
+    """
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+
+    verdict_keys = {
+        "failure_class": "CODE_ERROR",
+        "failure_category": "CODE_ERROR",
+        "blocker": {"kind": "test_failure", "tests": ["test_bar"]},
+        "_blocked_escalated": True,
+        "_precondition_escalated_key": "some_precondition",
+        "_blocked_optimistic_retries": 3,
+    }
+    durable_keys = {
+        "_previous_failure_class": "CODE_ERROR",
+        "_attempt_number": 1,
+    }
+
+    await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            **verdict_keys,
+            **durable_keys,
+        },
+        latest_status_message="Build failed",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+    assert result == 1
+
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    # All stale verdict and blocker-escalation keys must be absent from the clone.
+    for key in verdict_keys:
+        assert key not in clone_ctx, (
+            f"Stale verdict/blocker key {key!r} must not be inherited by requeue clone"
+        )
+
+    # Durable diagnostic keys must survive so retry guidance renders correctly.
+    assert clone_ctx.get("_previous_failure_class") == "CODE_ERROR", (
+        "_previous_failure_class must be preserved in requeue clone"
     )

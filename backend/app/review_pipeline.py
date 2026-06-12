@@ -8,6 +8,7 @@ or app.task_lifecycle.
 """
 
 import logging
+import os
 import re
 import uuid
 from datetime import timedelta
@@ -111,6 +112,13 @@ from app.review_loop_convergence import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_REVIEW_SUPERSEDE_CHURN_COUNT_KEY = "_review_supersede_churn_count"
+_REVIEW_SUPERSEDE_CHURN_LAST_KEY = "_review_supersede_churn_last"
+_REVIEW_SUPERSEDE_CHURN_LIMIT = max(
+    1, int(os.getenv("REVIEW_SUPERSEDE_CHURN_LIMIT", "3"))
+)
 
 
 # Goal framing for review-fix tasks: the cited issues are necessary
@@ -491,6 +499,9 @@ SPAWN_REASON_STUCK = "stuck_cycle"
 # disclosure) and was escalated to the operator at iteration K rather than
 # grinding to the full cap. Distinct from stuck_cycle (same issue re-raised).
 SPAWN_REASON_NONCONVERGENCE = "early_nonconvergence"
+# Consecutive supersession cancellations on one PR chain crossed the churn
+# bound, so the pipeline stopped respawning and escalated the driver task.
+SPAWN_REASON_SUPERSEDE_CHURN = "supersession_churn_halt"
 # Two consecutive same-type pipeline tasks failed with an identical failure
 # fingerprint — the agent's code edits aren't moving the failure shape, which
 # is the signature of a precondition gap (missing system lib, baseline lint
@@ -1238,6 +1249,38 @@ def task_counts_toward_review_cap(task: Task) -> bool:
     return True
 
 
+def _review_supersede_churn_count(task: Task | None) -> int:
+    """Consecutive same-PR supersession cancellations carried on the chain root."""
+    try:
+        return int((task.context or {}).get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+def _review_supersede_churn_snapshot(
+    task: Task,
+    *,
+    task_type: str,
+    pr_number: int,
+    reason: str,
+) -> dict[str, object]:
+    """Capture the last superseded task's diagnostics for escalation context."""
+    snapshot: dict[str, object] = {
+        "task_id": str(task.id),
+        "task_type": task_type,
+        "reason": reason,
+        "status": task.status,
+    }
+    if task.latest_status_message:
+        snapshot["latest_status_message"] = task.latest_status_message
+    if task.started_at is not None:
+        snapshot["started_at"] = task.started_at.isoformat()
+    if task.last_heartbeat is not None:
+        snapshot["last_heartbeat"] = task.last_heartbeat.isoformat()
+    snapshot["pr_number"] = pr_number
+    return snapshot
+
+
 async def _handle_lane_checkpoint_recovery(
     session: AsyncSession,
     *,
@@ -1467,6 +1510,7 @@ async def _spawn_pipeline_task(
     )
 
     # Guard: don't spawn if PR is already merged (check both original and source).
+    orig_task: Task | None = None
     try:
         orig_task = await session.get(Task, uuid.UUID(resolved_original_id))
         if orig_task and (orig_task.context or {}).get("pr_merged"):
@@ -1544,6 +1588,22 @@ async def _spawn_pipeline_task(
             attempt=attempt,
         )
 
+    supersede_churn_count = _review_supersede_churn_count(orig_task)
+    if (
+        source_task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+        and task_counts_toward_review_cap(source_task)
+    ):
+        supersede_churn_count = 0
+        if orig_task is not None:
+            from sqlalchemy.orm.attributes import flag_modified
+
+            orig_ctx = dict(orig_task.context or {})
+            orig_ctx.pop(_REVIEW_SUPERSEDE_CHURN_LAST_KEY, None)
+            orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = 0
+            orig_task.context = orig_ctx
+            flag_modified(orig_task, "context")
+            session.add(orig_task)
+
     # Dedup guard for active pipeline tasks on this PR/chain. The match axes are
     # (pr_number, chain, task_type, liveness):
     #
@@ -1566,6 +1626,7 @@ async def _spawn_pipeline_task(
     # double-spawn review/fix for the shared PR.
     is_rollup_source = _is_rollup_chain_source(source_task)
     superseded_stale_task = False
+    supersede_churn_last_snapshot: dict[str, object] | None = None
     active_pipeline = (
         (
             await session.execute(
@@ -1603,15 +1664,37 @@ async def _spawn_pipeline_task(
                 AGENT_TIMEOUT,
                 persist_failure_category,
             )
+            from sqlalchemy.orm.attributes import flag_modified
 
+            t_ctx = dict(t.context or {})
+            t_ctx["failure_detail"] = "superseded_by_review_pipeline"
+            t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = {
+                **_review_supersede_churn_snapshot(
+                    t, task_type=t_type, pr_number=pr_number, reason="stale"
+                ),
+                "supersession_kind": "stale",
+            }
+            t.context = t_ctx
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
                 f"Superseded by new {task_type} for PR #{pr_number}: "
                 f"no heartbeat for >{PIPELINE_TASK_STALE_MINUTES}min"
             )
             persist_failure_category(t, AGENT_TIMEOUT)
+            flag_modified(t, "context")
             session.add(t)
             superseded_stale_task = True
+            supersede_churn_last_snapshot = t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY]
+            if orig_task is not None:
+                orig_ctx = dict(orig_task.context or {})
+                supersede_churn_count = int(
+                    orig_ctx.get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0
+                ) + 1
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = supersede_churn_count
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = supersede_churn_last_snapshot
+                orig_task.context = orig_ctx
+                flag_modified(orig_task, "context")
+                session.add(orig_task)
             logger.warning(
                 f"[PIPELINE] Superseding stale {t_type} task {t.id} "
                 f"(last_heartbeat={t.last_heartbeat}, started_at={t.started_at}) "
@@ -1637,15 +1720,37 @@ async def _spawn_pipeline_task(
                 AGENT_TIMEOUT,
                 persist_failure_category,
             )
+            from sqlalchemy.orm.attributes import flag_modified
 
+            t_ctx = dict(t.context or {})
+            t_ctx["failure_detail"] = "superseded_by_review_pipeline"
+            t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = {
+                **_review_supersede_churn_snapshot(
+                    t, task_type=t_type, pr_number=pr_number, reason="fix"
+                ),
+                "supersession_kind": "fix_supersedes_review",
+            }
+            t.context = t_ctx
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
                 f"Superseded by fix on PR #{pr_number}: review was scoped to "
                 f"a pre-conflict / pre-CI-failure snapshot"
             )
             persist_failure_category(t, AGENT_TIMEOUT)
+            flag_modified(t, "context")
             session.add(t)
             superseded_stale_task = True
+            supersede_churn_last_snapshot = t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY]
+            if orig_task is not None:
+                orig_ctx = dict(orig_task.context or {})
+                supersede_churn_count = int(
+                    orig_ctx.get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0
+                ) + 1
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = supersede_churn_count
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = supersede_churn_last_snapshot
+                orig_task.context = orig_ctx
+                flag_modified(orig_task, "context")
+                session.add(orig_task)
             logger.warning(
                 f"[PIPELINE] Cancelling in-flight review {t.id} on PR #{pr_number} "
                 f"so fix can proceed (review snapshot is stale)"
@@ -1668,6 +1773,93 @@ async def _spawn_pipeline_task(
         # Release the active-idempotency partial index before inserting the
         # replacement task in the same transaction.
         await session.flush()
+
+    churn_limit = int(
+        _runtime_config.get(
+            "review_supersede_churn_limit", _REVIEW_SUPERSEDE_CHURN_LIMIT
+        )
+        or _REVIEW_SUPERSEDE_CHURN_LIMIT
+    )
+    if (
+        superseded_stale_task
+        and orig_task is not None
+        and supersede_churn_count >= churn_limit
+    ):
+        from app.alert_dispatch import _maybe_create_escalation_alert
+        from sqlalchemy.orm.attributes import flag_modified
+
+        churn_last = supersede_churn_last_snapshot or (
+            orig_task.context or {}
+        ).get(_REVIEW_SUPERSEDE_CHURN_LAST_KEY)
+        detail = (
+            "Supersession churn reached the bound after "
+            f"{supersede_churn_count} consecutive superseded task(s) with no "
+            "counted run in between."
+        )
+        if churn_last:
+            detail += f" Last superseded task: {churn_last}."
+        if _runtime_config.get("require_approval_gates", True):
+            orig_task.requires_approval = True
+        orig_task.latest_status_message = (
+            f"Review/fix supersession churn on PR #{pr_number}: "
+            f"{supersede_churn_count} consecutive superseded task(s); "
+            "manual review required."
+        )
+        _set_review_loop_terminal_outcome(
+            orig_task,
+            kind="supersession_churn_halt",
+            reason="supersession-churn",
+            pr_number=pr_number,
+            iterations=supersede_churn_count,
+            detail=detail,
+        )
+        orig_ctx = dict(orig_task.context or {})
+        orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = supersede_churn_count
+        if churn_last is not None:
+            orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = churn_last
+        orig_task.context = orig_ctx
+        flag_modified(orig_task, "context")
+        session.add(orig_task)
+        try:
+            await _maybe_create_escalation_alert(
+                orig_task,
+                session,
+                pr_number=pr_number,
+                reason="supersession-churn",
+                iteration=supersede_churn_count,
+            )
+        except Exception as _ae:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Failed to create supersession churn alert for "
+                f"PR #{pr_number}: {_ae}",
+                exc_info=True,
+            )
+        try:
+            import asyncio as _asyncio
+            from app.notification_dispatch import dispatch_external_notification
+
+            _asyncio.ensure_future(  # noqa: RUF006
+                dispatch_external_notification(
+                    orig_task.project_id,
+                    "APPROVAL_NEEDED",
+                    {
+                        "task_id": str(orig_task.id),
+                        "task_title": orig_task.title or str(orig_task.id)[:8],
+                        "pr_number": pr_number,
+                        "iteration": supersede_churn_count,
+                        "reason": "Review/fix supersession churn",
+                        "details": detail,
+                        "last_superseded_task": churn_last,
+                    },
+                )
+            )
+        except Exception as _ne:  # noqa: BLE001
+            logger.warning(
+                f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}"
+            )
+        _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+        session.add(source_task)
+        return (None, False)
 
     # Mid-retry defer: when spawning a review, treat the chain as busy if a
     # same-PR fix is FAILED/CANCELLED with an infra failure_category within the

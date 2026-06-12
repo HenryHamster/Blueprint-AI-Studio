@@ -72,12 +72,12 @@ def _set_review_loop_terminal_outcome(
 # deliberately NOT in this set: that path closes the PR and terminalizes the
 # chain, so nothing can legitimately converge afterwards.
 _RESOLVABLE_ESCALATION_GATE_KINDS = frozenset(
-    {"stuck", "standoff", "repeat_fingerprint_halt"}
+    {"stuck", "standoff", "repeat_fingerprint_halt", "supersession_churn_halt"}
 )
 
 
 def clear_review_escalation_approval_gate(orig: Task, *, resolved_by: str) -> bool:
-    """Release a stale stuck/standoff/repeat-fingerprint approval hold.
+    """Release a stale stuck/standoff/repeat-fingerprint/supersession hold.
 
     Pure mutation (mirrors :func:`_set_review_loop_terminal_outcome`): the
     caller owns the row lock and the commit. Only touches holds whose recorded
