@@ -1357,6 +1357,101 @@ def test_qual_state_promotion_failed_surfaces_reason():
     assert "fresh qualify" in state["summary"].lower()
 
 
+def test_qual_state_managed_check_wait_is_distinct_state():
+    """status='pending' WITH a managed_check_wait promotion_pending = a
+    migration-carrying PR waiting on required checks; Blueprint retries the merge
+    automatically. This is a DISTINCT state from native auto-merge — the copy
+    must say it is waiting for checks and does NOT need a fresh qualification."""
+    enabled_at = (_utcnow() - timedelta(minutes=10)).isoformat()
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 9191,
+                "pr_url": "https://example/pr/9191",
+                "auto_merge_enabled": False,
+                "migration_carrying": True,
+                "managed_check_wait": True,
+                "enabled_at": enabled_at,
+                "ci_state": "pending",
+                "check_snapshot": {"pending": ["CI / Backend"]},
+            },
+        }
+    )
+    assert state["state"] == "promotion_check_wait"
+    assert state["promotion_pr_number"] == 9191
+    assert state["promotion_pr_url"] == "https://example/pr/9191"
+    assert state["migration_carrying"] is True
+    # The additive CI context is forwarded for operator surfaces.
+    assert state["ci_state"] == "pending"
+    assert state["check_snapshot"] == {"pending": ["CI / Backend"]}
+    # Freshness keys are present (same machinery as in-flight).
+    assert state["promotion_enabled_at"] == enabled_at
+    assert state["promotion_age_seconds"] >= 590
+    # Copy must explicitly say waiting for required checks + auto-retry, and must
+    # NOT tell the reader a fresh qualification is needed.
+    lowered = state["summary"].lower()
+    assert "required" in lowered and "check" in lowered
+    assert "automatically" in lowered
+    assert "does not need a fresh qualification" in lowered
+
+
+def test_qual_state_required_check_failed_surfaces_failing_names():
+    """A promotion_failed with error='required_check_failed' classifies as a
+    distinct state and surfaces the failing check names from detail."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "promotion_failed",
+            "error": "required_check_failed",
+            "detail": "PR #9191 required checks failed: CI / Backend, CI / Lint",
+        }
+    )
+    assert state["state"] == "required_check_failed"
+    assert state["error"] == "required_check_failed"
+    assert "CI / Backend" in state["detail"]
+    # The failing names are surfaced in the human summary.
+    assert "CI / Backend" in state["summary"]
+    assert "required" in state["summary"].lower()
+
+
+def test_qual_state_protection_blocked_review_says_human_action():
+    """A promotion_failed with error='protection_blocked_review' classifies as a
+    distinct state and tells the reader a human action is required and that
+    re-qualifying will not help."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "promotion_failed",
+            "error": "protection_blocked_review",
+            "detail": "At least 1 approving review is required",
+        }
+    )
+    assert state["state"] == "protection_blocked_review"
+    assert state["error"] == "protection_blocked_review"
+    lowered = state["summary"].lower()
+    assert "human" in lowered
+    assert "re-qualifying will not help" in lowered
+
+
+def test_qual_state_generic_promotion_failed_unchanged_for_other_errors():
+    """An ordinary promotion failure (non check/protection error) stays the
+    generic promotion_failed state — the split only carves out the two managed
+    check-wait blocker errors."""
+    state = rv.summarize_qualification_state(
+        {"status": "promotion_failed", "error": "merge_blocked", "detail": "conflict"}
+    )
+    assert state["state"] == "promotion_failed"
+    assert state["error"] == "merge_blocked"
+    assert "fresh qualify" in state["summary"].lower()
+
+
+def test_promotion_blocking_states_set_contents():
+    """The exported blocking set names exactly the two mid-promotion holds so
+    every operator guard agrees by construction."""
+    assert rv.PROMOTION_BLOCKING_STATES == frozenset(
+        {"promotion_in_flight", "promotion_check_wait"}
+    )
+
+
 def test_qual_state_not_promoted_includes_scores():
     state = rv.summarize_qualification_state(
         {
