@@ -16,6 +16,11 @@ The API surface is split into a few families:
 - **Admin UI & User Endpoints**: Bearer token from Firebase Auth in `Authorization: Bearer <firebase_token>` header
 - **Agent VM Endpoints**: Custom JWT in `Authorization: Bearer <agent_jwt>` header, scoped to the task ID. The default TTL is **1 hour** (`AGENT_TOKEN_TTL_HOURS`); the agent refreshes proactively at ~45 min via `POST /api/agent/refresh-token`. Cold-start agents that have not yet proven they can refresh receive a longer **8-hour bootstrap** token (`AGENT_BOOTSTRAP_TOKEN_TTL_HOURS`) that is rotated back down to the 1-hour TTL on the first successful refresh.
 - **Server-to-Server**: the `ADMIN_API_KEY` value is sent as a bearer token in the `Authorization: Bearer <ADMIN_API_KEY>` header (the same header as the Firebase token). A request whose bearer token matches `ADMIN_API_KEY` is granted admin access (`get_current_user` in `backend/app/auth.py`).
+- **Read-only metric endpoints**: a small set of non-mutating operator-metric endpoints (see table below) additionally accept a valid agent JWT as a `Authorization: Bearer <agent_jwt>` credential via the `get_metrics_reader` dependency. This grants **read-only** access to those specific endpoints only — it does not grant admin or mutating access. Research/measurement VMs that have `ORCHESTRATOR_URL` and `AGENT_SECRET_TOKEN` but no `ADMIN_API_KEY` can use this path.
+
+| Endpoint | Auth accepted |
+|----------|--------------|
+| `GET /api/admin/digest-latency-stats` | `ADMIN_API_KEY` **or** valid agent JWT |
 
 ---
 
@@ -847,6 +852,7 @@ branch-routing endpoints. The remaining config endpoints:
 | GET | `/api/admin/pipeline-regressions` | Active pipeline regression signals with autonomous-loop response status. |
 | GET | `/api/admin/pipeline-efficiency` | VM cold-start latency, warm reuse rate, and review iterations. |
 | GET | `/api/admin/projects/{project_id}/warm-reuse-funnel` | Rolling warm-VM backlog reuse funnel counters. |
+| GET | `/api/admin/digest-latency-stats` | Per-instance rolling p50/p95 latency for `/api/admin/digest`. Accepts `ADMIN_API_KEY` **or** a valid agent JWT (read-only; see Authentication section). |
 
 #### Diagnostics & Debug (`admin_debug.py`, `admin_health.py`, `admin_orchestrator_errors.py`, `anomaly_detection.py`)
 

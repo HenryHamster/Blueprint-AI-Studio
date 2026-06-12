@@ -370,3 +370,49 @@ def require_admin(current_user: dict = Depends(get_current_user)):
             status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required"
         )
     return current_user
+
+
+# METRICS_READER_ENDPOINTS: grep this token to audit which endpoints accept agent JWTs.
+# This dependency MUST be used ONLY on read-only, non-mutating endpoints that expose
+# non-tenant-sensitive data (e.g. per-instance latency percentiles, tier counts).
+# NEVER use it on mutating endpoints or endpoints returning project/tenant data.
+async def get_metrics_reader(
+    credentials: HTTPAuthorizationCredentials = Security(security),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """FastAPI dependency for READ-ONLY operator-metric endpoints.
+
+    Accepts EITHER:
+    - A token matching ADMIN_API_KEY (existing server-to-server admin path)
+    - A valid agent JWT signed with AGENT_JWT_SECRET (task-scoped or VM-scoped)
+    - A Firebase token for an allowed admin user (browser admin UI path)
+
+    Returns a small principal dict for logging/audit. Does NOT call into Firebase.
+    unless the token is neither ADMIN_API_KEY nor an agent JWT. This is a
+    deliberately narrow path — READ-ONLY metric access only. It MUST NEVER be
+    placed on mutating endpoints.
+    """
+    token = credentials.credentials
+
+    admin_api_key = os.getenv("ADMIN_API_KEY")
+    if admin_api_key and secrets.compare_digest(token, admin_api_key):
+        return {"role": "admin"}
+
+    try:
+        # verify_agent_jwt raises HTTPException(401) on expired or invalid tokens.
+        payload = verify_agent_jwt(token)
+        return {
+            "role": "metrics_reader",
+            "sub": payload.get("sub"),
+            "vm_instance_id": payload.get("vm_instance_id"),
+        }
+    except HTTPException as agent_auth_error:
+        if agent_auth_error.status_code != status.HTTP_401_UNAUTHORIZED:
+            raise
+
+    current_user = await get_current_user(credentials=credentials, session=session)
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required"
+        )
+    return current_user

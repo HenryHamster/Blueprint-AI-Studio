@@ -25,7 +25,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.admin_helpers import _get_user_project_with_role
-from app.auth import get_current_user, require_admin
+from app.auth import get_current_user, get_metrics_reader, require_admin
 from app.database import get_session, resolve_dialect_name
 from app.failure_layer_classifier import parse_viewport_regression_class
 from app.models import (
@@ -66,6 +66,14 @@ _VIEWPORT_IN_COMPONENT_RE = re.compile(
 )
 
 router = APIRouter()
+
+# Separate router for endpoints that accept agent JWTs via get_metrics_reader.
+# Registered directly in main.py WITHOUT the get_current_user router-level dep
+# so agent JWTs can reach these endpoints. All routes here MUST be read-only.
+metrics_router = APIRouter(
+    prefix="/api/admin",
+    tags=["admin-metrics"],
+)
 
 
 def _iter_viewport_regression_keys(value: Any):
@@ -1543,9 +1551,9 @@ async def get_warm_reuse_dropout_trend(
     return {"buckets": buckets}
 
 
-@router.get("/digest-latency-stats")
+@metrics_router.get("/digest-latency-stats")
 async def get_digest_latency_stats(
-    current_user: dict = Depends(require_admin),  # noqa: ARG001
+    current_user: dict = Depends(get_metrics_reader),  # METRICS_READER_ENDPOINTS
 ) -> Dict[str, Any]:
     """Return in-process rolling latency aggregate for /api/admin/digest.
 

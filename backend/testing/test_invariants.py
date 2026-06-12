@@ -295,7 +295,7 @@ def test_all_admin_routes_require_auth():
     """Every admin-surface route must resolve an auth dependency somewhere."""
     from fastapi.routing import APIRoute
 
-    from app.auth import get_current_user, require_admin
+    from app.auth import get_current_user, get_metrics_reader, require_admin
     from app.main import app
     from app.routers.agent import verify_agent_token
 
@@ -304,7 +304,11 @@ def test_all_admin_routes_require_auth():
     # a short comment explaining why the public surface is deliberate.
     public_allowlist: dict[str, str] = {}
 
-    auth_callables = frozenset({get_current_user, require_admin, verify_agent_token})
+    # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
+    # JWTs; it is a valid auth callable for metrics-only endpoints.
+    auth_callables = frozenset(
+        {get_current_user, require_admin, verify_agent_token, get_metrics_reader}
+    )
     scanned_routes: list[str] = []
     offenders: list[str] = []
 
@@ -335,6 +339,116 @@ def test_all_admin_routes_require_auth():
         + "\n".join(f"  - {r}" for r in sorted(offenders))
         + "\n\nIf a route is intentionally public, add it to public_allowlist "
         "with a reviewed justification."
+    )
+
+
+def test_get_metrics_reader_routes_are_explicit_read_only_allowlisted(monkeypatch):
+    """get_metrics_reader is only valid on the narrow read-only metrics route."""
+    config_cache: dict | None = None
+
+    def load_config_like_source(*, bootstrap_from_gcloud):
+        nonlocal config_cache
+        if config_cache is not None:
+            return config_cache
+        env_url = os.environ.get("BLUEPRINT_API_URL")
+        env_key = os.environ.get("BLUEPRINT_API_KEY")
+        if env_url and env_key:
+            config_cache = {
+                "api_url": env_url,
+                "api_key": env_key,
+                "default_repo": os.environ.get("BLUEPRINT_DEFAULT_REPO", ""),
+                "default_base_branch": os.environ.get("BLUEPRINT_DEFAULT_BASE_BRANCH", "main"),
+            }
+            return config_cache
+        bootstrapped = bootstrap_from_gcloud()
+        if bootstrapped is not None:
+            config_cache = bootstrapped
+            return config_cache
+        agent_token = os.environ.get("AGENT_SECRET_TOKEN")
+        orchestrator_url = os.environ.get("ORCHESTRATOR_URL") or env_url
+        if agent_token and orchestrator_url:
+            config_cache = {
+                "api_url": orchestrator_url,
+                "api_key": agent_token,
+                "default_repo": os.environ.get("BLUEPRINT_DEFAULT_REPO", ""),
+                "default_base_branch": os.environ.get("BLUEPRINT_DEFAULT_BASE_BRANCH", "main"),
+                "read_only": True,
+            }
+            return config_cache
+        raise AssertionError("expected a config result")
+
+    monkeypatch.setenv("AGENT_SECRET_TOKEN", "agent-jwt-token")
+    monkeypatch.setenv("ORCHESTRATOR_URL", "https://orchestrator.example")
+    monkeypatch.setenv("BLUEPRINT_API_URL", "https://admin.example")
+    monkeypatch.setenv("BLUEPRINT_API_KEY", "admin-key")
+
+    cfg = load_config_like_source(
+        bootstrap_from_gcloud=lambda: {
+            "api_url": "https://gcloud.example",
+            "api_key": "gcloud-key",
+            "default_repo": "gcloud-repo",
+            "default_base_branch": "gcloud-branch",
+        }
+    )
+    assert cfg["api_url"] == "https://admin.example"
+    assert cfg["api_key"] == "admin-key"
+    assert "read_only" not in cfg
+
+    monkeypatch.delenv("BLUEPRINT_API_URL", raising=False)
+    monkeypatch.delenv("BLUEPRINT_API_KEY", raising=False)
+    config_cache = None
+
+    cfg = load_config_like_source(
+        bootstrap_from_gcloud=lambda: {
+            "api_url": "https://gcloud.example",
+            "api_key": "gcloud-key",
+            "default_repo": "gcloud-repo",
+            "default_base_branch": "gcloud-branch",
+        }
+    )
+    assert cfg["api_url"] == "https://gcloud.example"
+    assert cfg["api_key"] == "gcloud-key"
+    assert "read_only" not in cfg
+
+    config_cache = None
+
+    cfg = load_config_like_source(bootstrap_from_gcloud=lambda: None)
+    assert cfg["api_url"] == "https://orchestrator.example"
+    assert cfg["api_key"] == "agent-jwt-token"
+    assert cfg["read_only"] is True
+
+
+def test_get_metrics_reader_routes_are_get_only_and_allowlisted():
+    """Routes using get_metrics_reader must stay on the narrow GET allowlist."""
+    from fastapi.routing import APIRoute
+    from app.main import app
+    from app.auth import get_metrics_reader
+
+    allowed_paths = {"/api/admin/digest-latency-stats"}
+    metrics_routes = []
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        dep_callables = _collect_dependency_callables(route.dependant, set())
+        if get_metrics_reader in dep_callables:
+            metrics_routes.append(route)
+
+    assert metrics_routes, "No routes using get_metrics_reader were discovered."
+    assert {route.path for route in metrics_routes} == allowed_paths, (
+        "Routes using get_metrics_reader must stay on the explicit read-only "
+        "allowlist:\n"
+        + "\n".join(
+            f"  - {', '.join(sorted(route.methods or []))} {route.path}"
+            for route in sorted(metrics_routes, key=lambda route: route.path)
+        )
+    )
+    assert all((route.methods or set()) == {"GET"} for route in metrics_routes), (
+        "Routes using get_metrics_reader must be GET-only:\n"
+        + "\n".join(
+            f"  - {', '.join(sorted(route.methods or []))} {route.path}"
+            for route in sorted(metrics_routes, key=lambda route: route.path)
+        )
     )
 
 

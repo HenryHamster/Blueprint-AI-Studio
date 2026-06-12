@@ -104,6 +104,12 @@ def load_config() -> dict:
 
     Prefer ~/.blueprint-config.json or BLUEPRINT_API_URL/BLUEPRINT_API_KEY env
     vars so credentials never live in the (gitignored-but-still-local) repo tree.
+
+    Read-only fallback: if all admin-credential tiers fail but ORCHESTRATOR_URL
+    (or BLUEPRINT_API_URL) and AGENT_SECRET_TOKEN are set, returns a read-only
+    config using the agent JWT as the bearer credential. This path grants access
+    only to non-mutating operator-metric endpoints (e.g. /api/admin/digest-latency-stats);
+    mutating/admin endpoints will 403. The returned dict carries ``read_only: True``.
     """
     global _config_cache
     if _config_cache is not None:
@@ -125,13 +131,29 @@ def load_config() -> dict:
     if bootstrapped is not None:
         _config_cache = bootstrapped
         return _config_cache
+    # Read-only agent-JWT fallback: research/measurement VMs have ORCHESTRATOR_URL
+    # and AGENT_SECRET_TOKEN but no admin key or config file. This path works only
+    # for read-only metric endpoints (e.g. /api/admin/digest-latency-stats) — the
+    # backend accepts a valid agent JWT on those endpoints via get_metrics_reader.
+    agent_token = os.environ.get("AGENT_SECRET_TOKEN")
+    orchestrator_url = os.environ.get("ORCHESTRATOR_URL") or env_url
+    if agent_token and orchestrator_url:
+        _config_cache = {
+            "api_url": orchestrator_url,
+            "api_key": agent_token,
+            "default_repo": os.environ.get("BLUEPRINT_DEFAULT_REPO", ""),
+            "default_base_branch": os.environ.get("BLUEPRINT_DEFAULT_BASE_BRANCH", "main"),
+            "read_only": True,
+        }
+        return _config_cache
     searched = "\n  ".join(str(p) for p in _config_search_paths())
     print("ERROR: no Blueprint API config found. Searched:\n  " + searched)
     print("Fix with any of:")
     print("  - run `gcloud auth login` (config auto-bootstraps from Secret Manager), or")
     print("  - create ~/.blueprint-config.json "
           "(keys: api_url, api_key, default_repo, default_base_branch), or")
-    print("  - export BLUEPRINT_API_URL + BLUEPRINT_API_KEY.")
+    print("  - export BLUEPRINT_API_URL + BLUEPRINT_API_KEY, or")
+    print("  - export ORCHESTRATOR_URL + AGENT_SECRET_TOKEN (read-only metric access only).")
     sys.exit(1)
 
 

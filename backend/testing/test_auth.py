@@ -299,7 +299,118 @@ class TestLastLoginThrottleAndBestEffort:
             await _persist_auth_metadata_best_effort(session, user)
 
         assert not any(
-            "SET LOCAL" in str(call.args[0])
-            for call in session.execute.call_args_list
+            "SET LOCAL" in str(call.args[0]) for call in session.execute.call_args_list
         ), "SET LOCAL must not be issued on non-Postgres dialects"
         session.commit.assert_awaited_once()
+
+
+class TestGetMetricsReader:
+    """get_metrics_reader must accept ADMIN_API_KEY and valid agent JWTs, reject all else.
+
+    The dependency is intentionally narrow: it grants read-only metric access
+    to agent JWTs so research VMs can probe non-mutating endpoints without
+    holding an ADMIN_API_KEY.
+    """
+
+    @pytest.mark.asyncio
+    async def test_admin_api_key_accepted(self, monkeypatch):
+        """ADMIN_API_KEY path returns role=admin."""
+        from app.auth import get_metrics_reader
+
+        monkeypatch.setenv("ADMIN_API_KEY", "test-metrics-key-abc")
+        creds = HTTPAuthorizationCredentials(
+            scheme="Bearer", credentials="test-metrics-key-abc"
+        )
+        result = await get_metrics_reader(credentials=creds)
+        assert result["role"] == "admin"
+
+    @pytest.mark.asyncio
+    async def test_task_scoped_agent_jwt_accepted(self):
+        """A valid task-scoped agent JWT returns role=metrics_reader."""
+        from app.auth import create_agent_token, get_metrics_reader
+
+        token = create_agent_token(
+            task_id="task-abc-123",
+            vm_instance_id="vm-def-456",
+            task_type="research",
+            project_id="proj-000",
+        )
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        result = await get_metrics_reader(credentials=creds)
+        assert result["role"] == "metrics_reader"
+        assert result["sub"] == "task-abc-123"
+        assert result["vm_instance_id"] == "vm-def-456"
+
+    @pytest.mark.asyncio
+    async def test_vm_scoped_agent_jwt_accepted(self):
+        """A valid VM-scoped (taskless) agent JWT returns role=metrics_reader."""
+        from app.auth import create_vm_scoped_token, get_metrics_reader
+
+        token = create_vm_scoped_token(
+            vm_instance_id="pool-vm-001", project_id="proj-111"
+        )
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        result = await get_metrics_reader(credentials=creds)
+        assert result["role"] == "metrics_reader"
+        assert result["vm_instance_id"] == "pool-vm-001"
+
+    @pytest.mark.asyncio
+    async def test_expired_jwt_rejected(self):
+        """An expired agent JWT raises 401."""
+        import jwt as pyjwt
+        from datetime import datetime, timezone
+        from fastapi import HTTPException
+        from app.auth import (
+            AGENT_JWT_ALGORITHM,
+            AGENT_JWT_SECRET,
+            get_metrics_reader,
+        )
+
+        expired_payload = {
+            "sub": "old-task",
+            "vm_instance_id": "old-vm",
+            "exp": datetime.now(timezone.utc) - timedelta(hours=2),
+            "iat": datetime.now(timezone.utc) - timedelta(hours=3),
+        }
+        expired_token = pyjwt.encode(
+            expired_payload, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM
+        )
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=expired_token)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_metrics_reader(credentials=creds)
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_invalid_token_rejected(self):
+        """A garbage/invalid token (not ADMIN_API_KEY, not a valid JWT) raises 401."""
+        from fastapi import HTTPException
+        from app.auth import get_metrics_reader
+
+        creds = HTTPAuthorizationCredentials(
+            scheme="Bearer", credentials="garbage-not-a-jwt"
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_metrics_reader(credentials=creds)
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_metrics_reader_accepts_agent_jwt(self):
+        """Acceptance test: freshly minted agent JWT is accepted by get_metrics_reader.
+
+        This is the named acceptance gate for the METRICS_READER_ENDPOINTS feature.
+        """
+        from app.auth import create_agent_token, get_metrics_reader
+
+        token = create_agent_token(
+            task_id="acceptance-task-001",
+            vm_instance_id="acceptance-vm-001",
+            task_type="research",
+            project_id="00000000-0000-0000-0000-000000000001",
+        )
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        result = await get_metrics_reader(credentials=creds)
+        assert result["role"] == "metrics_reader"
+        assert result["sub"] == "acceptance-task-001"
+        assert result["vm_instance_id"] == "acceptance-vm-001"

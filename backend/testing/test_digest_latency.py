@@ -7,6 +7,8 @@ Also exercises the /api/admin/digest-latency-stats endpoint via TestClient.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from app.digest_latency import (
     _reset_for_testing,
@@ -65,9 +67,13 @@ class TestRecordAndSnapshot:
             record_digest_request(i * 0.1, "l3_on_demand")
         snap = get_digest_latency_snapshot()
         # p50 index = int(10*0.50) = 5 → sorted[5] = 0.6
-        assert snap["latency_percentiles"]["p50_seconds"] == pytest.approx(0.6, abs=0.001)
+        assert snap["latency_percentiles"]["p50_seconds"] == pytest.approx(
+            0.6, abs=0.001
+        )
         # p95 index = int(10*0.95) = 9 → sorted[9] = 1.0
-        assert snap["latency_percentiles"]["p95_seconds"] == pytest.approx(1.0, abs=0.001)
+        assert snap["latency_percentiles"]["p95_seconds"] == pytest.approx(
+            1.0, abs=0.001
+        )
         assert snap["latency_percentiles"]["sample_n"] == 10
 
     def test_deque_bounded_at_1000(self):
@@ -86,11 +92,28 @@ class TestRecordAndSnapshot:
         assert "per-instance" in snap["instance_note"]
 
 
+@pytest.fixture
+def override_get_metrics_reader():
+    """Override get_metrics_reader so auth is bypassed for non-JWT tests.
+
+    The conftest client fixture overrides require_admin, but digest-latency-stats
+    now depends on get_metrics_reader. This fixture adds the matching bypass.
+    """
+    from app.auth import get_metrics_reader
+    from app.main import app
+
+    app.dependency_overrides[get_metrics_reader] = lambda: {"role": "admin"}
+    yield
+    app.dependency_overrides.pop(get_metrics_reader, None)
+
+
 class TestDigestLatencyEndpoint:
     """Integration test: GET /api/admin/digest-latency-stats returns 200."""
 
     @pytest.mark.asyncio
-    async def test_endpoint_returns_snapshot(self, client, db_session):
+    async def test_endpoint_returns_snapshot(
+        self, client, db_session, override_get_metrics_reader
+    ):
         record_digest_request(0.25, "l1_precompute")
         record_digest_request(1.8, "l3_on_demand")
 
@@ -105,3 +128,73 @@ class TestDigestLatencyEndpoint:
         assert "total_served" in data
         assert data["tier_counts"]["l1_precompute"] >= 1
         assert data["tier_counts"]["l3_on_demand"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_endpoint_accepts_agent_jwt(self, override_get_session):
+        """GET /api/admin/digest-latency-stats returns 200 with a valid agent JWT.
+
+        The endpoint lives on metrics_router (registered directly in main.py without
+        the get_current_user router-level dep), so agent JWTs are accepted by
+        get_metrics_reader without any override of get_current_user.
+        """
+        from app.auth import create_agent_token
+        from app.main import app
+        from httpx import ASGITransport, AsyncClient
+
+        record_digest_request(0.5, "l2_shared_cache")
+
+        token = create_agent_token(
+            task_id="metrics-probe-task-001",
+            vm_instance_id="metrics-probe-vm-001",
+            task_type="research",
+            project_id="00000000-0000-0000-0000-000000000001",
+        )
+        # No get_current_user override — the real dependency stack must pass.
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as raw_client:
+            resp = await raw_client.get(
+                "/api/admin/digest-latency-stats",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "latency_percentiles" in data
+        assert "tier_counts" in data
+        assert data["tier_counts"]["l2_shared_cache"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_endpoint_accepts_firebase_admin_token(
+        self, override_get_session, db_session
+    ):
+        """Browser admins use Firebase ID tokens via apiFetch/getIdToken."""
+        from app.main import app
+        from app.models import AllowedUser
+        from httpx import ASGITransport, AsyncClient
+
+        email = "metrics-admin@example.com"
+        db_session.add(AllowedUser(email=email, role="admin"))
+        await db_session.commit()
+        record_digest_request(0.75, "l1_precompute")
+
+        decoded = {
+            "uid": "metrics-admin-uid",
+            "email": email,
+            "email_verified": True,
+            "name": "Metrics Admin",
+        }
+        with patch("app.auth.firebase_auth.verify_id_token", return_value=decoded):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as raw_client:
+                resp = await raw_client.get(
+                    "/api/admin/digest-latency-stats",
+                    headers={"Authorization": "Bearer fake-firebase-admin-token"},
+                )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "latency_percentiles" in data
+        assert "tier_counts" in data
+        assert data["tier_counts"]["l1_precompute"] >= 1

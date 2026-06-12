@@ -299,6 +299,33 @@ curl -X POST https://orchestrator/api/admin/restart-orchestrator \
 2. Or: Admin UI → Max Plan Accounts → add OAuth token
 3. Verify token has `repo` and `read:user` scopes
 
+### Read-only metric retrieval from research/measurement VMs
+
+Research and measurement VMs that run one-shot metric probes (e.g. `GET /api/admin/digest-latency-stats`) may not have `ADMIN_API_KEY` or `~/.blueprint-config.json`. They typically have:
+
+- `ORCHESTRATOR_URL` — the orchestrator's public URL (set at VM launch time)
+- `AGENT_SECRET_TOKEN` — the agent JWT minted by the orchestrator for this VM (also present in `/etc/agent.env`)
+
+When `scripts/blueprint_api.py` (the shared ops helper) finds none of the normal admin-credential tiers (config files, `BLUEPRINT_API_URL`+`BLUEPRINT_API_KEY`, `gcloud`), it falls back to this pair automatically. The resulting config is flagged `read_only: True` in the returned dict.
+
+**What this grants:** read access to non-mutating operator-metric endpoints that use the `get_metrics_reader` FastAPI dependency (see `METRICS_READER_ENDPOINTS` comment in `backend/app/auth.py`). Currently: `GET /api/admin/digest-latency-stats`.
+
+**What this does NOT grant:** any admin or mutating access. Calls to endpoints protected by `get_current_user` or `require_admin` will return 403.
+
+**Usage on a measurement VM:**
+```bash
+# Only ORCHESTRATOR_URL and AGENT_SECRET_TOKEN need to be set (already present in /etc/agent.env)
+python3 scripts/blueprint_api.py list_tasks    # will 403 — admin endpoint
+# Use the API helper directly for the allowed metrics path:
+python3 -c "
+from scripts.blueprint_api import api
+import json
+print(json.dumps(api('GET', '/api/admin/digest-latency-stats'), indent=2))
+"
+```
+
+**Security note:** `AGENT_SECRET_TOKEN` is the VM's task-scoped JWT. Never log it or echo it. The `scripts/blueprint_api.py` helper never prints the token.
+
 ---
 
 ## Environment Variable Reference (Alphabetical)
