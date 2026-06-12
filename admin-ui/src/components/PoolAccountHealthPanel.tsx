@@ -95,6 +95,13 @@ function formatResetAt(iso: string | null): string {
   return d.toLocaleString();
 }
 
+function formatTimeOnly(iso: string | null): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+}
+
 // ---------- component ----------
 
 export function PoolAccountHealthPanel({ accounts, loading }: {
@@ -146,7 +153,7 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                   {acct.usage_snapshot && (
                     acct.usage_snapshot.known ? (
                       <span
-                        className="flex items-center gap-1 text-[10px] font-mono"
+                        className={`flex items-center gap-1 text-[10px] font-mono${acct.usage_snapshot.stale ? ' opacity-60' : ''}`}
                         title={`Usage headroom — 5h / 7d window utilization${acct.usage_snapshot.stale ? ' (stale)' : ''}`}
                       >
                         <span className={usageColor(acct.usage_snapshot.five_hour_utilization)}>
@@ -155,7 +162,11 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                         <span className={usageColor(acct.usage_snapshot.seven_day_utilization)}>
                           7d {acct.usage_snapshot.seven_day_utilization == null ? '?' : `${Math.round(acct.usage_snapshot.seven_day_utilization)}%`}
                         </span>
-                        {acct.usage_snapshot.stale && <span className="text-neutral-500" title="Snapshot is stale">~</span>}
+                        {acct.usage_snapshot.stale && (
+                          <span className="text-neutral-400" title={`Snapshot is stale${acct.usage_snapshot.probed_at ? ` (probed at ${acct.usage_snapshot.probed_at})` : ''}`}>
+                            stale{acct.usage_snapshot.probed_at ? ` @${formatTimeOnly(acct.usage_snapshot.probed_at)}` : ''}
+                          </span>
+                        )}
                       </span>
                     ) : (
                       <span

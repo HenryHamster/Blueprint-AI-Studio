@@ -125,6 +125,80 @@ describe('ProviderCostPanel', () => {
     expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/provider-cost-summary?hours=24', undefined);
     expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/provider-cost-summary?hours=168', undefined);
   });
+
+  it('marks rows stale when polling fails after a successful load', async () => {
+    const costRow = {
+      provider: 'openai',
+      account_id: null,
+      account_name: 'Default',
+      total_tasks: 5,
+      success_count: 4,
+      merged_count: 3,
+      total_cost_usd: 10,
+      success_rate: 0.8,
+      cost_per_merged_pr: 3.33,
+    };
+    apiFetchMock.mockResolvedValueOnce(jsonResponse({ window_hours: 24, rows: [costRow] }));
+    apiFetchMock.mockRejectedValue(new Error('network error'));
+
+    vi.useFakeTimers();
+    render(<ProviderCostPanel selectedProjectId={null} windowHours={24} />);
+
+    // Initial load succeeds — no stale banner yet
+    await act(async () => {});
+    // The panel renders both mobile card and desktop table layouts, so both contain 'Default'
+    expect(screen.getAllByText('Default').length).toBeGreaterThan(0);
+    expect(screen.queryByText(/stale/i)).toBeNull();
+
+    // Next poll fails
+    await act(async () => { vi.advanceTimersByTime(30_000); });
+    await act(async () => {});
+
+    // Stale banner visible; rows still rendered
+    expect(screen.getByText(/stale/i)).toBeInTheDocument();
+    expect(screen.getAllByText('Default').length).toBeGreaterThan(0);
+  });
+
+  it('renders error placeholder when poll fails before any data', async () => {
+    apiFetchMock.mockRejectedValue(new Error('network error'));
+
+    render(<ProviderCostPanel selectedProjectId={null} windowHours={24} />);
+    await act(async () => {});
+
+    expect(screen.getByText('Provider Cost & Success')).toBeInTheDocument();
+    expect(screen.getByText(/unavailable/i)).toBeInTheDocument();
+  });
+
+  it('clears stale banner once a poll succeeds again', async () => {
+    const costRow = {
+      provider: 'openai',
+      account_id: null,
+      account_name: 'Default',
+      total_tasks: 5,
+      success_count: 4,
+      merged_count: 3,
+      total_cost_usd: 10,
+      success_rate: 0.8,
+      cost_per_merged_pr: 3.33,
+    };
+    apiFetchMock
+      .mockResolvedValueOnce(jsonResponse({ window_hours: 24, rows: [costRow] }))
+      .mockRejectedValueOnce(new Error('network error'))
+      .mockResolvedValue(jsonResponse({ window_hours: 24, rows: [costRow] }));
+
+    vi.useFakeTimers();
+    render(<ProviderCostPanel selectedProjectId={null} windowHours={24} />);
+    await act(async () => {});
+
+    await act(async () => { vi.advanceTimersByTime(30_000); });
+    await act(async () => {});
+    expect(screen.getByText(/stale/i)).toBeInTheDocument();
+
+    await act(async () => { vi.advanceTimersByTime(30_000); });
+    await act(async () => {});
+    // Banner cleared after successful recovery poll
+    expect(screen.queryByText(/stale/i)).toBeNull();
+  });
 });
 
 describe('ProviderCostPanel — warm-start origin breakdown', () => {

@@ -37,16 +37,40 @@ export function LlmCostBreakdownPanel({
   // Tag loaded data with the project it belongs to so a project switch never
   // briefly renders the previous project's spend before the next load resolves.
   const [state, setState] = useState<{ projectId: string; data: LlmCostBreakdownResponse } | null>(null);
+  // Track which project's last poll failed so we can show a stale/error affordance.
+  const [pollErrorProjectId, setPollErrorProjectId] = useState<string | null>(null);
 
   usePoller(async (signal) => {
     if (!selectedProjectId) return;
     try {
       const res = await fetchLlmCostBreakdown(selectedProjectId, windowDays);
-      if (!signal.aborted) setState({ projectId: selectedProjectId, data: res });
-    } catch { /* silent */ }
+      if (!signal.aborted) {
+        setState({ projectId: selectedProjectId, data: res });
+        setPollErrorProjectId(null);
+      }
+    } catch {
+      if (!signal.aborted) setPollErrorProjectId(selectedProjectId);
+    }
   }, { intervalMs: DEFAULT_POLL_MS, enabled: !!selectedProjectId, deps: [selectedProjectId, windowDays] });
 
-  if (!selectedProjectId || state?.projectId !== selectedProjectId) return null;
+  const pollError = pollErrorProjectId === selectedProjectId;
+
+  if (!selectedProjectId) return null;
+
+  if (state?.projectId !== selectedProjectId) {
+    if (pollError) {
+      return (
+        <section>
+          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+            LLM Cost by Model
+          </h2>
+          <div className="text-xs text-red-400 px-1">Cost data unavailable — fetch failed.</div>
+        </section>
+      );
+    }
+    return null;
+  }
+
   const data = state.data;
 
   const { by_model, by_task_type, totals, unpriced_combos, approximate_priced_combos } = data;
@@ -59,10 +83,17 @@ export function LlmCostBreakdownPanel({
     </h2>
   );
 
+  const StaleBanner = pollError && (
+    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+      Data may be stale — last poll failed.
+    </div>
+  );
+
   if (by_model.length === 0) {
     return (
       <section>
         {Header}
+        {StaleBanner}
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-[11px] text-neutral-500">
           No priced LLM token spend in the last {data.window_days} days for this project.
         </div>
@@ -231,6 +262,7 @@ export function LlmCostBreakdownPanel({
   return (
     <section>
       {Header}
+      {StaleBanner}
       {coverageWarning}
       {fallbackWarning}
       {approximateWarning}

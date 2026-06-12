@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ChevronRight, CheckSquare, ExternalLink, EyeOff, RefreshCw, Wand2 } from 'lucide-react';
+import { AlertTriangle, ChevronRight, CheckSquare, ExternalLink, EyeOff, RefreshCw, Wand2 } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import type { Task } from '../types/task';
@@ -45,7 +45,7 @@ function SkeletonRow() {
   return <div className="animate-pulse bg-neutral-800/60 rounded h-10 w-full" />;
 }
 
-export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget, onSpawnFixTask, onPanelReviewPr }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null; onSpawnFixTask?: (pr: OpenPR) => void; onPanelReviewPr?: (pr: OpenPR) => void }) {
+export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget, onSpawnFixTask, onPanelReviewPr, stale }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null; onSpawnFixTask?: (pr: OpenPR) => void; onPanelReviewPr?: (pr: OpenPR) => void; stale?: boolean }) {
   const [expanded, setExpanded] = useState(true);
   const [dismissedPrs, setDismissedPrs] = useState<Set<number>>(() => new Set());
   const tasksById = React.useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
@@ -72,6 +72,16 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
           >
             <RefreshCw className={`w-3 h-3 ${busy ? 'animate-spin' : ''}`} />
           </button>
+        )}
+        {stale && openPRs.length > 0 && (
+          <span
+            data-testid="open-prs-stale-badge"
+            title="Last PR refresh failed — showing cached data"
+            className="flex items-center gap-1 text-[10px] text-amber-400"
+          >
+            <AlertTriangle className="w-3 h-3" />
+            cached
+          </span>
         )}
       </div>
       {expanded && (

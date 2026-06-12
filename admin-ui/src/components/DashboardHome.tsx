@@ -118,7 +118,9 @@ const WINDOW_OPTIONS = [
 
 export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, userRole }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
+  const [digestStale, setDigestStale] = useState(false);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
+  const [openPRsStale, setOpenPRsStale] = useState(false);
   const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
   const [openPRsPromotionTarget, setOpenPRsPromotionTarget] = useState<string | null>(null);
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
@@ -150,6 +152,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
   const [srDrillThroughError, setSrDrillThroughError] = useState<{ taskId: string; message: string } | null>(null);
   const sparkRef = useRef<SparkPoint[]>([]);
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
+  // Tracks whether any successful digest fetch has run in the current project
+  // context. Used in the allFailed check to avoid reading stale `digest` state
+  // inside the fetchData useCallback closure.
+  const digestHasDataRef = useRef(false);
   const reviewQualitySectionRef = useRef<HTMLElement>(null);
   const dashboardRequestIdRef = useRef(0);
   const openPRsRequestIdRef = useRef(0);
@@ -160,7 +166,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
 
   const resetProjectScopedState = useCallback(() => {
     setDigest(null);
+    setDigestStale(false);
     setOpenPRs([]);
+    setOpenPRsStale(false);
     setOpenPRsIntegrationBranch(null);
     setOpenPRsPromotionTarget(null);
     setMeasurementData(null);
@@ -184,6 +192,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     setAgentServingShas(null);
     setSparkData([]);
     sparkRef.current = [];
+    digestHasDataRef.current = false;
     setOpenPRsRefreshing(false);
     setLoading(true);
     setLastFetchError(false);
@@ -272,16 +281,20 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
             const data = await res.json();
             if (requestId === dashboardRequestIdRef.current && assertDigestContract<DirectionProgress>(data)) {
               setDigest(data);
+              setDigestStale(false);
+              digestHasDataRef.current = true;
               digestOk = true;
             } else if (requestId === dashboardRequestIdRef.current) {
-              setDigest(null);
+              // Contract failed — preserve previous digest, mark stale
+              setDigestStale(true);
             }
           } else if (requestId === dashboardRequestIdRef.current) {
-            setDigest(null);
+            // HTTP error — preserve previous digest, mark stale
+            setDigestStale(true);
           }
         } catch {
           if (requestId === dashboardRequestIdRef.current) {
-            setDigest(null);
+            setDigestStale(true);
           }
           /* silent */
         }
@@ -307,9 +320,14 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
               setOpenPRs(data.open_prs ?? []);
               setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
               setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
+              setOpenPRsStale(false);
               openPRsOk = true;
+            } else if (requestId === dashboardRequestIdRef.current) {
+              setOpenPRsStale(true);
             }
-          } catch { /* silent */ }
+          } catch {
+            if (requestId === dashboardRequestIdRef.current) setOpenPRsStale(true);
+          }
         })(),
         (async () => {
           try {
@@ -445,10 +463,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     if (requestId !== dashboardRequestIdRef.current) return;
     setLoading(false);
 
-    // Show error banner only when all primary fetches fail (backend unreachable)
+    // Show error banner only when all primary fetches fail AND we have no
+    // previously-loaded digest to show. digestHasDataRef tracks whether any
+    // successful digest fetch has run (avoids the stale-closure problem with
+    // reading `digest` state directly inside this callback).
     const allFailed = selectedProjectId
-      ? !digestOk && !diagnosticsOk && !openPRsOk
-      : !digestOk;
+      ? !digestOk && !diagnosticsOk && !openPRsOk && !digestHasDataRef.current
+      : !digestOk && !digestHasDataRef.current;
     setLastFetchError(allFailed);
   }, [selectedProjectId, windowHours, selectedSrCategory]);
 
@@ -582,6 +603,19 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
         <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
           <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
           <span>Backend unreachable — showing stale data</span>
+        </div>
+      )}
+      {/* Digest staleness banner — shown when the backend served a stale
+          fallback (served_stale) OR when the client-side fetch failed but
+          prior digest data is preserved (digestStale). Distinct from the
+          "Backend unreachable" banner, which only fires when no data exists. */}
+      {(digestStale || digest?.served_stale) && !loading && (
+        <div
+          data-testid="digest-stale-banner"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs"
+        >
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+          <span>Digest data may be stale — last fetch failed, showing cached values</span>
         </div>
       )}
       {/* Header row with time window selector */}
@@ -915,6 +949,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
             promotionTarget={openPRsPromotionTarget}
             onSpawnFixTask={onSpawnOrphanFix}
             onPanelReviewPr={onPanelReviewPr}
+            stale={openPRsStale}
           />
         </div>
       </div>

@@ -257,7 +257,7 @@ async def get_digest(
         )
 
     cache_key = ("digest", hours, str(project_id) if project_id else None)
-    result = await cache.get_or_compute(
+    result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_digest(hours=hours, project_id=project_id, session=session),
         ttl=60.0,
@@ -268,12 +268,14 @@ async def get_digest(
     # payload as fresh-for-PRECOMPUTE_STALE_FALLBACK_SECONDS, regressing
     # non-leader digest freshness from 15s to 5 minutes.
     record_digest_request(time.monotonic() - _t0, "l3_on_demand")
-    return annotate_precompute_metadata(
+    annotated = annotate_precompute_metadata(
         result,
         precomputed=False,
         precomputed_at=result.get("generated_at") or None,
         precompute_age_seconds=0.0,
     )
+    annotated["served_stale"] = served_stale
+    return annotated
 
 
 async def _compute_digest(

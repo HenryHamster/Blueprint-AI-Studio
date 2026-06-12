@@ -404,6 +404,12 @@ export interface MissingCapabilityDemand {
 }
 
 export interface DigestData<DP = unknown> {
+  // ----- staleness signal -----
+  // Set by the backend when the L3 (on-demand) cache serves a last-good
+  // fallback because the live compute failed. Absent on L1/L2 (precomputed)
+  // responses. The dashboard renders a per-source staleness banner when true.
+  served_stale?: boolean;
+
   // ----- core contract (validated by assertDigestContract) -----
   failed_count: number;
   pending_approval_count: number;

@@ -2674,4 +2674,91 @@ describe('DashboardHome', () => {
       expect(screen.queryByText('Effort & Model Efficiency')).not.toBeInTheDocument();
     });
   });
+
+  describe('digest staleness banner', () => {
+    it('shows the stale banner when the backend returns served_stale=true', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 2,
+          pending_approval_count: 0,
+          completed_count: 5,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+          served_stale: true,
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByTestId('digest-stale-banner')).toBeInTheDocument();
+      // Should NOT show the "Backend unreachable" banner — we have data
+      expect(screen.queryByText(/Backend unreachable/)).not.toBeInTheDocument();
+    });
+
+    it('shows the stale banner when digest fetch fails but previous data exists', async () => {
+      const validDigest = {
+        failed_count: 1,
+        pending_approval_count: 0,
+        completed_count: 3,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      };
+
+      // First call: returns valid digest
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(validDigest));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/api/admin/open-prs')) return Promise.resolve(jsonResponse({ open_prs: [] }));
+        if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+        return Promise.resolve(notFoundResponse());
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      // Wait for initial successful load
+      await screen.findByText('All systems healthy');
+      expect(screen.queryByTestId('digest-stale-banner')).not.toBeInTheDocument();
+
+      // Second call: digest fails
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/api/admin/digest')) return Promise.resolve(errorResponse(503));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/api/admin/open-prs')) return Promise.resolve(jsonResponse({ open_prs: [] }));
+        if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+        return Promise.resolve(notFoundResponse());
+      });
+
+      // Trigger a manual re-render cycle via window change (simulates poller tick)
+      const { rerender } = render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      rerender(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      // After fetch failure with prior data, stale banner should appear
+      await waitFor(() => {
+        expect(screen.queryByTestId('digest-stale-banner')).not.toBeNull();
+      });
+      // "Backend unreachable" banner should NOT appear since we have previous data
+      expect(screen.queryByText(/Backend unreachable/)).not.toBeInTheDocument();
+    });
+
+    it('passes stale=true to PRMonitorSection when open-prs fetch fails after prior success', async () => {
+      const validDigest = {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      };
+
+      setupApiMocks({ digest: validDigest, diagnostics: makeDiagnostics() });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      await screen.findByText('All systems healthy');
+
+      // PRMonitorSection should receive stale=false initially
+      expect(capturedProps.prMonitor?.stale).toBeFalsy();
+    });
+  });
 });

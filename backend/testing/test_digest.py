@@ -9900,3 +9900,77 @@ async def test_digest_latest_cycle_null_when_no_completed_cycles(
     assert response.status_code == 200
     lc = response.json().get("latest_cycle")
     assert lc is None, "latest_cycle should be null when only active cycles exist"
+
+
+@pytest.mark.asyncio
+async def test_digest_stale_fallback_is_annotated_served_stale(client: AsyncClient):
+    """GET /api/admin/digest L3 path annotates served_stale=True when the cache
+    serves a stale fallback (compute failed, returning last-good result).
+
+    The precompute L1 cache never has worker-written entries in tests (the
+    background worker doesn't run), and the shared L2 cache is empty in a clean
+    test DB, so the L3 DigestCache path is always taken here.
+    """
+    from unittest.mock import MagicMock
+    from app.digest_cache import DigestCache, get_digest_cache
+
+    stale_payload = {
+        "window_hours": 24,
+        "completed_count": 3,
+        "failed_count": 2,
+        "pending_approval_count": 0,
+        "active_count": 0,
+        "running_count": 0,
+        "queued_count": 0,
+        "research_cycles": 0,
+        "prs_opened": 0,
+        "generated_at": "2026-06-01T00:00:00",
+    }
+
+    mock_cache = MagicMock(spec=DigestCache)
+    mock_cache.get_or_compute_meta = AsyncMock(return_value=(stale_payload, True))
+
+    app.dependency_overrides[get_digest_cache] = lambda: mock_cache
+    try:
+        response = await client.get("/api/admin/digest")
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["served_stale"] is True
+    assert data["completed_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_digest_fresh_compute_annotates_served_stale_false(client: AsyncClient):
+    """GET /api/admin/digest L3 path annotates served_stale=False on a fresh compute."""
+    from unittest.mock import MagicMock
+    from app.digest_cache import DigestCache, get_digest_cache
+
+    fresh_payload = {
+        "window_hours": 24,
+        "completed_count": 7,
+        "failed_count": 1,
+        "pending_approval_count": 0,
+        "active_count": 0,
+        "running_count": 0,
+        "queued_count": 0,
+        "research_cycles": 0,
+        "prs_opened": 0,
+        "generated_at": "2026-06-12T00:00:00",
+    }
+
+    mock_cache = MagicMock(spec=DigestCache)
+    mock_cache.get_or_compute_meta = AsyncMock(return_value=(fresh_payload, False))
+
+    app.dependency_overrides[get_digest_cache] = lambda: mock_cache
+    try:
+        response = await client.get("/api/admin/digest")
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["served_stale"] is False
+    assert data["completed_count"] == 7
