@@ -14309,8 +14309,9 @@ async def test_no_findings_completion_stamps_saturation_and_refractory(
     db_session, mocker
 ):
     """When a research task completes with no actionable findings, the direction
-    must be marked possibly_saturated=True and stamped with refractory_until so
-    it cannot be immediately re-selected.
+    must be stamped with refractory_until and last_researched_at so it cannot be
+    immediately re-selected. possibly_saturated is NOT set on the first no-findings
+    cycle — saturation requires 3+ consecutive unproductive cycles.
 
     This closes the blind spot where the early-return gate in
     _handle_research_completion skipped _apply_direction_state_updates entirely,
@@ -14370,8 +14371,8 @@ async def test_no_findings_completion_stamps_saturation_and_refractory(
     dirs = project.directions or []
     target = next((d for d in dirs if d.get("id") == direction_id), None)
     assert target is not None, "Direction must still exist"
-    assert target.get("possibly_saturated") is True, (
-        "Direction must be marked saturated after no-findings completion"
+    assert target.get("possibly_saturated") is not True, (
+        "Direction must NOT be marked saturated after a single no-findings cycle"
     )
     assert target.get("last_researched_at") is not None, (
         "last_researched_at must be set so the cooldown applies"

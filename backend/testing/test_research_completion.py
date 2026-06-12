@@ -6484,7 +6484,9 @@ class TestCompletedFoundationSatisfiesPrereqAtSpawn:
             "app.research_completion.cited_paths_changed_since",
             new=AsyncMock(return_value=None),
         )
-        mocker.patch("app.research_completion._has_validation_backend", return_value=True)
+        mocker.patch(
+            "app.research_completion._has_validation_backend", return_value=True
+        )
         mocker.patch(
             "app.research_completion._summarize_ungrounded_claims_grounded",
             new=AsyncMock(return_value=None),
@@ -12123,3 +12125,89 @@ async def test_audit_mode_persist_error_does_not_block_spawn(db_session, mocker)
         .all()
     )
     assert len(children) >= 1, "spawn loop must proceed even when audit persist fails"
+
+
+class TestStampNoFindingsRefractory:
+    """_stamp_no_findings_refractory: possibly_saturated should only be set after 3+ consecutive unproductive cycles."""
+
+    def _make_task(self, direction_id="d-test"):
+        task = MagicMock()
+        task.id = uuid.uuid4()
+        task.project_id = uuid.uuid4()
+        task.context = {"direction_id": direction_id}
+        task.first_payload = {}
+        return task
+
+    def _make_session(self):
+        session = AsyncMock()
+        session.add = MagicMock()
+        return session
+
+    def _make_project(
+        self, direction_id="d-test", consecutive_unproductive=0, research_history=None
+    ):
+        project = MagicMock()
+        project.directions = [
+            {
+                "id": direction_id,
+                "research_history": research_history
+                if research_history is not None
+                else [],
+                "consecutive_unproductive_cycles": consecutive_unproductive,
+            }
+        ]
+        return project
+
+    def _run(self, project, coro):
+        import asyncio
+        from unittest.mock import patch
+
+        async def _mock_wdl(session, project_id, mutate_fn):
+            mutate_fn(project.directions)
+
+        with patch("app.research_completion.with_directions_locked", _mock_wdl):
+            asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_first_unproductive_cycle_not_marked_saturated(self):
+        """A single no-findings cycle must NOT set possibly_saturated (history too short)."""
+        from app.research_completion import _stamp_no_findings_refractory
+
+        task = self._make_task()
+        project = self._make_project(consecutive_unproductive=0)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction.get("possibly_saturated") is False
+
+    def test_two_consecutive_unproductive_cycles_not_saturated(self):
+        """Two consecutive no-findings cycles must NOT set possibly_saturated."""
+        from app.research_completion import _stamp_no_findings_refractory
+
+        task = self._make_task()
+        project = self._make_project(consecutive_unproductive=1)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction.get("possibly_saturated") is False
+
+    def test_three_consecutive_unproductive_cycles_marked_saturated(self):
+        """After 3 consecutive no-findings cycles, possibly_saturated must be True."""
+        from app.research_completion import _stamp_no_findings_refractory
+
+        task = self._make_task()
+        project = self._make_project(consecutive_unproductive=2)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction.get("possibly_saturated") is True
+
+    def test_consecutive_counter_incremented(self):
+        """consecutive_unproductive_cycles is incremented on each call."""
+        from app.research_completion import _stamp_no_findings_refractory
+
+        task = self._make_task()
+        project = self._make_project(consecutive_unproductive=1)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction["consecutive_unproductive_cycles"] == 2

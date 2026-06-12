@@ -1229,12 +1229,11 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
             return
         target["last_researched_at"] = now_iso
         target["last_cycle_productive"] = False
-        target["consecutive_unproductive_cycles"] = (
-            int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
-        )
-        # "No actionable findings" is direct saturation evidence — mark the direction
-        # and apply the longer refractory so the portfolio moves on.
-        target["possibly_saturated"] = True
+        new_consec = int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
+        target["consecutive_unproductive_cycles"] = new_consec
+        # Only mark saturated after 3+ consecutive unproductive cycles, consistent
+        # with _compute_saturation's history-based threshold.
+        target["possibly_saturated"] = new_consec >= 3
         stamp_direction_refractory(target)
 
     await with_directions_locked(
