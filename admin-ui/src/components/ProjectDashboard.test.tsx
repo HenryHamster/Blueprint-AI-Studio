@@ -148,6 +148,72 @@ describe('ProjectDashboard', () => {
     expect(screen.getByText('2 blocked')).toBeInTheDocument();
   });
 
+  it('selected project slice does not zero other project counts', () => {
+    // The `tasks` prop is the current server-scoped, paginated page. Here it
+    // contains ONLY a one-task slice of proj-1, as if the operator paginated or
+    // selected into proj-1 — proj-2 has no rows on this page at all. The backend
+    // aggregate `task_status_counts`, however, reports the real project-wide
+    // totals. The carousel must render the aggregate so proj-2's running/failed
+    // work cannot disappear and proj-1's count cannot collapse to the slice.
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[
+          makeProject({
+            id: 'proj-1',
+            name: 'Platform',
+            task_status_counts: { queued: 3, running: 5, evaluating: 0, blocked: 0, failed: 0, completed: 2, total: 10 },
+          }),
+          makeProject({
+            id: 'proj-2',
+            name: 'Bootstrap',
+            github_repo: 'bootstrap',
+            task_status_counts: { queued: 0, running: 4, evaluating: 0, blocked: 0, failed: 2, completed: 0, total: 6 },
+          }),
+        ]}
+        // Page slice: a single proj-1 task. proj-2 is entirely absent from it.
+        tasks={[makeTask('proj-1', 'IN_PROGRESS')]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    // proj-1 reflects the aggregate (5 running / 3 queued), NOT the page slice (1 running).
+    expect(screen.getByText('5 running')).toBeInTheDocument();
+    expect(screen.getByText('3 queued')).toBeInTheDocument();
+    expect(screen.queryByText('1 running')).not.toBeInTheDocument();
+
+    // proj-2's running + failed work survives even though it has zero rows on the page.
+    expect(screen.getByText('4 running')).toBeInTheDocument();
+    // "2 failed" appears both as the corner badge and the inline count row.
+    expect(screen.getAllByText('2 failed').length).toBeGreaterThanOrEqual(1);
+
+    // "All Projects" total reflects the aggregate sum (10 + 6), not tasks.length (1).
+    expect(screen.getByText('16 tasks total')).toBeInTheDocument();
+    expect(screen.queryByText(/1 tasks total/)).not.toBeInTheDocument();
+
+    // No page-only qualifier when every project carries the aggregate.
+    expect(screen.queryByText('(this page)')).not.toBeInTheDocument();
+  });
+
+  it('labels per-card counts as current-page only when the aggregate is absent (legacy payload)', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        // No task_status_counts → legacy payload → fall back to the page slice.
+        projects={[makeProject({ id: 'proj-1', name: 'Platform' })]}
+        tasks={[makeTask('proj-1', 'IN_PROGRESS'), makeTask('proj-1', 'QUEUED')]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('1 running')).toBeInTheDocument();
+    expect(screen.getByText('1 queued')).toBeInTheDocument();
+    // The fallback is visibly marked so a page slice can't masquerade as project truth.
+    expect(screen.getAllByText('(this page)').length).toBeGreaterThanOrEqual(1);
+  });
+
   it('renders a per-project status badge', () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
     const recentTime = new Date(Date.now() - 30 * 60 * 1000).toISOString(); // 30 mins ago

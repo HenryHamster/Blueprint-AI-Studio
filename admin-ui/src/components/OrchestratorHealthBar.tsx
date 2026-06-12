@@ -84,6 +84,10 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
   const [localQuota, setLocalQuota] = useState<GithubQuota | null>(null);
   const [dailyCostUsd, setDailyCostUsd] = useState<number | null>(null);
   const [dailyCostCeilingUsd, setDailyCostCeilingUsd] = useState<number>(0);
+  // Fleet-scoped stale-heartbeat count from the same digest fetch as the cost
+  // pill. `null` until the digest has returned the field; until then the warning
+  // falls back to the current `tasks` page (clearly labelled as page-only).
+  const [fleetStaleHeartbeatCount, setFleetStaleHeartbeatCount] = useState<number | null>(null);
   const costFetchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -108,6 +112,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         const data = await res.json();
         if (data?.daily_cost_usd != null) setDailyCostUsd(data.daily_cost_usd);
         if (data?.daily_cost_ceiling_usd != null) setDailyCostCeilingUsd(data.daily_cost_ceiling_usd);
+        if (typeof data?.stale_heartbeat_count === 'number') setFleetStaleHeartbeatCount(data.stale_heartbeat_count);
       }
     } catch { /* silent */ }
   }, []);
@@ -135,7 +140,9 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
     }
   };
 
-  const staleHeartbeatCount = useMemo(() => {
+  // Page-derived stale-heartbeat count over the current `tasks` slice. Used only
+  // as a fallback until the fleet-scoped digest count is available.
+  const pageStaleHeartbeatCount = useMemo(() => {
     const fiveMinutesAgo = now - 5 * 60 * 1000;
     return tasks.filter(t =>
       t.status === 'IN_PROGRESS' &&
@@ -143,6 +150,12 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
       parseTimestamp(t.last_heartbeat).getTime() < fiveMinutesAgo
     ).length;
   }, [tasks, now]);
+
+  // Prefer the fleet-wide digest count so the warning reflects every stuck task,
+  // not just those on the current paginated page. Fall back to the page count
+  // (labelled page-only in the tooltip) until the digest field has loaded.
+  const staleIsPageOnly = fleetStaleHeartbeatCount == null;
+  const staleHeartbeatCount = fleetStaleHeartbeatCount ?? pageStaleHeartbeatCount;
 
   // Cycle-COMPLETION age is now only a secondary, informational slow-cycle
   // signal. The PRIMARY health verdict comes from the backend's progress-based
@@ -520,7 +533,10 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
       {/* Right: stale heartbeats + last update */}
       <div className="flex items-center gap-3">
         {staleHeartbeatCount > 0 && (
-          <span className="text-amber-400" title={`${staleHeartbeatCount} IN_PROGRESS task${staleHeartbeatCount !== 1 ? 's' : ''} with no heartbeat in the last 5 minutes`}>
+          <span
+            className="text-amber-400"
+            title={`${staleHeartbeatCount} IN_PROGRESS task${staleHeartbeatCount !== 1 ? 's' : ''} with no heartbeat in the last 5 minutes${staleIsPageOnly ? ' (current page only — fleet count unavailable)' : ' (fleet-wide)'}`}
+          >
             ⚠ {staleHeartbeatCount} stale
           </span>
         )}

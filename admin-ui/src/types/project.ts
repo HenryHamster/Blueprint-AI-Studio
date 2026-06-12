@@ -203,6 +203,23 @@ export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig 
   recent_spend_usd: number;
 }
 
+/**
+ * Per-project task-status rollup returned by GET /api/admin/projects
+ * (`items[].task_status_counts`). Covers EVERY task in the project, not just the
+ * current paginated task page, so operator surfaces can render project-wide
+ * truth instead of a page slice. Additive — absent on legacy payloads, so every
+ * read must guard for `undefined`.
+ */
+export interface TaskStatusCounts {
+  queued: number;
+  running: number;
+  evaluating: number;
+  blocked: number;
+  failed: number;
+  completed: number;
+  total: number;
+}
+
 export interface RepoOverview {
   tech_stack?: string | null;
   directory_layout?: string | null;
@@ -231,6 +248,10 @@ export interface Project {
   directions?: Direction[];
   /** Count of active directions — present on list endpoint. */
   directions_count?: number;
+  /** Project-wide task-status rollup from GET /api/admin/projects. Covers every
+   *  task in the project (not the current task page), so operator surfaces can
+   *  render project-scoped truth. Additive — absent on legacy payloads. */
+  task_status_counts?: TaskStatusCounts;
   created_at: string;
   my_role?: 'owner' | 'member' | 'viewer';
   build_config?: BuildConfig | null;

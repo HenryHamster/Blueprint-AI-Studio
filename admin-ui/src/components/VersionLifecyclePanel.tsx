@@ -958,7 +958,65 @@ function ChallengedVsUnchallengedSummary({ telemetry }: { telemetry: ChallengedV
   );
 }
 
-export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void; userRole?: 'admin' | 'user' | null }) {
+interface VersionLifecyclePanelProps {
+  data: VersionLifecycleResponse | null;
+  loading: boolean;
+  projectId: string | null;
+  onRefresh: () => void;
+  userRole?: 'admin' | 'user' | null;
+  refreshError?: string | null;
+  lastSuccessfulRefreshAt?: string | null;
+  refreshing?: boolean;
+}
+
+function VersionLifecycleRefreshBanner({
+  kind,
+  message,
+  lastSuccessfulRefreshAt,
+  refreshing,
+  canRetry,
+  onRefresh,
+}: {
+  kind: 'stale' | 'unavailable';
+  message: string;
+  lastSuccessfulRefreshAt?: string | null;
+  refreshing: boolean;
+  canRetry: boolean;
+  onRefresh: () => void;
+}) {
+  const stale = kind === 'stale';
+  const toneClass = stale
+    ? 'mb-2 border-amber-500/30 bg-amber-500/10 text-amber-200'
+    : 'border-red-500/30 bg-red-500/10 text-red-300';
+  const detailClass = stale ? 'text-amber-200/90' : 'text-red-300/90';
+  const buttonClass = stale
+    ? 'border-amber-400/40 text-amber-100 hover:bg-amber-500/10'
+    : 'border-red-400/40 text-red-200 hover:bg-red-500/10';
+  return (
+    <div role="alert" data-testid={stale ? 'version-lifecycle-stale' : 'version-lifecycle-unavailable'} className={`${toneClass} rounded-lg border px-3 py-2 text-xs`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className={`font-semibold ${stale ? '' : 'text-red-200'}`}>
+            {stale ? 'Version lifecycle data may be stale' : 'Version lifecycle unavailable'}
+          </p>
+          <p className={`text-[11px] ${detailClass}`}>
+            {message}{stale && lastSuccessfulRefreshAt ? `; last successful refresh ${timeAgo(lastSuccessfulRefreshAt)}` : ''}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={refreshing || !canRetry}
+          className={`min-h-[44px] rounded border px-2 py-1 text-[11px] disabled:cursor-not-allowed disabled:opacity-50 ${buttonClass}`}
+        >
+          {refreshing ? 'Retrying...' : 'Retry'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole, refreshError, lastSuccessfulRefreshAt, refreshing = false }: VersionLifecyclePanelProps) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
@@ -987,7 +1045,16 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     setPromotionEnabledOverride(null);
   }, [data?.promotion_enabled]);
 
-  if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
+  if (loading) return null;
+  if (!data || (!data.current_version && data.recent_versions.length === 0)) {
+    if (!refreshError) return null;
+    return (
+      <section data-testid="version-lifecycle-panel">
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
+        <VersionLifecycleRefreshBanner kind="unavailable" message={refreshError} refreshing={refreshing} canRetry={!!projectId} onRefresh={onRefresh} />
+      </section>
+    );
+  }
   const cv = data.current_version ? (optimisticOverrides ? { ...data.current_version, ...optimisticOverrides } : data.current_version) : null;
   const recent = data.recent_versions;
   const promotionEnabled = data.promotion_enabled ?? false;
@@ -1213,6 +1280,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
+      {refreshError && (
+        <VersionLifecycleRefreshBanner kind="stale" message={refreshError} lastSuccessfulRefreshAt={lastSuccessfulRefreshAt} refreshing={refreshing} canRetry={!!projectId} onRefresh={onRefresh} />
+      )}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
         <div className="flex flex-wrap items-center gap-2">
           {data.promotion_enabled !== undefined && (

@@ -379,6 +379,36 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     setActiveWindow(e.currentTarget.dataset.key as TimeWindow);
   }, []);
 
+  // Aggregate "needs attention" count from the digest, which covers the whole
+  // project/fleet window — not just the current paginated task page. Prefer the
+  // explicit needs_attention list; fall back to pending-approval + failed counts
+  // when an older payload omits it. `null` until the digest has loaded, at which
+  // point the page-derived `needsAttentionCount` prop is used as the fallback.
+  const digestAttentionCount = digest
+    ? ((digest.needs_attention?.length) ?? (digest.pending_approval_count + digest.failed_count))
+    : null;
+  const attentionCount = digestAttentionCount ?? needsAttentionCount;
+
+  // First-render auto-expand, driven by the aggregate digest count so a
+  // paginated page that hides other projects' attention items can't suppress the
+  // expand. Runs once per session (shared sessionStorage guard with the
+  // synchronous prop-based fallback in the `collapsed` initializer above), and
+  // only once the digest has loaded.
+  const didDigestAutoExpandRef = useRef(false);
+  useEffect(() => {
+    if (didDigestAutoExpandRef.current) return;
+    if (digestAttentionCount == null) return; // wait for the digest to load
+    didDigestAutoExpandRef.current = true;
+    if (sessionStorage.getItem('blueprint-admin:catchUpAutoExpanded')) return;
+    if (
+      digestAttentionCount > 0 &&
+      localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true'
+    ) {
+      sessionStorage.setItem('blueprint-admin:catchUpAutoExpanded', 'true');
+      setCollapsed(false);
+    }
+  }, [digestAttentionCount]);
+
   const hasActivity = digest && (
     digest.completed_count > 0 ||
     digest.failed_count > 0 ||
@@ -426,9 +456,9 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
           {collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
           <Clock className="w-3 h-3" />
           Catch-up
-          {collapsed && needsAttentionCount > 0 && (
+          {collapsed && attentionCount > 0 && (
             <span className="ml-1 bg-red-500/20 border border-red-500/40 text-red-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none">
-              {needsAttentionCount} need attention
+              {attentionCount} need attention
             </span>
           )}
           {collapsed && digest && (

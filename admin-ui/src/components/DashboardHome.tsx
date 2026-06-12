@@ -87,6 +87,15 @@ export interface DashboardHomeProps {
   tasks: Task[];
   selectedProjectId: string | null;
   projects?: Project[];
+  // Membership-scoped aggregate task counts from the tasks hook (/api/admin/tasks).
+  // These cover the whole accessible fleet (global*) or the selected project
+  // (scoped*), NOT the current paginated task page, so the Active/Queued cards
+  // can render true counts instead of a slice. All optional/additive: when
+  // undefined the cards fall back to deriving from the `tasks` page.
+  globalActiveCount?: number;
+  globalQueuedCount?: number;
+  scopedActiveCount?: number | null;
+  scopedQueuedCount?: number | null;
   onViewTask: (task: Task) => void;
   onDirectionClick?: (directionId: string) => void;
   onCategoryClick?: (category: string) => void;
@@ -107,7 +116,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, userRole }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, userRole }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
@@ -119,6 +128,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [versionLifecycle, setVersionLifecycle] = useState<VersionLifecycleResponse | null>(null);
+  const [versionLifecycleError, setVersionLifecycleError] = useState<string | null>(null);
+  const [versionLifecycleLastSuccessAt, setVersionLifecycleLastSuccessAt] = useState<string | null>(null);
+  const [versionLifecycleRefreshing, setVersionLifecycleRefreshing] = useState(false);
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [expandedBlindSpotThemes, setExpandedBlindSpotThemes] = useState<Set<string>>(new Set());
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
@@ -157,6 +169,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     setSystemMaturity(null);
     setTaskDurationStats(null);
     setVersionLifecycle(null);
+    setVersionLifecycleError(null);
+    setVersionLifecycleLastSuccessAt(null);
+    setVersionLifecycleRefreshing(false);
     setBlindSpots(null);
     setExpandedBlindSpotThemes(new Set());
     setSrRecentMisses(null);
@@ -367,8 +382,19 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) setVersionLifecycle(await res.json());
-          } catch { /* silent */ }
+            if (requestId !== dashboardRequestIdRef.current) return;
+            if (res.ok) {
+              setVersionLifecycle(await res.json());
+              setVersionLifecycleError(null);
+              setVersionLifecycleLastSuccessAt(new Date().toISOString());
+            } else {
+              setVersionLifecycleError(`Version lifecycle unavailable (${res.status})`);
+            }
+          } catch {
+            if (requestId === dashboardRequestIdRef.current) {
+              setVersionLifecycleError('Version lifecycle refresh failed');
+            }
+          }
         })(),
         (async () => {
           try {
@@ -429,10 +455,26 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const refreshVersionLifecycle = useCallback(async () => {
     if (!selectedProjectId) return;
     const requestId = ++versionLifecycleRequestIdRef.current;
+    setVersionLifecycleRefreshing(true);
     try {
       const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
-      if (res.ok && requestId === versionLifecycleRequestIdRef.current) setVersionLifecycle(await res.json());
-    } catch { /* silent */ }
+      if (requestId !== versionLifecycleRequestIdRef.current) return;
+      if (res.ok) {
+        setVersionLifecycle(await res.json());
+        setVersionLifecycleError(null);
+        setVersionLifecycleLastSuccessAt(new Date().toISOString());
+      } else {
+        setVersionLifecycleError(`Version lifecycle unavailable (${res.status})`);
+      }
+    } catch {
+      if (requestId === versionLifecycleRequestIdRef.current) {
+        setVersionLifecycleError('Version lifecycle refresh failed');
+      }
+    } finally {
+      if (requestId === versionLifecycleRequestIdRef.current) {
+        setVersionLifecycleRefreshing(false);
+      }
+    }
   }, [selectedProjectId]);
 
   // Reset project-scoped state synchronously on a project/window/category
@@ -466,10 +508,21 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     void fetchData(++dashboardRequestIdRef.current);
   }, [fetchData]);
 
-  const { activeCount, queuedCount } = useMemo(() => ({
-    activeCount: tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
-    queuedCount: tasks.filter(t => t.status === 'QUEUED').length,
+  // Active/Queued headline cards read the membership-scoped aggregate counts
+  // (project-scoped when a project is selected, else fleet-wide) so a paginated
+  // task page can never hide active/queued work from other projects. Fall back
+  // to deriving from the current `tasks` page only when the aggregate props are
+  // absent (e.g. legacy callers / tests that don't thread them through).
+  const { pageActiveCount, pageQueuedCount } = useMemo(() => ({
+    pageActiveCount: tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
+    pageQueuedCount: tasks.filter(t => t.status === 'QUEUED').length,
   }), [tasks]);
+  const activeCount = selectedProjectId && scopedActiveCount != null
+    ? scopedActiveCount
+    : (globalActiveCount ?? pageActiveCount);
+  const queuedCount = selectedProjectId && scopedQueuedCount != null
+    ? scopedQueuedCount
+    : (globalQueuedCount ?? pageQueuedCount);
 
   // Sparkline sampling
   useEffect(() => {
@@ -563,7 +616,18 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
 
       {/* Version Lifecycle */}
-      {selectedProjectId && <VersionLifecyclePanel data={versionLifecycle} loading={loading} projectId={selectedProjectId} onRefresh={refreshVersionLifecycle} userRole={userRole} />}
+      {selectedProjectId && (
+        <VersionLifecyclePanel
+          data={versionLifecycle}
+          loading={loading}
+          projectId={selectedProjectId}
+          onRefresh={refreshVersionLifecycle}
+          userRole={userRole}
+          refreshError={versionLifecycleError}
+          lastSuccessfulRefreshAt={versionLifecycleLastSuccessAt}
+          refreshing={versionLifecycleRefreshing}
+        />
+      )}
 
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />

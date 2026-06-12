@@ -487,14 +487,26 @@ async def _compute_digest(
     if project_id:
         active_filters.append(Task.project_id == project_id)
     active_counts_result = await session.execute(
-        select(Task.status, func.count())
-        .where(*active_filters)
-        .group_by(Task.status)
+        select(Task.status, func.count()).where(*active_filters).group_by(Task.status)
     )
     active_count_by_status = {
         row_status: int(row_count or 0)
         for row_status, row_count in active_counts_result.all()
     }
+
+    # Stale-heartbeat count: IN_PROGRESS tasks whose last_heartbeat is >5 min old.
+    # Scoped to project_id when provided (same pattern as active_filters above).
+    _stale_threshold = _utcnow() - timedelta(minutes=5)
+    stale_filters = [
+        Task.status == TaskStatus.IN_PROGRESS,
+        Task.last_heartbeat < _stale_threshold,
+    ]
+    if project_id:
+        stale_filters.append(Task.project_id == project_id)
+    stale_count_result = await session.execute(
+        select(func.count()).where(*stale_filters)
+    )
+    stale_heartbeat_count = int(stale_count_result.scalar() or 0)
     if _use_projection:
         active_result = await session.execute(
             select(
@@ -621,9 +633,13 @@ async def _compute_digest(
             .order_by(Artifact.created_at.asc())
             .limit(500)
         )
-        for task_id, artifact_type, pr_url, error_log_snippet, created_at in (
-            artifacts_result.all()
-        ):
+        for (
+            task_id,
+            artifact_type,
+            pr_url,
+            error_log_snippet,
+            created_at,
+        ) in artifacts_result.all():
             tid = str(task_id)
             if artifact_type == ArtifactType.PULL_REQUEST:
                 if created_at >= window_start:
@@ -1266,22 +1282,16 @@ async def _compute_digest(
                 latest_cycle[CYCLE_META_MEMOS_AVAILABLE] = _ms[
                     CYCLE_META_MEMOS_AVAILABLE
                 ]
-                latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[
-                    CYCLE_META_MEMOS_CITED
-                ]
+                latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[CYCLE_META_MEMOS_CITED]
                 # Compact strategic-judgment-challenge summary when this
                 # cycle carried a challenge record; omit entirely for
                 # legacy cycles so absence never reads as a failure.
                 _challenge_record = (_sc_row.cycle_metadata or {}).get(
                     "strategic_judgment_challenge"
                 )
-                _challenge_summary = strategic_challenge_summary(
-                    _challenge_record
-                )
+                _challenge_summary = strategic_challenge_summary(_challenge_record)
                 if _challenge_summary is not None:
-                    latest_cycle["strategic_judgment_challenge"] = (
-                        _challenge_summary
-                    )
+                    latest_cycle["strategic_judgment_challenge"] = _challenge_summary
             _sc_history = await _strategic_cycle.recent_for_agent_context(
                 session,
                 project_id,
@@ -1428,6 +1438,7 @@ async def _compute_digest(
     _augmented_verdicts: dict = {}
     if _digest_project is not None:
         from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
+
         _verdict_evaluated_at = _tv_utcnow().isoformat()
         _pending_trial_verdicts: list[tuple[str, dict[str, Any]]] = []
         # Collected gate-integrity alert detail (if any) — persisted durably in
@@ -1471,6 +1482,7 @@ async def _compute_digest(
             compute_lane_pilot_aggregates,
             compute_lane_arm_time_medians,
         )
+
         if project_id is not None:
             _lane_aggs = await compute_lane_pilot_aggregates(session, project_id)
             _lane_verdict = evaluate_lane_pilot_verdict(_lane_aggs)
@@ -1482,19 +1494,26 @@ async def _compute_digest(
             try:
                 from app.lane_baseline_snapshot import read_version_lane_baseline  # noqa: PLC0415
                 from app.models import ReleaseVersion as _ReleaseVersion  # noqa: PLC0415
+
                 _latest_rv = (
-                    await session.execute(
-                        select(_ReleaseVersion)
-                        .where(
-                            _ReleaseVersion.project_id == project_id,
-                            _ReleaseVersion.status.in_(["promoted", "abandoned"]),
+                    (
+                        await session.execute(
+                            select(_ReleaseVersion)
+                            .where(
+                                _ReleaseVersion.project_id == project_id,
+                                _ReleaseVersion.status.in_(["promoted", "abandoned"]),
+                            )
+                            .order_by(desc(_ReleaseVersion.version_number))
+                            .limit(1)
                         )
-                        .order_by(desc(_ReleaseVersion.version_number))
-                        .limit(1)
                     )
-                ).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 if _latest_rv is not None and _digest_project is not None:
-                    _rb = read_version_lane_baseline(_digest_project, _latest_rv.version_number)
+                    _rb = read_version_lane_baseline(
+                        _digest_project, _latest_rv.version_number
+                    )
                     if _rb is not None:
                         _relay_m = _rb.get("relay_medians") or {}
                         _relay_fields = {
@@ -1504,11 +1523,22 @@ async def _compute_digest(
                             "task_count": _relay_m.get("task_count"),
                             "pr_count": _relay_m.get("pr_count", 0),
                         }
-                        _lane_m = await compute_lane_arm_time_medians(session, project_id)
+                        _lane_m = await compute_lane_arm_time_medians(
+                            session, project_id
+                        )
                         _deltas: dict[str, Any] = {}
-                        for _mf in ("wall_clock_seconds", "active_seconds", "gap_seconds", "task_count"):
+                        for _mf in (
+                            "wall_clock_seconds",
+                            "active_seconds",
+                            "gap_seconds",
+                            "task_count",
+                        ):
                             _rv, _lv = _relay_fields.get(_mf), _lane_m.get(_mf)
-                            _deltas[_mf] = (_lv - _rv) if (_rv is not None and _lv is not None) else None
+                            _deltas[_mf] = (
+                                (_lv - _rv)
+                                if (_rv is not None and _lv is not None)
+                                else None
+                            )
                         _lane_verdict["lane_relay_comparison"] = {
                             "source_version": {
                                 "version_number": _latest_rv.version_number,
@@ -1520,7 +1550,10 @@ async def _compute_digest(
                             "deltas": _deltas,
                         }
             except Exception:
-                logger.warning("[LANE_PILOT] failed to compute lane_relay_comparison", exc_info=True)
+                logger.warning(
+                    "[LANE_PILOT] failed to compute lane_relay_comparison",
+                    exc_info=True,
+                )
             if _lane_verdict.get("verdict") == "KILL":
                 await apply_lane_pilot_kill_in_transaction(
                     session,
@@ -1801,4 +1834,5 @@ async def _compute_digest(
         else {},
         "research_output_quality": _research_output_quality,
         "problem_model_gc_health": problem_model_gc_health,
+        "stale_heartbeat_count": stale_heartbeat_count,
     }

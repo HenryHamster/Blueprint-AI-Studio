@@ -148,6 +148,55 @@ async def get_all_projects(
     rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
     page_rows = rows[:limit]
+
+    # Single grouped query for task-status counts across all user-accessible projects.
+    # Scoped to caller membership via _user_project_ids — no cross-project leakage.
+    project_ids_for_page = [row.id for row in page_rows]
+    task_status_counts: Dict[str, Any] = {}
+    if project_ids_for_page:
+        counts_result = await session.execute(
+            select(Task.project_id, Task.status, func.count())
+            .where(Task.project_id.in_(project_ids_for_page))
+            .where(Task.archived.is_(False))
+            .group_by(Task.project_id, Task.status)
+        )
+        for proj_id, status, count in counts_result.all():
+            proj_key = str(proj_id)
+            if proj_key not in task_status_counts:
+                task_status_counts[proj_key] = {
+                    "queued": 0,
+                    "running": 0,
+                    "evaluating": 0,
+                    "blocked": 0,
+                    "failed": 0,
+                    "completed": 0,
+                    "total": 0,
+                }
+            bucket = task_status_counts[proj_key]
+            n = int(count or 0)
+            bucket["total"] += n
+            if status == TaskStatus.QUEUED:
+                bucket["queued"] += n
+            elif status in (TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING):
+                bucket["running"] += n
+            elif status == TaskStatus.EVALUATING:
+                bucket["evaluating"] += n
+            elif status == TaskStatus.BLOCKED:
+                bucket["blocked"] += n
+            elif status == TaskStatus.FAILED:
+                bucket["failed"] += n
+            elif status == TaskStatus.COMPLETED:
+                bucket["completed"] += n
+
+    _empty_counts = {
+        "queued": 0,
+        "running": 0,
+        "evaluating": 0,
+        "blocked": 0,
+        "failed": 0,
+        "completed": 0,
+        "total": 0,
+    }
     return {
         "items": [
             {
@@ -176,6 +225,9 @@ async def get_all_projects(
                 ),
                 "directions_count": row.directions_count,
                 "my_role": row.my_role,
+                "task_status_counts": task_status_counts.get(
+                    str(row.id), _empty_counts
+                ),
             }
             for row in page_rows
         ],
@@ -597,6 +649,7 @@ async def detect_project_build_config(
     from app.github import get_repo_installation_token
     from app.routers.admin_onboard import _detect_build_config
     from app.schemas import BuildConfig as BuildConfigSchema
+
     token = await get_repo_installation_token(project.github_owner, project.github_repo)
     if not token:
         raise HTTPException(
@@ -1278,8 +1331,7 @@ async def get_task_type_cost_adherence(
     }
 
     ceilings = {
-        value: cap.cost_ceiling_usd
-        for value, cap in TASK_CAPABILITY_BY_VALUE.items()
+        value: cap.cost_ceiling_usd for value, cap in TASK_CAPABILITY_BY_VALUE.items()
     }
     rows = compute_task_type_cost_adherence(
         tasks,
@@ -1380,7 +1432,9 @@ async def get_autonomous_status(
                 "tasks_spawned_last_hour": tasks_per_project.get(project.id, 0),
                 "rate_limit": effective_cap,
                 "fleet_default_rate_limit": fleet_default,
-                "rate_limit_source": "project_override" if has_override else "fleet_default",
+                "rate_limit_source": "project_override"
+                if has_override
+                else "fleet_default",
             }
         )
 

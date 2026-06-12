@@ -258,3 +258,56 @@ describe('OrchestratorHealthBar deploy state', () => {
     expect(deployIndicator.textContent).toContain('External dependency down');
   });
 });
+
+describe('OrchestratorHealthBar stale heartbeat warning', () => {
+  beforeEach(() => {
+    apiFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0 }),
+    } as Response);
+  });
+
+  function tasksWithStaleHeartbeats(count: number) {
+    return Array.from({ length: count }, (_, idx) => ({
+      id: `task-${idx + 1}`,
+      status: 'IN_PROGRESS',
+      last_heartbeat: '2026-05-06T22:30:00Z',
+    }));
+  }
+
+  it('uses the fleet digest stale-heartbeat count instead of the page slice', async () => {
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0, stale_heartbeat_count: 7 }),
+    } as Response);
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} tasks={tasksWithStaleHeartbeats(2)} />); });
+
+    const warning = screen.getByTitle(/7 IN_PROGRESS tasks with no heartbeat in the last 5 minutes \(fleet-wide\)/);
+    expect(warning.textContent).toContain('7 stale');
+    expect(warning.textContent).not.toContain('2 stale');
+  });
+
+  it('hides the warning when the fleet digest reports zero stale heartbeats', async () => {
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0, stale_heartbeat_count: 0 }),
+    } as Response);
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} tasks={tasksWithStaleHeartbeats(2)} />); });
+
+    expect(screen.queryByText(/stale$/)).toBeNull();
+  });
+
+  it('falls back to the current page slice when the digest omits stale_heartbeat_count', async () => {
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0 }),
+    } as Response);
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} tasks={tasksWithStaleHeartbeats(2)} />); });
+
+    const warning = screen.getByTitle(/2 IN_PROGRESS tasks with no heartbeat in the last 5 minutes \(current page only — fleet count unavailable\)/);
+    expect(warning.textContent).toContain('2 stale');
+  });
+});

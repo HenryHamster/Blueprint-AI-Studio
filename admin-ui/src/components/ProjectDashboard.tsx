@@ -455,6 +455,14 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
 
   if (projects.length === 0) return null;
 
+  // Prefer the backend's project-wide task_status_counts aggregate over the
+  // page-derived task slice so per-card counts and the "All Projects" total
+  // reflect every task in the project, not just whatever rows are on the current
+  // paginated page. Fall back to the page slice (clearly labelled) only when the
+  // aggregate is absent on a legacy payload.
+  const allProjectsHaveAggregate = projects.every(p => p.task_status_counts != null);
+  const aggregateTaskTotal = projects.reduce((sum, p) => sum + (p.task_status_counts?.total ?? 0), 0);
+
   return (
     <div className="mb-4 shrink-0">
       <div className="flex items-center justify-between mb-2">
@@ -543,11 +551,24 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
             }`}
           >
             <div className="text-xs font-semibold text-neutral-200 mb-1">All Projects</div>
-            <div className="text-[10px] text-neutral-500 font-mono">{tasks.length} tasks total</div>
+            {allProjectsHaveAggregate ? (
+              <div className="text-[10px] text-neutral-500 font-mono">{aggregateTaskTotal} tasks total</div>
+            ) : (
+              <div
+                className="text-[10px] text-neutral-500 font-mono"
+                title="Project-wide totals are unavailable on this payload — showing only the tasks on the current page."
+              >
+                {tasks.length} tasks total <span className="text-neutral-600">(this page)</span>
+              </div>
+            )}
           </button>
 
           {projects.map(project => {
-            const counts = getTaskCounts(tasks, project.id);
+            // Project-wide aggregate when present; otherwise the page slice
+            // (visibly marked so a paginated count can't masquerade as project truth).
+            const aggregateCounts = project.task_status_counts ?? null;
+            const counts = aggregateCounts ?? getTaskCounts(tasks, project.id);
+            const countsArePageOnly = aggregateCounts == null;
             const isSelected = selectedProjectId === project.id;
             const showSetupNudge = isNewProject(project, counts.completed);
 
@@ -903,6 +924,14 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                     {counts.failed > 0 && <span className="text-red-400">{counts.failed} failed</span>}
                     {counts.completed > 0 && <span className="text-emerald-400">{counts.completed} done</span>}
                     {counts.total === 0 && <span className="text-neutral-600">no tasks</span>}
+                    {countsArePageOnly && counts.total > 0 && (
+                      <span
+                        className="text-neutral-600"
+                        title="Counts reflect the current task page only — project-wide totals are unavailable on this payload."
+                      >
+                        (this page)
+                      </span>
+                    )}
                   </div>
                 </button>
               </div>

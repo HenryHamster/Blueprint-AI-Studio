@@ -68,6 +68,83 @@ async def test_digest_empty_window(client: AsyncClient):
     assert data["recent_failures"] == []
     assert data["recent_completions"] == []
     assert "parallel_review_effectiveness" not in data
+    assert data["stale_heartbeat_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_digest_stale_heartbeat_count_old_heartbeat(db_session):
+    """IN_PROGRESS task with a >5min-old heartbeat increments stale_heartbeat_count."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+    )
+    db_session.add(stale_task)
+    await db_session.commit()
+
+    data = await _compute_digest(hours=24, project_id=None, session=db_session)
+    assert data["stale_heartbeat_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_stale_heartbeat_count_fresh_heartbeat(db_session):
+    """IN_PROGRESS task with a recent heartbeat does not increment stale_heartbeat_count."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fresh_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_utcnow() - timedelta(minutes=1),
+    )
+    db_session.add(fresh_task)
+    await db_session.commit()
+
+    data = await _compute_digest(hours=24, project_id=None, session=db_session)
+    assert data["stale_heartbeat_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_digest_stale_heartbeat_count_is_membership_scoped(db_session):
+    """stale_heartbeat_count for a project_id only counts that project's stale tasks."""
+    project_a = make_project(name="Project A")
+    project_b = make_project(name="Project B")
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    stale_a = make_task(
+        project_id=project_a.id,
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+    )
+    stale_b = make_task(
+        project_id=project_b.id,
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+    )
+    db_session.add(stale_a)
+    db_session.add(stale_b)
+    await db_session.commit()
+
+    # Scoped to project_a — should only count stale_a
+    data_a = await _compute_digest(
+        hours=24, project_id=project_a.id, session=db_session
+    )
+    assert data_a["stale_heartbeat_count"] == 1
+
+    # Fleet-wide — should count both
+    data_all = await _compute_digest(hours=24, project_id=None, session=db_session)
+    assert data_all["stale_heartbeat_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -158,9 +235,10 @@ async def test_lane_pilot_kill_survives_digest_session_rollback(db_session):
             result = await _compute_digest(
                 hours=24, project_id=project.id, session=digest_session
             )
-            assert result["capability_adoption_verdicts"][LANE_PILOT_CAP_NAME][
-                "verdict"
-            ] == "KILL"
+            assert (
+                result["capability_adoption_verdicts"][LANE_PILOT_CAP_NAME]["verdict"]
+                == "KILL"
+            )
             await digest_session.rollback()
 
         async with Session() as fresh:
@@ -175,19 +253,29 @@ async def test_lane_pilot_kill_survives_digest_session_rollback(db_session):
             stored_lane = await fresh.get(ImprovementLane, lane.id)
             assert stored_lane.status == ImprovementLaneStatus.KILLED.value
             stored_vm = (
-                await fresh.execute(
-                    select(PoolVm).where(
-                        PoolVm.vm_instance_id == "digest-kill-reserved-vm"
+                (
+                    await fresh.execute(
+                        select(PoolVm).where(
+                            PoolVm.vm_instance_id == "digest-kill-reserved-vm"
+                        )
                     )
                 )
-            ).scalars().one()
+                .scalars()
+                .one()
+            )
             assert stored_vm.reserved_lane_id is None
             assert stored_vm.reservation_expires_at is None
             messages = (
-                await fresh.execute(
-                    select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+                (
+                    await fresh.execute(
+                        select(ProjectMessage).where(
+                            ProjectMessage.project_id == project.id
+                        )
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             assert len(messages) == 1
             assert messages[0].context["dedupe_key"] == (
                 "review_fix_lane_gate_integrity_violation"
@@ -196,17 +284,25 @@ async def test_lane_pilot_kill_survives_digest_session_rollback(db_session):
         assert runtime_config["review_fix_lane_pilot_enabled"] is False
 
         async with Session() as digest_session:
-            await _compute_digest(hours=24, project_id=project.id, session=digest_session)
+            await _compute_digest(
+                hours=24, project_id=project.id, session=digest_session
+            )
             await digest_session.rollback()
 
         async with Session() as fresh:
             stored_lane = await fresh.get(ImprovementLane, lane.id)
             assert stored_lane.status == ImprovementLaneStatus.KILLED.value
             messages = (
-                await fresh.execute(
-                    select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+                (
+                    await fresh.execute(
+                        select(ProjectMessage).where(
+                            ProjectMessage.project_id == project.id
+                        )
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             assert len(messages) == 1
     finally:
         if previous_flag is None:
@@ -299,10 +395,16 @@ async def test_request_path_digest_persists_trial_verdict_and_alert_without_call
         assert decided, f"no decided trial verdict durably persisted: {stored}"
 
         messages = (
-            await fresh.execute(
-                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            (
+                await fresh.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert any(
             (m.context or {}).get("dedupe_key")
             == "review_fix_lane_gate_integrity_violation"
@@ -311,7 +413,9 @@ async def test_request_path_digest_persists_trial_verdict_and_alert_without_call
 
 
 @pytest.mark.asyncio
-async def test_precompute_persists_verdicts_when_l2_cache_write_fails(db_session, mocker):
+async def test_precompute_persists_verdicts_when_l2_cache_write_fails(
+    db_session, mocker
+):
     """A precompute tick whose L2 cache write (write_shared) FAILS still durably
     persists the trial verdicts.
 
@@ -367,12 +471,14 @@ async def test_precompute_persists_verdicts_when_l2_cache_write_fails(db_session
             and v.get("verdict") in ("adopt", "reject")
         ]
         assert decided, (
-            "trial verdicts were lost when the L2 cache write failed: " f"{stored}"
+            f"trial verdicts were lost when the L2 cache write failed: {stored}"
         )
 
 
 @pytest.mark.asyncio
-async def test_lane_pilot_immediate_alert_on_continue_is_not_dropped(db_session, mocker):
+async def test_lane_pilot_immediate_alert_on_continue_is_not_dropped(
+    db_session, mocker
+):
     """A CONTINUE verdict with immediate_alert still raises the operator alert."""
     project = make_project()
     db_session.add(project)
@@ -600,7 +706,9 @@ async def test_digest_merge_gate_fleet_health_verified(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
-async def test_digest_merge_gate_fleet_health_fell_open(client: AsyncClient, db_session):
+async def test_digest_merge_gate_fleet_health_fell_open(
+    client: AsyncClient, db_session
+):
     """Fleet with fell-open merges: fell_open_count and most_common_reason are
     correct, degraded_project_count reflects projects with falls."""
     now_iso = _utcnow().isoformat()
@@ -1440,9 +1548,7 @@ async def test_digest_recurring_patterns_fix_shipped_not_verified_when_unverifie
                 context={
                     "error_fingerprint": "fp-unv-001",
                     "pr_merged": True,
-                    "review_loop": {
-                        "unverified_merge_reason": "verify_setup_failed"
-                    },
+                    "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
                 },
             )
         )
@@ -1550,14 +1656,21 @@ async def test_digest_early_warnings_affected_direction_count_per_class(
 
         # Find warnings by failure_class and verify affected_direction_count matches
         # the actual affected_directions for each warning, not a global total.
-        warning_1 = next(w for w in warnings if w["failure_class"] == "FailureRateMomentum")
-        warning_2 = next(w for w in warnings if w["failure_class"] == "FailureRateMomentum_db")
+        warning_1 = next(
+            w for w in warnings if w["failure_class"] == "FailureRateMomentum"
+        )
+        warning_2 = next(
+            w for w in warnings if w["failure_class"] == "FailureRateMomentum_db"
+        )
 
         assert warning_1["affected_direction_count"] == 2  # affects dir-a, dir-b
         assert warning_2["affected_direction_count"] == 1  # affects dir-c only
 
         # Ensure they have different counts (the bug was that they were the same).
-        assert warning_1["affected_direction_count"] != warning_2["affected_direction_count"]
+        assert (
+            warning_1["affected_direction_count"]
+            != warning_2["affected_direction_count"]
+        )
     finally:
         _ss.persistent_anomalies.pop(proj_key, None)
 
@@ -7095,7 +7208,9 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_digest_migration_health_includes_slot_contention(client: AsyncClient, db_session):
+async def test_digest_migration_health_includes_slot_contention(
+    client: AsyncClient, db_session
+):
     """The digest surfaces migration-slot contention with holder and wait-time detail."""
     project = make_project()
     db_session.add(project)
@@ -7295,7 +7410,9 @@ async def test_digest_direction_progress_exposes_spawn_gate_block(
     assert response.status_code == 200
     data = response.json()
 
-    dp = next(d for d in data["direction_progress"] if d["direction_id"] == "dir-spawn-gate")
+    dp = next(
+        d for d in data["direction_progress"] if d["direction_id"] == "dir-spawn-gate"
+    )
     gate = dp["research_spawn_gate"]
     assert gate["challenged_count"] == 2
     assert gate["refuted_count"] == 1
@@ -7332,7 +7449,10 @@ async def test_digest_direction_progress_exposes_adversarial_give_up(
                         "tasks_created": 1,
                         "research_spawn_gate_adversarial_give_up_count": 3,
                         "research_spawn_gate_adversarial_give_up_samples": [
-                            {"title": "Abandoned finding A", "direction_id": "dir-give-up"},
+                            {
+                                "title": "Abandoned finding A",
+                                "direction_id": "dir-give-up",
+                            },
                             {"title": "Abandoned finding B"},
                         ],
                     },
@@ -7368,7 +7488,9 @@ async def test_digest_direction_progress_exposes_adversarial_give_up(
     assert response.status_code == 200
     data = response.json()
 
-    dp = next(d for d in data["direction_progress"] if d["direction_id"] == "dir-give-up")
+    dp = next(
+        d for d in data["direction_progress"] if d["direction_id"] == "dir-give-up"
+    )
     gate = dp["research_spawn_gate"]
     assert gate is not None
     # Counts sum across both history entries.
@@ -9215,18 +9337,14 @@ async def test_digest_includes_sr_false_attestation_trends_from_design_doc(
     data = response.json()
     assert "sr_false_attestation_trends" in data
     assert data["sr_false_attestation_trends"] is not None
+    assert data["sr_false_attestation_trends"]["computed_at"] == "2026-06-05T10:00:00"
     assert (
-        data["sr_false_attestation_trends"]["computed_at"]
-        == "2026-06-05T10:00:00"
+        "tests_executed_cleanly" in data["sr_false_attestation_trends"]["per_category"]
     )
     assert (
-        "tests_executed_cleanly"
-        in data["sr_false_attestation_trends"]["per_category"]
-    )
-    assert (
-        data["sr_false_attestation_trends"]["per_category"][
-            "tests_executed_cleanly"
-        ]["false_attestation_rate"]
+        data["sr_false_attestation_trends"]["per_category"]["tests_executed_cleanly"][
+            "false_attestation_rate"
+        ]
         == 0.05
     )
 
@@ -9331,8 +9449,11 @@ async def test_compute_trial_arm_accumulation_empty_arm_yields_none_rate(db_sess
     db_session.add_all(
         [
             _arm_task(
-                project.id, had_repo_map=True, first_attempt_succeeded=True,
-                days_ago=1, idx=i,
+                project.id,
+                had_repo_map=True,
+                first_attempt_succeeded=True,
+                days_ago=1,
+                idx=i,
             )
             for i in range(3)
         ]
@@ -9371,11 +9492,29 @@ async def test_compute_trial_arm_accumulation_intent_to_treat(db_session):
 
     tasks = [
         # Treatment-assigned, received map → WITH arm, success
-        _task({"_repo_map_arm": True, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        _task(
+            {
+                "_repo_map_arm": True,
+                "_had_repo_map": True,
+                "_first_attempt_succeeded": True,
+            }
+        ),
         # Treatment-assigned, NO map (empty map case) → still WITH arm, failure
-        _task({"_repo_map_arm": True, "_had_repo_map": False, "_first_attempt_succeeded": False}),
+        _task(
+            {
+                "_repo_map_arm": True,
+                "_had_repo_map": False,
+                "_first_attempt_succeeded": False,
+            }
+        ),
         # Holdback-assigned, had map anyway → WITHOUT arm, success
-        _task({"_repo_map_arm": False, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        _task(
+            {
+                "_repo_map_arm": False,
+                "_had_repo_map": True,
+                "_first_attempt_succeeded": True,
+            }
+        ),
         # Legacy task (no assignment key) — falls back to receipt key, WITH arm
         _task({"_had_repo_map": True, "_first_attempt_succeeded": True}),
         # Legacy task (no assignment key) — falls back to receipt key, WITHOUT arm
@@ -9415,23 +9554,32 @@ async def test_compute_trial_arm_accrual_windows_by_created_at(db_session):
     for i in range(4):
         tasks.append(
             _arm_task(
-                project.id, had_repo_map=True, first_attempt_succeeded=True,
-                days_ago=i + 1, idx=i,
+                project.id,
+                had_repo_map=True,
+                first_attempt_succeeded=True,
+                days_ago=i + 1,
+                idx=i,
             )
         )
     # In-window WITHOUT arm: 2 tasks created 1–2 days ago.
     for i in range(2):
         tasks.append(
             _arm_task(
-                project.id, had_repo_map=False, first_attempt_succeeded=False,
-                days_ago=i + 1, idx=50 + i,
+                project.id,
+                had_repo_map=False,
+                first_attempt_succeeded=False,
+                days_ago=i + 1,
+                idx=50 + i,
             )
         )
     # Out-of-window (older than 7 days) — must be excluded.
     tasks.append(
         _arm_task(
-            project.id, had_repo_map=True, first_attempt_succeeded=True,
-            days_ago=10, idx=99,
+            project.id,
+            had_repo_map=True,
+            first_attempt_succeeded=True,
+            days_ago=10,
+            idx=99,
         )
     )
     db_session.add_all(tasks)
@@ -9446,7 +9594,9 @@ async def test_compute_trial_arm_accrual_windows_by_created_at(db_session):
 
 
 @pytest.mark.asyncio
-async def test_compute_trial_arm_accrual_project_scoped_and_ignores_null_arm(db_session):
+async def test_compute_trial_arm_accrual_project_scoped_and_ignores_null_arm(
+    db_session,
+):
     """Accrual is project-scoped and excludes tasks missing the assignment flag."""
     project = make_project()
     other = make_project()
@@ -9456,11 +9606,17 @@ async def test_compute_trial_arm_accrual_project_scoped_and_ignores_null_arm(db_
     await db_session.refresh(other)
 
     tasks = [
-        _arm_task(project.id, had_repo_map=True, first_attempt_succeeded=True,
-                  days_ago=1, idx=0),
+        _arm_task(
+            project.id,
+            had_repo_map=True,
+            first_attempt_succeeded=True,
+            days_ago=1,
+            idx=0,
+        ),
         # Different project — must not count.
-        _arm_task(other.id, had_repo_map=True, first_attempt_succeeded=True,
-                  days_ago=1, idx=1),
+        _arm_task(
+            other.id, had_repo_map=True, first_attempt_succeeded=True, days_ago=1, idx=1
+        ),
         # No assignment key at all — must not count.
         make_task(
             project_id=project.id,
@@ -9487,13 +9643,25 @@ async def test_compute_trial_arm_accrual_window_days_param_respected(db_session)
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add_all([
-        _arm_task(project.id, had_repo_map=True, first_attempt_succeeded=True,
-                  days_ago=1, idx=0),
-        # 10 days old: outside default 7d, inside a 14d window.
-        _arm_task(project.id, had_repo_map=True, first_attempt_succeeded=True,
-                  days_ago=10, idx=1),
-    ])
+    db_session.add_all(
+        [
+            _arm_task(
+                project.id,
+                had_repo_map=True,
+                first_attempt_succeeded=True,
+                days_ago=1,
+                idx=0,
+            ),
+            # 10 days old: outside default 7d, inside a 14d window.
+            _arm_task(
+                project.id,
+                had_repo_map=True,
+                first_attempt_succeeded=True,
+                days_ago=10,
+                idx=1,
+            ),
+        ]
+    )
     await db_session.commit()
 
     default = await compute_trial_arm_accrual(
@@ -9502,7 +9670,9 @@ async def test_compute_trial_arm_accrual_window_days_param_respected(db_session)
     assert default["with_7d"] == 1
 
     widened = await compute_trial_arm_accrual(
-        db_session, project_id=project.id, assignment_key="_repo_map_arm",
+        db_session,
+        project_id=project.id,
+        assignment_key="_repo_map_arm",
         window_days=14,
     )
     assert widened["with_7d"] == 2
@@ -9522,13 +9692,23 @@ async def test_digest_exposes_accrual_projection_for_assignment_trial(db_session
     tasks = []
     for i in range(7):
         tasks.append(
-            _arm_task(project.id, had_repo_map=True, first_attempt_succeeded=True,
-                      days_ago=1, idx=i)
+            _arm_task(
+                project.id,
+                had_repo_map=True,
+                first_attempt_succeeded=True,
+                days_ago=1,
+                idx=i,
+            )
         )
     for i in range(7):
         tasks.append(
-            _arm_task(project.id, had_repo_map=False, first_attempt_succeeded=False,
-                      days_ago=1, idx=50 + i)
+            _arm_task(
+                project.id,
+                had_repo_map=False,
+                first_attempt_succeeded=False,
+                days_ago=1,
+                idx=50 + i,
+            )
         )
     db_session.add_all(tasks)
     await db_session.commit()
@@ -9572,15 +9752,21 @@ async def test_trial_verdict_accumulates_across_windows_to_decision(db_session):
     for i in range(35):
         tasks.append(
             _arm_task(
-                project.id, had_repo_map=True, first_attempt_succeeded=True,
-                days_ago=2 + (i % 7), idx=i,
+                project.id,
+                had_repo_map=True,
+                first_attempt_succeeded=True,
+                days_ago=2 + (i % 7),
+                idx=i,
             )
         )
     for i in range(35):
         tasks.append(
             _arm_task(
-                project.id, had_repo_map=False, first_attempt_succeeded=False,
-                days_ago=2 + (i % 7), idx=200 + i,
+                project.id,
+                had_repo_map=False,
+                first_attempt_succeeded=False,
+                days_ago=2 + (i % 7),
+                idx=200 + i,
             )
         )
     db_session.add_all(tasks)
@@ -9615,14 +9801,20 @@ async def test_trial_verdict_insufficient_accumulation_stays_continue_trial(db_s
 
     tasks = [
         _arm_task(
-            project.id, had_repo_map=True, first_attempt_succeeded=True,
-            days_ago=2, idx=i,
+            project.id,
+            had_repo_map=True,
+            first_attempt_succeeded=True,
+            days_ago=2,
+            idx=i,
         )
         for i in range(5)
     ] + [
         _arm_task(
-            project.id, had_repo_map=False, first_attempt_succeeded=False,
-            days_ago=2, idx=100 + i,
+            project.id,
+            had_repo_map=False,
+            first_attempt_succeeded=False,
+            days_ago=2,
+            idx=100 + i,
         )
         for i in range(2)
     ]
@@ -9674,7 +9866,9 @@ async def test_digest_latest_cycle_from_table_no_jsonb_needed(
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
     assert response.status_code == 200
     lc = response.json().get("latest_cycle")
-    assert lc is not None, "latest_cycle should be non-null when a completed cycle exists"
+    assert lc is not None, (
+        "latest_cycle should be non-null when a completed cycle exists"
+    )
     assert lc["cycle_id"] == cycle.id
     assert lc["outcome"] == _sc.OUTCOME_COMPLETED
     assert lc["directions_created"] == 3
