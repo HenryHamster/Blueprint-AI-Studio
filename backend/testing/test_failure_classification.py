@@ -782,6 +782,19 @@ class TestNormalizeAgentFailureCategory:
         assert normalize_agent_failure_category("test_failed", task) == CODE_ERROR
         assert "rate_limit_kind" not in task.context
 
+    def test_reset_failed_routes_to_provision_failure(self):
+        task = _task("reset_failed: warm re-target failed")
+
+        assert normalize_agent_failure_category("reset_failed", task) == PROVISION_FAILURE
+
+    def test_oauth_rotation_failed_routes_to_external_api(self):
+        task = _task("OAuth rotation failed before running task")
+
+        assert (
+            normalize_agent_failure_category("oauth_rotation_failed", task)
+            == EXTERNAL_API
+        )
+
     def test_generic_fatal_without_provider_signal_stays_code_error(self):
         task = _task("Fatal error: TypeError: cannot read property of undefined")
 

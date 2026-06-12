@@ -689,10 +689,12 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     "lint_failed": CODE_ERROR,
     "pr_creation_failed": EXTERNAL_API,
     "external_api": EXTERNAL_API,
+    "oauth_rotation_failed": EXTERNAL_API,
     "claude_code_failed": CODE_ERROR,
     "parse_failed": CODE_ERROR,
     "fatal": CODE_ERROR,
     "rate_limited": RATE_LIMIT,
+    "reset_failed": PROVISION_FAILURE,
     "scope_overflow": SCOPE_OVERFLOW,
     "timeout": AGENT_TIMEOUT,
     # 2026-05-04: emitted by the new Claude-driven flow.
