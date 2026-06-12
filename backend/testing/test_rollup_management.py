@@ -493,14 +493,36 @@ async def test_post_merge_behind_ancestor_skips_update_branch(cleanup_db, mocker
 
 
 @pytest.mark.asyncio
-async def test_unfetchable_migration_diff_defers_failsafe(cleanup_db, mocker):
-    """Fail-safe: a rollup touches alembic/versions but the diff cannot be
-    fetched (empty response) → the guard defers; the merge is NOT performed and
-    no fix is spawned (the parent retries next sweep, still EVALUATING)."""
+async def test_unfetchable_migration_source_defers_failsafe(cleanup_db, mocker):
+    """Fail-safe: a rollup touches alembic/versions but neither the whole-PR diff
+    (empty — GitHub 406s an over-cap diff) NOR the per-file head read can supply
+    the migration source → the guard defers; the merge is NOT performed and no
+    fix is spawned (the parent retries next sweep, still EVALUATING).
+
+    An empty diff alone is no longer a defer: it now falls back to a per-file
+    head read (so an over-cap release rollup can still validate + promote). The
+    defer here is genuine — BOTH source paths are unavailable."""
     mock_merge, mock_spawn = _mock_automerge_deps(
         mocker,
         pr_files=_files("backend/alembic/versions/0124_a.py"),
-        diff="",  # unfetchable diff → ("defer", ...)
+        diff="",  # empty whole-PR diff → fall back to per-file head read
+    )
+    # One head-bearing PR dict satisfies every get_pull_request call (existing-PR
+    # validation, diff-size, and the fallback's head-SHA fetch), independent of
+    # call count; the per-file source read then returns None → fail-safe defer.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "merged": False,
+            "state": "open",
+            "additions": 10,
+            "deletions": 5,
+            "head": {"sha": "headsha1234567"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref", new_callable=AsyncMock, return_value=None
     )
 
     from app.rollup_management import _check_and_trigger_rollup

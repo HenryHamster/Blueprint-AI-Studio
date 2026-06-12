@@ -82,6 +82,65 @@ async def pr_touches_migrations(
     return any(_touches_alembic_versions(f.get("filename", "")) for f in files)
 
 
+async def _read_added_migration_sources_at_head(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    files: list[dict],
+) -> tuple[dict[str, str] | None, str | None]:
+    """Read each touched migration's source at the PR head (diff-cap-immune).
+
+    Fallback for when the whole-PR unified diff is unavailable (empty body —
+    GitHub 406s the ``.diff`` media type once a PR exceeds its diff size cap,
+    which a large release rollup routinely does). Reads only ADDED/modified
+    ``alembic/versions`` files (a pure deletion contributes no post-image, just
+    like the diff-based reconstruction) one file at a time via the contents API,
+    which is not subject to the unified-diff size cap.
+
+    Returns ``(sources, None)`` on success or ``(None, defer_reason)`` when the
+    PR head or any migration source cannot be read — fail-safe, mirroring the
+    caller's ``defer`` semantics (an unreadable source is never "no migrations").
+    """
+    migration_files = [
+        f
+        for f in files
+        if _touches_alembic_versions(f.get("filename", ""))
+        and f.get("status") != "removed"
+    ]
+    if not migration_files:
+        return ({}, None)
+    try:
+        pr_detail = await github.get_pull_request(gh_token, owner, repo, pr_number)
+    except Exception as e:
+        return (
+            None,
+            f"could not fetch PR #{pr_number} detail to read Alembic migration "
+            f"sources at its head: {type(e).__name__}: {e}",
+        )
+    head_sha = (pr_detail.get("head") or {}).get("sha")
+    if not head_sha:
+        return (
+            None,
+            f"PR #{pr_number} detail is missing a head SHA; cannot read Alembic "
+            f"migration sources to validate the chain",
+        )
+    sources: dict[str, str] = {}
+    for f in migration_files:
+        path = f["filename"]
+        text = await github.get_file_text_at_ref(
+            path, token=gh_token, owner=owner, repo=repo, ref=head_sha
+        )
+        if not text:
+            return (
+                None,
+                f"could not read migration source '{path}' at PR #{pr_number} head "
+                f"{head_sha[:7]}; deferring Alembic chain validation",
+            )
+        sources[path] = text
+    return (sources, None)
+
+
 async def _validate_rollup_migration_chain(
     gh_token: str,
     owner: str,
@@ -139,12 +198,22 @@ async def _validate_rollup_migration_chain(
             f"could not fetch rollup diff to validate Alembic migrations: "
             f"{type(e).__name__}: {e}",
         )
-    if not diff:
-        return (
-            "defer",
-            "could not fetch rollup diff to validate Alembic migrations (empty response)",
+    if diff:
+        added_sources = _extract_rollup_migration_sources(diff)
+    else:
+        # The whole-PR diff came back empty. GitHub's ``.diff`` media type 406s
+        # (-> empty body here) once a PR exceeds its diff size cap, and a release
+        # rollup routinely does (v10: 107 files / 20k+ lines). Treating that as a
+        # fail-safe ``defer`` wedged EVERY migration-carrying release: it deferred
+        # each promotion cycle and never landed, and the rollup only grows, so it
+        # never self-heals. Fall back to reading each touched migration's source
+        # directly at the PR head — small per-file contents immune to the diff
+        # size cap, the same per-file approach the post-merge guard uses.
+        added_sources, defer_reason = await _read_added_migration_sources_at_head(
+            gh_token, owner, repo, pr_number, files
         )
-    added_sources = _extract_rollup_migration_sources(diff)
+        if defer_reason is not None:
+            return ("defer", defer_reason)
 
     if not target_branch:
         reason = validate_added_migrations(added_sources)

@@ -883,42 +883,60 @@ async def get_pr_files(
 
     When include_patch=True, the returned dicts also contain a 'patch' key with
     the unified diff text for each file (may be absent for binary files).
+
+    Pages through the files endpoint (100 per page, GitHub's max) until a short
+    page so a PR with more than 100 changed files is not silently truncated to
+    its first page — migration-safety detection must see EVERY changed file, not
+    just the first 100 (a large release rollup routinely exceeds that, and a
+    missed migration file on a later page would read as "no migrations" and skip
+    the chain guard). Bounded at GitHub's 30-page / 3000-file hard cap.
     """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    response = await _github_request(
-        "GET",
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
-        headers,
-        project_id=project_id,
-    )
-    if response.status_code == 401:
-        raise HTTPException(
-            status_code=401, detail="GitHub authentication failed (401 Unauthorized)"
-        )
-    if response.status_code != 200:
-        logger.error(
-            f"Failed to get PR files #{pr_number}: {response.status_code} {response.text[:300]}"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"GitHub API error fetching PR #{pr_number} files (HTTP {response.status_code})",
-        )
     result = []
-    for f in response.json():
-        entry: dict = {
-            "filename": f["filename"],
-            "status": f["status"],
-            "additions": f.get("additions", 0),
-            "deletions": f.get("deletions", 0),
-            "changes": f.get("changes", 0),
-        }
-        if include_patch and "patch" in f:
-            entry["patch"] = f["patch"]
-        result.append(entry)
+    for page in range(1, 31):
+        response = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
+            f"?per_page=100&page={page}",
+            headers,
+            project_id=project_id,
+        )
+        if response.status_code == 401:
+            raise HTTPException(
+                status_code=401,
+                detail="GitHub authentication failed (401 Unauthorized)",
+            )
+        if response.status_code != 200:
+            logger.error(
+                f"Failed to get PR files #{pr_number} (page {page}): "
+                f"{response.status_code} {response.text[:300]}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"GitHub API error fetching PR #{pr_number} files (HTTP {response.status_code})",
+            )
+        batch = response.json()
+        for f in batch:
+            entry: dict = {
+                "filename": f["filename"],
+                "status": f["status"],
+                "additions": f.get("additions", 0),
+                "deletions": f.get("deletions", 0),
+                "changes": f.get("changes", 0),
+            }
+            if include_patch and "patch" in f:
+                entry["patch"] = f["patch"]
+            result.append(entry)
+        # A short page (fewer than the per_page max) is the last page. An empty
+        # first page is a genuinely empty PR and returns [] (status non-200 on
+        # the first page already raised above, preserving the transient-vs-empty
+        # distinction callers rely on).
+        if len(batch) < 100:
+            break
     return result
 
 
