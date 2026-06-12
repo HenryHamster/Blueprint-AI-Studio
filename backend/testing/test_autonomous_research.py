@@ -8690,8 +8690,8 @@ async def test_batch_cap_excess_findings_are_deferred_not_discarded(db_session, 
     task = await _make_research_task(project, direction, db_session)
 
     _patch_research_externals(mocker)
-    # Force batch cap to 3 by saturating queue (cap_by_queue = max(3, 15-12) = 3)
-    mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
+    # Force the per-cycle finding cap to 3 (real capacity is gated at dispatch now).
+    mocker.patch("app.research_completion._MAX_FINDINGS_PER_CYCLE", 3)
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
         return_value=(False, None),
@@ -8737,8 +8737,8 @@ async def test_priority_sort_before_batch_cap_keeps_high_priority(db_session, mo
     task = await _make_research_task(project, direction, db_session)
 
     _patch_research_externals(mocker)
-    # Force batch cap to 3
-    mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
+    # Force the per-cycle finding cap to 3.
+    mocker.patch("app.research_completion._MAX_FINDINGS_PER_CYCLE", 3)
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
         return_value=(False, None),
@@ -8801,8 +8801,8 @@ async def test_batch_cap_preserves_depends_on_indices_across_priority_selection(
     task = await _make_research_task(project, direction, db_session)
 
     _patch_research_externals(mocker)
-    # Force batch cap to 3
-    mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
+    # Force the per-cycle finding cap to 3.
+    mocker.patch("app.research_completion._MAX_FINDINGS_PER_CYCLE", 3)
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
         return_value=(False, None),
@@ -8859,8 +8859,8 @@ async def test_batch_cap_and_health_gate_deferrals_combine(db_session, mocker):
     task = await _make_research_task(project, direction, db_session)
 
     _patch_research_externals(mocker)
-    # Batch cap = 4 (queue gauge = 11 → max(3, 15-11) = 4)
-    mocker.patch.object(_shared_state, "tasks_queued_gauge", 11)
+    # Force the per-cycle finding cap to 4.
+    mocker.patch("app.research_completion._MAX_FINDINGS_PER_CYCLE", 4)
     # And pipeline degraded so health gate further limits to _DEGRADED_SPAWN_CAP
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
