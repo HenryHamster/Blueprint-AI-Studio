@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import timedelta
 
@@ -9,6 +10,7 @@ import pytest
 
 from app.lane_baseline_snapshot import (
     DESIGN_DOC_KEY,
+    _MAX_BASELINE_ENTRY_BYTES,
     _MAX_BASELINES_STORED,
     _compute_checkpoint_recovery_waste,
     _compute_relay_medians,
@@ -174,10 +176,13 @@ class TestPersistVersionLaneBaseline:
         assert result["version_number"] == 9
         assert result["terminal_status"] == "promoted"
         assert "lane_iteration_distribution" in result
-        assert "relay_counts_by_lane" in result
         assert "lane_waste" in result
         assert "relay_medians" in result
         assert result["pr_count"] == 1
+        # Bloat sub-blobs must not be stored
+        assert "relay_counts_by_lane" not in result
+        assert "per_pr_phase_breakdown" not in result
+        assert "chains" not in result.get("lane_waste", {})
 
         # Verify it landed in design_doc
         await db_session.refresh(project)
@@ -297,6 +302,129 @@ class TestPersistVersionLaneBaseline:
             terminal_status="promoted",
         )
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_persist_bounds_entry_bytes_preserving_readback(self, db_session):
+        """High-volume baseline stays under byte budget with all required fields intact."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        opened = now - timedelta(days=7)
+        closed = now - timedelta(days=1)
+
+        # Create many review-loop tasks across many PRs to produce large
+        # per_pr_phase_breakdown and lane_waste chains before slimming.
+        for pr_num in range(1, 51):
+            for _ in range(3):
+                task = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": "review", "prompt": "x" * 50}],
+                    context={"review_loop": {"pr_number": str(pr_num)}},
+                    created_at=opened + timedelta(hours=pr_num),
+                    started_at=opened + timedelta(hours=pr_num),
+                    status_log=[
+                        {
+                            "s": "COMPLETED",
+                            "t": (
+                                opened + timedelta(hours=pr_num, minutes=30)
+                            ).isoformat(),
+                        }
+                    ],
+                )
+                db_session.add(task)
+        await db_session.commit()
+
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=12,
+            opened_at=opened,
+            closed_at=closed,
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+
+        # (a) per-entry byte budget
+        entry_bytes = len(json.dumps(result, default=str).encode())
+        assert entry_bytes <= _MAX_BASELINE_ENTRY_BYTES, (
+            f"Stored entry is {entry_bytes} bytes, exceeds {_MAX_BASELINE_ENTRY_BYTES}"
+        )
+
+        # (b) full section under 500 KB
+        await db_session.refresh(project)
+        section = project.design_doc.get(DESIGN_DOC_KEY, {})
+        section_bytes = len(json.dumps(section, default=str).encode())
+        assert section_bytes <= 500_000, (
+            f"Full section is {section_bytes} bytes, exceeds 500 KB"
+        )
+
+        # (c) all required readback fields present
+        assert "relay_medians" in result
+        assert "lane_iteration_distribution" in result
+        assert "checkpoint_recovery_waste" in result
+        assert "lane_waste" in result
+        lw = result["lane_waste"]
+        assert "waste_taxonomy" in lw
+        assert "waste_task_count" in lw
+        assert "version_number" in result
+        assert "captured_at" in result
+        assert "terminal_status" in result
+        assert "pr_count" in result
+        assert "task_count" in result
+
+        # (d) bloat sub-blobs dropped
+        assert "per_pr_phase_breakdown" not in result
+        assert "relay_counts_by_lane" not in result
+        assert "chains" not in lw
+
+    @pytest.mark.asyncio
+    async def test_persist_self_heals_existing_bloated_entries(self, db_session):
+        """Writing a new version re-slims existing oversized entries."""
+        project = make_project()
+        # Pre-populate with a bloated entry (simulates state before byte budget)
+        bloated_entry = {
+            "version_number": 8,
+            "captured_at": "2026-01-01T00:00:00",
+            "terminal_status": "promoted",
+            "relay_medians": {"pr_count": 1},
+            "per_pr_phase_breakdown": [{"pr_number": str(i)} for i in range(100)],
+            "relay_counts_by_lane": {"review": 5},
+            "lane_waste": {
+                "waste_taxonomy": {},
+                "waste_task_count": 0,
+                "chains": [{"key": str(i), "tasks": []} for i in range(100)],
+            },
+        }
+        project.design_doc = {DESIGN_DOC_KEY: {"8": bloated_entry}}
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=9,
+            opened_at=now - timedelta(days=7),
+            closed_at=now - timedelta(days=1),
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        await db_session.refresh(project)
+        healed = project.design_doc[DESIGN_DOC_KEY]["8"]
+        assert "per_pr_phase_breakdown" not in healed
+        assert "relay_counts_by_lane" not in healed
+        assert "chains" not in healed.get("lane_waste", {})
+        # Slimmed entry must be within byte budget
+        assert (
+            len(json.dumps(healed, default=str).encode()) <= _MAX_BASELINE_ENTRY_BYTES
+        )
 
 
 # ---------------------------------------------------------------------------

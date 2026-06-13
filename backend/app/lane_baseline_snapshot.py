@@ -11,6 +11,7 @@ plus per-PR relay medians for the v10 lane-pilot comparison.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -39,6 +40,54 @@ BASELINE_DEF_VERSION = "v1"
 _SNAPSHOT_PR_BREAKDOWN_LIMIT = 100
 _MAX_TASKS_PER_SNAPSHOT = 5000
 _MAX_BASELINES_STORED = 20
+# Per-entry byte budget: 20 entries x 10 KB = 200 KB max, well under the 500 KB design-doc ceiling.
+_MAX_BASELINE_ENTRY_BYTES = 10_000
+
+# Fields dropped before persisting: large unread sub-blobs that inflate the entry.
+_SLIM_DROP_TOP_LEVEL = frozenset({"per_pr_phase_breakdown", "relay_counts_by_lane"})
+# Fallback fields to shed one-by-one if the entry still exceeds the byte budget after
+# the primary drops.  Ordered least-to-most critical for downstream readers.
+_SLIM_OVERFLOW_DROPPABLE = (
+    "lane_waste",
+    "lane_iteration_distribution",
+    "checkpoint_recovery_waste",
+)
+
+
+def _slim_baseline(baseline: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of *baseline* with large unread sub-blobs removed.
+
+    Primary drops (no downstream readers):
+    - ``per_pr_phase_breakdown`` — per-PR phase rows (the live UI recomputes from DB)
+    - ``relay_counts_by_lane`` — relay-count breakdown by lane
+    - ``lane_waste["chains"]`` — per-chain/per-task drilldown rows
+
+    After the primary drops an entry should comfortably fit inside
+    ``_MAX_BASELINE_ENTRY_BYTES``.  If it still exceeds the budget (e.g. because a
+    future heavy field was added), fields are shed in ``_SLIM_OVERFLOW_DROPPABLE``
+    order until the entry fits, and a warning is emitted so operators can diagnose.
+    """
+    entry = {k: v for k, v in baseline.items() if k not in _SLIM_DROP_TOP_LEVEL}
+    if "lane_waste" in entry and isinstance(entry["lane_waste"], dict):
+        lw = dict(entry["lane_waste"])
+        lw.pop("chains", None)
+        entry["lane_waste"] = lw
+
+    for field in _SLIM_OVERFLOW_DROPPABLE:
+        raw = json.dumps(entry, default=str)
+        if len(raw.encode()) <= _MAX_BASELINE_ENTRY_BYTES:
+            break
+        if field in entry:
+            logger.warning(
+                "[LANE_BASELINE] entry for v%s still over %d B after slim; dropping %s",
+                entry.get("version_number"),
+                _MAX_BASELINE_ENTRY_BYTES,
+                field,
+            )
+            entry.pop(field)
+
+    return entry
+
 
 _TASK_SNAPSHOT_COLUMNS = (
     Task.id,
@@ -237,13 +286,19 @@ async def persist_version_lane_baseline(
             result["skipped"] = True
             result["stored"] = baselines[version_key]
             return
-        baselines[version_key] = baseline
+        # Re-slim all existing entries on every write to self-heal bloated state that
+        # was stored before the byte budget was enforced.
+        for k, v in list(baselines.items()):
+            if isinstance(v, dict):
+                baselines[k] = _slim_baseline(v)
+        slimmed = _slim_baseline(baseline)
+        baselines[version_key] = slimmed
         if len(baselines) > _MAX_BASELINES_STORED:
             sorted_keys = sorted(baselines, key=lambda k: int(k))
             for old_key in sorted_keys[: len(baselines) - _MAX_BASELINES_STORED]:
                 del baselines[old_key]
         doc[DESIGN_DOC_KEY] = baselines
-        result["stored"] = baseline
+        result["stored"] = slimmed
 
     applied = await with_design_doc_locked(session, project_id, _store_baseline)
     if not applied:
@@ -359,7 +414,7 @@ async def backfill_missing_lane_baselines(
                 await _snap_session.commit()
             if result is not None:
                 backfilled.append(version.version_number)
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.warning(
                 "[LANE_BASELINE] backfill: persist failed for project=%s v%d (non-fatal)",
                 project_id,
@@ -371,7 +426,7 @@ async def backfill_missing_lane_baselines(
 
 
 def read_version_lane_baseline(
-    project: "Project",
+    project: Project,
     version_number: int,
 ) -> Dict[str, Any] | None:
     """Return the persisted lane baseline for the given version, or None.
