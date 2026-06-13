@@ -4923,6 +4923,393 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
 
 
 @pytest.mark.asyncio
+async def test_managed_check_wait_transient_cancellation_left_pending(
+    db_session, mocker
+):
+    """Core acceptance test: when CI is red but ALL check conclusions are
+    transient (cancelled/timed_out) the reconciler must NOT tear down the
+    promotion PR or record a terminal failure — it leaves the version pending
+    so the candidate can recover when CI re-runs.
+
+    This exercises the ``_check_result_has_genuine_failure`` guard introduced
+    to fix the v10 promoter misclassification.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "c0ffee00" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    # All checks are transient — no genuine failure present.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {
+                        "name": "ci/backend-shard-4",
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                    {
+                        "name": "ci/backend-shard-5",
+                        "status": "completed",
+                        "conclusion": "timed_out",
+                    },
+                ],
+            }
+        ),
+    )
+    # Cap at 5 (default); first sweep should leave pending, not tear down.
+    mocker.patch(
+        "app.release_reconciliation._max_transient_ci_red_sweeps",
+        return_value=5,
+    )
+    # Cleanup / terminal path must NOT be called.
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False, (
+        "Transient-only CI red must NOT drive the version to a terminal state"
+    )
+    cleanup.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    # Counter was incremented so subsequent sweeps can eventually escalate.
+    pending = version.last_qualification["promotion_pending"]
+    assert pending.get("transient_red_count") == 1
+    assert pending.get("managed_check_wait") is True
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_timed_out_only_leaves_pending(db_session, mocker):
+    """A check result whose only non-green conclusion is timed_out (no failure /
+    action_required) must leave the version pending — same guard as the cancelled
+    path."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "dead0000" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {
+                        "name": "ci/infra",
+                        "status": "completed",
+                        "conclusion": "timed_out",
+                    },
+                ],
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._max_transient_ci_red_sweeps",
+        return_value=5,
+    )
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "efef" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    cleanup.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_transient_red_escalates_after_cap(db_session, mocker):
+    """Once the transient-red sweep counter reaches the configured cap the
+    reconciler MUST escalate to the terminal ``required_check_failed`` path so a
+    genuinely stuck check does not pin the version open forever."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "f00df00d" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {
+                        "name": "ci/backend-shard-4",
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                ],
+            }
+        ),
+    )
+    # Set cap to 3; seed the counter at 2 so this sweep is the cap sweep.
+    mocker.patch(
+        "app.release_reconciliation._max_transient_ci_red_sweeps",
+        return_value=3,
+    )
+    mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "1234" * 10
+    qual = _managed_check_wait_qual(candidate_sha)
+    # Pre-seed counter so we're at cap - 1 sweeps already done.
+    qual["promotion_pending"]["transient_red_count"] = 2
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True, (
+        "After reaching the transient-red sweep cap the version must be driven "
+        "to a terminal state"
+    )
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "required_check_failed"
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_auto_merge_transient_only_ci_leaves_pending(
+    db_session, mocker
+):
+    """A pending native-auto-merge PR whose CI is red due only to transient
+    conclusions (cancelled/timed_out) must NOT be driven to promotion_failed —
+    the version stays pending so it can recover when CI re-runs."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": "aabbccdd" * 5},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {
+                        "name": "ci/backend-shard-4",
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                ],
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._max_transient_ci_red_sweeps",
+        return_value=5,
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "confidence": 0.95,
+        "promotion_pending": {
+            "pr_number": 44,
+            "pr_url": "https://github.com/acme/widget/pull/44",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_auto_merge_landed(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False, (
+        "Transient-only CI red must NOT drive the auto-merge version to terminal"
+    )
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending.get("transient_red_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_auto_merge_transient_red_escalates_after_cap(
+    db_session, mocker
+):
+    """Once the transient-red sweep counter reaches the configured cap the
+    pending_auto_merge reconciler MUST escalate to the terminal ``pr_ci_red``
+    path so a genuinely stuck cancelled/timed_out CI does not pin the version
+    open forever.
+
+    This is distinct from test_managed_check_wait_transient_red_escalates_after_cap
+    (which uses a different code path and error code ``required_check_failed``)."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "c0ffee00" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {
+                        "name": "ci/backend-shard-1",
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                ],
+            }
+        ),
+    )
+    # Set cap to 3; seed the counter at 2 so this sweep is the cap sweep.
+    mocker.patch(
+        "app.release_reconciliation._max_transient_ci_red_sweeps",
+        return_value=3,
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "confidence": 0.95,
+        "promotion_pending": {
+            "pr_number": 45,
+            "pr_url": "https://github.com/acme/widget/pull/45",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+            "transient_red_count": 2,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_auto_merge_landed(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True, (
+        "After reaching the transient-red sweep cap the version must be driven "
+        "to a terminal state"
+    )
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "pr_ci_red"
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
 async def test_managed_check_wait_defers_on_migration_metadata_unfetchable(
     db_session, mocker
 ):
@@ -5848,7 +6235,10 @@ async def test_managed_check_wait_405_retriable_vs_terminal(db_session, mocker):
     assert version.phase == "stabilize"
     assert version.last_qualification["status"] == "promotion_failed"
     assert version.last_qualification["error"] == "merge_refused_405_terminal"
-    assert "auto merge was disabled" in version.last_qualification.get("detail", "").lower()
+    assert (
+        "auto merge was disabled"
+        in version.last_qualification.get("detail", "").lower()
+    )
 
     # --- Retriable 405: "Required status check ... has not passed" ---
     mocker.patch(
@@ -5874,7 +6264,9 @@ async def test_managed_check_wait_405_retriable_vs_terminal(db_session, mocker):
         version2.id, session_factory=_shared_session_factory(db_session)
     )
 
-    assert reconciled2 is False, "retriable 405 should return reconciled=False (leave pending)"
+    assert reconciled2 is False, (
+        "retriable 405 should return reconciled=False (leave pending)"
+    )
     await db_session.refresh(version2)
     assert version2.status == "open"
     assert version2.last_qualification["status"] == "pending"
