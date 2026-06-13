@@ -435,7 +435,9 @@ async def test_checkpoint_lane_red_tests_still_checkpoints(db: AsyncSession):
         branch_name="lane/red1",
         base_branch="main",
     )
+    task_id = uuid.uuid4()
     lane.status = ImprovementLaneStatus.ACTIVE.value
+    lane.current_task_id = task_id
     await db.commit()
 
     cp = LaneCheckpointPayload(
@@ -445,7 +447,7 @@ async def test_checkpoint_lane_red_tests_still_checkpoints(db: AsyncSession):
         wip_failing=["testing/test_auth.py::test_login"],
     )
 
-    updated = await checkpoint_lane(db, lane.id, "fix", uuid.uuid4(), cp)
+    updated = await checkpoint_lane(db, lane.id, "fix", task_id, cp)
     await db.commit()
 
     assert updated.status == ImprovementLaneStatus.PARKED.value
@@ -469,7 +471,9 @@ async def test_checkpoint_lane_rolling_window(db: AsyncSession):
         branch_name="lane/roll1",
         base_branch="main",
     )
+    task_id = uuid.uuid4()
     lane.status = ImprovementLaneStatus.ACTIVE.value
+    lane.current_task_id = task_id
     await db.commit()
 
     # Seed the checkpoints list with _LANE_CHECKPOINT_LIMIT existing entries.
@@ -483,7 +487,7 @@ async def test_checkpoint_lane_rolling_window(db: AsyncSession):
         sha="newsha99",
         summary="overflow checkpoint",
     )
-    updated = await checkpoint_lane(db, lane.id, "create", uuid.uuid4(), cp)
+    updated = await checkpoint_lane(db, lane.id, "create", task_id, cp)
     await db.commit()
 
     assert len(updated.checkpoints) == _LANE_CHECKPOINT_LIMIT
@@ -548,6 +552,42 @@ async def test_checkpoint_lane_rejects_non_owner_task(db: AsyncSession):
     assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
     assert refreshed.current_task_id == owner_id
     assert refreshed.last_checkpoint_sha == "original_sha"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_lane_rejects_none_owner_active_lane(db: AsyncSession):
+    """An ACTIVE lane with current_task_id=None rejects any foreign checkpoint.
+
+    Before the fix, the guard read ``if current_task_id is not None and ...``
+    which short-circuits to False when current_task_id is None — silently
+    admitting any caller.  After the fix the guard is unconditional so None
+    never matches a real task_id and raises LaneOwnerMismatchError.
+    """
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/none-owner1",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    # Deliberately leave current_task_id as None (no owner stamped yet).
+    await db.commit()
+
+    foreign_task_id = uuid.uuid4()
+    cp = LaneCheckpointPayload(sha="foreign_sha", summary="should be rejected")
+    with pytest.raises(LaneOwnerMismatchError):
+        await checkpoint_lane(db, lane.id, "create", foreign_task_id, cp)
+
+    # Lane must be untouched after the rejection.
+    await db.rollback()
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
+    assert refreshed.current_task_id is None
+    assert refreshed.last_checkpoint_sha is None
 
 
 # ---------------------------------------------------------------------------
@@ -2111,7 +2151,9 @@ async def test_expired_reservation_clears_leased_workspace_state(
 # ---------------------------------------------------------------------------
 
 
-async def _make_active_lane(session, project_id, *, current_task_id=None, phase_requeues=0):
+async def _make_active_lane(
+    session, project_id, *, current_task_id=None, phase_requeues=0
+):
     """Create an ACTIVE lane with an optional task binding and phase_requeues count."""
     lane = await create_lane(
         session,
@@ -2175,7 +2217,9 @@ async def test_sweep_stranded_lanes_class1_active_no_task_id_is_stranded(
     from datetime import datetime
 
     project_id = await _make_project(db)
-    lane = await _make_active_lane(db, project_id, current_task_id=None, phase_requeues=0)
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=None, phase_requeues=0
+    )
 
     with patch(
         "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
@@ -2202,7 +2246,9 @@ async def test_sweep_stranded_lanes_class1_terminal_task_statuses_are_stranded(
 
     for status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
         task = await _make_task(db, project_id, status)
-        lane = await _make_active_lane(db, project_id, current_task_id=task.id, phase_requeues=0)
+        lane = await _make_active_lane(
+            db, project_id, current_task_id=task.id, phase_requeues=0
+        )
 
         with patch(
             "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
@@ -2228,7 +2274,9 @@ async def test_sweep_stranded_lanes_class1_live_task_not_stranded(
 
     project_id = await _make_project(db)
     task = await _make_task(db, project_id, TaskStatus.IN_PROGRESS)
-    lane = await _make_active_lane(db, project_id, current_task_id=task.id, phase_requeues=0)
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=task.id, phase_requeues=0
+    )
 
     with patch(
         "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
@@ -2253,7 +2301,9 @@ async def test_sweep_stranded_lanes_class1_under_budget_parks_with_clear_task(
     project_id = await _make_project(db)
     task = await _make_task(db, project_id, TaskStatus.COMPLETED)
     # phase_requeues=0 → after mark_checkpoint_missing increments → 1 ≤ 3 → PARKED
-    lane = await _make_active_lane(db, project_id, current_task_id=task.id, phase_requeues=0)
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=task.id, phase_requeues=0
+    )
 
     with patch(
         "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
@@ -2316,7 +2366,9 @@ async def test_sweep_stranded_lanes_class1_cas_miss_is_noop(db: AsyncSession):
     from datetime import datetime
 
     project_id = await _make_project(db)
-    lane = await _make_active_lane(db, project_id, current_task_id=None, phase_requeues=0)
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=None, phase_requeues=0
+    )
 
     async def _raise_cas(session, lane_id, expected, next_status, **kw):
         raise LaneCASError("simulated concurrent transition")

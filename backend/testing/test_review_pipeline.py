@@ -14204,6 +14204,10 @@ async def test_lane_checkpoint_missing_over_budget_kills_lane_and_falls_back(
     db_session.add(source_task)
     await db_session.commit()
     await db_session.refresh(source_task)
+    lane.current_task_id = source_task.id
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
 
     review, created = await _spawn_pipeline_task(
         source_task,
@@ -15823,6 +15827,9 @@ class TestLaneCheckpointShaVerification:
         db_session.add(source_task)
         await db_session.commit()
         await db_session.refresh(source_task)
+        lane.current_task_id = source_task.id
+        db_session.add(lane)
+        await db_session.commit()
         await db_session.refresh(lane)
         return lane, source_task
 
@@ -16137,6 +16144,9 @@ async def test_lane_pilot_manifest_patch_and_fix_resume_context(db_session, mock
     db_session.add(source_task)
     await db_session.commit()
     await db_session.refresh(source_task)
+    lane.current_task_id = source_task.id
+    db_session.add(lane)
+    await db_session.commit()
     await db_session.refresh(lane)
 
     # (1) Manifest accumulation: the checkpoint records a derived manifest patch.

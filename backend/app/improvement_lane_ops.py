@@ -216,7 +216,7 @@ async def checkpoint_lane(
         raise LaneCheckpointError(
             f"Lane {lane_id} must be ACTIVE to checkpoint, got {lane.status}"
         )
-    if lane.current_task_id is not None and lane.current_task_id != task_id:
+    if lane.current_task_id != task_id:
         raise LaneOwnerMismatchError(
             f"Lane {lane_id} is owned by task {lane.current_task_id}, "
             f"but checkpoint was attempted by task {task_id}"
