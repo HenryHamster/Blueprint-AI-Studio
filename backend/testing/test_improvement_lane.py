@@ -2104,3 +2104,358 @@ async def test_expired_reservation_clears_leased_workspace_state(
     assert refreshed.workspace_vm_instance_id is None, (
         "workspace_vm_instance_id must be cleared alongside workspace_state"
     )
+
+
+# ---------------------------------------------------------------------------
+# sweep_stranded_lanes — Class 1 and Class 2 coverage
+# ---------------------------------------------------------------------------
+
+
+async def _make_active_lane(session, project_id, *, current_task_id=None, phase_requeues=0):
+    """Create an ACTIVE lane with an optional task binding and phase_requeues count."""
+    lane = await create_lane(
+        session,
+        project_id=project_id,
+        direction_id=None,
+        title="Active test lane",
+        goal="G",
+        branch_name=f"lane/active-{uuid.uuid4().hex[:8]}",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    lane.current_task_id = current_task_id
+    lane.phase_requeues = phase_requeues
+    await session.commit()
+    return lane
+
+
+async def _make_task(session, project_id, status):
+    """Create a Task row with the given TaskStatus."""
+    from app.models import Task
+
+    task = Task(
+        project_id=project_id,
+        title="test task",
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        status=status,
+    )
+    session.add(task)
+    await session.commit()
+    return task
+
+
+async def _make_proposed_lane(session, project_id, *, created_ago_seconds: int = 3600):
+    """Create a PROPOSED lane whose created_at is `created_ago_seconds` in the past."""
+    from datetime import datetime, timedelta
+
+    lane = await create_lane(
+        session,
+        project_id=project_id,
+        direction_id=None,
+        title="Proposed test lane",
+        goal="G",
+        branch_name=f"lane/proposed-{uuid.uuid4().hex[:8]}",
+        base_branch="main",
+    )
+    # create_lane already leaves status=PROPOSED; backdate created_at
+    lane.created_at = datetime.utcnow() - timedelta(seconds=created_ago_seconds)
+    await session.commit()
+    return lane
+
+
+# --- Class 1: ACTIVE lane with no current_task_id ---
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_active_no_task_id_is_stranded(
+    db: AsyncSession,
+):
+    """ACTIVE lane with current_task_id=None must be treated as stranded and parked."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_active_lane(db, project_id, current_task_id=None, phase_requeues=0)
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PARKED.value
+    assert refreshed.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_terminal_task_statuses_are_stranded(
+    db: AsyncSession,
+):
+    """ACTIVE lane whose current_task is COMPLETED/FAILED/CANCELLED is stranded."""
+    from app.models import TaskStatus
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+
+    for status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        task = await _make_task(db, project_id, status)
+        lane = await _make_active_lane(db, project_id, current_task_id=task.id, phase_requeues=0)
+
+        with patch(
+            "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+        ):
+            count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+        await db.commit()
+
+        assert count == 1, f"expected 1 transition for status={status}"
+        refreshed = await db.get(ImprovementLane, lane.id)
+        assert refreshed.status == ImprovementLaneStatus.PARKED.value, (
+            f"expected PARKED for status={status}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_live_task_not_stranded(
+    db: AsyncSession,
+):
+    """ACTIVE lane whose current_task is IN_PROGRESS is NOT stranded — leave it alone."""
+    from app.models import TaskStatus
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    task = await _make_task(db, project_id, TaskStatus.IN_PROGRESS)
+    lane = await _make_active_lane(db, project_id, current_task_id=task.id, phase_requeues=0)
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_under_budget_parks_with_clear_task(
+    db: AsyncSession,
+):
+    """Stranded ACTIVE lane under the requeue budget must transition ACTIVE→PARKED
+    with the task binding cleared (clear_task=True path)."""
+    from app.models import TaskStatus
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    task = await _make_task(db, project_id, TaskStatus.COMPLETED)
+    # phase_requeues=0 → after mark_checkpoint_missing increments → 1 ≤ 3 → PARKED
+    lane = await _make_active_lane(db, project_id, current_task_id=task.id, phase_requeues=0)
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PARKED.value
+    assert refreshed.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_over_budget_kills_and_releases_reservation(
+    db: AsyncSession,
+):
+    """Stranded ACTIVE lane that has exhausted the requeue budget must transition
+    ACTIVE→KILLED and release any pool reservation."""
+    from app.models import TaskStatus
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    task = await _make_task(db, project_id, TaskStatus.FAILED)
+    # phase_requeues=_LANE_MAX_PHASE_REQUEUES (3) → after increment → 4 > 3 → KILLED
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=task.id, phase_requeues=_LANE_MAX_PHASE_REQUEUES
+    )
+
+    member = PoolVm(
+        vm_instance_id=f"pool-vm-class1-kill-{uuid.uuid4().hex[:8]}",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+    )
+    db.add(member)
+    await db.commit()
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.KILLED.value
+    await db.refresh(member)
+    assert member.reserved_lane_id is None
+    assert member.reservation_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_cas_miss_is_noop(db: AsyncSession):
+    """A concurrent CAS miss on a stranded ACTIVE lane must not raise and must
+    not increment the returned count."""
+    from app.improvement_lane_ops import LaneCASError
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_active_lane(db, project_id, current_task_id=None, phase_requeues=0)
+
+    async def _raise_cas(session, lane_id, expected, next_status, **kw):
+        raise LaneCASError("simulated concurrent transition")
+
+    with (
+        patch(
+            "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+        ),
+        patch("app.improvement_lane_ops.cas_transition", side_effect=_raise_cas),
+    ):
+        count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_inert_when_disabled(db: AsyncSession):
+    """When improvement_lanes_enabled=False, Class 1 sweep must be a no-op."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    await _make_active_lane(db, project_id, current_task_id=None, phase_requeues=0)
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=False
+    ):
+        count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+
+    assert count == 0
+
+
+# --- Class 2: stale PROPOSED lanes ---
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class2_stale_proposed_lane_is_killed(
+    db: AsyncSession,
+):
+    """PROPOSED lane older than the staleness threshold must be killed."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    # Created 3600s ago; threshold is 1800s (default) — well past the threshold
+    lane = await _make_proposed_lane(db, project_id, created_ago_seconds=3600)
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_proposed_stale_seconds": 1800},
+        )
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.KILLED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class2_recent_proposed_lane_left_alone(
+    db: AsyncSession,
+):
+    """PROPOSED lane newer than the staleness threshold must be left unchanged."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    # Created 60s ago; threshold is 1800s — well within the window
+    lane = await _make_proposed_lane(db, project_id, created_ago_seconds=60)
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_proposed_stale_seconds": 1800},
+        )
+
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PROPOSED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class2_cas_miss_is_noop(db: AsyncSession):
+    """A concurrent CAS miss on a stale PROPOSED lane must not raise and must
+    not increment the returned count."""
+    from app.improvement_lane_ops import LaneCASError
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_proposed_lane(db, project_id, created_ago_seconds=3600)
+
+    async def _raise_cas(session, lane_id, expected, next_status, **kw):
+        raise LaneCASError("simulated concurrent transition")
+
+    with (
+        patch(
+            "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+        ),
+        patch("app.improvement_lane_ops.cas_transition", side_effect=_raise_cas),
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_proposed_stale_seconds": 1800},
+        )
+
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PROPOSED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class2_inert_when_disabled(db: AsyncSession):
+    """When improvement_lanes_enabled=False, Class 2 sweep must be a no-op."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_proposed_lane(db, project_id, created_ago_seconds=3600)
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=False
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_proposed_stale_seconds": 1800},
+        )
+
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PROPOSED.value

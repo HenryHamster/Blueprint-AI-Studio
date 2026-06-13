@@ -141,6 +141,31 @@ export interface DirectionFindingChallengeSummary {
   fail_closed_unparseable?: number;
 }
 
+export interface LaneRelayTimings {
+  wall_clock_seconds?: number | null;
+  active_seconds?: number | null;
+  gap_seconds?: number | null;
+  task_count?: number | null;
+  pr_count?: number | null;
+}
+
+export interface LaneRelayComparison {
+  source_version?: {
+    version_number?: number | null;
+    captured_at?: string | null;
+    terminal_status?: string | null;
+  };
+  relay?: LaneRelayTimings;
+  lane?: LaneRelayTimings;
+  deltas?: {
+    wall_clock_seconds?: number | null;
+    active_seconds?: number | null;
+    gap_seconds?: number | null;
+    task_count?: number | null;
+    pr_count?: number | null;
+  };
+}
+
 export interface CapabilityTrialVerdict {
   verdict: 'adopt' | 'reject' | 'continue-trial' | 'ADOPT' | 'KILL' | 'CONTINUE';
   lift?: number | null;
@@ -181,6 +206,7 @@ export interface CapabilityTrialVerdict {
   accumulation_basis?: string;
   arm_composition?: { with_assigned?: number; with_receipt?: number; without_assigned?: number; without_receipt?: number };
   accrual_projection?: { with_7d?: number; without_7d?: number; window_days?: number; holdback_fraction?: number; days_to_min_n?: number | null };
+  lane_relay_comparison?: LaneRelayComparison | null;
 }
 
 type ScopeConversionRates = Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }>;

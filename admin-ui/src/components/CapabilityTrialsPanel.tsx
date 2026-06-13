@@ -4,6 +4,8 @@ function fmtLift(lift: number | null): string { return lift == null ? '—' : li
 function fmtDate(ts?: string): string { return ts ? new Date(ts).toLocaleString() : '—'; }
 function fmtRate(rate?: number | null): string { return rate == null ? '—' : `${(rate * 100).toFixed(1)}%`; }
 function fmtMoney(value?: number | null): string { return value == null ? '—' : `$${value.toFixed(2)}`; }
+function fmtSeconds(s?: number | null): string { return s == null ? '—' : `${s.toFixed(0)}s`; }
+function fmtSecondsDelta(d?: number | null): string { if (d == null) return '—'; return d >= 0 ? `+${d.toFixed(0)}s` : `${d.toFixed(0)}s`; }
 
 type AccrualProjection = NonNullable<DigestData['capability_adoption_verdicts']>[string]['accrual_projection'];
 type CapabilityVerdict = NonNullable<DigestData['capability_adoption_verdicts']>[string];
@@ -37,6 +39,12 @@ function laneMetricSummary(v: CapabilityVerdict): string[] {
   if (v.lane_fix_tasks_sampled != null) {
     lines.push(`Warm resume ${fmtRate(v.warm_resume_fraction)} (${v.lane_fix_tasks_sampled} fix tasks)`);
     lines.push(`Checkpoint receipt ${fmtRate(v.checkpoint_fraction)}`);
+  }
+  const cmp = v.lane_relay_comparison;
+  if (cmp != null) {
+    const vnum = cmp.source_version?.version_number;
+    const label = vnum != null ? `vs v${vnum}` : 'vs relay';
+    lines.push(`Wall-clock ${fmtSeconds(cmp.lane?.wall_clock_seconds)} lane / ${fmtSeconds(cmp.relay?.wall_clock_seconds)} relay (${fmtSecondsDelta(cmp.deltas?.wall_clock_seconds)} ${label})`);
   }
   return lines;
 }
@@ -84,6 +92,17 @@ export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null })
                     </>}
                     {v.engagement_low && <span className="text-amber-300">Engagement low — treatment not delivered</span>}
                     {v.immediate_alert && <span className="text-red-300">Immediate alert: yes</span>}
+                    {v.lane_relay_comparison != null && (() => {
+                      const cmp = v.lane_relay_comparison;
+                      const vnum = cmp?.source_version?.version_number;
+                      const label = vnum != null ? `v${vnum}` : 'relay';
+                      return <>
+                        <span className="col-span-2 text-neutral-400 font-medium">Wall-clock vs {label} baseline:</span>
+                        <span>Lane: <span className="text-neutral-300 tabular-nums">{fmtSeconds(cmp?.lane?.wall_clock_seconds)}</span></span>
+                        <span>Relay: <span className="text-neutral-300 tabular-nums">{fmtSeconds(cmp?.relay?.wall_clock_seconds)}</span></span>
+                        <span className="col-span-2">Delta: <span className="text-neutral-300 tabular-nums">{fmtSecondsDelta(cmp?.deltas?.wall_clock_seconds)}</span></span>
+                      </>;
+                    })()}
                     <span>Evaluated: <span className="text-neutral-300">{fmtDate(v.evaluated_at)}</span></span>
                   </div>
                 ) : (
