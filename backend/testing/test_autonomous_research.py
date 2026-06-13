@@ -14487,6 +14487,281 @@ async def test_no_findings_completion_stamps_saturation_and_refractory(
 
 
 @pytest.mark.asyncio
+async def test_exhausted_saturated_proven_direction_auto_completes(db_session, mocker):
+    """A fully-exhausted saturated direction auto-completes when all findings are deduped.
+
+    Covers the zero-spawn (all-deduped) path through apply_post_spawn_state.
+    Before the fix, the guard `entry.get("tasks_created", 0) > 0` prevented
+    auto-completion exactly for the most exhausted directions — those where every
+    finding was already known and nothing spawned. After the fix, the criteria
+    (saturated + total_merged >= 3) are evaluated regardless of tasks_created.
+    """
+    direction_id = "d-exhaust-sat1"
+    direction = {
+        **_active_direction(direction_id, "Exhausted saturated direction"),
+        # 3 prior low-output cycles → _compute_saturation returns True
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "tasks_created": 1, "prs_merged": 1},
+            {"timestamp": "2026-01-02T00:00:00", "tasks_created": 0, "prs_merged": 1},
+            {"timestamp": "2026-01-03T00:00:00", "tasks_created": 1, "prs_merged": 1},
+        ],
+    }
+    project = Project(
+        name="Exhausted Saturated Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_title = "Fix exhausted finding"
+    dup_desc = "Already addressed"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    existing = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "direction_id": direction_id},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix the exhausted finding",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new=AsyncMock(return_value=None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    target = next((d for d in dirs if d.get("id") == direction_id), None)
+    assert target is not None, "Direction must still exist"
+    assert target.get("status") == "completed", (
+        "Saturated direction with proven merged PRs must be auto-completed "
+        "even when the triggering cycle produced zero tasks (all deduped)"
+    )
+    assert target.get("auto_completed") is True, "auto_completed flag must be set"
+    assert target.get("auto_completed_reason"), "auto_completed_reason must be set"
+
+
+@pytest.mark.asyncio
+async def test_no_findings_saturated_proven_direction_auto_completes(
+    db_session, mocker
+):
+    """A saturated, proven direction is auto-completed via the no-findings path.
+
+    Covers _stamp_no_findings_refractory: when 3+ consecutive unproductive
+    cycles make the direction saturated AND total_merged >= 3, the direction
+    is marked completed in the same locked write that stamps the refractory.
+    """
+    direction_id = "d-nf-sat-proven"
+    direction = {
+        **_active_direction(direction_id, "No-findings saturated proven"),
+        # 2 prior consecutive unproductive cycles — one more makes it saturated
+        "consecutive_unproductive_cycles": 2,
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "tasks_created": 0, "prs_merged": 1},
+            {"timestamp": "2026-01-02T00:00:00", "tasks_created": 0, "prs_merged": 1},
+            {"timestamp": "2026-01-03T00:00:00", "tasks_created": 0, "prs_merged": 1},
+        ],
+    }
+    project = Project(
+        name="No-Findings Saturation Auto-Complete",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new=AsyncMock(side_effect=lambda t, *a, **kw: t),
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new=AsyncMock(return_value=None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    target = next((d for d in dirs if d.get("id") == direction_id), None)
+    assert target is not None, "Direction must still exist"
+    assert target.get("status") == "completed", (
+        "Saturated proven direction must be auto-completed via the no-findings path"
+    )
+    assert target.get("auto_completed") is True
+    assert target.get("auto_completed_reason"), "auto_completed_reason must be set"
+
+
+@pytest.mark.asyncio
+async def test_no_findings_saturated_unproven_direction_not_auto_completed(
+    db_session, mocker
+):
+    """An unproven direction is NOT auto-completed even when saturated.
+
+    Guards against premature retirement: saturation + consecutive no-findings
+    cycles alone are not sufficient — the direction also needs total_merged >= 3
+    to prove it produced value. An under-proven saturated direction should
+    stay active and receive normal refractory stamping.
+    """
+    direction_id = "d-nf-sat-unproven"
+    direction = {
+        **_active_direction(direction_id, "Saturated but unproven direction"),
+        "consecutive_unproductive_cycles": 2,
+        # Only 2 PRs merged — below the threshold of 3
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "tasks_created": 0, "prs_merged": 1},
+            {"timestamp": "2026-01-02T00:00:00", "tasks_created": 0, "prs_merged": 1},
+            {"timestamp": "2026-01-03T00:00:00", "tasks_created": 0, "prs_merged": 0},
+        ],
+    }
+    project = Project(
+        name="No-Findings Saturation No-Autocompletion",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new=AsyncMock(side_effect=lambda t, *a, **kw: t),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    target = next((d for d in dirs if d.get("id") == direction_id), None)
+    assert target is not None
+    assert target.get("status") == "active", (
+        "Under-proven direction (total_merged < 3) must NOT be auto-completed "
+        "even when saturated"
+    )
+    assert not target.get("auto_completed"), (
+        "auto_completed must not be set on an unproven direction"
+    )
+    assert target.get("possibly_saturated") is True, (
+        "Direction should be marked saturated after 3 consecutive unproductive cycles"
+    )
+    assert target.get("refractory_until") is not None, (
+        "refractory_until must be stamped to prevent immediate re-selection"
+    )
+
+
+@pytest.mark.asyncio
 async def test_zero_eligible_directions_triggers_strategic_refresh(db_session, mocker):
     """When ALL active directions are in refractory (no eligible directions this
     cycle), the spawn loop must fire request_strategic_refresh exactly once via
@@ -15362,3 +15637,95 @@ async def test_pending_sr_age_exceeded_drops_marker_and_alerts(db_session, mocke
     )
 
     _ss.runtime_config.pop("pending_sr_max_age_hours", None)
+
+
+@pytest.mark.asyncio
+async def test_filter_breakdown_type_filtered_is_per_direction(db_session):
+    """Each direction's research_history filter_breakdown.type_filtered records only
+    that direction's own type-filtered metadata findings, not the cycle-wide total.
+
+    A two-direction cycle where direction A produces 2 type-filtered findings and
+    direction B produces 1 must write 2 and 1 respectively — not 3 in both entries.
+    """
+    from app.research_direction_state import apply_post_spawn_state
+
+    dir_a_id = "d-aaa-tf01"
+    dir_b_id = "d-bbb-tf02"
+    direction_a = _active_direction(dir_a_id, "Direction A")
+    direction_b = _active_direction(dir_b_id, "Direction B")
+
+    project = Project(
+        name="Per-Direction Type-Filtered Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction_a, direction_b],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: per-direction type_filtered",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction_a, direction_b],
+                "base_branch": "main",
+            }
+        ],
+        context={"direction_id": dir_a_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # One actionable finding per direction so both directions enter direction_ids_with_findings
+    finding_a = _make_finding("Actionable finding A", direction_id=dir_a_id)
+    finding_b = _make_finding("Actionable finding B", direction_id=dir_b_id)
+
+    await apply_post_spawn_state(
+        session=db_session,
+        task=task,
+        findings=[finding_a, finding_b],
+        child_tasks=[],
+        deduplicated=[(0, finding_a, "hash-a"), (1, finding_b, "hash-b")],
+        insights=[],
+        direction_notes=[],
+        direction_proposals=[],
+        hash_dedup_count=0,
+        word_overlap_count=0,
+        file_overlap_count=0,
+        evidence_overlap_count=0,
+        type_filtered_count=3,
+        empty_prompt_count=0,
+        research_branch="research-branch",
+        original_base="main",
+        research_depth=0,
+        parent_research_task_id=None,
+        # Direction A had 2 type-filtered findings; direction B had 1
+        type_filtered_by_dir={dir_a_id: 2, dir_b_id: 1},
+    )
+
+    await db_session.refresh(project)
+    dirs = {d["id"]: d for d in (project.directions or [])}
+
+    history_a = dirs[dir_a_id].get("research_history", [])
+    history_b = dirs[dir_b_id].get("research_history", [])
+
+    assert history_a, "Direction A must have a research_history entry"
+    assert history_b, "Direction B must have a research_history entry"
+
+    tf_a = history_a[-1]["filter_breakdown"]["type_filtered"]
+    tf_b = history_b[-1]["filter_breakdown"]["type_filtered"]
+
+    assert tf_a == 2, (
+        f"Direction A type_filtered must be 2 (its own count), got {tf_a}"
+    )
+    assert tf_b == 1, (
+        f"Direction B type_filtered must be 1 (its own count), got {tf_b}"
+    )
+    assert tf_a != tf_b, "Directions must not share the same type_filtered count"

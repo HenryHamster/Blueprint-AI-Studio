@@ -1220,6 +1220,12 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     eligible for re-selection on the next post-merge hook (the 20s gap
     observed in the 2026-06-10 incident where cycle 10 spawned 2 minutes
     after cycle 9 completed with "no actionable findings").
+
+    Also applies the same auto-completion criteria used by apply_post_spawn_state:
+    if the direction becomes saturated (3+ consecutive unproductive cycles) and has
+    accumulated enough merged PRs (>= 3), it is marked completed so that fully
+    exhausted, proven directions are retired consistently regardless of whether the
+    triggering cycle happened to produce any findings.
     """
     direction_id = (task.context or {}).get("direction_id") or task.first_payload.get(
         "current_direction_id"
@@ -1227,6 +1233,8 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     if not direction_id or task.project_id is None:
         return
     now_iso = _utcnow().isoformat()
+
+    _auto_complete_info: list[dict] = []
 
     def _apply_no_findings_refractory(dirs: list) -> None:
         target = next((d for d in dirs if d.get("id") == direction_id), None)
@@ -1241,9 +1249,70 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
         target["possibly_saturated"] = new_consec >= 3
         stamp_direction_refractory(target)
 
+        # Auto-complete if saturated and proven by merged PRs — same criteria as
+        # apply_post_spawn_state, applied here so the most exhausted directions
+        # (those producing zero findings) are retired rather than looping forever.
+        if target.get("status") == "active" and target.get("possibly_saturated"):
+            history = target.get("research_history", [])
+            agg = target.get("history_aggregate", {})
+            total_merged = sum(e.get("prs_merged", 0) for e in history) + (
+                agg.get("total_prs_merged") or 0
+            )
+            if total_merged >= 3:
+                total_cycles = len(history) + (agg.get("total_cycles") or 0)
+                target["status"] = "completed"
+                target["completed_at"] = now_iso
+                target["auto_completed"] = True
+                target["auto_completed_reason"] = (
+                    f"Auto-completed: direction saturated with {total_merged} "
+                    f"total PRs merged across {total_cycles} cycles"
+                )
+                _auto_complete_info.append(
+                    {
+                        "text": target.get("text", direction_id),
+                        "reason": target["auto_completed_reason"],
+                        "total_merged": total_merged,
+                        "total_cycles": total_cycles,
+                    }
+                )
+
     await with_directions_locked(
         session, task.project_id, _apply_no_findings_refractory
     )
+
+    for info in _auto_complete_info:
+        from app.models import Alert, AlertSeverity  # noqa: PLC0415
+
+        session.add(
+            Alert(
+                project_id=task.project_id,
+                severity=AlertSeverity.INFO,
+                title="Direction auto-completed",
+                message=(
+                    f"Direction '{info['text'][:80]}' was auto-completed: "
+                    f"saturated with {info['total_merged']} PRs merged "
+                    f"across {info['total_cycles']} cycles."
+                ),
+            )
+        )
+        try:
+            from app.notification_dispatch import (  # noqa: PLC0415
+                post_direction_milestone_message,
+            )
+
+            await post_direction_milestone_message(
+                session,
+                task.project_id,
+                direction_text=info["text"],
+                milestone="auto-completed",
+                reason=info["reason"],
+                direction_id=direction_id,
+            )
+        except Exception as _notify_exc:
+            logger.warning(
+                "[NOTIFY] Failed to post direction milestone message: %s",
+                _notify_exc,
+            )
 
 
 def _summarize_dispatch_outcome(
@@ -3428,6 +3497,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     evidence_overlap_count = _dedup_outcome.evidence_overlap_count
     filtered_findings = _dedup_outcome.filtered
     type_filtered_count = 0
+    type_filtered_by_dir: dict[str, int] = {}
     empty_prompt_count = 0
 
     # Assess pipeline health once before spawning implementation tasks.
@@ -3639,6 +3709,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
             await with_design_doc_locked(session, task.project_id, _add_obs_proposal)
             type_filtered_count += 1
+            _tf_did = finding.get("direction_id") or _parent_direction_id
+            if _tf_did:
+                type_filtered_by_dir[_tf_did] = type_filtered_by_dir.get(_tf_did, 0) + 1
             continue  # Don't create a task
 
         if finding_type == "direction_update":
@@ -3646,6 +3719,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             target_id = finding.get("direction_id")
             if not target_id:
                 type_filtered_count += 1
+                _tf_did = finding.get("direction_id") or _parent_direction_id
+                if _tf_did:
+                    type_filtered_by_dir[_tf_did] = (
+                        type_filtered_by_dir.get(_tf_did, 0) + 1
+                    )
                 continue  # direction_update requires a target direction_id
             _du_finding = finding
             _du_target_id = target_id
@@ -3672,6 +3750,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
             await with_directions_locked(session, task.project_id, _set_pending_update)
             type_filtered_count += 1
+            _tf_did = finding.get("direction_id") or _parent_direction_id
+            if _tf_did:
+                type_filtered_by_dir[_tf_did] = type_filtered_by_dir.get(_tf_did, 0) + 1
             continue  # Don't create a task for direction_update findings
 
         if not prompt:
@@ -5867,6 +5948,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         file_overlap_count=file_overlap_count,
         evidence_overlap_count=evidence_overlap_count,
         type_filtered_count=type_filtered_count,
+        type_filtered_by_dir=type_filtered_by_dir,
         empty_prompt_count=empty_prompt_count,
         batch_cap_applied_count=batch_cap_applied_count,
         research_branch=research_branch,

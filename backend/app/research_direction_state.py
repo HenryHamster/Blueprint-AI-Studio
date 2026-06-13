@@ -102,12 +102,12 @@ def _merge_finding_challenge_summary(target: dict, source: dict) -> None:
     target["fail_closed_unparseable"] += source.get("fail_closed_unparseable") or 0
     for key in _CHALLENGE_AGREEMENT_BUCKETS:
         target["agreement_distribution"][key] += (
-            (source.get("agreement_distribution") or {}).get(key) or 0
-        )
+            source.get("agreement_distribution") or {}
+        ).get(key) or 0
     for key in _CHALLENGE_BOUNDARY_BUCKETS:
         target["boundary_distribution"][key] += (
-            (source.get("boundary_distribution") or {}).get(key) or 0
-        )
+            source.get("boundary_distribution") or {}
+        ).get(key) or 0
 
 
 def _append_evicted_findings(direction: dict, new_entries: list) -> None:
@@ -244,6 +244,7 @@ async def apply_post_spawn_state(
     parent_research_task_id: str | None,
     batch_cap_applied_count: int = 0,
     filtered_findings: List[Dict[str, Any]] | None = None,
+    type_filtered_by_dir: dict | None = None,
 ) -> None:
     """Apply all direction-state updates after research child tasks have been spawned.
 
@@ -266,6 +267,13 @@ async def apply_post_spawn_state(
         did = (ct.context or {}).get("direction_id")
         if did:
             direction_ids_with_findings.add(did)
+    # Include directions that produced deduplicated (actionable) findings even
+    # when no child tasks were created (e.g. testing, deferred spawn, or task
+    # creation failure) so each such direction still gets a history entry.
+    for _orig_i, _finding, _fhash in deduplicated:
+        _did = _finding.get("direction_id")
+        if _did:
+            direction_ids_with_findings.add(_did)
     # If all findings were deduped OR no findings at all, still put the current
     # direction on cooldown and record a cycle entry. This closes a blind spot
     # where research tasks that completed with zero actionable findings (agent
@@ -464,7 +472,7 @@ async def apply_post_spawn_state(
                             "evidence_overlap_dedup": evidence_overlap_by_dir.get(
                                 did, 0
                             ),
-                            "type_filtered": type_filtered_count,
+                            "type_filtered": (type_filtered_by_dir or {}).get(did, 0),
                             "empty_prompt": empty_prompt_count,
                         },
                     }
@@ -490,9 +498,13 @@ async def apply_post_spawn_state(
                     # is not immediately re-queued on a direction that has no work left.
                     if d.get("possibly_saturated"):
                         _sat_refractory_min = direction_saturation_refractory_minutes()
-                        if isinstance(_sat_refractory_min, (int, float)) and _sat_refractory_min > 0:
+                        if (
+                            isinstance(_sat_refractory_min, (int, float))
+                            and _sat_refractory_min > 0
+                        ):
                             d["refractory_until"] = (
-                                _utcnow() + timedelta(minutes=float(_sat_refractory_min))
+                                _utcnow()
+                                + timedelta(minutes=float(_sat_refractory_min))
                             ).isoformat()
 
                     # Deadlock detection: 3+ consecutive 0-task cycles driven by dedup
@@ -607,12 +619,11 @@ async def apply_post_spawn_state(
 
                     record_outcome_progress_snapshot(d)
 
-                    # Auto-complete direction if saturated with sufficient merged PRs
-                    if (
-                        d.get("status") == "active"
-                        and d.get("possibly_saturated")
-                        and entry.get("tasks_created", 0) > 0
-                    ):
+                    # Auto-complete direction if saturated with sufficient merged PRs.
+                    # The tasks_created guard is intentionally omitted: a fully-exhausted
+                    # direction (all findings deduped, zero tasks spawned) is exactly the
+                    # case that should trigger auto-completion, not escape it.
+                    if d.get("status") == "active" and d.get("possibly_saturated"):
                         history = d.get("research_history", [])
                         agg = d.get("history_aggregate", {})
                         total_merged = sum(e.get("prs_merged", 0) for e in history) + (
