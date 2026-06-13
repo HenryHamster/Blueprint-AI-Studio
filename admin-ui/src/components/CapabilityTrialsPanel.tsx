@@ -42,6 +42,7 @@ function laneMetricSummary(v: CapabilityVerdict): string[] {
 }
 
 export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null }) {
+  if (digest === null) return null;
   const verdicts = Object.entries(digest?.capability_adoption_verdicts ?? {});
   const genericVerdicts = verdicts.filter(([, v]) => !hasLaneMetrics(v));
   const totalWith = genericVerdicts.reduce((sum, [, v]) => sum + Math.min(v.n_with ?? 0, v.thresholds?.min_n_per_arm ?? 30), 0);
