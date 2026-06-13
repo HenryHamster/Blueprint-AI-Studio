@@ -114,6 +114,18 @@ def apply_operator_build_config_overrides(
     ):
         if _cm_key in existing:
             detected[_cm_key] = existing[_cm_key]
+    # Onboarding-proof milestone timestamps are durable event records, not
+    # repo-derived config; carry them forward so re-detect never erases evidence.
+    for _op_key in (
+        "first_task_spawned_at",
+        "first_pr_opened_at",
+        "first_merge_gate_verdict_at",
+        "first_merge_gate_executed_tests",
+        "first_merge_gate_unverified_reason",
+        "first_pr_merged_at",
+    ):
+        if _op_key in existing:
+            detected[_op_key] = existing[_op_key]
 
     # Merge per-directory agent-confirmed command fields back onto re-detected
     # directories.  These are written by the agent write-back endpoint and are
