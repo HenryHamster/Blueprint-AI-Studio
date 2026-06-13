@@ -656,8 +656,15 @@ async def _finalize_warm_claim(
         )
         # Ground warm-resume receipts in actual outcome: stamp only here, at the
         # warm-claim site, so a cold-fallback fix (reserved member reaped, lease
-        # expired, or pool fallback) leaves the receipt absent.
-        if ctx.get("is_lane_phase"):
+        # expired, or pool fallback) leaves the receipt absent. Gate receipt stamping
+        # on the same condition as SHA delivery (improvement_lanes_enabled) so a flag
+        # flip between spawn and warm-claim can never produce a receipt that claims
+        # a checkpoint reset that did not (and could not) happen.
+        from app.runtime_config_state import (
+            is_improvement_lanes_enabled as _is_lanes_enabled,
+        )
+
+        if _is_lanes_enabled() and ctx.get("is_lane_phase"):
             from app.review_fix_lane_pilot import confirm_lane_warm_resume
 
             confirm_lane_warm_resume(

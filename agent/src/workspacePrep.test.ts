@@ -738,6 +738,59 @@ describe('prepareWorkspaceForRole', () => {
       )).toBe(true);
       expect(cloneWithRetryMock).not.toHaveBeenCalled();
     });
+
+    it('lane mode: checkpoint SHA present locally but not ancestor of branch (force-push) → falls back to origin/<branch>', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'abc1234567890123456789012345678901234567';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      // The checkpoint SHA exists locally (e.g., from a prior phase on the warm VM),
+      // but the ancestor check fails because the branch was force-pushed and the
+      // checkpoint is no longer reachable from origin/<branch>.
+      execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === 'git' && Array.isArray(args) && args.includes('merge-base')
+            && args.includes('--is-ancestor')) {
+          // Node's execFileSync surfaces a merge-base --is-ancestor exit-1 as an
+          // error with status=1 and message 'Command failed: git ...' (empty stderr).
+          const e = new Error('Command failed: git -C /ws merge-base --is-ancestor abc1234567890123456789012345678901234567 origin/feat/lane') as NodeJS.ErrnoException & { status: number };
+          e.status = 1;
+          throw e;
+        }
+        return '';
+      });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feat/lane',
+      });
+
+      const gitArgsList = execFileSyncMock.mock.calls
+        .filter(c => c[0] === 'git')
+        .map(c => (c[1] as string[]).join(' '));
+
+      // merge-base --is-ancestor check was attempted:
+      expect(gitArgsList.some(a =>
+        a.includes('merge-base --is-ancestor abc1234567890123456789012345678901234567 origin/feat/lane'),
+      )).toBe(true);
+
+      // When ancestor check fails, reset falls back to origin/<branch>, not the checkpoint:
+      expect(gitArgsList.some(a =>
+        a.includes('reset --hard origin/feat/lane'),
+      )).toBe(true);
+      expect(gitArgsList.some(a =>
+        a.includes('reset --hard abc1234567890123456789012345678901234567'),
+      )).toBe(false);
+
+      // Warm path completed without falling back to cold clone.
+      expect(cloneWithRetryMock).not.toHaveBeenCalled();
+
+      // Logged the fallback:
+      const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
+      expect(logged).toMatch(/not ancestor of origin/i);
+    });
   });
 
   // ── WorkspacePrepOutcome: module-level recorder ─────────────────────────────

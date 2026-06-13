@@ -299,9 +299,7 @@ async def test_warm_vm_backlog_completion_to_reuse_full_flow(
         # Now the deferred-teardown coroutine must NOT delete the VM: its REAL DB
         # re-check (_vm_claimed_backlog_work, unmocked) finds the IN_PROGRESS task
         # bound to the VM. Only the timing sleep and the actual delete are mocked.
-        mocker.patch(
-            "app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock
-        )
+        mocker.patch("app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock)
         delete_mock = mocker.patch(
             "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
         )
@@ -379,9 +377,7 @@ async def test_warm_vm_backlog_ineligible_skips_claim_and_grace_releases(
         rc["warm_backlog_grace_window_secs"] = 40
         rc["warm_backlog_grace_idle_secs"] = 30
         rc["warm_backlog_grace_poll_interval_secs"] = 5
-        mocker.patch(
-            "app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock
-        )
+        mocker.patch("app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock)
 
         # Idle exit: the agent stopped heartbeating -> early release, deleted once.
         wbr._grace_idle_release_events.clear()
@@ -618,9 +614,7 @@ async def test_spawn_pipeline_task_skips_warm_pin_when_project_paused(
     try:
         _runtime_config["warm_continuity_enabled"] = True
 
-        project = Project(
-            name="Spawn Pin Paused", user_id="test-user-123", paused=True
-        )
+        project = Project(name="Spawn Pin Paused", user_id="test-user-123", paused=True)
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -819,6 +813,7 @@ async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
 
         # Verify the pool is enabled at this point (inside the context manager).
         from app.warm_pool import is_warm_pool_enabled
+
         assert is_warm_pool_enabled() is True
 
         pool_token = create_vm_scoped_token(pool_vm_id, str(project.id))
@@ -1050,9 +1045,7 @@ async def test_warm_pool_miss_paths_record_lease_miss_by_reason(
         def _new_task():
             t = Task(
                 project_id=project.id,
-                payloads=[
-                    {"type": "create", "prompt": "x", "base_branch": "automain"}
-                ],
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
                 status=TaskStatus.QUEUED,
                 context={"scope": "small"},
             )
@@ -1131,7 +1124,10 @@ async def test_try_pool_dispatch_does_not_clobber_racing_warm_reservation(
 ):
     """A concurrent re-reservation must survive the miss-path workspace reset."""
     from app.models import ImprovementLane
-    from app.warm_pool import clear_lane_warm_workspace_if_matching_member, try_pool_dispatch
+    from app.warm_pool import (
+        clear_lane_warm_workspace_if_matching_member,
+        try_pool_dispatch,
+    )
     import app.shared_state as _ss
 
     prior = dict(_ss.runtime_config)
@@ -1795,7 +1791,9 @@ async def test_next_role_lane_fields_present_when_flag_on(
         source_task = Task(
             project_id=project.id,
             title="Source task",
-            payloads=[{"type": "create", "pr_number": 7001, "branch": "feat/lane-test"}],
+            payloads=[
+                {"type": "create", "pr_number": 7001, "branch": "feat/lane-test"}
+            ],
             vm_instance_id=vm_id,
             status=TaskStatus.IN_PROGRESS,
             context={"scope": "small"},
@@ -1808,7 +1806,9 @@ async def test_next_role_lane_fields_present_when_flag_on(
         pinned_task = Task(
             project_id=project.id,
             title="Lane phase task",
-            payloads=[{"type": "create", "pr_number": 7001, "branch": "feat/lane-test"}],
+            payloads=[
+                {"type": "create", "pr_number": 7001, "branch": "feat/lane-test"}
+            ],
             status=TaskStatus.QUEUED,
             context={
                 "warm_target_vm_id": vm_id,
@@ -2000,7 +2000,9 @@ async def test_lane_warm_resume_receipt_set_at_claim_not_spawn(
         source_task = Task(
             project_id=project.id,
             title="Source task for lane receipt",
-            payloads=[{"type": "create", "pr_number": 8001, "branch": "feat/lane-receipt"}],
+            payloads=[
+                {"type": "create", "pr_number": 8001, "branch": "feat/lane-receipt"}
+            ],
             vm_instance_id=vm_id,
             status=TaskStatus.IN_PROGRESS,
             context={"scope": "small"},
@@ -2014,7 +2016,9 @@ async def test_lane_warm_resume_receipt_set_at_claim_not_spawn(
         lane_fix_task = Task(
             project_id=project.id,
             title="Lane fix task",
-            payloads=[{"type": "fix", "pr_number": 8001, "branch": "feat/lane-receipt"}],
+            payloads=[
+                {"type": "fix", "pr_number": 8001, "branch": "feat/lane-receipt"}
+            ],
             status=TaskStatus.QUEUED,
             context={
                 "warm_target_vm_id": vm_id,
@@ -2248,3 +2252,166 @@ async def test_try_pool_dispatch_updates_workspace_vm_when_non_reserved_member_l
                 _ss.runtime_config.pop(k, None)
         _ss.warm_pool_suppressed_until = None
         _ss.warm_pool_claim_failure_events.clear()
+
+
+@pytest.mark.asyncio
+async def test_warm_claim_checkpoint_receipt_gated_on_substrate_flag(
+    db_session, mocker
+):
+    """Verify checkpoint receipt stamping is gated on improvement_lanes_enabled.
+
+    When a fix task with lane context (is_lane_phase, lane_checkpoint_sha) is
+    claimed warm and the substrate flag is disabled, the checkpoint receipt must
+    NOT be stamped. This prevents false receipts when the flag is flipped between
+    spawn and warm-claim. Receipt stamping and SHA delivery must use identical
+    gating conditions.
+
+    Scenario:
+      1. Task spawned with lane context while flag is ON
+      2. Operator flips substrate flag OFF
+      3. Task claimed warm via _finalize_warm_claim
+      4. Assert: checkpoint receipt is absent (flag is off, so no delivery possible)
+      5. Assert: warm-resume receipt is also absent (gate applies to both)
+      6. Assert: warm path completes successfully despite missing receipts
+    """
+    from app.shared_state import runtime_config as _runtime_config
+    from app.capability_trial_verdict import (
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+    )
+    from app.routers.agent_warm_continuity import _finalize_warm_claim
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=mocker.AsyncMock)
+
+    prior_lanes_enabled = _runtime_config.get("improvement_lanes_enabled")
+    try:
+        # Create a project and a task with lane context.
+        project = Project(name="Lane Receipt Gating Test", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        vm_id = "agent-vm-lane-receipt-test"
+        lane_id = str(uuid.uuid4())
+        checkpoint_sha = "abc1234567890def"
+
+        # Task with lane context (as if spawned while flag was on).
+        task = Task(
+            project_id=project.id,
+            title="Fix task with lane context",
+            payloads=[
+                {
+                    "type": "fix",
+                    "pr_number": 999,
+                    "branch": "fix/test",
+                    "base_branch": "main",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            context={
+                "is_lane_phase": True,
+                "lane_checkpoint_sha": checkpoint_sha,
+                "improvement_lane_id": lane_id,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # Disable the substrate flag (simulating operator flipping it off).
+        _runtime_config["improvement_lanes_enabled"] = False
+
+        # Finalize the warm claim with the flag disabled.
+        result = await _finalize_warm_claim(
+            db_session,
+            task,
+            vm_id,
+            origin="backlog_reuse",
+            refresh_capable=False,
+        )
+
+        # Verify the response is valid (warm claim succeeds).
+        assert isinstance(result, dict)
+        assert result["action"] == "claim"
+        assert result["task_id"] == str(task.id)
+        assert result["warm_start"] is True
+        assert isinstance(result.get("agent_token"), str)
+
+        # Verify checkpoint receipt is NOT stamped (flag is disabled).
+        ctx = task.context or {}
+        assert LANE_PILOT_CHECKPOINT_RECEIPT_KEY not in ctx, (
+            "Checkpoint receipt must be absent when improvement_lanes_enabled is False"
+        )
+
+        # Verify warm-resume receipt is also NOT stamped (same gate applies).
+        assert LANE_PILOT_WARM_RESUME_RECEIPT_KEY not in ctx, (
+            "Warm-resume receipt must be absent when improvement_lanes_enabled is False"
+        )
+
+        # Verify checkpoint SHA was NOT delivered to response (flag prevents delivery).
+        assert "lane_checkpoint_sha" not in result, (
+            "Checkpoint SHA must not be in response when improvement_lanes_enabled is False"
+        )
+
+        # Now test the opposite: enable the flag and verify receipts ARE stamped.
+        # Create a fresh task for the second scenario.
+        task2 = Task(
+            project_id=project.id,
+            title="Fix task with lane context (flag enabled)",
+            payloads=[
+                {
+                    "type": "fix",
+                    "pr_number": 1000,
+                    "branch": "fix/test2",
+                    "base_branch": "main",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            context={
+                "is_lane_phase": True,
+                "lane_checkpoint_sha": checkpoint_sha,
+                "improvement_lane_id": lane_id,
+            },
+        )
+        db_session.add(task2)
+        await db_session.commit()
+        await db_session.refresh(task2)
+
+        # Enable the flag.
+        _runtime_config["improvement_lanes_enabled"] = True
+
+        # Finalize the warm claim with the flag enabled.
+        result2 = await _finalize_warm_claim(
+            db_session,
+            task2,
+            vm_id,
+            origin="backlog_reuse",
+            refresh_capable=False,
+        )
+
+        # Verify the response is valid.
+        assert isinstance(result2, dict)
+        assert result2["action"] == "claim"
+        assert result2["task_id"] == str(task2.id)
+
+        # Verify checkpoint receipt IS stamped when flag is enabled.
+        ctx2 = task2.context or {}
+        assert ctx2.get(LANE_PILOT_CHECKPOINT_RECEIPT_KEY) is True, (
+            "Checkpoint receipt must be stamped when improvement_lanes_enabled is True"
+        )
+
+        # Verify warm-resume receipt IS stamped.
+        assert ctx2.get(LANE_PILOT_WARM_RESUME_RECEIPT_KEY) is True, (
+            "Warm-resume receipt must be stamped when improvement_lanes_enabled is True"
+        )
+
+        # Verify checkpoint SHA IS delivered to response when flag is enabled.
+        assert result2.get("lane_checkpoint_sha") == checkpoint_sha, (
+            "Checkpoint SHA must be in response when improvement_lanes_enabled is True"
+        )
+
+    finally:
+        if prior_lanes_enabled is None:
+            _runtime_config.pop("improvement_lanes_enabled", None)
+        else:
+            _runtime_config["improvement_lanes_enabled"] = prior_lanes_enabled
