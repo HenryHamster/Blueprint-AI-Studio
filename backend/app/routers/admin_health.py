@@ -760,10 +760,28 @@ async def get_warm_vm_state(
     same for every admin caller. Default TTL 15s; tune in digest_cache.
     """
     cache_key = ("warm-vm-state",)
-    return await cache.get_or_compute(
+    result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_warm_vm_state(session=session),
     )
+    generated_at = result.get("generated_at") if isinstance(result, dict) else None
+    age_seconds: float | None = None
+    if generated_at:
+        try:
+            age_seconds = max(
+                0.0,
+                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
+            )
+        except (ValueError, TypeError):
+            age_seconds = None
+    annotated = annotate_precompute_metadata(
+        result,
+        precomputed=False,
+        precomputed_at=generated_at,
+        precompute_age_seconds=age_seconds,
+    )
+    annotated["served_stale"] = served_stale
+    return annotated
 
 
 # Phase F3 (H2): hard cap on each warm-vm-state scan. The endpoint is admin-
@@ -1119,6 +1137,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         "spawn_pin_funnel": _get_spawn_pin_funnel(),
         "backlog_reuse_funnel": await _get_backlog_reuse_funnel(session),
         "pool_metrics": await _get_pool_metrics(session),
+        "generated_at": now.isoformat(),
     }
 
 
@@ -1324,17 +1343,36 @@ async def get_fleet_utilization(
     user. Returns all snapshot fields plus a derived ``saturation`` label.
     """
     cache_key = ("fleet-utilization",)
-    return await cache.get_or_compute(
+    result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_fleet_utilization(session=session),
     )
+    generated_at = result.get("generated_at") if isinstance(result, dict) else None
+    age_seconds: float | None = None
+    if generated_at:
+        try:
+            age_seconds = max(
+                0.0,
+                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
+            )
+        except (ValueError, TypeError):
+            age_seconds = None
+    annotated = annotate_precompute_metadata(
+        result,
+        precomputed=False,
+        precomputed_at=generated_at,
+        precompute_age_seconds=age_seconds,
+    )
+    annotated["served_stale"] = served_stale
+    return annotated
 
 
 async def _compute_fleet_utilization(*, session: AsyncSession) -> Dict[str, Any]:
     """Compute the fleet-utilization payload (cached by caller)."""
+    now = _utcnow()
     snapshot = await get_fleet_utilization_snapshot(session)
     saturation = _derive_saturation(snapshot.get("util_avg"), snapshot.get("util_now"))
-    return {**snapshot, "saturation": saturation}
+    return {**snapshot, "saturation": saturation, "generated_at": now.isoformat()}
 
 
 @router.get("/evergreen-fill")

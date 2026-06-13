@@ -44,6 +44,12 @@ function statusClasses(status: string): string {
       return 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300';
     case 'PARKED':
       return 'border-amber-500/30 bg-amber-500/15 text-amber-300';
+    case 'PROPOSED':
+      return 'border-slate-500/30 bg-slate-500/15 text-slate-300';
+    case 'RETIRED':
+      return 'border-sky-500/30 bg-sky-500/15 text-sky-300';
+    case 'KILLED':
+      return 'border-red-500/30 bg-red-500/15 text-red-300';
     default:
       return 'border-neutral-700 bg-neutral-800 text-neutral-300';
   }

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DriftSignalsCard } from './DriftSignalsCard';
@@ -30,6 +30,10 @@ function makeSnapshot(overrides: Record<string, unknown> = {}) {
 describe('DriftSignalsCard', () => {
   beforeEach(() => {
     apiFetchMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('renders nothing when flagged_count is 0', async () => {
@@ -82,6 +86,77 @@ describe('DriftSignalsCard', () => {
 
     await act(async () => {});
     expect(screen.getByText(/Drift Signals — 2 directions flagged/)).toBeInTheDocument();
+  });
+
+  it('marks the last-good snapshot stale after a failed poll and clears it on recovery', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-13T12:00:00Z'));
+    apiFetchMock
+      .mockResolvedValueOnce(
+        jsonResponse(
+          makeSnapshot({
+            flagged_count: 1,
+            flagged_directions: [
+              {
+                direction_id: 'd-1',
+                direction_text: 'Ship retry backoff',
+                over_claim_flag: true,
+                stalled_despite_churn_flag: false,
+                claimed_changes_count: 5,
+                actually_merged_prs: 1,
+                claim_shipped_consistency: 0.2,
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce({ ok: false, json: async () => ({}) } as Response)
+      .mockResolvedValueOnce(
+        jsonResponse(
+          makeSnapshot({
+            flagged_count: 2,
+            flagged_directions: [
+              {
+                direction_id: 'd-2',
+                direction_text: 'Fix flaky CI',
+                over_claim_flag: false,
+                stalled_despite_churn_flag: true,
+                claimed_changes_count: 6,
+                actually_merged_prs: 0,
+                claim_shipped_consistency: 0,
+              },
+              {
+                direction_id: 'd-3',
+                direction_text: 'Reduce review latency',
+                over_claim_flag: true,
+                stalled_despite_churn_flag: false,
+                claimed_changes_count: 4,
+                actually_merged_prs: 1,
+                claim_shipped_consistency: 0.25,
+              },
+            ],
+          }),
+        ),
+      );
+
+    render(<DriftSignalsCard projectId="proj-1" />);
+    await act(async () => {});
+
+    expect(screen.getByRole('button', { name: /Drift Signals — 1 direction flagged/i })).not.toHaveTextContent('stale');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+
+    const staleButton = screen.getByRole('button', { name: /Drift Signals — 1 direction flagged/i });
+    expect(staleButton).toHaveTextContent('stale · as of 1m ago');
+    expect(staleButton).toHaveAttribute('title', 'Last drift poll failed; showing snapshot as of 1m ago.');
+    expect(staleButton.querySelector('div')?.className).toContain('opacity-75');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+
+    const recoveredButton = screen.getByRole('button', { name: /Drift Signals — 2 directions flagged/i });
+    expect(recoveredButton).not.toHaveTextContent('stale');
+    expect(recoveredButton).not.toHaveAttribute('title');
+    expect(recoveredButton.querySelector('div')?.className).not.toContain('opacity-75');
   });
 
   it('expands to show direction entries when clicked', async () => {

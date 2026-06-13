@@ -197,4 +197,29 @@ describe('PoolAccountHealthPanel', () => {
     expect(badge).toHaveTextContent('stale');
     expect(badge).toHaveTextContent('@12:00');
   });
+
+  it('renders a response-level stale chip when servedStale is true', () => {
+    const account = makeAccount();
+    render(
+      <PoolAccountHealthPanel
+        accounts={[account]}
+        loading={false}
+        servedStale
+        generatedAt="2026-06-13T00:00:00Z"
+      />,
+    );
+
+    // The response-level chip is distinct from the per-account usage_snapshot.stale
+    // indicator (which this account does not carry).
+    const chip = screen.getByTitle(/whole panel is a cached fallback/i);
+    expect(chip).toBeInTheDocument();
+    expect(chip).toHaveTextContent(/stale/i);
+  });
+
+  it('renders no response-level stale chip when servedStale is absent/false', () => {
+    const account = makeAccount();
+    render(<PoolAccountHealthPanel accounts={[account]} loading={false} />);
+
+    expect(screen.queryByTitle(/whole panel is a cached fallback/i)).not.toBeInTheDocument();
+  });
 });

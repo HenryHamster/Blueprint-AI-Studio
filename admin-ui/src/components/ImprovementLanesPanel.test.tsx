@@ -219,4 +219,51 @@ describe('ImprovementLanesPanel', () => {
 
     expect(await screen.findByText('drain failed')).toBeTruthy();
   });
+
+  test('renders correct badge classes for all five lane statuses', async () => {
+    const ALL_STATUSES_RESPONSE = {
+      lanes: [
+        { id: 'l-proposed', status: 'PROPOSED', direction_id: 'd-1', branch: 'lane/proposed', last_checkpoint_phase: null, last_checkpoint_seq: null, last_checkpoint_sha: null, last_checkpoint_age_seconds: null, checkpoint_loss_count: 0, workspace_state: null, workspace_vm_instance_id: null, reservation_expires_at: null, reserved_vm_instance_id: null, pilot_arm: null, phase_requeues: 0, llm_input_tokens_total: 0, llm_output_tokens_total: 0, vm_cost_usd_total: 0, reserved_idle_cost_usd_total: 0, shadow: false, created_at: '2026-06-11T10:00:00Z', updated_at: '2026-06-11T10:00:00Z' },
+        { id: 'l-active', status: 'ACTIVE', direction_id: 'd-2', branch: 'lane/active', last_checkpoint_phase: null, last_checkpoint_seq: null, last_checkpoint_sha: null, last_checkpoint_age_seconds: null, checkpoint_loss_count: 0, workspace_state: null, workspace_vm_instance_id: null, reservation_expires_at: null, reserved_vm_instance_id: null, pilot_arm: null, phase_requeues: 0, llm_input_tokens_total: 0, llm_output_tokens_total: 0, vm_cost_usd_total: 0, reserved_idle_cost_usd_total: 0, shadow: false, created_at: '2026-06-11T10:00:00Z', updated_at: '2026-06-11T10:00:00Z' },
+        { id: 'l-parked', status: 'PARKED', direction_id: 'd-3', branch: 'lane/parked', last_checkpoint_phase: null, last_checkpoint_seq: null, last_checkpoint_sha: null, last_checkpoint_age_seconds: null, checkpoint_loss_count: 0, workspace_state: null, workspace_vm_instance_id: null, reservation_expires_at: null, reserved_vm_instance_id: null, pilot_arm: null, phase_requeues: 0, llm_input_tokens_total: 0, llm_output_tokens_total: 0, vm_cost_usd_total: 0, reserved_idle_cost_usd_total: 0, shadow: false, created_at: '2026-06-11T10:00:00Z', updated_at: '2026-06-11T10:00:00Z' },
+        { id: 'l-retired', status: 'RETIRED', direction_id: 'd-4', branch: 'lane/retired', last_checkpoint_phase: null, last_checkpoint_seq: null, last_checkpoint_sha: null, last_checkpoint_age_seconds: null, checkpoint_loss_count: 0, workspace_state: null, workspace_vm_instance_id: null, reservation_expires_at: null, reserved_vm_instance_id: null, pilot_arm: null, phase_requeues: 0, llm_input_tokens_total: 0, llm_output_tokens_total: 0, vm_cost_usd_total: 0, reserved_idle_cost_usd_total: 0, shadow: false, created_at: '2026-06-11T10:00:00Z', updated_at: '2026-06-11T10:00:00Z' },
+        { id: 'l-killed', status: 'KILLED', direction_id: 'd-5', branch: 'lane/killed', last_checkpoint_phase: null, last_checkpoint_seq: null, last_checkpoint_sha: null, last_checkpoint_age_seconds: null, checkpoint_loss_count: 0, workspace_state: null, workspace_vm_instance_id: null, reservation_expires_at: null, reserved_vm_instance_id: null, pilot_arm: null, phase_requeues: 0, llm_input_tokens_total: 0, llm_output_tokens_total: 0, vm_cost_usd_total: 0, reserved_idle_cost_usd_total: 0, shadow: false, created_at: '2026-06-11T10:00:00Z', updated_at: '2026-06-11T10:00:00Z' },
+      ],
+      total_returned: 5,
+      offset: 0,
+      limit: 50,
+      project_id: 'proj-1',
+    };
+
+    fetchImprovementLanes.mockResolvedValueOnce(ALL_STATUSES_RESPONSE);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    expect(rows).toHaveLength(5);
+
+    const badges = rows.map((row) =>
+      row.querySelector('[class*="rounded"][class*="border"][class*="px-1.5"][class*="uppercase"]'),
+    );
+
+    // PROPOSED — slate neutral-pending
+    expect(badges[0]?.className).toContain('text-slate-300');
+    expect(badges[0]?.textContent).toBe('PROPOSED');
+
+    // ACTIVE — emerald
+    expect(badges[1]?.className).toContain('text-emerald-300');
+    expect(badges[1]?.textContent).toBe('ACTIVE');
+
+    // PARKED — amber
+    expect(badges[2]?.className).toContain('text-amber-300');
+    expect(badges[2]?.textContent).toBe('PARKED');
+
+    // RETIRED — sky/teal completed look
+    expect(badges[3]?.className).toContain('text-sky-300');
+    expect(badges[3]?.textContent).toBe('RETIRED');
+
+    // KILLED — red failure look
+    expect(badges[4]?.className).toContain('text-red-300');
+    expect(badges[4]?.textContent).toBe('KILLED');
+  });
 });

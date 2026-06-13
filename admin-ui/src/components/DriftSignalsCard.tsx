@@ -2,6 +2,7 @@ import { useState, useCallback } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '../api';
 import { usePoller } from '../hooks/usePoller';
+import { timeAgo } from '../utils/time';
 
 interface DriftHistoryPoint {
   snapshot_at: string;
@@ -62,14 +63,24 @@ function scoreBadgeClass(score: number): string {
 
 export function DriftSignalsCard({ projectId }: { projectId: string }) {
   const [snapshot, setSnapshot] = useState<DriftSnapshot | null>(null);
+  const [pollFailed, setPollFailed] = useState(false);
+  const [lastSuccessAt, setLastSuccessAt] = useState<number | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [systemsExpanded, setSystemsExpanded] = useState(false);
 
   const fetchSnapshot = useCallback(async () => {
     try {
       const res = await apiFetch(`/api/admin/drift-snapshot?project_id=${encodeURIComponent(projectId)}`);
-      if (res.ok) setSnapshot(await res.json());
-    } catch { /* silent */ }
+      if (res.ok) {
+        setSnapshot(await res.json());
+        setLastSuccessAt(Date.now());
+        setPollFailed(false);
+      } else {
+        setPollFailed(true);
+      }
+    } catch {
+      setPollFailed(true);
+    }
   }, [projectId]);
 
   usePoller(fetchSnapshot, { intervalMs: 60_000, deps: [fetchSnapshot] });
@@ -77,6 +88,7 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
   if (!snapshot || snapshot.flagged_count === 0) return null;
 
   const { flagged_directions, flagged_count } = snapshot;
+  const staleLabel = pollFailed && lastSuccessAt != null ? `as of ${timeAgo(lastSuccessAt)}` : null;
   const flaggedSystems = Object.entries(snapshot.by_system ?? {}).filter(
     ([, signal]) => signal.over_claim_flag || signal.stalled_despite_churn_flag,
   );
@@ -89,12 +101,16 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
         className="w-full text-left"
         onClick={() => setExpanded(v => !v)}
         aria-expanded={expanded}
+        title={staleLabel ? `Last drift poll failed; showing snapshot ${staleLabel}.` : undefined}
       >
-        <div className="flex items-center gap-2 bg-amber-900/20 border border-amber-500/30 rounded-lg px-3 py-2">
+        <div className={`flex items-center gap-2 bg-amber-900/20 border rounded-lg px-3 py-2 ${pollFailed ? 'border-amber-400/50 opacity-75' : 'border-amber-500/30'}`}>
           <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
           <span className="text-xs font-semibold text-amber-300">
             Drift Signals — {flagged_count} direction{flagged_count !== 1 ? 's' : ''} flagged
           </span>
+          {staleLabel && (
+            <span className="text-[10px] text-amber-300">stale · {staleLabel}</span>
+          )}
           {expanded
             ? <ChevronDown className="w-3.5 h-3.5 text-amber-400 ml-auto" />
             : <ChevronRight className="w-3.5 h-3.5 text-amber-400 ml-auto" />}

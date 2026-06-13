@@ -95,6 +95,39 @@ describe('DetailsTab — parked wake registration', () => {
   });
 });
 
+describe('DetailsTab — dependency status colors', () => {
+  afterEach(() => cleanup());
+
+  function makeDepTask(status: Task['status']): Task {
+    return {
+      id: 'dep-1',
+      title: 'Dependency task',
+      description: 'dep',
+      status,
+      task_type: 'create',
+      created_at: '2024-01-01T00:00:00Z',
+      created_by: 'ORCHESTRATOR',
+      requires_approval: false,
+    };
+  }
+
+  it('colors a BLOCKED dependency item with amber text', () => {
+    const task = makeTask({ depends_on: ['dep-1'] });
+    const depTask = makeDepTask('BLOCKED');
+    render(<DetailsTab task={task} tasks={[task, depTask]} />);
+    const statusLabel = screen.getByText('BLOCKED');
+    expect(statusLabel.className).toContain('amber');
+  });
+
+  it('colors a PARKED dependency item with purple text', () => {
+    const task = makeTask({ depends_on: ['dep-1'] });
+    const depTask = makeDepTask('PARKED');
+    render(<DetailsTab task={task} tasks={[task, depTask]} />);
+    const statusLabel = screen.getByText('PARKED');
+    expect(statusLabel.className).toContain('purple');
+  });
+});
+
 describe('DetailsTab — Merge Test Gate', () => {
   afterEach(() => cleanup());
 

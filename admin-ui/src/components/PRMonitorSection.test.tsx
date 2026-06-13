@@ -83,6 +83,20 @@ describe('PRMonitorSection', () => {
   it('renders "No open PRs" when hasProject=true, not loading, and openPRs is empty', () => {
     render(<PRMonitorSection {...baseProps} loading={false} openPRs={[]} />);
     expect(screen.getByText('No open PRs')).toBeInTheDocument();
+    expect(screen.queryByTestId('open-prs-stale-badge')).toBeNull();
+  });
+
+  it('renders an outage badge when the empty response is degraded', () => {
+    render(
+      <PRMonitorSection
+        {...baseProps}
+        loading={false}
+        openPRs={[]}
+        degraded={true}
+      />,
+    );
+    expect(screen.getByTestId('open-prs-stale-badge')).toHaveTextContent('GitHub unreachable');
+    expect(screen.getAllByText('GitHub unreachable')).toHaveLength(2);
   });
 
   it('renders an orphaned PR with "No active task" and a red dot indicator', () => {

@@ -1,6 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { DEFAULT_POLL_MS, __pollerInternals } from '../hooks/usePoller';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -21,6 +22,10 @@ import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 
 function jsonResponse(data: unknown): Response {
   return { ok: true, json: async () => data } as Response;
+}
+
+function errorResponse(): Response {
+  return { ok: false, status: 503, json: async () => ({}) } as Response;
 }
 
 function makeRow(overrides: Record<string, unknown> = {}) {
@@ -59,6 +64,11 @@ function inTable() {
 describe('ProviderModelBreakdownPanel', () => {
   beforeEach(() => {
     apiFetchMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    __pollerInternals.reset();
   });
 
   it('renders nothing when rows array is empty', async () => {
@@ -257,5 +267,59 @@ describe('ProviderModelBreakdownPanel', () => {
     await user.click(screen.getByText('Hide single-account'));
     expect(inTable().queryByText('model-a')).not.toBeInTheDocument();
     expect(inTable().getByText('model-b')).toBeInTheDocument();
+  });
+
+  it('renders a stale / as-of affordance when the response was served stale', async () => {
+    const generatedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    apiFetchMock.mockResolvedValue(
+      jsonResponse({ rows: [makeRow()], served_stale: true, generated_at: generatedAt }),
+    );
+
+    render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
+    await act(async () => {});
+
+    // Rows still render ...
+    expect(inTable().getByText('claude-opus-4-7')).toBeInTheDocument();
+    // ... but explicitly marked as a non-live, cached reading.
+    expect(screen.getByText(/stale/i)).toBeInTheDocument();
+  });
+
+  it('does not unmount on an initial fetch failure — shows an error affordance', async () => {
+    apiFetchMock.mockResolvedValue(errorResponse());
+
+    const { container } = render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
+    await act(async () => {});
+
+    // The panel must NOT disappear (the bug) — it renders an explicit error.
+    expect(container.firstChild).not.toBeNull();
+    expect(screen.getByText(/could not load/i)).toBeInTheDocument();
+  });
+
+  it('keeps the panel mounted with a stale affordance after a poll fails following a prior success', async () => {
+    vi.useFakeTimers();
+    __pollerInternals.reset();
+    apiFetchMock
+      .mockResolvedValueOnce(jsonResponse({ rows: [makeRow()], served_stale: false }))
+      .mockResolvedValue(errorResponse());
+
+    render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
+    // Flush the leading (successful) load.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(inTable().getByText('claude-opus-4-7')).toBeInTheDocument();
+    expect(screen.queryByText(/stale/i)).not.toBeInTheDocument();
+
+    // Advance to the next poll tick, which now fails.
+    await act(async () => {
+      vi.advanceTimersByTime(DEFAULT_POLL_MS);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Last-good rows stay mounted, but are now flagged as stale.
+    expect(inTable().getByText('claude-opus-4-7')).toBeInTheDocument();
+    expect(screen.getByText(/stale/i)).toBeInTheDocument();
   });
 });

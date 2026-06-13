@@ -45,12 +45,17 @@ function SkeletonRow() {
   return <div className="animate-pulse bg-neutral-800/60 rounded h-10 w-full" />;
 }
 
-export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget, onSpawnFixTask, onPanelReviewPr, stale }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null; onSpawnFixTask?: (pr: OpenPR) => void; onPanelReviewPr?: (pr: OpenPR) => void; stale?: boolean }) {
+export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget, onSpawnFixTask, onPanelReviewPr, stale, degraded }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null; onSpawnFixTask?: (pr: OpenPR) => void; onPanelReviewPr?: (pr: OpenPR) => void; stale?: boolean; degraded?: boolean }) {
   const [expanded, setExpanded] = useState(true);
   const [dismissedPrs, setDismissedPrs] = useState<Set<number>>(() => new Set());
   const tasksById = React.useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
   const busy = loading || refreshing;
   const visiblePRs = React.useMemo(() => openPRs.filter(pr => !dismissedPrs.has(pr.pr_number)), [openPRs, dismissedPrs]);
+  const hasOutage = Boolean(degraded || stale);
+  const staleBadgeLabel = degraded || (stale && openPRs.length === 0) ? 'GitHub unreachable' : 'cached';
+  const staleBadgeTitle = degraded || (stale && openPRs.length === 0)
+    ? 'GitHub is unreachable — showing outage state'
+    : 'Last PR refresh failed — showing cached data';
 
   return (
     <section className="mt-4">
@@ -73,14 +78,14 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
             <RefreshCw className={`w-3 h-3 ${busy ? 'animate-spin' : ''}`} />
           </button>
         )}
-        {stale && openPRs.length > 0 && (
+        {hasOutage && (
           <span
             data-testid="open-prs-stale-badge"
-            title="Last PR refresh failed — showing cached data"
+            title={staleBadgeTitle}
             className="flex items-center gap-1 text-[10px] text-amber-400"
           >
             <AlertTriangle className="w-3 h-3" />
-            cached
+            {staleBadgeLabel}
           </span>
         )}
       </div>
@@ -90,7 +95,9 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
         ) : loading ? (
           <div className="space-y-2"><SkeletonRow /><SkeletonRow /></div>
         ) : visiblePRs.length === 0 ? (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No open PRs</div>
+          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
+            {hasOutage ? 'GitHub unreachable' : 'No open PRs'}
+          </div>
         ) : (
           <div className="space-y-1.5 max-h-[400px] overflow-y-auto custom-scrollbar">
             {visiblePRs.map(pr => (

@@ -50,6 +50,8 @@ const OUTCOME_STYLES: Record<string, { icon: typeof CheckCircle; color: string; 
   EVALUATING: { icon: Clock, color: 'text-amber-400', label: 'Evaluating' },
   QUEUED: { icon: Clock, color: 'text-neutral-400', label: 'Queued' },
   PROVISIONING: { icon: Clock, color: 'text-neutral-400', label: 'Starting' },
+  BLOCKED: { icon: Clock, color: 'text-amber-400', label: 'Blocked' },
+  PARKED: { icon: Clock, color: 'text-purple-400', label: 'Parked' },
   FAILED: { icon: XCircle, color: 'text-red-400', label: 'Failed' },
   CANCELLED: { icon: Minus, color: 'text-neutral-500', label: 'Cancelled' },
 };
@@ -261,7 +263,7 @@ function OutcomeSummaryPills({ summary }: { summary: TaskEvaluationSummary }) {
 
 type OutcomeFilter = 'all' | 'shipped' | 'in_progress' | 'proposed' | 'failed' | 'findings_documented';
 
-const IN_PROGRESS_OUTCOMES = new Set(['IN_PROGRESS', 'EVALUATING', 'QUEUED', 'PROVISIONING']);
+const IN_PROGRESS_OUTCOMES = new Set(['IN_PROGRESS', 'EVALUATING', 'QUEUED', 'PROVISIONING', 'BLOCKED', 'PARKED']);
 const FAILED_OUTCOMES = new Set(['FAILED', 'CANCELLED']);
 
 const METADATA_FINDING_TYPES = new Set(['design_doc_observation', 'direction_note', 'direction_proposal', 'direction_update']);

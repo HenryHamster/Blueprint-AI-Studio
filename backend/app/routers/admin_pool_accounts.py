@@ -8,6 +8,7 @@ legacy Anthropic OAuth path for existing clients.
 import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -21,6 +22,7 @@ from app.admin_helpers import _get_user_project
 from app.auth import get_current_user
 from app.database import get_session, resolve_dialect_name
 from app.digest_cache import DigestCache, get_digest_cache
+from app.digest_precompute import annotate_precompute_metadata
 from app.models import (
     Alert,
     AlertSeverity,
@@ -224,6 +226,39 @@ def _parse_cap(payload: Dict[str, Any], field: str) -> int | None | object:
 
 _UNSET = object()
 
+
+def _annotate_response_freshness(
+    result: Dict[str, Any], served_stale: bool
+) -> Dict[str, Any]:
+    """Stamp response-level freshness onto a cached pool-account payload.
+
+    Mirrors the digest / health-overview contract (see admin_health.py): the
+    age is derived from the payload's OWN ``generated_at`` (not the cache's
+    wall age) so a served-stale fallback that is hours old reports a large
+    ``precompute_age_seconds`` and ``served_stale=True`` — an operator can
+    never mistake a frozen cache reading for a live one. All added keys are
+    additive; the existing ``accounts`` / ``rows`` payload is untouched.
+    """
+    generated_at = result.get("generated_at") if isinstance(result, dict) else None
+    age_seconds: float | None = None
+    if generated_at:
+        try:
+            age_seconds = max(
+                0.0,
+                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
+            )
+        except (ValueError, TypeError):
+            age_seconds = None
+    annotated = annotate_precompute_metadata(
+        result,
+        precomputed=False,
+        precomputed_at=generated_at,
+        precompute_age_seconds=age_seconds,
+    )
+    annotated["served_stale"] = served_stale
+    return annotated
+
+
 _HEALTH_FAILURE_CLASSES = (
     "CODE_ERROR",
     "RATE_LIMIT",
@@ -258,13 +293,14 @@ async def get_account_health_summary(
     """
     user_id = current_user["user_id"]
     cache_key = ("max-plan-accounts-health", user_id)
-    return await cache.get_or_compute(
+    result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_account_health_summary(
             user_id=user_id,
             session=session,
         ),
     )
+    return _annotate_response_freshness(result, served_stale)
 
 
 async def _compute_account_health_summary(
@@ -397,7 +433,7 @@ async def _compute_account_health_summary(
             }
         )
 
-    return {"accounts": accounts}
+    return {"accounts": accounts, "generated_at": now.isoformat()}
 
 
 @router.get("/max-plan-accounts/provider-model-breakdown")
@@ -430,7 +466,9 @@ async def get_provider_model_breakdown(
     )
     user_acct_id_strs = [str(aid) for aid in user_acct_ids]
     if not user_acct_id_strs:
-        return {"rows": []}
+        return _annotate_response_freshness(
+            {"rows": [], "generated_at": _utcnow().isoformat()}, served_stale=False
+        )
 
     cache_key = (
         "provider-model-breakdown",
@@ -438,7 +476,7 @@ async def get_provider_model_breakdown(
         str(project_id) if project_id is not None else None,
         expand_accounts,
     )
-    return await cache.get_or_compute(
+    result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_provider_model_breakdown(
             session=session,
@@ -447,6 +485,7 @@ async def get_provider_model_breakdown(
             project_id=project_id,
         ),
     )
+    return _annotate_response_freshness(result, served_stale)
 
 
 async def _compute_provider_model_breakdown(
@@ -461,7 +500,7 @@ async def _compute_provider_model_breakdown(
     rows = await compute_provider_model_breakdown(
         session, account_ids, expand_accounts=expand_accounts, project_id=project_id
     )
-    return {"rows": rows}
+    return {"rows": rows, "generated_at": _utcnow().isoformat()}
 
 
 @router.post("/max-plan-accounts")

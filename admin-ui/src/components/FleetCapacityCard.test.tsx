@@ -92,6 +92,45 @@ describe('FleetCapacityCard', () => {
     expect(getByText('5 / 20')).toBeTruthy();
   });
 
+  test('marks and dims stale snapshots when backend served a stale fallback', () => {
+    const { container, getByText } = render(
+      <FleetCapacityCard
+        data={makeSnapshot({
+          precomputed: true,
+          precomputed_at: '2024-01-01T00:00:00',
+          precompute_age_seconds: 30,
+          served_stale: true,
+        })}
+        loading={false}
+      />,
+    );
+    expect(getByText(/as of .*stale/)).toBeTruthy();
+    expect(container.querySelector('.opacity-60.saturate-50')).toBeTruthy();
+  });
+
+  test('marks cached snapshots stale when their age exceeds the threshold', () => {
+    const { getByText } = render(
+      <FleetCapacityCard
+        data={makeSnapshot({
+          precomputed: true,
+          precomputed_at: '2024-01-01T00:00:00',
+          precompute_age_seconds: 121,
+        })}
+        loading={false}
+      />,
+    );
+    expect(getByText(/as of .*stale/)).toBeTruthy();
+  });
+
+  test('renders older fleet payloads without a freshness affordance', () => {
+    const { container, getByText, queryByText } = render(
+      <FleetCapacityCard data={makeSnapshot({ active_now: 5, nominal_capacity: 20 })} loading={false} />,
+    );
+    expect(queryByText(/as of/)).toBeNull();
+    expect(container.querySelector('.opacity-60.saturate-50')).toBeNull();
+    expect(getByText('5 / 20')).toBeTruthy();
+  });
+
   test('shows utilization percentages', () => {
     const { getByText } = render(
       <FleetCapacityCard data={makeSnapshot({ util_avg: 0.75, util_now: 0.3 })} loading={false} />,

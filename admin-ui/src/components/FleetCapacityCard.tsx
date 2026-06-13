@@ -1,8 +1,12 @@
 import { AlertTriangle } from 'lucide-react';
 import { Skeleton } from './DashboardMetricCards';
+import { snapshotFreshness } from '../utils/time';
 import type { AgentServingShasResponse, FleetUtilizationResponse } from '../api';
 
 export type { FleetUtilizationResponse };
+
+const SNAPSHOT_STALE_AFTER_SECONDS = 120;
+const STALE_CLASSES = 'opacity-60 saturate-50';
 
 const _SAT_STYLE: Record<string, { badge: string; label: string }> = {
   healthy:   { badge: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400', label: 'Healthy' },
@@ -57,6 +61,12 @@ export function FleetCapacityCard({
     : null;
   const shaBuckets = agentServingShas?.fleet.buckets ?? [];
   const unknownCount = agentServingShas?.fleet.unknown_count ?? 0;
+  const { asOfLabel, stale: freshnessStale } = snapshotFreshness(
+    data?.precomputed_at,
+    data?.precompute_age_seconds,
+    SNAPSHOT_STALE_AFTER_SECONDS,
+  );
+  const stale = freshnessStale || data?.served_stale === true;
 
   return (
     <section>
@@ -72,6 +82,14 @@ export function FleetCapacityCard({
             Unknown
           </span>
         )}
+        {!loading && data && asOfLabel && (
+          <span
+            className={`text-[10px] ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-500'}`}
+            title={stale ? 'Cached snapshot is stale — may not reflect current fleet capacity' : 'When this fleet-capacity snapshot was computed'}
+          >
+            {stale && '⚠ '}as of {asOfLabel}{stale && ' · stale'}
+          </span>
+        )}
       </div>
       {loading ? (
         <div className="space-y-2"><Skeleton className="h-10 w-full" /></div>
@@ -81,7 +99,7 @@ export function FleetCapacityCard({
           Fleet capacity data unavailable
         </div>
       ) : (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2">
+        <div className={`bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 ${stale ? STALE_CLASSES : ''}`}>
           <div className="flex flex-wrap gap-2">
             <div className="flex items-center gap-1.5 text-xs">
               <span className="text-neutral-500">Active</span>

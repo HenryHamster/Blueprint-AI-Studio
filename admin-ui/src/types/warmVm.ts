@@ -266,6 +266,10 @@ export interface WarmPoolTargetSetResponse {
 
 export interface WarmVmStateResponse {
   active_vms: WarmVmRow[];
+  precomputed?: boolean;
+  precomputed_at?: string | null;
+  precompute_age_seconds?: number | null;
+  served_stale?: boolean;
   // Whether warm_pool_account_retarget_enabled is on (any idle member serves
   // any account in the tenant). Optional for backward compatibility with older
   // backends that predate the field; panel treats absent as false.

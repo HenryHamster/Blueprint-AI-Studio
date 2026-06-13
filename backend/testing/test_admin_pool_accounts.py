@@ -1,10 +1,15 @@
+import asyncio
 import uuid
 from datetime import datetime, timedelta
+from typing import Any, Dict
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlmodel import select
 
+from app.digest_cache import DigestCache, get_digest_cache
+from app.main import app
+from app.routers import admin_pool_accounts as _admin_pool_accounts
 from app.max_plan_pool import _account_by_id, _max_plan_pools
 from app.models import (
     LLMAuthMode,
@@ -1741,3 +1746,125 @@ async def test_provider_model_breakdown_project_id_rejects_non_member(client, db
         f"/api/admin/max-plan-accounts/provider-model-breakdown?project_id={other_project.id}"
     )
     assert res.status_code == 404
+
+
+# ── response-level served-stale freshness annotation ────────────────────────
+
+
+async def test_provider_model_breakdown_serve_stale_annotates_response(
+    client, db_session, mocker
+):
+    """When the live compute fails and the cache serves the last-good payload,
+    the breakdown response must carry served_stale=True plus a large
+    precompute_age_seconds derived from the payload's own generated_at — so a
+    hours-old fallback can never be shown as a live reading. A fresh compute
+    reports served_stale=False.
+
+    Mirrors the short-TTL + compute-fails-after-one-success pattern from
+    test_admin_endpoint_cache.py.
+    """
+    # An account must exist for test-user-123 so the endpoint reaches the cache
+    # path rather than short-circuiting on the empty-accounts branch.
+    acct = MaxPlanAccount(
+        id=uuid.uuid4(),
+        user_id="test-user-123",
+        name="stale-test",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    short_cache = DigestCache(default_ttl=0.05, stale_retry_ttl=60)
+    app.dependency_overrides[get_digest_cache] = lambda: short_cache
+
+    old_iso = (_admin_pool_accounts._utcnow() - timedelta(hours=2)).isoformat()
+    good: Dict[str, Any] = {
+        "rows": [
+            {
+                "provider": "anthropic",
+                "model": "claude-3-5",
+                "total_tasks": 7,
+                "success_count": 6,
+                "success_rate": 6 / 7,
+                "distinct_accounts": 1,
+                "project_median_success_rate": 6 / 7,
+            }
+        ],
+        "generated_at": old_iso,
+    }
+    spy = AsyncMock(side_effect=[good, RuntimeError("statement timeout")])
+    mocker.patch.object(
+        _admin_pool_accounts, "_compute_provider_model_breakdown", spy
+    )
+
+    try:
+        r1 = await client.get(
+            "/api/admin/max-plan-accounts/provider-model-breakdown"
+        )
+        await asyncio.sleep(0.1)  # expire the fresh entry → next poll recomputes
+        r2 = await client.get(
+            "/api/admin/max-plan-accounts/provider-model-breakdown"
+        )
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    # Fresh compute: live verdict.
+    assert r1.status_code == 200
+    b1 = r1.json()
+    assert b1["rows"][0]["model"] == "claude-3-5"
+    assert b1["served_stale"] is False
+    assert b1["precomputed"] is False
+
+    # Served-stale fallback: same last-good rows, but explicitly marked not-live.
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["rows"][0]["model"] == "claude-3-5"  # last-good payload preserved
+    assert b2["served_stale"] is True
+    assert b2["precompute_age_seconds"] > 120  # derived from 2h-old generated_at
+    assert spy.call_count == 2
+
+
+async def test_account_health_summary_annotates_fresh_freshness(
+    client, db_session, mocker
+):
+    """The health endpoint stamps a truthful live-freshness signal on a fresh
+    compute: served_stale=False, precomputed=False, and a generated_at the
+    panel can render an as-of label from."""
+    short_cache = DigestCache(default_ttl=60.0)
+    app.dependency_overrides[get_digest_cache] = lambda: short_cache
+
+    generated = _admin_pool_accounts._utcnow().isoformat()
+    payload: Dict[str, Any] = {"accounts": [], "generated_at": generated}
+    spy = AsyncMock(return_value=payload)
+    mocker.patch.object(
+        _admin_pool_accounts, "_compute_account_health_summary", spy
+    )
+
+    try:
+        res = await client.get("/api/admin/max-plan-accounts/health")
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["accounts"] == []
+    assert body["served_stale"] is False
+    assert body["precomputed"] is False
+    assert body["generated_at"] == generated
+    assert body["precompute_age_seconds"] is not None
+    assert body["precompute_age_seconds"] < 60
+
+
+async def test_provider_model_breakdown_empty_accounts_carries_freshness(
+    client, db_session
+):
+    """The no-accounts early-return path is annotated consistently so the
+    response still carries served_stale / generated_at (never a bare rows:[])."""
+    res = await client.get("/api/admin/max-plan-accounts/provider-model-breakdown")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["rows"] == []
+    assert body["served_stale"] is False
+    assert "generated_at" in body
+    assert "precompute_age_seconds" in body

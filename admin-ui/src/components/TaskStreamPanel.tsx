@@ -28,6 +28,8 @@ function statusDotColor(status?: string): string {
     case 'FAILED': return 'bg-red-500';
     case 'CANCELLED': return 'bg-neutral-500';
     case 'QUEUED': return 'bg-neutral-400';
+    case 'BLOCKED': return 'bg-amber-500';
+    case 'PARKED': return 'bg-purple-500';
     default: return 'bg-neutral-600';
   }
 }

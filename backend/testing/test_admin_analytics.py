@@ -1750,7 +1750,13 @@ class TestOpenPrs:
         resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
 
         assert resp.status_code == 200
-        assert resp.json() == {"open_prs": []}
+        assert resp.json() == {
+            "open_prs": [],
+            "project_integration_branch": "main",
+            "project_promotion_target": "main",
+            "degraded": False,
+            "degraded_reason": None,
+        }
         token_mock.assert_not_awaited()
         prs_mock.assert_not_awaited()
 
@@ -1770,9 +1776,18 @@ class TestOpenPrs:
         monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
 
         resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+        cached = await client.get(f"/api/admin/open-prs?project_id={project.id}")
 
         assert resp.status_code == 200
-        assert resp.json() == {"open_prs": []}
+        assert resp.json() == {
+            "open_prs": [],
+            "project_integration_branch": "main",
+            "project_promotion_target": "main",
+            "degraded": True,
+            "degraded_reason": "github_token_error",
+        }
+        assert cached.status_code == 200
+        assert cached.json() == resp.json()
         token_mock.assert_awaited_once()
         prs_mock.assert_not_awaited()
 
@@ -1794,9 +1809,43 @@ class TestOpenPrs:
         resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
 
         assert resp.status_code == 200
-        assert resp.json() == {"open_prs": []}
+        assert resp.json() == {
+            "open_prs": [],
+            "project_integration_branch": "main",
+            "project_promotion_target": "main",
+            "degraded": True,
+            "degraded_reason": "no_token",
+        }
         token_mock.assert_awaited_once()
         prs_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_healthy_empty_response_is_not_degraded(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project = make_project(github_owner="acme", github_repo="widgets")
+        db_session.add(project)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value="token")
+        prs_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "open_prs": [],
+            "project_integration_branch": "main",
+            "project_promotion_target": "main",
+            "degraded": False,
+            "degraded_reason": None,
+        }
+        token_mock.assert_awaited_once()
+        prs_mock.assert_awaited_once_with("token", "acme", "widgets")
 
     @pytest.mark.asyncio
     async def test_unmatched_github_pr_is_orphaned(
@@ -1835,6 +1884,8 @@ class TestOpenPrs:
             ],
             "project_integration_branch": "main",
             "project_promotion_target": "main",
+            "degraded": False,
+            "degraded_reason": None,
         }
         token_mock.assert_awaited_once()
         prs_mock.assert_awaited_once_with("token", "acme", "widgets")

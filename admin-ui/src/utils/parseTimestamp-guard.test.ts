@@ -2,6 +2,14 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import path from 'path';
 
+function expectNamedImport(file: string, name: string, source: string) {
+  const importPattern = new RegExp(
+    `import\\s+\\{([^}]+)\\}\\s+from\\s+['"]${source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`
+  );
+  const match = file.match(importPattern);
+  expect(match?.[1].split(',').map(part => part.trim())).toContain(name);
+}
+
 /**
  * Guard test: prevents regression of the timezone-shift bug.
  *
@@ -50,7 +58,7 @@ describe('parseTimestamp guard: prevent direct new Date(apiString)', () => {
       path.join(__dirname, '../components/ProviderModelBreakdownPanel.tsx'),
       'utf-8'
     );
-    expect(file).toContain("import { parseTimestamp } from '../utils/time'");
+    expectNamedImport(file, 'parseTimestamp', '../utils/time');
   });
 
   it('ProviderModelBreakdownPanel.tsx uses parseTimestamp for dates', () => {

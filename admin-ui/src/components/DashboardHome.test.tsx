@@ -716,6 +716,36 @@ describe('DashboardHome', () => {
     expect(screen.getByText('120c 2rl')).toBeInTheDocument();
   });
 
+  it('threads response-level served_stale from the health endpoint into the pool panel', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+      accountHealth: {
+        served_stale: true,
+        generated_at: '2026-06-13T00:00:00Z',
+        accounts: [
+          {
+            account_id: 'acct-1',
+            label: 'Main Anthropic',
+            provider: 'anthropic',
+            state: 'healthy',
+            health_score: 0.92,
+            completions_24h: 120,
+            rl_events_24h: 2,
+            rate_limited_models: [],
+            failure_class_counts: {},
+          },
+        ],
+      },
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    expect(await screen.findByText('Provider Account Health')).toBeInTheDocument();
+    // The response-level stale chip is present because served_stale flowed through.
+    expect(screen.getByTitle(/whole panel is a cached fallback/i)).toBeInTheDocument();
+  });
+
   it('shows disabled state with reason and expands to reveal quota-vs-cooldown badges', async () => {
     setupApiMocks({
       digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
@@ -2742,6 +2772,35 @@ describe('DashboardHome', () => {
       expect(screen.queryByText(/Backend unreachable/)).not.toBeInTheDocument();
     });
 
+    it('passes degraded=true to PRMonitorSection when open-prs payload is degraded', async () => {
+      const validDigest = {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      };
+
+      setupApiMocks({
+        digest: validDigest,
+        diagnostics: makeDiagnostics(),
+        openPRs: {
+          open_prs: [],
+          project_integration_branch: 'main',
+          project_promotion_target: 'main',
+          degraded: true,
+          degraded_reason: 'github_token_error',
+        },
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      await screen.findByText('All systems healthy');
+
+      expect(capturedProps.prMonitor?.stale).toBeFalsy();
+      expect(capturedProps.prMonitor?.degraded).toBe(true);
+    });
+
     it('passes stale=true to PRMonitorSection when open-prs fetch fails after prior success', async () => {
       const validDigest = {
         failed_count: 0,
@@ -2759,6 +2818,25 @@ describe('DashboardHome', () => {
 
       // PRMonitorSection should receive stale=false initially
       expect(capturedProps.prMonitor?.stale).toBeFalsy();
+
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(validDigest));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/api/admin/open-prs')) return Promise.resolve(errorResponse(503));
+        if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+        return Promise.resolve(notFoundResponse());
+      });
+
+      const refresh = capturedProps.prMonitor?.onRefresh as (() => Promise<void>) | undefined;
+      expect(refresh).toBeDefined();
+      if (refresh) {
+        await refresh();
+      }
+
+      await waitFor(() => {
+        expect(capturedProps.prMonitor?.stale).toBe(true);
+      });
+      expect(capturedProps.prMonitor?.degraded).toBeFalsy();
     });
   });
 });

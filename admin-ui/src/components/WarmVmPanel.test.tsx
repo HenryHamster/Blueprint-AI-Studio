@@ -146,6 +146,46 @@ describe('WarmVmPanel — backlog-reuse toggle + attribution', () => {
     expect(chainLabel.parentElement?.textContent).toContain('1');
   });
 
+  test('marks and dims stale snapshots when backend served a stale fallback', async () => {
+    const staleState: WarmVmStateResponse = {
+      ...baseState,
+      precomputed: true,
+      precomputed_at: '2024-01-01T00:00:00',
+      precompute_age_seconds: 30,
+      served_stale: true,
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(staleState), { status: 200 }),
+    );
+    const { container } = render(<WarmVmPanel onViewTask={() => {}} />);
+
+    expect(await screen.findByText(/as of .*stale/)).toBeTruthy();
+    expect(container.querySelector('.opacity-60.saturate-50')).toBeTruthy();
+  });
+
+  test('marks cached warm-VM snapshots stale when their age exceeds the threshold', async () => {
+    const staleState: WarmVmStateResponse = {
+      ...baseState,
+      precomputed: true,
+      precomputed_at: '2024-01-01T00:00:00',
+      precompute_age_seconds: 121,
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(staleState), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    expect(await screen.findByText(/as of .*stale/)).toBeTruthy();
+  });
+
+  test('renders older warm-VM payloads without a freshness affordance', async () => {
+    const { container } = render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByText(/as of/)).toBeNull();
+    expect(container.querySelector('.opacity-60.saturate-50')).toBeNull();
+  });
+
   test('renders pool-origin claim count and share as their own bucket', async () => {
     const stateWithPoolOrigin: WarmVmStateResponse = {
       ...baseState,

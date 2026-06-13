@@ -106,6 +106,14 @@ export interface DashboardHomeProps {
   userRole?: 'admin' | 'user' | null;
 }
 
+interface OpenPrsResponse {
+  open_prs?: OpenPR[];
+  project_integration_branch?: string | null;
+  project_promotion_target?: string | null;
+  degraded?: boolean;
+  degraded_reason?: string | null;
+}
+
 // ---------- component ----------
 
 const WINDOW_OPTIONS = [
@@ -121,12 +129,15 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
   const [digestStale, setDigestStale] = useState(false);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [openPRsStale, setOpenPRsStale] = useState(false);
+  const [openPRsDegraded, setOpenPRsDegraded] = useState(false);
   const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
   const [openPRsPromotionTarget, setOpenPRsPromotionTarget] = useState<string | null>(null);
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
   const [scopeBaselines, setScopeBaselines] = useState<ScopeBaselinesResponse | null>(null);
   const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
   const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
+  const [accountHealthServedStale, setAccountHealthServedStale] = useState(false);
+  const [accountHealthGeneratedAt, setAccountHealthGeneratedAt] = useState<string | null>(null);
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [versionLifecycle, setVersionLifecycle] = useState<VersionLifecycleResponse | null>(null);
@@ -169,11 +180,14 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     setDigestStale(false);
     setOpenPRs([]);
     setOpenPRsStale(false);
+    setOpenPRsDegraded(false);
     setOpenPRsIntegrationBranch(null);
     setOpenPRsPromotionTarget(null);
     setMeasurementData(null);
     setScopeBaselines(null);
     setAccountHealth(null);
+    setAccountHealthServedStale(false);
+    setAccountHealthGeneratedAt(null);
     setSystemMaturity(null);
     setTaskDurationStats(null);
     setVersionLifecycle(null);
@@ -206,10 +220,15 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     try {
       const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
       if (res.ok && requestId === openPRsRequestIdRef.current) {
-        const data = await res.json();
+        const data = await res.json() as OpenPrsResponse;
         setOpenPRs(data.open_prs ?? []);
         setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
         setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
+        setOpenPRsDegraded(Boolean(data.degraded));
+        setOpenPRsStale(false);
+      } else if (requestId === openPRsRequestIdRef.current) {
+        setOpenPRsStale(true);
+        setOpenPRsDegraded(false);
       }
     } catch { /* silent */ }
     finally {
@@ -316,17 +335,22 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
           try {
             const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
             if (res.ok && requestId === dashboardRequestIdRef.current) {
-              const data = await res.json();
+              const data = await res.json() as OpenPrsResponse;
               setOpenPRs(data.open_prs ?? []);
               setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
               setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
+              setOpenPRsDegraded(Boolean(data.degraded));
               setOpenPRsStale(false);
               openPRsOk = true;
             } else if (requestId === dashboardRequestIdRef.current) {
               setOpenPRsStale(true);
+              setOpenPRsDegraded(false);
             }
           } catch {
-            if (requestId === dashboardRequestIdRef.current) setOpenPRsStale(true);
+            if (requestId === dashboardRequestIdRef.current) {
+              setOpenPRsStale(true);
+              setOpenPRsDegraded(false);
+            }
           }
         })(),
         (async () => {
@@ -347,6 +371,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
             if (res.ok && requestId === dashboardRequestIdRef.current) {
               const data = await res.json();
               setAccountHealth(data.accounts ?? []);
+              setAccountHealthServedStale(data.served_stale === true);
+              setAccountHealthGeneratedAt(
+                typeof data.generated_at === 'string' ? data.generated_at : null,
+              );
             }
           } catch { /* silent */ }
         })(),
@@ -875,7 +903,12 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
 
           {/* Section 2d: Provider Account Health */}
           {!!selectedProjectId && (
-            <PoolAccountHealthPanel accounts={accountHealth} loading={loading} />
+            <PoolAccountHealthPanel
+              accounts={accountHealth}
+              loading={loading}
+              servedStale={accountHealthServedStale}
+              generatedAt={accountHealthGeneratedAt}
+            />
           )}
 
           {/* Section 2e: Provider / Model Breakdown */}
@@ -950,6 +983,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
             onSpawnFixTask={onSpawnOrphanFix}
             onPanelReviewPr={onPanelReviewPr}
             stale={openPRsStale}
+            degraded={openPRsDegraded}
           />
         </div>
       </div>

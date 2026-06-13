@@ -2927,6 +2927,10 @@ export interface FleetUtilizationResponse {
   idle_pool_vms: number | null;
   vm_slots_available: number | null;
   vm_saturation: 'healthy' | 'busy' | 'saturated' | null;
+  precomputed?: boolean;
+  precomputed_at?: string | null;
+  precompute_age_seconds?: number | null;
+  served_stale?: boolean;
 }
 
 export async function fetchFleetUtilization(): Promise<FleetUtilizationResponse> {

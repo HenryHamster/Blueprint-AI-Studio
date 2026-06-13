@@ -1089,6 +1089,24 @@ _OPEN_PRS_CACHE_TTL_SECONDS = 60
 _open_prs_cache: Dict[uuid.UUID, Tuple[float, dict]] = {}
 
 
+def _build_open_prs_payload(
+    project: Project | None,
+    open_prs: list[dict],
+    *,
+    degraded: bool,
+    degraded_reason: str | None,
+) -> dict:
+    integration_branch = get_project_integration_branch(project) if project else None
+    promotion_target = get_project_promotion_target(project) if project else None
+    return {
+        "open_prs": open_prs,
+        "project_integration_branch": integration_branch,
+        "project_promotion_target": promotion_target,
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
+    }
+
+
 @router.get("/open-prs")
 async def get_open_prs(
     project_id: uuid.UUID = Query(...),
@@ -1105,7 +1123,8 @@ async def get_open_prs(
         .first()
     )
     if not project or not project.github_owner or not project.github_repo:
-        return {"open_prs": []}
+        # Missing GitHub config is an operator-visible configuration state, not a GitHub outage.
+        return _build_open_prs_payload(project, [], degraded=False, degraded_reason=None)
 
     # Cache check (skipping early paths above because github_owner/repo can
     # change and we want to honor that immediately).
@@ -1117,9 +1136,23 @@ async def get_open_prs(
         token = await _get_project_github_token(project, session)
     except Exception:
         logger.warning("Failed to get GitHub token for project %s", project_id)
-        return {"open_prs": []}
+        payload = _build_open_prs_payload(
+            project,
+            [],
+            degraded=True,
+            degraded_reason="github_token_error",
+        )
+        _open_prs_cache[project_id] = (time.time(), payload)
+        return payload
     if not token:
-        return {"open_prs": []}
+        payload = _build_open_prs_payload(
+            project,
+            [],
+            degraded=True,
+            degraded_reason="no_token",
+        )
+        _open_prs_cache[project_id] = (time.time(), payload)
+        return payload
 
     github_prs = await get_open_pull_requests(
         token, project.github_owner, project.github_repo
@@ -1130,11 +1163,12 @@ async def get_open_prs(
         if isinstance(pr_number, int)
     }
     if not open_pr_numbers:
-        payload = {
-            "open_prs": [],
-            "project_integration_branch": get_project_integration_branch(project),
-            "project_promotion_target": get_project_promotion_target(project),
-        }
+        payload = _build_open_prs_payload(
+            project,
+            [],
+            degraded=False,
+            degraded_reason=None,
+        )
         _open_prs_cache[project_id] = (time.time(), payload)
         return payload
 
@@ -1244,11 +1278,12 @@ async def get_open_prs(
             }
         )
 
-    payload = {
-        "open_prs": result,
-        "project_integration_branch": get_project_integration_branch(project),
-        "project_promotion_target": get_project_promotion_target(project),
-    }
+    payload = _build_open_prs_payload(
+        project,
+        result,
+        degraded=False,
+        degraded_reason=None,
+    )
     _open_prs_cache[project_id] = (time.time(), payload)
     return payload
 
