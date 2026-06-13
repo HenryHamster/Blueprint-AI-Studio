@@ -1826,6 +1826,14 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // Log ring buffer — without clearing, prior-role lines replay on the next
   // task's websocket connect and can trip the backend's 20 msg/s close-threshold.
   clearLogBuffer();
+  // Heartbeat mutex — reset so a stale in-flight flag from the prior role
+  // doesn't silence the new role's first periodic tick. stopHeartbeat() clears
+  // these too, but resetting here makes resetPerRoleModuleState self-contained
+  // regardless of call ordering.
+  // (heartbeatGeneration is intentionally left monotonic — it only needs to be
+  // unique per tick, never reset between roles.)
+  heartbeatInFlight = false;
+  heartbeatInFlightSince = 0;
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────

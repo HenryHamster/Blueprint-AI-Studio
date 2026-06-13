@@ -55,6 +55,7 @@ from app.warm_pool_maintainer import (
     reconcile_project_pool,
     retire_and_delete_pool_vm,
     run_pool_maintainer_cycle,
+    sweep_exhausted_lane_budgets,
     sweep_idle_pool_vms,
     sweep_stranded_lanes,
 )
@@ -3113,6 +3114,115 @@ async def test_sweep_idle_pool_vms_invokes_stranded_lane_sweep(
     assert lane.status == ImprovementLaneStatus.PARKED.value, (
         "the wired sweep actually reconciled the stranded lane"
     )
+
+
+@pytest.mark.asyncio
+async def test_sweep_exhausted_budget_clears_pool_vm_reservation(db_session, lanes_on):
+    """sweep_exhausted_lane_budgets clears PoolVm reservation fields after
+    killing an over-budget lane so the VM rejoins the general pool immediately."""
+    project = await _make_project(db_session, name="Exhausted Budget Res")
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        phase_requeues=_LANE_MAX_PHASE_REQUEUES + 1,
+        name="over-budget",
+    )
+    member = await _register(db_session, project, "agent-vm-exh-res", PoolVmState.IDLE)
+    member.reserved_lane_id = lane.id
+    member.reservation_expires_at = _utcnow() + timedelta(hours=1)
+    member.reservation_hard_expires_at = _utcnow() + timedelta(hours=2)
+    db_session.add(member)
+    await db_session.commit()
+
+    killed = await sweep_exhausted_lane_budgets(db_session)
+    assert killed == 1
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.KILLED.value
+
+    await db_session.refresh(member)
+    assert member.reserved_lane_id is None, "reservation must be cleared after KILLED"
+    assert member.reservation_expires_at is None
+    assert member.reservation_hard_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lane_kill_clears_pool_vm_reservation(
+    db_session, lanes_on
+):
+    """sweep_stranded_lanes clears PoolVm reservation fields when it KILLs a
+    budget-exhausted stranded lane."""
+    project = await _make_project(db_session, name="Stranded Kill Res")
+    failed = await _make_task(db_session, project, TaskStatus.FAILED)
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=failed.id,
+        phase_requeues=_LANE_MAX_PHASE_REQUEUES,
+        name="stranded-exhausted",
+    )
+    member = await _register(
+        db_session, project, "agent-vm-strand-res", PoolVmState.IDLE
+    )
+    member.reserved_lane_id = lane.id
+    member.reservation_expires_at = _utcnow() + timedelta(hours=1)
+    member.reservation_hard_expires_at = _utcnow() + timedelta(hours=2)
+    db_session.add(member)
+    await db_session.commit()
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 1
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.KILLED.value
+
+    await db_session.refresh(member)
+    assert member.reserved_lane_id is None, "reservation must be cleared after KILLED"
+    assert member.reservation_expires_at is None
+    assert member.reservation_hard_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lane_park_does_not_clear_reservation(
+    db_session, lanes_on
+):
+    """sweep_stranded_lanes does NOT clear PoolVm reservation fields when it
+    PARKs an under-budget stranded lane — the lane is still active/requeuing."""
+    project = await _make_project(db_session, name="Stranded Park Res")
+    cancelled = await _make_task(db_session, project, TaskStatus.CANCELLED)
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=cancelled.id,
+        phase_requeues=0,
+        name="stranded-under-budget",
+    )
+    member = await _register(db_session, project, "agent-vm-park-res", PoolVmState.IDLE)
+    member.reserved_lane_id = lane.id
+    member.reservation_expires_at = _utcnow() + timedelta(hours=1)
+    member.reservation_hard_expires_at = _utcnow() + timedelta(hours=2)
+    db_session.add(member)
+    await db_session.commit()
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 1
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+
+    await db_session.refresh(member)
+    assert member.reserved_lane_id == lane.id, (
+        "reservation must NOT be cleared when lane is only PARKed (still requeuing)"
+    )
+    assert member.reservation_expires_at is not None
+    assert member.reservation_hard_expires_at is not None
 
 
 @pytest.mark.asyncio

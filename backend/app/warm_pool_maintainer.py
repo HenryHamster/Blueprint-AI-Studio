@@ -1245,6 +1245,8 @@ async def sweep_exhausted_lane_budgets(session) -> int:
         .all()
     )
 
+    from app.warm_pool import record_lane_reservation_cause
+
     killed = 0
     for lane in exhausted:
         try:
@@ -1260,6 +1262,21 @@ async def sweep_exhausted_lane_budgets(session) -> int:
                 lane.id,
                 lane.phase_requeues,
             )
+            reserved = (
+                (
+                    await session.execute(
+                        select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for member in reserved:
+                member.reserved_lane_id = None
+                member.reservation_expires_at = None
+                member.reservation_hard_expires_at = None
+                session.add(member)
+                await record_lane_reservation_cause(session, lane.id, "force_expired")
         except LaneCASError as exc:  # noqa: PERF203 — CAS miss per iteration is intentional
             logger.debug(
                 "[WARM-POOL] exhausted-budget CAS miss lane=%s: %s", lane.id, exc
@@ -1327,6 +1344,7 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
     )
     from app.models import ImprovementLaneStatus
     from app.runtime_config_state import is_improvement_lanes_enabled
+    from app.warm_pool import record_lane_reservation_cause
 
     if not is_improvement_lanes_enabled():
         return 0
@@ -1391,6 +1409,23 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                     lane.id,
                     lane.phase_requeues,
                 )
+                reserved = (
+                    (
+                        await session.execute(
+                            select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for member in reserved:
+                    member.reserved_lane_id = None
+                    member.reservation_expires_at = None
+                    member.reservation_hard_expires_at = None
+                    session.add(member)
+                    await record_lane_reservation_cause(
+                        session, lane.id, "force_expired"
+                    )
             transitioned += 1
         except LaneCASError as exc:
             # Concurrent maintainer/sweep tick already transitioned this lane —
