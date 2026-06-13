@@ -1213,33 +1213,89 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # rather than waiting up to 6 more research spawns (~3+ hours).
     pending_sr = (project.vision or {}).get("_pending_strategic_review")
     if pending_sr:
-        try:
-            from app.strategic_spawning import _spawn_strategic_review
+        _sr_attempt_count = pending_sr.get("attempt_count", 0)
+        _sr_first_attempted_at = pending_sr.get("first_attempted_at")
+        _sr_max_attempts = _runtime_config.get("pending_sr_max_attempts", 3)
+        _sr_max_age_hours = _runtime_config.get("pending_sr_max_age_hours", 24)
 
-            if await _spawn_strategic_review(
-                project,
-                session,
-                cycle_id=pending_sr.get("cycle_id"),
-                operator_steered=bool(pending_sr.get("operator_steered")),
-                steering_excerpt=pending_sr.get("steering_excerpt"),
-            ):
-
-                def _clear_pending_sr(vision: dict) -> None:
-                    vision.pop("_pending_strategic_review", None)
-
-                await with_vision_locked(session, project.id, _clear_pending_sr)
-                logger.info(
-                    f"[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get('failed_at')})"
+        # Check if the marker has exceeded the retry cap or age window.
+        _sr_age_exceeded = False
+        if _sr_first_attempted_at:
+            try:
+                _first_dt = datetime.fromisoformat(_sr_first_attempted_at).replace(
+                    tzinfo=timezone.utc
                 )
-            else:
-                logger.warning(
-                    f"[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}"
-                )
-        except Exception:
-            logger.exception(
-                f"[STRATEGIC] Retry of pending strategic review failed for project {project.id}"
+                _sr_age_exceeded = (
+                    _utcnow().replace(tzinfo=timezone.utc) - _first_dt
+                ) > timedelta(hours=_sr_max_age_hours)
+            except (ValueError, TypeError):
+                pass
+
+        if _sr_attempt_count >= _sr_max_attempts or _sr_age_exceeded:
+            _reason = (
+                f"attempt_count={_sr_attempt_count} >= max={_sr_max_attempts}"
+                if _sr_attempt_count >= _sr_max_attempts
+                else f"marker age exceeded {_sr_max_age_hours}h (first_attempted_at={_sr_first_attempted_at})"
             )
-        return  # Don't spawn tactical research this cycle
+            logger.error(
+                f"[STRATEGIC] Pending SR cap/age exceeded for project {project.id}: {_reason} — dropping marker and alerting"
+            )
+
+            def _drop_pending_sr(vision: dict) -> None:
+                vision.pop("_pending_strategic_review", None)
+
+            await with_vision_locked(session, project.id, _drop_pending_sr)
+
+            from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
+
+            await _create_strategic_alert(
+                project.id,
+                session,
+                f"Pending strategic review retry abandoned after {_reason}. "
+                f"Original failure: {pending_sr.get('error', 'unknown')}",
+            )
+            # Fall through to tactical research below
+        else:
+            try:
+                from app.strategic_spawning import _spawn_strategic_review
+
+                if await _spawn_strategic_review(
+                    project,
+                    session,
+                    cycle_id=pending_sr.get("cycle_id"),
+                    operator_steered=bool(pending_sr.get("operator_steered")),
+                    steering_excerpt=pending_sr.get("steering_excerpt"),
+                ):
+
+                    def _clear_pending_sr(vision: dict) -> None:
+                        vision.pop("_pending_strategic_review", None)
+
+                    await with_vision_locked(session, project.id, _clear_pending_sr)
+                    logger.info(
+                        f"[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get('failed_at')})"
+                    )
+                    return  # Don't spawn tactical research this cycle
+                else:
+                    logger.warning(
+                        f"[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}"
+                    )
+                    # Fall through to tactical research
+            except Exception:
+                logger.exception(
+                    f"[STRATEGIC] Retry of pending strategic review failed for project {project.id}"
+                )
+                _now_iso = _utcnow().isoformat()
+
+                def _bump_pending_sr(vision: dict) -> None:
+                    marker = vision.get("_pending_strategic_review")
+                    if marker is None:
+                        return
+                    marker["attempt_count"] = marker.get("attempt_count", 0) + 1
+                    if not marker.get("first_attempted_at"):
+                        marker["first_attempted_at"] = _now_iso
+
+                await with_vision_locked(session, project.id, _bump_pending_sr)
+                # Fall through to tactical research
 
     # Strategic cycle check — runs BEFORE the research blocking guard so it's
     # never blocked by an active tactical research task.  The design_doc_update

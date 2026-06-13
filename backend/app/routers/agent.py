@@ -117,7 +117,9 @@ def _effective_repo_map_holdback(project: object) -> float:
     default = float(_shared_state.runtime_config.get("repo_map_holdback_fraction", 0.0))
     if project is None:
         return default
-    return get_effective_holdback_fraction(get_trial_verdicts(project), "repo_map", default)
+    return get_effective_holdback_fraction(
+        get_trial_verdicts(project), "repo_map", default
+    )
 
 
 def _effective_module_interfaces_holdback(project: object) -> float:
@@ -127,10 +129,14 @@ def _effective_module_interfaces_holdback(project: object) -> float:
         get_trial_verdicts,
     )
 
-    default = float(_shared_state.runtime_config.get("module_interfaces_holdback_fraction", 0.0))
+    default = float(
+        _shared_state.runtime_config.get("module_interfaces_holdback_fraction", 0.0)
+    )
     if project is None:
         return default
-    return get_effective_holdback_fraction(get_trial_verdicts(project), "module_interfaces", default)
+    return get_effective_holdback_fraction(
+        get_trial_verdicts(project), "module_interfaces", default
+    )
 
 
 def _effective_related_tests_holdback(project: object) -> float:
@@ -140,10 +146,14 @@ def _effective_related_tests_holdback(project: object) -> float:
         get_trial_verdicts,
     )
 
-    default = float(_shared_state.runtime_config.get("related_tests_holdback_fraction", 0.0))
+    default = float(
+        _shared_state.runtime_config.get("related_tests_holdback_fraction", 0.0)
+    )
     if project is None:
         return default
-    return get_effective_holdback_fraction(get_trial_verdicts(project), "related_tests", default)
+    return get_effective_holdback_fraction(
+        get_trial_verdicts(project), "related_tests", default
+    )
 
 
 def _effective_affected_consumers_holdback(project: object) -> float:
@@ -153,10 +163,14 @@ def _effective_affected_consumers_holdback(project: object) -> float:
         get_trial_verdicts,
     )
 
-    default = float(_shared_state.runtime_config.get("affected_consumers_holdback_fraction", 0.0))
+    default = float(
+        _shared_state.runtime_config.get("affected_consumers_holdback_fraction", 0.0)
+    )
     if project is None:
         return default
-    return get_effective_holdback_fraction(get_trial_verdicts(project), "affected_consumers", default)
+    return get_effective_holdback_fraction(
+        get_trial_verdicts(project), "affected_consumers", default
+    )
 
 
 def _effective_diagnostics_after_edit_holdback(project: object) -> float:
@@ -166,10 +180,16 @@ def _effective_diagnostics_after_edit_holdback(project: object) -> float:
         get_trial_verdicts,
     )
 
-    default = float(_shared_state.runtime_config.get("diagnostics_after_edit_holdback_fraction", 0.1))
+    default = float(
+        _shared_state.runtime_config.get(
+            "diagnostics_after_edit_holdback_fraction", 0.1
+        )
+    )
     if project is None:
         return default
-    return get_effective_holdback_fraction(get_trial_verdicts(project), "diagnostics_after_edit", default)
+    return get_effective_holdback_fraction(
+        get_trial_verdicts(project), "diagnostics_after_edit", default
+    )
 
 
 def _log_agent_auth_reject(
@@ -924,10 +944,18 @@ async def claim_task(
             "promotion_target": project_promotion_target,
             "integration_branch": project_integration_branch,
             "repo_map_holdback_fraction": _effective_repo_map_holdback(project),
-            "module_interfaces_holdback_fraction": _effective_module_interfaces_holdback(project),
-            "related_tests_holdback_fraction": _effective_related_tests_holdback(project),
-            "affected_consumers_holdback_fraction": _effective_affected_consumers_holdback(project),
-            "diagnostics_after_edit_holdback_fraction": _effective_diagnostics_after_edit_holdback(project),
+            "module_interfaces_holdback_fraction": _effective_module_interfaces_holdback(
+                project
+            ),
+            "related_tests_holdback_fraction": _effective_related_tests_holdback(
+                project
+            ),
+            "affected_consumers_holdback_fraction": _effective_affected_consumers_holdback(
+                project
+            ),
+            "diagnostics_after_edit_holdback_fraction": _effective_diagnostics_after_edit_holdback(
+                project
+            ),
             "diagnostics_after_edit_enabled": bool(
                 _shared_state.runtime_config.get("diagnostics_after_edit_enabled", True)
             ),
@@ -1176,9 +1204,7 @@ async def claim_task(
         _history_ranked = (
             select(
                 Task.id.label("task_id"),
-                func.row_number()
-                .over(order_by=Task.created_at.desc())
-                .label("rn"),
+                func.row_number().over(order_by=Task.created_at.desc()).label("rn"),
             )
             .where(
                 Task.project_id == task.project_id,
@@ -1739,7 +1765,7 @@ async def claim_task(
                 with contextlib.suppress(Exception):
                     await session.rollback()
             try:
-                await _refresh_sr_catch_rate(session, task.project_id)
+                await _refresh_sr_catch_rate(session, _claimed_project_id)
             except Exception:
                 logger.exception(
                     "[AGENT] Failed to compute sr_catch_rate_trends (non-critical)"
@@ -1756,7 +1782,7 @@ async def claim_task(
                 from app.sr_analytics import compute_sr_false_attestation_trends
 
                 await compute_sr_false_attestation_trends(
-                    project_id=task.project_id,
+                    project_id=_claimed_project_id,
                     session=session,
                     all_tasks=list(high_iter_rows),
                 )
@@ -1772,7 +1798,7 @@ async def claim_task(
                 )
 
                 await compute_sr_regression_risk_test_signal_trends(
-                    project_id=task.project_id,
+                    project_id=_claimed_project_id,
                     session=session,
                     all_tasks=list(high_iter_rows),
                 )
@@ -1786,7 +1812,7 @@ async def claim_task(
                 from app.sr_analytics import compute_fresh_reviewer_trend
 
                 await compute_fresh_reviewer_trend(
-                    project_id=task.project_id,
+                    project_id=_claimed_project_id,
                     session=session,
                     all_tasks=list(high_iter_rows),
                 )
@@ -1800,7 +1826,7 @@ async def claim_task(
                 from app.sr_analytics import compute_edges_trend
 
                 await compute_edges_trend(
-                    project_id=task.project_id,
+                    project_id=_claimed_project_id,
                     session=session,
                     all_tasks=list(high_iter_rows),
                 )
@@ -1810,7 +1836,7 @@ async def claim_task(
                     await session.rollback()
             try:
                 await _stamp_reviewer_recovery_count(
-                    session, task.project_id, high_iter_rows
+                    session, _claimed_project_id, high_iter_rows
                 )
             except Exception:
                 logger.exception(
@@ -1822,7 +1848,7 @@ async def claim_task(
                 from app.sr_analytics import compute_sr_reviewer_disagreements
 
                 await compute_sr_reviewer_disagreements(
-                    project_id=task.project_id,
+                    project_id=_claimed_project_id,
                     session=session,
                     all_tasks=list(high_iter_rows),
                 )
@@ -1865,7 +1891,7 @@ async def claim_task(
         # Record review measurement attribution in task.context for outcome tracking
         try:
             _had_measurements = bool(review_issue_distribution)
-            _ctx = dict(task.context or {})
+            _ctx = dict(_claimed_context)
             _ctx["_had_review_measurements"] = _had_measurements
             if _had_measurements:
                 _ctx["_top_review_issue_categories"] = list(
@@ -2367,8 +2393,7 @@ async def claim_task(
                                         doc.pop("_meta", None)
                                 if (
                                     isinstance(grounding_diagnostic, dict)
-                                    and grounding_diagnostic.get("kind")
-                                    == "cap_breach"
+                                    and grounding_diagnostic.get("kind") == "cap_breach"
                                 ):
                                     logger.debug(
                                         "[AGENT] Branch-aware design-doc grounding "
@@ -3672,19 +3697,37 @@ async def claim_task(
     # when absent so the claim shape is byte-identical for projects that never
     # ran bootstrap.
     _REPO_OVERVIEW_TASK_TYPES = {
-        "create", "fix", "refactor", "migrate", "qa", "docs", "review",
-        "research", "plan", "design", "debug", "investigate",
-        "security_audit", "perf",
-        "self_audit", "release_audit", "release_audit_challenge",
-        "smoketest", "design_doc_update", "strategic_review",
+        "create",
+        "fix",
+        "refactor",
+        "migrate",
+        "qa",
+        "docs",
+        "review",
+        "research",
+        "plan",
+        "design",
+        "debug",
+        "investigate",
+        "security_audit",
+        "perf",
+        "self_audit",
+        "release_audit",
+        "release_audit_challenge",
+        "smoketest",
+        "design_doc_update",
+        "strategic_review",
     }
     if task_type in _REPO_OVERVIEW_TASK_TYPES and project_for_playbook:
         _raw_overview = (project_for_playbook.design_doc or {}).get("repo_overview")
         if (
             isinstance(_raw_overview, dict)
-            and isinstance(_raw_overview.get("tech_stack"), str) and _raw_overview["tech_stack"]
-            and isinstance(_raw_overview.get("directory_layout"), str) and _raw_overview["directory_layout"]
-            and isinstance(_raw_overview.get("first_steps_summary"), str) and _raw_overview["first_steps_summary"]
+            and isinstance(_raw_overview.get("tech_stack"), str)
+            and _raw_overview["tech_stack"]
+            and isinstance(_raw_overview.get("directory_layout"), str)
+            and _raw_overview["directory_layout"]
+            and isinstance(_raw_overview.get("first_steps_summary"), str)
+            and _raw_overview["first_steps_summary"]
         ):
             _repo_overview: dict = {
                 "tech_stack": _raw_overview["tech_stack"],
@@ -3692,7 +3735,10 @@ async def claim_task(
                 "first_steps_summary": _raw_overview["first_steps_summary"],
             }
             for _opt_field in (
-                "entry_points", "test_layout", "key_conventions", "environment_requirements"
+                "entry_points",
+                "test_layout",
+                "key_conventions",
+                "environment_requirements",
             ):
                 _opt_val = _raw_overview.get(_opt_field)
                 if isinstance(_opt_val, str) and _opt_val:
@@ -3724,10 +3770,18 @@ async def claim_task(
         _bootstrap_payload = _claimed_first_payload or {}
         response["bootstrap_guidance"] = {
             "files_to_read": [
-                "README.md", "README.rst", "README",
-                "package.json", "yarn.lock", "pnpm-lock.yaml",
-                "Makefile", "makefile", "GNUmakefile",
-                "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+                "README.md",
+                "README.rst",
+                "README",
+                "package.json",
+                "yarn.lock",
+                "pnpm-lock.yaml",
+                "Makefile",
+                "makefile",
+                "GNUmakefile",
+                "Dockerfile",
+                "docker-compose.yml",
+                "docker-compose.yaml",
                 ".github/workflows/*.yml",
             ],
             "design_doc_section": "repo_overview",
@@ -4306,19 +4360,31 @@ async def agent_heartbeat(
     # Write-once repo-map capability flag. Set on the first heartbeat that
     # carries had_repo_map so that later heartbeats (which don't re-send it)
     # cannot clear the flag; mirrors the _had_arch_context write-once pattern.
-    if req.had_repo_map is not None and (task.context or {}).get("_had_repo_map") is None:
+    if (
+        req.had_repo_map is not None
+        and (task.context or {}).get("_had_repo_map") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_had_repo_map"] = req.had_repo_map
         task.context = ctx
-    if req.had_module_interfaces is not None and (task.context or {}).get("_had_module_interfaces") is None:
+    if (
+        req.had_module_interfaces is not None
+        and (task.context or {}).get("_had_module_interfaces") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_had_module_interfaces"] = req.had_module_interfaces
         task.context = ctx
-    if req.had_related_tests is not None and (task.context or {}).get("_had_related_tests") is None:
+    if (
+        req.had_related_tests is not None
+        and (task.context or {}).get("_had_related_tests") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_had_related_tests"] = req.had_related_tests
         task.context = ctx
-    if req.had_affected_consumers is not None and (task.context or {}).get("_had_affected_consumers") is None:
+    if (
+        req.had_affected_consumers is not None
+        and (task.context or {}).get("_had_affected_consumers") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_had_affected_consumers"] = req.had_affected_consumers
         task.context = ctx
@@ -4326,32 +4392,50 @@ async def agent_heartbeat(
     # Write-once repo-map arm-assignment flag. Records the deterministic
     # holdback vs treatment assignment independently of receipt; used for
     # intent-to-treat arm partitioning in digest_metrics.
-    if req.repo_map_arm is not None and (task.context or {}).get("_repo_map_arm") is None:
+    if (
+        req.repo_map_arm is not None
+        and (task.context or {}).get("_repo_map_arm") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_repo_map_arm"] = req.repo_map_arm
         task.context = ctx
-    if req.module_interfaces_arm is not None and (task.context or {}).get("_module_interfaces_arm") is None:
+    if (
+        req.module_interfaces_arm is not None
+        and (task.context or {}).get("_module_interfaces_arm") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_module_interfaces_arm"] = req.module_interfaces_arm
         task.context = ctx
-    if req.related_tests_arm is not None and (task.context or {}).get("_related_tests_arm") is None:
+    if (
+        req.related_tests_arm is not None
+        and (task.context or {}).get("_related_tests_arm") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_related_tests_arm"] = req.related_tests_arm
         task.context = ctx
-    if req.affected_consumers_arm is not None and (task.context or {}).get("_affected_consumers_arm") is None:
+    if (
+        req.affected_consumers_arm is not None
+        and (task.context or {}).get("_affected_consumers_arm") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_affected_consumers_arm"] = req.affected_consumers_arm
         task.context = ctx
 
     # Write-once diagnostics-after-edit capability flag. Set on the first
     # heartbeat that carries had_diagnostics_after_edit; mirrors had_repo_map pattern.
-    if req.had_diagnostics_after_edit is not None and (task.context or {}).get("_had_diagnostics_after_edit") is None:
+    if (
+        req.had_diagnostics_after_edit is not None
+        and (task.context or {}).get("_had_diagnostics_after_edit") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_had_diagnostics_after_edit"] = req.had_diagnostics_after_edit
         task.context = ctx
     # Write-once diagnostics-after-edit arm-assignment flag. Records the
     # deterministic holdback vs treatment assignment for intent-to-treat analysis.
-    if req.diagnostics_after_edit_arm is not None and (task.context or {}).get("_diagnostics_after_edit_arm") is None:
+    if (
+        req.diagnostics_after_edit_arm is not None
+        and (task.context or {}).get("_diagnostics_after_edit_arm") is None
+    ):
         ctx = dict(task.context or {})
         ctx["_diagnostics_after_edit_arm"] = req.diagnostics_after_edit_arm
         task.context = ctx
@@ -4400,11 +4484,15 @@ async def agent_heartbeat(
             },
             "format_repair_attempts_by_schema": {
                 str(schema): int(count)
-                for schema, count in (req.format_repair_attempts_by_schema or {}).items()
+                for schema, count in (
+                    req.format_repair_attempts_by_schema or {}
+                ).items()
             },
             "format_repair_successes_by_schema": {
                 str(schema): int(count)
-                for schema, count in (req.format_repair_successes_by_schema or {}).items()
+                for schema, count in (
+                    req.format_repair_successes_by_schema or {}
+                ).items()
             },
             "last_updated_at": _utcnow().isoformat(),
         }
@@ -4536,7 +4624,9 @@ async def spawn_subtask(
         try:
             payload = validate_task_payload(payload)
         except ValueError as exc:
-            logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+            logger.warning(
+                "Validation error in task payload: %s: %s", type(exc).__name__, exc
+            )
             raise HTTPException(status_code=422, detail="Invalid request") from exc
         parent_payload = parent_task.first_payload
         parent_context = {

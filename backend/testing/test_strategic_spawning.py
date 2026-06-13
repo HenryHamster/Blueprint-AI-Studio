@@ -1686,6 +1686,39 @@ async def test_spawn_strategic_review_aborts_when_peer_holds_spawn_lock_at_inser
     assert result.scalars().all() == []
 
 
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_bail_survives_rollback_expiry(db_session, mocker):
+    """Bail paths do not raise MissingGreenlet when the session rollback expires ORM instances.
+
+    SQLAlchemy expires every instance in the identity map on rollback (expire_on_commit=False
+    does not apply to rollback). Accessing project.id after rollback used to trigger a
+    synchronous lazy-load that raises MissingGreenlet in async context (BUG_REPORT e530efec).
+    The fix captures project.id before rolling back; this test confirms the bail path returns
+    False cleanly rather than propagating the greenlet exception.
+    """
+    mocker.patch(
+        "app.autonomous_research._try_research_spawn_advisory_lock",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    # Expire the project instance — simulates what SQLAlchemy does on rollback.
+    # After expire(), any attribute access on the instance without an active
+    # async IO context raises MissingGreenlet (the same failure mode as
+    # post-rollback access).  The bail path must not access ORM attributes
+    # after the rollback, so this expiry is functionally equivalent.
+    db_session.expire(project)
+
+    # Must return False without raising
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is False
+
+
 # ── Bootstrap-pending guard in _spawn_design_doc_update ───────────────────────
 
 

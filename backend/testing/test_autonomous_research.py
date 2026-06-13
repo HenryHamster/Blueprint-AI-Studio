@@ -14895,3 +14895,297 @@ def test_explicit_saturation_refractory_key_wins():
     _runtime_config["autonomous_direction_cooldown_minutes"] = 60
     _runtime_config["direction_saturation_refractory_minutes"] = 720
     assert direction_saturation_refractory_minutes() == 720.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pending strategic review retry cap and escalation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_pending_sr_project(db_session_fixture, **vision_overrides):
+    """Helper: create and return an unsaved Project with _pending_strategic_review marker."""
+    pending_sr = {
+        "design_doc_task_id": str(uuid.uuid4()),
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+        "error": "test error",
+        "cycle_id": "cyc-test-001",
+        "operator_steered": False,
+        "steering_excerpt": None,
+        **vision_overrides,
+    }
+    return Project(
+        name="Pending SR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-psr-test1", "Pending SR direction")],
+        vision={"purpose": "test", "_pending_strategic_review": pending_sr},
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_success_clears_marker_and_returns_early(db_session, mocker):
+    """Happy path: _spawn_strategic_review returns True → marker cleared, no tactical research."""
+    spawn_sr_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    project = _make_pending_sr_project(db_session)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    assert spawn_sr_mock.called, (
+        "_spawn_strategic_review must be called on a fresh pending marker"
+    )
+
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_pending_strategic_review") is None, (
+        "Marker must be cleared after successful retry"
+    )
+
+    # No tactical research tasks should have spawned
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 0, (
+        "Tactical research must not spawn when SR retry succeeded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_skip_falls_through_to_tactical(db_session, mocker):
+    """When _spawn_strategic_review returns False (active task), fall through; marker is preserved."""
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=False),
+    )
+
+    # Direction in refractory so no tactical research spawns after fall-through
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    project = Project(
+        name="Pending SR Skip Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-skip1", "Pending SR direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": datetime.now(timezone.utc).isoformat(),
+                "error": "skipped: active strategic task exists",
+                "cycle_id": "cyc-skip-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # Marker should still be present (not cleared on skip, not incremented on skip)
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_pending_strategic_review")
+    assert marker is not None, "Marker must remain when SR spawn was skipped"
+    assert marker.get("attempt_count", 0) == 0, (
+        "attempt_count must NOT be incremented on a skip (only on exception)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_exception_increments_count_and_falls_through(
+    db_session, mocker
+):
+    """When _spawn_strategic_review raises, attempt_count is bumped; tactical research may proceed."""
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(side_effect=RuntimeError("DB connection lost")),
+    )
+
+    # Direction in refractory so no tactical research spawns after fall-through
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    project = Project(
+        name="Pending SR Exception Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-exc1", "Pending SR direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": datetime.now(timezone.utc).isoformat(),
+                "error": "spawn error",
+                "cycle_id": "cyc-exc-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_pending_strategic_review")
+    assert marker is not None, "Marker must persist after exception"
+    assert marker.get("attempt_count", 0) == 1, (
+        "attempt_count must be incremented to 1 after the first exception"
+    )
+    assert marker.get("first_attempted_at") is not None, (
+        "first_attempted_at must be stamped on first exception"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_strategic_review_retry_failure_cap(db_session, mocker):
+    """When attempt_count >= pending_sr_max_attempts, drop the marker, fire an alert,
+    and allow tactical research to proceed normally."""
+    import app.shared_state as _ss
+
+    _ss.runtime_config["pending_sr_max_attempts"] = 3
+
+    spawn_sr_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert",
+        new=AsyncMock(return_value=None),
+    )
+
+    # Direction in refractory so no tactical research spawns after fall-through
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    project = Project(
+        name="Pending SR Cap Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-cap1", "Cap direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": (
+                    datetime.now(timezone.utc) - timedelta(hours=2)
+                ).isoformat(),
+                "error": "repeated failure",
+                "cycle_id": "cyc-cap-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+                "attempt_count": 3,
+                "first_attempted_at": (
+                    datetime.now(timezone.utc) - timedelta(hours=1)
+                ).isoformat(),
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # SR spawn must NOT be called — we're over the cap
+    assert not spawn_sr_mock.called, (
+        "_spawn_strategic_review must not be called when attempt_count >= max"
+    )
+
+    # Alert must be fired
+    assert alert_mock.called, "Alert must be created when retry cap is exceeded"
+    alert_msg = alert_mock.call_args[0][2] if alert_mock.call_args[0] else ""
+    assert "attempt_count" in alert_msg or "retry" in alert_msg.lower(), (
+        "Alert message should mention the cap-exceeded reason"
+    )
+
+    # Marker must be dropped
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_pending_strategic_review") is None, (
+        "Marker must be dropped after cap is exceeded"
+    )
+
+    _ss.runtime_config.pop("pending_sr_max_attempts", None)
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_age_exceeded_drops_marker_and_alerts(db_session, mocker):
+    """When the marker's first_attempted_at is older than pending_sr_max_age_hours,
+    drop the marker and fire an alert regardless of attempt_count."""
+    import app.shared_state as _ss
+
+    _ss.runtime_config["pending_sr_max_age_hours"] = 1  # 1-hour window for this test
+
+    spawn_sr_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert",
+        new=AsyncMock(return_value=None),
+    )
+
+    # Direction in refractory so no tactical research spawns after fall-through
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    stale_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    project = Project(
+        name="Pending SR Age Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-age1", "Age direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": stale_ts,
+                "error": "spawn error",
+                "cycle_id": "cyc-age-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+                "attempt_count": 1,  # Only 1 attempt — age alone triggers the drop
+                "first_attempted_at": stale_ts,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    assert not spawn_sr_mock.called, (
+        "_spawn_strategic_review must not be called when marker is stale"
+    )
+    assert alert_mock.called, "Alert must be created when marker age is exceeded"
+
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_pending_strategic_review") is None, (
+        "Stale marker must be dropped"
+    )
+
+    _ss.runtime_config.pop("pending_sr_max_age_hours", None)

@@ -904,7 +904,7 @@ async def update_agent_status(
                     await session.rollback()
                 return {
                     "status": "post_commit_retry_pending",
-                    "task_id": str(task.id),
+                    "task_id": _task_id_str,
                 }
             except Exception as e:
                 # A disconnection-class DB error on the retry path is deploy-cutover
@@ -2105,9 +2105,7 @@ async def update_agent_status(
                 if payload.logs and (
                     not payload.artifact_type or payload.status == TaskStatus.FAILED
                 ):
-                    task.latest_status_message = _sanitize_log_tail(
-                        payload.logs, 8000
-                    )
+                    task.latest_status_message = _sanitize_log_tail(payload.logs, 8000)
                 # Re-apply the structured error report (mirrors the pre-commit
                 # block at ~line 1075) so the normalize call below still sees
                 # it as the primary signal after session recovery.
@@ -3179,9 +3177,7 @@ async def update_agent_status(
                             "type": "debug",
                             "failed_task_id": str(task.id),
                             "failed_task_title": task.title,
-                            "error_logs": _sanitize_log_tail(
-                                payload.logs or "", 20000
-                            ),
+                            "error_logs": _sanitize_log_tail(payload.logs or "", 20000),
                             "base_branch": base_branch,
                             "failed_task_prompt": (
                                 failed_task_payload.get("prompt")

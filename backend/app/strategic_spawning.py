@@ -335,8 +335,13 @@ def _design_doc_index(doc: dict | None) -> dict:
             # fields inline so the first strategic cycle has actual repo context
             # without a fetch round-trip. Optional fields are included when present.
             for field in (
-                "tech_stack", "directory_layout", "first_steps_summary",
-                "entry_points", "test_layout", "key_conventions", "environment_requirements",
+                "tech_stack",
+                "directory_layout",
+                "first_steps_summary",
+                "entry_points",
+                "test_layout",
+                "key_conventions",
+                "environment_requirements",
             ):
                 raw = value.get(field)
                 if isinstance(raw, str) and raw.strip():
@@ -456,9 +461,7 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
                     shortened[key] = {"shown": keep, "total": len(arr)}
                     g2[key] = arr[-keep:]
             if shortened:
-                gap_memory_trimmed.append(
-                    {"gap_id": g2.get("id"), "fields": shortened}
-                )
+                gap_memory_trimmed.append({"gap_id": g2.get("id"), "fields": shortened})
             new_gaps.append(g2)
         trimmed["gaps"] = new_gaps
         # Surface the pre-trim so the strategic agent can tell a gap's
@@ -807,7 +810,6 @@ def _build_operator_overrides_summary(project: Project) -> list[dict]:
     return entries[:_OPERATOR_OVERRIDES_MAX]
 
 
-
 async def _verify_capability_backing_paths(
     pm: dict | None,
     *,
@@ -1044,7 +1046,11 @@ def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
     managed_vm_count = fleet.get("managed_vm_count")
     if vm_cap:
         effective = None
-        if active_task_vms is not None and managed_vm_count is not None and idle_pool_vms is not None:
+        if (
+            active_task_vms is not None
+            and managed_vm_count is not None
+            and idle_pool_vms is not None
+        ):
             effective = max(active_task_vms, managed_vm_count - idle_pool_vms)
         if effective is not None:
             saturated_marker = " [SATURATED]" if vm_slots_available == 0 else ""
@@ -1186,9 +1192,7 @@ def _direction_activity_score(stat: dict) -> int:
     """
     if not isinstance(stat, dict):
         return 0
-    merged = int(
-        stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0
-    )
+    merged = int(stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0)
     failed = int(stat.get("tasks_failed") or 0)
     cycles = int(stat.get("total_cycles") or 0)
     priority = stat.get("priority")
@@ -1407,7 +1411,9 @@ def _build_cycle_start_reconciliation(
 
     # Active directions and the set of gap_ids they reference (forward linkage).
     active_dirs = [
-        d for d in direction_stats if isinstance(d, dict) and d.get("status") == "active"
+        d
+        for d in direction_stats
+        if isinstance(d, dict) and d.get("status") == "active"
     ]
     referenced_gap_ids: set[str] = {
         str(d["gap_id"]) for d in active_dirs if d.get("gap_id")
@@ -1557,9 +1563,7 @@ def _build_cycle_start_reconciliation(
             if isinstance(sampled_titles, list)
             else []
         )
-        landed_n = (
-            _count_field(count_block, "verified_landed") if count_block else None
-        )
+        landed_n = _count_field(count_block, "verified_landed") if count_block else None
         not_landed_n = (
             _count_field(count_block, "verified_not_landed") if count_block else None
         )
@@ -1606,7 +1610,10 @@ def _build_cycle_start_reconciliation(
             }
         )
     merge_accounting.sort(
-        key=lambda m: (-int(m.get("not_landed") or 0), str(m.get("direction_text") or ""))
+        key=lambda m: (
+            -int(m.get("not_landed") or 0),
+            str(m.get("direction_text") or ""),
+        )
     )
 
     # Nothing to reconcile (e.g. a cold-start project): let the caller omit it.
@@ -1655,9 +1662,7 @@ def _build_cycle_start_reconciliation(
             "active_directions": len(active_dirs),
             "direction_pipeline": len(direction_pipeline),
             "direction_pipeline_overflow": pipeline_dropped,
-            "pipeline_waiting_on_action": pipeline_counts[
-                "research_waiting_on_action"
-            ],
+            "pipeline_waiting_on_action": pipeline_counts["research_waiting_on_action"],
             "pipeline_tasks_in_progress": pipeline_counts["tasks_in_progress"],
             "pipeline_idle": pipeline_counts["idle"],
             # Merge-accounting drift: true direction-with-conflict total (shown +
@@ -1756,9 +1761,7 @@ def _build_prune_candidates(
         # per entry (with its legacy prs_merged fallback) plus the verified
         # aggregate key (falling back to total_prs_merged for pre-attribution
         # folded history).
-        merged = sum(
-            verified_merged_count(h) for h in history if isinstance(h, dict)
-        )
+        merged = sum(verified_merged_count(h) for h in history if isinstance(h, dict))
         agg = d.get("history_aggregate") or {}
         merged += int(
             agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
@@ -1887,7 +1890,11 @@ def _build_prune_candidates(
         raw_name = str(cap.get("name") or "")
         if len(raw_name) > _CAPABILITY_LONG_NAME_THRESHOLD:
             long_names.append(
-                {"kind": "capability", "name": _label(raw_name), "length": len(raw_name)}
+                {
+                    "kind": "capability",
+                    "name": _label(raw_name),
+                    "length": len(raw_name),
+                }
             )
     for g in gaps:
         if not isinstance(g, dict):
@@ -2053,7 +2060,9 @@ def _strip_verbose_fields(m: dict) -> dict:
 
 def _cap_excerpt(m: dict) -> dict:
     result = dict(m)
-    result["summary_excerpt"] = (m.get("summary_excerpt") or "")[:_MEMO_EXCERPT_MAX_CHARS]
+    result["summary_excerpt"] = (m.get("summary_excerpt") or "")[
+        :_MEMO_EXCERPT_MAX_CHARS
+    ]
     return result
 
 
@@ -2092,8 +2101,8 @@ def _summarize_memo_citations(memos: list) -> list:
 # a per-message excerpt cap) and priority-ordered so unresolved
 # BUG_REPORT/BLOCKER items (then the oldest-open items) are the LAST to be
 # dropped under budget pressure, never the first.
-_OPEN_MESSAGES_FETCH_LIMIT = 200       # DB window over open-status rows
-_OPEN_MESSAGES_KEEP = 40               # count bound for the packed feed
+_OPEN_MESSAGES_FETCH_LIMIT = 200  # DB window over open-status rows
+_OPEN_MESSAGES_KEEP = 40  # count bound for the packed feed
 _OPEN_MESSAGES_KEEP_WHEN_TRIMMED = 20  # tighter bound for the summarize fallback
 _OPEN_MESSAGE_EXCERPT_MAX_CHARS = 800  # per-message content excerpt cap
 _CRITICAL_OPEN_MESSAGE_TYPES = (
@@ -2890,9 +2899,7 @@ async def _build_recent_interventions(
         # (multiple children share one parent rollup PR) and lets us fan the
         # per-PR ancestry checks out concurrently without redundant fetches.
         _tasks_by_pr: dict[int, list[uuid.UUID]] = {}
-        _rollup_message_evidence_by_task: dict[
-            uuid.UUID, tuple[str, set[int]]
-        ] = {}
+        _rollup_message_evidence_by_task: dict[uuid.UUID, tuple[str, set[int]]] = {}
         for _t in (t for t in merged_tasks if t.id in _to_verify_ids):
             _ctx_t = _t.context or {}
             _task_pr_numbers: set[int] = set()
@@ -3095,9 +3102,7 @@ async def _build_recent_interventions(
                     if _recent_promotion_messages is not None:
                         for _tid in _message_rescued_task_ids:
                             _title, _task_pr_numbers = (
-                                _rollup_message_evidence_by_task.get(
-                                    _tid, ("", set())
-                                )
+                                _rollup_message_evidence_by_task.get(_tid, ("", set()))
                             )
                             if _recent_commit_messages_match_task(
                                 _recent_promotion_messages,
@@ -3142,7 +3147,11 @@ async def _build_recent_interventions(
         no second GitHub/ancestry pass.
         """
         if task.id in _automain_verified:
-            return "verified_landed" if _automain_verified[task.id] else "verified_not_landed"
+            return (
+                "verified_landed"
+                if _automain_verified[task.id]
+                else "verified_not_landed"
+            )
         return "unverifiable"
 
     # For rollups: look up child titles so the agent sees what actually
@@ -3723,11 +3732,13 @@ async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
             .where(
                 Task.project_id == project.id,
                 Task.payloads[0]["type"].as_string() == "repo_bootstrap",
-                Task.status.in_([
-                    TaskStatus.QUEUED,
-                    TaskStatus.PROVISIONING,
-                    TaskStatus.IN_PROGRESS,
-                ]),
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                    ]
+                ),
             )
             .limit(1)
         )
@@ -4043,9 +4054,7 @@ async def _spawn_strategic_review(
         # The displayed prs_merged and operator_rejection_rate below stay RAW
         # (operator-judgment metrics); only the activity-score selection input
         # reads this verified field.
-        total_verified_merged = sum(
-            verified_merged_count(h) for h in history
-        ) + (
+        total_verified_merged = sum(verified_merged_count(h) for h in history) + (
             agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
         )
         # Proven lifetime merge total — STRICTER than verified: only merges with
@@ -4053,17 +4062,17 @@ async def _spawn_strategic_review(
         # consumption (proven_merged_count); legacy entries degrade to 0. Always
         # <= total_verified_merged for the same window, so a direction that
         # shipped many merges but proved few is visibly distinct.
-        total_proven_merged = sum(
-            proven_merged_count(h) for h in history
-        ) + (agg.get("total_acceptance_proven_merged", 0) or 0)
+        total_proven_merged = sum(proven_merged_count(h) for h in history) + (
+            agg.get("total_acceptance_proven_merged", 0) or 0
+        )
         total_consumed_merged = sum(
             h.get("acceptance_consumed_merged", 0) for h in history
         ) + (agg.get("total_acceptance_consumed_merged", 0) or 0)
         # Declaration coverage = declared / merged-write, recomputed from summed
         # counts (not averaged per-cycle fractions) so it survives eviction.
-        total_declared_merged = sum(
-            declared_merged_count(h) for h in history
-        ) + (agg.get("total_acceptance_declared_merged", 0) or 0)
+        total_declared_merged = sum(declared_merged_count(h) for h in history) + (
+            agg.get("total_acceptance_declared_merged", 0) or 0
+        )
         total_merged_write = sum(
             h.get("acceptance_merged_write_total", 0) for h in history
         ) + (agg.get("total_acceptance_merged_write_total", 0) or 0)
@@ -4273,12 +4282,13 @@ async def _spawn_strategic_review(
         exhaustion_count = int(spawn_gate_metrics.get("exhaustion_count") or 0)
         if exhaustion_count <= 0:
             continue
-        direction_label = f"{stat_entry.get('id')}: {(stat_entry.get('text') or '')[:120]}".strip()
+        direction_label = (
+            f"{stat_entry.get('id')}: {(stat_entry.get('text') or '')[:120]}".strip()
+        )
         cause_distribution = spawn_gate_metrics.get("cause_distribution") or {}
         if cause_distribution:
             cause_parts = ", ".join(
-                f"{cat} x{cnt}"
-                for cat, cnt in sorted(cause_distribution.items())
+                f"{cat} x{cnt}" for cat, cnt in sorted(cause_distribution.items())
             )
             cause_note = f"observed causes: {cause_parts}"
         else:
@@ -4331,9 +4341,7 @@ async def _spawn_strategic_review(
     running_update_superseded = (
         {
             "count": len(_superseded_entries),
-            "most_recent_at": max(
-                (e.get("at") or "") for e in _superseded_entries
-            ),
+            "most_recent_at": max((e.get("at") or "") for e in _superseded_entries),
         }
         if _superseded_entries
         else None
@@ -4494,9 +4502,7 @@ async def _spawn_strategic_review(
             "measurable, promote it first."
         )
         prompt_suffix = (
-            f"{_deploy_framing}\n{prompt_suffix}"
-            if prompt_suffix
-            else _deploy_framing
+            f"{_deploy_framing}\n{prompt_suffix}" if prompt_suffix else _deploy_framing
         )
         try:
             from app.release_version import (
@@ -4638,9 +4644,9 @@ async def _spawn_strategic_review(
                 recent_closed_versions as _recent_closed_for_deploy,
             )
 
-            _tasks_merged_unpromoted = (
-                (_version_phase_block or {}).get("tasks_merged_this_version") or 0
-            )
+            _tasks_merged_unpromoted = (_version_phase_block or {}).get(
+                "tasks_merged_this_version"
+            ) or 0
             # Latest promoted version (rows are newest-first; the first promoted
             # one is the most recent promotion = highest version_number).
             _promoted_v = None
@@ -4710,9 +4716,9 @@ async def _spawn_strategic_review(
                 and _promoted_aggregate["serving_status"] == "serving_confirmed"
             ):
                 _deployed_sha = _promoted_v.served_sha
-            _undeployed_dirs = (
-                (recent_interventions or {}).get("undeployed_directions") or []
-            )
+            _undeployed_dirs = (recent_interventions or {}).get(
+                "undeployed_directions"
+            ) or []
             # automain_ahead_of_main: reliable from DB alone (open, un-promoted
             # version carrying merged work), refined by the GitHub-verified
             # per-direction list when available.
@@ -4730,8 +4736,7 @@ async def _spawn_strategic_review(
                 "deploy_status": _deploy_status,
                 # Rollback provenance (self-repo only; None/0 otherwise) — the
                 # same truth operators already see in the deploy panel.
-                "rolled_back_from_sha": (_rolled_back_from_sha or "")[:12]
-                or None,
+                "rolled_back_from_sha": (_rolled_back_from_sha or "")[:12] or None,
                 "rollback_count": _rollback_count,
                 "rollback_reason": _rollback_reason,
                 "promoted_version": (
@@ -4751,9 +4756,7 @@ async def _spawn_strategic_review(
                     else None
                 ),
                 "promoted_deploy_failure_reason": (
-                    _promoted_aggregate["reason_code"]
-                    if _promoted_aggregate
-                    else None
+                    _promoted_aggregate["reason_code"] if _promoted_aggregate else None
                 ),
                 "promoted_artifacts": _promoted_artifacts,
                 "promoted_artifact_gap": _promoted_gap,
@@ -4818,9 +4821,7 @@ async def _spawn_strategic_review(
                     else ""
                 )
                 _reason_txt = (
-                    f" Rollback reason: {_rollback_reason}."
-                    if _rollback_reason
-                    else ""
+                    f" Rollback reason: {_rollback_reason}." if _rollback_reason else ""
                 )
                 _count_txt = (
                     f" Consecutive rollbacks: {_rollback_count}."
@@ -4925,9 +4926,7 @@ async def _spawn_strategic_review(
 
             _project_id_str = str(project.id)
             _dir_text_map = {
-                d.get("id"): d
-                for d in (project.directions or [])
-                if d.get("id")
+                d.get("id"): d for d in (project.directions or []) if d.get("id")
             }
             # One bounded query for the project's recent FAILED tasks, then
             # partition by direction_id in memory (mirrors the gathering logic
@@ -4970,9 +4969,7 @@ async def _spawn_strategic_review(
                     {
                         "direction_id": _did,
                         "direction_text": (_direction.get("text") or "?")[:300],
-                        "consecutive_failures": _hold_info.get(
-                            "consecutive_failures"
-                        ),
+                        "consecutive_failures": _hold_info.get("consecutive_failures"),
                         "last_failure_class": _hold_info.get("last_failure_class"),
                         "dominant_error_fingerprint": _dominant_fp,
                         "recent_failure_messages": _failure_messages,
@@ -5074,9 +5071,7 @@ async def _spawn_strategic_review(
                 f" (reason={_prior_deploy_reason})" if _prior_deploy_reason else ""
             )
             _artifact_txt = (
-                f" Evidence: {_prior_artifact_gap}."
-                if _prior_artifact_gap
-                else ""
+                f" Evidence: {_prior_artifact_gap}." if _prior_artifact_gap else ""
             )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} MERGED to "
@@ -5101,9 +5096,7 @@ async def _spawn_strategic_review(
                 f" (reason={_prior_deploy_reason})" if _prior_deploy_reason else ""
             )
             _artifact_txt = (
-                f" Evidence: {_prior_artifact_gap}."
-                if _prior_artifact_gap
-                else ""
+                f" Evidence: {_prior_artifact_gap}." if _prior_artifact_gap else ""
             )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} MERGED to "
@@ -5123,9 +5116,7 @@ async def _spawn_strategic_review(
             )
         elif _prior_serving_status == "unconfirmed":
             _artifact_txt = (
-                f" Evidence: {_prior_artifact_gap}."
-                if _prior_artifact_gap
-                else ""
+                f" Evidence: {_prior_artifact_gap}." if _prior_artifact_gap else ""
             )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} was promoted "
@@ -5179,17 +5170,12 @@ async def _spawn_strategic_review(
     # independently of the post-promotion handoff (which self-clears once the fresh
     # version starts qualifying) so failed deploys continue to drive strategic
     # attention until actually recovered.
-    if (
-        _open_version is not None
-        and _integration_branch != _promotion_target
-    ):
+    if _open_version is not None and _integration_branch != _promotion_target:
         _latest_promoted_version: Any | None = None
         try:
             from app.release_version import recent_closed_versions as _rcv
 
-            for _v in await _rcv(
-                session, project.id, limit=1, include_artifacts=True
-            ):
+            for _v in await _rcv(session, project.id, limit=1, include_artifacts=True):
                 if _v.status == "promoted":
                     _latest_promoted_version = _v
                     break
@@ -5218,9 +5204,7 @@ async def _spawn_strategic_review(
                 else ""
             )
             _artifact_txt = (
-                f" Evidence: {_latest_artifact_gap}."
-                if _latest_artifact_gap
-                else ""
+                f" Evidence: {_latest_artifact_gap}." if _latest_artifact_gap else ""
             )
             _failed_deploy_directive = (
                 f"Active deployment crisis — v{_latest_promoted_version.version_number} "
@@ -5329,8 +5313,7 @@ async def _spawn_strategic_review(
                     _binding_key = min(_active, key=lambda _k: _active[_k])
                     if _binding_key == "audit":
                         _binding_desc = (
-                            "the audit sub-score is the binding constraint on "
-                            "promotion"
+                            "the audit sub-score is the binding constraint on promotion"
                         )
                     else:
                         _binding_desc = (
@@ -5937,20 +5920,26 @@ async def _spawn_strategic_review(
     # recomputed by the surviving spawner's cycle.
     from app.autonomous_research import _try_research_spawn_advisory_lock
 
-    if not await _try_research_spawn_advisory_lock(session, project.id):
+    # Capture before any rollback: rollback expires all ORM instances in the
+    # identity map (expire_on_commit=False does not apply to rollback), so
+    # accessing project.id after rollback triggers a synchronous lazy-load
+    # that raises MissingGreenlet in async context (BUG_REPORT e530efec).
+    _project_id = project.id
+
+    if not await _try_research_spawn_advisory_lock(session, _project_id):
         await session.rollback()
         logger.warning(
             "[STRATEGIC] Aborting strategic review spawn for project %s — a peer "
             "instance took the research-spawn lock during the payload build",
-            project.id,
+            _project_id,
         )
         return False
-    if await _has_active_strategic_task(project.id, session):
+    if await _has_active_strategic_task(_project_id, session):
         await session.rollback()
         logger.warning(
             "[STRATEGIC] Aborting strategic review spawn for project %s — a "
             "strategic task appeared during the payload build",
-            project.id,
+            _project_id,
         )
         return False
 
