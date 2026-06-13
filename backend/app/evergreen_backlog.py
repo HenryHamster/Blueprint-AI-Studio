@@ -768,7 +768,9 @@ async def check_evergreen_fill() -> None:
                 ).scalar()
                 or 0
             )
-            global_rate_limited = global_recent >= max_global_per_hour
+            # Tracks probes spawned within this tick so the global cap is
+            # re-evaluated on each iteration without an extra DB round-trip.
+            tick_spawned = 0
 
             projects = (
                 (
@@ -810,6 +812,12 @@ async def check_evergreen_fill() -> None:
                         session, project_id=project.id, item=candidate
                     )
 
+                # Re-evaluate the global cap each iteration using the trailing-hour
+                # count plus probes already spawned in this tick.
+                global_rate_limited = (
+                    global_recent + tick_spawned
+                ) >= max_global_per_hour
+
                 signal = FleetSignal(
                     mode=mode,
                     util_now=util_now,
@@ -844,6 +852,7 @@ async def check_evergreen_fill() -> None:
                     base_branch=base_branch,
                 )
                 if task is not None:
+                    tick_spawned += 1
                     await session.commit()
                     logger.info(
                         "[EVERGREEN] spawned probe %s for item %s (trigger=%s, project=%s)",

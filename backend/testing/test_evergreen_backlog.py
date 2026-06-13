@@ -689,3 +689,149 @@ async def test_deferred_memo_enrollment_flag_gated(db_session, mocker):
         .all()
     )
     assert len(rows_dedup) == 1, "dedup: still exactly one row after second enroll"
+
+
+# --------------------------------------------------------------------------- #
+# check_evergreen_fill: global hourly cap enforced within one tick.
+# --------------------------------------------------------------------------- #
+
+
+async def test_global_hourly_cap_holds_across_multi_project_tick(db_session, mocker):
+    """Global hourly cap is never exceeded within a single check_evergreen_fill tick.
+
+    Setup: 4 projects each with one enrolled candidate; global_recent seeded to
+    cap-1; max_global_per_hour=cap.  Only 1 probe should be created because the
+    tick_spawned counter must stop the loop after the first successful spawn.
+    """
+    import contextlib
+    import uuid as _uuid
+    from unittest.mock import AsyncMock, patch
+
+    import app.shared_state as _ss
+    from app.evergreen_backlog import check_evergreen_fill
+    from app.models import Task, TaskStatus
+
+    cap = 3  # small cap for fast assertion
+
+    # ---- Seed 4 autonomous-enabled projects, each with one backlog candidate ----
+    projects = []
+    items = []
+    for i in range(4):
+        proj = Project(
+            name=f"cap-test-{i}-{_uuid.uuid4().hex[:6]}",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+        )
+        db_session.add(proj)
+        await db_session.flush()
+        item = await enroll_backlog_item(
+            db_session,
+            project_id=proj.id,
+            finding_key=f"cap-gap-{i}",
+            title=f"Cap test gap {i}",
+        )
+        projects.append(proj)
+        items.append(item)
+
+    # ---- Seed cap-1 pre-existing evergreen probes in the trailing hour ----
+    for j in range(cap - 1):
+        dummy_proj = projects[0]
+        existing = Task(
+            project_id=dummy_proj.id,
+            title=f"pre-existing probe {j}",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            idempotency_key=f"evergreen-fill:{dummy_proj.id}:pre-{j}",
+        )
+        db_session.add(existing)
+    await db_session.flush()
+
+    # ---- Patch external dependencies so check_evergreen_fill runs end-to-end ----
+
+    # Wrap the real db_session in a no-op async context manager.
+    @contextlib.asynccontextmanager
+    async def _session_cm():
+        yield db_session
+
+    # Bypass interval throttle.
+    _ss.last_evergreen_check = None
+
+    # runtime_config overrides for this test.
+    runtime_overrides = {
+        "evergreen_fill_mode": "enforce",
+        "evergreen_fill_interval_minutes": 0,
+        "evergreen_fill_util_threshold": 0.9,  # threshold HIGH so util (0.1) triggers
+        "evergreen_fill_min_free_slots": 1,
+        "evergreen_fill_max_active": 5,  # don't hit per-project active cap
+        "evergreen_fill_daily_cap": 10,  # don't hit per-project daily cap
+        "max_global_autonomous_tasks_per_hour": cap,
+    }
+
+    # Mutate the live runtime_config dict (same object the function reads) and
+    # restore it afterward — avoids mock complexity with lazy imports.
+    import app.shared_state as _real_ss
+    from app.shared_state import runtime_config as _real_rc
+
+    orig_values = {k: _real_rc.get(k) for k in runtime_overrides}
+    for k, v in runtime_overrides.items():
+        _real_rc[k] = v
+    _real_ss.last_evergreen_check = None
+
+    try:
+        with (
+            patch("app.database.AsyncSessionLocal", _session_cm),
+            patch(
+                "app.fleet_utilization.get_fleet_utilization_snapshot",
+                new=AsyncMock(return_value={"util_now": 0.1, "vm_slots_available": 8}),
+            ),
+            patch(
+                "app.branch_resolution.get_project_integration_branch",
+                return_value="automain",
+            ),
+            patch(
+                "app.evergreen_backlog._evergreen_spend_ceiling_reason",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.evergreen_backlog._evergreen_circuit_open",
+                return_value=False,
+            ),
+            patch(
+                "app.evergreen_backlog._directions_parked_or_proof_waiting",
+                return_value=False,
+            ),
+            patch(
+                "app.evergreen_backlog.has_direction_conflict",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "app.evergreen_backlog.has_duplicate_lineage",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            await check_evergreen_fill()
+    finally:
+        for k, orig_v in orig_values.items():
+            if orig_v is None:
+                _real_rc.pop(k, None)
+            else:
+                _real_rc[k] = orig_v
+
+    # ---- Count total evergreen probes created by this tick ----
+    all_probes = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.idempotency_key.like("evergreen-fill:%"),
+                    Task.idempotency_key.not_like("evergreen-fill:%:pre-%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(all_probes) == 1, (
+        f"Expected exactly 1 probe (cap={cap}, pre-existing={cap - 1}), "
+        f"got {len(all_probes)}"
+    )
