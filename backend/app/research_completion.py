@@ -4611,6 +4611,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     str(finding.get("title", title) or ""),
                     str(finding.get("description", finding.get("prompt", "")) or ""),
                 ),
+                # NEW-convention hash (description or prompt): ensures missing_hash
+                # (which uses `description or prompt`) matches this lineage even when
+                # description is an empty string and prompt is non-empty.
+                _finding_hash(
+                    str(finding.get("title", title) or ""),
+                    str(
+                        finding.get("description")
+                        or finding.get("prompt", "")
+                        or ""
+                    ),
+                ),
             )
             if isinstance(v, str) and v.strip()
         }
@@ -4870,7 +4881,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         stamped.setdefault("originally_researched_at", _now_iso)
         if not stamped.get("finding_hash"):
             stamped["finding_hash"] = _finding_hash(
-                stamped.get("title", ""), stamped.get("description", "")
+                stamped.get("title", ""),
+                str(stamped.get("description") or stamped.get("prompt", "")),
             )
         return stamped
 
@@ -4893,14 +4905,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     )
     for _adf in _adversarial_gate_deferred:
         _adf_stamped = _stamp_deferral(_adf, "adversarial_gate")
-        # Re-key the finding_hash the SAME way adversarial verdicts are keyed
-        # (title + description-or-prompt), overriding the description-only hash
-        # _stamp_deferral computes, so downstream consumers can match this
-        # deferred entry to its challenger verdict by hash, not just by title.
-        _adf_stamped["finding_hash"] = _finding_hash(
-            str(_adf_stamped.get("title", "")),
-            str(_adf_stamped.get("description", "") or _adf_stamped.get("prompt", "")),
-        )
         _adf_stamped.pop("_adversarial_verdict", None)
         _gate_reason = _adf_stamped.pop("_adversarial_verdict_reason", None)
         _adf_stamped.pop("_adversarial_verdict_explicit", None)
@@ -5450,9 +5454,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             missing_hash = _finding_hash(
                 str(missing_title),
                 str(
-                    missing_finding.get(
-                        "description", missing_finding.get("prompt", "")
-                    )
+                    missing_finding.get("description")
+                    or missing_finding.get("prompt", "")
                     or ""
                 ),
             )
@@ -5917,7 +5920,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         await with_design_doc_locked(session, task.project_id, _credit_playbook_keys)
         await session.commit()
-
 
 
 async def _record_research_task_failure(task: Task, session: AsyncSession) -> None:

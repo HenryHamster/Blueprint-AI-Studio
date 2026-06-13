@@ -1284,6 +1284,17 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     logger.warning(
                         f"[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}"
                     )
+                    _now_iso = _utcnow().isoformat()
+
+                    def _bump_pending_sr_skip(vision: dict) -> None:
+                        marker = vision.get("_pending_strategic_review")
+                        if marker is None:
+                            return
+                        marker["attempt_count"] = marker.get("attempt_count", 0) + 1
+                        if not marker.get("first_attempted_at"):
+                            marker["first_attempted_at"] = _now_iso
+
+                    await with_vision_locked(session, project.id, _bump_pending_sr_skip)
                     # Fall through to tactical research
             except Exception:
                 logger.exception(

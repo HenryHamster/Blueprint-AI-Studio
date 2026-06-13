@@ -15057,7 +15057,7 @@ async def test_pending_sr_success_clears_marker_and_returns_early(db_session, mo
 
 @pytest.mark.asyncio
 async def test_pending_sr_skip_falls_through_to_tactical(db_session, mocker):
-    """When _spawn_strategic_review returns False (active task), fall through; marker is preserved."""
+    """When _spawn_strategic_review returns False (active task), fall through; marker is preserved and attempt_count is incremented."""
     mocker.patch(
         "app.strategic_spawning._spawn_strategic_review",
         new=AsyncMock(return_value=False),
@@ -15093,13 +15093,87 @@ async def test_pending_sr_skip_falls_through_to_tactical(db_session, mocker):
 
     await _spawn_research_task(project, db_session)
 
-    # Marker should still be present (not cleared on skip, not incremented on skip)
+    # Marker should still be present; attempt_count must be incremented so the cap/age escalation arms
     await db_session.refresh(project)
     marker = (project.vision or {}).get("_pending_strategic_review")
     assert marker is not None, "Marker must remain when SR spawn was skipped"
-    assert marker.get("attempt_count", 0) == 0, (
-        "attempt_count must NOT be incremented on a skip (only on exception)"
+    assert marker.get("attempt_count", 0) == 1, (
+        "attempt_count must be incremented on a skip so the cap/age safety valve eventually fires"
     )
+    assert marker.get("first_attempted_at") is not None, (
+        "first_attempted_at must be stamped on first skip so the age window arms"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_skip_escalates_after_cap_reached(db_session, mocker):
+    """A marker behind a persistently-active strategic task (return-False) escalates after cap.
+
+    Starts with attempt_count == max_attempts - 1, mocks _spawn_strategic_review to
+    return False again, and verifies the marker is dropped and an alert is created —
+    proving the cap/age safety valve fires on the return-False path, not just on exceptions.
+    """
+    import app.shared_state as _ss
+
+    _ss.runtime_config["pending_sr_max_attempts"] = 3
+
+    spawn_sr_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=False),
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert",
+        new=AsyncMock(return_value=None),
+    )
+
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    first_attempted = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    project = Project(
+        name="Pending SR Skip Cap Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-skip-cap1", "Pending SR direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": first_attempted,
+                "error": "skipped: active strategic task exists",
+                "cycle_id": "cyc-skip-cap-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+                # Pre-seed attempt_count at max - 1; one more skip should push it to max
+                # and trigger the escalation on the NEXT cycle (cap check runs first)
+                "attempt_count": 3,
+                "first_attempted_at": first_attempted,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # When attempt_count >= max, the cap path fires BEFORE calling _spawn_strategic_review
+    assert not spawn_sr_mock.called, (
+        "_spawn_strategic_review must not be called when attempt_count >= max"
+    )
+    assert alert_mock.called, (
+        "Alert must be created when retry cap is exceeded (return-False path)"
+    )
+
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_pending_strategic_review") is None, (
+        "Marker must be dropped after cap is exceeded on return-False path"
+    )
+
+    _ss.runtime_config.pop("pending_sr_max_attempts", None)
 
 
 @pytest.mark.asyncio

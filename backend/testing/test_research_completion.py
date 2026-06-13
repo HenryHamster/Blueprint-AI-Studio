@@ -5218,6 +5218,75 @@ async def test_deferred_sibling_prerequisite_co_defers_dependent(db_session, moc
 
 
 @_pytest.mark.asyncio
+async def test_deferred_prompt_only_prerequisite_co_defers_dependent(
+    db_session, mocker
+):
+    """A prerequisite finding with an empty description but a non-empty prompt must
+    receive the same identity hash as the hash computed by the sibling's
+    depends_on resolution (which falls back to prompt when description is empty).
+    Before the fix, _stamp_deferral used description-only, so the deferred prereq's
+    hash never matched the sibling's missing_hash lookup, causing the sibling to be
+    cancelled instead of co-deferred."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-prq-prompt-only"
+    )
+    prereq = _make_finding(
+        title="Prompt-only prerequisite", direction_id=direction["id"]
+    )
+    # Clear description so the finding is prompt-only — this is the case that
+    # previously produced a hash mismatch between _stamp_deferral and the
+    # depends_on resolution path.
+    prereq["description"] = ""
+    prereq["actionability_grade"] = "LOW"
+
+    dependent = _make_finding(
+        title="Dependent on prompt-only prereq", direction_id=direction["id"]
+    )
+    dependent["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[prereq, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    dependent_children = [c for c in children if c.title == dependent["title"]]
+    assert not any(c.status == TaskStatus.BLOCKED for c in dependent_children), (
+        "a dependent must not sit live-blocked behind a deferred prompt-only prereq"
+    )
+    assert all(c.status == TaskStatus.CANCELLED for c in dependent_children), (
+        "the co-deferred dependent's live task must be cancelled"
+    )
+
+    deferred = (task.context or {}).get("deferred_findings", [])
+    # The prereq hash must use title + prompt (description is empty), matching the
+    # hash the depends_on resolution path computes via _finding_hash(title, prompt).
+    prereq_hash = _finding_hash(prereq["title"], prereq["prompt"])
+    dependent_hash = _finding_hash(dependent["title"], dependent["description"])
+    by_hash = {f.get("finding_hash"): f for f in deferred}
+    assert prereq_hash in by_hash, (
+        "the deferred prompt-only prerequisite must be shelved with the correct hash"
+    )
+    assert dependent_hash in by_hash, "the co-deferred dependent must be shelved"
+    assert by_hash[dependent_hash]["deferred_reason"] == "prereq_deferred_same_cycle"
+
+
+@_pytest.mark.asyncio
 async def test_two_deferred_sibling_prerequisites_co_defer_dependent(
     db_session, mocker
 ):
@@ -8517,6 +8586,221 @@ def test_adversarial_gate_unresolved_reason_distinguishes_parse_failure_modes():
     assert result["h1"]["passed"] is False
     # h2 was not in the output at all → no_hash_matches
     assert result["h2"]["unresolved_reason"] == "no_hash_matches"
+
+
+# ---------------------------------------------------------------------------
+# Cross-seam contract: challenge handler output shape ↔ backend parser
+# ---------------------------------------------------------------------------
+
+
+class TestAdversarialChallengeHandlerToParserContract:
+    """Cross-seam contract: adversarial challenge handler output ↔ backend parser.
+
+    The prompt builder (build_adversarial_finding_prompt) instructs the challenger
+    to emit a [{index, hash, verdict, reason}] array keyed by the finding's hash.
+    The backend parser (parse_adversarial_finding_verdicts) expects that same shape.
+    This class pins the round-trip so drift on either side — a new prompt template,
+    a change to the array schema, or re-introduction of investigation-report wrapping
+    — fails a test rather than silently suppressing all findings at the gate.
+    """
+
+    def _findings(self):
+        return [
+            {
+                "title": "Missing null check in parser module",
+                "description": "The parser at backend/app/foo.py:42 does not guard against None input.",
+                "risk": "high",
+                "scope": "small",
+            },
+            {
+                "title": "Race condition in task dispatch path",
+                "description": "Concurrent task dispatch can double-spawn under high load in orchestrator.",
+                "risk": "medium",
+                "scope": "medium",
+            },
+        ]
+
+    def test_prompt_builder_output_schema_round_trips_through_parser(self):
+        """Challenger output shaped exactly as the prompt instructs parses to real verdicts.
+
+        Build the manifest using finding_hash (exactly as research_completion does),
+        embed it in the adversarial prompt, construct a challenger response following
+        the prompt's [{index, hash, verdict, reason}] schema, and assert
+        parse_adversarial_finding_verdicts returns ok with explicit verdicts.
+        """
+        from app.task_evaluators import (
+            build_adversarial_challenge_manifest,
+            build_adversarial_finding_prompt,
+        )
+        from app.finding_deduplication import finding_hash
+
+        findings = self._findings()
+        for f in findings:
+            f["hash"] = finding_hash(f["title"], f["description"])
+
+        compact, manifest_json = build_adversarial_challenge_manifest(findings)
+        assert len(compact) == 2
+        prompt = build_adversarial_finding_prompt(manifest_json)
+        # The manifest JSON must appear verbatim in the prompt.
+        assert manifest_json in prompt
+
+        # Build a challenger response shaped exactly as the prompt instructs.
+        # The prompt ends with the schema:
+        #   [{"index": <1-based>, "hash": "<hash from input>", "verdict": "pass"|"fail", "reason": "..."}]
+        challenger_response = json.dumps(
+            [
+                {
+                    "index": entry["index"],
+                    "hash": entry["hash"],
+                    "verdict": "pass",
+                    "reason": "All three criteria hold at HEAD: premise verified, evidence real, scope accurate.",
+                }
+                for entry in compact
+            ]
+        )
+
+        finding_hashes = [f["hash"] for f in findings]
+        verdicts, parse_outcome = parse_adversarial_finding_verdicts(
+            challenger_response, finding_hashes
+        )
+
+        assert parse_outcome == "ok", (
+            f"Parser rejected prompt-builder-instructed challenger output; outcome={parse_outcome!r}. "
+            "The prompt instructs a shape the parser cannot read — this is a live regression."
+        )
+        for fhash in finding_hashes:
+            assert verdicts[fhash]["explicit"] is True, (
+                f"Finding {fhash!r} received a fail-closed default instead of an explicit verdict. "
+                "The prompt-to-parser contract is broken."
+            )
+            assert verdicts[fhash]["passed"] is True
+            assert verdicts[fhash]["reason"] != ""
+
+    def test_investigation_report_wrapper_breaks_parser(self):
+        """Pure investigation-report output fails the parser (original regression guard).
+
+        The handler was broken when the adversarial branch was routed through the
+        standard investigation template, instructing the agent to write a JSON object
+        with schema {summary, root_cause, affected_files, recommended_fix, ...} —
+        which contains NO hash or verdict fields at all.  The parser anchors on a
+        JSON array containing 'hash' and 'verdict' keys; an investigation-report object
+        with none of those keys yields no_json_array and all findings fail closed.
+        This test locks that invariant: an investigation-report object WITHOUT hash/verdict
+        arrays must produce no_json_array, not 'ok'.
+        """
+        from app.finding_deduplication import finding_hash
+
+        findings = self._findings()
+        finding_hashes = [finding_hash(f["title"], f["description"]) for f in findings]
+
+        # A pure investigation-report object — the exact shape the agent would emit
+        # when the standard investigate template is applied instead of the adversarial
+        # prompt.  Crucially, there are NO hash or verdict fields anywhere.
+        pure_investigation_report = json.dumps(
+            {
+                "summary": "Evaluated each finding against the three criteria.",
+                "root_cause": "The parser at backend/app/foo.py:42 lacks a null guard.",
+                "affected_files": [
+                    {
+                        "path": "backend/app/foo.py",
+                        "issue": "missing null check at line 42",
+                    }
+                ],
+                "recommended_fix": "Add null guard before accessing result.",
+                "severity": "medium",
+                "confidence": "high",
+            }
+        )
+
+        verdicts, parse_outcome = parse_adversarial_finding_verdicts(
+            pure_investigation_report, finding_hashes
+        )
+
+        # A pure investigation-report with no hash/verdict fields must yield no_json_array
+        # and fail-close all findings.
+        assert parse_outcome == "no_json_array", (
+            f"Expected no_json_array for a pure investigation-report, got {parse_outcome!r}. "
+            "If the handler re-introduces investigation-report wrapping this gate would "
+            "collapse to 'no verdict returned' for every finding, silently suppressing them all."
+        )
+        for fhash in finding_hashes:
+            assert verdicts[fhash]["explicit"] is False, (
+                f"Finding {fhash!r} got an explicit verdict from a pure investigation-report — "
+                "the parser must fail-close when no hash/verdict array is present."
+            )
+            assert verdicts[fhash]["passed"] is False
+
+    def test_hash_from_manifest_matches_hash_from_finding_deduplication(self):
+        """The hash embedded by build_adversarial_challenge_manifest equals finding_hash(title, description).
+
+        research_completion stamps each finding's hash using finding_hash before
+        passing it to build_adversarial_challenge_manifest.  If the manifest ever
+        re-computed the hash differently, the challenger would write back a hash
+        the parser's finding_hashes list does not contain, causing no_hash_matches.
+        """
+        from app.task_evaluators import build_adversarial_challenge_manifest
+        from app.finding_deduplication import finding_hash
+
+        findings = self._findings()
+        for f in findings:
+            f["hash"] = finding_hash(f["title"], f["description"])
+
+        compact, _ = build_adversarial_challenge_manifest(findings)
+
+        for i, entry in enumerate(compact):
+            expected_hash = finding_hash(
+                findings[i]["title"], findings[i]["description"]
+            )
+            assert entry["hash"] == expected_hash, (
+                f"Manifest hash {entry['hash']!r} != finding_hash result {expected_hash!r} "
+                f"for finding {i}. A discrepancy here causes no_hash_matches at parse time."
+            )
+
+    def test_parser_produces_real_verdicts_not_fail_closed_defaults(self):
+        """Explicit pass and fail verdicts are genuinely propagated, not collapsed to defaults.
+
+        Builds a mixed response (one pass, one fail) shaped as the prompt instructs and
+        verifies the parser returns the actual per-finding outcome, not uniform fail-closed
+        defaults.  This catches a regression where all verdicts collapse to
+        passed=False/explicit=False regardless of the challenger's actual output.
+        """
+        from app.task_evaluators import build_adversarial_challenge_manifest
+        from app.finding_deduplication import finding_hash
+
+        findings = self._findings()
+        for f in findings:
+            f["hash"] = finding_hash(f["title"], f["description"])
+
+        compact, _ = build_adversarial_challenge_manifest(findings)
+        finding_hashes = [f["hash"] for f in findings]
+
+        # First finding passes, second fails.
+        response = json.dumps(
+            [
+                {
+                    "index": compact[0]["index"],
+                    "hash": compact[0]["hash"],
+                    "verdict": "pass",
+                    "reason": "Premise is real and cited code exists at HEAD.",
+                },
+                {
+                    "index": compact[1]["index"],
+                    "hash": compact[1]["hash"],
+                    "verdict": "fail",
+                    "reason": "Cited file was removed in a prior refactor; premise is stale.",
+                },
+            ]
+        )
+
+        verdicts, parse_outcome = parse_adversarial_finding_verdicts(
+            response, finding_hashes
+        )
+
+        assert parse_outcome == "ok"
+        assert verdicts[finding_hashes[0]]["passed"] is True
+        assert verdicts[finding_hashes[0]]["explicit"] is True
+        assert verdicts[finding_hashes[1]]["passed"] is False
+        assert verdicts[finding_hashes[1]]["explicit"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -878,9 +878,32 @@ The "verdict" value MUST be exactly "pass" or "fail" — no other values are acc
       // A focused re-ask succeeded with recognized verdicts — post the repaired array.
       challengeLogs = sanitize(JSON.stringify(repaired.value));
     } else {
-      // First attempt was already parseable (retry===null), repair failed, or
-      // exitCode!==0 — pass raw output through unchanged.
-      challengeLogs = sanitize(lastResultText || (allOutput || '').slice(-50_000));
+      const rawOutput = lastResultText || (allOutput || '').slice(-50_000);
+      // Guard: if the raw output is an investigation-report envelope (a
+      // {summary, root_cause, ...} object), the backend parser anchored on a
+      // top-level array would find no array and fail-close all findings.  Post
+      // the already-extracted valid array instead so the verdicts flow through.
+      if (repaired.value !== null) {
+        let isInvestigationReportEnvelope = false;
+        try {
+          const parsed = JSON.parse(rawOutput) as unknown;
+          isInvestigationReportEnvelope = (
+            parsed !== null &&
+            typeof parsed === 'object' &&
+            !Array.isArray(parsed) &&
+            'summary' in (parsed as Record<string, unknown>)
+          );
+        } catch { /* not a JSON object — safe to pass through */ }
+        if (isInvestigationReportEnvelope) {
+          challengeLogs = sanitize(JSON.stringify(repaired.value));
+        } else {
+          challengeLogs = sanitize(rawOutput);
+        }
+      } else {
+        // First attempt was already parseable (retry===null), repair failed, or
+        // exitCode!==0 — pass raw output through unchanged.
+        challengeLogs = sanitize(rawOutput);
+      }
     }
     await persistAndPostStatus(taskId, {
       task_id: taskId,

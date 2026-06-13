@@ -902,6 +902,47 @@ describe('handleInvestigate — adversarial grader self-repair', () => {
     expect(call.logs).not.toContain('agree');
     expect(call.logs).not.toContain('disagree');
   });
+
+  it('regression guard: adversarial branch emits a flat array, not an investigation-report object', async () => {
+    // The original defect: the handler wrapped adversarial output in the standard
+    // investigation-report schema {summary, root_cause, ...}, which has no top-level
+    // hash+verdict array for the backend parser to anchor on.  This test asserts the
+    // adversarial branch posts the raw challenger output (a flat [{hash, verdict, reason}]
+    // array) rather than a JSON.stringify'd investigation-report object.
+    const INVESTIGATION_REPORT_SHAPE = JSON.stringify({
+      summary: 'Challenger evaluated each finding',
+      root_cause: 'See findings array below',
+      affected_files: [],
+      recommended_fix: 'No action needed',
+      severity: 'low',
+      confidence: 'high',
+      findings: [{ hash: 'abc123', verdict: 'pass', reason: 'holds at HEAD' }],
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: INVESTIGATION_REPORT_SHAPE,
+    });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    // The posted logs must NOT be an investigation-report object — if they were, the
+    // backend parser (anchored on a top-level [{hash, verdict}] array) would find no
+    // array and fail-close all findings regardless of the actual verdicts.
+    const posted = call.logs as string;
+    let parsed: unknown;
+    try { parsed = JSON.parse(posted); } catch { parsed = null; }
+    // Must not be an object with investigation-report keys.
+    const isInvestigationReport = (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      'summary' in (parsed as Record<string, unknown>)
+    );
+    expect(isInvestigationReport).toBe(false);
+  });
 });
 
 // ── handleInvestigate — bounded self-repair on a clean-exit-but-unparseable run ─
