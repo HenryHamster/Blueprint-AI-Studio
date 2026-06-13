@@ -3058,6 +3058,57 @@ export interface LaneDiagResponse {
     opened_at: string;
     promoted_at: string | null;
   };
+  checkpoint_recovery_waste?: {
+    by_reason: Record<string, number>;
+    total: number;
+    exhausted_count: number;
+  };
+}
+
+export interface LaneBaselineTrendBlock {
+  latest: number | null;
+  prior: number | null;
+  delta: number | null;
+  classification: 'improving' | 'declining' | 'stable' | null;
+}
+
+export interface LaneBaselineTrend {
+  latest_version: number | null;
+  prior_version: number | null;
+  relay_medians: {
+    wall_clock_seconds: LaneBaselineTrendBlock;
+    active_seconds: LaneBaselineTrendBlock;
+    gap_seconds: LaneBaselineTrendBlock;
+    task_count: LaneBaselineTrendBlock;
+  };
+  lane_iterations: {
+    review: { p50: LaneBaselineTrendBlock; p90: LaneBaselineTrendBlock };
+    fix: { p50: LaneBaselineTrendBlock; p90: LaneBaselineTrendBlock };
+  };
+  waste_taxonomy_shares: Record<string, LaneBaselineTrendBlock>;
+  checkpoint_recovery_waste_total: LaneBaselineTrendBlock;
+}
+
+export interface LaneBaselinesResponse {
+  project_id: string;
+  count: number;
+  baselines: Record<string, unknown>[];
+  trend: LaneBaselineTrend | null;
+}
+
+export async function fetchLaneBaselines(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<LaneBaselinesResponse> {
+  const res = await apiFetch(
+    `/api/admin/lane-baselines?project_id=${encodeURIComponent(projectId)}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch lane baselines: ${res.status}`);
+  return res.json();
 }
 
 export async function fetchLaneDiag(

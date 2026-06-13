@@ -1,5 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
-import { apiFetch, type LaneDiagResponse, type LaneWasteTaxonomy, type PerPrPhaseRow } from '../api';
+import {
+  apiFetch,
+  fetchLaneBaselines,
+  type LaneDiagResponse,
+  type LaneWasteTaxonomy,
+  type LaneBaselineTrend,
+  type LaneBaselineTrendBlock,
+  type PerPrPhaseRow,
+} from '../api';
 
 const WASTE_CATEGORIES: { key: keyof LaneWasteTaxonomy; label: string; color: string }[] = [
   { key: 'infra', label: 'Infra', color: 'bg-red-500' },
@@ -14,6 +22,20 @@ function fmt(s: number): string {
   if (s >= 3600) return `${(s / 3600).toFixed(1)}h`;
   if (s >= 60) return `${Math.round(s / 60)}m`;
   return `${Math.round(s)}s`;
+}
+
+function classificationBadge(c: LaneBaselineTrendBlock['classification']): string {
+  if (c === 'improving') return 'text-green-400';
+  if (c === 'declining') return 'text-red-400';
+  if (c === 'stable') return 'text-neutral-400';
+  return 'text-neutral-600';
+}
+
+function classificationLabel(c: LaneBaselineTrendBlock['classification']): string {
+  if (c === 'improving') return '↓ improving';
+  if (c === 'declining') return '↑ declining';
+  if (c === 'stable') return '→ stable';
+  return '—';
 }
 
 function WasteTaxonomyTable({ taxonomy }: { taxonomy: LaneWasteTaxonomy }) {
@@ -37,6 +59,44 @@ function WasteTaxonomyTable({ taxonomy }: { taxonomy: LaneWasteTaxonomy }) {
         );
       })}
       <p className="text-xs text-neutral-500 pt-1">Total waste tasks: {total}</p>
+    </div>
+  );
+}
+
+function CheckpointRecoveryWasteTable({
+  crw,
+}: {
+  crw: NonNullable<LaneDiagResponse['checkpoint_recovery_waste']>;
+}) {
+  if (crw.total === 0) {
+    return <p className="text-xs text-neutral-500">No checkpoint-recovery waste recorded.</p>;
+  }
+
+  const entries = Object.entries(crw.by_reason).filter(([, v]) => v > 0);
+  return (
+    <div className="space-y-1">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-neutral-500 border-b border-neutral-800">
+            <th className="text-left py-1 font-normal">Recovery Reason</th>
+            <th className="text-right py-1 font-normal">Count</th>
+            <th className="text-right py-1 font-normal">Share</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.sort(([, a], [, b]) => b - a).map(([reason, count]) => {
+            const pct = crw.total > 0 ? ((count / crw.total) * 100).toFixed(0) : '0';
+            return (
+              <tr key={reason} className="border-b border-neutral-800/50">
+                <td className="py-1 text-neutral-300 font-mono">{reason}</td>
+                <td className="py-1 text-right text-neutral-200">{count}</td>
+                <td className="py-1 text-right text-neutral-500">{pct}%</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="text-xs text-neutral-500 pt-1">Total recovery tasks: {crw.total}</p>
     </div>
   );
 }
@@ -106,6 +166,127 @@ function PhaseBreakdownTable({ rows, truncated }: { rows: PerPrPhaseRow[]; trunc
   );
 }
 
+function TrendRow({
+  label,
+  block,
+  fmt: fmtVal,
+}: {
+  label: string;
+  block: LaneBaselineTrendBlock;
+  fmt?: (v: number) => string;
+}) {
+  const display = (v: number | null) =>
+    v == null ? '—' : fmtVal ? fmtVal(v) : v.toFixed(1);
+
+  return (
+    <tr className="border-b border-neutral-800/50">
+      <td className="py-1 text-neutral-300">{label}</td>
+      <td className="py-1 text-right text-neutral-400">{display(block.prior)}</td>
+      <td className="py-1 text-right text-neutral-200">{display(block.latest)}</td>
+      <td className={`py-1 text-right font-medium ${classificationBadge(block.classification)}`}>
+        {classificationLabel(block.classification)}
+      </td>
+    </tr>
+  );
+}
+
+function CrossVersionTrendPanel({ trend }: { trend: LaneBaselineTrend }) {
+  return (
+    <div className="space-y-4" data-testid="cross-version-trend">
+      <p className="text-xs text-neutral-500">
+        v{trend.prior_version} → v{trend.latest_version}
+      </p>
+
+      <div>
+        <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">
+          Relay Medians
+        </p>
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-neutral-500 border-b border-neutral-800">
+              <th className="text-left py-1 font-normal">Metric</th>
+              <th className="text-right py-1 font-normal">Prior</th>
+              <th className="text-right py-1 font-normal">Latest</th>
+              <th className="text-right py-1 font-normal">Trend</th>
+            </tr>
+          </thead>
+          <tbody>
+            <TrendRow label="Wall clock" block={trend.relay_medians.wall_clock_seconds} fmt={fmt} />
+            <TrendRow label="Active" block={trend.relay_medians.active_seconds} fmt={fmt} />
+            <TrendRow label="Gap" block={trend.relay_medians.gap_seconds} fmt={fmt} />
+            <TrendRow label="Tasks/PR" block={trend.relay_medians.task_count} />
+          </tbody>
+        </table>
+      </div>
+
+      <div>
+        <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">
+          Lane Iterations
+        </p>
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-neutral-500 border-b border-neutral-800">
+              <th className="text-left py-1 font-normal">Metric</th>
+              <th className="text-right py-1 font-normal">Prior</th>
+              <th className="text-right py-1 font-normal">Latest</th>
+              <th className="text-right py-1 font-normal">Trend</th>
+            </tr>
+          </thead>
+          <tbody>
+            <TrendRow label="Review p50" block={trend.lane_iterations.review.p50} />
+            <TrendRow label="Review p90" block={trend.lane_iterations.review.p90} />
+            <TrendRow label="Fix p50" block={trend.lane_iterations.fix.p50} />
+            <TrendRow label="Fix p90" block={trend.lane_iterations.fix.p90} />
+          </tbody>
+        </table>
+      </div>
+
+      <div>
+        <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">
+          Waste Taxonomy Shares
+        </p>
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-neutral-500 border-b border-neutral-800">
+              <th className="text-left py-1 font-normal">Category</th>
+              <th className="text-right py-1 font-normal">Prior</th>
+              <th className="text-right py-1 font-normal">Latest</th>
+              <th className="text-right py-1 font-normal">Trend</th>
+            </tr>
+          </thead>
+          <tbody>
+            {WASTE_CATEGORIES.map(({ key, label }) => {
+              const block = trend.waste_taxonomy_shares[key];
+              if (!block) return null;
+              const fmtPct = (v: number) => `${(v * 100).toFixed(0)}%`;
+              return <TrendRow key={key} label={label} block={block} fmt={fmtPct} />;
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div>
+        <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">
+          Checkpoint Recovery Waste
+        </p>
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-neutral-500 border-b border-neutral-800">
+              <th className="text-left py-1 font-normal">Metric</th>
+              <th className="text-right py-1 font-normal">Prior</th>
+              <th className="text-right py-1 font-normal">Latest</th>
+              <th className="text-right py-1 font-normal">Trend</th>
+            </tr>
+          </thead>
+          <tbody>
+            <TrendRow label="Recovery tasks" block={trend.checkpoint_recovery_waste_total} />
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 interface LaneDiagPanelProps {
   projectId?: string;
 }
@@ -114,6 +295,7 @@ export function LaneDiagPanel({ projectId }: LaneDiagPanelProps) {
   const [data, setData] = useState<LaneDiagResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [trend, setTrend] = useState<LaneBaselineTrend | null>(null);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -133,9 +315,20 @@ export function LaneDiagPanel({ projectId }: LaneDiagPanelProps) {
     }
   }, [projectId]);
 
+  const fetchTrend = useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const baselines = await fetchLaneBaselines(projectId);
+      setTrend(baselines.trend);
+    } catch {
+      // Trend is supplementary — silently skip on error.
+    }
+  }, [projectId]);
+
   useEffect(() => {
     fetchData();
-  }, [fetchData]);
+    fetchTrend();
+  }, [fetchData, fetchTrend]);
 
   if (loading) {
     return <p className="text-xs text-neutral-500">Loading lane diagnostics…</p>;
@@ -169,6 +362,17 @@ export function LaneDiagPanel({ projectId }: LaneDiagPanelProps) {
 
       <div>
         <h4 className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">
+          Checkpoint Recovery Waste
+        </h4>
+        {data.checkpoint_recovery_waste != null ? (
+          <CheckpointRecoveryWasteTable crw={data.checkpoint_recovery_waste} />
+        ) : (
+          <p className="text-xs text-neutral-500">No checkpoint-recovery waste recorded.</p>
+        )}
+      </div>
+
+      <div>
+        <h4 className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">
           Relay Counts by Lane
         </h4>
         <RelayCountsTable counts={data.relay_counts_by_lane} />
@@ -183,6 +387,15 @@ export function LaneDiagPanel({ projectId }: LaneDiagPanelProps) {
           truncated={data.pr_breakdown_truncated}
         />
       </div>
+
+      {trend && (
+        <div>
+          <h4 className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">
+            Cross-Version Trend
+          </h4>
+          <CrossVersionTrendPanel trend={trend} />
+        </div>
+      )}
     </div>
   );
 }
