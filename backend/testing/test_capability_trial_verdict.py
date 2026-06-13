@@ -11,6 +11,7 @@ Covers:
   - get_trial_verdicts: returns empty dict when column is absent/None
 """
 
+import pytest
 from unittest.mock import MagicMock, patch
 
 from app.capability_trial_verdict import (
@@ -40,8 +41,11 @@ class TestEvaluateTrialVerdict:
 
     def test_adopt_at_threshold(self):
         entry = evaluate_trial_verdict(
-            lift=0.05, n_with=30, n_without=30,
-            config=self._cfg(), evaluated_at="2026-06-09T00:00:00"
+            lift=0.05,
+            n_with=30,
+            n_without=30,
+            config=self._cfg(),
+            evaluated_at="2026-06-09T00:00:00",
         )
         assert entry["verdict"] == "adopt"
         assert entry["lift"] == 0.05
@@ -50,56 +54,72 @@ class TestEvaluateTrialVerdict:
 
     def test_adopt_above_threshold(self):
         entry = evaluate_trial_verdict(
-            lift=0.12, n_with=50, n_without=50,
+            lift=0.12,
+            n_with=50,
+            n_without=50,
             config=self._cfg(),
         )
         assert entry["verdict"] == "adopt"
 
     def test_reject_at_threshold(self):
         entry = evaluate_trial_verdict(
-            lift=-0.03, n_with=30, n_without=30,
+            lift=-0.03,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "reject"
 
     def test_reject_below_threshold(self):
         entry = evaluate_trial_verdict(
-            lift=-0.10, n_with=40, n_without=40,
+            lift=-0.10,
+            n_with=40,
+            n_without=40,
             config=self._cfg(),
         )
         assert entry["verdict"] == "reject"
 
     def test_continue_trial_lift_between_thresholds(self):
         entry = evaluate_trial_verdict(
-            lift=0.02, n_with=30, n_without=30,
+            lift=0.02,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
 
     def test_continue_trial_negative_but_above_reject(self):
         entry = evaluate_trial_verdict(
-            lift=-0.01, n_with=30, n_without=30,
+            lift=-0.01,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
 
     def test_continue_trial_insufficient_with_arm(self):
         entry = evaluate_trial_verdict(
-            lift=0.10, n_with=5, n_without=30,
+            lift=0.10,
+            n_with=5,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
 
     def test_continue_trial_insufficient_without_arm(self):
         entry = evaluate_trial_verdict(
-            lift=0.10, n_with=30, n_without=5,
+            lift=0.10,
+            n_with=30,
+            n_without=5,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
 
     def test_continue_trial_none_lift(self):
         entry = evaluate_trial_verdict(
-            lift=None, n_with=30, n_without=30,
+            lift=None,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
@@ -107,7 +127,9 @@ class TestEvaluateTrialVerdict:
 
     def test_evaluated_at_propagated(self):
         entry = evaluate_trial_verdict(
-            lift=0.06, n_with=30, n_without=30,
+            lift=0.06,
+            n_with=30,
+            n_without=30,
             evaluated_at="2026-06-09T12:00:00",
         )
         assert entry["evaluated_at"] == "2026-06-09T12:00:00"
@@ -127,7 +149,9 @@ class TestEvaluateTrialVerdict:
         # window_hours describes the dashboard window; accumulation_basis names the
         # population that actually produced the decision counts.
         entry = evaluate_trial_verdict(
-            lift=0.06, n_with=42, n_without=37,
+            lift=0.06,
+            n_with=42,
+            n_without=37,
             window_hours=24,
             accumulation_basis="cumulative_terminal_arm_tasks",
         )
@@ -145,7 +169,9 @@ class TestEvaluateTrialVerdict:
     def test_configurable_min_n_respected(self):
         # With a lower min_n threshold the arms qualify earlier.
         entry = evaluate_trial_verdict(
-            lift=0.06, n_with=10, n_without=10,
+            lift=0.06,
+            n_with=10,
+            n_without=10,
             config={"min_n_per_arm": 10, "adopt_lift": 0.05, "reject_lift": -0.03},
         )
         assert entry["verdict"] == "adopt"
@@ -153,7 +179,9 @@ class TestEvaluateTrialVerdict:
     def test_configurable_adopt_lift_respected(self):
         # Require a higher lift to adopt — lift=0.05 should still be continue.
         entry = evaluate_trial_verdict(
-            lift=0.05, n_with=30, n_without=30,
+            lift=0.05,
+            n_with=30,
+            n_without=30,
             config={"min_n_per_arm": 30, "adopt_lift": 0.10, "reject_lift": -0.03},
         )
         assert entry["verdict"] == "continue-trial"
@@ -161,14 +189,18 @@ class TestEvaluateTrialVerdict:
     def test_configurable_reject_lift_respected(self):
         # Require a steeper drop to reject — lift=-0.03 should be continue.
         entry = evaluate_trial_verdict(
-            lift=-0.03, n_with=30, n_without=30,
+            lift=-0.03,
+            n_with=30,
+            n_without=30,
             config={"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.08},
         )
         assert entry["verdict"] == "continue-trial"
 
     def test_thresholds_included_in_entry(self):
         entry = evaluate_trial_verdict(
-            lift=0.06, n_with=30, n_without=30,
+            lift=0.06,
+            n_with=30,
+            n_without=30,
             config={"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03},
         )
         assert entry["thresholds"]["min_n_per_arm"] == 30
@@ -177,7 +209,9 @@ class TestEvaluateTrialVerdict:
 
     def test_verdict_reason_sufficient_data_adopt(self):
         entry = evaluate_trial_verdict(
-            lift=0.06, n_with=30, n_without=30,
+            lift=0.06,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "adopt"
@@ -185,7 +219,9 @@ class TestEvaluateTrialVerdict:
 
     def test_verdict_reason_sufficient_data_reject(self):
         entry = evaluate_trial_verdict(
-            lift=-0.05, n_with=30, n_without=30,
+            lift=-0.05,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "reject"
@@ -193,7 +229,9 @@ class TestEvaluateTrialVerdict:
 
     def test_verdict_reason_ambiguous_lift(self):
         entry = evaluate_trial_verdict(
-            lift=0.02, n_with=30, n_without=30,
+            lift=0.02,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
@@ -201,7 +239,9 @@ class TestEvaluateTrialVerdict:
 
     def test_verdict_reason_insufficient_data_none_lift(self):
         entry = evaluate_trial_verdict(
-            lift=None, n_with=30, n_without=30,
+            lift=None,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
@@ -209,7 +249,9 @@ class TestEvaluateTrialVerdict:
 
     def test_verdict_reason_insufficient_data_below_min_n(self):
         entry = evaluate_trial_verdict(
-            lift=0.06, n_with=5, n_without=30,
+            lift=0.06,
+            n_with=5,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
@@ -221,7 +263,9 @@ class TestEvaluateTrialVerdict:
         # Acceptance test: both arms at futility_n with ambiguous lift → reject/futility_bound_reached
         # Default futility_n = 30 * 3 = 90
         entry = evaluate_trial_verdict(
-            lift=0.02, n_with=90, n_without=90,
+            lift=0.02,
+            n_with=90,
+            n_without=90,
             config=self._cfg(),
         )
         assert entry["verdict"] == "reject"
@@ -229,7 +273,9 @@ class TestEvaluateTrialVerdict:
 
     def test_futility_bound_reached_emits_reject(self):
         entry = evaluate_trial_verdict(
-            lift=0.01, n_with=100, n_without=100,
+            lift=0.01,
+            n_with=100,
+            n_without=100,
             config=self._cfg(),
         )
         assert entry["verdict"] == "reject"
@@ -238,7 +284,9 @@ class TestEvaluateTrialVerdict:
     def test_below_futility_bound_stays_ambiguous(self):
         # Both arms at min_n (30) but below futility_n (90)
         entry = evaluate_trial_verdict(
-            lift=0.02, n_with=30, n_without=30,
+            lift=0.02,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
@@ -247,7 +295,9 @@ class TestEvaluateTrialVerdict:
     def test_one_arm_below_futility_bound_stays_ambiguous(self):
         # n_with >= futility_n but n_without < futility_n
         entry = evaluate_trial_verdict(
-            lift=0.02, n_with=90, n_without=50,
+            lift=0.02,
+            n_with=90,
+            n_without=50,
             config=self._cfg(),
         )
         assert entry["verdict"] == "continue-trial"
@@ -256,7 +306,9 @@ class TestEvaluateTrialVerdict:
     def test_futility_bound_not_triggered_when_adopt_lift_met(self):
         # lift >= adopt_lift must still produce adopt even at futility_n
         entry = evaluate_trial_verdict(
-            lift=0.06, n_with=90, n_without=90,
+            lift=0.06,
+            n_with=90,
+            n_without=90,
             config=self._cfg(),
         )
         assert entry["verdict"] == "adopt"
@@ -265,7 +317,9 @@ class TestEvaluateTrialVerdict:
     def test_futility_bound_not_triggered_when_reject_lift_met(self):
         # lift <= reject_lift must still produce reject/sufficient_data even at futility_n
         entry = evaluate_trial_verdict(
-            lift=-0.05, n_with=90, n_without=90,
+            lift=-0.05,
+            n_with=90,
+            n_without=90,
             config=self._cfg(),
         )
         assert entry["verdict"] == "reject"
@@ -273,7 +327,9 @@ class TestEvaluateTrialVerdict:
 
     def test_futility_n_included_in_thresholds_entry(self):
         entry = evaluate_trial_verdict(
-            lift=0.02, n_with=90, n_without=90,
+            lift=0.02,
+            n_with=90,
+            n_without=90,
             config=self._cfg(),
         )
         assert "futility_n" in entry["thresholds"]
@@ -284,7 +340,9 @@ class TestEvaluateTrialVerdict:
         cfg = self._cfg()
         cfg["futility_n"] = 50
         entry = evaluate_trial_verdict(
-            lift=0.01, n_with=50, n_without=50,
+            lift=0.01,
+            n_with=50,
+            n_without=50,
             config=cfg,
         )
         assert entry["verdict"] == "reject"
@@ -293,7 +351,9 @@ class TestEvaluateTrialVerdict:
     def test_futility_bound_holdback_is_one(self):
         # futility_bound_reached reuses reject verdict — holdback must be 1.0
         entry = evaluate_trial_verdict(
-            lift=0.01, n_with=90, n_without=90,
+            lift=0.01,
+            n_with=90,
+            n_without=90,
             config=self._cfg(),
         )
         verdicts = {"repo_map": entry}
@@ -323,7 +383,12 @@ class TestRecordTrialVerdict:
     def test_supersedes_prior_verdict(self):
         # continue-trial → adopt is an allowed upward transition
         project = _make_project()
-        prior = {"verdict": "continue-trial", "lift": 0.01, "n_with": 10, "n_without": 10}
+        prior = {
+            "verdict": "continue-trial",
+            "lift": 0.01,
+            "n_with": 10,
+            "n_without": 10,
+        }
         project.capability_adoption_verdicts = {"repo_map": prior}
         newer = {"verdict": "adopt", "lift": 0.07, "n_with": 40, "n_without": 40}
 
@@ -337,7 +402,12 @@ class TestRecordTrialVerdict:
         project = _make_project()
         decided = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
         project.capability_adoption_verdicts = {"repo_map": decided}
-        insufficient = {"verdict": "continue-trial", "lift": None, "n_with": 3, "n_without": 2}
+        insufficient = {
+            "verdict": "continue-trial",
+            "lift": None,
+            "n_with": 3,
+            "n_without": 2,
+        }
 
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", insufficient)
@@ -351,7 +421,12 @@ class TestRecordTrialVerdict:
         project = _make_project()
         decided = {"verdict": "reject", "lift": -0.08, "n_with": 50, "n_without": 50}
         project.capability_adoption_verdicts = {"repo_map": decided}
-        insufficient = {"verdict": "continue-trial", "lift": 0.0, "n_with": 5, "n_without": 0}
+        insufficient = {
+            "verdict": "continue-trial",
+            "lift": 0.0,
+            "n_with": 5,
+            "n_without": 0,
+        }
 
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", insufficient)
@@ -371,7 +446,9 @@ class TestRecordTrialVerdict:
         project = _make_project()
         # Record the initial adoption decision
         adopt_entry = evaluate_trial_verdict(
-            lift=0.07, n_with=40, n_without=40,
+            lift=0.07,
+            n_with=40,
+            n_without=40,
             evaluated_at="2026-06-01T00:00:00",
         )
         assert adopt_entry["verdict"] == "adopt"
@@ -383,7 +460,9 @@ class TestRecordTrialVerdict:
 
         # Simulate periodic digest re-evaluation after window rolls: without-arm dried up
         reevaluation = evaluate_trial_verdict(
-            lift=None, n_with=0, n_without=0,
+            lift=None,
+            n_with=0,
+            n_without=0,
             evaluated_at="2026-06-09T00:00:00",
         )
         assert reevaluation["verdict"] == "continue-trial"
@@ -401,7 +480,13 @@ class TestRecordTrialVerdict:
         project = _make_project()
         prior = {"verdict": "reject", "lift": -0.05, "n_with": 40, "n_without": 40}
         project.capability_adoption_verdicts = {"repo_map": prior}
-        reversal = {"verdict": "adopt", "lift": 0.08, "n_with": 50, "n_without": 50, "evidence_source": "strategic_review"}
+        reversal = {
+            "verdict": "adopt",
+            "lift": 0.08,
+            "n_with": 50,
+            "n_without": 50,
+            "evidence_source": "strategic_review",
+        }
 
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", reversal)
@@ -441,8 +526,14 @@ class TestRecordTrialVerdict:
             record_trial_verdict(project, "repo_map", strategic_reopen)
 
         # Strategic re-declaration must supersede the prior decided verdict
-        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
-        assert project.capability_adoption_verdicts["repo_map"]["evidence_source"] == "strategic_review"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict"]
+            == "continue-trial"
+        )
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["evidence_source"]
+            == "strategic_review"
+        )
         mock_flag.assert_called_once()
 
     def test_strategic_review_continue_trial_reopens_reject(self):
@@ -458,7 +549,10 @@ class TestRecordTrialVerdict:
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", strategic_reopen)
 
-        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict"]
+            == "continue-trial"
+        )
         mock_flag.assert_called_once()
 
     def test_non_strategic_continue_trial_still_blocked_after_decide(self):
@@ -466,7 +560,12 @@ class TestRecordTrialVerdict:
         project = _make_project()
         decided = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
         project.capability_adoption_verdicts = {"repo_map": decided}
-        auto_eval = {"verdict": "continue-trial", "lift": None, "n_with": 0, "n_without": 0}
+        auto_eval = {
+            "verdict": "continue-trial",
+            "lift": None,
+            "n_with": 0,
+            "n_without": 0,
+        }
 
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", auto_eval)
@@ -477,9 +576,19 @@ class TestRecordTrialVerdict:
     def test_continue_trial_overwrites_prior_continue_trial(self):
         # Normal trial progression: continue-trial updates are allowed
         project = _make_project()
-        prior = {"verdict": "continue-trial", "lift": 0.01, "n_with": 10, "n_without": 10}
+        prior = {
+            "verdict": "continue-trial",
+            "lift": 0.01,
+            "n_with": 10,
+            "n_without": 10,
+        }
         project.capability_adoption_verdicts = {"repo_map": prior}
-        newer = {"verdict": "continue-trial", "lift": 0.02, "n_with": 20, "n_without": 20}
+        newer = {
+            "verdict": "continue-trial",
+            "lift": 0.02,
+            "n_with": 20,
+            "n_without": 20,
+        }
 
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", newer)
@@ -508,7 +617,9 @@ class TestRecordTrialVerdict:
             record_trial_verdict(project, "another_cap", e2)
 
         assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
-        assert project.capability_adoption_verdicts["another_cap"]["verdict"] == "reject"
+        assert (
+            project.capability_adoption_verdicts["another_cap"]["verdict"] == "reject"
+        )
 
     def test_preserves_prior_adopt_against_insufficient_data(self):
         project = _make_project()
@@ -556,13 +667,17 @@ class TestRecordTrialVerdict:
         # supersede a prior decided adopt.
         project = _make_project()
         prior = evaluate_trial_verdict(
-            lift=0.08, n_with=40, n_without=40,
+            lift=0.08,
+            n_with=40,
+            n_without=40,
             accumulation_basis="cumulative_terminal_arm_tasks",
         )
         assert prior["verdict"] == "adopt"
         project.capability_adoption_verdicts = {"repo_map": prior}
         incoming = evaluate_trial_verdict(
-            lift=None, n_with=12, n_without=3,
+            lift=None,
+            n_with=12,
+            n_without=3,
             accumulation_basis="cumulative_terminal_arm_tasks",
         )
         assert incoming["verdict"] == "continue-trial"
@@ -595,7 +710,10 @@ class TestRecordTrialVerdict:
             record_trial_verdict(project, "repo_map", incoming)
 
         # Should overwrite: ambiguous_lift with sufficient data supersedes prior adopt.
-        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict"]
+            == "continue-trial"
+        )
         assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.02
 
     def test_preserves_strategist_declared_against_insufficient_data(self):
@@ -622,7 +740,10 @@ class TestRecordTrialVerdict:
 
         # Strategist-declared verdict must be preserved.
         assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
-        assert project.capability_adoption_verdicts["repo_map"]["evidence_source"] == "strategic_review"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["evidence_source"]
+            == "strategic_review"
+        )
 
     def test_fresh_adopt_always_overwrites(self):
         project = _make_project()
@@ -687,7 +808,10 @@ class TestRecordTrialVerdict:
             record_trial_verdict(project, "repo_map", incoming)
 
         assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "reject"
-        assert project.capability_adoption_verdicts["repo_map"]["verdict_reason"] == "futility_bound_reached"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict_reason"]
+            == "futility_bound_reached"
+        )
         mock_flag.assert_not_called()
 
     def test_strategic_review_can_override_futility_bound(self):
@@ -710,17 +834,39 @@ class TestRecordTrialVerdict:
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", strategic_reopen)
 
-        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
-        assert project.capability_adoption_verdicts["repo_map"]["evidence_source"] == "strategic_review"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict"]
+            == "continue-trial"
+        )
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["evidence_source"]
+            == "strategic_review"
+        )
         mock_flag.assert_called_once()
 
     def test_decided_lane_verdict_survives_insufficient_data_continue(self):
         continue_entry = evaluate_lane_pilot_verdict({"n_lane": 1, "n_control": 1})
-        assert (continue_entry["verdict"], continue_entry["verdict_reason"]) == ("CONTINUE", "insufficient_data")
-        lane_kill = evaluate_lane_pilot_verdict({"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.60, "control_merge_rate": 0.70})
+        assert (continue_entry["verdict"], continue_entry["verdict_reason"]) == (
+            "CONTINUE",
+            "insufficient_data",
+        )
+        lane_kill = evaluate_lane_pilot_verdict(
+            {
+                "n_lane": 40,
+                "n_control": 40,
+                "lane_merge_rate": 0.60,
+                "control_merge_rate": 0.70,
+            }
+        )
         lane_adopt = evaluate_lane_pilot_verdict(
-            {"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.75, "control_merge_rate": 0.70,
-             "lane_cost_per_merged": 90.0, "control_cost_per_merged": 100.0}
+            {
+                "n_lane": 40,
+                "n_control": 40,
+                "lane_merge_rate": 0.75,
+                "control_merge_rate": 0.70,
+                "lane_cost_per_merged": 90.0,
+                "control_cost_per_merged": 100.0,
+            }
         )
         assert (lane_kill["verdict"], lane_adopt["verdict"]) == ("KILL", "ADOPT")
 
@@ -735,13 +881,31 @@ class TestRecordTrialVerdict:
 
     def test_decided_lane_verdict_survives_accumulating_data_continue(self):
         # n between min_n (30) and futility_n (90), no kill/adopt criteria → accumulating_data
-        accumulating_entry = evaluate_lane_pilot_verdict({"n_lane": 50, "n_control": 50})
-        assert (accumulating_entry["verdict"], accumulating_entry["verdict_reason"]) == ("CONTINUE", "accumulating_data")
+        accumulating_entry = evaluate_lane_pilot_verdict(
+            {"n_lane": 50, "n_control": 50}
+        )
+        assert (
+            accumulating_entry["verdict"],
+            accumulating_entry["verdict_reason"],
+        ) == ("CONTINUE", "accumulating_data")
 
-        lane_kill = evaluate_lane_pilot_verdict({"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.60, "control_merge_rate": 0.70})
+        lane_kill = evaluate_lane_pilot_verdict(
+            {
+                "n_lane": 40,
+                "n_control": 40,
+                "lane_merge_rate": 0.60,
+                "control_merge_rate": 0.70,
+            }
+        )
         lane_adopt = evaluate_lane_pilot_verdict(
-            {"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.75, "control_merge_rate": 0.70,
-             "lane_cost_per_merged": 90.0, "control_cost_per_merged": 100.0}
+            {
+                "n_lane": 40,
+                "n_control": 40,
+                "lane_merge_rate": 0.75,
+                "control_merge_rate": 0.70,
+                "lane_cost_per_merged": 90.0,
+                "control_cost_per_merged": 100.0,
+            }
         )
         assert (lane_kill["verdict"], lane_adopt["verdict"]) == ("KILL", "ADOPT")
 
@@ -754,12 +918,27 @@ class TestRecordTrialVerdict:
             assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == decided
             mock_flag.assert_not_called()
 
-    def test_lane_kill_survives_automated_adopt_and_strategic_verdicts_still_supersede(self):
+    def test_lane_kill_survives_automated_adopt_and_strategic_verdicts_still_supersede(
+        self,
+    ):
         project = _make_project()
-        kill_entry = evaluate_lane_pilot_verdict({"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.60, "control_merge_rate": 0.70})
+        kill_entry = evaluate_lane_pilot_verdict(
+            {
+                "n_lane": 40,
+                "n_control": 40,
+                "lane_merge_rate": 0.60,
+                "control_merge_rate": 0.70,
+            }
+        )
         adopt_entry = evaluate_lane_pilot_verdict(
-            {"n_lane": 40, "n_control": 40, "lane_merge_rate": 0.75, "control_merge_rate": 0.70,
-             "lane_cost_per_merged": 90.0, "control_cost_per_merged": 100.0}
+            {
+                "n_lane": 40,
+                "n_control": 40,
+                "lane_merge_rate": 0.75,
+                "control_merge_rate": 0.70,
+                "lane_cost_per_merged": 90.0,
+                "control_cost_per_merged": 100.0,
+            }
         )
         project.capability_adoption_verdicts = {LANE_PILOT_CAP_NAME: kill_entry}
 
@@ -769,11 +948,18 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == kill_entry
         mock_flag.assert_not_called()
 
-        strategic_reopen = {"verdict": "CONTINUE", "verdict_reason": "insufficient_data", "evidence_source": "strategic_review"}
+        strategic_reopen = {
+            "verdict": "CONTINUE",
+            "verdict_reason": "insufficient_data",
+            "evidence_source": "strategic_review",
+        }
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, LANE_PILOT_CAP_NAME, strategic_reopen)
 
-        assert project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME] == strategic_reopen
+        assert (
+            project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME]
+            == strategic_reopen
+        )
         mock_flag.assert_called_once()
 
 
@@ -804,22 +990,32 @@ class TestGetTrialVerdicts:
 
 class TestGetEffectiveHoldbackFraction:
     def _verdicts(self, verdict: str) -> dict:
-        return {"repo_map": {"verdict": verdict, "lift": 0.0, "n_with": 40, "n_without": 40}}
+        return {
+            "repo_map": {"verdict": verdict, "lift": 0.0, "n_with": 40, "n_without": 40}
+        }
 
     def test_effective_holdback_adopt_returns_zero(self):
-        result = get_effective_holdback_fraction(self._verdicts("adopt"), "repo_map", 0.5)
+        result = get_effective_holdback_fraction(
+            self._verdicts("adopt"), "repo_map", 0.5
+        )
         assert result == 0.0
 
     def test_effective_holdback_reject_returns_one(self):
-        result = get_effective_holdback_fraction(self._verdicts("reject"), "repo_map", 0.5)
+        result = get_effective_holdback_fraction(
+            self._verdicts("reject"), "repo_map", 0.5
+        )
         assert result == 1.0
 
     def test_effective_holdback_continue_returns_default(self):
-        result = get_effective_holdback_fraction(self._verdicts("continue-trial"), "repo_map", 0.3)
+        result = get_effective_holdback_fraction(
+            self._verdicts("continue-trial"), "repo_map", 0.3
+        )
         assert result == 0.3
 
     def test_effective_holdback_missing_cap_returns_default(self):
-        result = get_effective_holdback_fraction({"other_cap": {"verdict": "adopt"}}, "repo_map", 0.4)
+        result = get_effective_holdback_fraction(
+            {"other_cap": {"verdict": "adopt"}}, "repo_map", 0.4
+        )
         assert result == 0.4
 
     def test_effective_holdback_none_verdicts_returns_default(self):
@@ -836,11 +1032,15 @@ class TestGetEffectiveHoldbackFraction:
         assert result == 0.5
 
     def test_effective_holdback_adopt_ignores_default(self):
-        result = get_effective_holdback_fraction(self._verdicts("adopt"), "repo_map", 0.99)
+        result = get_effective_holdback_fraction(
+            self._verdicts("adopt"), "repo_map", 0.99
+        )
         assert result == 0.0
 
     def test_effective_holdback_reject_ignores_default(self):
-        result = get_effective_holdback_fraction(self._verdicts("reject"), "repo_map", 0.0)
+        result = get_effective_holdback_fraction(
+            self._verdicts("reject"), "repo_map", 0.0
+        )
         assert result == 1.0
 
 
@@ -872,6 +1072,7 @@ class TestGetTrialDefinitions:
             _DEFAULT_MIN_N_PER_ARM,
             _DEFAULT_REJECT_LIFT,
         )
+
         defs = get_trial_definitions()
         rm = next(td for td in defs if td["cap_name"] == "repo_map")
         # When thresholds are passed as-is to evaluate_trial_verdict, module defaults apply.
@@ -896,10 +1097,18 @@ class TestArmComposition:
         return base
 
     def test_arm_composition_recorded_in_entry(self):
-        comp = {"with_assigned": 30, "with_receipt": 5, "without_assigned": 30, "without_receipt": 3}
+        comp = {
+            "with_assigned": 30,
+            "with_receipt": 5,
+            "without_assigned": 30,
+            "without_receipt": 3,
+        }
         entry = evaluate_trial_verdict(
-            lift=0.08, n_with=35, n_without=33,
-            config=self._cfg(), arm_composition=comp,
+            lift=0.08,
+            n_with=35,
+            n_without=33,
+            config=self._cfg(),
+            arm_composition=comp,
         )
         assert entry["arm_composition"] == comp
 
@@ -909,48 +1118,88 @@ class TestArmComposition:
 
     def test_purity_gate_blocks_adopt_when_assigned_with_arm_insufficient(self):
         # Total n_with=35 would satisfy min_n=30 — but only 15 are assignment-based.
-        comp = {"with_assigned": 15, "with_receipt": 20, "without_assigned": 30, "without_receipt": 2}
+        comp = {
+            "with_assigned": 15,
+            "with_receipt": 20,
+            "without_assigned": 30,
+            "without_receipt": 2,
+        }
         entry = evaluate_trial_verdict(
-            lift=0.08, n_with=35, n_without=32,
-            config=self._cfg(), arm_composition=comp,
+            lift=0.08,
+            n_with=35,
+            n_without=32,
+            config=self._cfg(),
+            arm_composition=comp,
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
         assert entry["arm_composition"] == comp
 
     def test_purity_gate_blocks_adopt_when_assigned_without_arm_insufficient(self):
-        comp = {"with_assigned": 30, "with_receipt": 5, "without_assigned": 10, "without_receipt": 20}
+        comp = {
+            "with_assigned": 30,
+            "with_receipt": 5,
+            "without_assigned": 10,
+            "without_receipt": 20,
+        }
         entry = evaluate_trial_verdict(
-            lift=0.08, n_with=35, n_without=30,
-            config=self._cfg(), arm_composition=comp,
+            lift=0.08,
+            n_with=35,
+            n_without=30,
+            config=self._cfg(),
+            arm_composition=comp,
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
 
     def test_purity_gate_allows_adopt_when_both_assigned_arms_sufficient(self):
-        comp = {"with_assigned": 30, "with_receipt": 5, "without_assigned": 30, "without_receipt": 3}
+        comp = {
+            "with_assigned": 30,
+            "with_receipt": 5,
+            "without_assigned": 30,
+            "without_receipt": 3,
+        }
         entry = evaluate_trial_verdict(
-            lift=0.08, n_with=35, n_without=33,
-            config=self._cfg(), arm_composition=comp,
+            lift=0.08,
+            n_with=35,
+            n_without=33,
+            config=self._cfg(),
+            arm_composition=comp,
         )
         assert entry["verdict"] == "adopt"
         assert entry["verdict_reason"] == "sufficient_data"
 
     def test_purity_gate_blocks_reject_when_assigned_arm_insufficient(self):
-        comp = {"with_assigned": 30, "with_receipt": 5, "without_assigned": 12, "without_receipt": 18}
+        comp = {
+            "with_assigned": 30,
+            "with_receipt": 5,
+            "without_assigned": 12,
+            "without_receipt": 18,
+        }
         entry = evaluate_trial_verdict(
-            lift=-0.05, n_with=35, n_without=30,
-            config=self._cfg(), arm_composition=comp,
+            lift=-0.05,
+            n_with=35,
+            n_without=30,
+            config=self._cfg(),
+            arm_composition=comp,
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
 
     def test_purity_gate_blocks_futility_bound_when_assigned_arm_insufficient(self):
         # Total arms both >= futility_n=90, but assigned arms below min_n=30.
-        comp = {"with_assigned": 20, "with_receipt": 70, "without_assigned": 20, "without_receipt": 70}
+        comp = {
+            "with_assigned": 20,
+            "with_receipt": 70,
+            "without_assigned": 20,
+            "without_receipt": 70,
+        }
         entry = evaluate_trial_verdict(
-            lift=0.02, n_with=90, n_without=90,
-            config=self._cfg(), arm_composition=comp,
+            lift=0.02,
+            n_with=90,
+            n_without=90,
+            config=self._cfg(),
+            arm_composition=comp,
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
@@ -958,17 +1207,27 @@ class TestArmComposition:
     def test_purity_gate_skipped_when_arm_composition_absent(self):
         # Without arm_composition, normal verdict logic applies.
         entry = evaluate_trial_verdict(
-            lift=0.08, n_with=30, n_without=30,
+            lift=0.08,
+            n_with=30,
+            n_without=30,
             config=self._cfg(),
         )
         assert entry["verdict"] == "adopt"
 
     def test_purity_gate_does_not_affect_continue_trial(self):
         # continue-trial from insufficient total n is not changed by the purity gate.
-        comp = {"with_assigned": 5, "with_receipt": 0, "without_assigned": 2, "without_receipt": 0}
+        comp = {
+            "with_assigned": 5,
+            "with_receipt": 0,
+            "without_assigned": 2,
+            "without_receipt": 0,
+        }
         entry = evaluate_trial_verdict(
-            lift=0.08, n_with=5, n_without=2,
-            config=self._cfg(), arm_composition=comp,
+            lift=0.08,
+            n_with=5,
+            n_without=2,
+            config=self._cfg(),
+            arm_composition=comp,
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_data"
@@ -986,8 +1245,11 @@ class TestReceiptOnlyTrial:
     def test_receipt_only_blocks_adopt(self):
         # Lift qualifies for adopt, both arms meet min_n, but receipt_only_trial=True.
         entry = evaluate_trial_verdict(
-            lift=0.08, n_with=35, n_without=33,
-            config=self._cfg(), receipt_only_trial=True,
+            lift=0.08,
+            n_with=35,
+            n_without=33,
+            config=self._cfg(),
+            receipt_only_trial=True,
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "receipt_only_trial"
@@ -995,8 +1257,11 @@ class TestReceiptOnlyTrial:
     def test_receipt_only_blocks_reject(self):
         # Lift qualifies for reject, both arms meet min_n, but receipt_only_trial=True.
         entry = evaluate_trial_verdict(
-            lift=-0.05, n_with=35, n_without=33,
-            config=self._cfg(), receipt_only_trial=True,
+            lift=-0.05,
+            n_with=35,
+            n_without=33,
+            config=self._cfg(),
+            receipt_only_trial=True,
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "receipt_only_trial"
@@ -1004,8 +1269,11 @@ class TestReceiptOnlyTrial:
     def test_receipt_only_blocks_futility_bound(self):
         # Both arms >= futility_n=90 with ambiguous lift → normally futility_bound_reached.
         entry = evaluate_trial_verdict(
-            lift=0.02, n_with=90, n_without=90,
-            config=self._cfg(), receipt_only_trial=True,
+            lift=0.02,
+            n_with=90,
+            n_without=90,
+            config=self._cfg(),
+            receipt_only_trial=True,
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "receipt_only_trial"
@@ -1013,8 +1281,11 @@ class TestReceiptOnlyTrial:
     def test_receipt_only_allows_continue_trial_passthrough(self):
         # Insufficient data → continue-trial/insufficient_data regardless of the flag.
         entry = evaluate_trial_verdict(
-            lift=0.08, n_with=5, n_without=33,
-            config=self._cfg(), receipt_only_trial=True,
+            lift=0.08,
+            n_with=5,
+            n_without=33,
+            config=self._cfg(),
+            receipt_only_trial=True,
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_data"
@@ -1022,8 +1293,11 @@ class TestReceiptOnlyTrial:
     def test_receipt_only_false_behaves_normally(self):
         # Default (False) must not change the adopt outcome.
         entry = evaluate_trial_verdict(
-            lift=0.08, n_with=35, n_without=33,
-            config=self._cfg(), receipt_only_trial=False,
+            lift=0.08,
+            n_with=35,
+            n_without=33,
+            config=self._cfg(),
+            receipt_only_trial=False,
         )
         assert entry["verdict"] == "adopt"
 
@@ -1035,8 +1309,11 @@ class TestReceiptOnlyTrial:
         project.capability_adoption_verdicts = {"module_interfaces": confounded}
 
         new_entry = evaluate_trial_verdict(
-            lift=0.08, n_with=40, n_without=40,
-            config=self._cfg(), receipt_only_trial=True,
+            lift=0.08,
+            n_with=40,
+            n_without=40,
+            config=self._cfg(),
+            receipt_only_trial=True,
         )
         assert new_entry["verdict"] == "continue-trial"
         assert new_entry["verdict_reason"] == "receipt_only_trial"
@@ -1045,8 +1322,14 @@ class TestReceiptOnlyTrial:
             record_trial_verdict(project, "module_interfaces", new_entry)
 
         # The confounded adopt must be superseded by receipt_only_trial evaluation.
-        assert project.capability_adoption_verdicts["module_interfaces"]["verdict"] == "continue-trial"
-        assert project.capability_adoption_verdicts["module_interfaces"]["verdict_reason"] == "receipt_only_trial"
+        assert (
+            project.capability_adoption_verdicts["module_interfaces"]["verdict"]
+            == "continue-trial"
+        )
+        assert (
+            project.capability_adoption_verdicts["module_interfaces"]["verdict_reason"]
+            == "receipt_only_trial"
+        )
         mock_flag.assert_called_once()
 
     def test_receipt_only_continue_trial_supersedes_confounded_reject(self):
@@ -1055,15 +1338,21 @@ class TestReceiptOnlyTrial:
         project.capability_adoption_verdicts = {"related_tests": confounded}
 
         new_entry = evaluate_trial_verdict(
-            lift=-0.07, n_with=40, n_without=40,
-            config=self._cfg(), receipt_only_trial=True,
+            lift=-0.07,
+            n_with=40,
+            n_without=40,
+            config=self._cfg(),
+            receipt_only_trial=True,
         )
         assert new_entry["verdict_reason"] == "receipt_only_trial"
 
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "related_tests", new_entry)
 
-        assert project.capability_adoption_verdicts["related_tests"]["verdict"] == "continue-trial"
+        assert (
+            project.capability_adoption_verdicts["related_tests"]["verdict"]
+            == "continue-trial"
+        )
         mock_flag.assert_called_once()
 
 
@@ -1078,7 +1367,13 @@ class TestCarryAdoptionVerdictsForConsolidation:
         return {"verdict": "reject", "lift": -0.05, "n_with": 35, "n_without": 33}
 
     def _continue_entry(self, reason: str = "insufficient_data") -> dict:
-        return {"verdict": "continue-trial", "verdict_reason": reason, "lift": None, "n_with": 5, "n_without": 3}
+        return {
+            "verdict": "continue-trial",
+            "verdict_reason": reason,
+            "lift": None,
+            "n_with": 5,
+            "n_without": 3,
+        }
 
     def _strategic_entry(self) -> dict:
         return {"verdict": "adopt", "evidence_source": "strategic_review"}
@@ -1116,7 +1411,12 @@ class TestCarryAdoptionVerdictsForConsolidation:
 
     def test_absorbed_adopt_does_not_overwrite_existing_decided_survivor(self):
         """An absorbed adopt must not clobber a survivor that already has adopt."""
-        survivor_entry = {"verdict": "adopt", "lift": 0.12, "n_with": 60, "n_without": 55}
+        survivor_entry = {
+            "verdict": "adopt",
+            "lift": 0.12,
+            "n_with": 60,
+            "n_without": 55,
+        }
         verdicts = {
             "survivor-cap": survivor_entry,
             "old-cap": self._adopt_entry(),
@@ -1201,11 +1501,17 @@ class TestAssignedArmTrials:
             assert cap in by_name, f"missing trial definition for {cap}"
             td = by_name[cap]
             assert "assignment_key" in td, f"{cap} missing assignment_key"
-        assert by_name["module_interfaces"]["assignment_key"] == "_module_interfaces_arm"
+        assert (
+            by_name["module_interfaces"]["assignment_key"] == "_module_interfaces_arm"
+        )
         assert by_name["related_tests"]["assignment_key"] == "_related_tests_arm"
-        assert by_name["affected_consumers"]["assignment_key"] == "_affected_consumers_arm"
+        assert (
+            by_name["affected_consumers"]["assignment_key"] == "_affected_consumers_arm"
+        )
 
-    def _decided_verdict_with_sufficient_assigned_arms(self, cap_name: str, lift: float, verdict: str):
+    def _decided_verdict_with_sufficient_assigned_arms(
+        self, cap_name: str, lift: float, verdict: str
+    ):
         """Helper: build an arm_composition with both assigned arms >= min_n and verify verdict."""
         comp = {
             "with_assigned": 35,
@@ -1232,33 +1538,45 @@ class TestAssignedArmTrials:
 
     def test_module_interfaces_adopt_with_sufficient_assigned_arms(self):
         """module_interfaces trial can reach adopt when both assigned arms meet min_n."""
-        self._decided_verdict_with_sufficient_assigned_arms("module_interfaces", 0.08, "adopt")
+        self._decided_verdict_with_sufficient_assigned_arms(
+            "module_interfaces", 0.08, "adopt"
+        )
 
     def test_related_tests_adopt_with_sufficient_assigned_arms(self):
         """related_tests trial can reach adopt when both assigned arms meet min_n."""
-        self._decided_verdict_with_sufficient_assigned_arms("related_tests", 0.07, "adopt")
+        self._decided_verdict_with_sufficient_assigned_arms(
+            "related_tests", 0.07, "adopt"
+        )
 
     def test_affected_consumers_adopt_with_sufficient_assigned_arms(self):
         """affected_consumers trial can reach adopt when both assigned arms meet min_n."""
-        self._decided_verdict_with_sufficient_assigned_arms("affected_consumers", 0.06, "adopt")
+        self._decided_verdict_with_sufficient_assigned_arms(
+            "affected_consumers", 0.06, "adopt"
+        )
 
     def test_module_interfaces_reject_with_sufficient_assigned_arms(self):
         """module_interfaces trial can reach reject when both assigned arms meet min_n."""
-        self._decided_verdict_with_sufficient_assigned_arms("module_interfaces", -0.05, "reject")
+        self._decided_verdict_with_sufficient_assigned_arms(
+            "module_interfaces", -0.05, "reject"
+        )
 
     def test_related_tests_reject_with_sufficient_assigned_arms(self):
         """related_tests trial can reach reject when both assigned arms meet min_n."""
-        self._decided_verdict_with_sufficient_assigned_arms("related_tests", -0.06, "reject")
+        self._decided_verdict_with_sufficient_assigned_arms(
+            "related_tests", -0.06, "reject"
+        )
 
     def test_affected_consumers_reject_with_sufficient_assigned_arms(self):
         """affected_consumers trial can reach reject when both assigned arms meet min_n."""
-        self._decided_verdict_with_sufficient_assigned_arms("affected_consumers", -0.04, "reject")
+        self._decided_verdict_with_sufficient_assigned_arms(
+            "affected_consumers", -0.04, "reject"
+        )
 
     def _insufficient_assigned_arm_verdict(self, cap_name: str, lift: float):
         """Helper: assigned-arm subpopulation below min_n → insufficient_assigned_arm_data."""
         # Total n_with/without both meet min_n, but assigned arms are below min_n.
         comp = {
-            "with_assigned": 15,   # below min_n=30
+            "with_assigned": 15,  # below min_n=30
             "with_receipt": 20,
             "without_assigned": 12,  # below min_n=30
             "without_receipt": 18,
@@ -1346,8 +1664,16 @@ class TestAssignedArmTrials:
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "module_interfaces", entry)
 
-        assert project.capability_adoption_verdicts["module_interfaces"]["verdict"] == "adopt"
-        assert project.capability_adoption_verdicts["module_interfaces"]["accumulation_basis"] == "cumulative_terminal_arm_tasks"
+        assert (
+            project.capability_adoption_verdicts["module_interfaces"]["verdict"]
+            == "adopt"
+        )
+        assert (
+            project.capability_adoption_verdicts["module_interfaces"][
+                "accumulation_basis"
+            ]
+            == "cumulative_terminal_arm_tasks"
+        )
         mock_flag.assert_called_once()
 
     def test_full_merge_test_verdict_cycle_related_tests(self):
@@ -1374,7 +1700,9 @@ class TestAssignedArmTrials:
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "related_tests", entry)
 
-        assert project.capability_adoption_verdicts["related_tests"]["verdict"] == "adopt"
+        assert (
+            project.capability_adoption_verdicts["related_tests"]["verdict"] == "adopt"
+        )
         mock_flag.assert_called_once()
 
     def test_full_merge_test_verdict_cycle_affected_consumers(self):
@@ -1401,17 +1729,28 @@ class TestAssignedArmTrials:
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "affected_consumers", entry)
 
-        assert project.capability_adoption_verdicts["affected_consumers"]["verdict"] == "adopt"
+        assert (
+            project.capability_adoption_verdicts["affected_consumers"]["verdict"]
+            == "adopt"
+        )
         mock_flag.assert_called_once()
 
     def test_decided_verdict_not_reverted_by_insufficient_data_after_adoption(self):
         """After adopt, a subsequent insufficient-data evaluation must not self-revert it."""
         project = _make_project()
 
-        comp = {"with_assigned": 35, "with_receipt": 5, "without_assigned": 30, "without_receipt": 3}
+        comp = {
+            "with_assigned": 35,
+            "with_receipt": 5,
+            "without_assigned": 30,
+            "without_receipt": 3,
+        }
         adopt_entry = evaluate_trial_verdict(
-            lift=0.08, n_with=40, n_without=33,
-            config=self._cfg(), arm_composition=comp,
+            lift=0.08,
+            n_with=40,
+            n_without=33,
+            config=self._cfg(),
+            arm_composition=comp,
             evaluated_at="2026-06-11T00:00:00",
         )
         assert adopt_entry["verdict"] == "adopt"
@@ -1421,7 +1760,9 @@ class TestAssignedArmTrials:
 
         # Post-adoption: without-arm dries up, periodic evaluator returns insufficient_data.
         stale_entry = evaluate_trial_verdict(
-            lift=None, n_with=0, n_without=0,
+            lift=None,
+            n_with=0,
+            n_without=0,
             evaluated_at="2026-06-12T00:00:00",
         )
         assert stale_entry["verdict"] == "continue-trial"
@@ -1431,7 +1772,10 @@ class TestAssignedArmTrials:
             record_trial_verdict(project, "module_interfaces", stale_entry)
 
         # Adopt must survive.
-        assert project.capability_adoption_verdicts["module_interfaces"]["verdict"] == "adopt"
+        assert (
+            project.capability_adoption_verdicts["module_interfaces"]["verdict"]
+            == "adopt"
+        )
         mock_flag.assert_not_called()
 
 
@@ -1456,7 +1800,11 @@ class TestDiagnosticsAfterEditTrialDefinition:
         assert "futility_n" in td["thresholds"]
 
     def test_adopt_verdict_with_sufficient_assigned_arm_data(self):
-        from app.capability_trial_verdict import _DEFAULT_ADOPT_LIFT, _DEFAULT_MIN_N_PER_ARM
+        from app.capability_trial_verdict import (
+            _DEFAULT_ADOPT_LIFT,
+            _DEFAULT_MIN_N_PER_ARM,
+        )
+
         defs = get_trial_definitions()
         td = next(d for d in defs if d["cap_name"] == "diagnostics_after_edit")
         arm_composition = {
@@ -1476,6 +1824,7 @@ class TestDiagnosticsAfterEditTrialDefinition:
 
     def test_purity_gate_blocks_adopt_when_assigned_arm_insufficient(self):
         from app.capability_trial_verdict import _DEFAULT_ADOPT_LIFT
+
         defs = get_trial_definitions()
         td = next(d for d in defs if d["cap_name"] == "diagnostics_after_edit")
         # Total n meets min_n but assigned subpopulation does not
@@ -1544,8 +1893,14 @@ class TestTrialDefinitionsLanePilot:
     def test_canonical_key_constants_exported(self):
         assert isinstance(LANE_PILOT_CAP_NAME, str) and LANE_PILOT_CAP_NAME
         assert isinstance(LANE_PILOT_ASSIGNMENT_KEY, str) and LANE_PILOT_ASSIGNMENT_KEY
-        assert isinstance(LANE_PILOT_WARM_RESUME_RECEIPT_KEY, str) and LANE_PILOT_WARM_RESUME_RECEIPT_KEY
-        assert isinstance(LANE_PILOT_CHECKPOINT_RECEIPT_KEY, str) and LANE_PILOT_CHECKPOINT_RECEIPT_KEY
+        assert (
+            isinstance(LANE_PILOT_WARM_RESUME_RECEIPT_KEY, str)
+            and LANE_PILOT_WARM_RESUME_RECEIPT_KEY
+        )
+        assert (
+            isinstance(LANE_PILOT_CHECKPOINT_RECEIPT_KEY, str)
+            and LANE_PILOT_CHECKPOINT_RECEIPT_KEY
+        )
 
 
 # ── is_lane_pilot_arm_member (partitioning helper) ────────────────────────────
@@ -1583,7 +1938,14 @@ class TestIsLanePilotArmMember:
 # ── evaluate_lane_pilot_verdict ───────────────────────────────────────────────
 
 
-def _good_aggs(*, n=40, merge_lift=0.10, cost_improvement=0.10, gate_violations=0, checkpoint_loss=0.01) -> dict:
+def _good_aggs(
+    *,
+    n=40,
+    merge_lift=0.10,
+    cost_improvement=0.10,
+    gate_violations=0,
+    checkpoint_loss=0.01,
+) -> dict:
     """Build a healthy aggregate dict (ADOPT territory by default)."""
     control_rate = 0.70
     lane_rate = control_rate + merge_lift
@@ -1753,9 +2115,17 @@ class TestEvaluateLanePilotVerdict:
     def test_snapshot_fields_present_on_kill(self):
         aggs = _good_aggs(merge_lift=-0.05)
         result = evaluate_lane_pilot_verdict(aggs)
-        for field in ("n_lane", "n_control", "lane_merge_rate", "control_merge_rate",
-                      "lane_cost_per_merged", "control_cost_per_merged",
-                      "gate_integrity_violations", "checkpoint_loss_rate", "thresholds"):
+        for field in (
+            "n_lane",
+            "n_control",
+            "lane_merge_rate",
+            "control_merge_rate",
+            "lane_cost_per_merged",
+            "control_cost_per_merged",
+            "gate_integrity_violations",
+            "checkpoint_loss_rate",
+            "thresholds",
+        ):
             assert field in result, f"missing field: {field}"
 
     def test_snapshot_fields_present_on_adopt(self):
@@ -1764,9 +2134,16 @@ class TestEvaluateLanePilotVerdict:
         assert result["verdict"] == "ADOPT"
         assert "thresholds" in result
         assert isinstance(result["thresholds"], dict)
-        for key in ("min_n", "kill_merge_rate_floor", "kill_cost_ceiling",
-                    "kill_gate_violations_max", "kill_checkpoint_loss_ceiling",
-                    "futility_n", "adopt_merge_lift_floor", "adopt_cost_improvement"):
+        for key in (
+            "min_n",
+            "kill_merge_rate_floor",
+            "kill_cost_ceiling",
+            "kill_gate_violations_max",
+            "kill_checkpoint_loss_ceiling",
+            "futility_n",
+            "adopt_merge_lift_floor",
+            "adopt_cost_improvement",
+        ):
             assert key in result["thresholds"]
 
     def test_snapshot_fields_present_on_continue(self):
@@ -1871,7 +2248,12 @@ class TestLaneRelayComparison:
 
     def _build_comparison(self, relay, lane, version_number=9):
         deltas = {}
-        for field in ("wall_clock_seconds", "active_seconds", "gap_seconds", "task_count"):
+        for field in (
+            "wall_clock_seconds",
+            "active_seconds",
+            "gap_seconds",
+            "task_count",
+        ):
             rv, lv = relay.get(field), lane.get(field)
             deltas[field] = (lv - rv) if (rv is not None and lv is not None) else None
         return {
@@ -1888,9 +2270,12 @@ class TestLaneRelayComparison:
     def test_evaluate_lane_pilot_verdict_has_no_relay_baseline(self):
         """evaluate_lane_pilot_verdict output must never include relay_baseline."""
         aggs = {
-            "n_lane": 5, "n_control": 5,
-            "lane_merge_rate": 0.8, "control_merge_rate": 0.7,
-            "lane_cost_per_merged": 1.0, "control_cost_per_merged": 1.2,
+            "n_lane": 5,
+            "n_control": 5,
+            "lane_merge_rate": 0.8,
+            "control_merge_rate": 0.7,
+            "lane_cost_per_merged": 1.0,
+            "control_cost_per_merged": 1.2,
             "gate_integrity_violations": 0,
             "checkpoint_loss_rate": 0.1,
             "warm_resume_fraction": 0.9,
@@ -1905,7 +2290,9 @@ class TestLaneRelayComparison:
         assert set(comparison.keys()) == {"source_version", "relay", "lane", "deltas"}
 
     def test_source_version_has_identity_fields(self):
-        comparison = self._build_comparison(self._make_relay(), self._make_lane(), version_number=10)
+        comparison = self._build_comparison(
+            self._make_relay(), self._make_lane(), version_number=10
+        )
         sv = comparison["source_version"]
         assert sv["version_number"] == 10
         assert sv["captured_at"] == "2026-06-01T00:00:00"
@@ -1960,3 +2347,359 @@ class TestLaneRelayComparison:
         assert "relay_baseline" not in stored
         assert "lane_relay_comparison" in stored
         assert stored["lane_relay_comparison"]["source_version"]["version_number"] == 9
+
+
+# ── raise_capability_verdict_notice ──────────────────────────────────────────
+
+
+def _mock_async_session(existing_messages=None):
+    """Build a mock async session with configurable existing open messages."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    session = MagicMock()
+    scalars_mock = MagicMock()
+    scalars_mock.all.return_value = existing_messages or []
+    execute_result = MagicMock()
+    execute_result.scalars.return_value = scalars_mock
+    session.execute = AsyncMock(return_value=execute_result)
+    session.add = MagicMock()
+    return session
+
+
+def _open_message(dedupe_key: str):
+    """Build a mock ProjectMessage carrying a specific dedupe_key."""
+    from unittest.mock import MagicMock
+
+    msg = MagicMock()
+    msg.context = {"dedupe_key": dedupe_key}
+    return msg
+
+
+class TestRaiseCapabilityVerdictNotice:
+    """Unit tests for raise_capability_verdict_notice using mock sessions."""
+
+    @pytest.mark.asyncio
+    async def test_notice_created_on_first_decide(self):
+        """No prior open message → session.add called once for the transition notice."""
+        from app.capability_trial_verdict import raise_capability_verdict_notice
+
+        session = _mock_async_session(existing_messages=[])
+        entry = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.08,
+            "n_with": 40,
+            "n_without": 40,
+        }
+        await raise_capability_verdict_notice(
+            session, "proj-id", "repo_map", None, "adopt", entry
+        )
+        session.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_notice_on_repeated_same_decided_verdict(self):
+        """Existing open message with same dedupe_key → session.add NOT called."""
+        from app.capability_trial_verdict import raise_capability_verdict_notice
+
+        existing = _open_message("capability_verdict_decided_repo_map_adopt")
+        session = _mock_async_session(existing_messages=[existing])
+        entry = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.09,
+            "n_with": 50,
+            "n_without": 50,
+        }
+        await raise_capability_verdict_notice(
+            session, "proj-id", "repo_map", "continue-trial", "adopt", entry
+        )
+        session.add.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reversal_emits_new_notice(self):
+        """Adopt notice exists but we're recording a reject reversal → new notice fired."""
+        from app.capability_trial_verdict import raise_capability_verdict_notice
+
+        existing = _open_message("capability_verdict_decided_repo_map_adopt")
+        session = _mock_async_session(existing_messages=[existing])
+        entry = {
+            "verdict": "reject",
+            "verdict_reason": "sufficient_data",
+            "lift": -0.05,
+            "n_with": 50,
+            "n_without": 50,
+        }
+        await raise_capability_verdict_notice(
+            session, "proj-id", "repo_map", "adopt", "reject", entry
+        )
+        session.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_notice_content_carries_evidence(self):
+        """Notice content and context include cap_name, verdict, lift, n_with, n_without."""
+        from app.capability_trial_verdict import raise_capability_verdict_notice
+        from app.models import MessageType
+
+        session = _mock_async_session(existing_messages=[])
+        entry = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.08,
+            "n_with": 42,
+            "n_without": 38,
+        }
+        await raise_capability_verdict_notice(
+            session, "proj-id", "repo_map", None, "adopt", entry
+        )
+        added = session.add.call_args[0][0]
+        assert "repo_map" in added.content
+        assert "adopt" in added.content
+        assert "0.08" in added.content
+        assert "42" in added.content
+        assert "38" in added.content
+        assert added.context["cap_name"] == "repo_map"
+        assert added.context["new_verdict"] == "adopt"
+        assert added.context["lift"] == 0.08
+        assert added.context["n_with"] == 42
+        assert added.context["n_without"] == 38
+        assert added.message_type == MessageType.NOTE
+
+    @pytest.mark.asyncio
+    async def test_notice_from_type_is_system(self):
+        """Notice from_type must be 'system'."""
+        from app.capability_trial_verdict import raise_capability_verdict_notice
+
+        session = _mock_async_session(existing_messages=[])
+        entry = {
+            "verdict": "reject",
+            "verdict_reason": "sufficient_data",
+            "lift": -0.05,
+            "n_with": 30,
+            "n_without": 30,
+        }
+        await raise_capability_verdict_notice(
+            session, "proj-id", "repo_map", None, "reject", entry
+        )
+        added = session.add.call_args[0][0]
+        assert added.from_type == "system"
+
+    @pytest.mark.asyncio
+    async def test_undecided_transition_label_in_content(self):
+        """When prior_verdict is None the content mentions 'undecided → verdict'."""
+        from app.capability_trial_verdict import raise_capability_verdict_notice
+
+        session = _mock_async_session(existing_messages=[])
+        entry = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.06,
+            "n_with": 35,
+            "n_without": 32,
+        }
+        await raise_capability_verdict_notice(
+            session, "proj-id", "repo_map", None, "adopt", entry
+        )
+        added = session.add.call_args[0][0]
+        assert "undecided" in added.content
+
+
+# ── persist_trial_verdicts_in_transaction notice emission ─────────────────────
+
+
+class TestPersistTrialVerdictsNoticeEmission:
+    """Tests that persist_trial_verdicts_in_transaction emits notices for
+    decided transitions and suppresses them when no transition occurred."""
+
+    def _build_mock_db(self, prior_verdicts: dict | None = None):
+        """Return (mock_session, mock_project) with configurable prior verdict state."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_project = MagicMock()
+        mock_project.capability_adoption_verdicts = dict(prior_verdicts or {})
+
+        mock_session = MagicMock()
+        mock_session.get = AsyncMock(return_value=mock_project)
+        mock_session.commit = AsyncMock()
+        mock_session.rollback = AsyncMock()
+        # execute returns empty result so raise_capability_verdict_notice dedup query works
+        scalars_mock = MagicMock()
+        scalars_mock.all.return_value = []
+        execute_result = MagicMock()
+        execute_result.scalars.return_value = scalars_mock
+        mock_session.execute = AsyncMock(return_value=execute_result)
+        mock_session.add = MagicMock()
+
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        # factory() is called (not factory directly) in async with factory() as session:
+        # so mock_cm() must return mock_cm itself for __aenter__ to fire correctly.
+        mock_cm.return_value = mock_cm
+
+        return mock_session, mock_project, mock_cm
+
+    @pytest.mark.asyncio
+    async def test_notice_emitted_on_first_adopt_transition(self):
+        """No prior verdict → adopt transition emits exactly one notice via real notice helper."""
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
+
+        project_id = uuid.uuid4()
+        _, _, mock_cm = self._build_mock_db(prior_verdicts={})
+        mock_factory = MagicMock(return_value=mock_cm)
+
+        entry = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.07,
+            "n_with": 40,
+            "n_without": 40,
+        }
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch(
+                "app.capability_trial_verdict.raise_capability_verdict_notice",
+                new_callable=AsyncMock,
+            ) as mock_notice,
+            patch("app.capability_trial_verdict.record_trial_verdict") as mock_record,
+        ):
+
+            def _write_verdict(project, cap_name, e):
+                project.capability_adoption_verdicts[cap_name] = e
+
+            mock_record.side_effect = _write_verdict
+            await persist_trial_verdicts_in_transaction(
+                MagicMock(),
+                project_id,
+                pending_verdicts=[("repo_map", entry)],
+            )
+
+        mock_notice.assert_called_once()
+        args = mock_notice.call_args[0]
+        assert args[2] == "repo_map"  # cap_name
+        assert args[3] is None  # prior_verdict (was absent)
+        assert args[4] == "adopt"  # new_verdict
+
+    @pytest.mark.asyncio
+    async def test_no_notice_on_continue_trial_skipped_by_self_revert_guard(self):
+        """Prior=adopt, incoming=insufficient-data continue-trial: guard skips write → no notice."""
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
+
+        project_id = uuid.uuid4()
+        prior_entry = {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 40}
+        _, _, mock_cm = self._build_mock_db(prior_verdicts={"repo_map": prior_entry})
+        mock_factory = MagicMock(return_value=mock_cm)
+
+        incoming = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "lift": None,
+            "n_with": 5,
+            "n_without": 0,
+        }
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch(
+                "app.capability_trial_verdict.raise_capability_verdict_notice",
+                new_callable=AsyncMock,
+            ) as mock_notice,
+            # Use the REAL record_trial_verdict — the guard must block the write
+            patch("app.capability_trial_verdict.flag_modified"),
+        ):
+            await persist_trial_verdicts_in_transaction(
+                MagicMock(),
+                project_id,
+                pending_verdicts=[("repo_map", incoming)],
+            )
+
+        mock_notice.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_notice_on_strategic_review_adoption(self):
+        """Strategic-review adoptions are exempted from notice emission."""
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
+
+        project_id = uuid.uuid4()
+        _, _, mock_cm = self._build_mock_db(prior_verdicts={})
+        mock_factory = MagicMock(return_value=mock_cm)
+
+        entry = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.08,
+            "n_with": 40,
+            "n_without": 40,
+            "evidence_source": "strategic_review",
+        }
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch(
+                "app.capability_trial_verdict.raise_capability_verdict_notice",
+                new_callable=AsyncMock,
+            ) as mock_notice,
+            patch("app.capability_trial_verdict.record_trial_verdict") as mock_record,
+        ):
+
+            def _write_verdict(project, cap_name, e):
+                project.capability_adoption_verdicts[cap_name] = e
+
+            mock_record.side_effect = _write_verdict
+            await persist_trial_verdicts_in_transaction(
+                MagicMock(),
+                project_id,
+                pending_verdicts=[("repo_map", entry)],
+            )
+
+        mock_notice.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_notice_on_standing_decided_verdict_repeated_evaluation(self):
+        """Re-evaluation of a trial that already has the same decided verdict → no notice."""
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
+
+        project_id = uuid.uuid4()
+        prior_entry = {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 40}
+        _, _, mock_cm = self._build_mock_db(prior_verdicts={"repo_map": prior_entry})
+        mock_factory = MagicMock(return_value=mock_cm)
+
+        same_entry = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch(
+                "app.capability_trial_verdict.raise_capability_verdict_notice",
+                new_callable=AsyncMock,
+            ) as mock_notice,
+            patch("app.capability_trial_verdict.record_trial_verdict") as mock_record,
+        ):
+
+            def _write_same(project, cap_name, e):
+                project.capability_adoption_verdicts[cap_name] = e
+
+            mock_record.side_effect = _write_same
+            await persist_trial_verdicts_in_transaction(
+                MagicMock(),
+                project_id,
+                pending_verdicts=[("repo_map", same_entry)],
+            )
+
+        # same prior and actual verdict → no transition → no notice
+        mock_notice.assert_not_called()
