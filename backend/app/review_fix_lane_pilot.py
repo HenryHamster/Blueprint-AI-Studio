@@ -40,6 +40,7 @@ import contextlib
 import json
 import logging
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -911,7 +912,8 @@ async def activate_lane_for_fix(
     left unchanged.
     """
     from app.improvement_lane_ops import LaneCASError, cas_transition
-    from app.models import ImprovementLaneStatus
+    from app.models import ImprovementLaneStatus, PoolVm
+    from app.shared_state import runtime_config as _runtime_config
 
     if lane is None or lane.status != ImprovementLaneStatus.PARKED.value:
         return
@@ -930,6 +932,42 @@ async def activate_lane_for_fix(
         logger.warning(
             "[LANE-PILOT] could not resume lane %s for fix: %s", lane.id, exc
         )
+        return
+
+    # Re-stamp the soft TTL on the reserved PoolVm so the fix task has a full
+    # TTL window to claim it. The Pass 1 sweep only extends while the lane is
+    # PARKED; once we flip to ACTIVE here the sweep stops. Without re-stamping,
+    # a lane that waited a long time in PARKED may have an expired soft TTL,
+    # causing the fix task's warm-claim to fail silently.
+    member = (
+        (
+            await session.execute(
+                select(PoolVm).where(PoolVm.reserved_lane_id == lane.id).limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if member is not None and member.reservation_hard_expires_at is not None:
+        now = _utcnow()
+        hard_anchor = member.reservation_hard_expires_at
+        if hard_anchor > now:
+            soft_ttl = int(
+                _runtime_config.get("warm_pool_lane_reservation_ttl_seconds", 1800)
+                or 1800
+            )
+            member.reservation_expires_at = min(
+                now + timedelta(seconds=soft_ttl), hard_anchor
+            )
+            session.add(member)
+            logger.debug(
+                "[LANE-PILOT] re-stamped reservation soft TTL vm=%s lane=%s -> %s "
+                "(hard ceiling %s)",
+                member.vm_instance_id,
+                lane.id,
+                member.reservation_expires_at,
+                hard_anchor,
+            )
 
 
 def wire_fix_lane_context(ctx: dict, lane: Any) -> None:

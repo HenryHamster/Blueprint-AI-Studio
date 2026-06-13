@@ -31,6 +31,7 @@ from app.models import (
 from app.payload_schemas import LaneCheckpointPayload, LaneCheckpointValidated
 from app.review_fix_lane_pilot import (
     LANE_CHAIN_ID_KEY,
+    activate_lane_for_fix,
     ensure_chain_lane,
     get_chain_lane,
     kill_project_lanes,
@@ -1908,3 +1909,198 @@ async def test_clear_lane_warm_workspace_if_matching_member_noop_on_cold(
     assert cleared is False
     refreshed = await db.get(ImprovementLane, lane.id)
     assert refreshed.workspace_state == "COLD"
+
+
+# ---------------------------------------------------------------------------
+# activate_lane_for_fix — reservation soft-TTL re-stamp
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reservation_ttl_restamped_at_fix_spawn(db: AsyncSession):
+    """PARKED->ACTIVE transition re-stamps the PoolVm soft TTL so the fix task
+    has a full window to claim it, bounded by the hard ceiling."""
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    from app.time_utils import _utcnow
+
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/restamp-soft-ttl",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    now = _utcnow()
+    hard_anchor = now + timedelta(seconds=3600)
+    member = PoolVm(
+        vm_instance_id="pool-vm-restamp-soft-ttl",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+        # Soft TTL already expired — the fix task would miss its warm claim
+        # without a re-stamp.
+        reservation_expires_at=now - timedelta(seconds=60),
+        reservation_hard_expires_at=hard_anchor,
+    )
+    db.add(member)
+    await db.commit()
+
+    task_id = uuid.uuid4()
+    with patch(
+        "app.shared_state.runtime_config",
+        {"warm_pool_lane_reservation_ttl_seconds": 1800},
+    ):
+        await activate_lane_for_fix(db, lane, task_id=task_id, lease_workspace=True)
+    await db.commit()
+
+    # Lane must be ACTIVE.
+    refreshed_lane = await db.get(ImprovementLane, lane.id)
+    assert refreshed_lane.status == ImprovementLaneStatus.ACTIVE.value
+
+    # Soft TTL must be extended into the future (re-stamped).
+    await db.refresh(member)
+    assert member.reservation_expires_at is not None
+    assert member.reservation_expires_at > now, (
+        "soft TTL should have been re-stamped into the future"
+    )
+    # Must not exceed the hard ceiling.
+    assert member.reservation_expires_at <= hard_anchor, (
+        "re-stamped TTL must be bounded by reservation_hard_expires_at"
+    )
+    # Hard ceiling itself must be unchanged.
+    assert member.reservation_hard_expires_at == hard_anchor
+
+
+@pytest.mark.asyncio
+async def test_activate_lane_for_fix_no_restamp_when_hard_ceiling_elapsed(
+    db: AsyncSession,
+):
+    """When the hard ceiling has already elapsed, activate_lane_for_fix does
+    not re-stamp the soft TTL (clearing or extending it would be wrong — the
+    maintainer's sweep owns the cleanup path)."""
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    from app.time_utils import _utcnow
+
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/restamp-hard-elapsed",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    now = _utcnow()
+    original_soft = now - timedelta(seconds=120)
+    original_hard = now - timedelta(seconds=30)
+    member = PoolVm(
+        vm_instance_id="pool-vm-restamp-hard-elapsed",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+        reservation_expires_at=original_soft,
+        reservation_hard_expires_at=original_hard,
+    )
+    db.add(member)
+    await db.commit()
+
+    task_id = uuid.uuid4()
+    with patch(
+        "app.shared_state.runtime_config",
+        {"warm_pool_lane_reservation_ttl_seconds": 1800},
+    ):
+        await activate_lane_for_fix(db, lane, task_id=task_id, lease_workspace=True)
+    await db.commit()
+
+    # Lane still transitions to ACTIVE — re-stamping is best-effort.
+    refreshed_lane = await db.get(ImprovementLane, lane.id)
+    assert refreshed_lane.status == ImprovementLaneStatus.ACTIVE.value
+
+    # Soft TTL must NOT have been changed (hard ceiling elapsed).
+    await db.refresh(member)
+    assert member.reservation_expires_at == original_soft, (
+        "soft TTL must not be re-stamped when the hard ceiling has elapsed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reservation-expiry while lane is in LEASED state (end-to-end seam)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_expired_reservation_clears_leased_workspace_state(
+    db: AsyncSession,
+):
+    """When a PoolVm reservation expires while the lane is already in LEASED
+    state (i.e. activate_lane_for_fix set workspace_state='LEASED' before the
+    IDLE member's soft TTL lapsed), the sweep's call to
+    clear_lane_warm_workspace_if_matching_member must reset workspace_state to
+    COLD and clear workspace_vm_instance_id.
+
+    The bug: the old WHERE clause used ``workspace_state == 'WARM_RESERVED'``,
+    which never matched a LEASED lane, leaving the workspace pointer stale.
+    The fix: ``workspace_state != 'COLD'`` covers both WARM_RESERVED and LEASED.
+    """
+    from datetime import datetime, timedelta
+
+    from app.warm_pool import clear_lane_warm_workspace_if_matching_member
+
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/expired-leased",
+        base_branch="main",
+    )
+    # Simulate state after activate_lane_for_fix: lane is ACTIVE with LEASED
+    # workspace and the vm pointer set.
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    lane.workspace_state = "LEASED"
+    lane.workspace_vm_instance_id = "pool-vm-expiry-leased-1"
+
+    # An IDLE PoolVm reserved for this lane whose soft TTL has lapsed.
+    expired_at = datetime.utcnow() - timedelta(seconds=60)
+    member = PoolVm(
+        vm_instance_id="pool-vm-expiry-leased-1",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+        reservation_expires_at=expired_at,
+    )
+    db.add(member)
+    await db.commit()
+
+    # The sweep identifies the expired IDLE member and calls
+    # clear_lane_warm_workspace_if_matching_member with the PoolVm's
+    # vm_instance_id.  This must clear the LEASED workspace to COLD.
+    cleared = await clear_lane_warm_workspace_if_matching_member(
+        db, lane.id, member.vm_instance_id
+    )
+    await db.commit()
+
+    assert cleared is True, (
+        "clear_lane_warm_workspace_if_matching_member must return True when "
+        "the lane is in LEASED state and the vm_instance_id matches"
+    )
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.workspace_state == "COLD", (
+        "workspace_state must be reset to COLD after reservation expiry "
+        "regardless of whether the prior state was WARM_RESERVED or LEASED"
+    )
+    assert refreshed.workspace_vm_instance_id is None, (
+        "workspace_vm_instance_id must be cleared alongside workspace_state"
+    )
