@@ -22018,3 +22018,196 @@ async def test_log_sanitization_all_patterns_redacted(
         assert unique_part not in msg, (
             f"{label} pattern secret '{unique_part}' leaked into latest_status_message"
         )
+
+
+
+# ---------------------------------------------------------------------------
+# Holdback fraction tests — capability trial verdict wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_repo_map_adopt_returns_holdback_zero(
+    client: AsyncClient, db_session
+):
+    """adopt verdict → repo_map_holdback_fraction == 0.0 in claim response."""
+    project = Project(
+        name="Holdback Adopt Test",
+        user_id="test-user-123",
+        capability_adoption_verdicts={"repo_map": {"verdict": "adopt"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "ls"}],
+        vm_instance_id="agent-vm-holdback-adopt",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-holdback-adopt")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["repo_map_holdback_fraction"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_repo_map_reject_returns_holdback_one(
+    client: AsyncClient, db_session
+):
+    """reject verdict → repo_map_holdback_fraction == 1.0 in claim response."""
+    project = Project(
+        name="Holdback Reject Test",
+        user_id="test-user-123",
+        capability_adoption_verdicts={"repo_map": {"verdict": "reject"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "ls"}],
+        vm_instance_id="agent-vm-holdback-reject",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-holdback-reject")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["repo_map_holdback_fraction"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_repo_map_continue_trial_returns_default(
+    client: AsyncClient, db_session
+):
+    """continue-trial verdict → repo_map_holdback_fraction equals runtime default (0.0)."""
+    project = Project(
+        name="Holdback Continue Test",
+        user_id="test-user-123",
+        capability_adoption_verdicts={"repo_map": {"verdict": "continue-trial"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "ls"}],
+        vm_instance_id="agent-vm-holdback-continue",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-holdback-continue")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    # Default runtime_config has no override, so default is 0.0
+    assert data["repo_map_holdback_fraction"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_no_verdicts_returns_default_holdback(
+    client: AsyncClient, db_session
+):
+    """No capability_adoption_verdicts → holdback fractions equal configured defaults."""
+    project = Project(
+        name="Holdback No Verdicts Test",
+        user_id="test-user-123",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "ls"}],
+        vm_instance_id="agent-vm-holdback-none",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-holdback-none")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["repo_map_holdback_fraction"] == 0.0
+    assert data["related_tests_holdback_fraction"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_related_tests_adopt_returns_holdback_zero(
+    client: AsyncClient, db_session
+):
+    """adopt verdict on related_tests → related_tests_holdback_fraction == 0.0."""
+    project = Project(
+        name="Holdback Related Tests Adopt",
+        user_id="test-user-123",
+        capability_adoption_verdicts={"related_tests": {"verdict": "adopt"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "ls"}],
+        vm_instance_id="agent-vm-holdback-rt-adopt",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-holdback-rt-adopt")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["related_tests_holdback_fraction"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_related_tests_reject_returns_holdback_one(
+    client: AsyncClient, db_session
+):
+    """reject verdict on related_tests → related_tests_holdback_fraction == 1.0."""
+    project = Project(
+        name="Holdback Related Tests Reject",
+        user_id="test-user-123",
+        capability_adoption_verdicts={"related_tests": {"verdict": "reject"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "ls"}],
+        vm_instance_id="agent-vm-holdback-rt-reject",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-holdback-rt-reject")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["related_tests_holdback_fraction"] == 1.0

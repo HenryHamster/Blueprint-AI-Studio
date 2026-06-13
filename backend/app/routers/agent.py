@@ -918,12 +918,24 @@ async def claim_task(
         else:
             response_payloads.append(entry)
 
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    _project_verdicts = get_trial_verdicts(project) if project else {}
     response = {
         "task_id": str(task.id),
         "title": task.title,
         "description": task.description,
         "payloads": response_payloads,
         "context": safe_context,
+        "repo_map_holdback_fraction": get_effective_holdback_fraction(
+            _project_verdicts, "repo_map", 0.0
+        ),
+        "related_tests_holdback_fraction": get_effective_holdback_fraction(
+            _project_verdicts, "related_tests", 0.0
+        ),
     }
 
     # Add project metadata so agents can adapt to different project structures
