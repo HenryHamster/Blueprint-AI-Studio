@@ -15,6 +15,8 @@ from app.review_fix_lane_pilot import (
 )
 from app.capability_trial_verdict import (
     LANE_PILOT_ASSIGNMENT_KEY,
+    LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+    LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
     evaluate_lane_pilot_verdict,
 )
 from app.models import TaskStatus
@@ -413,7 +415,6 @@ async def test_lane_pilot_aggregates_include_cancelled_fix_task_cost(db_session)
     assert agg["lane_cost_per_merged"] == pytest.approx(4.5)
 
 
-@pytest.mark.asyncio
 async def test_shadow_pilot_arm_counted_in_n_shadow_not_n_lane(db_session):
     """Tasks with pilot_arm='shadow' are counted under n_shadow, not n_lane/n_control."""
     project = await _make_project(db_session, is_self_repo=True)
@@ -620,3 +621,241 @@ def test_lane_verdict_cost_includes_reserved_idle_cost():
     }
     verdict_runtime_only = evaluate_lane_pilot_verdict(agg_runtime_only)
     assert verdict_runtime_only["verdict"] != "KILL"
+
+
+@pytest.mark.asyncio
+async def test_gate_integrity_violations_counts_review_with_lane_id(db_session):
+    """gate_integrity_violations is 1 when a review task carries improvement_lane_id."""
+    project = await _make_project(db_session, is_self_repo=True)
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="gate-test-lane",
+        goal="gate-test-lane",
+        branch_name="gate-test-lane",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+
+    # A review task that incorrectly carries improvement_lane_id in its context.
+    bad_review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review", "prompt": "review", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "improvement_lane_id": str(lane.id),
+        },
+        estimated_cost_usd=0.5,
+    )
+
+    db_session.add_all([lane, bad_review_task])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+    assert agg["gate_integrity_violations"] == 1
+
+    # A separate project with no such task should report 0 violations.
+    clean_project = await _make_project(db_session, is_self_repo=True)
+    agg_clean = await compute_lane_pilot_aggregates(db_session, clean_project.id)
+    assert agg_clean["gate_integrity_violations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_loss_rate_reflects_phase_requeues(db_session):
+    """checkpoint_loss_rate is the fraction of lane rows with phase_requeues > 0."""
+    project = await _make_project(db_session, is_self_repo=True)
+
+    # Lane 1: no requeues (no loss)
+    lane_ok = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="lane-no-requeue",
+        goal="lane-no-requeue",
+        branch_name="lane-no-requeue",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    lane_ok.phase_requeues = 0
+
+    # Lane 2: has a requeue (checkpoint loss)
+    lane_lost = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="lane-requeued",
+        goal="lane-requeued",
+        branch_name="lane-requeued",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    lane_lost.phase_requeues = 1
+
+    db_session.add_all([lane_ok, lane_lost])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+    # 1 of 2 lanes had a checkpoint loss → 0.5
+    assert agg["checkpoint_loss_rate"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_warm_resume_fraction_from_fix_task_context(db_session):
+    """warm_resume_fraction is 1.0 when the fix task carries the warm-resume receipt."""
+    project = await _make_project(db_session, is_self_repo=True)
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="warm-resume-lane",
+        goal="warm-resume-lane",
+        branch_name="warm-resume-lane",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+
+    root_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+        },
+        estimated_cost_usd=0.5,
+    )
+    fix_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_task.id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "pr_merged": True,
+            LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    db_session.add_all([lane, root_task, fix_task])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+    assert agg["warm_resume_fraction"] == pytest.approx(1.0)
+
+    # Without the receipt, fraction should be None (no fix tasks).
+    empty_project = await _make_project(db_session, is_self_repo=True)
+    agg_empty = await compute_lane_pilot_aggregates(db_session, empty_project.id)
+    assert agg_empty["warm_resume_fraction"] is None
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_fraction_from_fix_task_context(db_session):
+    """checkpoint_fraction is 1.0 when the fix task carries the checkpoint receipt."""
+    project = await _make_project(db_session, is_self_repo=True)
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="checkpoint-lane",
+        goal="checkpoint-lane",
+        branch_name="checkpoint-lane",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+
+    root_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+        },
+        estimated_cost_usd=0.5,
+    )
+    fix_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_task.id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "pr_merged": True,
+            LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    db_session.add_all([lane, root_task, fix_task])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+    assert agg["checkpoint_fraction"] == pytest.approx(1.0)
+
+    # A fix task without the receipt should yield 0.0, not None.
+    project2 = await _make_project(db_session, is_self_repo=True)
+    lane2 = await create_lane(
+        db_session,
+        project_id=project2.id,
+        direction_id=None,
+        title="no-ckpt-lane",
+        goal="no-ckpt-lane",
+        branch_name="no-ckpt-lane",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    root2 = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane2.id),
+        },
+        estimated_cost_usd=0.3,
+    )
+    fix2 = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root2.id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane2.id),
+            "pr_merged": True,
+            # No checkpoint receipt key
+        },
+        estimated_cost_usd=0.8,
+    )
+    db_session.add_all([lane2, root2, fix2])
+    await db_session.commit()
+
+    agg2 = await compute_lane_pilot_aggregates(db_session, project2.id)
+    assert agg2["checkpoint_fraction"] == pytest.approx(0.0)

@@ -1437,3 +1437,193 @@ def test_confirm_lane_warm_resume_existing_keys_overwritten():
     assert ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] is True
     assert ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] is True
     assert ctx["other_key"] == "preserved"
+
+
+# ---------------------------------------------------------------------------
+# sweep_stranded_lanes — Class 3: PARKED lane retirement via terminal spawn_reason
+# ---------------------------------------------------------------------------
+
+
+async def _make_parked_lane(session, project_id, *, parked_ago_seconds: int = 7200):
+    """Create a PARKED lane with parked_at set to `parked_ago_seconds` ago."""
+    from datetime import datetime, timedelta
+
+    lane = await create_lane(
+        session,
+        project_id=project_id,
+        direction_id=None,
+        title="Parked test lane",
+        goal="G",
+        branch_name=f"lane/parked-{uuid.uuid4().hex[:8]}",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    lane.parked_at = datetime.utcnow() - timedelta(seconds=parked_ago_seconds)
+    await session.commit()
+    return lane
+
+
+async def _make_terminal_task(session, project_id, lane_id, spawn_reason: str):
+    """Create a terminal Task with LANE_CHAIN_ID_KEY and spawn_reason set."""
+    from app.models import Task, TaskStatus
+    from app.review_pipeline import SPAWN_REASON_KEY
+
+    task = Task(
+        project_id=project_id,
+        title="terminal task",
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_review_fix_lane_id": str(lane_id),
+            SPAWN_REASON_KEY: spawn_reason,
+        },
+    )
+    session.add(task)
+    await session.commit()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_retires_parked_lane_already_merged(
+    db: AsyncSession,
+):
+    """PARKED lane older than threshold with a terminal task carrying
+    spawn_reason='already_merged' must be retired."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    await _make_terminal_task(db, project_id, lane.id, "already_merged")
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_retires_pr_closed_unmerged(
+    db: AsyncSession,
+):
+    """PARKED lane older than threshold with spawn_reason='pr_closed_unmerged'
+    must also be retired."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    await _make_terminal_task(db, project_id, lane.id, "pr_closed_unmerged")
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_skips_lane_without_terminal_reason(
+    db: AsyncSession,
+):
+    """PARKED lane older than threshold but whose terminal task carries a
+    non-terminal spawn_reason (e.g. 'spawned') must NOT be retired."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    await _make_terminal_task(db, project_id, lane.id, "spawned")
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PARKED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_skips_recent_parked_lane(
+    db: AsyncSession,
+):
+    """PARKED lane within the threshold window must not be touched even if
+    the chain terminal spawn_reason matches."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    # parked only 60 seconds ago — well within the 3600s threshold
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=60)
+    await _make_terminal_task(db, project_id, lane.id, "already_merged")
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PARKED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_cas_miss_is_noop(db: AsyncSession):
+    """A concurrent CAS miss on a PARKED lane must not raise and must not
+    increment the returned count."""
+    from app.improvement_lane_ops import LaneCASError
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    await _make_terminal_task(db, project_id, lane.id, "already_merged")
+
+    async def _raise_cas(session, lane_id, expected, next_status, **kw):
+        raise LaneCASError("simulated concurrent transition")
+
+    with (
+        patch(
+            "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+        ),
+        patch("app.improvement_lane_ops.cas_transition", side_effect=_raise_cas),
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+
+    # CAS miss is a no-op — count stays 0, lane unchanged
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PARKED.value

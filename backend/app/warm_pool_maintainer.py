@@ -1475,6 +1475,101 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                 "[WARM-POOL] stale-PROPOSED CAS miss lane=%s: %s", lane.id, exc
             )
 
+    # --- Class 3: PARKED lanes whose chain completed without triggering a spawn ---
+    # retire_chain_lane is only called from review_pipeline.py guard paths (on the
+    # NEXT spawn attempt). If a fix PR merges cleanly and no further spawn occurs,
+    # the lane stays PARKED indefinitely. Detect this by finding PARKED lanes older
+    # than a threshold whose most recent terminal chain task carries a
+    # spawn_reason of 'already_merged' or 'pr_closed_unmerged'.
+    _TERMINAL_SPAWN_REASONS = frozenset({"already_merged", "pr_closed_unmerged"})
+    parked_stale_seconds = int(
+        runtime_config.get(
+            "improvement_lane_parked_terminal_stale_seconds",
+            3600,
+        )
+        or 3600
+    )
+    parked_cutoff = now - timedelta(seconds=parked_stale_seconds)
+
+    from app.review_pipeline import SPAWN_REASON_KEY
+
+    stale_parked = (
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.status == ImprovementLaneStatus.PARKED.value,
+                    ImprovementLane.parked_at < parked_cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for lane in stale_parked:
+        lane_id_str = str(lane.id)
+        # Find terminal tasks belonging to this lane's chain. Use Python-side
+        # context filtering to stay dialect-agnostic (SQLite / Postgres).
+        terminal_tasks = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == lane.project_id,
+                        Task.status.in_(list(_LANE_TERMINAL_TASK_STATUSES)),
+                    )
+                    .order_by(Task.updated_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Find the most recent terminal task in this lane's chain.
+        matched_reason: str | None = None
+        for t in terminal_tasks:
+            ctx = t.context or {}
+            if ctx.get("_review_fix_lane_id") == lane_id_str:
+                reason = ctx.get(SPAWN_REASON_KEY)
+                if reason in _TERMINAL_SPAWN_REASONS:
+                    matched_reason = reason
+                break
+        if matched_reason is None:
+            continue
+        try:
+            await cas_transition(
+                session,
+                lane.id,
+                ImprovementLaneStatus.PARKED,
+                ImprovementLaneStatus.RETIRED,
+            )
+            logger.info(
+                "[WARM-POOL] retired stale PARKED lane %s -> RETIRED "
+                "(chain terminal spawn_reason=%s; parked_at=%s)",
+                lane.id,
+                matched_reason,
+                lane.parked_at,
+            )
+            reserved = (
+                (
+                    await session.execute(
+                        select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for member in reserved:
+                member.reserved_lane_id = None
+                member.reservation_expires_at = None
+                member.reservation_hard_expires_at = None
+                session.add(member)
+                await record_lane_reservation_cause(session, lane.id, "force_expired")
+            transitioned += 1
+        except LaneCASError as exc:
+            logger.debug(
+                "[WARM-POOL] stale-PARKED retirement CAS miss lane=%s: %s", lane.id, exc
+            )
+
     if transitioned:
         await session.commit()
     return transitioned
