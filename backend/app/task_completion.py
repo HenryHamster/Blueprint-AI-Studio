@@ -4144,6 +4144,107 @@ async def _handle_design_doc_completion(
         )
 
 
+# Confirmed-command field names written back by the agent build-config endpoint.
+_CONFIRMED_COMMAND_KEYS = (
+    "confirmed_lint_cmd",
+    "confirmed_test_cmd",
+    "confirmed_build_cmd",
+    "confirmed_install_cmd",
+)
+# Command-memory statuses that mean "overview may be fine but command write-back
+# is NOT complete" — i.e. a partial / degraded command-memory state.
+_PARTIAL_COMMAND_MEMORY_STATUSES = frozenset(
+    {"missing_commands", "writeback_failed", "unknown"}
+)
+
+
+def _has_command_writeback_evidence(build_config: Dict[str, Any], task_id: str) -> bool:
+    """Return True when *this* task durably persisted ≥1 confirmed command.
+
+    Primary evidence is the top-level write-back marker stamped by
+    ``agent_write_back_build_config_commands``; the per-directory
+    ``confirming_task_id`` stamps are a robustness fallback (e.g. a marker
+    written by an older endpoint build that predates the top-level field).
+    """
+    if (
+        build_config.get("last_command_writeback_task_id") == task_id
+        and build_config.get("last_command_writeback_paths")
+    ):
+        return True
+    for entry in build_config.get("directories") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("confirming_task_id")) != task_id:
+            continue
+        if any(
+            isinstance(entry.get(k), str) and entry.get(k).strip()
+            for k in _CONFIRMED_COMMAND_KEYS
+        ):
+            return True
+    return False
+
+
+def _stamp_command_memory_status(build_config: Dict[str, Any], task: Task) -> None:
+    """Record a truthful, distinguishable command-memory marker on build_config.
+
+    Reconciles the agent's self-reported ``command_memory`` outcome (persisted
+    into ``task.context``) against durable write-back evidence so a valid
+    repo_overview can no longer mask incomplete command memory. Mutates
+    ``build_config`` in place; never raises on malformed input.
+    """
+    task_id = str(task.id)
+    reported = (task.context or {}).get("command_memory")
+    reported_status: str | None = None
+    reported_detail: str | None = None
+    reported_paths: list[str] | None = None
+    if isinstance(reported, dict):
+        rs = reported.get("status")
+        if isinstance(rs, str):
+            reported_status = rs
+        rd = reported.get("detail")
+        if isinstance(rd, str) and rd.strip():
+            reported_detail = rd
+        rp = reported.get("updated_paths")
+        if isinstance(rp, list):
+            reported_paths = [p for p in rp if isinstance(p, str) and p.strip()]
+
+    evidence = _has_command_writeback_evidence(build_config, task_id)
+
+    detail = reported_detail
+    if evidence:
+        status = "confirmed"
+    elif reported_status == "missing_commands":
+        status = "missing_commands"
+    elif reported_status == "writeback_failed":
+        status = "writeback_failed"
+    elif reported_status == "success":
+        # Agent claimed success but nothing landed — degrade truthfully so the
+        # marker reflects reality, not the unverified claim.
+        status = "writeback_failed"
+        detail = detail or "reported success without write-back evidence"
+    else:
+        # Older agent omitted the payload entirely.
+        status = "unknown"
+
+    build_config["bootstrap_command_memory_status"] = status
+    build_config["bootstrap_command_memory_complete"] = status == "confirmed"
+    build_config["bootstrap_command_memory_updated_at"] = _utcnow().isoformat()
+    if detail:
+        build_config["bootstrap_command_memory_detail"] = detail
+    else:
+        build_config.pop("bootstrap_command_memory_detail", None)
+
+    paths = reported_paths or (
+        list(build_config.get("last_command_writeback_paths") or [])
+        if build_config.get("last_command_writeback_task_id") == task_id
+        else []
+    )
+    if paths:
+        build_config["bootstrap_command_memory_paths"] = paths
+    else:
+        build_config.pop("bootstrap_command_memory_paths", None)
+
+
 async def _handle_repo_bootstrap_completion(
     task: Task, logs: str, session: AsyncSession
 ) -> None:
@@ -4222,9 +4323,10 @@ async def _handle_repo_bootstrap_completion(
             return
 
         build_config = dict(project.build_config or {})
+        now = _utcnow()
+        now_iso = now.isoformat()
 
         if overview:
-            now_iso = _utcnow().isoformat()
             # Provenance carried alongside the overview so downstream agents see
             # freshness (refreshed time + the branch/revision the overview
             # describes). Nested under the repo_overview block so a refresh
@@ -4269,7 +4371,6 @@ async def _handle_repo_bootstrap_completion(
             )
         else:
             if not build_config.get("bootstrap_completed_at"):
-                now = _utcnow()
                 attempts = (
                     coerce_recovery_attempts(
                         build_config.get("bootstrap_recovery_attempts")
@@ -4295,6 +4396,21 @@ async def _handle_repo_bootstrap_completion(
                     task.project_id,
                     task.id,
                 )
+
+        # ── Command-memory status (independent of overview persistence) ──────
+        # A valid overview no longer implies complete command memory. The agent
+        # reports the write-back outcome separately (success / missing_commands
+        # / writeback_failed), and the write-back endpoint stamps top-level
+        # evidence (last_command_writeback_task_id) plus per-directory
+        # confirming_task_id. Completion reconciles the two so build_config
+        # exposes a truthful, distinguishable command-memory marker:
+        #   confirmed       — this task persisted ≥1 confirmed command
+        #   missing_commands— agent found nothing runnable to confirm
+        #   writeback_failed— agent's write-back failed (or it claimed success
+        #                     without leaving any evidence)
+        #   unknown         — older agent omitted the payload entirely; degrade
+        #                     truthfully rather than falsely claim success
+        _stamp_command_memory_status(build_config, task)
 
         project.build_config = build_config
         flag_modified(project, "build_config")

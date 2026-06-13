@@ -89,6 +89,28 @@ export interface BuildConfig {
   bootstrap_overview_source_branch?: string | null;
   /** Commit SHA the refreshed overview was captured at (optional; may be absent). */
   bootstrap_overview_source_revision?: string | null;
+  /** Outcome of the repo_bootstrap command write-back, recorded independently of
+   *  the repo overview. `confirmed` = commands written back and verified;
+   *  `missing_commands` = overview produced but no commands to confirm;
+   *  `writeback_failed` = commands existed but the write-back did not land;
+   *  `unknown` = a legacy agent omitted the status payload. Absent on projects
+   *  that predate the command-memory status contract. */
+  bootstrap_command_memory_status?:
+    | 'confirmed'
+    | 'missing_commands'
+    | 'writeback_failed'
+    | 'unknown'
+    | string
+    | null;
+  /** True only when the command write-back was confirmed (status === 'confirmed').
+   *  False means the command memory is partial/degraded even if an overview exists. */
+  bootstrap_command_memory_complete?: boolean | null;
+  /** Human-readable detail explaining a non-confirmed command-memory outcome. */
+  bootstrap_command_memory_detail?: string | null;
+  /** Paths written back during command confirmation, when any landed. */
+  bootstrap_command_memory_paths?: string[] | null;
+  /** ISO timestamp stamped when the command-memory status was last recorded. */
+  bootstrap_command_memory_updated_at?: string | null;
 }
 
 export interface StagingBranchPrefixesConfig {
@@ -228,6 +250,11 @@ export interface RepoOverview {
   test_layout?: string | null;
   key_conventions?: string | null;
   environment_requirements?: string | null;
+  provenance?: {
+    refreshed_at?: string | null;
+    source_branch?: string | null;
+    source_revision?: string | null;
+  } | null;
 }
 
 export interface Project {

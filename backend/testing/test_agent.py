@@ -2274,6 +2274,48 @@ async def test_agent_claim_omits_repo_overview_for_non_repo_context_tasks(
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_bootstrap_guidance_requests_source_revision(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="Bootstrap Guidance Source Revision",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="source-revision",
+        build_config={},
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "repo_bootstrap",
+            "github_owner": "acme",
+            "github_repo": "source-revision",
+            "integration_branch": "main",
+        }],
+        vm_instance_id="agent-vm-bootstrap-guidance-source-revision",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    guidance = resp.json()["bootstrap_guidance"]
+    assert "source_revision" in guidance["design_doc_section_fields"]
+    assert any(
+        "source_revision" in step and "checked-out HEAD SHA" in step
+        for step in guidance["completion_steps"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_surfaces_repo_is_empty(client: AsyncClient, db_session):
     """The claim response surfaces build_config.repo_is_empty as top-level repo_is_empty.
 

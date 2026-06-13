@@ -3793,6 +3793,7 @@ async def claim_task(
                 "test_layout",
                 "key_conventions",
                 "environment_requirements",
+                "source_revision",
             ],
             "completion_payload_field": "repo_overview",
             "build_config_writeback_endpoint": (
@@ -3800,7 +3801,7 @@ async def claim_task(
             ),
             "completion_steps": [
                 "Read listed files to understand project structure",
-                "Write /tmp/bootstrap_overview_<task_id>.json with tech_stack, directory_layout, first_steps_summary, entry_points (main runnable scripts/services and their purposes), test_layout (where tests live, unit/integration/e2e organization, and run commands), key_conventions (branch naming, commit style, required review steps), environment_requirements (required env vars, system deps, version constraints beyond install_cmd)",
+                "Write /tmp/bootstrap_overview_<task_id>.json with tech_stack, directory_layout, first_steps_summary, entry_points (main runnable scripts/services and their purposes), test_layout (where tests live, unit/integration/e2e organization, and run commands), key_conventions (branch naming, commit style, required review steps), environment_requirements (required env vars, system deps, version constraints beyond install_cmd), source_revision (the checked-out HEAD SHA after clone/checkout)",
                 "Confirm working build/test commands by running them",
                 "Write confirmed commands back via the build_config_writeback_endpoint",
                 "Post COMPLETED with repo_overview in the completion payload",
@@ -4973,56 +4974,60 @@ async def agent_write_back_build_config_commands(
     task_id_str = str(payload.task_id)
     updated_paths: list[str] = []
 
+    def _confirmed_command(value: str | None) -> str | None:
+        if isinstance(value, str) and value.strip():
+            return value
+        return None
+
     for entry in payload.entries:
         norm = _normalize_dir_path(entry.path)
+        confirmed_values = {
+            "confirmed_lint_cmd": _confirmed_command(entry.confirmed_lint_cmd),
+            "confirmed_test_cmd": _confirmed_command(entry.confirmed_test_cmd),
+            "confirmed_build_cmd": _confirmed_command(entry.confirmed_build_cmd),
+            "confirmed_install_cmd": _confirmed_command(entry.confirmed_install_cmd),
+        }
+        has_confirmed = any(value is not None for value in confirmed_values.values())
         if norm not in index_by_path:
             # Unknown path — create a new directory entry when the agent has
             # confirmed a non-empty command.  This is the empty-detection case
             # where bootstrap discovers a real test command but detection found
             # no directories. Only confirmed_* fields are written; detected
             # test_cmd/build_cmd/install_cmd stay absent on the new entry.
-            has_confirmed = any(
-                v is not None and str(v).strip()
-                for v in (
-                    entry.confirmed_lint_cmd,
-                    entry.confirmed_test_cmd,
-                    entry.confirmed_build_cmd,
-                    entry.confirmed_install_cmd,
-                )
-            )
             if not has_confirmed:
                 continue
             new_entry: dict = {"path": norm}
-            if entry.confirmed_lint_cmd is not None:
-                new_entry["confirmed_lint_cmd"] = entry.confirmed_lint_cmd
-            if entry.confirmed_test_cmd is not None:
-                new_entry["confirmed_test_cmd"] = entry.confirmed_test_cmd
-            if entry.confirmed_build_cmd is not None:
-                new_entry["confirmed_build_cmd"] = entry.confirmed_build_cmd
-            if entry.confirmed_install_cmd is not None:
-                new_entry["confirmed_install_cmd"] = entry.confirmed_install_cmd
+            for key, value in confirmed_values.items():
+                if value is not None:
+                    new_entry[key] = value
             new_entry["commands_confirmed_at"] = now_iso
             new_entry["confirming_task_id"] = task_id_str
             index_by_path[norm] = len(directories)
             directories.append(new_entry)
             updated_paths.append(norm)
             continue
+        if not has_confirmed:
+            continue
         idx = index_by_path[norm]
         dir_entry = directories[idx]
-        if entry.confirmed_lint_cmd is not None:
-            dir_entry["confirmed_lint_cmd"] = entry.confirmed_lint_cmd
-        if entry.confirmed_test_cmd is not None:
-            dir_entry["confirmed_test_cmd"] = entry.confirmed_test_cmd
-        if entry.confirmed_build_cmd is not None:
-            dir_entry["confirmed_build_cmd"] = entry.confirmed_build_cmd
-        if entry.confirmed_install_cmd is not None:
-            dir_entry["confirmed_install_cmd"] = entry.confirmed_install_cmd
+        for key, value in confirmed_values.items():
+            if value is not None:
+                dir_entry[key] = value
         dir_entry["commands_confirmed_at"] = now_iso
         dir_entry["confirming_task_id"] = task_id_str
         directories[idx] = dir_entry
         updated_paths.append(norm)
 
     existing["directories"] = directories
+    # Stamp a top-level write-back marker so repo_bootstrap completion can
+    # verify command-memory success without re-scanning every directory entry.
+    # The per-directory confirming_task_id stamps above remain the durable
+    # per-entry provenance; this marker is the completion-handler evidence that
+    # *this* task actually persisted confirmed commands.
+    if updated_paths:
+        existing["last_command_writeback_at"] = now_iso
+        existing["last_command_writeback_task_id"] = task_id_str
+        existing["last_command_writeback_paths"] = updated_paths
     project.build_config = existing
     flag_modified(project, "build_config")
     await session.commit()

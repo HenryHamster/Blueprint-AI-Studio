@@ -3769,13 +3769,16 @@ async def _find_last_strategic_cycle_time(
 
 
 async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
-    """Return True if a repo_bootstrap task is still in-flight for this project.
+    """Return True if a repo_bootstrap task is still in-flight for this project,
+    or if an automatic recovery attempt is scheduled but not yet due.
 
     False for self-repo projects and for projects whose bootstrap has already
     completed (``bootstrap_completed_at`` is set).  A terminal bootstrap
-    (FAILED / COMPLETED / …) also returns False so a permanently degraded
-    bootstrap never deadlocks autonomous spawning.
+    (FAILED / COMPLETED / …) with no pending recovery also returns False so a
+    permanently degraded bootstrap never deadlocks autonomous spawning.
     """
+    from app.repo_bootstrap import _parse_recovery_at
+
     _build_cfg = project.build_config or {}
     if _build_cfg.get("bootstrap_completed_at") or project.is_self_repo:
         return False
@@ -3796,7 +3799,15 @@ async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
             .limit(1)
         )
     ).first()
-    return pending is not None
+    if pending is not None:
+        return True
+    # Also defer during a scheduled recovery backoff window so that the recovery
+    # attempt gets a chance to produce repo memory before implementation cycles start.
+    if _build_cfg.get("bootstrap_recovery_state") == "backoff":
+        next_at = _parse_recovery_at(_build_cfg.get("bootstrap_recovery_next_at"))
+        if next_at is not None and next_at > _utcnow():
+            return True
+    return False
 
 
 async def _maybe_notify_operator_bootstrap_deferred(

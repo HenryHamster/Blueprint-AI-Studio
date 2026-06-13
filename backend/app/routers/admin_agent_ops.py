@@ -2900,4 +2900,24 @@ async def admin_get_build_config_commands(
                 "commands_stale": is_commands_stale(confirmed_at),
             }
         )
-    return {"project_id": str(project_id), "directories": result}
+
+    # Surface the bootstrap command-memory outcome recorded separately from the
+    # repo overview, so operators can distinguish a confirmed write-back from a
+    # bootstrap that produced an overview but failed to confirm/write commands.
+    # Absent on legacy projects (keys never stamped) -> command_memory is None.
+    cm_status = cfg.get("bootstrap_command_memory_status")
+    command_memory = None
+    if cm_status is not None:
+        command_memory = {
+            "status": cm_status,
+            "complete": cfg.get("bootstrap_command_memory_complete"),
+            "detail": cfg.get("bootstrap_command_memory_detail"),
+            "paths": cfg.get("bootstrap_command_memory_paths"),
+            "updated_at": cfg.get("bootstrap_command_memory_updated_at"),
+        }
+
+    return {
+        "project_id": str(project_id),
+        "directories": result,
+        "command_memory": command_memory,
+    }

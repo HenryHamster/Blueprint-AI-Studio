@@ -72,6 +72,32 @@ function getRetryOutcomeMessage(outcome: RetryOutcome): string {
   return 'This project is not eligible for bootstrap recovery.';
 }
 
+/** Partial/degraded command-memory marker for the completed bootstrap state.
+ *  Returns null when the command write-back was confirmed, or when the project
+ *  predates the command-memory status contract (no fields stamped) — in both
+ *  cases there is nothing degraded to surface. Overview presence is NOT proof of
+ *  command memory, so this is derived independently from the overview. */
+function getCommandMemoryMarker(
+  project: Project,
+): { label: string; detail: string | null } | null {
+  const cfg = project.build_config;
+  const status = cfg?.bootstrap_command_memory_status;
+  // Legacy project: no command-memory status was ever recorded.
+  if (!status) return null;
+  // Confirmed write-back — nothing degraded to flag.
+  if (cfg?.bootstrap_command_memory_complete) return null;
+
+  const detail = cfg?.bootstrap_command_memory_detail ?? null;
+  if (status === 'missing_commands') {
+    return { label: 'Command memory incomplete — no commands confirmed', detail };
+  }
+  if (status === 'writeback_failed') {
+    return { label: 'Command memory degraded — write-back failed', detail };
+  }
+  // 'unknown' or any future/partial status that is not confirmed.
+  return { label: 'Command memory not confirmed', detail };
+}
+
 function getRecoveryDetail(project: Project): string | null {
   const cfg = project.build_config;
   if (!cfg?.bootstrap_degraded_reason) return null;
@@ -136,6 +162,7 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
     repoOverview?.first_steps_summary
   );
   const recoveryDetail = getRecoveryDetail(project);
+  const commandMemoryMarker = getCommandMemoryMarker(project);
   const retryState = retryOutcome?.state;
   const refreshState = refreshOutcome?.state;
   const displayState: BootstrapState =
@@ -225,6 +252,17 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
                 {project.build_config?.bootstrap_overview_source_revision && (
                   <> @ <span className="font-mono text-neutral-300">{project.build_config.bootstrap_overview_source_revision.slice(0, 7)}</span></>
                 )}
+              </div>
+            )}
+            {displayState === 'completed' && commandMemoryMarker && (
+              <div className="text-[10px] text-amber-300 mt-0.5 flex items-start gap-1">
+                <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
+                <span>
+                  {commandMemoryMarker.label}
+                  {commandMemoryMarker.detail && (
+                    <span className="text-amber-400/80"> — {commandMemoryMarker.detail}</span>
+                  )}
+                </span>
               </div>
             )}
             {displayState === 'pending' && (

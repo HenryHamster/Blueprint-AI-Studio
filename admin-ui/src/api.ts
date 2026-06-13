@@ -2627,9 +2627,31 @@ export interface BuildConfigCommandEntry {
   commands_stale: boolean;
 }
 
+/** Outcome of the repo_bootstrap command write-back, recorded independently of
+ *  the repo overview. `confirmed` = commands were written back and verified;
+ *  `missing_commands` = bootstrap produced an overview but no commands to confirm;
+ *  `writeback_failed` = commands existed but the write-back did not land;
+ *  `unknown` = a legacy agent omitted the status payload entirely. */
+export type BuildConfigCommandMemoryStatus =
+  | 'confirmed'
+  | 'missing_commands'
+  | 'writeback_failed'
+  | 'unknown';
+
+export interface BuildConfigCommandMemory {
+  status: BuildConfigCommandMemoryStatus | string;
+  complete?: boolean | null;
+  detail?: string | null;
+  paths?: string[] | null;
+  updated_at?: string | null;
+}
+
 export interface BuildConfigCommandsResponse {
   project_id: string;
   directories: BuildConfigCommandEntry[];
+  /** Bootstrap command-memory outcome. Null/absent on legacy projects that
+   *  predate the command-memory status contract. */
+  command_memory?: BuildConfigCommandMemory | null;
 }
 
 export async function fetchBuildConfigCommands(

@@ -111,6 +111,36 @@ class ReproduceVerdict(BaseModel):
         return v
 
 
+class CommandMemoryOutcome(BaseModel):
+    """Agent-reported repo_bootstrap command write-back outcome.
+
+    Carries whether the bootstrap agent confirmed and wrote back build/test/lint
+    commands, reported *separately* from ``repo_overview`` persistence. A valid
+    overview no longer implies complete command memory: the agent reports one of
+    ``success`` (commands confirmed and written back), ``missing_commands`` (no
+    runnable command could be confirmed), or ``writeback_failed`` (the write-back
+    request itself failed). Mirrors ``ReproduceVerdict``'s additive,
+    extra-ignoring shape so older agents that omit it behave identically — the
+    completion handler then degrades the command-memory marker to ``unknown``
+    rather than falsely claiming success. Persisted into
+    ``task.context["command_memory"]`` and consumed by
+    ``_handle_repo_bootstrap_completion``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    status: str = Field(..., max_length=32)
+    detail: str | None = Field(None, max_length=2000)
+    updated_paths: List[str] | None = Field(None, max_length=50)
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str) -> str:
+        allowed = {"success", "missing_commands", "writeback_failed"}
+        if v not in allowed:
+            raise ValueError(f"status must be one of {allowed}")
+        return v
+
+
 class WorkspacePrepOutcome(BaseModel):
     """Bounded agent-reported workspace-preparation outcome for lane telemetry."""
 
@@ -250,6 +280,14 @@ class AgentStatusPayload(BaseModel):
     # task.context["reproduce_verdict"]. Absent payloads behave identically to
     # today (older agents only send no_op_reason).
     reproduce_verdict: ReproduceVerdict | None = None
+    # Optional repo_bootstrap command write-back outcome, reported separately
+    # from repo_overview. Set by the bootstrap agent on its terminal COMPLETED
+    # status to declare whether build/test/lint commands were confirmed and
+    # written back (success / missing_commands / writeback_failed). Persisted
+    # into task.context["command_memory"]. Absent payloads behave identically to
+    # today (older agents omit it, and completion degrades command memory to
+    # "unknown" rather than claiming success).
+    command_memory: CommandMemoryOutcome | None = None
 
     @field_validator("blocked_need", mode="before")
     @classmethod
@@ -824,6 +862,25 @@ class BuildConfig(BaseModel):
     # has not yet run or has not completed. The strategic spawn gate checks this
     # to defer implementation tasks until the bootstrap has grounded repo knowledge.
     bootstrap_completed_at: str | None = None
+    # Durable command-memory outcome stamped by repo_bootstrap completion and
+    # preserved through ordinary project saves and re-detects. These fields are
+    # operator-visible state, not repo-derived config, so they must round-trip
+    # through BuildConfig validation.
+    bootstrap_command_memory_status: str | None = None
+    bootstrap_command_memory_complete: bool = False
+    bootstrap_command_memory_detail: str | None = None
+    bootstrap_command_memory_paths: List[str] | None = None
+    bootstrap_command_memory_updated_at: str | None = None
+    # Durable write-back evidence stamped by agent_write_back_build_config_commands.
+    # Read by _stamp_command_memory_status at repo_bootstrap completion to confirm
+    # command memory without re-scanning every directory entry.  Must be part of
+    # the schema so a settings-UI PATCH (which round-trips through BuildConfig
+    # validation + model_dump(exclude_none=True)) does not silently erase the
+    # evidence before completion runs and downgrade a successful write-back to
+    # writeback_failed.
+    last_command_writeback_at: str | None = None
+    last_command_writeback_task_id: str | None = None
+    last_command_writeback_paths: List[str] | None = None
     # Per-project resource envelope controlling concurrent VM caps and spend
     # ceilings.  None/absent means unlimited (inherit global behavior).
     # Validated by ResourceEnvelope; carried across re-detect by

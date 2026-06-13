@@ -562,4 +562,90 @@ describe('BootstrapStatusPanel', () => {
     });
     expect(screen.getByRole('button', { name: /refresh bootstrap/i })).toBeTruthy();
   });
+
+  test('shows partial command-memory marker in COMPLETED state when status is missing_commands', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: {
+            bootstrap_completed_at: '2026-06-01T12:00:00Z',
+            bootstrap_command_memory_status: 'missing_commands',
+            bootstrap_command_memory_complete: false,
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Command memory incomplete/i)).toBeTruthy();
+  });
+
+  test('shows degraded command-memory marker with detail when write-back failed', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: {
+            bootstrap_completed_at: '2026-06-01T12:00:00Z',
+            bootstrap_command_memory_status: 'writeback_failed',
+            bootstrap_command_memory_complete: false,
+            bootstrap_command_memory_detail: 'reported success without write-back evidence',
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Command memory degraded/i)).toBeTruthy();
+    expect(screen.getByText(/reported success without write-back evidence/i)).toBeTruthy();
+  });
+
+  test('shows NO command-memory marker when status is confirmed', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: {
+            bootstrap_completed_at: '2026-06-01T12:00:00Z',
+            bootstrap_command_memory_status: 'confirmed',
+            bootstrap_command_memory_complete: true,
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Completed/)).toBeTruthy();
+    expect(screen.queryByText(/Command memory/i)).toBeNull();
+  });
+
+  test('shows NO command-memory marker for legacy project without command-memory fields', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({ build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' } })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Completed/)).toBeTruthy();
+    expect(screen.queryByText(/Command memory/i)).toBeNull();
+  });
+
+  test('command-memory marker is independent of overview presence (shows with no overview)', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: {
+            bootstrap_completed_at: '2026-06-01T12:00:00Z',
+            bootstrap_command_memory_status: 'unknown',
+            bootstrap_command_memory_complete: false,
+          },
+          // No design_doc / repo_overview at all.
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Command memory not confirmed/i)).toBeTruthy();
+    // Overview toggle should not appear since there is no overview content.
+    expect(screen.queryByRole('button', { name: /repo overview/i })).toBeNull();
+  });
 });

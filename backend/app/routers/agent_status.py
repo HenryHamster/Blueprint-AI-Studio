@@ -1131,6 +1131,12 @@ async def update_agent_status(
             ctx["repo_overview"] = payload.repo_overview.model_dump()
         else:
             ctx.pop("repo_overview", None)
+        # Command write-back outcome is reported independently of repo_overview
+        # so completion can record command-memory truthfully even when the
+        # overview persisted cleanly. Older agents omit it (left absent here),
+        # which the completion handler degrades to "unknown".
+        if payload.command_memory is not None:
+            ctx["command_memory"] = payload.command_memory.model_dump()
         task.context = ctx
         flag_modified(task, "context")
     if payload.file_change_details:

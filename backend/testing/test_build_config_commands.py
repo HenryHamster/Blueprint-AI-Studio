@@ -8,7 +8,8 @@ from httpx import AsyncClient
 
 from app.auth import create_agent_token
 from app.claim_task_helpers import annotate_stale_build_config_dirs, is_commands_stale
-from app.models import Project, Task, TaskStatus
+from app.models import Project, ProjectMember, Task, TaskStatus
+from app.schemas import BuildConfig as BuildConfigSchema
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,140 @@ async def test_write_back_merges_confirmed_commands(client: AsyncClient, db_sess
     assert dirs[0]["test_cmd"] == "pytest"
     assert dirs[0]["confirming_task_id"] == str(task.id)
     assert dirs[0]["commands_confirmed_at"] == data["commands_confirmed_at"]
+    # Top-level write-back marker stamps enough evidence for repo_bootstrap
+    # completion to verify command-memory success without re-scanning directories.
+    bc = project.build_config
+    assert bc["last_command_writeback_task_id"] == str(task.id)
+    assert "." in bc["last_command_writeback_paths"]
+    assert bc["last_command_writeback_at"] == data["commands_confirmed_at"]
+
+
+@pytest.mark.asyncio
+async def test_write_back_marker_consumed_by_bootstrap_completion(
+    client: AsyncClient, db_session
+):
+    """End-to-end: a write-back during a repo_bootstrap task is verified as
+    confirmed command memory by _handle_repo_bootstrap_completion."""
+    from app.task_completion import _handle_repo_bootstrap_completion
+
+    project = Project(
+        name="WriteBack Bootstrap E2E",
+        user_id="test-user-123",
+        build_config={
+            "language": "python",
+            "directories": [
+                {"path": "backend", "type": "python", "test_cmd": "pytest"}
+            ],
+        },
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "repo_bootstrap"}],
+        vm_instance_id="vm-writeback-bootstrap",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "repo_overview": {
+                "tech_stack": "Python",
+                "directory_layout": "backend/",
+                "first_steps_summary": "pytest",
+            },
+            "command_memory": {"status": "success", "updated_paths": ["backend"]},
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-writeback-bootstrap")
+    resp = await client.patch(
+        f"/api/agent/projects/{project.id}/build-config/commands",
+        json={
+            "task_id": str(task.id),
+            "entries": [{"path": "backend", "confirmed_test_cmd": "pytest -x"}],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    await _handle_repo_bootstrap_completion(task, "", db_session)
+    await db_session.refresh(project)
+
+    bc = project.build_config or {}
+    assert bc.get("bootstrap_command_memory_status") == "confirmed"
+    assert bc.get("bootstrap_command_memory_complete") is True
+
+
+@pytest.mark.asyncio
+async def test_write_back_blank_existing_path_does_not_stamp_command_memory_marker(
+    client: AsyncClient, db_session
+):
+    """Blank confirmed commands on an existing path are ignored and do not
+    unlock repo_bootstrap command-memory confirmation."""
+    from app.task_completion import _handle_repo_bootstrap_completion
+
+    project = Project(
+        name="Blank WriteBack Test",
+        user_id="test-user-123",
+        build_config={
+            "language": "python",
+            "directories": [
+                {"path": "backend", "type": "python", "test_cmd": "pytest"}
+            ],
+        },
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "repo_bootstrap"}],
+        vm_instance_id="vm-writeback-blank",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "repo_overview": {
+                "tech_stack": "Python",
+                "directory_layout": "backend/",
+                "first_steps_summary": "pytest",
+            },
+            "command_memory": {"status": "success", "updated_paths": ["backend"]},
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-writeback-blank")
+    resp = await client.patch(
+        f"/api/agent/projects/{project.id}/build-config/commands",
+        json={
+            "task_id": str(task.id),
+            "entries": [{"path": "backend", "confirmed_test_cmd": "   "}],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["updated_paths"] == []
+
+    await db_session.refresh(project)
+    bc = project.build_config or {}
+    assert bc.get("last_command_writeback_task_id") is None
+    assert bc.get("last_command_writeback_paths") is None
+
+    await _handle_repo_bootstrap_completion(task, "", db_session)
+    await db_session.refresh(project)
+    bc = project.build_config or {}
+
+    assert bc.get("bootstrap_command_memory_status") == "writeback_failed"
+    assert bc.get("bootstrap_command_memory_complete") is False
 
 
 @pytest.mark.asyncio
@@ -260,7 +395,9 @@ async def test_write_back_sets_timestamp_and_task_id(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
-async def test_write_back_unknown_path_creates_new_entry(client: AsyncClient, db_session):
+async def test_write_back_unknown_path_creates_new_entry(
+    client: AsyncClient, db_session
+):
     """An unknown directory path with a non-empty confirmed command creates a new entry."""
     project = Project(
         name="Unknown Path Test",
@@ -459,9 +596,7 @@ async def test_admin_get_build_config_commands(client: AsyncClient, db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    resp = await client.get(
-        f"/api/admin/projects/{project.id}/build-config/commands"
-    )
+    resp = await client.get(f"/api/admin/projects/{project.id}/build-config/commands")
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["project_id"] == str(project.id)
@@ -476,12 +611,63 @@ async def test_admin_get_build_config_commands(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_admin_get_build_config_commands_legacy_no_command_memory(
+    client: AsyncClient, db_session
+):
+    """Legacy projects without command-memory keys surface command_memory: None."""
+    project = Project(
+        name="Legacy Command Memory",
+        user_id="test-user-123",
+        build_config={"directories": [{"path": ".", "type": "python"}]},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/build-config/commands")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "command_memory" in data
+    assert data["command_memory"] is None
+
+
+@pytest.mark.asyncio
+async def test_admin_get_build_config_commands_surfaces_command_memory(
+    client: AsyncClient, db_session
+):
+    """Persisted bootstrap_command_memory_* keys surface as a command_memory block."""
+    project = Project(
+        name="Command Memory Degraded",
+        user_id="test-user-123",
+        build_config={
+            "directories": [{"path": ".", "type": "python"}],
+            "bootstrap_command_memory_status": "writeback_failed",
+            "bootstrap_command_memory_complete": False,
+            "bootstrap_command_memory_detail": "reported success without write-back evidence",
+            "bootstrap_command_memory_paths": ["backend"],
+            "bootstrap_command_memory_updated_at": "2026-06-01T12:00:00+00:00",
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/build-config/commands")
+    assert resp.status_code == 200, resp.text
+    cm = resp.json()["command_memory"]
+    assert cm is not None
+    assert cm["status"] == "writeback_failed"
+    assert cm["complete"] is False
+    assert cm["detail"] == "reported success without write-back evidence"
+    assert cm["paths"] == ["backend"]
+    assert cm["updated_at"] == "2026-06-01T12:00:00+00:00"
+
+
+@pytest.mark.asyncio
 async def test_admin_get_build_config_commands_not_found(
     client: AsyncClient, db_session
 ):
-    resp = await client.get(
-        f"/api/admin/projects/{uuid.uuid4()}/build-config/commands"
-    )
+    resp = await client.get(f"/api/admin/projects/{uuid.uuid4()}/build-config/commands")
     assert resp.status_code == 404
 
 
@@ -620,7 +806,10 @@ def test_compute_merge_verdict_stale_confirmed_uses_detected():
 def test_empty_detection_confirmed_command_flips_verdict_to_tests_gated():
     """Headline gate-flip: project with NO detected directories but a fresh confirmed
     command gets verdict=tests_gated, and has_detectable_tests returns True."""
-    from app.ci_resolution import compute_merge_verification_verdict, has_detectable_tests
+    from app.ci_resolution import (
+        compute_merge_verification_verdict,
+        has_detectable_tests,
+    )
 
     recent = (datetime.now(tz=timezone.utc) - timedelta(days=2)).isoformat()
     # Simulate a project whose initial detection found no directories at all
@@ -654,7 +843,9 @@ async def test_write_back_confirmed_lint_cmd(client: AsyncClient, db_session):
         user_id="test-user-123",
         build_config={
             "language": "python",
-            "directories": [{"path": ".", "type": "python", "lint_cmd": "ruff check ."}],
+            "directories": [
+                {"path": ".", "type": "python", "lint_cmd": "ruff check ."}
+            ],
         },
     )
     db_session.add(project)
@@ -788,6 +979,47 @@ async def test_write_back_empty_confirmed_cmd_unknown_path_skipped(
     assert len(dirs) == 1
 
 
+@pytest.mark.asyncio
+async def test_patch_project_build_config_preserves_bootstrap_command_memory(
+    client: AsyncClient, db_session
+):
+    """PATCH /projects/{id} must preserve durable bootstrap command-memory fields."""
+    project = Project(
+        name="Bootstrap Command Memory Patch",
+        user_id="test-user-123",
+        build_config={
+            "language": "python",
+            "bootstrap_command_memory_status": "confirmed",
+            "bootstrap_command_memory_complete": True,
+            "bootstrap_command_memory_detail": "all commands persisted",
+            "bootstrap_command_memory_paths": ["backend"],
+            "bootstrap_command_memory_updated_at": "2026-06-01T12:00:00+00:00",
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}",
+        json={"build_config": {"language": "typescript"}},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    bc = project.build_config or {}
+    assert bc["language"] == "typescript"
+    assert bc["bootstrap_command_memory_status"] == "confirmed"
+    assert bc["bootstrap_command_memory_complete"] is True
+    assert bc["bootstrap_command_memory_detail"] == "all commands persisted"
+    assert bc["bootstrap_command_memory_paths"] == ["backend"]
+    assert bc["bootstrap_command_memory_updated_at"] == "2026-06-01T12:00:00+00:00"
+
+
 def test_redetection_preserves_confirmed_lint_cmd():
     """Re-running detection after a prior confirmation preserves confirmed_lint_cmd."""
     from app.build_config_detection import apply_operator_build_config_overrides
@@ -820,3 +1052,53 @@ def test_redetection_preserves_confirmed_lint_cmd():
     assert dirs[0]["confirmed_test_cmd"] == "pytest -x"
     assert dirs[0]["commands_confirmed_at"] == recent
     assert dirs[0]["confirming_task_id"] == "task-abc"
+
+
+def test_build_config_schema_round_trips_bootstrap_command_memory():
+    """BuildConfig validation must preserve bootstrap command-memory markers."""
+    cfg = BuildConfigSchema(
+        language="python",
+        bootstrap_command_memory_status="confirmed",
+        bootstrap_command_memory_complete=True,
+        bootstrap_command_memory_detail="all commands persisted",
+        bootstrap_command_memory_paths=["backend"],
+        bootstrap_command_memory_updated_at="2026-06-01T12:00:00+00:00",
+    )
+
+    dumped = cfg.model_dump(exclude_none=True)
+
+    assert dumped["bootstrap_command_memory_status"] == "confirmed"
+    assert dumped["bootstrap_command_memory_complete"] is True
+    assert dumped["bootstrap_command_memory_detail"] == "all commands persisted"
+    assert dumped["bootstrap_command_memory_paths"] == ["backend"]
+    assert dumped["bootstrap_command_memory_updated_at"] == "2026-06-01T12:00:00+00:00"
+
+
+def test_redetection_preserves_bootstrap_command_memory():
+    """Re-running detection preserves durable bootstrap command-memory fields."""
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    existing = {
+        "language": "python",
+        "bootstrap_command_memory_status": "writeback_failed",
+        "bootstrap_command_memory_complete": False,
+        "bootstrap_command_memory_detail": "reported success without write-back evidence",
+        "bootstrap_command_memory_paths": ["backend"],
+        "bootstrap_command_memory_updated_at": "2026-06-01T12:00:00+00:00",
+        "directories": [{"path": ".", "type": "python"}],
+    }
+    detected = {
+        "language": "python",
+        "directories": [{"path": ".", "type": "python"}],
+    }
+
+    result = apply_operator_build_config_overrides(detected, existing)
+
+    assert result["bootstrap_command_memory_status"] == "writeback_failed"
+    assert result["bootstrap_command_memory_complete"] is False
+    assert (
+        result["bootstrap_command_memory_detail"]
+        == "reported success without write-back evidence"
+    )
+    assert result["bootstrap_command_memory_paths"] == ["backend"]
+    assert result["bootstrap_command_memory_updated_at"] == "2026-06-01T12:00:00+00:00"

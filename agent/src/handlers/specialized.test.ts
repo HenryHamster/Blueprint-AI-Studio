@@ -134,6 +134,7 @@ import {
   handleSelfAudit,
   resolveMigrationLayout,
   isRepoBootstrapOverview,
+  isCommandMemoryOutcome,
 } from './specialized.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
@@ -1767,6 +1768,7 @@ describe('specialized handler task-specific content contracts', () => {
         test_layout: 'backend/testing for pytest; agent/src/*.test.ts for vitest',
         key_conventions: 'Conventional commits and feature branches',
         environment_requirements: 'Node 22, Python 3.12, DATABASE_URL in .env',
+        source_revision: 'abc1234def5678',
       };
 
       expect(isRepoBootstrapOverview(repoOverview)).toBe(true);
@@ -1775,6 +1777,7 @@ describe('specialized handler task-specific content contracts', () => {
       expect(repoOverview.test_layout).toBe('backend/testing for pytest; agent/src/*.test.ts for vitest');
       expect(repoOverview.key_conventions).toBe('Conventional commits and feature branches');
       expect(repoOverview.environment_requirements).toBe('Node 22, Python 3.12, DATABASE_URL in .env');
+      expect(repoOverview.source_revision).toBe('abc1234def5678');
     });
 
     it('persists a valid repo overview unchanged', async () => {
@@ -1786,6 +1789,7 @@ describe('specialized handler task-specific content contracts', () => {
         test_layout: 'backend/testing for pytest; agent/src/*.test.ts for vitest',
         key_conventions: 'Conventional commits and feature branches',
         environment_requirements: 'Node 22, Python 3.12, DATABASE_URL in .env',
+        source_revision: 'abc1234def5678',
       };
       vi.mocked(readHandlerOutput).mockReturnValue(repoOverview);
       vi.mocked(runClaudeCode).mockResolvedValue({
@@ -1802,7 +1806,7 @@ describe('specialized handler task-specific content contracts', () => {
       expect(call.logs).toBe(JSON.stringify(repoOverview));
     });
 
-    it('repo_bootstrap prompt requests all seven repo overview fields', async () => {
+    it('repo_bootstrap prompt requests all repo overview fields including source revision', async () => {
       vi.mocked(readHandlerOutput).mockReturnValue(null);
       await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
       const p = vi.mocked(runClaudeCode).mock.calls[0][0];
@@ -1817,6 +1821,8 @@ describe('specialized handler task-specific content contracts', () => {
       expect(p).toContain('if discoverable: branch naming, commit style, PR conventions');
       expect(p).toContain('"environment_requirements"');
       expect(p).toContain('if discoverable: required env vars, runtime versions, .env.example notes');
+      expect(p).toContain('"source_revision"');
+      expect(p).toContain('checked-out HEAD SHA after clone/checkout');
     });
 
     it('repo_bootstrap prompt includes playbook seeding guidance', async () => {
@@ -1844,6 +1850,98 @@ describe('specialized handler task-specific content contracts', () => {
       expect(call.status).toBe('COMPLETED');
       expect(call.repo_overview).toBeUndefined();
       expect(call.logs).toBe('bootstrap transcript tail');
+    });
+
+    it('isCommandMemoryOutcome accepts the three statuses and rejects others', () => {
+      expect(isCommandMemoryOutcome({ status: 'success' })).toBe(true);
+      expect(isCommandMemoryOutcome({ status: 'missing_commands', detail: 'none found' })).toBe(true);
+      expect(isCommandMemoryOutcome({ status: 'writeback_failed', updated_paths: ['.'] })).toBe(true);
+      // Reject unknown status, non-objects, arrays, and overview-shaped payloads.
+      expect(isCommandMemoryOutcome({ status: 'confirmed' })).toBe(false);
+      expect(isCommandMemoryOutcome({ tech_stack: 'x' })).toBe(false);
+      expect(isCommandMemoryOutcome(['success'])).toBe(false);
+      expect(isCommandMemoryOutcome(null)).toBe(false);
+    });
+
+    it('reports command_memory from the command-memory file independently of the overview', async () => {
+      const repoOverview = {
+        tech_stack: 'TypeScript',
+        directory_layout: 'agent/',
+        first_steps_summary: 'install, build, test',
+      };
+      // Distinct files: overview vs. command memory. Reported independently so a
+      // good overview never implies confirmed commands.
+      vi.mocked(readHandlerOutput).mockImplementation((_taskId, outputType) =>
+        outputType === 'bootstrap_overview'
+          ? repoOverview
+          : { status: 'missing_commands', detail: 'no runnable test command' },
+      );
+      vi.mocked(runClaudeCode).mockResolvedValue({
+        exitCode: 0,
+        allOutput: 'bootstrap transcript tail',
+        lastResultText: '',
+      });
+
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(call.repo_overview).toEqual(repoOverview);
+      expect(call.command_memory).toEqual({ status: 'missing_commands', detail: 'no runnable test command' });
+    });
+
+    it('clamps oversized command_memory detail and updated_paths before posting status', async () => {
+      const repoOverview = {
+        tech_stack: 'TypeScript',
+        directory_layout: 'agent/',
+        first_steps_summary: 'install, build, test',
+      };
+      const detail = 'x'.repeat(2001);
+      const updatedPaths = Array.from({ length: 55 }, (_, index) => `dir-${index}`);
+      vi.mocked(readHandlerOutput).mockImplementation((_taskId, outputType) =>
+        outputType === 'bootstrap_overview'
+          ? repoOverview
+          : { status: 'success', detail, updated_paths: updatedPaths },
+      );
+      vi.mocked(runClaudeCode).mockResolvedValue({
+        exitCode: 0,
+        allOutput: 'bootstrap transcript tail',
+        lastResultText: '',
+      });
+
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(call.command_memory).toEqual({
+        status: 'success',
+        detail: 'x'.repeat(2000),
+        updated_paths: updatedPaths.slice(0, 50),
+      });
+    });
+
+    it('omits command_memory when the command-memory file is absent/invalid', async () => {
+      vi.mocked(readHandlerOutput).mockImplementation((_taskId, outputType) =>
+        outputType === 'bootstrap_overview'
+          ? { tech_stack: 'TypeScript', directory_layout: 'agent/', first_steps_summary: 'go' }
+          : null,
+      );
+      vi.mocked(runClaudeCode).mockResolvedValue({
+        exitCode: 0,
+        allOutput: 'bootstrap transcript tail',
+        lastResultText: '',
+      });
+
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(call.command_memory).toBeUndefined();
+    });
+
+    it('repo_bootstrap prompt requests the command-memory outcome file', async () => {
+      vi.mocked(readHandlerOutput).mockReturnValue(null);
+      await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain(`/tmp/command_memory_${TASK_ID}.json`);
+      expect(p).toContain('success | missing_commands | writeback_failed');
     });
   });
 

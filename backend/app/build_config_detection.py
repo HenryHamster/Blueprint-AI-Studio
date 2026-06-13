@@ -102,6 +102,18 @@ def apply_operator_build_config_overrides(
     # re-detect does not silently drop an operator-set envelope.
     if "resource_envelope" in existing:
         detected["resource_envelope"] = existing["resource_envelope"]
+    # Repo-bootstrap command-memory status is operator-visible completion state,
+    # not repo-derived config; carry it forward so refreshes do not erase the
+    # durable outcome stamped by task completion.
+    for _cm_key in (
+        "bootstrap_command_memory_status",
+        "bootstrap_command_memory_complete",
+        "bootstrap_command_memory_detail",
+        "bootstrap_command_memory_paths",
+        "bootstrap_command_memory_updated_at",
+    ):
+        if _cm_key in existing:
+            detected[_cm_key] = existing[_cm_key]
 
     # Merge per-directory agent-confirmed command fields back onto re-detected
     # directories.  These are written by the agent write-back endpoint and are

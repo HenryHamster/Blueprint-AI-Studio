@@ -28,6 +28,7 @@ def test_repo_bootstrap_overview_optional_fields_survive_model_dump():
         test_layout="backend/testing for pytest; agent/src/*.test.ts for vitest",
         key_conventions="Conventional commits and feature branches",
         environment_requirements="Node 22, Python 3.12, DATABASE_URL in .env",
+        source_revision="abc1234def5678",
         unexpected_field="must be ignored",
     )
 
@@ -40,8 +41,84 @@ def test_repo_bootstrap_overview_optional_fields_survive_model_dump():
         "test_layout": "backend/testing for pytest; agent/src/*.test.ts for vitest",
         "key_conventions": "Conventional commits and feature branches",
         "environment_requirements": "Node 22, Python 3.12, DATABASE_URL in .env",
+        "source_revision": "abc1234def5678",
     }
     assert "unexpected_field" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_completed_bootstrap_status_persists_source_revision_from_structured_overview(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="acme/structured-source-revision",
+        user_id=TEST_USER_ID,
+        status=ProjectStatus.DEPLOYING,
+        github_owner="acme",
+        github_repo="structured-source-revision",
+        build_config={"language": "python"},
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    task = Task(
+        project_id=project.id,
+        title="Bootstrap: acme/structured-source-revision",
+        description="First-cycle bootstrap",
+        payloads=[{
+            "type": "repo_bootstrap",
+            "github_owner": "acme",
+            "github_repo": "structured-source-revision",
+            "integration_branch": "main",
+        }],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    source_revision = "abc1234def5678"
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "logs": "structured bootstrap complete",
+            "repo_overview": {
+                "tech_stack": "Python 3.12, FastAPI, SQLAlchemy",
+                "directory_layout": "backend/ - API; admin-ui/ - React frontend",
+                "first_steps_summary": "Install deps, run pytest and npm checks",
+                "entry_points": "backend/app/main.py",
+                "test_layout": "backend/testing for pytest",
+                "key_conventions": "FastAPI routers under backend/app/routers",
+                "environment_requirements": "DATABASE_URL and GitHub app secrets",
+                "source_revision": source_revision,
+                "unexpected_field": "must be ignored",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    await db_session.refresh(project)
+
+    context_overview = (task.context or {}).get("repo_overview") or {}
+    assert context_overview["source_revision"] == source_revision
+    assert "unexpected_field" not in context_overview
+
+    stored_overview = (project.design_doc or {}).get("repo_overview") or {}
+    provenance = stored_overview.get("provenance") or {}
+    assert provenance.get("source_branch") == "main"
+    assert provenance.get("source_revision") == source_revision
+
+    build_config = project.build_config or {}
+    assert build_config.get("bootstrap_overview_source_branch") == "main"
+    assert build_config.get("bootstrap_overview_source_revision") == source_revision
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +139,9 @@ def _onboard_patches(build_config=None, default_branch="main"):
         patch(
             "app.routers.admin_onboard._detect_build_config",
             new_callable=AsyncMock,
-            return_value=build_config if build_config is not None else {"language": "python"},
+            return_value=build_config
+            if build_config is not None
+            else {"language": "python"},
         ),
         patch(
             "app.github.get_repo_installation_token",
@@ -99,16 +178,19 @@ class TestRepoBootstrapOnboardSpawn:
         assert not project.is_self_repo
 
         tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.status == TaskStatus.QUEUED,
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.status == TaskStatus.QUEUED,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         bootstrap_tasks = [
-            t for t in tasks
-            if (t.first_payload or {}).get("type") == "repo_bootstrap"
+            t for t in tasks if (t.first_payload or {}).get("type") == "repo_bootstrap"
         ]
         assert len(bootstrap_tasks) == 1, (
             f"Expected 1 repo_bootstrap task, got {len(bootstrap_tasks)}"
@@ -130,7 +212,10 @@ class TestRepoBootstrapOnboardSpawn:
         with detect_patch, token_patch, branch_patch:
             resp = await client.post(
                 "/api/admin/projects/onboard",
-                json={"github_owner": "HenryHamster", "github_repo": "BlueprintAIStudio"},
+                json={
+                    "github_owner": "HenryHamster",
+                    "github_repo": "BlueprintAIStudio",
+                },
             )
 
         assert resp.status_code == 200
@@ -160,15 +245,18 @@ class TestRepoBootstrapOnboardSpawn:
 
         # Verify no bootstrap task was auto-spawned for the self-repo project
         tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == self_repo_project.id,
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == self_repo_project.id,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         bootstrap_tasks = [
-            t for t in tasks
-            if (t.first_payload or {}).get("type") == "repo_bootstrap"
+            t for t in tasks if (t.first_payload or {}).get("type") == "repo_bootstrap"
         ]
         assert len(bootstrap_tasks) == 0, (
             "self_repo project must not have a repo_bootstrap task"
@@ -194,13 +282,16 @@ class TestRepoBootstrapOnboardSpawn:
         assert project is not None
 
         tasks = (
-            await db_session.execute(
-                select(Task).where(Task.project_id == project.id)
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         bootstrap_tasks = [
-            t for t in tasks
-            if (t.first_payload or {}).get("type") == "repo_bootstrap"
+            t for t in tasks if (t.first_payload or {}).get("type") == "repo_bootstrap"
         ]
         assert len(bootstrap_tasks) == 0, (
             "repo_is_empty=True project must not have a repo_bootstrap task"
@@ -230,13 +321,16 @@ class TestRepoBootstrapOnboardSpawn:
         assert project is not None
 
         tasks = (
-            await db_session.execute(
-                select(Task).where(Task.project_id == project.id)
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         bootstrap_tasks = [
-            t for t in tasks
-            if (t.first_payload or {}).get("type") == "repo_bootstrap"
+            t for t in tasks if (t.first_payload or {}).get("type") == "repo_bootstrap"
         ]
         assert len(bootstrap_tasks) == 0, (
             "Project with bootstrap_completed_at must not spawn a second bootstrap task"
@@ -458,15 +552,20 @@ class TestRepoBootstrapStrategicGate:
 
         # Verify a strategic_review task was spawned
         tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.status == TaskStatus.QUEUED,
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.status == TaskStatus.QUEUED,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         strategic_tasks = [
-            t for t in tasks
+            t
+            for t in tasks
             if (t.first_payload or {}).get("type") == "strategic_review"
         ]
         assert len(strategic_tasks) >= 1, (
@@ -557,12 +656,16 @@ class TestRepoBootstrapCompletionStamp:
         await db_session.refresh(project)
         await db_session.refresh(bootstrap_task)
 
-        overview_logs = _json.dumps({
-            "tech_stack": "Python, FastAPI",
-            "directory_layout": "backend/ — FastAPI app; admin-ui/ — React UI",
-            "first_steps_summary": "pip install -r requirements.txt && pytest",
-        })
-        await _handle_repo_bootstrap_completion(bootstrap_task, overview_logs, db_session)
+        overview_logs = _json.dumps(
+            {
+                "tech_stack": "Python, FastAPI",
+                "directory_layout": "backend/ — FastAPI app; admin-ui/ — React UI",
+                "first_steps_summary": "pip install -r requirements.txt && pytest",
+            }
+        )
+        await _handle_repo_bootstrap_completion(
+            bootstrap_task, overview_logs, db_session
+        )
 
         await db_session.refresh(project)
         assert (project.build_config or {}).get("bootstrap_completed_at") is not None, (
@@ -607,7 +710,9 @@ class TestRepoBootstrapCompletionStamp:
         await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
 
         await db_session.refresh(project)
-        assert (project.build_config or {}).get("bootstrap_completed_at") == "2026-01-01T00:00:00", (
+        assert (project.build_config or {}).get(
+            "bootstrap_completed_at"
+        ) == "2026-01-01T00:00:00", (
             "Existing bootstrap_completed_at must not be overwritten"
         )
 
@@ -649,17 +754,339 @@ class TestRepoBootstrapCompletionStamp:
         await db_session.refresh(project)
         await db_session.refresh(bootstrap_task)
 
-        overview_logs = _json.dumps({
-            "tech_stack": "Python, FastAPI",
-            "directory_layout": "backend/ — FastAPI app",
-            "first_steps_summary": "pytest",
-        })
-        await _handle_repo_bootstrap_completion(bootstrap_task, overview_logs, db_session)
+        overview_logs = _json.dumps(
+            {
+                "tech_stack": "Python, FastAPI",
+                "directory_layout": "backend/ — FastAPI app",
+                "first_steps_summary": "pytest",
+            }
+        )
+        await _handle_repo_bootstrap_completion(
+            bootstrap_task, overview_logs, db_session
+        )
         await db_session.refresh(bootstrap_task)
 
         assert bootstrap_task.completed_at is not None, (
             "task.completed_at must be stamped by _handle_repo_bootstrap_completion"
         )
+
+
+class TestRepoBootstrapCommandMemory:
+    """Command-memory status is recorded independently of repo_overview.
+
+    A valid overview no longer implies complete command memory: completion must
+    expose an explicit, distinguishable command-memory marker on build_config so
+    operators and downstream agents can tell write-back success from missing
+    commands, write-back failure, and the older-agent (no payload) degrade case.
+    """
+
+    async def _make_bootstrap_task(self, db_session, *, build_config, context):
+        project = Project(
+            name=f"acme/cmdmem-{uuid.uuid4().hex[:8]}",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="cmdmem",
+            build_config=build_config,
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/cmdmem",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context=context,
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(bootstrap_task)
+        return project, bootstrap_task
+
+    _VALID_OVERVIEW = {
+        "tech_stack": "Python, FastAPI",
+        "directory_layout": "backend/ — FastAPI app",
+        "first_steps_summary": "pip install && pytest",
+    }
+
+    @pytest.mark.asyncio
+    async def test_completed_bootstrap_with_overview_but_no_command_writeback_marks_command_memory_partial(
+        self, db_session
+    ):
+        """Overview persists cleanly, yet command memory is marked partial — not
+        complete — when the agent confirmed no commands and wrote nothing back."""
+        from app.task_completion import (
+            _handle_repo_bootstrap_completion,
+            _PARTIAL_COMMAND_MEMORY_STATUSES,
+        )
+
+        # Overview present in context; agent reports missing_commands; NO
+        # write-back evidence on build_config (no last_command_writeback_task_id,
+        # no confirming directory entries).
+        project, bootstrap_task = await self._make_bootstrap_task(
+            db_session,
+            build_config={"language": "python"},
+            context={
+                "repo_overview": dict(self._VALID_OVERVIEW),
+                "command_memory": {"status": "missing_commands", "detail": "no test cmd"},
+            },
+        )
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+
+        # Overview persistence still succeeded.
+        assert bc.get("bootstrap_completed_at") is not None, (
+            "overview present → bootstrap_completed_at must still be stamped"
+        )
+        assert (project.design_doc or {}).get("repo_overview") is not None, (
+            "valid overview must persist into design_doc independently of command memory"
+        )
+
+        # Command memory is explicitly partial, NOT complete.
+        assert bc.get("bootstrap_command_memory_status") == "missing_commands"
+        assert bc.get("bootstrap_command_memory_status") in _PARTIAL_COMMAND_MEMORY_STATUSES
+        assert bc.get("bootstrap_command_memory_complete") is False, (
+            "a valid overview must no longer imply complete command memory"
+        )
+        assert bc.get("bootstrap_command_memory_detail") == "no test cmd"
+
+    @pytest.mark.asyncio
+    async def test_command_memory_confirmed_when_writeback_evidence_present(self, db_session):
+        """Top-level write-back evidence from this task marks command memory confirmed."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project, bootstrap_task = await self._make_bootstrap_task(
+            db_session,
+            build_config={"language": "python"},
+            context={"repo_overview": dict(self._VALID_OVERVIEW)},
+        )
+        # Simulate the write-back endpoint having stamped evidence for THIS task.
+        bc = dict(project.build_config)
+        bc["last_command_writeback_task_id"] = str(bootstrap_task.id)
+        bc["last_command_writeback_paths"] = ["backend"]
+        project.build_config = bc
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+
+        assert bc.get("bootstrap_command_memory_status") == "confirmed"
+        assert bc.get("bootstrap_command_memory_complete") is True
+        assert bc.get("bootstrap_command_memory_paths") == ["backend"]
+
+    @pytest.mark.asyncio
+    async def test_command_memory_confirmed_via_per_directory_evidence(self, db_session):
+        """A confirming_task_id stamp on a directory entry is accepted as evidence."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project, bootstrap_task = await self._make_bootstrap_task(
+            db_session,
+            build_config={"language": "python"},
+            context={"repo_overview": dict(self._VALID_OVERVIEW)},
+        )
+        bc = dict(project.build_config)
+        bc["directories"] = [
+            {
+                "path": "backend",
+                "confirmed_test_cmd": "pytest",
+                "confirming_task_id": str(bootstrap_task.id),
+                "commands_confirmed_at": "2026-06-13T00:00:00+00:00",
+            }
+        ]
+        project.build_config = bc
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+
+        assert bc.get("bootstrap_command_memory_status") == "confirmed"
+        assert bc.get("bootstrap_command_memory_complete") is True
+
+    @pytest.mark.asyncio
+    async def test_older_agent_without_payload_degrades_to_unknown(self, db_session):
+        """An older agent that omits command_memory must degrade truthfully to
+        'unknown' — never falsely 'confirmed' — even with a valid overview."""
+        from app.task_completion import (
+            _handle_repo_bootstrap_completion,
+            _PARTIAL_COMMAND_MEMORY_STATUSES,
+        )
+
+        project, bootstrap_task = await self._make_bootstrap_task(
+            db_session,
+            build_config={"language": "python"},
+            context={"repo_overview": dict(self._VALID_OVERVIEW)},
+        )
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+
+        assert bc.get("bootstrap_command_memory_status") == "unknown"
+        assert bc.get("bootstrap_command_memory_status") in _PARTIAL_COMMAND_MEMORY_STATUSES
+        assert bc.get("bootstrap_command_memory_complete") is False
+
+    @pytest.mark.asyncio
+    async def test_claimed_success_without_evidence_degrades_to_writeback_failed(self, db_session):
+        """An agent claiming success with no persisted evidence is downgraded to
+        writeback_failed rather than trusted blindly."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project, bootstrap_task = await self._make_bootstrap_task(
+            db_session,
+            build_config={"language": "python"},
+            context={
+                "repo_overview": dict(self._VALID_OVERVIEW),
+                "command_memory": {"status": "success", "updated_paths": ["."]},
+            },
+        )
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+
+        assert bc.get("bootstrap_command_memory_status") == "writeback_failed"
+        assert bc.get("bootstrap_command_memory_complete") is False
+        assert "without write-back evidence" in (bc.get("bootstrap_command_memory_detail") or "")
+
+    @pytest.mark.asyncio
+    async def test_command_memory_recorded_even_on_degraded_overview(self, db_session):
+        """Command-memory marker is stamped even when the overview is missing
+        (degraded overview path), since the two are independent."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project, bootstrap_task = await self._make_bootstrap_task(
+            db_session,
+            build_config={"language": "python"},
+            context={"command_memory": {"status": "missing_commands"}},
+        )
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+
+        # Degraded overview path still records the command-memory marker.
+        assert bc.get("bootstrap_degraded_reason") == "overview_missing"
+        assert bc.get("bootstrap_command_memory_status") == "missing_commands"
+        assert bc.get("bootstrap_command_memory_complete") is False
+
+
+@pytest.mark.asyncio
+async def test_completed_bootstrap_status_with_command_memory_persists_to_context_and_build_config(
+    client: AsyncClient, db_session
+):
+    """POSTing a repo_bootstrap COMPLETED status with command_memory in the payload
+    persists the outcome into task.context AND into project.build_config via
+    _handle_repo_bootstrap_completion — exercising the full router/schema wiring
+    path so a regression in payload handling surfaces as a test failure rather
+    than silently degrading to bootstrap_command_memory_status='unknown'."""
+    project = Project(
+        name="acme/cmd-mem-http",
+        user_id=TEST_USER_ID,
+        status=ProjectStatus.DEPLOYING,
+        github_owner="acme",
+        github_repo="cmd-mem-http",
+        build_config={"language": "python"},
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    task = Task(
+        project_id=project.id,
+        title="Bootstrap: acme/cmd-mem-http",
+        description="First-cycle bootstrap",
+        payloads=[{
+            "type": "repo_bootstrap",
+            "github_owner": "acme",
+            "github_repo": "cmd-mem-http",
+            "integration_branch": "main",
+        }],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+
+    # Seed write-back evidence on build_config so the completion handler can
+    # confirm command memory.  This mirrors what agent_write_back_build_config_commands
+    # would have stored for this task.
+    await db_session.flush()
+    await db_session.refresh(task)
+    project.build_config = {
+        "language": "python",
+        "last_command_writeback_task_id": str(task.id),
+        "last_command_writeback_paths": ["backend"],
+    }
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+    _flag_modified(project, "build_config")
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "logs": "bootstrap complete",
+            "repo_overview": {
+                "tech_stack": "Python, FastAPI",
+                "directory_layout": "backend/ — FastAPI app",
+                "first_steps_summary": "pip install && pytest",
+                "entry_points": "backend/app/main.py",
+                "test_layout": "backend/testing for pytest",
+                "key_conventions": "Conventional commits",
+                "environment_requirements": "DATABASE_URL in .env",
+            },
+            "command_memory": {
+                "status": "success",
+                "updated_paths": ["backend"],
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(task)
+    await db_session.refresh(project)
+
+    # 1. Router persists command_memory into task.context synchronously.
+    ctx_cm = (task.context or {}).get("command_memory")
+    assert ctx_cm is not None, (
+        "command_memory must be persisted into task.context by the status router"
+    )
+    assert ctx_cm.get("status") == "success", (
+        f"task.context['command_memory']['status'] expected 'success', got {ctx_cm.get('status')!r}"
+    )
+    assert ctx_cm.get("updated_paths") == ["backend"], (
+        f"task.context['command_memory']['updated_paths'] expected ['backend'], got {ctx_cm.get('updated_paths')!r}"
+    )
+
+    # 2. _handle_repo_bootstrap_completion consumes the context + build_config evidence
+    # and stamps the durable command-memory marker.  With write-back evidence present,
+    # status must be 'confirmed' — not 'unknown' (missing payload) or 'writeback_failed'.
+    bc = project.build_config or {}
+    assert bc.get("bootstrap_command_memory_status") == "confirmed", (
+        f"bootstrap_command_memory_status expected 'confirmed', got {bc.get('bootstrap_command_memory_status')!r}"
+    )
+    assert bc.get("bootstrap_command_memory_complete") is True, (
+        "bootstrap_command_memory_complete must be True when status is 'confirmed'"
+    )
+    assert bc.get("bootstrap_command_memory_paths") == ["backend"], (
+        f"bootstrap_command_memory_paths expected ['backend'], got {bc.get('bootstrap_command_memory_paths')!r}"
+    )
 
 
 class TestBootstrapSpawnAdvisoryLock:
@@ -680,7 +1107,9 @@ class TestBootstrapSpawnAdvisoryLock:
         key1 = _bootstrap_spawn_lock_key(project_id)
         key2 = _bootstrap_spawn_lock_key(project_id)
         assert key1 == key2, "Lock key must be deterministic"
-        assert 0 <= key1 < 2**31, "Lock key must be a valid 31-bit Postgres advisory lock key"
+        assert 0 <= key1 < 2**31, (
+            "Lock key must be a valid 31-bit Postgres advisory lock key"
+        )
 
     @pytest.mark.asyncio
     async def test_advisory_lock_keys_differ_per_project(self):
@@ -690,14 +1119,18 @@ class TestBootstrapSpawnAdvisoryLock:
 
         key_a = _bootstrap_spawn_lock_key("aaaabbbb-cccc-dddd-eeee-ffffffffffff")
         key_b = _bootstrap_spawn_lock_key("11112222-3333-4444-5555-666677778888")
-        assert key_a != key_b, "Different projects must get different advisory lock keys"
+        assert key_a != key_b, (
+            "Different projects must get different advisory lock keys"
+        )
 
 
 class TestRepoBootstrapDesignDocPersistence:
     """Tests for design_doc persistence via the completion handler."""
 
     @pytest.mark.asyncio
-    async def test_bootstrap_with_overview_persists_design_doc_section(self, db_session):
+    async def test_bootstrap_with_overview_persists_design_doc_section(
+        self, db_session
+    ):
         """Completing a bootstrap with a valid overview persists it to design_doc['repo_overview']
         and makes it visible in the strategic design-doc index (_design_doc_index /
         _agent_view_design_doc) — the same surface the first strategic cycle consumes.
@@ -732,12 +1165,16 @@ class TestRepoBootstrapDesignDocPersistence:
         await db_session.refresh(project)
         await db_session.refresh(bootstrap_task)
 
-        overview_logs = _json.dumps({
-            "tech_stack": "Python 3.12, FastAPI, SQLAlchemy",
-            "directory_layout": "backend/ — API; admin-ui/ — React frontend",
-            "first_steps_summary": "cd backend && pip install -r requirements.txt && pytest",
-        })
-        await _handle_repo_bootstrap_completion(bootstrap_task, overview_logs, db_session)
+        overview_logs = _json.dumps(
+            {
+                "tech_stack": "Python 3.12, FastAPI, SQLAlchemy",
+                "directory_layout": "backend/ — API; admin-ui/ — React frontend",
+                "first_steps_summary": "cd backend && pip install -r requirements.txt && pytest",
+            }
+        )
+        await _handle_repo_bootstrap_completion(
+            bootstrap_task, overview_logs, db_session
+        )
 
         await db_session.refresh(project)
 
@@ -747,8 +1184,13 @@ class TestRepoBootstrapDesignDocPersistence:
         )
         stored = (project.design_doc or {})["repo_overview"]
         assert stored["tech_stack"] == "Python 3.12, FastAPI, SQLAlchemy"
-        assert stored["directory_layout"] == "backend/ — API; admin-ui/ — React frontend"
-        assert stored["first_steps_summary"] == "cd backend && pip install -r requirements.txt && pytest"
+        assert (
+            stored["directory_layout"] == "backend/ — API; admin-ui/ — React frontend"
+        )
+        assert (
+            stored["first_steps_summary"]
+            == "cd backend && pip install -r requirements.txt && pytest"
+        )
 
         # 2. Section visible in _agent_view_design_doc (agent-facing view, drops '_'-keys).
         agent_view = _agent_view_design_doc(project.design_doc)
@@ -810,12 +1252,16 @@ class TestRepoBootstrapDesignDocPersistence:
         await db_session.refresh(project)
         await db_session.refresh(bootstrap_task)
 
-        overview_logs = _json.dumps({
-            "tech_stack": "TypeScript, Node.js, Vitest",
-            "directory_layout": "agent/ — worker; backend/ — API; admin-ui/ — React",
-            "first_steps_summary": "cd agent && npm install && npm test",
-        })
-        await _handle_repo_bootstrap_completion(bootstrap_task, overview_logs, db_session)
+        overview_logs = _json.dumps(
+            {
+                "tech_stack": "TypeScript, Node.js, Vitest",
+                "directory_layout": "agent/ — worker; backend/ — API; admin-ui/ — React",
+                "first_steps_summary": "cd agent && npm install && npm test",
+            }
+        )
+        await _handle_repo_bootstrap_completion(
+            bootstrap_task, overview_logs, db_session
+        )
         await db_session.refresh(project)
 
         # Build the strategic index from the persisted design_doc.
@@ -830,12 +1276,13 @@ class TestRepoBootstrapDesignDocPersistence:
         assert entry.get("tech_stack") == "TypeScript, Node.js, Vitest", (
             "tech_stack must be carried inline in the repo_overview index entry"
         )
-        assert entry.get("directory_layout") == "agent/ — worker; backend/ — API; admin-ui/ — React", (
-            "directory_layout must be carried inline in the repo_overview index entry"
-        )
-        assert entry.get("first_steps_summary") == "cd agent && npm install && npm test", (
-            "first_steps_summary must be carried inline in the repo_overview index entry"
-        )
+        assert (
+            entry.get("directory_layout")
+            == "agent/ — worker; backend/ — API; admin-ui/ — React"
+        ), "directory_layout must be carried inline in the repo_overview index entry"
+        assert (
+            entry.get("first_steps_summary") == "cd agent && npm install && npm test"
+        ), "first_steps_summary must be carried inline in the repo_overview index entry"
 
         # Degraded path: no overview → no inline fields on any entry.
         project2 = Project(
@@ -909,33 +1356,63 @@ class TestRepoBootstrapDesignDocPersistence:
         await db_session.refresh(project)
         await db_session.refresh(bootstrap_task)
 
-        overview_logs = _json.dumps({
-            "tech_stack": "TypeScript, Node.js",
-            "directory_layout": "src/ — source; tests/ — test suite",
-            "first_steps_summary": "npm install && npm test",
-            "entry_points": "src/index.ts — main server; src/cli.ts — CLI tool",
-            "test_layout": "tests/unit — unit tests; tests/integration — integration; npm test runs all",
-            "key_conventions": "branch: feat/<name>; commits: conventional commits; PRs require one review",
-            "environment_requirements": "Node >= 18; DATABASE_URL required; .env.example provided",
-        })
-        await _handle_repo_bootstrap_completion(bootstrap_task, overview_logs, db_session)
+        overview_logs = _json.dumps(
+            {
+                "tech_stack": "TypeScript, Node.js",
+                "directory_layout": "src/ — source; tests/ — test suite",
+                "first_steps_summary": "npm install && npm test",
+                "entry_points": "src/index.ts — main server; src/cli.ts — CLI tool",
+                "test_layout": "tests/unit — unit tests; tests/integration — integration; npm test runs all",
+                "key_conventions": "branch: feat/<name>; commits: conventional commits; PRs require one review",
+                "environment_requirements": "Node >= 18; DATABASE_URL required; .env.example provided",
+            }
+        )
+        await _handle_repo_bootstrap_completion(
+            bootstrap_task, overview_logs, db_session
+        )
         await db_session.refresh(project)
 
         stored = (project.design_doc or {}).get("repo_overview", {})
         assert stored.get("tech_stack") == "TypeScript, Node.js"
-        assert stored.get("entry_points") == "src/index.ts — main server; src/cli.ts — CLI tool"
-        assert stored.get("test_layout") == "tests/unit — unit tests; tests/integration — integration; npm test runs all"
-        assert stored.get("key_conventions") == "branch: feat/<name>; commits: conventional commits; PRs require one review"
-        assert stored.get("environment_requirements") == "Node >= 18; DATABASE_URL required; .env.example provided"
+        assert (
+            stored.get("entry_points")
+            == "src/index.ts — main server; src/cli.ts — CLI tool"
+        )
+        assert (
+            stored.get("test_layout")
+            == "tests/unit — unit tests; tests/integration — integration; npm test runs all"
+        )
+        assert (
+            stored.get("key_conventions")
+            == "branch: feat/<name>; commits: conventional commits; PRs require one review"
+        )
+        assert (
+            stored.get("environment_requirements")
+            == "Node >= 18; DATABASE_URL required; .env.example provided"
+        )
 
         # Verify optional fields appear inline in the strategic index.
         agent_view = _agent_view_design_doc(project.design_doc)
         index = _design_doc_index(agent_view)
-        entry = {e["key"]: e for e in index.get("sections", [])}.get("repo_overview", {})
-        assert entry.get("entry_points") == "src/index.ts — main server; src/cli.ts — CLI tool"
-        assert entry.get("test_layout") == "tests/unit — unit tests; tests/integration — integration; npm test runs all"
-        assert entry.get("key_conventions") == "branch: feat/<name>; commits: conventional commits; PRs require one review"
-        assert entry.get("environment_requirements") == "Node >= 18; DATABASE_URL required; .env.example provided"
+        entry = {e["key"]: e for e in index.get("sections", [])}.get(
+            "repo_overview", {}
+        )
+        assert (
+            entry.get("entry_points")
+            == "src/index.ts — main server; src/cli.ts — CLI tool"
+        )
+        assert (
+            entry.get("test_layout")
+            == "tests/unit — unit tests; tests/integration — integration; npm test runs all"
+        )
+        assert (
+            entry.get("key_conventions")
+            == "branch: feat/<name>; commits: conventional commits; PRs require one review"
+        )
+        assert (
+            entry.get("environment_requirements")
+            == "Node >= 18; DATABASE_URL required; .env.example provided"
+        )
 
         # Partial path: only 3 required fields → optional fields absent from stored doc.
         project3 = Project(
@@ -964,20 +1441,28 @@ class TestRepoBootstrapDesignDocPersistence:
         await db_session.refresh(project3)
         await db_session.refresh(bootstrap_task3)
 
-        partial_logs = _json.dumps({
-            "tech_stack": "Python",
-            "directory_layout": "backend/ — app",
-            "first_steps_summary": "pip install -r requirements.txt && pytest",
-        })
-        await _handle_repo_bootstrap_completion(bootstrap_task3, partial_logs, db_session)
+        partial_logs = _json.dumps(
+            {
+                "tech_stack": "Python",
+                "directory_layout": "backend/ — app",
+                "first_steps_summary": "pip install -r requirements.txt && pytest",
+            }
+        )
+        await _handle_repo_bootstrap_completion(
+            bootstrap_task3, partial_logs, db_session
+        )
         await db_session.refresh(project3)
 
         stored3 = (project3.design_doc or {}).get("repo_overview", {})
         assert stored3.get("tech_stack") == "Python"
         assert "entry_points" not in stored3, "Optional field absent when not provided"
         assert "test_layout" not in stored3, "Optional field absent when not provided"
-        assert "key_conventions" not in stored3, "Optional field absent when not provided"
-        assert "environment_requirements" not in stored3, "Optional field absent when not provided"
+        assert "key_conventions" not in stored3, (
+            "Optional field absent when not provided"
+        )
+        assert "environment_requirements" not in stored3, (
+            "Optional field absent when not provided"
+        )
 
     @pytest.mark.asyncio
     async def test_bootstrap_without_overview_records_degraded_marker(self, db_session):
@@ -1103,14 +1588,18 @@ class TestRepoBootstrapCompletionSeam:
         # None here because this task's payload carries no integration_branch;
         # the refresh path test below exercises a populated source branch.)
         provenance = stored_overview.get("provenance") or {}
-        assert provenance.get("refreshed_at"), "overview provenance must stamp refreshed_at"
+        assert provenance.get("refreshed_at"), (
+            "overview provenance must stamp refreshed_at"
+        )
         assert "source_branch" in provenance
 
         from app.strategic_spawning import _agent_view_design_doc, _design_doc_index
 
         agent_view = _agent_view_design_doc(project.design_doc)
         assert "repo_overview" in agent_view
-        section_keys = [e["key"] for e in _design_doc_index(agent_view).get("sections", [])]
+        section_keys = [
+            e["key"] for e in _design_doc_index(agent_view).get("sections", [])
+        ]
         assert "repo_overview" in section_keys
 
         bc = project.build_config or {}
@@ -1211,11 +1700,14 @@ class TestRepoBootstrapCompletionSeam:
 
         # Test case: overview missing directory_layout (incomplete)
         import json
-        logs = json.dumps({
-            "tech_stack": "Python, FastAPI",
-            "directory_layout": "",  # Empty required field
-            "first_steps_summary": "pip install && pytest",
-        })
+
+        logs = json.dumps(
+            {
+                "tech_stack": "Python, FastAPI",
+                "directory_layout": "",  # Empty required field
+                "first_steps_summary": "pip install && pytest",
+            }
+        )
         await _handle_repo_bootstrap_completion(bootstrap_task, logs, db_session)
 
         await db_session.refresh(project)
@@ -1261,7 +1753,9 @@ def _make_external_project(
         github_owner="acme",
         github_repo=name.split("/")[-1],
         is_self_repo=is_self_repo,
-        build_config=build_config if build_config is not None else {"language": "python"},
+        build_config=build_config
+        if build_config is not None
+        else {"language": "python"},
         integration_branch="main",
         promotion_target="main",
     )
@@ -1313,14 +1807,18 @@ class TestSpawnBootstrapTaskHelper:
 
         # Exactly one active bootstrap task exists.
         tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
-                    Task.status == TaskStatus.QUEUED,
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                        Task.status == TaskStatus.QUEUED,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(tasks) == 1, (
             f"Expected exactly 1 QUEUED repo_bootstrap task, got {len(tasks)}"
         )
@@ -1330,13 +1828,17 @@ class TestSpawnBootstrapTaskHelper:
 
         # A TaskHistory SPAWNED row exists for this task.
         history = (
-            await db_session.execute(
-                select(TaskHistory).where(
-                    TaskHistory.task_id == task.id,
-                    TaskHistory.action == "SPAWNED",
+            (
+                await db_session.execute(
+                    select(TaskHistory).where(
+                        TaskHistory.task_id == task.id,
+                        TaskHistory.action == "SPAWNED",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(history) == 1, "Expected a SPAWNED TaskHistory row"
 
     @pytest.mark.asyncio
@@ -1375,13 +1877,17 @@ class TestSpawnBootstrapTaskHelper:
 
         # Still only one repo_bootstrap task.
         tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(tasks) == 1, "Must not create a duplicate when one is already active"
 
     @pytest.mark.asyncio
@@ -1408,14 +1914,20 @@ class TestSpawnBootstrapTaskHelper:
             f"Expected 'already_completed', got {result.outcome!r}"
         )
         tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    )
                 )
             )
-        ).scalars().all()
-        assert len(tasks) == 0, "Must not create a task when bootstrap_completed_at is set"
+            .scalars()
+            .all()
+        )
+        assert len(tasks) == 0, (
+            "Must not create a task when bootstrap_completed_at is set"
+        )
 
     @pytest.mark.asyncio
     async def test_recovery_no_op_for_self_repo(self, db_session):
@@ -1494,7 +2006,9 @@ class TestSpawnBootstrapTaskHelper:
         )
 
     @pytest.mark.asyncio
-    async def test_recovery_spawns_for_project_with_cancelled_bootstrap(self, db_session):
+    async def test_recovery_spawns_for_project_with_cancelled_bootstrap(
+        self, db_session
+    ):
         """Recovery spawns a new bootstrap for a project whose prior bootstrap CANCELLED."""
         from app.repo_bootstrap import spawn_bootstrap_task
 
@@ -1696,14 +2210,18 @@ class TestSpawnBootstrapTaskHelper:
         assert result.outcome == "not_eligible"
         assert result.reason == "bootstrap_recovery_exhausted"
         queued = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
-                    Task.status == TaskStatus.QUEUED,
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                        Task.status == TaskStatus.QUEUED,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert queued == []
 
 
@@ -1726,23 +2244,25 @@ class TestBootstrapRetryEndpoint:
         )
         await db_session.commit()
 
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/bootstrap/retry"
-        )
+        resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/retry")
         assert resp.status_code == 200
         body = resp.json()
         assert body["state"] == "spawned", f"Unexpected state: {body}"
         assert body["task_id"] is not None
 
         tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
-                    Task.status == TaskStatus.QUEUED,
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                        Task.status == TaskStatus.QUEUED,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(tasks) == 1, "Expected exactly one QUEUED repo_bootstrap task"
 
     @pytest.mark.asyncio
@@ -1770,21 +2290,23 @@ class TestBootstrapRetryEndpoint:
         db_session.add(active_task)
         await db_session.commit()
 
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/bootstrap/retry"
-        )
+        resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/retry")
         assert resp.status_code == 200
         body = resp.json()
         assert body["state"] == "already_active", f"Unexpected state: {body}"
 
         tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(tasks) == 1, "Must not create a duplicate"
 
     @pytest.mark.asyncio
@@ -1803,9 +2325,7 @@ class TestBootstrapRetryEndpoint:
         )
         await db_session.commit()
 
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/bootstrap/retry"
-        )
+        resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/retry")
         assert resp.status_code == 200
         body = resp.json()
         assert body["state"] == "already_completed", f"Unexpected state: {body}"
@@ -1824,9 +2344,7 @@ class TestBootstrapRetryEndpoint:
         )
         await db_session.commit()
 
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/bootstrap/retry"
-        )
+        resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/retry")
         assert resp.status_code == 200
         body = resp.json()
         assert body["state"] == "not_eligible", f"Unexpected state: {body}"
@@ -1864,10 +2382,13 @@ class TestBootstrapRecoveryAndStrategicGate:
         await _spawn_strategic_review(project, db_session)
         # Clean up any strategic task spawned.
         from sqlalchemy import delete as _delete
+
         await db_session.execute(
             _delete(Task).where(
                 Task.project_id == project.id,
-                Task.payloads[0]["type"].as_string().in_(["design_doc_update", "strategic_review"]),
+                Task.payloads[0]["type"]
+                .as_string()
+                .in_(["design_doc_update", "strategic_review"]),
             )
         )
         await db_session.commit()
@@ -1891,14 +2412,18 @@ class TestBootstrapRecoveryAndStrategicGate:
 
         # Exactly one bootstrap task in the queue.
         bootstrap_tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
-                    Task.status == TaskStatus.QUEUED,
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                        Task.status == TaskStatus.QUEUED,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(bootstrap_tasks) == 1, (
             f"Expected exactly 1 QUEUED repo_bootstrap task after recovery, got {len(bootstrap_tasks)}"
         )
@@ -1931,10 +2456,13 @@ class TestBootstrapRecoveryAndStrategicGate:
         # helper identifies this project as needing recovery.
         # Clean up any spawned strategic task.
         from sqlalchemy import delete as _delete
+
         await db_session.execute(
             _delete(Task).where(
                 Task.project_id == project.id,
-                Task.payloads[0]["type"].as_string().in_(["design_doc_update", "strategic_review"]),
+                Task.payloads[0]["type"]
+                .as_string()
+                .in_(["design_doc_update", "strategic_review"]),
             )
         )
         await db_session.commit()
@@ -1946,6 +2474,97 @@ class TestBootstrapRecoveryAndStrategicGate:
         assert spawn_result.outcome == "spawned", (
             f"A degraded project with no active bootstrap must be eligible for recovery, "
             f"got {spawn_result.outcome!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_pending_true_during_recovery_backoff(self, db_session):
+        """_bootstrap_pending returns True when bootstrap_recovery_state=backoff and
+        bootstrap_recovery_next_at is in the future — no active task required.
+
+        This is the acceptance test for the bootstrap-backoff deferral gate:
+        strategic and autonomous spawning must be held off while a scheduled
+        recovery attempt is waiting to fire, so the recovery gets a chance to
+        produce repo memory before implementation cycles start.
+        """
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+        from app.strategic_spawning import _bootstrap_pending
+
+        future_at = (_utcnow() + timedelta(hours=2)).isoformat()
+        project = _make_external_project(
+            db_session,
+            name="acme/backoff-gate-test",
+            build_config={
+                "language": "python",
+                "bootstrap_recovery_state": "backoff",
+                "bootstrap_recovery_next_at": future_at,
+            },
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        result = await _bootstrap_pending(project, db_session)
+        assert result is True, (
+            "_bootstrap_pending must return True when bootstrap_recovery_state='backoff' "
+            f"and bootstrap_recovery_next_at is in the future (got {result!r})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_pending_false_when_backoff_elapsed(self, db_session):
+        """_bootstrap_pending returns False when the backoff window has already passed.
+
+        Once bootstrap_recovery_next_at is in the past, the recovery sweep is
+        overdue (or already ran) — spawning is no longer blocked.
+        """
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+        from app.strategic_spawning import _bootstrap_pending
+
+        past_at = (_utcnow() - timedelta(hours=1)).isoformat()
+        project = _make_external_project(
+            db_session,
+            name="acme/elapsed-backoff-test",
+            build_config={
+                "language": "python",
+                "bootstrap_recovery_state": "backoff",
+                "bootstrap_recovery_next_at": past_at,
+            },
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        result = await _bootstrap_pending(project, db_session)
+        assert result is False, (
+            "_bootstrap_pending must return False when bootstrap_recovery_next_at is "
+            f"already in the past (got {result!r})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_pending_false_when_exhausted(self, db_session):
+        """_bootstrap_pending returns False when bootstrap is exhausted.
+
+        bootstrap_recovery_state='exhausted' means all retries are used up —
+        spawning must be allowed so a permanently-degraded bootstrap never
+        deadlocks the pipeline.
+        """
+        from app.strategic_spawning import _bootstrap_pending
+
+        project = _make_external_project(
+            db_session,
+            name="acme/exhausted-bootstrap-test",
+            build_config={
+                "language": "python",
+                "bootstrap_recovery_state": "exhausted",
+                "bootstrap_recovery_exhausted_at": "2026-01-01T00:00:00",
+            },
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        result = await _bootstrap_pending(project, db_session)
+        assert result is False, (
+            "_bootstrap_pending must return False when bootstrap_recovery_state='exhausted' "
+            f"(got {result!r})"
         )
 
 
@@ -2008,14 +2627,18 @@ class TestBootstrapSweepDirect:
         for proj in eligible_projects:
             await db_session.refresh(proj)
             bootstrap_tasks = (
-                await db_session.execute(
-                    select(Task).where(
-                        Task.project_id == proj.id,
-                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
-                        Task.status == TaskStatus.QUEUED,
+                (
+                    await db_session.execute(
+                        select(Task).where(
+                            Task.project_id == proj.id,
+                            Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                            Task.status == TaskStatus.QUEUED,
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             assert len(bootstrap_tasks) == 1, (
                 f"Eligible project {proj.name} must have exactly 1 QUEUED bootstrap "
                 f"task after sweep, got {len(bootstrap_tasks)}"
@@ -2024,13 +2647,17 @@ class TestBootstrapSweepDirect:
         # Verify: completed projects got no new bootstrap tasks.
         for proj in completed_projects:
             bootstrap_tasks = (
-                await db_session.execute(
-                    select(Task).where(
-                        Task.project_id == proj.id,
-                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                (
+                    await db_session.execute(
+                        select(Task).where(
+                            Task.project_id == proj.id,
+                            Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             assert len(bootstrap_tasks) == 0, (
                 f"Completed project {proj.name} must not receive a bootstrap task, "
                 f"got {len(bootstrap_tasks)}"
@@ -2056,12 +2683,16 @@ class TestBootstrapSweepDirect:
         await _sweep_bootstrap_recovery()
 
         total_bootstrap = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(total_bootstrap) == 0, (
             f"No bootstrap tasks should be spawned when all projects are completed, "
             f"got {len(total_bootstrap)}"
@@ -2084,13 +2715,15 @@ class TestBootstrapSweepDirect:
             project_id=project.id,
             title=f"Bootstrap: {project.name}",
             description="Recovery repo bootstrap",
-            payloads=[{
-                "type": "repo_bootstrap",
-                "github_owner": "acme",
-                "github_repo": "already-active-sweep",
-                "integration_branch": "main",
-                "is_first_bootstrap": False,
-            }],
+            payloads=[
+                {
+                    "type": "repo_bootstrap",
+                    "github_owner": "acme",
+                    "github_repo": "already-active-sweep",
+                    "integration_branch": "main",
+                    "is_first_bootstrap": False,
+                }
+            ],
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
         )
@@ -2101,13 +2734,17 @@ class TestBootstrapSweepDirect:
         await _sweep_bootstrap_recovery()
 
         bootstrap_tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(bootstrap_tasks) == 1, (
             f"Sweep must not create a duplicate when bootstrap is already active, "
             f"got {len(bootstrap_tasks)}"
@@ -2122,15 +2759,21 @@ class TestBootstrapSweepDirect:
 async def _fetch_queued_bootstrap_task(db_session, project_id) -> Task:
     """Return the single QUEUED repo_bootstrap task for a project."""
     tasks = (
-        await db_session.execute(
-            select(Task).where(
-                Task.project_id == project_id,
-                Task.payloads[0]["type"].as_string() == "repo_bootstrap",
-                Task.status == TaskStatus.QUEUED,
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    Task.status == TaskStatus.QUEUED,
+                )
             )
         )
-    ).scalars().all()
-    assert len(tasks) == 1, f"Expected exactly one QUEUED bootstrap task, got {len(tasks)}"
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1, (
+        f"Expected exactly one QUEUED bootstrap task, got {len(tasks)}"
+    )
     return tasks[0]
 
 
@@ -2184,19 +2827,23 @@ class TestBootstrapRefresh:
         )
         await db_session.refresh(project)
         # bootstrap_completed_at is preserved (first-bootstrap gate semantics intact).
-        assert (project.build_config or {}).get("bootstrap_completed_at") == "2026-01-01T00:00:00"
+        assert (project.build_config or {}).get(
+            "bootstrap_completed_at"
+        ) == "2026-01-01T00:00:00"
 
         task = await _fetch_queued_bootstrap_task(db_session, project.id)
         assert task.first_payload["is_first_bootstrap"] is False
         assert (task.context or {}).get("bootstrap_reason") == REFRESH_SPAWN_REASON
 
         # Complete the refreshed bootstrap with a NEW overview + reported revision.
-        new_overview = _json.dumps({
-            "tech_stack": "NEW Python 3.12, FastAPI",
-            "directory_layout": "NEW backend/ — API; admin-ui/ — React",
-            "first_steps_summary": "NEW pip install && pytest",
-            "source_revision": "abc1234",
-        })
+        new_overview = _json.dumps(
+            {
+                "tech_stack": "NEW Python 3.12, FastAPI",
+                "directory_layout": "NEW backend/ — API; admin-ui/ — React",
+                "first_steps_summary": "NEW pip install && pytest",
+                "source_revision": "abc1234",
+            }
+        )
         task.status = TaskStatus.COMPLETED
         db_session.add(task)
         await db_session.commit()
@@ -2212,7 +2859,9 @@ class TestBootstrapRefresh:
         assert stored["directory_layout"] == "NEW backend/ — API; admin-ui/ — React"
         # Provenance stamped into the design_doc overview block.
         provenance = stored.get("provenance") or {}
-        assert provenance.get("refreshed_at"), "design_doc provenance must stamp refreshed_at"
+        assert provenance.get("refreshed_at"), (
+            "design_doc provenance must stamp refreshed_at"
+        )
         assert provenance.get("source_branch") == "main", (
             "source_branch must be the bootstrap task's integration_branch"
         )
@@ -2264,13 +2913,17 @@ class TestBootstrapRefresh:
             f"Refresh must be idempotent against an active bootstrap, got {result.outcome!r}"
         )
         tasks = (
-            await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(tasks) == 1, "Refresh must not create a duplicate bootstrap task"
 
     @pytest.mark.asyncio
@@ -2356,9 +3009,7 @@ class TestBootstrapRefresh:
         )
         await db_session.commit()
 
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/bootstrap/refresh"
-        )
+        resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/refresh")
         assert resp.status_code == 200
         body = resp.json()
         assert body["state"] == "spawned", f"Unexpected state: {body}"
@@ -2394,9 +3045,7 @@ class TestBootstrapRefresh:
         db_session.add(active_task)
         await db_session.commit()
 
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/bootstrap/refresh"
-        )
+        resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/refresh")
         assert resp.status_code == 200
         assert resp.json()["state"] == "already_active"
 
@@ -2417,16 +3066,12 @@ class TestBootstrapRefresh:
         )
         await db_session.commit()
 
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/bootstrap/refresh"
-        )
+        resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/refresh")
         assert resp.status_code == 200
         assert resp.json()["state"] == "not_eligible"
 
     @pytest.mark.asyncio
-    async def test_refresh_endpoint_owner_gated(
-        self, client: AsyncClient, db_session
-    ):
+    async def test_refresh_endpoint_owner_gated(self, client: AsyncClient, db_session):
         """Refresh endpoint is owner-gated: a non-member is denied access."""
         project = _make_external_project(
             db_session,
@@ -2439,9 +3084,7 @@ class TestBootstrapRefresh:
         )
         await db_session.commit()
 
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/bootstrap/refresh"
-        )
+        resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/refresh")
         assert resp.status_code in (403, 404), (
             f"Non-owner must be denied, got {resp.status_code}"
         )
