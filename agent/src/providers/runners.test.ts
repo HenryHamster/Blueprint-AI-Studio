@@ -79,6 +79,7 @@ import {
   _setLastProviderRunErrorReportForTesting,
 } from './runners.js';
 import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
+import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -426,5 +427,76 @@ describe('drainJsonChunks — dispatch completeness', () => {
         typeof args[1] === 'string' && args[1].includes(`[claude-stream unknown type: ${eventType}]`),
     );
     expect(unknownCalls).toHaveLength(0);
+  });
+});
+
+describe('spawn stdio validation — no-stdio branch does not leak PID or timers', () => {
+  beforeEach(() => {
+    vi.mocked(registerChildPid).mockClear();
+    vi.mocked(unregisterChildPid).mockClear();
+    mockSendLog.mockClear();
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('resolves with exitCode=1 and never registers the PID when stdout is null', async () => {
+    vi.mocked(spawn).mockImplementationOnce(
+      (_cmd: string, _args: readonly string[], _opts?: unknown) =>
+        ({
+          pid: 77777,
+          exitCode: null,
+          signalCode: null,
+          stdin: { on: vi.fn(), end: vi.fn() },
+          stdout: null,
+          stderr: { on: vi.fn() },
+          on: vi.fn(),
+          kill: vi.fn(),
+        }) as unknown as SpawnMock,
+    );
+    const result = await runProviderAgent('prompt', null, { value: '' });
+    expect(result.exitCode).toBe(1);
+    expect(vi.mocked(registerChildPid)).not.toHaveBeenCalled();
+    expect(vi.mocked(unregisterChildPid)).not.toHaveBeenCalled();
+  });
+
+  it('resolves with exitCode=1 and never registers the PID when stderr is null', async () => {
+    vi.mocked(spawn).mockImplementationOnce(
+      (_cmd: string, _args: readonly string[], _opts?: unknown) =>
+        ({
+          pid: 77778,
+          exitCode: null,
+          signalCode: null,
+          stdin: { on: vi.fn(), end: vi.fn() },
+          stdout: { on: vi.fn() },
+          stderr: null,
+          on: vi.fn(),
+          kill: vi.fn(),
+        }) as unknown as SpawnMock,
+    );
+    const result = await runProviderAgent('prompt', null, { value: '' });
+    expect(result.exitCode).toBe(1);
+    expect(vi.mocked(registerChildPid)).not.toHaveBeenCalled();
+    expect(vi.mocked(unregisterChildPid)).not.toHaveBeenCalled();
+  });
+
+  it('logs an abort message when stdio streams are missing', async () => {
+    vi.mocked(spawn).mockImplementationOnce(
+      (_cmd: string, _args: readonly string[], _opts?: unknown) =>
+        ({
+          pid: 77779,
+          exitCode: null,
+          signalCode: null,
+          stdin: { on: vi.fn(), end: vi.fn() },
+          stdout: null,
+          stderr: null,
+          on: vi.fn(),
+          kill: vi.fn(),
+        }) as unknown as SpawnMock,
+    );
+    await runProviderAgent('prompt', null, { value: '' });
+    const abortCalls = mockSendLog.mock.calls.filter(
+      (args: unknown[]) =>
+        typeof args[1] === 'string' && args[1].includes('no stdio streams'),
+    );
+    expect(abortCalls.length).toBeGreaterThan(0);
   });
 });

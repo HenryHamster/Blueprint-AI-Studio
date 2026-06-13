@@ -877,6 +877,22 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       detached: true,
       stdio: [runCommand.promptInput === 'stdin' ? 'pipe' : (promptFd ?? 'ignore'), 'pipe', 'pipe'],
     });
+
+    // Validate stdio BEFORE registering the PID or arming any watchdog timers.
+    // With stdio:'pipe' this should never be null, but guard defensively: if
+    // either stream is absent the child is already running detached and we must
+    // kill its process group, clean up the fd, and bail without leaking anything.
+    if (!child.stdout || !child.stderr) {
+      const spawnedPid = child.pid;
+      if (typeof spawnedPid === 'number') {
+        try { process.kill(-spawnedPid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      if (promptFd !== undefined) fs.closeSync(promptFd);
+      sendLog(ws, '[runtime] spawn returned no stdio streams — aborting run\n');
+      resolve(1);
+      return;
+    }
+
     recordLlmCallStart();
     if (typeof child.pid === 'number') {
       registerChildPid(child.pid);
@@ -1053,10 +1069,6 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
           }, PROCESS_KILL_GRACE_MS);
         }
       }, 60_000);
-    }
-
-    if (!child.stdout || !child.stderr) {
-      throw new Error('spawn returned no stdio streams');
     }
 
     const pendingJsonChunks: string[] = [];

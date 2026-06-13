@@ -4670,6 +4670,43 @@ describe('pollForNextRole auth-revoked', () => {
     // Sanity: heartbeat was attempted at least once (the initial fire).
     expect(heartbeatCount).toBeGreaterThanOrEqual(1);
   });
+
+  it('redacts credentials in network error messages logged by pollForNextRole', async () => {
+    const logLines: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logLines.push(args.map(String).join(' '));
+    });
+
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      // Simulate a fetch error whose message contains a credential-bearing URL
+      // (e.g. ETIMEDOUT on a clone URL or a redirect error including the auth token).
+      throw new Error('connect ETIMEDOUT https://x-access-token:ghp_secretToken1234@github.com/org/repo.git');
+    });
+
+    await pollForNextRole({
+      vmInstanceId: 'vm-redact',
+      priorTaskId: 't-redact',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt-redact',
+      pollIntervalMs: 10,
+      timeoutMs: 50,
+      heartbeatIntervalMs: 10000,
+    });
+
+    consoleSpy.mockRestore();
+
+    const fetchErrLines = logLines.filter(l => l.includes('pollForNextRole fetch error'));
+    expect(fetchErrLines.length).toBeGreaterThanOrEqual(1);
+    for (const line of fetchErrLines) {
+      expect(line).not.toContain('ghp_secretToken1234');
+      expect(line).toContain('x-access-token:***@');
+    }
+  });
 });
 
 // ── getAgentHeaders — Issue 3 ───────────────────────────────────────────────

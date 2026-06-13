@@ -1143,7 +1143,7 @@ export function __resetTaskCapabilityContractLoadedForTesting(): void {
 }
 
 export function log(msg: string) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
+  console.log(`[${new Date().toISOString()}] ${sanitize(msg)}`);
 }
 
 // ── Warm-VM continuity polling (Phase 2a) ───────────────────────────────────
@@ -3064,7 +3064,7 @@ export async function main() {
         }
         return;
       }
-      log(`Cannot report pre-claim failure — TASK_ID env not set. Reason: ${reason}`);
+      log(`Cannot report pre-claim failure — TASK_ID env not set. Reason: ${truncated}`);
       return;
     }
     log(`Reporting pre-claim failure for task ${reportTaskId}: ${truncated}`);
