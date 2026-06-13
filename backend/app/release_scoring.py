@@ -631,9 +631,7 @@ _SEVERITY_RANK = {
 _CHALLENGE_FINDING_MAX = 12
 _CHALLENGE_ASSESSMENT_MAX = 600
 _CHALLENGE_SEVERITIES: frozenset[str] = frozenset({"low", "medium", "high"})
-_CHALLENGE_AGREEMENTS: frozenset[str] = frozenset(
-    {"agree", "partial", "disagree"}
-)
+_CHALLENGE_AGREEMENTS: frozenset[str] = frozenset({"agree", "partial", "disagree"})
 
 
 def _raw_audit_findings(report: dict[str, Any] | None) -> list[Any]:
@@ -734,7 +732,9 @@ def _compute_audit_challenge_synthesis(
                 "overstated_findings": [],
             },
             "counts": {
-                "primary_findings": len(_compact_challenge_findings(_raw_audit_findings(primary_report))),
+                "primary_findings": len(
+                    _compact_challenge_findings(_raw_audit_findings(primary_report))
+                ),
                 "challenger_missing": 0,
                 "challenger_overstated": 0,
             },
@@ -775,7 +775,11 @@ def _compute_audit_challenge_synthesis(
         else ""
     )
 
-    if reported_agreement == "agree" and not missing_findings and not overstated_findings:
+    if (
+        reported_agreement == "agree"
+        and not missing_findings
+        and not overstated_findings
+    ):
         both_flagged = primary_findings
         primary_only: list[dict[str, str]] = []
     else:
@@ -1287,7 +1291,9 @@ def _finding_summary_tokens(text: str) -> frozenset[str]:
     findings and challenge verdicts whose free-text summaries differ in wording
     while describing the same issue.
     """
-    return frozenset(tok for tok in re.findall(r"[a-z0-9]+", text.lower()) if len(tok) >= 3)
+    return frozenset(
+        tok for tok in re.findall(r"[a-z0-9]+", text.lower()) if len(tok) >= 3
+    )
 
 
 def _finding_summary_for_binding(finding: dict) -> str:
@@ -1334,7 +1340,10 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
     if f_file and cv_file and f_file != cv_file:
         return None
 
-    if str(verdict_entry.get("verdict") or "").lower().strip() == "refuted_false_positive":
+    if (
+        str(verdict_entry.get("verdict") or "").lower().strip()
+        == "refuted_false_positive"
+    ):
         f_severity = str(finding.get("severity") or finding.get("level") or "").lower()
         cv_severity = str(verdict_entry.get("severity") or "").lower()
         finding_rank = _SEVERITY_RANK.get(f_severity, 99)
@@ -1361,7 +1370,10 @@ def _score_finding_to_challenge(finding: dict, verdict_entry: dict) -> float | N
         )
         if is_refutation:
             union_size = len(f_tokens | cv_tokens)
-            if union_size > 0 and overlap / union_size >= _FINDING_MATCH_TOKEN_THRESHOLD:
+            if (
+                union_size > 0
+                and overlap / union_size >= _FINDING_MATCH_TOKEN_THRESHOLD
+            ):
                 return overlap / union_size
         else:
             min_size = min(len(f_tokens), len(cv_tokens))
@@ -1393,7 +1405,10 @@ def _indexed_verdict_can_bind(finding: dict, verdict_entry: dict) -> bool:
     """Validate non-text safety checks for an index-bound challenge verdict."""
     if not isinstance(verdict_entry, dict):
         return False
-    if str(verdict_entry.get("verdict") or "").lower().strip() != "refuted_false_positive":
+    if (
+        str(verdict_entry.get("verdict") or "").lower().strip()
+        != "refuted_false_positive"
+    ):
         return True
 
     f_severity = str(finding.get("severity") or finding.get("level") or "").lower()
@@ -1407,7 +1422,9 @@ def _reconcile_audit_with_challenge(
     report: dict[str, Any] | None,
     challenge_envelope: dict[str, Any] | None,
     candidate_sha: str | None,
-) -> tuple[str | None, dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    str | None, dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]
+]:
     """Reconcile verified audit findings with challenge verdicts (fail-closed)."""
     if not isinstance(report, dict):
         return None, report, [], []
@@ -1462,9 +1479,9 @@ def _reconcile_audit_with_challenge(
                                             _cv.get("summary") or ""
                                         ).strip()[:_FINDING_SUMMARY_MAX],
                                         "file": str(_cv.get("file") or "").strip(),
-                                        "reason": str(
-                                            _cv.get("reason") or ""
-                                        ).strip()[:_FINDING_SUMMARY_MAX],
+                                        "reason": str(_cv.get("reason") or "").strip()[
+                                            :_FINDING_SUMMARY_MAX
+                                        ],
                                         "source": "challenger_independent",
                                     }
                                 ],
@@ -1505,11 +1522,7 @@ def _reconcile_audit_with_challenge(
     # findings with an empty summary before numbering them for the agent, so the
     # index domain here must match that filtered subset exactly.
     primary_order_fis = sorted(
-        [
-            fi
-            for fi, (_, f) in enumerate(deductible)
-            if _finding_summary_for_binding(f)
-        ],
+        [fi for fi, (_, f) in enumerate(deductible) if _finding_summary_for_binding(f)],
         key=lambda fi: _SEVERITY_RANK.get(
             str(
                 deductible[fi][1].get("severity")
@@ -1526,6 +1539,7 @@ def _reconcile_audit_with_challenge(
     # Refutations still keep the severity ceiling because they remove audit
     # deductions.
     match_vi: dict[int, int] = {}  # vi -> fi currently matched
+    indexed_vi: set[int] = set()  # vi values bound via primary_finding_index
     for vi, cv in enumerate(available_verdicts):
         index = _primary_finding_index_for_verdict(cv)
         if index is None or index > len(primary_order_fis):
@@ -1536,6 +1550,7 @@ def _reconcile_audit_with_challenge(
         _, f = deductible[fi]
         if _indexed_verdict_can_bind(f, cv):
             match_vi[vi] = fi
+            indexed_vi.add(vi)
 
     # Build per-finding adjacency lists sorted by score descending.
     # Add a small severity-agreement bonus so a verdict prefers the finding
@@ -1632,6 +1647,7 @@ def _reconcile_audit_with_challenge(
         else:
             return "audit_challenge_uncertain", None, [], []
         if len(binding_record) < _BINDING_RECORD_CAP:
+            vi = assignment[fi]
             binding_record.append(
                 {
                     "finding_summary": _finding_summary_for_binding(f),
@@ -1643,6 +1659,7 @@ def _reconcile_audit_with_challenge(
                     "verdict_summary": str(matched.get("summary") or "").strip()[
                         :_FINDING_SUMMARY_MAX
                     ],
+                    "binding_method": "indexed" if vi in indexed_vi else "fuzzy",
                 }
             )
 
@@ -1713,7 +1730,9 @@ def compute_challenged_vs_unchallenged_telemetry(
         if (
             isinstance(challenge, dict)
             and challenge.get("status") == "available"
-            and (not candidate_sha or not challenge_sha or challenge_sha == candidate_sha)
+            and (
+                not candidate_sha or not challenge_sha or challenge_sha == candidate_sha
+            )
         ):
             challenged.append(v)
         else:
@@ -1738,7 +1757,8 @@ def compute_challenged_vs_unchallenged_telemetry(
             v
             for v in cohort
             if v.get("terminal_status") == "promoted"
-            and v.get("post_promotion_outcome") in ("serving_confirmed", "deploy_failed")
+            and v.get("post_promotion_outcome")
+            in ("serving_confirmed", "deploy_failed")
         ]
         resolved_sample = len(resolved)
         wrong_decision_count = sum(
@@ -1764,9 +1784,7 @@ def compute_challenged_vs_unchallenged_telemetry(
                 1
                 for v in cohort
                 if isinstance(v.get("audit_reconciliation"), dict)
-                and isinstance(
-                    v["audit_reconciliation"].get("audit_challenge"), dict
-                )
+                and isinstance(v["audit_reconciliation"].get("audit_challenge"), dict)
                 and v["audit_reconciliation"]["audit_challenge"].get(
                     "reported_agreement"
                 )
@@ -1786,9 +1804,7 @@ def compute_challenged_vs_unchallenged_telemetry(
                 )
                 for v in cohort
                 if isinstance(v.get("audit_reconciliation"), dict)
-                and isinstance(
-                    v["audit_reconciliation"].get("audit_challenge"), dict
-                )
+                and isinstance(v["audit_reconciliation"].get("audit_challenge"), dict)
                 and v["audit_reconciliation"]["audit_challenge"].get("status")
                 == "available"
             )

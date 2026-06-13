@@ -1414,7 +1414,11 @@ async def compute_lane_arm_time_medians(
     rows = (
         await session.execute(
             select(
-                Task.created_at, Task.started_at, Task.updated_at, Task.context
+                Task.created_at,
+                Task.started_at,
+                Task.updated_at,
+                Task.context,
+                Task.payloads,
             ).where(
                 Task.project_id == project_id,
                 Task.status.in_(
@@ -1425,6 +1429,9 @@ async def compute_lane_arm_time_medians(
         )
     ).all()
 
+    _FIX_TASK_TYPES = frozenset({"fix", "implement"})
+    _REVIEW_TASK_TYPES = frozenset({"review", "audit", "code-review"})
+
     def _strip_tz(dt: Any) -> Any:
         if dt is None:
             return None
@@ -1433,7 +1440,7 @@ async def compute_lane_arm_time_medians(
         )
 
     pr_buckets: dict[str, list[tuple]] = {}
-    for created_at, started_at, updated_at, ctx in rows:
+    for created_at, started_at, updated_at, ctx, payloads in rows:
         if not isinstance(ctx, dict):
             continue
         review_loop = ctx.get("review_loop")
@@ -1442,11 +1449,19 @@ async def compute_lane_arm_time_medians(
         pr_number = review_loop.get("pr_number")
         if pr_number is None:
             continue
+        payload_type = ""
+        if isinstance(payloads, list) and payloads and isinstance(payloads[0], dict):
+            payload_type = str(payloads[0].get("type") or "")
         key = str(pr_number)
         if key not in pr_buckets:
             pr_buckets[key] = []
         pr_buckets[key].append(
-            (_strip_tz(created_at), _strip_tz(started_at), _strip_tz(updated_at))
+            (
+                _strip_tz(created_at),
+                _strip_tz(started_at),
+                _strip_tz(updated_at),
+                payload_type,
+            )
         )
 
     if not pr_buckets:
@@ -1456,6 +1471,8 @@ async def compute_lane_arm_time_medians(
             "gap_seconds": None,
             "task_count": None,
             "pr_count": 0,
+            "fix_active_seconds": None,
+            "review_active_seconds": None,
         }
 
     def _median(vals: list) -> float | None:
@@ -1470,6 +1487,8 @@ async def compute_lane_arm_time_medians(
     active_vals: list[float] = []
     gap_vals: list[float] = []
     count_vals: list[float] = []
+    fix_active_vals: list[float] = []
+    review_active_vals: list[float] = []
 
     for _, tasks in pr_buckets.items():
         created_times = [t[0] for t in tasks if t[0] is not None]
@@ -1482,10 +1501,22 @@ async def compute_lane_arm_time_medians(
             for t in tasks
             if t[1] is not None and t[2] is not None
         )
+        fix_active = sum(
+            max((t[2] - t[1]).total_seconds(), 0.0)
+            for t in tasks
+            if t[1] is not None and t[2] is not None and t[3] in _FIX_TASK_TYPES
+        )
+        review_active = sum(
+            max((t[2] - t[1]).total_seconds(), 0.0)
+            for t in tasks
+            if t[1] is not None and t[2] is not None and t[3] in _REVIEW_TASK_TYPES
+        )
         wc_vals.append(wall_clock)
         active_vals.append(active)
         gap_vals.append(max(wall_clock - active, 0.0))
         count_vals.append(float(len(tasks)))
+        fix_active_vals.append(fix_active)
+        review_active_vals.append(review_active)
 
     return {
         "wall_clock_seconds": _median(wc_vals),
@@ -1493,6 +1524,8 @@ async def compute_lane_arm_time_medians(
         "gap_seconds": _median(gap_vals),
         "task_count": _median(count_vals),
         "pr_count": len(pr_buckets),
+        "fix_active_seconds": _median(fix_active_vals),
+        "review_active_seconds": _median(review_active_vals),
     }
 
 

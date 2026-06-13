@@ -1535,6 +1535,10 @@ async def _compute_digest(
                             "gap_seconds": _relay_m.get("gap_seconds"),
                             "task_count": _relay_m.get("task_count"),
                             "pr_count": _relay_m.get("pr_count", 0),
+                            "fix_active_seconds": _relay_m.get("fix_active_seconds"),
+                            "review_active_seconds": _relay_m.get(
+                                "review_active_seconds"
+                            ),
                         }
                         _lane_m = await compute_lane_arm_time_medians(
                             session, project_id
@@ -1545,6 +1549,8 @@ async def _compute_digest(
                             "active_seconds",
                             "gap_seconds",
                             "task_count",
+                            "fix_active_seconds",
+                            "review_active_seconds",
                         ):
                             _rv, _lv = _relay_fields.get(_mf), _lane_m.get(_mf)
                             _deltas[_mf] = (

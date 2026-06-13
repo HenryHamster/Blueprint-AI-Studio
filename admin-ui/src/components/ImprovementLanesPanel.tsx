@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset, XCircle } from 'lucide-react';
 import { drainLanePilot, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type ShadowLaneHealth } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
-import { formatAbsolute, formatDurationSec, parseTimestamp } from '../utils/time';
+import { formatAbsolute, formatDurationSec, parseTimestamp, timeAgo } from '../utils/time';
 import { ConfirmDialog } from './ConfirmDialog';
 
 const STORAGE_KEY = 'blueprint-admin:improvementLanesPanelCollapsed';
@@ -342,6 +342,9 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                 const reservationExpiresAt = lane.reservation_expires_at
                   ? formatAbsolute(parseTimestamp(lane.reservation_expires_at).getTime())
                   : '—';
+                const reservationIsExpired =
+                  lane.reservation_expires_at != null &&
+                  parseTimestamp(lane.reservation_expires_at).getTime() < Date.now();
                 return (
                   <div
                     key={lane.id}
@@ -403,9 +406,15 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                         <div className="mt-0.5 break-words text-neutral-300">
                           {lane.reserved_vm_instance_id ?? '—'}
                         </div>
-                        <div className="mt-0.5 text-neutral-500">
-                          Expires {reservationExpiresAt}
-                        </div>
+                        {reservationIsExpired ? (
+                          <div className="mt-0.5 text-amber-400" data-testid="reservation-expiry">
+                            Expired {timeAgo(lane.reservation_expires_at as string)}
+                          </div>
+                        ) : (
+                          <div className="mt-0.5 text-neutral-500" data-testid="reservation-expiry">
+                            Expires {reservationExpiresAt}
+                          </div>
+                        )}
                         <div className="mt-1 space-y-0.5 text-[10px]" data-testid="reservation-cause-breakdown">
                           <div>
                             <span className="text-neutral-500">Claimed </span>

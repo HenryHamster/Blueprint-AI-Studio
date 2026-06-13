@@ -832,16 +832,18 @@ class TestLoadPolicyProvenance:
         assert error is None
         assert policy["weights"]["audit"] == pytest.approx(0.5)
 
-    def test_hardcoded_defaults_provenance_includes_parse_error(
-        self, mocker, tmp_path
-    ):
+    def test_hardcoded_defaults_provenance_includes_parse_error(self, mocker, tmp_path):
         """A broken YAML file falls back to hardcoded defaults with an error string."""
         _point_policy_at(mocker, tmp_path, "weights: {unterminated: [1, 2")
 
         policy, source, error = rq._resolve_policy_with_provenance()
         assert source == "hardcoded_defaults"
         assert error is not None
-        assert "ScannerError" in error or "ParserError" in error or "while parsing" in error
+        assert (
+            "ScannerError" in error
+            or "ParserError" in error
+            or "while parsing" in error
+        )
         assert policy["weights"] == {
             "audit": 0.40,
             "test_erosion": 0.30,
@@ -3871,6 +3873,72 @@ class TestBindingRecordAndUnboundHoldDistinction:
         )
         assert len(binding) <= cap, (
             f"binding record exceeds cap: {len(binding)} > {cap}"
+        )
+
+
+class TestBindingRecordBindingMethod:
+    """binding_record entries must carry a binding_method field ('indexed' or 'fuzzy').
+
+    'indexed' when the verdict was bound via primary_finding_index; 'fuzzy' when
+    bound via the bipartite fuzzy-matching path.
+    """
+
+    SHA = "cafe1234"
+
+    def _verified(self, severity: str, summary: str, file: str = "") -> dict:
+        entry: dict = {
+            "severity": severity,
+            "summary": summary,
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+        if file:
+            entry["file"] = file
+        return entry
+
+    def test_binding_method_indexed(self):
+        """When verdict carries primary_finding_index, binding_method is 'indexed'."""
+        finding = self._verified(
+            "high", "SQL injection via unsanitized query parameter"
+        )
+        report = {"findings": [finding]}
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "severity": "high",
+                "summary": "SQL injection via unsanitized query parameter",
+                "primary_finding_index": 1,
+            }
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+        hold, modified, _refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+        assert hold is None, f"unexpected hold: {hold!r}"
+        assert len(binding) == 1
+        assert binding[0]["binding_method"] == "indexed", (
+            f"expected 'indexed', got {binding[0].get('binding_method')!r}"
+        )
+
+    def test_binding_method_fuzzy(self):
+        """When verdict has no primary_finding_index, binding_method is 'fuzzy'."""
+        finding = self._verified("high", "Hardcoded API secret in config file")
+        report = {"findings": [finding]}
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "severity": "high",
+                "summary": "Hardcoded API secret in config file",
+                # no primary_finding_index
+            }
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+        hold, modified, _refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+        assert hold is None, f"unexpected hold: {hold!r}"
+        assert len(binding) == 1
+        assert binding[0]["binding_method"] == "fuzzy", (
+            f"expected 'fuzzy', got {binding[0].get('binding_method')!r}"
         )
 
 

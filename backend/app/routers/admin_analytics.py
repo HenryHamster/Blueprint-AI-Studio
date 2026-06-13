@@ -42,7 +42,10 @@ from app.review_heuristics import (
     LANE_REVIEW_CONVERGENCE,
     classify_iteration_lane,
 )
-from app.digest_metrics import compute_lane_waste_diagnostics
+from app.digest_metrics import (
+    compute_lane_baseline_trend,
+    compute_lane_waste_diagnostics,
+)
 from app.routers.admin_pipeline_observability import (
     _load_escalation_alerts,
     _load_outer_loop_original_tasks,
@@ -1561,10 +1564,12 @@ async def get_lane_baselines(
         reverse=True,
     )
 
+    baseline_values = [v for _, v in sorted_baselines]
     return {
         "project_id": str(project_id),
         "count": len(sorted_baselines),
-        "baselines": [v for _, v in sorted_baselines],
+        "baselines": baseline_values,
+        "trend": compute_lane_baseline_trend(baseline_values),
     }
 
 

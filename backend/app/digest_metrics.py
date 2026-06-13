@@ -1672,6 +1672,150 @@ def compute_lane_waste_diagnostics(
     }
 
 
+def compute_lane_baseline_trend(
+    baselines: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    """Compute per-metric trend between the two most recent persisted lane baselines.
+
+    ``baselines`` must be sorted newest-first (as returned by
+    ``get_lane_baselines``).  Returns ``None`` when fewer than 2 baselines
+    exist.  For each tracked metric the returned block contains ``latest``,
+    ``prior``, ``delta``, and ``classification``
+    (``"improving"`` / ``"declining"`` / ``"stable"`` / ``None``).
+
+    Thresholds:
+    - Relay medians (wall_clock, active, gap seconds): relative ±10%.
+    - Relay medians task_count and lane p50/p90 iterations: absolute ±0.5.
+    - Waste-taxonomy shares (category count / waste_task_count): absolute ±0.05.
+
+    All timing and iteration metrics treat lower as better; waste shares also
+    treat lower as better (less waste = improving).
+    """
+    if len(baselines) < 2:
+        return None
+
+    latest = baselines[0]
+    prior = baselines[1]
+
+    def _block(
+        curr: float | None,
+        prev: float | None,
+        *,
+        threshold_rel: float | None = None,
+        threshold_abs: float | None = None,
+        lower_is_better: bool = True,
+    ) -> Dict[str, Any]:
+        delta = (curr - prev) if (curr is not None and prev is not None) else None
+        if delta is None:
+            classification: str | None = None
+        elif threshold_rel is not None:
+            if prev == 0:
+                classification = None
+            else:
+                rel = delta / abs(prev)
+                if lower_is_better:
+                    classification = (
+                        "improving"
+                        if rel < -threshold_rel
+                        else "declining"
+                        if rel > threshold_rel
+                        else "stable"
+                    )
+                else:
+                    classification = (
+                        "improving"
+                        if rel > threshold_rel
+                        else "declining"
+                        if rel < -threshold_rel
+                        else "stable"
+                    )
+        else:
+            assert threshold_abs is not None
+            if lower_is_better:
+                classification = (
+                    "improving"
+                    if delta < -threshold_abs
+                    else "declining"
+                    if delta > threshold_abs
+                    else "stable"
+                )
+            else:
+                classification = (
+                    "improving"
+                    if delta > threshold_abs
+                    else "declining"
+                    if delta < -threshold_abs
+                    else "stable"
+                )
+        return {
+            "latest": curr,
+            "prior": prev,
+            "delta": delta,
+            "classification": classification,
+        }
+
+    relay_curr = latest.get("relay_medians") or {}
+    relay_prev = prior.get("relay_medians") or {}
+    relay_trend: Dict[str, Any] = {}
+    for key in ("wall_clock_seconds", "active_seconds", "gap_seconds"):
+        relay_trend[key] = _block(
+            relay_curr.get(key),
+            relay_prev.get(key),
+            threshold_rel=0.10,
+            lower_is_better=True,
+        )
+    relay_trend["task_count"] = _block(
+        relay_curr.get("task_count"),
+        relay_prev.get("task_count"),
+        threshold_abs=0.5,
+        lower_is_better=True,
+    )
+
+    diag_curr = latest.get("lane_iteration_distribution") or {}
+    diag_prev = prior.get("lane_iteration_distribution") or {}
+    lane_iter_trend: Dict[str, Any] = {}
+    for lane in ("review", "fix"):
+        lc = diag_curr.get(lane) or {}
+        lp = diag_prev.get(lane) or {}
+        lane_iter_trend[lane] = {
+            "p50": _block(
+                lc.get("p50_iterations"),
+                lp.get("p50_iterations"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+            "p90": _block(
+                lc.get("p90_iterations"),
+                lp.get("p90_iterations"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+        }
+
+    waste_curr = (latest.get("lane_waste") or {}).get("waste_taxonomy") or {}
+    waste_prev = (prior.get("lane_waste") or {}).get("waste_taxonomy") or {}
+    total_curr = (latest.get("lane_waste") or {}).get("waste_task_count") or 0
+    total_prev = (prior.get("lane_waste") or {}).get("waste_task_count") or 0
+    waste_trend: Dict[str, Any] = {}
+    for cat in LANE_WASTE_CATEGORIES:
+        share_curr = (waste_curr.get(cat, 0) / total_curr) if total_curr > 0 else None
+        share_prev = (waste_prev.get(cat, 0) / total_prev) if total_prev > 0 else None
+        waste_trend[cat] = _block(
+            share_curr,
+            share_prev,
+            threshold_abs=0.05,
+            lower_is_better=True,
+        )
+
+    return {
+        "latest_version": latest.get("version_number"),
+        "prior_version": prior.get("version_number"),
+        "relay_medians": relay_trend,
+        "lane_iterations": lane_iter_trend,
+        "waste_taxonomy_shares": waste_trend,
+    }
+
+
 def compute_outer_loop_convergence(
     *,
     all_tasks: List[Task],
@@ -4754,7 +4898,7 @@ def compute_llm_rework_cost(
         if not has_landed_signal(t):
             prior = _prior_attempts(t)
             all_attempts = _task_llm_attempts(t)
-            current_only = all_attempts[len(prior):]
+            current_only = all_attempts[len(prior) :]
             c, ui, uo = _price_attempts(current_only)
             failed_cost += c
             failed_ua_input += ui

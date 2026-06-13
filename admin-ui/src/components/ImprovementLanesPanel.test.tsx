@@ -273,6 +273,40 @@ describe('ImprovementLanesPanel', () => {
     expect(expiredSpan).toBeTruthy();
   });
 
+  test('shows expired reservation in amber when expiry is in the past', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    // lane-1 has reservation_expires_at: '2026-06-11T12:00:00Z' which is in the past
+    const expiry = rows[0].querySelector('[data-testid="reservation-expiry"]');
+    expect(expiry).toBeTruthy();
+    expect(expiry?.textContent).toMatch(/^Expired /);
+    expect(expiry?.className).toContain('amber');
+  });
+
+  test('shows live reservation in neutral styling when expiry is in the future', async () => {
+    const futureExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const responseWithFutureReservation = {
+      ...LANE_RESPONSE,
+      lanes: [
+        { ...LANE_RESPONSE.lanes[0], reservation_expires_at: futureExpiry },
+        LANE_RESPONSE.lanes[1],
+      ],
+    };
+    fetchImprovementLanes.mockResolvedValueOnce(responseWithFutureReservation);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    const expiry = rows[0].querySelector('[data-testid="reservation-expiry"]');
+    expect(expiry).toBeTruthy();
+    expect(expiry?.textContent).toMatch(/^Expires /);
+    expect(expiry?.className).toContain('neutral');
+    expect(expiry?.className).not.toContain('amber');
+  });
+
   test('renders cold lane reservation breakdown without failure styling when all counts are zero', async () => {
     fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
 

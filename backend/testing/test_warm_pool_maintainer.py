@@ -3731,3 +3731,157 @@ async def test_routine_over_target_drain_spares_leased_member(
     assert await db_session.get(PoolVm, idle_member.id) is None
     surviving = await db_session.get(PoolVm, leased_member.id)
     assert surviving is not None and surviving.state == PoolVmState.LEASED
+
+
+# ---------------------------------------------------------------------------
+# Per-project cost guard: lease-side honor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lease_blocked_when_per_project_cost_guard_engaged(
+    db_session, warm_pool_on, mocker
+):
+    """When the fleet guard is disengaged but one project's per-project cost guard
+    is engaged, try_pool_dispatch must immediately return None and record a
+    'cost_guard' lease-miss for that project — without waiting for the maintainer
+    tick to drain idle members."""
+    from app.warm_backlog_reuse import (
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        get_project_pool_funnel_snapshot,
+        record_pool_lease_miss,
+    )
+
+    _pool_lease_hit_events.clear()
+    _pool_lease_miss_events.clear()
+
+    mocker.patch(
+        "app.efficiency_snapshot._compute_windowed_idle_cost",
+        new_callable=mocker.AsyncMock,
+        side_effect=lambda session, pid, cutoff: {"total": 5.0, "by_account": {}},
+    )
+
+    _runtime_config["warm_pool_cost_guard_min_dispatches"] = 5
+    _runtime_config["warm_pool_cost_guard_min_idle_cost_usd"] = 1.0
+    _runtime_config["warm_pool_cost_guard_min_hit_rate"] = 0.10
+
+    # Fleet guard is disengaged: patch it to return engaged=False.
+    mocker.patch(
+        "app.warm_pool_maintainer.evaluate_pool_cost_guard",
+        new_callable=mocker.AsyncMock,
+        return_value={
+            "engaged": False,
+            "reason": None,
+            "hit_rate": 1.0,
+            "total_dispatches": 10,
+            "idle_cost_usd": 0.0,
+            "min_hit_rate": 0.10,
+            "min_idle_cost_usd": 1.0,
+            "window_hours": 24,
+        },
+    )
+
+    project = await _make_project(db_session, name="Per-Project Guard Lease")
+    # Drive 10 eligible misses so the per-project hit rate is 0% — guard engages.
+    for _ in range(10):
+        record_pool_lease_miss("no_idle_member", project_id=project.id)
+
+    # Register an IDLE member that would otherwise be leaseable.
+    await _register(
+        db_session,
+        project,
+        "agent-vm-per-proj-guard",
+        PoolVmState.IDLE,
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+    )
+
+    task = await _make_task(db_session, project, TaskStatus.QUEUED)
+
+    # Pre-check: the per-project guard evaluates as engaged for this project.
+    per_guard = await evaluate_project_pool_cost_guard(
+        db_session, project.id, runtime_config=_runtime_config
+    )
+    assert per_guard["engaged"], (
+        "pre-condition: per-project guard must be engaged with 10 eligible misses"
+    )
+
+    # Record how many cost_guard misses exist before the dispatch call.
+    snap_before = get_project_pool_funnel_snapshot(project.id, 24)
+    cost_guard_before = snap_before["lease_miss_by_reason"].get("cost_guard", 0)
+
+    result = await try_pool_dispatch(
+        db_session,
+        task,
+        required_provider="anthropic",
+        required_model="claude-opus-4-8",
+        required_account="acct-1",
+    )
+
+    assert result is None, (
+        "try_pool_dispatch must return None when per-project cost guard is engaged"
+    )
+
+    snap_after = get_project_pool_funnel_snapshot(project.id, 24)
+    assert (
+        snap_after["lease_miss_by_reason"].get("cost_guard", 0) > cost_guard_before
+    ), "a cost_guard lease-miss must be recorded for the project"
+
+
+@pytest.mark.asyncio
+async def test_fleet_guard_engaged_skips_per_project_check(
+    db_session, warm_pool_on, mocker
+):
+    """When the fleet guard is already engaged, the per-project guard must NOT be
+    evaluated (short-circuit) — fleet guard acts as a global safety valve."""
+    mocker.patch(
+        "app.efficiency_snapshot._compute_windowed_idle_cost",
+        new_callable=mocker.AsyncMock,
+        return_value={"total": 5.0, "by_account": {}},
+    )
+
+    # Fleet guard engaged.
+    mocker.patch(
+        "app.warm_pool_maintainer.evaluate_pool_cost_guard",
+        new_callable=mocker.AsyncMock,
+        return_value={
+            "engaged": True,
+            "reason": "fleet guard test",
+            "hit_rate": 0.0,
+            "total_dispatches": 100,
+            "idle_cost_usd": 10.0,
+            "min_hit_rate": 0.10,
+            "min_idle_cost_usd": 1.0,
+            "window_hours": 24,
+        },
+    )
+    per_project_spy = mocker.patch(
+        "app.warm_pool_maintainer.evaluate_project_pool_cost_guard",
+        new_callable=mocker.AsyncMock,
+        return_value={"engaged": False},
+    )
+
+    project = await _make_project(db_session, name="Fleet Guard Short-circuit")
+    await _register(
+        db_session,
+        project,
+        "agent-vm-fleet-guard-sc",
+        PoolVmState.IDLE,
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+    )
+
+    task = await _make_task(db_session, project, TaskStatus.QUEUED)
+    result = await try_pool_dispatch(
+        db_session,
+        task,
+        required_provider="anthropic",
+        required_model="claude-opus-4-8",
+        required_account="acct-1",
+    )
+
+    assert result is None, "fleet guard must block the lease"
+    per_project_spy.assert_not_called()

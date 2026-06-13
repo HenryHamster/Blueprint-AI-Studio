@@ -23,7 +23,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import or_, update
+from sqlalchemy import func, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -483,24 +483,39 @@ async def _vm_boot_account_identity(
     """
     if not vm_instance_id:
         return None
+    # Filter in SQL for tasks that actually recorded an account, so .limit(1)
+    # skips unattributed tasks rather than returning None when the latest task
+    # has no account but an older one does.
+    if resolve_dialect_name(session) == "postgresql":
+        has_account = Task.context.op("?")(  # type: ignore[attr-defined]
+            "llm_account_id"
+        ) | Task.context.op("?")("max_plan_account_id")
+    else:
+        has_account = (
+            func.json_extract(Task.context, "$.llm_account_id").isnot(None)
+            | func.json_extract(Task.context, "$.max_plan_account_id").isnot(None)
+        )
     stmt = (
         select(Task.context)
-        .where(Task.vm_instance_id == vm_instance_id)
+        .where(Task.vm_instance_id == vm_instance_id, has_account)
         .order_by(Task.created_at.desc())
     )
     if exclude_task_id is not None:
         stmt = stmt.where(Task.id != exclude_task_id)
-    for (ctx,) in (await session.execute(stmt)).all():
-        ctx = ctx or {}
-        account_id = ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
-        if account_id:
-            return {
-                "account_id": str(account_id),
-                "provider": ctx.get("llm_provider"),
-                "auth_mode": ctx.get("llm_auth_mode"),
-                "model": ctx.get("llm_model"),
-            }
-    return None
+    stmt = stmt.limit(1)
+    row = (await session.execute(stmt)).first()
+    if row is None:
+        return None
+    ctx = row[0] or {}
+    account_id = ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
+    if not account_id:
+        return None
+    return {
+        "account_id": str(account_id),
+        "provider": ctx.get("llm_provider"),
+        "auth_mode": ctx.get("llm_auth_mode"),
+        "model": ctx.get("llm_model"),
+    }
 
 
 async def _finalize_warm_claim(

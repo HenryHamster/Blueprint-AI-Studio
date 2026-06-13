@@ -2766,6 +2766,81 @@ class TestAutonomousMode:
         assert body["counts_by_type"][direction_id]["research"] == 1
 
 
+class TestAutonomyDebug:
+    """Tests for GET /api/admin/projects/{project_id}/autonomy-debug."""
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_counts_only_research_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_this_hour in rate_limit block counts only research-type ORCHESTRATOR
+        tasks, not non-research ORCHESTRATOR tasks created in the last hour.
+
+        This exercises the dialect-specific SQL COUNT that replaced the Python-side
+        sum() loop — verifying it filters on payloads[0].type == 'research'.
+        """
+        from datetime import timedelta
+        from app.models import _utcnow
+
+        project = await _make_project(db_session, name="AutonomyDebug Rate Limit")
+        now = _utcnow()
+
+        # Research task within the last hour — should count.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "research"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(minutes=20),
+            )
+        )
+        # Another research task within the last hour — should also count.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "research"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(minutes=10),
+            )
+        )
+        # Non-research ORCHESTRATOR task within the last hour — must NOT count.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(minutes=15),
+            )
+        )
+        # Research task older than one hour — must NOT count.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "research"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(hours=2),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/autonomy-debug"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        assert "rate_limit" in data
+        tasks_this_hour = data["rate_limit"]["tasks_this_hour"]
+        assert tasks_this_hour == 2, (
+            f"Expected 2 research tasks this hour, got {tasks_this_hour}. "
+            "Non-research and out-of-window tasks must be excluded."
+        )
+
+
 class TestTaskTypeCostAdherence:
     @pytest.mark.asyncio
     async def test_requires_auth(self, override_get_session):

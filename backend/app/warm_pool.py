@@ -422,7 +422,9 @@ async def count_orphaned_leased_pool_vms(
     return int((await session.execute(stmt)).scalar() or 0)
 
 
-async def is_pool_cost_guard_engaged(session) -> bool:
+async def is_pool_cost_guard_engaged(
+    session, project_id: Optional[uuid.UUID] = None
+) -> bool:
     """True iff the cost-aware auto-drain guard is currently engaged.
 
     Cheap LIVE check — the in-memory dispatch funnel (lease-hit rate) plus a
@@ -433,17 +435,32 @@ async def is_pool_cost_guard_engaged(session) -> bool:
     to ``warm_pool_maintainer.evaluate_pool_cost_guard`` so the lease side (here)
     and the provision side (the maintainer's reconcile) engage on the SAME
     configurable thresholds and disengage together once a healthy hit rate
-    returns. Deferred import avoids a warm_pool <-> warm_pool_maintainer cycle.
+    returns. When ``project_id`` is supplied, also evaluates the per-project
+    guard (mirroring the maintainer's two-level check): if the fleet guard is
+    disengaged but the per-project guard is engaged, leasing is still blocked for
+    that project immediately — without waiting for the next maintainer tick to
+    drain idle members. Deferred import avoids a warm_pool <->
+    warm_pool_maintainer cycle.
 
     Degrades OPEN (returns False) on any evaluation error so a transient signal
     hiccup can never wedge the pool shut — the failure-based circuit breaker and
     the maintainer drain remain as backstops.
     """
     try:
-        from app.warm_pool_maintainer import evaluate_pool_cost_guard
+        from app.warm_pool_maintainer import (
+            evaluate_pool_cost_guard,
+            evaluate_project_pool_cost_guard,
+        )
 
         guard = await evaluate_pool_cost_guard(session, runtime_config=_runtime_config)
-        return bool(guard.get("engaged"))
+        if guard.get("engaged"):
+            return True
+        if project_id is not None:
+            per_guard = await evaluate_project_pool_cost_guard(
+                session, project_id, runtime_config=_runtime_config
+            )
+            return bool(per_guard.get("engaged"))
+        return False
     except Exception:
         logger.debug(
             "[WARM-POOL] cost-guard evaluation failed; treating as disengaged",
@@ -1005,7 +1022,7 @@ async def try_pool_dispatch(
     # cost-per-PR in the window before the maintainer drains idle members. The
     # guard reverses on its own (here and in the maintainer) once the hit rate
     # recovers above the configured floor.
-    if await is_pool_cost_guard_engaged(session):
+    if await is_pool_cost_guard_engaged(session, project_id=task.project_id):
         record_pool_lease_miss("cost_guard", project_id=task.project_id)
         return None
 

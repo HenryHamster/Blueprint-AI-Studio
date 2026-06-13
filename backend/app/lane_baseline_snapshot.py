@@ -67,6 +67,8 @@ def _compute_relay_medians(per_pr_breakdown: List[Dict[str, Any]]) -> Dict[str, 
             "gap_seconds": None,
             "task_count": None,
             "pr_count": 0,
+            "fix_active_seconds": None,
+            "review_active_seconds": None,
         }
 
     def _median(vals: List[float]) -> float | None:
@@ -85,6 +87,10 @@ def _compute_relay_medians(per_pr_breakdown: List[Dict[str, Any]]) -> Dict[str, 
         "gap_seconds": _median([r["gap_seconds"] for r in per_pr_breakdown]),
         "task_count": _median([float(r["task_count"]) for r in per_pr_breakdown]),
         "pr_count": len(per_pr_breakdown),
+        "fix_active_seconds": _median([r["fix_seconds"] for r in per_pr_breakdown]),
+        "review_active_seconds": _median(
+            [r["review_seconds"] for r in per_pr_breakdown]
+        ),
     }
 
 

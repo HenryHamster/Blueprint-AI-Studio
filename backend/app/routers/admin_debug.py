@@ -20,7 +20,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.models import (
     Task,
     TaskStatus,
@@ -760,19 +760,21 @@ async def get_autonomy_debug(
 
     # Guard 5: rate_limit_exceeded
     one_hour_ago = now - timedelta(hours=1)
-    recent_tasks_result = await session.execute(
-        select(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.created_by == "ORCHESTRATOR",
-            Task.created_at >= one_hour_ago,
+    dialect_name = resolve_dialect_name(session)
+    if dialect_name == "sqlite":
+        type_is_research = func.json_extract(Task.payloads, "$[0].type") == "research"
+    else:
+        type_is_research = Task.payloads[0]["type"].as_string() == "research"
+    tasks_this_hour = (
+        await session.execute(
+            select(func.count()).where(
+                Task.project_id == project_id,
+                Task.created_by == "ORCHESTRATOR",
+                Task.created_at >= one_hour_ago,
+                type_is_research,
+            )
         )
-        .limit(5000)
-    )
-    recent_tasks = recent_tasks_result.scalars().all()
-    tasks_this_hour = sum(
-        1 for t in recent_tasks if (t.first_payload).get("type") == "research"
-    )
+    ).scalar() or 0
     max_per_hour = project_parallelism_cap(
         project, "max_autonomous_tasks_per_hour", "max_autonomous_tasks_per_hour", 5
     )
