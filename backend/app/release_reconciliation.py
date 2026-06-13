@@ -1505,13 +1505,86 @@ async def _reconcile_if_managed_check_wait(
                     await session.commit()
                     return True
                 else:
-                    # Green CI but merge refused — non-check branch-protection
-                    # (e.g. required reviews not satisfied).
+                    # Green CI but merge refused — re-check the head's CI state
+                    # live before committing to a terminal failure.  A required
+                    # check may have flipped back to queued/pending between the
+                    # initial classification and the merge call (check re-run,
+                    # late-registered expectation).  protection_blocked_review is
+                    # reserved for the CI-independent reviews-required case where
+                    # retrying will not help.
                     msg = merge_result.get("message", "merge not completed")
+                    try:
+                        recheck_result = await github.get_check_runs_cached(
+                            token,
+                            owner,
+                            repo,
+                            pr_head_sha,
+                            project_id=str(version.project_id),
+                            treat_missing_as_success=False,
+                        )
+                        recheck_state = _classify_check_runs(recheck_result)
+                    except Exception as exc:  # noqa: BLE001 — fail-open, leave pending
+                        logger.warning(
+                            "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
+                            "for v%d merge refused (%s); CI re-check fetch failed (%s) "
+                            "— leaving pending for next sweep",
+                            pr_number,
+                            version.version_number,
+                            msg,
+                            exc,
+                        )
+                        classified_at = _utcnow()
+                        await _persist_managed_check_wait_snapshot(
+                            session,
+                            version.id,
+                            pr_number=int(pr_number),
+                            ci_state=_CI_PENDING,
+                            snapshot=_managed_check_wait_snapshot(
+                                ci_state=_CI_PENDING,
+                                classified_at=classified_at,
+                                head_sha=pr_head_sha,
+                                reason="merge_refused_recheck_failed",
+                                detail=str(msg)[:200],
+                            ),
+                        )
+                        return False
+
+                    if recheck_state != _CI_GREEN:
+                        # CI flipped back — transient race.  Leave pending so the
+                        # next sweep retries once CI settles again.
+                        logger.info(
+                            "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
+                            "for v%d merge refused (%s) and CI re-check is %s — "
+                            "leaving pending (transient race)",
+                            pr_number,
+                            version.version_number,
+                            msg,
+                            recheck_state,
+                        )
+                        classified_at = _utcnow()
+                        await _persist_managed_check_wait_snapshot(
+                            session,
+                            version.id,
+                            pr_number=int(pr_number),
+                            ci_state=recheck_state,
+                            snapshot=_managed_check_wait_snapshot(
+                                ci_state=recheck_state,
+                                classified_at=classified_at,
+                                head_sha=pr_head_sha,
+                                check_result=recheck_result,
+                                reason="merge_refused_ci_not_green",
+                                detail=str(msg)[:200],
+                            ),
+                        )
+                        return False
+
+                    # CI still green on re-check — the refusal is genuinely a
+                    # branch-protection / required-reviews block that a retry will
+                    # not resolve.  Record terminal failure.
                     logger.warning(
                         "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
-                        "for v%d merge refused despite green CI (%s) — recording "
-                        "protection_blocked_review",
+                        "for v%d merge refused despite green CI (re-check confirms "
+                        "green): %s — recording protection_blocked_review",
                         pr_number,
                         version.version_number,
                         msg,
