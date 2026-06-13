@@ -825,6 +825,11 @@ async def get_lane_diag(
         chain_limit=pr_breakdown_limit,
         escalation_alerts=alerts,
     )
+    from app.lane_baseline_snapshot import _compute_checkpoint_recovery_waste  # noqa: PLC0415
+
+    diag["checkpoint_recovery_waste"] = _compute_checkpoint_recovery_waste(
+        list(all_terminal_tasks)
+    )
     extra: dict = {
         "project_id": str(project_id) if project_id else None,
         "window_start": cutoff.isoformat(),

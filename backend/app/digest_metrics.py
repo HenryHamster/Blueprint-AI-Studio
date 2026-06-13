@@ -426,7 +426,9 @@ async def compute_trial_arm_accumulation(
         )
         # Receipt truthy: receipt key is explicitly true (SQLite json_extract returns 1 for JSON true).
         _receipt_truthy_flag_expr = (
-            case((_receipt_expr_for_delivery == 1, 1), else_=0) if _has_assignment else None
+            case((_receipt_expr_for_delivery == 1, 1), else_=0)
+            if _has_assignment
+            else None
         )
     else:
         _primary_expr = Task.context[_assign_key].astext
@@ -494,7 +496,14 @@ async def compute_trial_arm_accumulation(
         rows = (await session.execute(stmt)).all()
         with_assigned = with_receipt = without_assigned = without_receipt = 0
         with_assigned_delivered = without_contaminated = 0
-        for arm_val, succ_val, is_assigned_val, is_delivered_val, receipt_truthy_val, cnt in rows:
+        for (
+            arm_val,
+            succ_val,
+            is_assigned_val,
+            is_delivered_val,
+            receipt_truthy_val,
+            cnt,
+        ) in rows:
             cnt = int(cnt)
             is_assigned = bool(is_assigned_val)
             if _json_truthy(arm_val):
@@ -1807,12 +1816,22 @@ def compute_lane_baseline_trend(
             lower_is_better=True,
         )
 
+    crw_curr = latest.get("checkpoint_recovery_waste") or {}
+    crw_prev = prior.get("checkpoint_recovery_waste") or {}
+    crw_trend = _block(
+        float(crw_curr.get("total", 0)),
+        float(crw_prev.get("total", 0)),
+        threshold_abs=1.0,
+        lower_is_better=True,
+    )
+
     return {
         "latest_version": latest.get("version_number"),
         "prior_version": prior.get("version_number"),
         "relay_medians": relay_trend,
         "lane_iterations": lane_iter_trend,
         "waste_taxonomy_shares": waste_trend,
+        "checkpoint_recovery_waste_total": crw_trend,
     }
 
 

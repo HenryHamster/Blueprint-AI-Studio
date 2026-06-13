@@ -10,12 +10,14 @@ import pytest
 from app.lane_baseline_snapshot import (
     DESIGN_DOC_KEY,
     _MAX_BASELINES_STORED,
+    _compute_checkpoint_recovery_waste,
     _compute_relay_medians,
     backfill_missing_lane_baselines,
     persist_version_lane_baseline,
     read_version_lane_baseline,
 )
 from app.models import ReleaseVersion, TaskStatus
+from app.review_fix_lane_pilot import LANE_RECOVERY_REASON_KEY
 from app.time_utils import _utcnow
 from testing.factories import make_project, make_task
 
@@ -447,3 +449,136 @@ class TestBackfillMissingLaneBaselines:
         """backfill returns an empty list without error for a nonexistent project."""
         backfilled = await backfill_missing_lane_baselines(project_id=uuid.uuid4())
         assert backfilled == []
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint recovery waste tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeCheckpointRecoveryWaste:
+    def test_no_recovery_tasks_returns_zero_totals(self):
+        """A version with no recovery tasks produces zero counts."""
+        tasks = [make_task(context={"review_loop": {"pr_number": "1"}})]
+        result = _compute_checkpoint_recovery_waste(tasks)
+        assert result == {"by_reason": {}, "total": 0, "exhausted_count": 0}
+
+    def test_single_recovery_task_counted(self):
+        """A single recovery task is counted under its reason."""
+        tasks = [
+            make_task(context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"}),
+        ]
+        result = _compute_checkpoint_recovery_waste(tasks)
+        assert result["total"] == 1
+        assert result["by_reason"] == {"checkpoint_missing": 1}
+        assert result["exhausted_count"] == 0
+
+    def test_multiple_tasks_same_reason_aggregated(self):
+        """Multiple recovery tasks with the same reason are summed."""
+        tasks = [
+            make_task(context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"}),
+            make_task(context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"}),
+            make_task(context={"review_loop": {"pr_number": "99"}}),  # non-recovery
+        ]
+        result = _compute_checkpoint_recovery_waste(tasks)
+        assert result["total"] == 2
+        assert result["by_reason"] == {"checkpoint_missing": 2}
+
+    def test_multiple_reasons_grouped_separately(self):
+        """Tasks with distinct reason values form separate by_reason buckets."""
+        tasks = [
+            make_task(context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"}),
+            make_task(context={LANE_RECOVERY_REASON_KEY: "some_other_reason"}),
+        ]
+        result = _compute_checkpoint_recovery_waste(tasks)
+        assert result["total"] == 2
+        assert result["by_reason"]["checkpoint_missing"] == 1
+        assert result["by_reason"]["some_other_reason"] == 1
+
+    def test_empty_task_list_returns_zero(self):
+        """Empty task list returns all-zero result."""
+        result = _compute_checkpoint_recovery_waste([])
+        assert result == {"by_reason": {}, "total": 0, "exhausted_count": 0}
+
+    def test_task_with_none_context_skipped(self):
+        """Tasks with None context are skipped without error."""
+        task = make_task()
+        task.context = None
+        result = _compute_checkpoint_recovery_waste([task])
+        assert result["total"] == 0
+
+
+class TestPersistCheckpointRecoveryWasteInBaseline:
+    @pytest.mark.asyncio
+    async def test_persist_includes_checkpoint_recovery_waste(self, db_session):
+        """persist_version_lane_baseline folds checkpoint_recovery_waste into baseline."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        opened = now - timedelta(days=7)
+        closed = now - timedelta(days=1)
+
+        # Two recovery tasks in the version window
+        for _ in range(2):
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "fix", "prompt": "recover"}],
+                context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"},
+                created_at=opened + timedelta(hours=2),
+                started_at=opened + timedelta(hours=2),
+                status_log=[
+                    {
+                        "s": "COMPLETED",
+                        "t": (opened + timedelta(hours=3)).isoformat(),
+                    }
+                ],
+            )
+            db_session.add(task)
+        await db_session.commit()
+
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=10,
+            opened_at=opened,
+            closed_at=closed,
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+        crw = result.get("checkpoint_recovery_waste")
+        assert crw is not None
+        assert crw["total"] == 2
+        assert crw["by_reason"] == {"checkpoint_missing": 2}
+        assert crw["exhausted_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_persist_no_recovery_tasks_zero_waste(self, db_session):
+        """A version window with no recovery tasks produces a zero-waste block."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=11,
+            opened_at=now - timedelta(days=14),
+            closed_at=now - timedelta(days=7),
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+        crw = result.get("checkpoint_recovery_waste")
+        assert crw is not None
+        assert crw["total"] == 0
+        assert crw["by_reason"] == {}
+        assert crw["exhausted_count"] == 0
