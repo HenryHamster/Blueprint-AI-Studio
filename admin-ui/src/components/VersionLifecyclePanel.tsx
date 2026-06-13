@@ -574,7 +574,7 @@ function AuditFindingsList({ audit }: { audit: LatestAudit }) {
       {sorted.map((f, i) => (
         <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
           <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
-          <span>{f.summary}</span>
+          <span className="min-w-0 break-words">{f.summary}</span>
         </div>
       ))}
     </div>
@@ -743,7 +743,7 @@ function DurableQualificationEvidenceRow({ q }: { q: DurableQualificationEvidenc
     chips.push(
       <span
         key="test-erosion-detail"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
         title={formatCompactDetail(q.test_erosion_detail)}
       >
         erosion {formatCompactDetail(q.test_erosion_detail)}
@@ -754,7 +754,7 @@ function DurableQualificationEvidenceRow({ q }: { q: DurableQualificationEvidenc
     chips.push(
       <span
         key="smoketest-detail"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
         title={formatCompactDetail(q.smoketest_detail)}
       >
         smoke {formatCompactDetail(q.smoketest_detail)}
@@ -1334,12 +1334,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     {optimisticPromotionEnabled ? 'LIVE' : 'DRY-RUN'}
                   </span>
                   {projectId && userRole === 'admin' && (
-                    // eslint-disable-next-line viewport/min-touch-target
                     <button
                       onClick={handleTogglePromotionEnabled}
                       disabled={actionLoading !== null}
                       className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                       title="Changes promotion mode for all projects"
+                      data-viewport-allow-small-target
                     >
                       {actionLoading === 'promotion' ? '…' : optimisticPromotionEnabled ? 'Disable' : 'Enable'}
                     </button>
@@ -1355,31 +1355,31 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     </span>
                     {projectId && userRole === 'admin' && (
                       <>
-                        {/* eslint-disable-next-line viewport/min-touch-target */}
                         <button
                           onClick={() => handleSetProjectPromotion(true)}
                           disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === true)}
                           className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                           title="Arm live promotion for this project only"
+                          data-viewport-allow-small-target
                         >
                           {actionLoading === 'project-promotion' ? '…' : 'Arm'}
                         </button>
-                        {/* eslint-disable-next-line viewport/min-touch-target */}
                         <button
                           onClick={() => handleSetProjectPromotion(false)}
                           disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === false)}
                           className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                           title="Hold live promotion for this project only"
+                          data-viewport-allow-small-target
                         >
                           Hold
                         </button>
                         {data.promotion_enabled_source === 'project' && (
-                          // eslint-disable-next-line viewport/min-touch-target
                           <button
                             onClick={() => handleSetProjectPromotion(null)}
                             disabled={actionLoading !== null}
                             className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                             title="Clear this project's override and follow the fleet default"
+                            data-viewport-allow-small-target
                           >
                             Use fleet default
                           </button>
@@ -1428,15 +1428,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   rows={2}
                 />
                 <div className="flex gap-1">
-                  {/* eslint-disable-next-line viewport/min-touch-target */}
                   <button
                     onClick={handleSetGoal}
                     disabled={actionLoading !== null}
                     className="text-[10px] px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    data-viewport-allow-small-target
                   >
                     {actionLoading === 'goal' ? '…' : 'Save'}
                   </button>
-                  {/* eslint-disable-next-line viewport/min-touch-target */}
                   <button
                     onClick={() => {
                       setEditingGoal(false);
@@ -1444,6 +1443,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     }}
                     disabled={actionLoading !== null}
                     className="text-[10px] px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    data-viewport-allow-small-target
                   >
                     Cancel
                   </button>
@@ -1469,7 +1469,6 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       <span className="text-neutral-600">Live focus: </span>{cv.live_current_focus}
                     </p>
                     {projectId && (
-                      // eslint-disable-next-line viewport/min-touch-target
                       <button
                         onClick={() => {
                           setGoalInput(cv.live_current_focus || '');
@@ -1477,6 +1476,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                         }}
                         disabled={actionLoading !== null}
                         className="text-[10px] px-1.5 py-0.5 w-fit rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        data-viewport-allow-small-target
                       >
                         Resync to focus
                       </button>
@@ -1484,22 +1484,22 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </div>
                 )}
                 {projectId && (
-                  // eslint-disable-next-line viewport/min-touch-target
                   <button
                     onClick={() => setEditingGoal(true)}
                     disabled={actionLoading !== null}
                     className="text-[10px] px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    data-viewport-allow-small-target
                   >
                     Edit
                   </button>
                 )}
               </div>
             ) : projectId ? (
-              // eslint-disable-next-line viewport/min-touch-target
               <button
                 onClick={() => setEditingGoal(true)}
                 disabled={actionLoading !== null}
                 className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                data-viewport-allow-small-target
               >
                 Set goal
               </button>
@@ -1697,15 +1697,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                         maxLength={200}
                         className="text-[10px] flex-1 bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-0.5 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
                       />
-                      {/* eslint-disable-next-line viewport/min-touch-target */}
                       <button
                         onClick={handleCutVersion}
                         disabled={actionLoading !== null}
                         className="text-[10px] px-2 py-0.5 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        data-viewport-allow-small-target
                       >
                         {actionLoading === 'cut' ? '…' : 'Cut'}
                       </button>
-                      {/* eslint-disable-next-line viewport/min-touch-target */}
                       <button
                         onClick={() => {
                           setCuttingVersion(false);
@@ -1713,6 +1712,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                         }}
                         disabled={actionLoading !== null}
                         className="text-[10px] px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        data-viewport-allow-small-target
                       >
                         Cancel
                       </button>

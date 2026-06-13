@@ -1487,7 +1487,9 @@ async def compute_lane_pilot_aggregates(
                 _chain_lane_id_expr,
             ).where(
                 Task.project_id == project_id,
-                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                Task.status.in_(
+                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                ),
                 _arm_expr.in_(["lane", "control"]),
             )
         )
@@ -1523,7 +1525,9 @@ async def compute_lane_pilot_aggregates(
     if lane_ids:
         lane_rows = (
             await session.execute(
-                select(ImprovementLane.id, ImprovementLane.reserved_idle_cost_usd_total).where(
+                select(
+                    ImprovementLane.id, ImprovementLane.reserved_idle_cost_usd_total
+                ).where(
                     ImprovementLane.project_id == project_id,
                     ImprovementLane.pilot_arm == "lane",
                     ImprovementLane.id.in_(lane_ids),
