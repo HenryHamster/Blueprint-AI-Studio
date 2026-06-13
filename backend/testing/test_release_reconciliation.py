@@ -4923,6 +4923,81 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
 
 
 @pytest.mark.asyncio
+async def test_managed_check_wait_defers_on_migration_metadata_unfetchable(
+    db_session, mocker
+):
+    """When CI is green but the migration metadata cannot be fetched, the guard
+    verdict is ``defer`` — the reconciler must leave the version PENDING for the
+    next sweep, NOT record a terminal ``migration_guard_blocked`` failure.
+
+    A large migration-carrying rollup whose diff momentarily 406s would
+    otherwise be bounced to stabilize on a transient metadata fetch error; the
+    3-way verdict keeps it in managed_check_wait until the metadata is readable.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "feedface" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    # CI is green — reaches the pre-merge Alembic guard.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "completed", "conclusion": "success", "details": []}
+        ),
+    )
+    # The PR touches a migration file, but the diff fetch fails → guard "defer".
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0042_x.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(side_effect=RuntimeError("502 from GitHub")),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Deferred — not terminal. The version stays pending for the next sweep and
+    # the merge never ran.
+    assert reconciled is False
+    merge_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["promotion_pending"]["managed_check_wait"] is True
+    assert "error" not in version.last_qualification
+
+
+@pytest.mark.asyncio
 async def test_managed_check_wait_out_of_band_landing_records_promoted(
     db_session, mocker
 ):
