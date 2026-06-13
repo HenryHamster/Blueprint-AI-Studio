@@ -26,7 +26,7 @@ from typing import Optional
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models import PoolVm, PoolVmState, Task
+from app.models import PoolVm, PoolVmState, Task, TaskStatus
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -336,6 +336,58 @@ async def count_live_pool_vms(
         select(func.count())
         .select_from(PoolVm)
         .where(PoolVm.state.in_(LIVE_POOL_STATES))
+    )
+    if project_id is not None:
+        stmt = stmt.where(PoolVm.project_id == project_id)
+    return int((await session.execute(stmt)).scalar() or 0)
+
+
+# Terminal task statuses for orphaned-lease detection. A LEASED pool member whose
+# backing task is in one of these (or whose task row has vanished) is an ORPHANED
+# lease: the agent run is over, so the VM no longer backs active dispatch work.
+# EVALUATING is deliberately EXCLUDED — an EVALUATING task is still legitimately
+# in flight (waiting on its own children / a chain handoff), mirroring the
+# ``pool_lease_orphaned`` reclaim in warm_pool_maintainer.
+_ORPHANED_LEASE_TERMINAL_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+)
+
+
+async def count_orphaned_leased_pool_vms(
+    session, *, project_id: Optional[uuid.UUID] = None
+) -> int:
+    """Count LEASED pool members whose backing task is terminal or missing.
+
+    Slot accounting (orchestrator dispatch loop) assumes a LEASED member is
+    running an active task and is therefore already counted in ``active_count``
+    (PROVISIONING/IN_PROGRESS tasks), so it deliberately does NOT subtract LEASED
+    members from the GCP cross-check. When a leased member's task reaches a
+    terminal state — or its row vanishes — without the lease being released (e.g.
+    a leader crash / Cloud-Run cutover cancels the release mid-flight), the row
+    lingers in LEASED. Such a member is in neither ``active_count`` nor
+    ``IDLE_POOL_STATES``, so without this it phantom-consumes a dispatch slot
+    forever, latching ``orchestrator_slots_full`` (prod 2026-06-13: a leader-flap
+    deploy left ~16 stale leases that pinned ``slots_available`` at 0 with 0
+    active tasks — a total dispatch freeze).
+
+    Counting these lets the dispatcher exclude them from the budget as reclaimable
+    inventory rather than consumed capacity; the maintainer's
+    ``pool_lease_orphaned`` reaper tears the underlying VMs down out-of-band.
+    """
+    stmt = (
+        select(func.count())
+        .select_from(PoolVm)
+        .outerjoin(Task, Task.id == PoolVm.leased_task_id)
+        .where(
+            PoolVm.state == PoolVmState.LEASED,
+            or_(
+                PoolVm.leased_task_id.is_(None),
+                Task.id.is_(None),
+                Task.status.in_(_ORPHANED_LEASE_TERMINAL_STATUSES),
+            ),
+        )
     )
     if project_id is not None:
         stmt = stmt.where(PoolVm.project_id == project_id)

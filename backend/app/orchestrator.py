@@ -1798,25 +1798,48 @@ async def orchestrator_worker():
                 # non-task-bound pool members (PROVISIONING/IDLE) from the GCP
                 # cross-check — they live in a dedicated pool budget
                 # (warm_pool_max_vms, enforced by the maintainer), NOT the dispatch
-                # budget. LEASED pool members run a task and are already counted in
-                # active_count, so they must NOT be subtracted.
-                from app.warm_pool import count_idle_pool_vms, is_warm_pool_enabled
+                # budget. A LEASED member running an ACTIVE task is already counted
+                # in active_count, so it must NOT be subtracted — but a LEASED member
+                # whose task is terminal/gone (an ORPHANED lease) is in neither
+                # active_count nor IDLE_POOL_STATES and IS subtracted below.
+                from app.warm_pool import (
+                    count_idle_pool_vms,
+                    count_orphaned_leased_pool_vms,
+                    is_warm_pool_enabled,
+                )
 
                 # Only subtract idle pool inventory when the pool is enabled. When
                 # disabled the maintainer/idle-sweep early-return and never clear
                 # PoolVm rows, but the generic GCP cleanup still deletes the
                 # underlying VMs — so stale IDLE rows would over-subtract here,
                 # inflating slots_available past max_concurrent_vms. Gate it off.
+                _pool_enabled = is_warm_pool_enabled()
                 idle_pool_count = (
-                    await count_idle_pool_vms(session) if is_warm_pool_enabled() else 0
+                    await count_idle_pool_vms(session) if _pool_enabled else 0
                 )
-                gcp_dispatch_vms = max(0, actual_vm_count - idle_pool_count)
+                # Also exclude ORPHANED leases: LEASED pool rows whose task already
+                # reached a terminal state (or vanished) without the lease being
+                # released — e.g. a leader crash / Cloud-Run cutover cancelled the
+                # release mid-flight. Like idle inventory these are not in-flight
+                # work, but unlike a healthy LEASED member they are NOT in
+                # active_count (their task is gone), so without subtracting them they
+                # phantom-consume the dispatch budget and latch slots_full forever
+                # (prod 2026-06-13: a leader-flap deploy left ~16 stale leases that
+                # pinned slots_available at 0 with 0 active tasks — total dispatch
+                # freeze). Gated on the pool being enabled, same as idle_pool_count.
+                orphaned_leased_count = (
+                    await count_orphaned_leased_pool_vms(session) if _pool_enabled else 0
+                )
+                gcp_dispatch_vms = max(
+                    0, actual_vm_count - idle_pool_count - orphaned_leased_count
+                )
                 effective_count = max(active_count, gcp_dispatch_vms)
                 if gcp_dispatch_vms > active_count + 2:
                     logger.warning(
                         f"[ORCHESTRATOR] GCP VM count ({actual_vm_count}, "
-                        f"{idle_pool_count} idle-pool) > DB active count ({active_count}) "
-                        f"— possible orphans, using GCP count for slot calculation"
+                        f"{idle_pool_count} idle-pool, {orphaned_leased_count} orphaned-lease) "
+                        f"> DB active count ({active_count}) — possible orphans, "
+                        f"using GCP count for slot calculation"
                     )
                 slots_available = max(
                     0, _runtime_config["max_concurrent_vms"] - effective_count
