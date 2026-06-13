@@ -334,4 +334,44 @@ describe('ImprovementLanesPanel', () => {
     expect(badges[4]?.className).toContain('text-red-300');
     expect(badges[4]?.textContent).toBe('KILLED');
   });
+
+  test('shows preflight error indicator when preflight fetch fails', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchLanePilotPreflight.mockRejectedValueOnce(new Error('Network error'));
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    expect(await screen.findByText('Preflight data unavailable')).toBeTruthy();
+    expect(screen.queryByTestId('lane-pilot-preflight')).toBeNull();
+  });
+
+  test('does not show error indicator when preflight returns null (no pilot configured)', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchLanePilotPreflight.mockResolvedValueOnce(null);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    expect(screen.queryByText('Preflight data unavailable')).toBeNull();
+    expect(screen.queryByTestId('lane-pilot-preflight')).toBeNull();
+  });
+
+  test('shows preflight widget when preflight data is available', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchLanePilotPreflight.mockResolvedValueOnce({
+      ready: true,
+      pilot_mode: 'on',
+      durable_verdict: 'MAINTAIN',
+      checks: [
+        { name: 'project_ready', met: true, blocking_value: null, fix_hint: null },
+        { name: 'seed_approved', met: true, blocking_value: null, fix_hint: null },
+      ],
+    });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    expect(await screen.findByTestId('lane-pilot-preflight')).toBeTruthy();
+    expect(screen.getByText('Pilot ready to enable')).toBeTruthy();
+    expect(screen.queryByText('Preflight data unavailable')).toBeNull();
+  });
 });
