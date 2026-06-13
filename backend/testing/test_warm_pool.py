@@ -206,6 +206,72 @@ async def test_lease_returns_only_compatible_same_tenant_idle(db_session):
 
 
 @pytest.mark.asyncio
+async def test_count_orphaned_leased_pool_vms(db_session):
+    """Slot accounting must count a LEASED member whose task is terminal/gone
+    (it phantom-consumes a dispatch slot), but NOT one backing an active task
+    (counted in active_count) nor an EVALUATING one (still in flight). Regression
+    for the 2026-06-13 leader-flap dispatch freeze: ~16 stale leases pinned
+    slots_available at 0 with 0 active tasks."""
+    from app.warm_pool import count_orphaned_leased_pool_vms
+
+    project = await _make_project(db_session, name="Orphan Lease A")
+    other = await _make_project(db_session, name="Orphan Lease B")
+
+    async def _leased(vm_id, *, task_status=None, missing=False, proj=None):
+        member = await register_pool_vm(
+            db_session,
+            vm_instance_id=vm_id,
+            project_id=(proj or project).id,
+            account_id="acct-1",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            state=PoolVmState.LEASED,
+        )
+        if missing:
+            # leased_task_id points at a task row that does not exist (vanished).
+            member.leased_task_id = uuid.uuid4()
+        elif task_status is not None:
+            task = Task(
+                project_id=(proj or project).id,
+                payloads=[{"type": "create"}],
+                status=task_status,
+            )
+            db_session.add(task)
+            await db_session.flush()
+            member.leased_task_id = task.id
+        return member
+
+    # ORPHANED (counted): terminal task, vanished task, or no lease binding.
+    await _leased("vm-completed", task_status=TaskStatus.COMPLETED)
+    await _leased("vm-failed", task_status=TaskStatus.FAILED)
+    await _leased("vm-cancelled", task_status=TaskStatus.CANCELLED)
+    await _leased("vm-missing", missing=True)
+    await _leased("vm-null-lease")  # LEASED with leased_task_id=None
+    # NOT orphaned (excluded): active task is already in active_count; EVALUATING
+    # is still legitimately in flight.
+    await _leased("vm-provisioning", task_status=TaskStatus.PROVISIONING)
+    await _leased("vm-inprogress", task_status=TaskStatus.IN_PROGRESS)
+    await _leased("vm-evaluating", task_status=TaskStatus.EVALUATING)
+    # Non-LEASED inventory is never counted here (handled by count_idle_pool_vms).
+    await register_pool_vm(
+        db_session, vm_instance_id="vm-idle", project_id=project.id,
+        state=PoolVmState.IDLE,
+    )
+    await register_pool_vm(
+        db_session, vm_instance_id="vm-prov", project_id=project.id,
+        state=PoolVmState.PROVISIONING,
+    )
+    # An orphaned lease in a DIFFERENT tenant — counted fleet-wide, excluded by filter.
+    await _leased("vm-other-orphan", task_status=TaskStatus.COMPLETED, proj=other)
+    await db_session.commit()
+
+    # 5 orphaned in `project` + 1 in `other` = 6 fleet-wide.
+    assert await count_orphaned_leased_pool_vms(db_session) == 6
+    assert await count_orphaned_leased_pool_vms(db_session, project_id=project.id) == 5
+    assert await count_orphaned_leased_pool_vms(db_session, project_id=other.id) == 1
+
+
+@pytest.mark.asyncio
 async def test_lease_returns_none_when_no_compatible_member(db_session):
     project = await _make_project(db_session, name="Lease None")
     await register_pool_vm(
