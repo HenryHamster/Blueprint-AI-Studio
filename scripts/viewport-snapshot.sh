@@ -12,6 +12,10 @@
 #   bash scripts/viewport-snapshot.sh                 # auto-scope vs origin/<base>
 #   bash scripts/viewport-snapshot.sh --base main     # explicit base ref
 #   bash scripts/viewport-snapshot.sh TaskCard Kanban # explicit component names
+#   bash scripts/viewport-snapshot.sh --upload --task-id <id>  # capture, then
+#       PUT changed/new before/after PNGs to GCS and publish the manifest at
+#       /tmp/viewport_manifest_<id>.json for ./pr to inject into the PR body.
+#       Requires ORCHESTRATOR_URL + AGENT_API_TOKEN in the environment.
 #
 # It is INFORMATIONAL and never a gate: it exits 0 even when pairs differ. The
 # one non-zero exit is 75 with the VIEWPORT_GATE_INFRA_UNAVAILABLE sentinel on a
@@ -27,16 +31,28 @@ cd "$REPO_ROOT" || { echo "viewport-snapshot: cannot cd to repo root" >&2; exit 
 
 # ── args ────────────────────────────────────────────────────────────────────
 BASE="automain"
+UPLOAD=0
+TASK_ID=""
 COMPONENTS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) BASE="${2:-}"; shift 2 ;;
     --base=*) BASE="${1#*=}"; shift ;;
-    --upload) echo "viewport-snapshot: --upload is a Phase 1 feature, ignored in Phase 0" >&2; shift ;;
+    --upload) UPLOAD=1; shift ;;
+    --task-id) TASK_ID="${2:-}"; shift 2 ;;
+    --task-id=*) TASK_ID="${1#*=}"; shift ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) COMPONENTS+=("$1"); shift ;;
   esac
 done
+
+# --upload PUTs the changed/new before/after PNGs to GCS via the task-scoped
+# signed-URL endpoint and copies the manifest to a known path so ./pr can inject
+# the screenshots block. It is task-bound, so --task-id is mandatory.
+if [ "$UPLOAD" = "1" ] && [ -z "$TASK_ID" ]; then
+  echo "viewport-snapshot: --upload requires --task-id <id>" >&2
+  exit 1
+fi
 
 RUN_ID="${VIEWPORT_RUN_ID:-$$}"
 SHOT_ROOT="/tmp/viewport_shots/$RUN_ID"
@@ -194,5 +210,65 @@ fi
 python3 "$REPO_ROOT/scripts/viewport_manifest.py" "$BEFORE_DIR" "$AFTER_DIR" "${BASE_REF:-$BASE}" "$RUN_ID" "$MANIFEST" || {
   echo "viewport-snapshot: manifest generation failed (non-fatal)" >&2
 }
+
+# ── Phase 1: upload changed/new pairs + publish manifest at a known path ─────
+# PUTs each changed/new before/after PNG to the private GCS artifact bucket via
+# the task-scoped signed-PUT endpoint, then copies the manifest to
+# /tmp/viewport_manifest_<task_id>.json where ./pr (pr-helper.ts) reads it to
+# render the <!-- blueprint:screenshots --> block. The upload `name` is the
+# pair's `test` slug; the backend stores the object under
+# sanitize(name)-<width>-<phase>.png, and the PR renderer reconstructs the same
+# download name, so the two paths always agree. Bounded to 12 pairs (24 PNGs),
+# mirroring the backend's 24-entry context cap. Every failure is non-fatal:
+# snapshotting stays informational and never gates ./pr.
+if [ "$UPLOAD" = "1" ]; then
+  if [ ! -f "$MANIFEST" ]; then
+    echo "viewport-snapshot: --upload: no manifest at $MANIFEST; nothing to upload" >&2
+  else
+    : "${ORCHESTRATOR_URL:?viewport-snapshot: --upload requires ORCHESTRATOR_URL}"
+    : "${AGENT_API_TOKEN:?viewport-snapshot: --upload requires AGENT_API_TOKEN}"
+    UP_OK=0
+    UP_FAIL=0
+    # One TSV row (phase<TAB>test<TAB>width<TAB>png) per PNG to upload:
+    # changed pairs contribute before+after; new pairs contribute after only.
+    # Heredoc (not a pipe) so the counters survive in this shell.
+    while IFS="$(printf '\t')" read -r _phase _test _width _png; do
+      [ -z "$_png" ] && continue
+      if [ ! -f "$_png" ]; then
+        echo "viewport-snapshot: --upload: PNG not found, skipping: $_png" >&2
+        UP_FAIL=$((UP_FAIL + 1)); continue
+      fi
+      _resp=$(curl -sf -X POST \
+        -H "X-Agent-Token: ${AGENT_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"task_id\":\"${TASK_ID}\",\"name\":\"${_test}\",\"width\":${_width},\"phase\":\"${_phase}\"}" \
+        "${ORCHESTRATOR_URL}/api/agent/viewport/screenshot-upload-url") || _resp=""
+      _url=$(printf '%s' "$_resp" | jq -r '.upload_url // empty' 2>/dev/null || true)
+      if [ -z "$_url" ]; then
+        echo "viewport-snapshot: --upload: signing failed for ${_test}-${_width}-${_phase}" >&2
+        UP_FAIL=$((UP_FAIL + 1)); continue
+      fi
+      if curl -sf -T "$_png" -H "Content-Type: image/png" "$_url"; then
+        echo "viewport-snapshot: --upload: uploaded ${_test}-${_width}-${_phase}"
+        UP_OK=$((UP_OK + 1))
+      else
+        echo "viewport-snapshot: --upload: PUT failed for ${_test}-${_width}-${_phase}" >&2
+        UP_FAIL=$((UP_FAIL + 1))
+      fi
+    done <<EOF
+$(jq -r '.pairs
+  | map(select((.status == "changed" or .status == "new") and .width != null))[0:12][]
+  | (if .status == "changed" and .before then "before\t\(.test)\t\(.width)\t\(.before)" else empty end),
+    (if .after then "after\t\(.test)\t\(.width)\t\(.after)" else empty end)' "$MANIFEST" 2>/dev/null)
+EOF
+    # Publish the manifest at the path pr-helper.ts reads (task-deterministic).
+    if cp "$MANIFEST" "/tmp/viewport_manifest_${TASK_ID}.json" 2>/dev/null; then
+      echo "viewport-snapshot: --upload: manifest published to /tmp/viewport_manifest_${TASK_ID}.json"
+    else
+      echo "viewport-snapshot: --upload: WARN failed to publish manifest copy" >&2
+    fi
+    echo "viewport-snapshot: --upload: summary — ${UP_OK} uploaded, ${UP_FAIL} failed"
+  fi
+fi
 
 exit 0

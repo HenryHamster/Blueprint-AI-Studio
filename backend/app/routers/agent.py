@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -3981,6 +3981,88 @@ async def get_viewport_failure_screenshot_upload_url(
 
     ctx = dict(task.context or {})
     ctx["viewport_failure_screenshot_uri"] = storage_uri
+    task.context = ctx
+    flag_modified(task, "context")
+    session.add(task)
+    await session.commit()
+
+    return {"upload_url": upload_url, "storage_uri": storage_uri}
+
+
+class ViewportScreenshotUploadUrlRequest(BaseModel):
+    task_id: uuid.UUID
+    name: str = Field(max_length=200)
+    width: int = Field(ge=1, le=4096)
+    phase: Literal["before", "after"]
+
+
+@router.post("/viewport/screenshot-upload-url")
+@limiter.limit("120/minute")
+async def get_viewport_screenshot_upload_url(
+    request: Request,
+    req: ViewportScreenshotUploadUrlRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Generate a signed upload URL for a task-scoped before/after viewport screenshot.
+
+    The object path (viewport-shots/{project_id}/{task_id}/{safe_name}-{width}-{phase}.png)
+    is task-scoped to avoid collisions across tasks.  The storage_uri is appended to
+    task.context["viewport_screenshots"] (capped at 24 entries) so the PR renderer can
+    later retrieve the list and inject the screenshots into the PR body.
+    """
+    if str(req.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    stmt = select(Task).where(Task.id == req.task_id)
+    task = (await session.execute(stmt)).scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    import datetime as _dt
+    import re as _re
+
+    from google.cloud import storage as _gcs
+
+    from app.storage import ARTIFACT_BUCKET_NAME, GCP_PROJECT_ID
+
+    _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
+    safe_name = _SAFE_NAME_RE.sub("_", req.name)[:100]
+
+    screenshots = list((task.context or {}).get("viewport_screenshots", []))
+    if len(screenshots) >= 24:
+        raise HTTPException(status_code=429, detail="Upload cap reached")
+
+    object_name = f"viewport-shots/{task.project_id}/{task.id}/{safe_name}-{req.width}-{req.phase}.png"
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    def _generate() -> str:
+        blob = (
+            _gcs.Client(project=GCP_PROJECT_ID)
+            .bucket(ARTIFACT_BUCKET_NAME)
+            .blob(object_name)
+        )
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=_dt.timedelta(minutes=15),
+            method="PUT",
+            content_type="image/png",
+        )
+
+    try:
+        upload_url = await asyncio.to_thread(_generate)
+    except Exception as exc:
+        logger.warning(
+            "[VIEWPORT] signed upload URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(
+            status_code=503, detail="Artifact storage unavailable"
+        ) from exc
+
+    ctx = dict(task.context or {})
+    entry_name = f"{safe_name}-{req.width}-{req.phase}"
+    screenshots.append({"name": entry_name, "storage_uri": storage_uri})
+    ctx["viewport_screenshots"] = screenshots
     task.context = ctx
     flag_modified(task, "context")
     session.add(task)
