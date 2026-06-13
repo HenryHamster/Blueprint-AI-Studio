@@ -1024,7 +1024,11 @@ async def promote(
     # and let the reconciler re-run the guard on the next sweep (branch KEPT).
     # Only 'ok' proceeds to the merge. enforce_premerge_migration_guard (the
     # bool wrapper) is NOT used here because it collapses defer→hold, which for
-    # this release site means a spurious terminal failure.
+    # this release site means a spurious terminal failure: a large migration-
+    # carrying rollup whose metadata is momentarily unfetchable would be bounced
+    # to stabilize and re-qualify forever instead of simply retrying once the
+    # metadata is available. This is the missing hard backstop at merge time,
+    # NOT a replacement for the structural sync gate (which stays as-is).
     from app.rollup_migration_validation import _validate_rollup_migration_chain
 
     migration_verdict, hold_reason = await _validate_rollup_migration_chain(
