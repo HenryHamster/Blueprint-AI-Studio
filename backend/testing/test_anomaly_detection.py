@@ -423,9 +423,24 @@ async def test_declining_merge_rate_uses_verified_not_raw_count():
         "paths": [],
         "research_history": [
             # raw rate 1.0 each cycle; verified rate 0.80 → 0.40 → 0.00
-            {"tasks_created": 5, "prs_merged": 5, "verified_prs_merged": 4, "tasks_failed": 0},
-            {"tasks_created": 5, "prs_merged": 5, "verified_prs_merged": 2, "tasks_failed": 0},
-            {"tasks_created": 5, "prs_merged": 5, "verified_prs_merged": 0, "tasks_failed": 0},
+            {
+                "tasks_created": 5,
+                "prs_merged": 5,
+                "verified_prs_merged": 4,
+                "tasks_failed": 0,
+            },
+            {
+                "tasks_created": 5,
+                "prs_merged": 5,
+                "verified_prs_merged": 2,
+                "tasks_failed": 0,
+            },
+            {
+                "tasks_created": 5,
+                "prs_merged": 5,
+                "verified_prs_merged": 0,
+                "tasks_failed": 0,
+            },
         ],
     }
     project = make_project(directions=[direction])
@@ -453,9 +468,24 @@ async def test_degraded_merges_do_not_fabricate_declining_trend():
         "priority": "medium",
         "paths": [],
         "research_history": [
-            {"tasks_created": 5, "prs_merged": 5, "verified_prs_merged": 2, "tasks_failed": 0},
-            {"tasks_created": 5, "prs_merged": 3, "verified_prs_merged": 2, "tasks_failed": 0},
-            {"tasks_created": 5, "prs_merged": 1, "verified_prs_merged": 2, "tasks_failed": 0},
+            {
+                "tasks_created": 5,
+                "prs_merged": 5,
+                "verified_prs_merged": 2,
+                "tasks_failed": 0,
+            },
+            {
+                "tasks_created": 5,
+                "prs_merged": 3,
+                "verified_prs_merged": 2,
+                "tasks_failed": 0,
+            },
+            {
+                "tasks_created": 5,
+                "prs_merged": 1,
+                "verified_prs_merged": 2,
+                "tasks_failed": 0,
+            },
         ],
     }
     project = make_project(directions=[direction])
@@ -553,6 +583,152 @@ async def test_low_direction_failure_rate_no_anomaly():
     assert not any(
         "d-lowfail1" in a["signal"] and "failure rate" in a["signal"] for a in result
     )
+
+
+@pytest.mark.asyncio
+async def test_direction_fail_rate_excludes_infra_failures():
+    """Direction whose last 2 cycles' failures are entirely infra must NOT fire the fail-rate anomaly."""
+    project_id = uuid.uuid4()
+    direction = {
+        "id": "d-infrafail1",
+        "text": "Improve infra reliability",
+        "status": "active",
+        "priority": "high",
+        "paths": [],
+        "research_history": [
+            # All failures are infra — non-infra rate = 0%
+            {
+                "tasks_created": 5,
+                "prs_merged": 0,
+                "tasks_failed": 5,
+                "tasks_failed_infra": 5,
+            },
+            {
+                "tasks_created": 5,
+                "prs_merged": 0,
+                "tasks_failed": 5,
+                "tasks_failed_infra": 5,
+            },
+        ],
+    }
+    project = make_project(directions=[direction])
+    session = _make_session(tasks=[], project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    assert not any(
+        "d-infrafail1" in a["signal"] and "failure rate" in a["signal"] for a in result
+    )
+
+
+@pytest.mark.asyncio
+async def test_direction_fail_rate_fires_on_non_infra_failures():
+    """Direction with genuine code failures above 50% (after infra subtraction) fires the anomaly."""
+    project_id = uuid.uuid4()
+    direction = {
+        "id": "d-realfail1",
+        "text": "Migrate auth to OAuth2",
+        "status": "active",
+        "priority": "high",
+        "paths": [],
+        "research_history": [
+            # 7 failed, 2 infra → 5 non-infra out of 10 created = 50% — NOT > 50%, so no anomaly
+            {
+                "tasks_created": 5,
+                "prs_merged": 0,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 2,
+            },
+            {
+                "tasks_created": 5,
+                "prs_merged": 0,
+                "tasks_failed": 3,
+                "tasks_failed_infra": 0,
+            },
+        ],
+    }
+    project = make_project(directions=[direction])
+    session = _make_session(tasks=[], project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    # 5 non-infra / 10 created = 50% → threshold is > 0.5, so no anomaly at exactly 50%
+    assert not any(
+        "d-realfail1" in a["signal"] and "failure rate" in a["signal"] for a in result
+    )
+
+    # Now bump one non-infra failure to push it above 50%
+    direction2 = {
+        "id": "d-realfail2",
+        "text": "Migrate auth to OAuth2 v2",
+        "status": "active",
+        "priority": "high",
+        "paths": [],
+        "research_history": [
+            # 8 failed, 2 infra → 6 non-infra out of 10 = 60% → fires
+            {
+                "tasks_created": 5,
+                "prs_merged": 0,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 1,
+            },
+            {
+                "tasks_created": 5,
+                "prs_merged": 0,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 1,
+            },
+        ],
+    }
+    project2 = make_project(directions=[direction2])
+    session2 = _make_session(tasks=[], project=project2)
+
+    result2 = await _compute_research_anomalies(project_id, session2)
+
+    high = [
+        a for a in result2 if a["severity"] == "high" and "d-realfail2" in a["signal"]
+    ]
+    assert len(high) >= 1
+    assert "non-infra" in high[0]["signal"]
+    assert high[0]["anomaly_key"] == "Direction_d-realfail2_fail_rate"
+
+
+@pytest.mark.asyncio
+async def test_direction_fail_rate_infra_does_not_suppress_real_failures():
+    """Infra exclusion must not hide genuine code failures that push the rate above 50%."""
+    project_id = uuid.uuid4()
+    direction = {
+        "id": "d-mixedfail1",
+        "text": "Refactor core logic",
+        "status": "active",
+        "priority": "high",
+        "paths": [],
+        "research_history": [
+            # 8 total failed, 2 infra → 6 non-infra out of 10 = 60% → anomaly fires
+            {
+                "tasks_created": 5,
+                "prs_merged": 0,
+                "tasks_failed": 5,
+                "tasks_failed_infra": 1,
+            },
+            {
+                "tasks_created": 5,
+                "prs_merged": 0,
+                "tasks_failed": 3,
+                "tasks_failed_infra": 1,
+            },
+        ],
+    }
+    project = make_project(directions=[direction])
+    session = _make_session(tasks=[], project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    high = [
+        a for a in result if a["severity"] == "high" and "d-mixedfail1" in a["signal"]
+    ]
+    assert len(high) >= 1, "Real code failures above 50% should still fire the anomaly"
+    assert high[0]["anomaly_key"] == "Direction_d-mixedfail1_fail_rate"
 
 
 @pytest.mark.asyncio

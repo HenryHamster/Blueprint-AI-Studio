@@ -557,23 +557,25 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                         }
                     )
 
-            # High failure rate in last 2 cycles (>50%)
+            # High non-infra failure rate in last 2 cycles (>50%)
             if len(history) >= 2:
                 last2 = history[-2:]
                 total_created = sum(e.get("tasks_created", 0) for e in last2)
-                total_failed = sum(e.get("tasks_failed", 0) for e in last2)
+                total_failed_raw = sum(e.get("tasks_failed", 0) for e in last2)
+                total_failed_infra = sum(e.get("tasks_failed_infra", 0) for e in last2)
+                total_failed = max(0, total_failed_raw - total_failed_infra)
                 if total_created > 0 and total_failed / total_created > 0.5:
                     fail_pct = int(total_failed / total_created * 100)
                     anomalies.append(
                         {
-                            "signal": f"Direction '{d_id}' has {fail_pct}% task failure rate in last 2 cycles",
+                            "signal": f"Direction '{d_id}' has {fail_pct}% non-infra task failure rate in last 2 cycles",
                             # Distinct persistence key (see merge-decline signal above)
                             # so both direction signals survive when they co-fire.
                             "anomaly_key": f"Direction_{d_id}_fail_rate",
                             "severity": "high",
                             "details": (
                                 f'Direction "{d_text}" (id: {d_id}) had {total_failed}/{total_created} tasks fail '
-                                f"in the last 2 research cycles ({fail_pct}% failure rate). "
+                                f"in the last 2 research cycles ({fail_pct}% non-infra failure rate). "
                                 "The findings may be generating unimplementable tasks."
                             ),
                         }

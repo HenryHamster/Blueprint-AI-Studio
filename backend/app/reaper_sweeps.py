@@ -393,6 +393,12 @@ async def sweep_stalled_strategic_cycles(
                         f"heartbeat ({hb}) — skipping stall declaration"
                     )
                     continue
+                from app.failure_classification import (
+                    AGENT_STALLED,
+                    persist_failure_category,
+                )
+
+                persist_failure_category(linked_task, AGENT_STALLED)
                 linked_task.status = TaskStatus.FAILED
                 linked_task.latest_status_message = (
                     f"Force-terminated by stalled-cycle reaper — "
@@ -1311,9 +1317,7 @@ async def _apply_needs_disposition(
     #     resolved. This makes an indefinite recheck loop on an unobservable need
     #     impossible by construction (the parked re-eval cap is the bound for
     #     observable-but-unprovided needs; this is the bound for unobservable ones).
-    unobservable = [
-        n for n in disp["residual"] if need_is_structurally_unobservable(n)
-    ]
+    unobservable = [n for n in disp["residual"] if need_is_structurally_unobservable(n)]
     if unobservable:
         await _cancel_blocker_as_dead(
             task,
@@ -3444,8 +3448,7 @@ async def sweep_deliver_task_wakes(
                 await session.execute(
                     select(TaskWakeRegistration)
                     .where(
-                        TaskWakeRegistration.delivery_state
-                        == WakeDeliveryState.FIRED
+                        TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED
                     )
                     .order_by(TaskWakeRegistration.fired_at.asc().nullsfirst())
                     .limit(1)
@@ -3584,9 +3587,7 @@ async def sweep_deliver_task_wakes(
     fired_filters = [TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED]
     fired_undelivered = (
         await session.execute(
-            select(func.count())
-            .select_from(TaskWakeRegistration)
-            .where(*fired_filters)
+            select(func.count()).select_from(TaskWakeRegistration).where(*fired_filters)
         )
     ).scalar() or 0
 
@@ -3643,7 +3644,9 @@ async def sweep_wake_delivery_stall_alerts(
     if not delivery_stalled:
         # Delivery has recovered — dismiss open stall alerts fleet-wide.
         result = await session.execute(
-            select(Alert.project_id).distinct().where(
+            select(Alert.project_id)
+            .distinct()
+            .where(
                 Alert.dismissed_at.is_(None),
                 Alert.title == _WAKE_DELIVERY_STALL_ALERT_TITLE,
             )
@@ -3661,9 +3664,9 @@ async def sweep_wake_delivery_stall_alerts(
 
     # Delivery is stalled — raise a deduped alert per project with FIRED backlog.
     result = await session.execute(
-        select(TaskWakeRegistration.project_id).distinct().where(
-            TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED
-        )
+        select(TaskWakeRegistration.project_id)
+        .distinct()
+        .where(TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED)
     )
     project_ids = result.scalars().all()
     created = 0

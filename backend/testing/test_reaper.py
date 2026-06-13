@@ -5698,6 +5698,45 @@ async def test_step7_stalled_cycle_cancels_linked_phase2_task(
 
 
 @pytest.mark.asyncio
+async def test_stalled_cycle_force_terminate_records_infra_failure_category(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Force-terminated stalled-cycle task must carry AGENT_STALLED failure_category in context."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase1-stalled",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("failure_category") == "agent_stalled", (
+        "stalled-cycle force-terminate must record AGENT_STALLED infra class "
+        "so direction-health metrics exclude it from code-failure counts"
+    )
+
+
+@pytest.mark.asyncio
 async def test_step7_stalled_cycle_live_task_not_declared_stalled(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):

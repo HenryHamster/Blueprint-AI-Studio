@@ -1405,7 +1405,8 @@ async def _update_direction_research_outcomes(
                     "scope_calibrated_from": scope_calibrated_from,
                 }
             )
-            if category in INFRA_CLASSES and not _is_review_cap_exhausted(ct):
+            effective_cat = category or _classify_failure(ct)
+            if effective_cat in INFRA_CLASSES and not _is_review_cap_exhausted(ct):
                 infra_failures += 1
     entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
     entry["tasks_failed_infra"] = infra_failures
