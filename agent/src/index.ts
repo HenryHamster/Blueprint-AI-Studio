@@ -137,6 +137,7 @@ let _inWarmPollWindow = false;
 function setCrashReportTaskId(taskId: string): void { _crashReportTaskId = taskId; }
 export function _getCrashReportTaskIdForTesting(): string { return _crashReportTaskId; }
 export function _setInWarmPollWindowForTesting(value: boolean): void { _inWarmPollWindow = value; }
+export function _crashReportForTesting(label: string, detail: string, exitCode: number): void { _crashReport(label, detail, exitCode); }
 
 // ── OAuth credential rotation + ClaudeTimeoutError ───────────────────────────
 import {
@@ -2562,7 +2563,7 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
     } catch (e) {
       if (attempt === CLONE_MAX_RETRIES - 1) throw e;
       const delay = CLONE_RETRY_BASE_DELAY * Math.pow(2, attempt);
-      log(`Git clone failed (attempt ${attempt + 1}/3), retrying in ${delay / 1000}s: ${e instanceof Error ? e.message : String(e)}`);
+      log(`Git clone failed (attempt ${attempt + 1}/3), retrying in ${delay / 1000}s: ${sanitize(e instanceof Error ? e.message : String(e))}`);
       try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' }); } catch { /* ignore */ }
       await new Promise(r => setTimeout(r, delay));
     }
@@ -3570,12 +3571,13 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
 // every failure mode (uncaughtException, SIGTERM, cgroup OOM SIGKILL)
 // looks identical: heartbeats stop, task stays IN_PROGRESS, no evidence.
 function _crashReport(label: string, detail: string, exitCode: number) {
-  console.error(`[FATAL] ${label}: ${detail}`);
+  const safeDetail = sanitize(detail);
+  console.error(`[FATAL] ${label}: ${safeDetail}`);
   // Local file marker before any network attempt — survives even if the
   // sendHeartbeatSync curl times out or the network is partitioned. Combined
   // with serial-console capture (plan task 25075953), we get the agent's
   // last words even when the heartbeat never lands.
-  recordFinalState(`crash:${label}`, detail);
+  recordFinalState(`crash:${label}`, safeDetail);
   // Synchronous curl — fire-and-forget fetch() couldn't guarantee the write
   // flushed before process.exit, so crashes would show up as silent heartbeat
   // timeouts instead of explained failures. 3s timeout in the signal-handler
@@ -3598,7 +3600,7 @@ function _crashReport(label: string, detail: string, exitCode: number) {
   if (taskId) {
     try {
       const metrics = collectMetrics();
-      const msg = `[FATAL:${reportLabel}] ${detail.slice(0, 300)}`;
+      const msg = `[FATAL:${reportLabel}] ${safeDetail.slice(0, 300)}`;
       sendHeartbeatSync(taskId, `[${metrics.heap_used_mb}MB cg:${metrics.cgroup_mb || '?'}MB] ${msg}`, undefined, 3_000);
     } catch { /* best effort — we're dying anyway */ }
   }

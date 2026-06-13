@@ -406,6 +406,44 @@ Open-ended investigation of an issue (root cause analysis, post-mortem, feasibil
 
 ---
 
+### `handleRepoBootstrap`
+
+**Task type:** `repo_bootstrap`
+
+Performs a first-cycle repository bootstrap: reads repo structure, confirms build/test/lint commands, and writes a structured repo overview so the first strategic cycle starts with grounded knowledge.
+
+**Workflow:**
+1. Clone repo at base branch (read-only; no edits, no PR)
+2. Read build manifests, CI configs, and declared `files_to_read`
+3. Attempt to run detected build, test, and lint commands
+4. Write back confirmed commands via `PATCH /api/agent/projects/{id}/build-config/commands`
+5. Emit repo overview and command-memory outcome files
+
+**Output** (returned in COMPLETED status payload and `/tmp/bootstrap_overview_<taskId>.json`):
+```json
+{
+  "tech_stack": "...",
+  "directory_layout": "...",
+  "first_steps_summary": "...",
+  "entry_points": "...",
+  "test_layout": "...",
+  "key_conventions": "...",
+  "environment_requirements": "...",
+  "source_revision": "abc123..."
+}
+```
+
+**Command-memory outcome** (in `/tmp/command_memory_<taskId>.json`):
+```json
+{
+  "status": "success | missing_commands | writeback_failed",
+  "detail": "optional short explanation",
+  "updated_paths": [".", "backend", "admin-ui"]
+}
+```
+
+---
+
 ### `handleReleaseAudit`
 
 **Task type:** `release_audit`
@@ -515,7 +553,29 @@ Codebase-grounded design producing a durable design document. Mirrors `handleWeb
 
 **Task type:** `release_audit_challenge`
 
-Independently re-examines release-audit findings and emits per-finding verdicts (`upheld`/`overturned`/`inconclusive`). Spawned as a binding second-opinion pass alongside `release_audit`.
+Independently re-examines release-audit findings and emits per-finding verdicts (`confirmed`/`refuted_false_positive`/`uncertain`). Spawned as a binding second-opinion pass alongside `release_audit`.
+
+**Output artifact:**
+```json
+{
+  "artifact_type": "RELEASE_AUDIT_CHALLENGE",
+  "challenged_candidate_sha": "abc123...",
+  "verdicts": [
+    {
+      "severity": "critical",
+      "summary": "...",
+      "file": "path/to/file.ts",
+      "verdict": "confirmed",
+      "reason": "Reproduced at line 42 — ..."
+    }
+  ]
+}
+```
+
+**Verdict values:**
+- `confirmed` — the challenger independently reproduced the issue; it is a genuine problem.
+- `refuted_false_positive` — the challenger investigated and the issue does NOT hold.
+- `uncertain` — the challenger could not confidently confirm or refute the finding.
 
 **Workflow:**
 1. Clone repo at `candidate_sha`
@@ -652,6 +712,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   compute_experiment: handleComputeExperiment,
   web_research: handleWebResearch,
   design: handleDesign,
+  repo_bootstrap: handleRepoBootstrap,
 };
 ```
 
@@ -763,5 +824,6 @@ high:   60+ min timeout, comprehensive analysis
 | perf | specialized.ts | Clone (RO) | No | PERF_REPORT |
 | debug | specialized.ts | Clone (RO) | No | RESEARCH_FINDINGS |
 | memo | memo.ts | None | No | MEMO |
+| repo_bootstrap | specialized.ts | Clone (RO) | No | bootstrap_overview (JSON) |
 
 RO = Read-only (no edits)

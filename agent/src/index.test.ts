@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import {
   __resetTaskCapabilityContractForTesting,
@@ -383,6 +383,46 @@ describe('sanitize', () => {
     expect(result).toContain('ghp_***');
     expect(result).toContain('sk-ant-***');
     expect(result).toContain('Bearer ***');
+  });
+});
+
+// ── _crashReport token redaction ─────────────────────────────────────────────
+describe('_crashReport token redaction', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(fs.appendFileSync).mockReset();
+    process.env.TASK_ID = 'task-crash-redact-test';
+  });
+
+  afterEach(() => {
+    delete process.env.TASK_ID;
+    vi.restoreAllMocks();
+  });
+
+  it('redacts git x-access-token from console.error, forensic log, and heartbeat', () => {
+    const rawDetail = 'fatal: repository clone failed: https://x-access-token:ghs_SECRETTOKEN123@github.com/org/repo.git';
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    _crashReportForTesting('uncaughtException', rawDetail, 1);
+
+    // console.error must not contain the raw token
+    const consoleArgs = consoleSpy.mock.calls.flat().join(' ');
+    expect(consoleArgs).not.toContain('ghs_SECRETTOKEN123');
+    expect(consoleArgs).toContain('***');
+
+    // forensic log (fs.appendFileSync) must not contain the raw token
+    const appendCalls = vi.mocked(fs.appendFileSync).mock.calls;
+    const forensicContent = appendCalls.map(([, data]) => String(data)).join('\n');
+    expect(forensicContent).not.toContain('ghs_SECRETTOKEN123');
+    expect(forensicContent).toContain('***');
+
+    // sendHeartbeatSync (via curl execFileSync) must not contain the raw token
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    expect(curlCall).toBeDefined();
+    const curlArgs = (curlCall?.[1] as string[]).join(' ');
+    expect(curlArgs).not.toContain('ghs_SECRETTOKEN123');
+    expect(curlArgs).toContain('***');
   });
 });
 
@@ -6438,5 +6478,42 @@ describe('ensureTaskCapabilityContractLoaded', () => {
     const fetcher = (): Promise<TaskCapabilityContract> =>
       Promise.resolve({} as TaskCapabilityContract);
     await expect(ensureTaskCapabilityContractLoaded(fetcher)).rejects.toThrow(/does not cover/);
+  });
+});
+
+// ── cloneWithRetry ───────────────────────────────────────────────────────────
+describe('cloneWithRetry', () => {
+  it('redacts token-bearing URLs from retry log lines', async () => {
+    vi.useFakeTimers();
+    const tokenUrl = 'https://x-access-token:ghp_secret123@github.com/org/repo.git';
+    const errorMsg = `fatal: repository '${tokenUrl}' not found`;
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') {
+        callCount++;
+        if (callCount <= 2) throw new Error(errorMsg);
+        return '' as unknown as ReturnType<typeof execFileSync>;
+      }
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const logLines: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logLines.push(args.map(String).join(' '));
+    });
+
+    const clonePromise = cloneWithRetry(['clone', tokenUrl, '/tmp/repo'], 1000);
+    await vi.runAllTimersAsync();
+    await clonePromise;
+
+    consoleSpy.mockRestore();
+    vi.useRealTimers();
+
+    const retryLines = logLines.filter(l => l.includes('Git clone failed'));
+    expect(retryLines.length).toBeGreaterThanOrEqual(2);
+    for (const line of retryLines) {
+      expect(line).not.toContain('ghp_secret123');
+      expect(line).toContain('***');
+    }
   });
 });

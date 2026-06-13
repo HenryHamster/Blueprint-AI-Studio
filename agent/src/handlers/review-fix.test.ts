@@ -3548,3 +3548,50 @@ describe('handleFix — surviving_issues from challenge reconciliation', () => {
     expect(prompt).toContain('src/rejected.ts');
   });
 });
+
+// ── handleReview: PR metadata fetch aborts on timeout ────────────────────────
+describe('handleReview — pr metadata fetch aborts on timeout', () => {
+  it('aborts the PR metadata fetch after the timeout fires and still completes the review', async () => {
+    // Simulate a non-resolving fetch (hangs indefinitely without a timeout).
+    // The AbortController in handleReview should abort it after 25s, which
+    // causes the fetch promise to reject with an AbortError — caught by the
+    // surrounding try/catch, so handleReview still proceeds without metadata.
+    let capturedSignal: AbortSignal | undefined;
+    global.fetch = vi.fn().mockImplementation((_url: unknown, opts?: { signal?: AbortSignal }) => {
+      capturedSignal = opts?.signal;
+      // Return a promise that only resolves when the signal aborts.
+      return new Promise<never>((_resolve, reject) => {
+        if (opts?.signal) {
+          opts.signal.addEventListener('abort', () => {
+            reject(new DOMException('The operation was aborted.', 'AbortError'));
+          });
+        }
+      });
+    }) as unknown as typeof fetch;
+
+    // Use fake timers so we can fire the 25s timeout without waiting.
+    vi.useFakeTimers();
+
+    const reviewPromise = handleReview(
+      'task-meta-timeout',
+      { pr_number: 999, branch: 'feat/timeout', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // Advance time past the 25s PR metadata timeout.
+    await vi.advanceTimersByTimeAsync(26_000);
+
+    vi.useRealTimers();
+
+    // handleReview must complete (not hang) even though the fetch never resolved.
+    await reviewPromise;
+
+    // The signal was wired up and was aborted by the timeout.
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal?.aborted).toBe(true);
+
+    // runClaudeCode was still called — the review proceeded despite missing metadata.
+    expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalled();
+  });
+});

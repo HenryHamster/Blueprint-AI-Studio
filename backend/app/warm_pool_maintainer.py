@@ -385,6 +385,7 @@ async def retire_and_delete_pool_vm(
     *,
     reason: str,
     claim_grace_seconds: int = _RETIRING_CLAIM_GRACE_SECONDS,
+    force: bool = False,
 ) -> bool:
     """Atomically CLAIM a pool member, then tear it down. Returns True iff we won.
 
@@ -438,11 +439,22 @@ async def retire_and_delete_pool_vm(
         # self-exhausts (it keeps counting as a live member, halting replenish).
         claim_where = (PoolVm.state == PoolVmState.LEASED,)
     else:
-        # Claim a non-task-bound, not-yet-retiring member. A LEASED member is
-        # excluded so a dispatcher that leased it between the scan and now is
-        # never torn down mid-task; an already-RETIRING member is excluded so a
-        # peer's teardown is never duplicated.
-        claim_where = (PoolVm.state.in_((PoolVmState.PROVISIONING, PoolVmState.IDLE)),)
+        # Claim a non-task-bound, not-yet-retiring member.  A LEASED member is
+        # excluded from the ROUTINE paths so a dispatcher that leased it between
+        # the scan and now is never torn down mid-task.  When ``force=True``
+        # (operator drain / global disable) the teardown is intentional even for
+        # a LEASED member — those callers explicitly retire PROVISIONING, IDLE,
+        # AND LEASED members per their docstrings.
+        if force:
+            claim_where = (
+                PoolVm.state.in_(
+                    (PoolVmState.PROVISIONING, PoolVmState.IDLE, PoolVmState.LEASED)
+                ),
+            )
+        else:
+            claim_where = (
+                PoolVm.state.in_((PoolVmState.PROVISIONING, PoolVmState.IDLE)),
+            )
 
     # Bank any idle cost accrued since idle_since BEFORE the claim nulls it,
     # folded into the atomic UPDATE so only the claim winner persists it. We must
@@ -570,7 +582,7 @@ async def drain_global_warm_pool(*, session_factory=AsyncSessionLocal) -> int:
                 continue
             try:
                 if await retire_and_delete_pool_vm(
-                    session, member, reason="pool_global_disable"
+                    session, member, reason="pool_global_disable", force=True
                 ):
                     retired += 1
             except Exception:

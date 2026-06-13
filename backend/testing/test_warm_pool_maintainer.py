@@ -3602,3 +3602,132 @@ async def test_actively_reserved_member_not_idle_ttl_reaped(
             _runtime_config.pop("improvement_lanes_enabled", None)
         else:
             _runtime_config["improvement_lanes_enabled"] = prior_lanes
+
+
+# ---------------------------------------------------------------------------
+# Forced drain: operator drain/disable and global disable retire LEASED members
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_drain_tears_down_leased_member(db_session, warm_pool_on, mocker):
+    """drain_global_warm_pool must retire LEASED members, not silently skip them.
+
+    This is the acceptance-gate test named in the task.  Before the fix the else
+    branch of retire_and_delete_pool_vm excluded PoolVmState.LEASED from the
+    atomic claim predicate, so rowcount==0 and the member was left LEASED -- a
+    true leak because the pool stayed enabled and the orphan cleanup exempted
+    live pool members.  force=True now includes LEASED in the claim predicate.
+    """
+    mock_del = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+    _runtime_config["warm_pool_enabled"] = True
+
+    project = await _make_project(db_session)
+    member = await _register(
+        db_session, project, "agent-vm-leased-drain", PoolVmState.LEASED
+    )
+    member_id = member.id
+
+    retired = await _wpm.drain_global_warm_pool(
+        session_factory=_factory_for(db_session)
+    )
+    assert retired == 1, f"expected 1 retired, got {retired}"
+    mock_del.assert_awaited_once()
+    assert await db_session.get(PoolVm, member_id) is None
+
+
+@pytest.mark.asyncio
+async def test_drain_project_pool_operator_drain_retires_leased_member(
+    db_session, warm_pool_on, mocker
+):
+    """_drain_project_pool with reason='operator_drain' must retire LEASED members."""
+    from app.routers.admin_warm_pool import _drain_project_pool
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+
+    project = await _make_project(db_session)
+    member = await _register(
+        db_session, project, "agent-vm-leased-opdr", PoolVmState.LEASED
+    )
+    member_id = member.id
+
+    drained = await _drain_project_pool(
+        db_session, project.id, "u-test", reason="operator_drain"
+    )
+    assert drained == 1, f"expected 1 drained, got {drained}"
+    assert await db_session.get(PoolVm, member_id) is None
+
+
+@pytest.mark.asyncio
+async def test_drain_project_pool_operator_disable_retires_leased_member(
+    db_session, warm_pool_on, mocker
+):
+    """_drain_project_pool with reason='operator_disable' must retire LEASED members."""
+    from app.routers.admin_warm_pool import _drain_project_pool
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+
+    project = await _make_project(db_session)
+    member = await _register(
+        db_session, project, "agent-vm-leased-opds", PoolVmState.LEASED
+    )
+    member_id = member.id
+
+    drained = await _drain_project_pool(
+        db_session, project.id, "u-test", reason="operator_disable"
+    )
+    assert drained == 1, f"expected 1 drained, got {drained}"
+    assert await db_session.get(PoolVm, member_id) is None
+
+
+@pytest.mark.asyncio
+async def test_routine_over_target_drain_spares_leased_member(
+    db_session, warm_pool_on, mocker
+):
+    """The routine over-target drain path (non-forced) must NOT tear down a LEASED
+    member -- LEASED-protection stays in place for all paths that do not pass
+    force=True (i.e. reconcile_project_pool / sweep_idle_pool_vms).
+
+    This verifies that adding force=True to the forced-drain paths did NOT weaken
+    the protection on the routine reaping path.
+    """
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+    # Target 0, with 1 IDLE + 1 LEASED.  The routine drain triggers (IDLE count 1
+    # > target 0) and removes the IDLE member, but must leave the LEASED member
+    # untouched — reconcile only drains IDLE members, not LEASED ones.
+    _runtime_config["warm_pool_target_size"] = 0
+    project = await _make_project(db_session)
+    idle_member = await _register(
+        db_session, project, "agent-vm-idle-extra", PoolVmState.IDLE
+    )
+    idle_member.idle_since = _utcnow() - timedelta(seconds=300)
+    leased_member = await _register(
+        db_session, project, "agent-vm-leased-safe", PoolVmState.LEASED
+    )
+    db_session.add_all([idle_member, leased_member])
+    await db_session.commit()
+
+    async def _no_provision(session, project_id, **kw):
+        raise AssertionError("must not provision at target 0")
+
+    summary = await reconcile_project_pool(
+        db_session,
+        project.id,
+        runtime_config=_runtime_config,
+        provision_fn=_no_provision,
+        dispatch_slots_remaining=10,
+        pool_budget_remaining=10,
+        stale_vm_ids=set(),
+        suppressed=False,
+    )
+    # The IDLE member is over-target and gets drained; the LEASED member is spared.
+    assert summary["drained"] == 1
+    assert await db_session.get(PoolVm, idle_member.id) is None
+    surviving = await db_session.get(PoolVm, leased_member.id)
+    assert surviving is not None and surviving.state == PoolVmState.LEASED
