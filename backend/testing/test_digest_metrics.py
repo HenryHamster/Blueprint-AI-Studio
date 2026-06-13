@@ -6435,13 +6435,43 @@ async def test_trial_accumulation_counts_without_contaminated(db_session):
 
     tasks = [
         # WITH arm — 2 assigned tasks
-        _task({"_repo_map_arm": True, "_had_repo_map": True, "_first_attempt_succeeded": True}),
-        _task({"_repo_map_arm": True, "_had_repo_map": False, "_first_attempt_succeeded": False}),
+        _task(
+            {
+                "_repo_map_arm": True,
+                "_had_repo_map": True,
+                "_first_attempt_succeeded": True,
+            }
+        ),
+        _task(
+            {
+                "_repo_map_arm": True,
+                "_had_repo_map": False,
+                "_first_attempt_succeeded": False,
+            }
+        ),
         # WITHOUT arm, clean — holdback was respected (receipt=False)
-        _task({"_repo_map_arm": False, "_had_repo_map": False, "_first_attempt_succeeded": True}),
+        _task(
+            {
+                "_repo_map_arm": False,
+                "_had_repo_map": False,
+                "_first_attempt_succeeded": True,
+            }
+        ),
         # WITHOUT arm, contaminated — holdback was NOT respected (receipt=True)
-        _task({"_repo_map_arm": False, "_had_repo_map": True, "_first_attempt_succeeded": True}),
-        _task({"_repo_map_arm": False, "_had_repo_map": True, "_first_attempt_succeeded": False}),
+        _task(
+            {
+                "_repo_map_arm": False,
+                "_had_repo_map": True,
+                "_first_attempt_succeeded": True,
+            }
+        ),
+        _task(
+            {
+                "_repo_map_arm": False,
+                "_had_repo_map": True,
+                "_first_attempt_succeeded": False,
+            }
+        ),
     ]
     db_session.add_all(tasks)
     await db_session.commit()
@@ -6482,10 +6512,28 @@ async def test_trial_accumulation_no_contamination_when_receipt_false(db_session
         )
 
     tasks = [
-        _task({"_repo_map_arm": True, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        _task(
+            {
+                "_repo_map_arm": True,
+                "_had_repo_map": True,
+                "_first_attempt_succeeded": True,
+            }
+        ),
         # WITHOUT arm, receipt explicitly False — clean holdback
-        _task({"_repo_map_arm": False, "_had_repo_map": False, "_first_attempt_succeeded": True}),
-        _task({"_repo_map_arm": False, "_had_repo_map": False, "_first_attempt_succeeded": False}),
+        _task(
+            {
+                "_repo_map_arm": False,
+                "_had_repo_map": False,
+                "_first_attempt_succeeded": True,
+            }
+        ),
+        _task(
+            {
+                "_repo_map_arm": False,
+                "_had_repo_map": False,
+                "_first_attempt_succeeded": False,
+            }
+        ),
     ]
     db_session.add_all(tasks)
     await db_session.commit()
@@ -6503,7 +6551,9 @@ async def test_trial_accumulation_no_contamination_when_receipt_false(db_session
 
 
 @pytest.mark.asyncio
-async def test_trial_accumulation_without_contaminated_absent_when_no_assignment_key(db_session):
+async def test_trial_accumulation_without_contaminated_absent_when_no_assignment_key(
+    db_session,
+):
     """When no assignment_key is provided, without_contaminated is absent (receipt-only path)."""
     project = make_project()
     db_session.add(project)
@@ -6529,6 +6579,72 @@ async def test_trial_accumulation_without_contaminated_absent_when_no_assignment
     )
     # arm_composition is absent entirely when no assignment_key
     assert "arm_composition" not in accum
+
+
+@pytest.mark.asyncio
+async def test_trial_accumulation_reports_with_assigned_delivered(db_session):
+    """with_assigned_delivered counts only WITH-arm tasks where both assignment AND receipt keys are present.
+
+    A task is 'delivered' when it is assigned to the WITH arm (assignment_key set) AND
+    the receipt context_key is also present (treatment actually ran). Tasks where the
+    assignment key is set but the receipt key is absent entirely are assigned-but-undelivered
+    and must NOT be counted in with_assigned_delivered. This counter feeds the
+    engagement guard in capability_trial_verdict to suppress futility KILL verdicts
+    when the treatment was never actually delivered.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = _utcnow() - timedelta(days=1)
+
+    def _task(context):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=created,
+            context=context,
+        )
+
+    tasks = [
+        # WITH arm, delivered: assignment key set AND receipt key present
+        _task(
+            {
+                "_repo_map_arm": True,
+                "_had_repo_map": True,
+                "_first_attempt_succeeded": True,
+            }
+        ),
+        # WITH arm, assigned-but-undelivered: assignment key set but receipt key absent entirely
+        _task({"_repo_map_arm": True, "_first_attempt_succeeded": False}),
+        # WITHOUT arm — not relevant to with_assigned_delivered
+        _task(
+            {
+                "_repo_map_arm": False,
+                "_had_repo_map": False,
+                "_first_attempt_succeeded": True,
+            }
+        ),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        assignment_key="_repo_map_arm",
+    )
+
+    comp = accum["arm_composition"]
+    # Both WITH-arm tasks count as with_assigned
+    assert comp["with_assigned"] == 2
+    # Only the task with receipt key present counts as delivered
+    assert comp["with_assigned_delivered"] == 1
+    # with_assigned_delivered must be strictly less than with_assigned when an undelivered task exists
+    assert comp["with_assigned_delivered"] < comp["with_assigned"]
 
 
 # ── compute_problem_model_gc_health ──────────────────────────────────────────
