@@ -30,7 +30,17 @@ from datetime import datetime, timedelta
 import pytest
 from httpx import AsyncClient
 
-from app.models import PoolIdleCostLedger, PoolIdleSpan, Project, PoolVmState, Task, TaskStatus
+from app.models import (
+    ImprovementLane,
+    ImprovementLaneStatus,
+    PoolIdleCostLedger,
+    PoolIdleSpan,
+    PoolVm,
+    Project,
+    PoolVmState,
+    Task,
+    TaskStatus,
+)
 from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.review_pipeline import _spawn_pipeline_task
 from testing.conftest import TestingSessionLocal
@@ -900,6 +910,114 @@ async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
 
 
 @pytest.mark.asyncio
+async def test_warm_pool_non_owner_terminal_and_checkpoint_do_not_release_or_reserve(
+    db_session, mocker
+):
+    """A stale task with the same VM id cannot return or lane-reserve another
+    task's pool lease from either terminal completion or checkpoint flow."""
+    from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+    from app.task_completion import _release_pool_member_if_terminal
+
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=mocker.AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=mocker.AsyncMock,
+        return_value=True,
+    )
+
+    with _warm_pool_enabled():
+        project = Project(name="Warm Pool Ownership Guard", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        vm_id = f"agent-vm-owner-{uuid.uuid4().hex}"
+        owner_task = Task(
+            project_id=project.id,
+            title="Owner task",
+            payloads=[{"type": "create", "prompt": "owner", "base_branch": "main"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=vm_id,
+            context={"scope": "small"},
+        )
+        stale_task = Task(
+            project_id=project.id,
+            title="Stale task",
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "stale",
+                    "base_branch": "main",
+                    "branch": "feat/stale",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            context={"scope": "small"},
+        )
+        db_session.add_all([owner_task, stale_task])
+        await db_session.commit()
+        await db_session.refresh(owner_task)
+        await db_session.refresh(stale_task)
+
+        member = PoolVm(
+            vm_instance_id=vm_id,
+            project_id=project.id,
+            state=PoolVmState.LEASED,
+            leased_task_id=owner_task.id,
+            idle_since=None,
+        )
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="ownership lane",
+            goal="ownership goal",
+            status=ImprovementLaneStatus.ACTIVE.value,
+            branch_name="feat/stale",
+            base_branch="main",
+            current_task_id=stale_task.id,
+            workspace_state="LEASED",
+            workspace_vm_instance_id=vm_id,
+        )
+        db_session.add_all([member, lane])
+        await db_session.commit()
+        await db_session.refresh(member)
+        await db_session.refresh(lane)
+
+        released = await _release_pool_member_if_terminal(
+            stale_task,
+            TaskStatus.COMPLETED,
+            db_session,
+        )
+        assert released is None
+        await db_session.refresh(member)
+        assert member.state == PoolVmState.LEASED
+        assert member.leased_task_id == owner_task.id
+
+        checkpointed = await checkpoint_and_reserve_on_phase_complete(
+            db_session,
+            stale_task,
+            lane,
+            sha="abc1234def5678",
+            summary="stale checkpoint",
+        )
+        assert checkpointed is True
+        await db_session.refresh(member)
+        await db_session.refresh(lane)
+        assert member.state == PoolVmState.LEASED
+        assert member.leased_task_id == owner_task.id
+        assert member.reserved_lane_id is None
+        assert member.reservation_expires_at is None
+        assert lane.status == ImprovementLaneStatus.PARKED.value
+        assert lane.last_checkpoint_sha == "abc1234def5678"
+        assert lane.workspace_state == "LEASED"
+        assert lane.workspace_vm_instance_id == vm_id
+
+
+@pytest.mark.asyncio
 async def test_warm_pool_miss_paths_record_lease_miss_by_reason(
     client: AsyncClient, db_session, mocker
 ):
@@ -1004,6 +1122,91 @@ async def test_warm_pool_miss_paths_record_lease_miss_by_reason(
         assert by_reason.get("no_idle_member", 0) == 0
         assert by_reason.get("suppressed", 0) >= 1  # (c)
         assert funnel["lease_miss_total"] >= 3
+
+
+@pytest.mark.asyncio
+async def test_try_pool_dispatch_does_not_clobber_racing_warm_reservation(
+    db_session,
+    mocker,
+):
+    """A concurrent re-reservation must survive the miss-path workspace reset."""
+    from app.models import ImprovementLane
+    from app.warm_pool import clear_lane_warm_workspace_if_matching_member, try_pool_dispatch
+    import app.shared_state as _ss
+
+    prior = dict(_ss.runtime_config)
+    _ss.runtime_config["warm_pool_enabled"] = True
+    _ss.runtime_config["improvement_lanes_enabled"] = True
+    _ss.warm_pool_suppressed_until = None
+    _ss.warm_pool_claim_failure_events.clear()
+    try:
+        project = Project(name="Warm Pool Race", user_id="test-user-race")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="race lane",
+            goal="race goal",
+            branch_name="race-branch",
+            base_branch="main",
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="agent-vm-race-old",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+            status=TaskStatus.QUEUED,
+            context={
+                "scope": "small",
+                "improvement_lane_id": str(lane.id),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        original_clear = clear_lane_warm_workspace_if_matching_member
+
+        async def raced_clear(session, lane_id, workspace_vm_instance_id):
+            async with TestingSessionLocal() as racing_session:
+                racing_lane = await racing_session.get(ImprovementLane, lane.id)
+                racing_lane.workspace_state = "WARM_RESERVED"
+                racing_lane.workspace_vm_instance_id = "agent-vm-race-new"
+                racing_session.add(racing_lane)
+                await racing_session.commit()
+            return await original_clear(session, lane_id, workspace_vm_instance_id)
+
+        mocker.patch(
+            "app.warm_pool.clear_lane_warm_workspace_if_matching_member",
+            new=mocker.AsyncMock(side_effect=raced_clear),
+        )
+
+        result = await try_pool_dispatch(
+            db_session,
+            task,
+            required_provider="anthropic",
+            required_model="claude-opus-4-8",
+            required_account="acct-dispatch-test",
+        )
+
+        assert result is None
+        await db_session.refresh(lane)
+        assert lane.workspace_state == "WARM_RESERVED"
+        assert lane.workspace_vm_instance_id == "agent-vm-race-new"
+    finally:
+        for k in ("warm_pool_enabled", "improvement_lanes_enabled"):
+            if k in prior:
+                _ss.runtime_config[k] = prior[k]
+            else:
+                _ss.runtime_config.pop(k, None)
+        _ss.warm_pool_suppressed_until = None
+        _ss.warm_pool_claim_failure_events.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1349,7 +1552,7 @@ async def test_evaluating_parent_live_vm_lease_is_spared(
         db_session.add_all([task, leased])
         await db_session.commit()
 
-        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+        mocker.patch("app.warm_vm_state.is_pool_vm_alive", return_value=True)
         delete_mock = mocker.patch(
             "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
         )
@@ -1872,3 +2075,176 @@ async def test_lane_warm_resume_receipt_set_at_claim_not_spawn(
             _runtime_config["improvement_lanes_enabled"] = prior_lanes
         _shared_state.vm_last_heartbeat.clear()
         _shared_state.vm_last_heartbeat.update(prior_heartbeat)
+
+
+@pytest.mark.asyncio
+async def test_try_pool_dispatch_corrects_workspace_state_to_cold_when_no_member(
+    db_session,
+):
+    """When try_pool_dispatch finds no compatible idle member for a lane task,
+    it must degrade the owning ImprovementLane workspace_state from WARM_RESERVED
+    to COLD — so the lane's next phase knows to cold-prep instead of expecting a
+    warm workspace that no longer exists."""
+    from app.models import ImprovementLane
+    from app.warm_pool import try_pool_dispatch
+    import app.shared_state as _ss
+
+    prior = dict(_ss.runtime_config)
+    _ss.runtime_config["warm_pool_enabled"] = True
+    _ss.runtime_config["improvement_lanes_enabled"] = True
+    _ss.warm_pool_suppressed_until = None
+    _ss.warm_pool_claim_failure_events.clear()
+    try:
+        project = Project(name="Dispatch No Member", user_id="test-user-ws")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="dispatch no-member lane",
+            goal="test goal",
+            branch_name="test-branch",
+            base_branch="main",
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="old-vm-stale",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        # Task carrying the lane id; no compatible idle member is seeded.
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+            status=TaskStatus.QUEUED,
+            context={
+                "scope": "small",
+                "improvement_lane_id": str(lane.id),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        result = await try_pool_dispatch(
+            db_session,
+            task,
+            required_provider="anthropic",
+            required_model="claude-opus-4-8",
+            required_account="acct-dispatch-test",
+        )
+
+        assert result is None, "No compatible member — dispatch must return None"
+
+        # Lane workspace state must be corrected to COLD.
+        await db_session.refresh(lane)
+        assert lane.workspace_state == "COLD", (
+            f"Lane workspace_state must be COLD after pool miss, got {lane.workspace_state!r}"
+        )
+        assert lane.workspace_vm_instance_id is None, (
+            "Lane workspace_vm_instance_id must be cleared after pool miss"
+        )
+    finally:
+        for k in ("warm_pool_enabled", "improvement_lanes_enabled"):
+            if k in prior:
+                _ss.runtime_config[k] = prior[k]
+            else:
+                _ss.runtime_config.pop(k, None)
+        _ss.warm_pool_suppressed_until = None
+        _ss.warm_pool_claim_failure_events.clear()
+
+
+@pytest.mark.asyncio
+async def test_try_pool_dispatch_updates_workspace_vm_when_non_reserved_member_leased(
+    db_session,
+):
+    """When a lane task leases a pool member other than its reserved one,
+    try_pool_dispatch must update the lane's workspace_vm_instance_id to the
+    actual leased member's vm_instance_id so the lane row reflects truth."""
+    from app.models import ImprovementLane, PoolVmState
+    from app.warm_pool import register_pool_vm, try_pool_dispatch
+    import app.shared_state as _ss
+
+    prior = dict(_ss.runtime_config)
+    _ss.runtime_config["warm_pool_enabled"] = True
+    _ss.runtime_config["improvement_lanes_enabled"] = True
+    _ss.warm_pool_suppressed_until = None
+    _ss.warm_pool_claim_failure_events.clear()
+    try:
+        project = Project(name="Lane Non-Reserved Dispatch", user_id="test-user-lnrd")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Seed a lane that thinks its reserved VM is "old-reserved-vm".
+        # That VM is NOT in the pool — only a different generic idle member exists.
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="lane non-reserved dispatch",
+            goal="test goal",
+            branch_name="test-branch-lnrd",
+            base_branch="main",
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="old-reserved-vm",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        # Register a generic idle member (no reserved_lane_id) so the lane's
+        # task can still get a warm start, just not on its reserved VM.
+        acct, provider, model = "acct-lnrd-1", "anthropic", "claude-opus-4-8"
+        pool_vm_id = f"agent-vm-lnrd-{uuid.uuid4().hex}"
+        await register_pool_vm(
+            db_session,
+            vm_instance_id=pool_vm_id,
+            project_id=project.id,
+            account_id=acct,
+            provider=provider,
+            model=model,
+            state=PoolVmState.IDLE,
+        )
+        await db_session.commit()
+
+        # Task carrying the lane id dispatched to the generic member.
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+            status=TaskStatus.QUEUED,
+            context={
+                "scope": "small",
+                "improvement_lane_id": str(lane.id),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        leased = await try_pool_dispatch(
+            db_session,
+            task,
+            required_provider=provider,
+            required_model=model,
+            required_account=acct,
+        )
+
+        assert leased is not None, "Should lease the generic idle member"
+        assert leased.vm_instance_id == pool_vm_id
+
+        # The lane's workspace_vm_instance_id must be reconciled to the actual
+        # leased member — the caller's commit will persist this.
+        await db_session.commit()
+        await db_session.refresh(lane)
+        assert lane.workspace_vm_instance_id == pool_vm_id, (
+            f"Lane workspace_vm_instance_id must be updated to the leased member "
+            f"({pool_vm_id!r}), got {lane.workspace_vm_instance_id!r}"
+        )
+    finally:
+        for k in ("warm_pool_enabled", "improvement_lanes_enabled"):
+            if k in prior:
+                _ss.runtime_config[k] = prior[k]
+            else:
+                _ss.runtime_config.pop(k, None)
+        _ss.warm_pool_suppressed_until = None
+        _ss.warm_pool_claim_failure_events.clear()

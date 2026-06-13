@@ -252,7 +252,7 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('**blocked orphan** [low] (gap g-b) — BLOCKED');
   });
 
-  it('splits the research pipeline into waiting / in-progress / idle', () => {
+  it('splits the research pipeline into held / recent / waiting / in-progress / idle', () => {
     const result = buildCycleStartReconciliationSection({
       capability_contradictions: [],
       orphaned_gaps: [],
@@ -260,14 +260,48 @@ describe('buildCycleStartReconciliationSection', () => {
       direction_pipeline: [
         { direction_id: 'd-w', text: 'waiting dir', state: 'research_waiting_on_action', in_flight: 0, findings: 3 },
         { direction_id: 'd-p', text: 'busy dir', state: 'tasks_in_progress', in_flight: 2, findings: 0 },
+        { direction_id: 'd-h', text: 'held dir', state: 'held_on_dependency', in_flight: 0, held: 1, findings: 1 },
+        { direction_id: 'd-r', text: 'recent dir', state: 'recently_converted', in_flight: 0, recently_completed: 2, findings: 0 },
         { direction_id: 'd-i', text: 'quiet dir', state: 'idle', in_flight: 0, findings: 0 },
       ],
-      counts: { deferred_gaps: 1, active_directions: 3 },
+      counts: {
+        deferred_gaps: 1,
+        active_directions: 5,
+        pipeline_held_on_dependency: 1,
+        pipeline_recently_converted: 1,
+      },
     });
-    expect(result).toContain('Research pipeline by direction (1 with tasks in progress, 1 waiting on action, 1 idle; 1 gaps deferred)');
+    expect(result).toContain('Research pipeline by direction (1 with tasks in progress, 1 live-held, 1 recently converted, 1 waiting on action, 1 idle; 1 gaps deferred)');
     expect(result).toContain('waiting dir (id: d-w) — 3 recent finding(s), 0 tasks in flight');
     expect(result).toContain('busy dir (id: d-p) — 2 task(s) in flight');
+    expect(result).toContain('held dir (id: d-h) — 1 held task(s), 1 recent finding(s)');
+    expect(result).toContain('recent dir (id: d-r) — 2 recently completed task(s), 0 recent finding(s)');
     expect(result).toContain('Idle (no findings, no tasks in flight): quiet dir');
+  });
+
+  it('does not fold held or recent completion into waiting-on-action', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [
+        { direction_id: 'd-h', text: 'held lane', state: 'held_on_dependency', in_flight: 0, held: 1, findings: 2 },
+        { direction_id: 'd-r', text: 'recent lane', state: 'recently_converted', in_flight: 0, recently_completed: 1, findings: 2 },
+      ],
+      counts: {
+        deferred_gaps: 0,
+        pipeline_waiting_on_action: 0,
+        pipeline_tasks_in_progress: 0,
+        pipeline_held_on_dependency: 1,
+        pipeline_recently_converted: 1,
+        pipeline_idle: 0,
+      },
+    });
+    expect(result).toContain('1 live-held, 1 recently converted, 0 waiting on action');
+    expect(result).toContain('Live-held on dependency (blocked or parked work is not waiting-on-action):');
+    expect(result).toContain('Recently converted/completed (fresh work before the cycle start — not stalled):');
+    expect(result).not.toContain('held lane (id: d-h) — 2 recent finding(s), 0 tasks in flight');
+    expect(result).not.toContain('recent lane (id: d-r) — 2 recent finding(s), 0 tasks in flight');
   });
 
   it('shows a "+N more" tail when a list was capped below its true total', () => {
@@ -298,7 +332,7 @@ describe('buildCycleStartReconciliationSection', () => {
         direction_pipeline_overflow: 10,
       },
     });
-    expect(result).toContain('Research pipeline by direction (3 with tasks in progress, 4 waiting on action, 5 idle; 0 gaps deferred)');
+    expect(result).toContain('Research pipeline by direction (3 with tasks in progress, 0 live-held, 0 recently converted, 4 waiting on action, 5 idle; 0 gaps deferred)');
     expect(result).toContain('Only the first 2 active directions are listed below (+10 more not shown).');
     expect(result).toContain('+3 more waiting direction(s) not shown');
     expect(result).toContain('+2 more in-progress direction(s) not shown');

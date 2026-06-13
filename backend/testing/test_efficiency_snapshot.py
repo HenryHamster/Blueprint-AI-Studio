@@ -36,11 +36,17 @@ from app.efficiency_snapshot import (
     compute_current_axes,
     compute_llm_cost_breakdown,
     compute_llm_cost_by_task_type,
+    compute_pr_rework_chain_breakdown,
     maybe_write_daily_snapshot,
     read_baseline_with_drift,
     write_snapshot,
 )
-from app.models import ImprovementLane, ImprovementLaneStatus, TaskStatus, bank_task_current_attempt
+from app.models import (
+    ImprovementLane,
+    ImprovementLaneStatus,
+    TaskStatus,
+    bank_task_current_attempt,
+)
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from testing.factories import _utcnow, make_membership, make_project, make_task
 
@@ -250,9 +256,7 @@ async def test_warm_start_origin_breakdown_per_origin_counts(db_session):
             status=TaskStatus.COMPLETED,
             vm_provisioned_at=now - timedelta(minutes=2),
             vm_stopped_at=now,
-            context={
-                "_timing": {"warm_start": True, "warm_claim_origin": origin}
-            },
+            context={"_timing": {"warm_start": True, "warm_claim_origin": origin}},
         )
 
     # 2 pool, 1 backlog, 1 chain (next_role_endpoint), 1 legacy-unset chain.
@@ -334,9 +338,7 @@ async def test_read_baseline_surfaces_warm_start_origin_breakdown(db_session):
             status=TaskStatus.COMPLETED,
             vm_provisioned_at=now - timedelta(minutes=2),
             vm_stopped_at=now,
-            context={
-                "_timing": {"warm_start": True, "warm_claim_origin": "warm_pool"}
-            },
+            context={"_timing": {"warm_start": True, "warm_claim_origin": "warm_pool"}},
         )
     )
     await db_session.commit()
@@ -1391,7 +1393,9 @@ async def test_compute_llm_cost_breakdown_credits_each_attempt_model(db_session)
     assert openai_row["merged_count"] == 1
     assert anthropic_row["merge_rate"] == 1.0
     assert openai_row["merge_rate"] == 1.0
-    assert anthropic_row["cost_per_merge"] == round(anthropic_row["total_cost_usd"] / 1, 6)
+    assert anthropic_row["cost_per_merge"] == round(
+        anthropic_row["total_cost_usd"] / 1, 6
+    )
     assert openai_row["cost_per_merge"] == round(openai_row["total_cost_usd"] / 1, 6)
 
     totals = breakdown["totals"]
@@ -1845,7 +1849,9 @@ def test_task_llm_attempts_resolves_provider_model_pair_atomically():
     # Validate that the cost breakdown never contains chimera combos.
     breakdown = compute_llm_cost_breakdown([task])
     combo_keys = {entry["model"] for entry in breakdown["by_model"]}
-    assert "claude-opus-4-8" not in combo_keys, "chimera model from model-only row leaked"
+    assert "claude-opus-4-8" not in combo_keys, (
+        "chimera model from model-only row leaked"
+    )
     assert "gpt-5.4" in combo_keys  # legitimate pair must still appear
 
 
@@ -1873,7 +1879,9 @@ def test_task_llm_attempts_no_chimera_half_filled_provider_only():
     result = _task_llm_attempts(task)
     assert len(result) == 1
     p, m, _in, _out, _c = result[0]
-    assert (p, m) == (None, None), f"provider-only row must yield (None, None), got {p}:{m}"
+    assert (p, m) == (None, None), (
+        f"provider-only row must yield (None, None), got {p}:{m}"
+    )
     # Specifically: must NOT be openai:claude-opus-4-8 (chimera).
     assert not (p == "openai" and m == "claude-opus-4-8")
 
@@ -1902,7 +1910,9 @@ def test_task_llm_attempts_no_chimera_half_filled_model_only():
     result = _task_llm_attempts(task)
     assert len(result) == 1
     p, m, _in, _out, _c = result[0]
-    assert (p, m) == (None, None), f"model-only row must yield (None, None), got {p}:{m}"
+    assert (p, m) == (None, None), (
+        f"model-only row must yield (None, None), got {p}:{m}"
+    )
     # Specifically: must NOT be anthropic:gpt-5.4 (chimera).
     assert not (p == "anthropic" and m == "gpt-5.4")
 
@@ -2527,7 +2537,9 @@ async def test_snapshot_persists_reuse_dropout_and_surfaces_trend(db_session):
 
     snapshot = await write_snapshot(db_session, project.id)
     # The drop-out ranking is persisted in the snapshot body (survives restart).
-    assert snapshot["reuse_dropout"]["dominant_dropout"]["reason"] == "scan_file_conflict"
+    assert (
+        snapshot["reuse_dropout"]["dominant_dropout"]["reason"] == "scan_file_conflict"
+    )
     assert snapshot["reuse_dropout"]["dominant_dropout"]["count"] == 5
 
     # Simulate a deploy/restart wiping the in-memory funnel counters.
@@ -2543,7 +2555,10 @@ async def test_snapshot_persists_reuse_dropout_and_surfaces_trend(db_session):
     trend = result["reuse_dropout_trend"]
     assert len(trend) == 1
     assert trend[0]["dominant_reason"] == "scan_file_conflict"
-    assert trend[0]["dominant_share"] == result["reuse_dropout"]["dominant_dropout"]["share"]
+    assert (
+        trend[0]["dominant_share"]
+        == result["reuse_dropout"]["dominant_dropout"]["share"]
+    )
     assert trend[0]["dropout_total"] == 6
 
 
@@ -2608,7 +2623,9 @@ async def test_read_baseline_returns_pool_dispatch_funnel_trend(db_session):
     await db_session.refresh(project)
 
     snapshot = await write_snapshot(db_session, project.id)
-    assert snapshot["pool_dispatch_funnel"]["dominant_miss"]["reason"] == "no_idle_member"
+    assert (
+        snapshot["pool_dispatch_funnel"]["dominant_miss"]["reason"] == "no_idle_member"
+    )
     assert snapshot["pool_dispatch_funnel"]["pool_lease_hits"] == 1
 
     # Simulate a deploy/restart wiping the in-memory pool funnel counters.
@@ -2987,9 +3004,7 @@ async def test_payoff_transition_proven_with_volume_fires_info(db_session, mocke
 
 
 @pytest.mark.asyncio
-async def test_payoff_transition_proven_below_volume_floor_no_alert(
-    db_session, mocker
-):
+async def test_payoff_transition_proven_below_volume_floor_no_alert(db_session, mocker):
     """PROVEN but below the warm-start volume floor does NOT alert (too thin)."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
@@ -3303,9 +3318,7 @@ async def test_pool_hit_rate_estimate_endpoint_validates_target_size(
     await db_session.commit()
 
     # target_size is required.
-    resp = await client.get(
-        f"/api/admin/projects/{project.id}/pool-hit-rate-estimate"
-    )
+    resp = await client.get(f"/api/admin/projects/{project.id}/pool-hit-rate-estimate")
     assert resp.status_code == 422
     # target_size above le=100 is rejected.
     resp = await client.get(
@@ -3812,7 +3825,9 @@ def test_all_axes_have_named_consumer_or_retired_record():
     # (c) Every manifest key claiming an active consumer must still be in ALL_AXES
     # (prevents stale consumer records from outliving their axis).
     stale = {
-        k for k, v in AXIS_CONSUMERS.items() if v.get("consumer") and k not in all_axes_set
+        k
+        for k, v in AXIS_CONSUMERS.items()
+        if v.get("consumer") and k not in all_axes_set
     }
     assert not stale, (
         f"AXIS_CONSUMERS entries claiming active consumers for axes no longer in ALL_AXES: "
@@ -3911,7 +3926,9 @@ def test_llm_cost_breakdown_by_task_type_basic():
     assert abs(share_sum - 1.0) < 1e-6
 
     # Total cost must reconcile with compute_llm_cost_breakdown
-    breakdown_total = compute_llm_cost_breakdown([create_task, review_task])["totals"]["total_cost_usd"]
+    breakdown_total = compute_llm_cost_breakdown([create_task, review_task])["totals"][
+        "total_cost_usd"
+    ]
     type_total = round(sum(r["total_cost_usd"] for r in rows), 6)
     assert type_total == breakdown_total
 
@@ -4209,7 +4226,9 @@ async def test_windowed_idle_cost_live_member_clamped_to_window(db_session):
     assert windowed <= expected_max, "windowed cost must not include idle_cost_banked"
 
     # by_account must contain the member's account.
-    assert "acct-1" in result["by_account"], "by_account should contain the member account"
+    assert "acct-1" in result["by_account"], (
+        "by_account should contain the member account"
+    )
     assert result["by_account"]["acct-1"]["total_idle_cost_usd"] == windowed
 
 
@@ -4651,9 +4670,9 @@ async def test_backfilled_baseline_members_carry_seed_provenance(db_session):
     cost_prov = prov.get(AXIS_COST_PER_MERGED_PR)
     if cost_prov:
         # Retroactively inferred: must not show the new snapshot's captured_at.
-        assert cost_prov.get("_inferred") or cost_prov["seeded_at"] != snap["captured_at"], (
-            "unchanged axis must not be re-stamped with the new snapshot time"
-        )
+        assert (
+            cost_prov.get("_inferred") or cost_prov["seeded_at"] != snap["captured_at"]
+        ), "unchanged axis must not be re-stamped with the new snapshot time"
 
 
 @pytest.mark.asyncio
@@ -4772,7 +4791,9 @@ async def test_compute_project_window_spend_usd_sums_llm_cost(db_session):
     )
     await db_session.commit()
 
-    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    total = await compute_project_window_spend_usd(
+        db_session, project.id, window_hours=24
+    )
 
     in_rate, out_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
     expected = round(1000 * in_rate + 500 * out_rate, 6)
@@ -4789,7 +4810,9 @@ async def test_compute_project_window_spend_usd_zero_for_empty_project(db_sessio
     await db_session.commit()
     await db_session.refresh(project)
 
-    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    total = await compute_project_window_spend_usd(
+        db_session, project.id, window_hours=24
+    )
     assert total == 0.0
 
 
@@ -4866,7 +4889,9 @@ async def test_compute_project_window_spend_usd_counts_overlapping_vm_spans(db_s
 
     await db_session.commit()
 
-    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    total = await compute_project_window_spend_usd(
+        db_session, project.id, window_hours=24
+    )
 
     # Compute expected costs for the 3 overlapping tasks only.
     boundary_cost = (boundary_stop - boundary_start).total_seconds() * ON_DEMAND_RATE
@@ -4915,7 +4940,9 @@ async def test_compute_project_window_spend_usd_counts_task_started_before_windo
     )
     await db_session.commit()
 
-    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    total = await compute_project_window_spend_usd(
+        db_session, project.id, window_hours=24
+    )
 
     expected = round((stop - start).total_seconds() * ON_DEMAND_RATE, 6)
     assert total == pytest.approx(expected, rel=1e-4), (
@@ -4949,12 +4976,16 @@ async def test_compute_project_window_spend_usd_counts_inflight_task_started_bef
     )
     await db_session.commit()
 
-    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    total = await compute_project_window_spend_usd(
+        db_session, project.id, window_hours=24
+    )
 
     # In-flight tasks accrue cost up to now; must be positive.
     assert total > 0.0, "in-flight task started before window must contribute spend"
     # Sanity: cost should be roughly start-to-now seconds * rate (within 1 min slack).
-    max_expected = round((now - start + timedelta(minutes=1)).total_seconds() * ON_DEMAND_RATE, 6)
+    max_expected = round(
+        (now - start + timedelta(minutes=1)).total_seconds() * ON_DEMAND_RATE, 6
+    )
     assert total <= max_expected
 
 
@@ -4980,7 +5011,9 @@ async def test_compute_project_window_spend_usd_excludes_fully_outside_task(db_s
     )
     await db_session.commit()
 
-    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    total = await compute_project_window_spend_usd(
+        db_session, project.id, window_hours=24
+    )
     assert total == 0.0, f"fully-outside task must not contribute spend; got {total}"
 
 
@@ -5014,11 +5047,15 @@ async def test_compute_project_window_spend_usd_llm_only_task_in_window_still_co
     )
     await db_session.commit()
 
-    total = await compute_project_window_spend_usd(db_session, project.id, window_hours=24)
+    total = await compute_project_window_spend_usd(
+        db_session, project.id, window_hours=24
+    )
 
     in_rate, out_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
     expected = round(1000 * in_rate + 500 * out_rate, 6)
-    assert total == expected, f"LLM-only in-window task should contribute {expected}; got {total}"
+    assert total == expected, (
+        f"LLM-only in-window task should contribute {expected}; got {total}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5035,7 +5072,11 @@ def test_lane_axis_constants_registered():
     assert AXIS_LANE_WARM_RESUME_RATE in AXIS_CONSUMERS
     assert AXIS_CHECKPOINT_LOSS_RATE in AXIS_CONSUMERS
     # Consumers must claim a valid disposition.
-    for key in (AXIS_LANE_COST_PER_MERGED_PR, AXIS_LANE_WARM_RESUME_RATE, AXIS_CHECKPOINT_LOSS_RATE):
+    for key in (
+        AXIS_LANE_COST_PER_MERGED_PR,
+        AXIS_LANE_WARM_RESUME_RATE,
+        AXIS_CHECKPOINT_LOSS_RATE,
+    ):
         assert AXIS_CONSUMERS[key].get("consumer"), f"{key} must declare a consumer"
 
 
@@ -5113,7 +5154,9 @@ def test_compute_lane_warm_resume_rate_basic():
 
 def test_compute_lane_warm_resume_rate_no_checkpoints():
     """Returns None when no lanes have checkpoint records."""
-    lane = _make_lane(project_id=None, status=ImprovementLaneStatus.ACTIVE, checkpoints=[])
+    lane = _make_lane(
+        project_id=None, status=ImprovementLaneStatus.ACTIVE, checkpoints=[]
+    )
     assert _compute_lane_warm_resume_rate([lane]) is None
 
 
@@ -5131,7 +5174,12 @@ def test_compute_checkpoint_loss_rate_basic():
 
 def test_compute_checkpoint_loss_rate_no_attempts():
     """Returns None when all lanes have seq=0 and requeues=0."""
-    lane = _make_lane(project_id=None, status=ImprovementLaneStatus.ACTIVE, checkpoint_seq=0, phase_requeues=0)
+    lane = _make_lane(
+        project_id=None,
+        status=ImprovementLaneStatus.ACTIVE,
+        checkpoint_seq=0,
+        phase_requeues=0,
+    )
     assert _compute_checkpoint_loss_rate([lane]) is None
 
 
@@ -5176,7 +5224,10 @@ async def test_compute_current_axes_lane_axes_from_db(db_session):
         reserved_idle_cost_usd_total=1.0,
         checkpoint_seq=5,
         phase_requeues=1,
-        checkpoints=[{"warm_resume": True, "sha": "abc"}, {"warm_resume": False, "sha": "def"}],
+        checkpoints=[
+            {"warm_resume": True, "sha": "abc"},
+            {"warm_resume": False, "sha": "def"},
+        ],
         retired_at=_now(),
     )
     db_session.add(retired_lane)
@@ -5349,9 +5400,15 @@ async def test_format_compliance_by_type_persisted_in_snapshot(db_session):
     await db_session.refresh(project)
 
     # Two "create" tasks (well-formed + error) and one "research" task (well-formed).
-    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=0))
-    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=1))
-    db_session.add(_make_format_compliance_typed_task(project.id, task_type="research", errors=0))
+    db_session.add(
+        _make_format_compliance_typed_task(project.id, task_type="create", errors=0)
+    )
+    db_session.add(
+        _make_format_compliance_typed_task(project.id, task_type="create", errors=1)
+    )
+    db_session.add(
+        _make_format_compliance_typed_task(project.id, task_type="research", errors=0)
+    )
     await db_session.commit()
 
     snap = await write_snapshot(db_session, project.id)
@@ -5383,8 +5440,12 @@ async def test_read_baseline_surfaces_format_compliance_by_type(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=0))
-    db_session.add(_make_format_compliance_typed_task(project.id, task_type="fix", errors=1))
+    db_session.add(
+        _make_format_compliance_typed_task(project.id, task_type="create", errors=0)
+    )
+    db_session.add(
+        _make_format_compliance_typed_task(project.id, task_type="fix", errors=1)
+    )
     await db_session.commit()
 
     await write_snapshot(db_session, project.id)
@@ -5424,7 +5485,9 @@ async def test_format_compliance_by_type_none_for_old_snapshots(db_session):
 
 
 @pytest.mark.asyncio
-async def test_agent_format_compliance_snapshot_endpoint(client: AsyncClient, db_session):
+async def test_agent_format_compliance_snapshot_endpoint(
+    client: AsyncClient, db_session
+):
     """GET /api/agent/efficiency-snapshot/format-compliance returns by_type block."""
     from app.auth import create_agent_token
 
@@ -5443,8 +5506,12 @@ async def test_agent_format_compliance_snapshot_endpoint(client: AsyncClient, db
     await db_session.refresh(task)
 
     # Add format-compliance tasks and write a snapshot.
-    db_session.add(_make_format_compliance_typed_task(project.id, task_type="create", errors=0))
-    db_session.add(_make_format_compliance_typed_task(project.id, task_type="research", errors=1))
+    db_session.add(
+        _make_format_compliance_typed_task(project.id, task_type="create", errors=0)
+    )
+    db_session.add(
+        _make_format_compliance_typed_task(project.id, task_type="research", errors=1)
+    )
     await db_session.commit()
 
     await write_snapshot(db_session, project.id)
@@ -5466,3 +5533,387 @@ async def test_agent_format_compliance_snapshot_endpoint(client: AsyncClient, db
     assert "research" in by_type
     assert by_type["create"]["format_compliance_rate"] == 1.0
     assert by_type["research"]["format_compliance_rate"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# compute_pr_rework_chain_breakdown tests
+# ---------------------------------------------------------------------------
+
+
+def _pr_chain_task(
+    project_id,
+    *,
+    pr_number,
+    task_type,
+    iteration=None,
+    input_tokens=1000,
+    output_tokens=500,
+    provider="anthropic",
+    model="claude-sonnet-4-6",
+    vm_cost_seconds=300,
+):
+    """Simplified helper: task in a PR chain."""
+    from testing.factories import _utcnow
+
+    now = _utcnow()
+    context = {}
+    if iteration is not None:
+        context["review_loop"] = {"iteration": iteration, "pr_number": pr_number}
+    payload = {"type": task_type, "pr_number": pr_number}
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context=context,
+        payloads=[payload],
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+            "llm_call_count": 5,
+        },
+        provider=provider,
+        model=model,
+        vm_provisioned_at=now - timedelta(seconds=vm_cost_seconds),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+
+
+def test_pr_chain_rework_rollup_splits_first_pass_vs_rework():
+    """Core acceptance test: a create + first review (first-pass) and a fix +
+    re-review (rework) on the same PR number are correctly split.
+
+    PR 42 chain:
+      - create task (iteration=None)  -> first-pass
+      - review task (iteration=1)     -> first-pass (first review)
+      - fix task   (type="fix")       -> rework
+      - review task (iteration=2)     -> rework (re-review)
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # first-pass: create (2000 in / 1000 out) + review-iter1 (1000 in / 500 out)
+    create = _pr_chain_task(
+        project_id,
+        pr_number=42,
+        task_type="create",
+        input_tokens=2000,
+        output_tokens=1000,
+    )
+    review1 = _pr_chain_task(
+        project_id,
+        pr_number=42,
+        task_type="review",
+        iteration=1,
+        input_tokens=1000,
+        output_tokens=500,
+    )
+    # rework: fix (1500 in / 800 out) + re-review iter2 (1200 in / 600 out)
+    fix1 = _pr_chain_task(
+        project_id, pr_number=42, task_type="fix", input_tokens=1500, output_tokens=800
+    )
+    review2 = _pr_chain_task(
+        project_id,
+        pr_number=42,
+        task_type="review",
+        iteration=2,
+        input_tokens=1200,
+        output_tokens=600,
+    )
+
+    result = compute_pr_rework_chain_breakdown([create, review1, fix1, review2])
+
+    assert result["total_pr_chains"] == 1
+
+    expected_fp_llm = round(
+        2000 * input_rate
+        + 1000 * output_rate  # create
+        + 1000 * input_rate
+        + 500 * output_rate,  # review iter1
+        6,
+    )
+    expected_rw_llm = round(
+        1500 * input_rate
+        + 800 * output_rate  # fix
+        + 1200 * input_rate
+        + 600 * output_rate,  # review iter2
+        6,
+    )
+    expected_total_llm = round(expected_fp_llm + expected_rw_llm, 6)
+
+    assert result["first_pass_llm_usd"] == pytest.approx(expected_fp_llm, abs=1e-9)
+    assert result["rework_llm_usd"] == pytest.approx(expected_rw_llm, abs=1e-9)
+    assert result["total_llm_usd"] == pytest.approx(expected_total_llm, abs=1e-9)
+
+    expected_rework_share = round(expected_rw_llm / expected_total_llm, 4)
+    assert result["rework_share_of_total_llm_cost"] == expected_rework_share
+    assert result["unpriced_chain_count"] == 0
+
+    # top_rework_prs has exactly one entry for PR 42
+    assert len(result["top_rework_prs"]) == 1
+    pr_entry = result["top_rework_prs"][0]
+    assert pr_entry["pr_number"] == 42
+    assert pr_entry["task_count"] == 4
+    assert pr_entry["rework_task_count"] == 2
+    assert pr_entry["rework_llm_usd"] == pytest.approx(expected_rw_llm, abs=1e-9)
+    assert pr_entry["has_unpriced"] is False
+
+
+def test_pr_chain_rework_single_pass_no_rework():
+    """A PR with only a create task (no fix/re-review) reports zero rework share."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    create = _pr_chain_task(
+        project_id,
+        pr_number=101,
+        task_type="create",
+        input_tokens=1000,
+        output_tokens=500,
+    )
+    review1 = _pr_chain_task(
+        project_id,
+        pr_number=101,
+        task_type="review",
+        iteration=1,
+        input_tokens=800,
+        output_tokens=400,
+    )
+
+    result = compute_pr_rework_chain_breakdown([create, review1])
+
+    assert result["total_pr_chains"] == 1
+    assert result["rework_llm_usd"] == 0.0
+    assert result["rework_vm_usd"] == 0.0
+    assert result["rework_share_of_total_llm_cost"] == 0.0
+    assert result["top_rework_prs"][0]["rework_task_count"] == 0
+    assert result["top_rework_prs"][0]["rework_share"] == 0.0
+
+
+def test_pr_chain_rework_tasks_without_pr_number_excluded():
+    """Tasks with no pr_number are excluded; the rollup returns empty."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    no_pr = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "create"}],
+        api_call_summary={"total_input_tokens": 1000, "total_output_tokens": 500},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = compute_pr_rework_chain_breakdown([no_pr])
+
+    assert result["total_pr_chains"] == 0
+    assert result["total_llm_usd"] == 0.0
+    assert result["rework_llm_usd"] == 0.0
+    assert result["rework_share_of_total_llm_cost"] is None
+    assert result["top_rework_prs"] == []
+
+
+def test_pr_chain_rework_unpriced_combo_flagged():
+    """A chain with an unpriced provider/model contributes zero LLM cost but
+    has_unpriced=True and increments unpriced_chain_count."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    create = _pr_chain_task(
+        project_id,
+        pr_number=7,
+        task_type="create",
+        input_tokens=1000,
+        output_tokens=500,
+        provider="unknownprovider",
+        model="mystery-v1",
+    )
+    fix1 = _pr_chain_task(
+        project_id,
+        pr_number=7,
+        task_type="fix",
+        input_tokens=800,
+        output_tokens=400,
+        provider="unknownprovider",
+        model="mystery-v1",
+    )
+
+    result = compute_pr_rework_chain_breakdown([create, fix1])
+
+    assert result["total_pr_chains"] == 1
+    assert result["total_llm_usd"] == 0.0
+    assert result["rework_llm_usd"] == 0.0
+    assert result["unpriced_chain_count"] == 1
+    assert result["top_rework_prs"][0]["has_unpriced"] is True
+    # rework_share is None because total_llm_usd == 0
+    assert result["rework_share_of_total_llm_cost"] is None
+
+
+def test_pr_chain_rework_top_n_cap():
+    """With more than top_n PR chains, only the top_n by rework_llm_usd are returned."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    tasks = []
+    # Create 5 PR chains with different rework spend (PR 1 has most rework)
+    for pr in range(1, 6):
+        tasks.append(
+            _pr_chain_task(
+                project_id,
+                pr_number=pr,
+                task_type="create",
+                input_tokens=1000,
+                output_tokens=500,
+            )
+        )
+        # PR 1 gets 5000 rework input tokens, PR 2 gets 4000, ...
+        tasks.append(
+            _pr_chain_task(
+                project_id,
+                pr_number=pr,
+                task_type="fix",
+                input_tokens=pr * 1000,
+                output_tokens=500,
+            )
+        )
+
+    result = compute_pr_rework_chain_breakdown(tasks, top_n=3)
+
+    assert result["total_pr_chains"] == 5
+    assert len(result["top_rework_prs"]) == 3
+    # Top 3 by rework_llm_usd: PR 5 > PR 4 > PR 3
+    pr_numbers = [e["pr_number"] for e in result["top_rework_prs"]]
+    assert pr_numbers == [5, 4, 3]
+
+
+def test_pr_chain_rework_aggregate_rework_share_multi_prs():
+    """rework_share_of_total_llm_cost aggregates across multiple PR chains correctly."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # PR 10: create only (first-pass, 1000 in / 500 out)
+    create_10 = _pr_chain_task(
+        project_id,
+        pr_number=10,
+        task_type="create",
+        input_tokens=1000,
+        output_tokens=500,
+    )
+    # PR 20: create + fix (rework = fix cost)
+    create_20 = _pr_chain_task(
+        project_id,
+        pr_number=20,
+        task_type="create",
+        input_tokens=1000,
+        output_tokens=500,
+    )
+    fix_20 = _pr_chain_task(
+        project_id, pr_number=20, task_type="fix", input_tokens=2000, output_tokens=1000
+    )
+
+    result = compute_pr_rework_chain_breakdown([create_10, create_20, fix_20])
+
+    fp_cost = round(1000 * input_rate + 500 * output_rate, 6)  # create_10
+    fp_cost_20 = round(1000 * input_rate + 500 * output_rate, 6)  # create_20
+    rw_cost = round(2000 * input_rate + 1000 * output_rate, 6)  # fix_20
+    total = round(fp_cost + fp_cost_20 + rw_cost, 6)
+
+    assert result["first_pass_llm_usd"] == pytest.approx(fp_cost + fp_cost_20, abs=1e-9)
+    assert result["rework_llm_usd"] == pytest.approx(rw_cost, abs=1e-9)
+    expected_share = round(rw_cost / total, 4)
+    assert result["rework_share_of_total_llm_cost"] == expected_share
+    assert result["total_pr_chains"] == 2
+
+
+def test_pr_chain_rework_context_only_pr_number():
+    """PR number from context.review_loop.pr_number (no payload pr_number) works."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    from testing.factories import _utcnow
+
+    now = _utcnow()
+
+    # Payload has no pr_number; context.review_loop has it
+    review = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": {"pr_number": 99, "iteration": 2}},
+        payloads=[{"type": "review"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(seconds=300),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+
+    result = compute_pr_rework_chain_breakdown([review])
+
+    assert result["total_pr_chains"] == 1
+    assert result["top_rework_prs"][0]["pr_number"] == 99
+    # iteration=2 review is rework
+    assert result["top_rework_prs"][0]["rework_task_count"] == 1
+    assert result["rework_llm_usd"] > 0.0
+
+
+def test_pr_chain_rework_vm_cost_tracked():
+    """VM dollars are tracked alongside LLM dollars for both first-pass and rework."""
+    import uuid
+    from app.models import get_task_total_vm_cost_usd
+
+    project_id = uuid.uuid4()
+
+    create = _pr_chain_task(
+        project_id,
+        pr_number=5,
+        task_type="create",
+        input_tokens=1000,
+        output_tokens=500,
+        vm_cost_seconds=300,
+    )
+    fix1 = _pr_chain_task(
+        project_id,
+        pr_number=5,
+        task_type="fix",
+        input_tokens=800,
+        output_tokens=400,
+        vm_cost_seconds=600,
+    )
+
+    result = compute_pr_rework_chain_breakdown([create, fix1])
+
+    expected_fp_vm = get_task_total_vm_cost_usd(create)
+    expected_rw_vm = get_task_total_vm_cost_usd(fix1)
+    assert result["first_pass_vm_usd"] == pytest.approx(expected_fp_vm, abs=1e-6)
+    assert result["rework_vm_usd"] == pytest.approx(expected_rw_vm, abs=1e-6)
+    assert result["total_vm_usd"] == pytest.approx(
+        expected_fp_vm + expected_rw_vm, abs=1e-6
+    )
+    assert result["rework_share_of_total_vm_cost"] == pytest.approx(
+        round(expected_rw_vm / (expected_fp_vm + expected_rw_vm), 4), abs=1e-6
+    )
+
+
+def test_pr_chain_rework_empty_task_list():
+    """Empty task list returns zero-valued structure."""
+    result = compute_pr_rework_chain_breakdown([])
+
+    assert result["total_pr_chains"] == 0
+    assert result["total_llm_usd"] == 0.0
+    assert result["rework_llm_usd"] == 0.0
+    assert result["rework_share_of_total_llm_cost"] is None
+    assert result["rework_share_of_total_vm_cost"] is None
+    assert result["top_rework_prs"] == []
+    assert result["unpriced_chain_count"] == 0

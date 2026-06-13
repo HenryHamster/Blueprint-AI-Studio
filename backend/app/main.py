@@ -65,8 +65,12 @@ from app.routers.admin_users import router as admin_users_router
 from app.routers.admin_notifications import router as admin_notifications_router
 from app.routers.admin_analytics import router as admin_analytics_router
 from app.routers.admin_digest import router as admin_digest_router
+from app.routers.admin_pipeline_observability import (
+    metrics_router as admin_metrics_router,
+)
 from app.routers.admin_activity import router as admin_activity_router
 from app.routers.admin_health import router as admin_health_router
+from app.routers.admin_evergreen import router as admin_evergreen_router
 from app.routers.admin_orchestrator_errors import (
     router as admin_orchestrator_errors_router,
 )
@@ -87,7 +91,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0235"
+EXPECTED_SCHEMA_REVISION = "0273"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -787,8 +791,10 @@ app.include_router(admin_users_router)
 app.include_router(admin_notifications_router)
 app.include_router(admin_analytics_router)
 app.include_router(admin_digest_router)
+app.include_router(admin_metrics_router)
 app.include_router(admin_activity_router)
 app.include_router(admin_health_router)
+app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
 app.include_router(agent_status_router)

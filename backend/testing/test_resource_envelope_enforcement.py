@@ -9,7 +9,11 @@ import app.shared_state as _shared_state
 from app.autonomous_research import _spawn_periodic_task, _spawn_research_task
 from app.max_plan_pool import _account_by_id, _max_plan_pools
 from app.models import Task
-from testing.factories import make_project
+from app.orchestrator import (
+    _filter_project_resource_dispatch_eligible,
+    _project_resource_dispatch_defer_message,
+)
+from testing.factories import make_project, make_task
 
 
 @pytest.fixture(autouse=True)
@@ -60,13 +64,17 @@ async def test_spend_ceiling_blocks_autonomous_research_spawn(db_session, mocker
     await _spawn_research_task(project, db_session)
 
     spawned = (
-        await db_session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.created_by == "ORCHESTRATOR",
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert spawned == []
     spend_mock.assert_awaited_once_with(
         db_session,
@@ -104,16 +112,22 @@ async def test_spend_ceiling_blocks_autonomous_periodic_spawn(db_session, mocker
         if previous_periodic is None:
             _shared_state.runtime_config.pop("autonomous_periodic_tasks", None)
         else:
-            _shared_state.runtime_config["autonomous_periodic_tasks"] = previous_periodic
+            _shared_state.runtime_config["autonomous_periodic_tasks"] = (
+                previous_periodic
+            )
 
     spawned = (
-        await db_session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.created_by == "ORCHESTRATOR",
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert spawned == []
     spend_mock.assert_awaited_once_with(
         db_session,
@@ -150,9 +164,7 @@ async def test_spend_ceiling_blocks_residual_remediation_spawn(db_session, mocke
     async def _session_cm():
         yield db_session
 
-    mocker.patch(
-        "app.autonomous_research.AsyncSessionLocal", lambda: _session_cm()
-    )
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", lambda: _session_cm())
     mocker.patch(
         "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
     )
@@ -163,12 +175,8 @@ async def test_spend_ceiling_blocks_residual_remediation_spawn(db_session, mocke
         new=AsyncMock(return_value=15.0),
     )
     # Stub other spawn functions to avoid side-effects
-    mocker.patch(
-        "app.autonomous_research._spawn_research_task", new_callable=AsyncMock
-    )
-    mocker.patch(
-        "app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock
-    )
+    mocker.patch("app.autonomous_research._spawn_research_task", new_callable=AsyncMock)
+    mocker.patch("app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock)
     residual_mock = mocker.patch(
         "app.autonomous_research._spawn_residual_fingerprint_remediation",
         new_callable=AsyncMock,
@@ -182,3 +190,250 @@ async def test_spend_ceiling_blocks_residual_remediation_spawn(db_session, mocke
         _shared_state.last_idle_check = None
 
     residual_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Dispatch-time resource-envelope enforcement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_defers_task_at_project_vm_cap(db_session, mocker):
+    """Project at its concurrent-VM cap gets a VM-capacity deferral message."""
+    project = make_project(
+        build_config={"resource_envelope": {"max_concurrent_vms": 2}}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+
+    # Simulate 2 already-active tasks (at cap)
+    active_counts = {project.id: 2}
+    msg = await _project_resource_dispatch_defer_message(
+        db_session, task, active_counts
+    )
+
+    assert msg is not None
+    assert "VM capacity" in msg
+    assert "2/2" in msg
+
+
+@pytest.mark.asyncio
+async def test_dispatch_passes_task_under_vm_cap(db_session):
+    """Project with active tasks below cap returns None (no deferral)."""
+    project = make_project(
+        build_config={"resource_envelope": {"max_concurrent_vms": 3}}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+
+    active_counts = {project.id: 1}
+    msg = await _project_resource_dispatch_defer_message(
+        db_session, task, active_counts
+    )
+
+    assert msg is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_projected_count_stops_double_admit(db_session, mocker):
+    """With cap=1 and active=0, only the first of two queued tasks is admitted."""
+    project = make_project(
+        build_config={"resource_envelope": {"max_concurrent_vms": 1}}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task1 = make_task(project_id=project.id)
+    task2 = make_task(project_id=project.id)
+    db_session.add(task1)
+    db_session.add(task2)
+    await db_session.commit()
+
+    broadcast = AsyncMock()
+    active_counts = {project.id: 0}
+    result = await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task1.id, task2.id],
+        [task1, task2],
+        active_counts,
+        broadcast,
+    )
+
+    # Only the first task is admitted; second is deferred by projected count
+    assert result == [task1.id]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_defers_task_at_spend_ceiling(db_session, mocker):
+    """Project at or over its spend ceiling is deferred with a spend-budget message."""
+    project = make_project(
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 7,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(return_value=10.0),
+    )
+
+    msg = await _project_resource_dispatch_defer_message(db_session, task, {})
+
+    assert msg is not None
+    assert "spend budget" in msg
+    assert "$10.00/$10.00" in msg
+
+
+@pytest.mark.asyncio
+async def test_dispatch_passes_task_under_spend_ceiling(db_session, mocker):
+    """Project below its spend ceiling returns None (no deferral)."""
+    project = make_project(
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 7,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(return_value=9.99),
+    )
+
+    msg = await _project_resource_dispatch_defer_message(db_session, task, {})
+
+    assert msg is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_passes_task_with_no_envelope(db_session):
+    """Project with no resource envelope configured passes through unaffected."""
+    project = make_project(build_config={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+
+    broadcast = AsyncMock()
+    result = await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task.id],
+        [task],
+        {},
+        broadcast,
+    )
+
+    assert result == [task.id]
+    broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_missing_project_returns_sentinel(db_session):
+    """If the project row is absent from the DB, a sentinel string is returned."""
+    import uuid as _uuid
+
+    task = make_task(project_id=_uuid.uuid4())
+    # Do not persist the task or project — project_id is unknown to the DB
+
+    msg = await _project_resource_dispatch_defer_message(db_session, task, {})
+
+    assert msg is not None
+    assert "project record unavailable" in msg
+
+
+@pytest.mark.asyncio
+async def test_filter_broadcasts_on_new_defer_message(db_session, mocker):
+    """Deferred task with a new status message triggers broadcast_to_project."""
+    project = make_project(
+        build_config={"resource_envelope": {"max_concurrent_vms": 1}}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task1 = make_task(project_id=project.id)
+    task2 = make_task(project_id=project.id, latest_status_message=None)
+    db_session.add(task1)
+    db_session.add(task2)
+    await db_session.commit()
+
+    broadcast = AsyncMock()
+    await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task1.id, task2.id],
+        [task1, task2],
+        {project.id: 0},
+        broadcast,
+    )
+
+    # task2 is deferred (projected count from task1 fills the cap)
+    # broadcast should be called for task2's new deferral message
+    broadcast.assert_called_once()
+    call_args = broadcast.call_args
+    assert str(project.id) == call_args[0][0]
+    assert call_args[0][1] == "task_updated"
+
+
+@pytest.mark.asyncio
+async def test_filter_no_broadcast_when_message_unchanged(db_session, mocker):
+    """No broadcast when the deferred task already has the same status message."""
+    project = make_project(
+        build_config={"resource_envelope": {"max_concurrent_vms": 1}}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task1 = make_task(project_id=project.id)
+    # Pre-set task2's message to match the deferral message it will receive
+    expected_msg = (
+        "Waiting for project VM capacity — 1/1 project VM slots are already in use"
+    )
+    task2 = make_task(project_id=project.id, latest_status_message=expected_msg)
+    db_session.add(task1)
+    db_session.add(task2)
+    await db_session.commit()
+
+    broadcast = AsyncMock()
+    await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task1.id, task2.id],
+        [task1, task2],
+        {project.id: 0},
+        broadcast,
+    )
+
+    # task2 is deferred but message is unchanged — no broadcast
+    broadcast.assert_not_called()

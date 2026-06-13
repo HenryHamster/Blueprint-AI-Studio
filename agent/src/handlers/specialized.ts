@@ -47,12 +47,63 @@ export function isRepoBootstrapOverview(value: unknown): value is {
   test_layout?: string;
   key_conventions?: string;
   environment_requirements?: string;
+  source_revision?: string;
 } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   return typeof record.tech_stack === 'string'
     && typeof record.directory_layout === 'string'
     && typeof record.first_steps_summary === 'string';
+}
+
+/**
+ * Agent-reported repo_bootstrap command write-back outcome, reported separately
+ * from the repo overview. `status` is one of the backend-accepted values
+ * (success / missing_commands / writeback_failed); other shapes are rejected so
+ * a malformed file degrades to "no payload" (the backend then records the
+ * command-memory marker as "unknown" rather than falsely claiming success).
+ */
+export function isCommandMemoryOutcome(value: unknown): value is {
+  status: 'success' | 'missing_commands' | 'writeback_failed';
+  detail?: string;
+  updated_paths?: string[];
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return record.status === 'success'
+    || record.status === 'missing_commands'
+    || record.status === 'writeback_failed';
+}
+
+const COMMAND_MEMORY_DETAIL_MAX_LENGTH = 2000;
+const COMMAND_MEMORY_UPDATED_PATHS_MAX_LENGTH = 50;
+
+function normalizeCommandMemoryOutcome(value: {
+  status: 'success' | 'missing_commands' | 'writeback_failed';
+  detail?: string;
+  updated_paths?: string[];
+}): {
+  status: 'success' | 'missing_commands' | 'writeback_failed';
+  detail?: string;
+  updated_paths?: string[];
+} {
+  const normalized: {
+    status: 'success' | 'missing_commands' | 'writeback_failed';
+    detail?: string;
+    updated_paths?: string[];
+  } = { status: value.status };
+
+  if (typeof value.detail === 'string') {
+    normalized.detail = value.detail.slice(0, COMMAND_MEMORY_DETAIL_MAX_LENGTH);
+  }
+
+  if (Array.isArray(value.updated_paths)) {
+    normalized.updated_paths = value.updated_paths
+      .filter((p): p is string => typeof p === 'string')
+      .slice(0, COMMAND_MEMORY_UPDATED_PATHS_MAX_LENGTH);
+  }
+
+  return normalized;
 }
 
 // ── Migration layout resolution ──────────────────────────────────────────────
@@ -827,9 +878,32 @@ The "verdict" value MUST be exactly "pass" or "fail" — no other values are acc
       // A focused re-ask succeeded with recognized verdicts — post the repaired array.
       challengeLogs = sanitize(JSON.stringify(repaired.value));
     } else {
-      // First attempt was already parseable (retry===null), repair failed, or
-      // exitCode!==0 — pass raw output through unchanged.
-      challengeLogs = sanitize(lastResultText || (allOutput || '').slice(-50_000));
+      const rawOutput = lastResultText || (allOutput || '').slice(-50_000);
+      // Guard: if the raw output is an investigation-report envelope (a
+      // {summary, root_cause, ...} object), the backend parser anchored on a
+      // top-level array would find no array and fail-close all findings.  Post
+      // the already-extracted valid array instead so the verdicts flow through.
+      if (repaired.value !== null) {
+        let isInvestigationReportEnvelope = false;
+        try {
+          const parsed = JSON.parse(rawOutput) as unknown;
+          isInvestigationReportEnvelope = (
+            parsed !== null &&
+            typeof parsed === 'object' &&
+            !Array.isArray(parsed) &&
+            'summary' in (parsed as Record<string, unknown>)
+          );
+        } catch { /* not a JSON object — safe to pass through */ }
+        if (isInvestigationReportEnvelope) {
+          challengeLogs = sanitize(JSON.stringify(repaired.value));
+        } else {
+          challengeLogs = sanitize(rawOutput);
+        }
+      } else {
+        // First attempt was already parseable (retry===null), repair failed, or
+        // exitCode!==0 — pass raw output through unchanged.
+        challengeLogs = sanitize(rawOutput);
+      }
     }
     await persistAndPostStatus(taskId, {
       task_id: taskId,
@@ -1024,7 +1098,8 @@ Also read any detected build/CI manifests you find.
      "entry_points": "if discoverable: main executable(s) or server entry files",
      "test_layout": "if discoverable: test directory structure and how to run subsets",
      "key_conventions": "if discoverable: branch naming, commit style, PR conventions",
-     "environment_requirements": "if discoverable: required env vars, runtime versions, .env.example notes"
+     "environment_requirements": "if discoverable: required env vars, runtime versions, .env.example notes",
+     "source_revision": "checked-out HEAD SHA after clone/checkout"
    }
    \`\`\`
    The file must contain ONLY the JSON object, no markdown wrapping.
@@ -1034,7 +1109,17 @@ Also read any detected build/CI manifests you find.
    \`${writebackEndpoint}\`
    with the confirmed commands per directory.
 
-3. **Status**: After completing both steps, post COMPLETED status with \`${completionPayloadField}\` populated. If you cannot read the repo or run commands, still complete with whatever you found.
+3. **Command-memory outcome**: Record the result of step 2 — separately from the overview — by writing the following JSON object to \`/tmp/command_memory_${taskId}.json\` (NOT inside the repository):
+   \`\`\`json
+   {
+     "status": "success | missing_commands | writeback_failed",
+     "detail": "optional short explanation",
+     "updated_paths": ["directories you wrote back, e.g. ., backend, admin-ui"]
+   }
+   \`\`\`
+   Use \`success\` only if the write-back call actually succeeded with at least one confirmed command. Use \`missing_commands\` if you could not confirm any runnable command, and \`writeback_failed\` if the write-back call itself errored. The file must contain ONLY the JSON object, no markdown wrapping. This is reported independently of the overview — a good overview does NOT imply confirmed commands.
+
+4. **Status**: After completing the steps above, post COMPLETED status with \`${completionPayloadField}\` populated. If you cannot read the repo or run commands, still complete with whatever you found.
 
 ${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
 
@@ -1050,6 +1135,13 @@ ${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
   const rateLimitDetected = matchesRateLimit(allOutput || '');
   const parsedBootstrapOverview = exitCode === 0 ? readHandlerOutput(taskId, 'bootstrap_overview', ws) : null;
   const bootstrapOverview = isRepoBootstrapOverview(parsedBootstrapOverview) ? parsedBootstrapOverview : null;
+  // Command-memory outcome is read and reported independently of the overview:
+  // a present overview must not imply confirmed commands. An absent or malformed
+  // file leaves command_memory unset, which the backend degrades to "unknown".
+  const parsedCommandMemory = exitCode === 0 ? readHandlerOutput(taskId, 'command_memory', ws) : null;
+  const commandMemory = isCommandMemoryOutcome(parsedCommandMemory)
+    ? normalizeCommandMemoryOutcome(parsedCommandMemory)
+    : null;
   const logs = bootstrapOverview !== null
     ? sanitize(JSON.stringify(bootstrapOverview))
     : sanitize(allOutput ? allOutput.slice(-500) : 'Bootstrap complete');
@@ -1061,6 +1153,7 @@ ${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
       ? { artifact_type: 'ERROR_LOG', failure_category: rateLimitDetected ? 'rate_limited' : 'claude_code_failed' }
       : {}),
     ...(bootstrapOverview !== null ? { repo_overview: bootstrapOverview } : {}),
+    ...(commandMemory !== null ? { command_memory: commandMemory } : {}),
     logs,
   });
 }

@@ -822,7 +822,12 @@ async def test_agent_compute_job_launch_reuses_existing_active_job(
     ("artifact_status", "reason_code", "expected_aggregate", "expected_message"),
     [
         ("unconfirmed", None, "unconfirmed", "waiting on required artifacts"),
-        ("deploy_failed", "image_not_live", "deploy_failed", "required artifacts failed"),
+        (
+            "deploy_failed",
+            "image_not_live",
+            "deploy_failed",
+            "required artifacts failed",
+        ),
     ],
 )
 async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed(
@@ -1564,9 +1569,7 @@ async def test_agent_heartbeat_persists_had_repo_map_true(
 
 
 @pytest.mark.asyncio
-async def test_agent_heartbeat_had_repo_map_write_once(
-    client: AsyncClient, db_session
-):
+async def test_agent_heartbeat_had_repo_map_write_once(client: AsyncClient, db_session):
     """Second heartbeat with had_repo_map=False does not overwrite an already-set flag."""
     project = Project(name="Heartbeat Repo Map Write Once", user_id="test-user-123")
     db_session.add(project)
@@ -1662,9 +1665,7 @@ async def test_agent_heartbeat_persists_repo_map_arm_false(
 
 
 @pytest.mark.asyncio
-async def test_agent_heartbeat_repo_map_arm_write_once(
-    client: AsyncClient, db_session
-):
+async def test_agent_heartbeat_repo_map_arm_write_once(client: AsyncClient, db_session):
     """Second heartbeat with repo_map_arm=False does not overwrite an already-set flag."""
     project = Project(name="Heartbeat Repo Map Arm Write Once", user_id="test-user-123")
     db_session.add(project)
@@ -1693,6 +1694,178 @@ async def test_agent_heartbeat_repo_map_arm_write_once(
     await db_session.refresh(task)
     # Must remain True — write-once semantics
     assert (task.context or {}).get("_repo_map_arm") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_persists_had_diagnostics_after_edit_true(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with had_diagnostics_after_edit=True persists _had_diagnostics_after_edit=True to task.context."""
+    project = Project(name="Heartbeat Diag After Edit True", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-true",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-true")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "had_diagnostics_after_edit": True},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_had_diagnostics_after_edit") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_had_diagnostics_after_edit_write_once(
+    client: AsyncClient, db_session
+):
+    """Second heartbeat with had_diagnostics_after_edit=False does not overwrite an already-set flag."""
+    project = Project(
+        name="Heartbeat Diag After Edit Write Once", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-once",
+        status=TaskStatus.IN_PROGRESS,
+        context={"_had_diagnostics_after_edit": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-once")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "had_diagnostics_after_edit": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    # Must remain True — write-once semantics
+    assert (task.context or {}).get("_had_diagnostics_after_edit") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_persists_diagnostics_after_edit_arm_true(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with diagnostics_after_edit_arm=True persists _diagnostics_after_edit_arm=True to task.context."""
+    project = Project(
+        name="Heartbeat Diag After Edit Arm True", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-arm-true",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-arm-true")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "diagnostics_after_edit_arm": True},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_diagnostics_after_edit_arm") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_persists_diagnostics_after_edit_arm_false(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with diagnostics_after_edit_arm=False persists _diagnostics_after_edit_arm=False to task.context."""
+    project = Project(
+        name="Heartbeat Diag After Edit Arm False", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-arm-false",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-arm-false")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "diagnostics_after_edit_arm": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_diagnostics_after_edit_arm") is False
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_diagnostics_after_edit_arm_write_once(
+    client: AsyncClient, db_session
+):
+    """Second heartbeat with diagnostics_after_edit_arm=False does not overwrite an already-set flag."""
+    project = Project(
+        name="Heartbeat Diag After Edit Arm Write Once", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-arm-once",
+        status=TaskStatus.IN_PROGRESS,
+        context={"_diagnostics_after_edit_arm": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-arm-once")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "diagnostics_after_edit_arm": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    # Must remain True — write-once semantics
+    assert (task.context or {}).get("_diagnostics_after_edit_arm") is True
 
 
 @pytest.mark.asyncio
@@ -2270,6 +2443,50 @@ async def test_agent_claim_omits_repo_overview_for_non_repo_context_tasks(
 
     assert resp.status_code == 200
     assert "repo_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_bootstrap_guidance_requests_source_revision(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="Bootstrap Guidance Source Revision",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="source-revision",
+        build_config={},
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "repo_bootstrap",
+                "github_owner": "acme",
+                "github_repo": "source-revision",
+                "integration_branch": "main",
+            }
+        ],
+        vm_instance_id="agent-vm-bootstrap-guidance-source-revision",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    guidance = resp.json()["bootstrap_guidance"]
+    assert "source_revision" in guidance["design_doc_section_fields"]
+    assert any(
+        "source_revision" in step and "checked-out HEAD SHA" in step
+        for step in guidance["completion_steps"]
+    )
 
 
 @pytest.mark.asyncio
@@ -3663,7 +3880,9 @@ async def test_recently_completed_tasks_preserve_completed_and_failed_history(
     assert resp.status_code == 200
 
     recent = resp.json()["project_context"]["recently_completed_tasks"]
-    completed = [entry for entry in recent if entry["status"] == TaskStatus.COMPLETED.value]
+    completed = [
+        entry for entry in recent if entry["status"] == TaskStatus.COMPLETED.value
+    ]
     failed = [entry for entry in recent if entry["status"] == TaskStatus.FAILED.value]
 
     assert len(recent) == 15
@@ -3844,8 +4063,7 @@ async def test_lessons_and_direction_history_survive_terminal_summary_cap(
     pc = resp.json()["project_context"]
     assert any(entry["task_title"] == "Historic lesson" for entry in pc["lessons"])
     assert any(
-        entry["title"] == "Historic lesson"
-        for entry in pc["direction_recent_tasks"]
+        entry["title"] == "Historic lesson" for entry in pc["direction_recent_tasks"]
     )
 
 
@@ -3980,7 +4198,9 @@ async def test_agent_claim_sibling_tasks_include_terminal_outcomes(
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_limits_terminal_sibling_history(client: AsyncClient, db_session):
+async def test_agent_claim_limits_terminal_sibling_history(
+    client: AsyncClient, db_session
+):
     """Sibling history keeps active siblings and caps terminal siblings at five."""
     project = Project(name="Sibling History Limit", user_id="test-user-123")
     db_session.add(project)
@@ -11486,6 +11706,157 @@ def test_reproduce_verdict_schema_validation():
         AgentStatusPayload(**base, reproduce_verdict={"status": "maybe"})
 
 
+def test_workspace_prep_schema_validation():
+    """AgentStatusPayload.workspace_prep accepts the bounded lane outcome shape."""
+    from app.schemas import AgentStatusPayload
+    from pydantic import ValidationError
+
+    base = {"task_id": str(uuid.uuid4()), "status": "FAILED"}
+    assert AgentStatusPayload(**base).workspace_prep is None
+
+    parsed = AgentStatusPayload(
+        **base,
+        workspace_prep={
+            "path": "warm",
+            "warm_reuse_succeeded": True,
+            "checkpoint_reset_applied": False,
+            "cold_fallback_reason": None,
+            "lane_phase": True,
+        },
+    )
+    assert parsed.workspace_prep is not None
+    assert parsed.workspace_prep.path == "warm"
+    assert parsed.workspace_prep.warm_reuse_succeeded is True
+    assert parsed.workspace_prep.checkpoint_reset_applied is False
+    assert parsed.workspace_prep.cold_fallback_reason is None
+    assert parsed.workspace_prep.lane_phase is True
+
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(
+            **base,
+            workspace_prep={
+                "path": "sideways",
+                "warm_reuse_succeeded": True,
+                "checkpoint_reset_applied": True,
+                "cold_fallback_reason": None,
+                "lane_phase": True,
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_status_records_workspace_prep_and_reconciles_lane_receipts(
+    client: AsyncClient, db_session, mocker
+):
+    """Cold fallback clears receipts; successful warm reuse keeps them."""
+    from app.review_fix_lane_pilot import compute_lane_pilot_aggregates
+
+    async def _post_case(
+        *,
+        project_name: str,
+        user_id: str,
+        vm_id: str,
+        status: TaskStatus,
+        workspace_prep: dict[str, object],
+        logs: str,
+    ):
+        project = Project(name=project_name, user_id=user_id)
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "prompt": "patch lane bug"}],
+            vm_instance_id=vm_id,
+            status=TaskStatus.IN_PROGRESS,
+            context={
+                "_review_fix_lane_arm": "lane",
+                "is_lane_phase": True,
+                "improvement_lane_id": str(uuid.uuid4()),
+                "_review_fix_warm_resume": True,
+                "_review_fix_checkpoint": True,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), vm_id)
+        resp = await client.post(
+            "/api/agent/status",
+            json={
+                "task_id": str(task.id),
+                "status": status.value,
+                "logs": logs,
+                "workspace_prep": workspace_prep,
+            },
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(task)
+        agg = await compute_lane_pilot_aggregates(db_session, project.id)
+        return task, agg
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    cold_task, cold_agg = await _post_case(
+        project_name="Workspace Prep Cold",
+        user_id="test-user-workspace-cold",
+        vm_id="agent-vm-workspace-cold",
+        status=TaskStatus.COMPLETED,
+        workspace_prep={
+            "path": "cold",
+            "warm_reuse_succeeded": False,
+            "checkpoint_reset_applied": False,
+            "cold_fallback_reason": "warm git reset failed",
+            "lane_phase": True,
+        },
+        logs="warm path failed, fell back to cold clone, then completed",
+    )
+    cold_ctx = cold_task.context or {}
+    assert cold_ctx["_workspace_prep"] == {
+        "path": "cold",
+        "warm_reuse_succeeded": False,
+        "checkpoint_reset_applied": False,
+        "cold_fallback_reason": "warm git reset failed",
+        "lane_phase": True,
+    }
+    assert "_review_fix_warm_resume" not in cold_ctx
+    assert "_review_fix_checkpoint" not in cold_ctx
+    assert cold_agg["lane_fix_tasks_sampled"] == 1
+    assert cold_agg["warm_resume_fraction"] == 0.0
+    assert cold_agg["checkpoint_fraction"] == 0.0
+
+    warm_task, warm_agg = await _post_case(
+        project_name="Workspace Prep Warm",
+        user_id="test-user-workspace-warm",
+        vm_id="agent-vm-workspace-warm",
+        status=TaskStatus.COMPLETED,
+        workspace_prep={
+            "path": "warm",
+            "warm_reuse_succeeded": True,
+            "checkpoint_reset_applied": True,
+            "cold_fallback_reason": None,
+            "lane_phase": True,
+        },
+        logs="warm reuse and checkpoint reset completed",
+    )
+    warm_ctx = warm_task.context or {}
+    assert warm_ctx["_workspace_prep"] == {
+        "path": "warm",
+        "warm_reuse_succeeded": True,
+        "checkpoint_reset_applied": True,
+        "cold_fallback_reason": None,
+        "lane_phase": True,
+    }
+    assert warm_ctx["_review_fix_warm_resume"] is True
+    assert warm_ctx["_review_fix_checkpoint"] is True
+    assert warm_agg["lane_fix_tasks_sampled"] == 1
+    assert warm_agg["warm_resume_fraction"] == 1.0
+    assert warm_agg["checkpoint_fraction"] == 1.0
+
+
 @pytest.mark.asyncio
 async def test_playbook_recent_outcomes_flipped_on_first_attempt_success(
     client: AsyncClient, db_session, mocker
@@ -12785,11 +13156,7 @@ async def test_agent_status_completed_downstream_artifact_stamps_and_delivers(
     assert resp.status_code == 200
 
     artifacts = (
-        (
-            await db_session.execute(
-                select(Artifact).where(Artifact.task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -12868,7 +13235,8 @@ async def test_agent_status_completed_downstream_artifact_delivers_dependent_bey
                 vm_instance_id=f"agent-vm-downstream-scan-cap-irrelevant-{i}",
                 status=TaskStatus.QUEUED,
                 depends_on=[str(blocker.id)],
-                created_at=datetime.utcnow() - timedelta(minutes=9, seconds=_DEPENDENT_SCAN_CAP + 1 - i),
+                created_at=datetime.utcnow()
+                - timedelta(minutes=9, seconds=_DEPENDENT_SCAN_CAP + 1 - i),
             )
         )
 
@@ -12897,7 +13265,9 @@ async def test_agent_status_completed_downstream_artifact_delivers_dependent_bey
 
     artifacts = (
         (
-            await db_session.execute(select(Artifact).where(Artifact.task_id == producer.id))
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == producer.id)
+            )
         )
         .scalars()
         .all()
@@ -13043,11 +13413,7 @@ async def test_agent_status_failed_error_log_does_not_stamp_or_deliver_downstrea
     assert resp.status_code == 200
 
     artifacts = (
-        (
-            await db_session.execute(
-                select(Artifact).where(Artifact.task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -17186,9 +17552,7 @@ async def test_heartbeat_persists_format_compliance_with_by_schema_maps(
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_backward_compat_no_by_schema(
-    client: AsyncClient, db_session
-):
+async def test_heartbeat_backward_compat_no_by_schema(client: AsyncClient, db_session):
     """Heartbeat omitting per-schema maps (older agent) still succeeds and does
     not corrupt the existing fields or prevent persistence."""
     project = Project(name="Format Compliance Compat", user_id="test-user-compat")
@@ -18419,7 +18783,9 @@ async def test_viewport_failure_screenshot_download_url(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="member")
+    member = ProjectMember(
+        project_id=project.id, user_id="test-user-123", role="member"
+    )
     db_session.add(member)
     await db_session.commit()
 
@@ -18468,7 +18834,9 @@ async def test_viewport_failure_screenshot_download_url_storage_failure(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="member")
+    member = ProjectMember(
+        project_id=project.id, user_id="test-user-123", role="member"
+    )
     db_session.add(member)
     await db_session.commit()
 
@@ -18626,11 +18994,21 @@ async def test_rate_limit_parks_and_retains_vm_when_alternate_account_eligible(
         "oauth_token": "sk-ant-alt",
         "disabled_models": {},
     }
-    mocker.patch.object(pool_mod, "_account_by_id", {failed_account_id: failed, alternate_account_id: alternate})
+    mocker.patch.object(
+        pool_mod,
+        "_account_by_id",
+        {failed_account_id: failed, alternate_account_id: alternate},
+    )
     mocker.patch.object(pool_mod, "_max_plan_pools", {"u-park": [failed, alternate]})
-    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.disable_account_model", new_callable=AsyncMock)
-    delete_vm = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status.disable_account_model", new_callable=AsyncMock
+    )
+    delete_vm = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+    )
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     mocker.patch.dict(
         _runtime_config,
@@ -18721,9 +19099,15 @@ async def test_rate_limit_falls_back_to_cold_requeue_when_park_unavailable(
     }
     mocker.patch.object(pool_mod, "_account_by_id", {failed_account_id: failed})
     mocker.patch.object(pool_mod, "_max_plan_pools", {"u-cold": [failed]})
-    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.disable_account_model", new_callable=AsyncMock)
-    delete_vm = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status.disable_account_model", new_callable=AsyncMock
+    )
+    delete_vm = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+    )
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     mocker.patch.dict(
         _runtime_config,
@@ -18806,9 +19190,15 @@ async def test_external_api_provider_quota_cold_requeue_keeps_blacklist(
         "app.failure_classification.classify_failure_with_confidence",
         return_value=FailureClassification("EXTERNAL_API", 1.0),
     )
-    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.disable_account_model", new_callable=AsyncMock)
-    delete_vm = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.release_max_plan_account", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status.disable_account_model", new_callable=AsyncMock
+    )
+    delete_vm = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+    )
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     mocker.patch.dict(
         _runtime_config,
@@ -20378,9 +20768,7 @@ async def test_agent_status_compute_terminal_before_park_callback_finalizes_once
     await db_session.refresh(job)
 
     # No wake registration exists yet — the monitor fired nothing (lost-wakeup window).
-    pre_regs = (
-        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
-    )
+    pre_regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
     assert pre_regs == [], "no registration should exist before the task parks"
 
     # POST the same PARKED payload shape sent by agent/src/handlers/compute-experiment.ts
@@ -20557,7 +20945,9 @@ async def test_agent_status_compute_park_callback_duplicate_parked_is_idempotent
     regs_after_second = (
         (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
     )
-    assert len(regs_after_second) == 1, "duplicate POST must not create a second registration"
+    assert len(regs_after_second) == 1, (
+        "duplicate POST must not create a second registration"
+    )
     assert regs_after_second[0].id == first_reg_id
     assert regs_after_second[0].delivery_state == first_reg_state
 
@@ -20666,8 +21056,75 @@ async def test_agent_status_compute_park_stale_non_parked_after_parking_is_noop(
     regs_after_stale = (
         (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
     )
-    assert len(regs_after_stale) == 1, "stale callback must not create or remove registrations"
+    assert len(regs_after_stale) == 1, (
+        "stale callback must not create or remove registrations"
+    )
     assert regs_after_stale[0].delivery_state == reg_state_after_park
+
+
+@pytest.mark.asyncio
+async def test_agent_status_park_logs_sanitized_as_reason(
+    client: AsyncClient, db_session, mocker
+):
+    """Regression: when park_request.reason is absent, payload.logs must be
+    sanitized before being stored as park_reason.
+
+    If _sanitize_log is not applied, a raw secret in payload.logs leaks into
+    the durable park_reason column.  This test confirms the redacted form is
+    stored, not the raw token.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(name="Park Logs Sanitize Test", user_id="test-user-park-sanitize")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-park-san-{uuid.uuid4().hex[:12]}"
+    task = Task(
+        project_id=project.id,
+        title="test: park with secret in logs",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "standard", "prompt": "do work"}],
+        vm_instance_id=vm_id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    raw_token = "ghp_ABCDEFGHIJKLMNOPabcdefghijklmn01"
+    logs_with_secret = f"error: auth failed token={raw_token} retry"
+
+    token = create_agent_token(str(task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "PARKED",
+            "logs": logs_with_secret,
+            "park_request": {
+                "wake_source_kind": "external_event",
+                "wake_source_ref": "ref-sanitize-test",
+                "wake_action": "resume",
+                "deadline_seconds": 3600,
+                # reason intentionally absent — logs must be used and sanitized
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "parked"
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PARKED
+    assert task.park_reason is not None
+    assert raw_token not in task.park_reason, (
+        "raw secret token must not appear in park_reason"
+    )
+    assert "ghp_***" in task.park_reason, (
+        "sanitized park_reason must contain the redaction marker"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -20702,9 +21159,7 @@ async def test_reviewer_merge_self_merge_persists_recovery_origin(client, db_ses
         status=TaskStatus.COMPLETED,
         vm_instance_id="agent-vm-self-merge",
         context={
-            "_self_review_outcome": {
-                "check_results": {"correctness": {"passed": True}}
-            }
+            "_self_review_outcome": {"check_results": {"correctness": {"passed": True}}}
         },
     )
     db_session.add(task)
@@ -20724,9 +21179,7 @@ async def test_reviewer_merge_self_merge_persists_recovery_origin(client, db_ses
                     "severity": "HIGH",
                 }
             ],
-            "reviewer_edges_considered": [
-                {"case": "empty list", "handled": False}
-            ],
+            "reviewer_edges_considered": [{"case": "empty list", "handled": False}],
             "reviewer_recovery_origin": "lone_checker_recovery",
         },
     )
@@ -20739,9 +21192,7 @@ async def test_reviewer_merge_self_merge_persists_recovery_origin(client, db_ses
     assert len(sr["reviewer_findings"]) == 1
     # Supplied recovery origin is stamped (not the operator default).
     assert sr["reviewer_recovery_origin"] == "lone_checker_recovery"
-    assert sr["reviewer_edges_considered"] == [
-        {"case": "empty list", "handled": False}
-    ]
+    assert sr["reviewer_edges_considered"] == [{"case": "empty list", "handled": False}]
     # The previously-passing self-attestation is overridden and tagged with the
     # same recovery origin.
     assert sr["check_results"]["correctness"]["passed"] is False
@@ -20762,9 +21213,7 @@ async def test_reviewer_merge_self_merge_no_origin_uses_plain_reviewer(
         status=TaskStatus.COMPLETED,
         vm_instance_id="agent-vm-self-enabled",
         context={
-            "_self_review_outcome": {
-                "check_results": {"security": {"passed": True}}
-            }
+            "_self_review_outcome": {"check_results": {"security": {"passed": True}}}
         },
     )
     db_session.add(task)
@@ -20811,9 +21260,7 @@ async def test_reviewer_merge_operator_path_no_origin_defaults_to_operator(
         status=TaskStatus.COMPLETED,
         vm_instance_id="agent-vm-orig",
         context={
-            "_self_review_outcome": {
-                "check_results": {"correctness": {"passed": True}}
-            }
+            "_self_review_outcome": {"check_results": {"correctness": {"passed": True}}}
         },
     )
     db_session.add(original)
@@ -20851,10 +21298,7 @@ async def test_reviewer_merge_operator_path_no_origin_defaults_to_operator(
     await db_session.refresh(original)
     sr = original.context["_self_review_outcome"]
     assert sr["reviewer_recovery_origin"] == "operator_requested_recovery"
-    assert (
-        sr["check_results"]["correctness"]["origin"]
-        == "operator_requested_recovery"
-    )
+    assert sr["check_results"]["correctness"]["origin"] == "operator_requested_recovery"
 
 
 @pytest.mark.asyncio
@@ -20977,9 +21421,7 @@ async def test_agent_build_discovery_ignored_when_directories_populated(
         user_id="user-disc-002",
         build_config={
             "requires_ci_checks": False,
-            "directories": [
-                {"path": ".", "type": "node", "test_cmd": "npm test"}
-            ],
+            "directories": [{"path": ".", "type": "node", "test_cmd": "npm test"}],
         },
     )
     db_session.add(project)
@@ -21135,9 +21577,7 @@ async def test_agent_build_discovery_fill_only_preserves_existing_commands(
 
 
 @pytest.mark.asyncio
-async def test_agent_build_discovery_entry_count_bound(
-    client: AsyncClient, db_session
-):
+async def test_agent_build_discovery_entry_count_bound(client: AsyncClient, db_session):
     """At most 50 entries are accepted per report (schema-level max_length)."""
     project = Project(
         name="Discovery Count Bound",
@@ -21175,3 +21615,406 @@ async def test_agent_build_discovery_entry_count_bound(
     )
     # Schema clamps at 50; FastAPI returns 422 for > max_length list
     assert resp.status_code in (200, 422)
+
+
+# ── Log sanitization at status-ingestion sinks ────────────────────────────────
+# Verify that _sanitize_log is applied before credentials from payload.logs
+# reach any persisted or broadcast sink (latest_status_message, artifact_created).
+# Patterns exercised: sk-ant-*, ghp_*, ghs_*, github_pat_*, sk-proj-*, sk-*,
+# AIza*, JWT (eyJ…), Bearer ***, oauth_token=***.
+
+
+@pytest.mark.asyncio
+async def test_log_sanitization_latest_status_message_no_artifact(
+    client: AsyncClient, db_session, mocker
+):
+    """Logs with embedded credentials stored in latest_status_message are redacted
+    (no artifact_type branch — the plain FAILED status path at ~line 1024)."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Sanitize Status Msg", user_id="u-sanitize-1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="vm-sanitize-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-sanitize-1")
+    raw_logs = (
+        "fatal: Authentication failed: https://x-access-token:ghp_ABCDEF123456@github.com/org/repo "
+        "API key: sk-ant-api03-REALKEY_xyz123 "
+        "OPENAI key: sk-proj-abcdefghijklmnopqrstuvwxyz123456 "
+        "Authorization: Bearer supersecret_jwt_token "
+        "oauth_token=xoxb-realtoken-here"
+    )
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "FAILED", "logs": raw_logs},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    msg = task.latest_status_message or ""
+    # None of the raw secret values must appear verbatim.
+    assert "ghp_ABCDEF123456" not in msg, "GitHub PAT leaked into latest_status_message"
+    assert "sk-ant-api03-REALKEY_xyz123" not in msg, (
+        "Anthropic key leaked into latest_status_message"
+    )
+    assert "sk-proj-abcdefghijklmnopqrstuvwxyz123456" not in msg, "sk-proj key leaked"
+    assert "supersecret_jwt_token" not in msg, (
+        "Bearer token leaked into latest_status_message"
+    )
+    assert "xoxb-realtoken-here" not in msg, (
+        "OAuth token leaked into latest_status_message"
+    )
+
+
+@pytest.mark.asyncio
+async def test_log_sanitization_latest_status_message_boundary_crossing(
+    client: AsyncClient, db_session, mocker
+):
+    """A secret that straddles the 8000-char tail boundary is still redacted.
+
+    This exercises the regression where truncating first could drop the
+    ``Bearer `` prefix and leave the raw token tail behind in
+    ``latest_status_message``.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Sanitize Boundary Msg", user_id="u-sanitize-1b")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="vm-sanitize-1b",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-sanitize-1b")
+    raw_logs = "x" * 7995 + "Bearer supersecret_jwt_token"
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "COMPLETED", "logs": raw_logs},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    msg = task.latest_status_message or ""
+    assert task.status == TaskStatus.COMPLETED
+    assert len(msg) == 8000
+    assert "supersecret_jwt_token" not in msg, (
+        "boundary-crossing bearer token leaked into latest_status_message"
+    )
+    assert "Bearer ***" in msg, "boundary-crossing bearer token was not redacted"
+    assert msg.endswith("Bearer ***"), (
+        "latest_status_message should keep the redacted tail after truncation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_log_sanitization_artifact_created_broadcast(
+    client: AsyncClient, db_session, mocker
+):
+    """Logs field in the artifact_created broadcast event is redacted before
+    being sent to WebSocket clients (artifact-bearing COMPLETED path ~line 1331)."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    broadcast_mock = mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Sanitize Artifact Broadcast", user_id="u-sanitize-2")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "artifact work"}],
+        vm_instance_id="vm-sanitize-2",
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": "acct-san-2", "max_plan_account_id": "acct-san-2"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-sanitize-2")
+    raw_logs = (
+        "ghs_serverToken_ABCDEF123456 "
+        "github_pat_LONGPATTERN_abcdefghij "
+        "key=AIzaSyabcdefghijklmnopqrstuvwxyz123456789 "
+        "sk-realopenaiapikey1234567890ABCDEF "
+        "Bearer real-bearer-credential-here"
+    )
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "artifact_type": "ERROR_LOG",
+            "logs": raw_logs,
+            "storage_uri": "gs://bucket/object.log",
+        },
+    )
+    assert resp.status_code == 200
+
+    # Find the artifact_created broadcast call.
+    artifact_calls = [
+        call
+        for call in broadcast_mock.call_args_list
+        if len(call.args) >= 2 and call.args[1] == "artifact_created"
+    ]
+    assert artifact_calls, "artifact_created broadcast was not emitted"
+
+    broadcast_data = artifact_calls[0].args[2]
+    logs_in_broadcast = broadcast_data.get("logs") or ""
+    assert "ghs_serverToken_ABCDEF123456" not in logs_in_broadcast, (
+        "ghs_ token leaked into artifact_created broadcast"
+    )
+    assert "github_pat_LONGPATTERN_abcdefghij" not in logs_in_broadcast, (
+        "github_pat token leaked into artifact_created broadcast"
+    )
+    assert "AIzaSyabcdefghijklmnopqrstuvwxyz123456789" not in logs_in_broadcast, (
+        "Google API key leaked into artifact_created broadcast"
+    )
+    assert "sk-realopenaiapikey1234567890ABCDEF" not in logs_in_broadcast, (
+        "OpenAI-style sk- key leaked into artifact_created broadcast"
+    )
+    assert "real-bearer-credential-here" not in logs_in_broadcast, (
+        "Bearer credential leaked into artifact_created broadcast"
+    )
+
+
+@pytest.mark.asyncio
+async def test_log_sanitization_persisted_artifact_logs(
+    client: AsyncClient, db_session, mocker
+):
+    """Logs with embedded credentials are redacted before being stored in the
+    durable Artifact.logs column for both the PR artifact branch and the
+    non-PR/ERROR_LOG branch.
+
+    Regression: prior to the fix, payload.logs was persisted raw into
+    Artifact.logs while only the broadcast path applied _sanitize_log.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Sanitize Artifact Logs Persist", user_id="u-sanitize-art-p")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    raw_logs = (
+        "fatal: Authentication failed "
+        "https://x-access-token:ghp_ARTPERSIST1234567890@github.com/org/repo "
+        "sk-ant-api03-SECRETANTKEY_xyz789"
+    )
+
+    # --- Non-PR branch (ERROR_LOG artifact) ---
+    task_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "error log work"}],
+        vm_instance_id="vm-san-art-p-a",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token_a = create_agent_token(str(task_a.id), "vm-san-art-p-a")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token_a},
+        json={
+            "task_id": str(task_a.id),
+            "status": "FAILED",
+            "artifact_type": "ERROR_LOG",
+            "logs": raw_logs,
+            "storage_uri": "gs://bucket/error.log",
+        },
+    )
+    assert resp.status_code == 200
+
+    artifacts_a = (
+        (
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == task_a.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert artifacts_a, "ERROR_LOG artifact was not created"
+    art_logs_a = artifacts_a[0].logs or ""
+    assert "ghp_ARTPERSIST1234567890" not in art_logs_a, (
+        "GitHub PAT leaked into ERROR_LOG Artifact.logs"
+    )
+    assert "sk-ant-api03-SECRETANTKEY_xyz789" not in art_logs_a, (
+        "Anthropic key leaked into ERROR_LOG Artifact.logs"
+    )
+
+    # --- PR artifact branch ---
+    task_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "pr work"}],
+        vm_instance_id="vm-san-art-p-b",
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": "acct-san-b", "max_plan_account_id": "acct-san-b"},
+    )
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_b)
+
+    token_b = create_agent_token(str(task_b.id), "vm-san-art-p-b")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token_b},
+        json={
+            "task_id": str(task_b.id),
+            "status": "COMPLETED",
+            "artifact_type": "PULL_REQUEST",
+            "pr_url": "https://github.com/org/repo/pull/99",
+            "logs": raw_logs,
+        },
+    )
+    assert resp.status_code == 200
+
+    artifacts_b = (
+        (
+            await db_session.execute(
+                select(Artifact).where(Artifact.task_id == task_b.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert artifacts_b, "PULL_REQUEST artifact was not created"
+    art_logs_b = artifacts_b[0].logs or ""
+    assert "ghp_ARTPERSIST1234567890" not in art_logs_b, (
+        "GitHub PAT leaked into PULL_REQUEST Artifact.logs"
+    )
+    assert "sk-ant-api03-SECRETANTKEY_xyz789" not in art_logs_b, (
+        "Anthropic key leaked into PULL_REQUEST Artifact.logs"
+    )
+
+
+@pytest.mark.asyncio
+async def test_log_sanitization_all_patterns_redacted(
+    client: AsyncClient, db_session, mocker
+):
+    """Single-pass coverage: every _SANITIZE_PATTERNS regex family is redacted
+    before reaching latest_status_message. Uses a FAILED + no-artifact payload
+    so the status message is written from payload.logs."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="All Patterns Sanitize", user_id="u-sanitize-3")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "check all patterns"}],
+        vm_instance_id="vm-sanitize-3",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # One representative value from each _SANITIZE_PATTERNS family.
+    secrets = [
+        ("ghp_", "ghp_TESTTOKEN_abcdef1234567890"),
+        ("ghs_", "ghs_serverToken_ABCDEF1234567890"),
+        ("github_pat_", "github_pat_LONGPATTERN_abcdefghij"),
+        ("sk-ant-", "sk-ant-api03-REALKEY_xyz1234567890"),
+        ("sk-proj-", "sk-proj-abcdefghijklmnopqrstuvwxyz1234"),
+        ("AIza", "AIzaSyabcdefghijklmnopqrstuvwxyz123456789"),
+        ("Bearer", "Bearer real-bearer-credential-here"),
+        ("oauth_token", "oauth_token=xoxb-realtoken-here"),
+        (
+            "JWT",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+            ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+            ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        ),
+    ]
+    raw_logs = "Error output: " + " ".join(v for _, v in secrets)
+
+    token = create_agent_token(str(task.id), "vm-sanitize-3")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "FAILED", "logs": raw_logs},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    msg = task.latest_status_message or ""
+    for label, secret_value in secrets:
+        # Extract the unique secret portion (not the prefix itself).
+        unique_part = (
+            secret_value.split("_", 1)[-1] if "_" in secret_value else secret_value[6:]
+        )
+        # For Bearer and oauth_token patterns, check the token value.
+        if label == "Bearer":
+            unique_part = "real-bearer-credential-here"
+        elif label == "oauth_token":
+            unique_part = "xoxb-realtoken-here"
+        elif label == "JWT":
+            # The JWT regex matches the full three-part token; check the payload segment.
+            unique_part = "eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        assert unique_part not in msg, (
+            f"{label} pattern secret '{unique_part}' leaked into latest_status_message"
+        )

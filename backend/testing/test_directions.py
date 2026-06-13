@@ -101,8 +101,19 @@ async def _add_direction(
 
 
 async def _load_project_and_direction(db_session, project_id: str, direction_id: str):
-    project = (await db_session.execute(select(Project).where(Project.id == uuid.UUID(project_id)))).scalar_one()
-    direction_row = (await db_session.execute(select(Direction).where(Direction.project_id == uuid.UUID(project_id), Direction.direction_key == direction_id))).scalar_one_or_none()
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    direction_row = (
+        await db_session.execute(
+            select(Direction).where(
+                Direction.project_id == uuid.UUID(project_id),
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one_or_none()
     return project, direction_row
 
 
@@ -259,9 +270,7 @@ async def test_create_staged_direction_duplicate_replay_preserves_staging(
         "completion_criteria": "All staged checks pass",
         "idempotency_key": idem_key,
     }
-    resp1 = await client.post(
-        f"/api/admin/projects/{project_id}/directions", json=body
-    )
+    resp1 = await client.post(f"/api/admin/projects/{project_id}/directions", json=body)
     assert resp1.status_code == 200
     d1 = resp1.json()["direction"]
     assert d1["status"] == "staged"
@@ -269,9 +278,7 @@ async def test_create_staged_direction_duplicate_replay_preserves_staging(
     assert d1["completion_criteria"] == "All staged checks pass"
 
     # Replay with the same key returns the stored staged direction verbatim.
-    resp2 = await client.post(
-        f"/api/admin/projects/{project_id}/directions", json=body
-    )
+    resp2 = await client.post(f"/api/admin/projects/{project_id}/directions", json=body)
     assert resp2.status_code == 200
     assert resp2.json().get("status") == "duplicate"
     d2 = resp2.json()["direction"]
@@ -299,15 +306,11 @@ async def test_create_direction_duplicate_replay_does_not_double_count_cap(
 
     idem_key = "cap-replay-key"
     body = {"text": "Only lane", "priority": "high", "idempotency_key": idem_key}
-    resp1 = await client.post(
-        f"/api/admin/projects/{project_id}/directions", json=body
-    )
+    resp1 = await client.post(f"/api/admin/projects/{project_id}/directions", json=body)
     assert resp1.status_code == 200
 
     # Replaying the same key returns the duplicate, not a 409 cap error.
-    resp2 = await client.post(
-        f"/api/admin/projects/{project_id}/directions", json=body
-    )
+    resp2 = await client.post(f"/api/admin/projects/{project_id}/directions", json=body)
     assert resp2.status_code == 200
     assert resp2.json().get("status") == "duplicate"
 
@@ -424,9 +427,7 @@ async def test_get_directions_includes_null_hold_timing_when_not_held(
 
 
 @pytest.mark.asyncio
-async def test_get_directions_includes_refractory_payload(
-    client: AsyncClient, mocker
-):
+async def test_get_directions_includes_refractory_payload(client: AsyncClient, mocker):
     """GET surfaces remaining refractory time and whether it is a standard or saturation hold."""
     project_id = await _deploy_project(client, mocker)
     future_ts = (datetime.now(timezone.utc) + timedelta(minutes=90)).isoformat()
@@ -801,7 +802,9 @@ async def test_update_direction_status_stage_sets_version_marker(
         assert field not in body
     assert body["remediation_attempts"] == 0
 
-    project, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    project, row = await _load_project_and_direction(
+        db_session, project_id, direction_id
+    )
     blob = next(d for d in project.directions or [] if d.get("id") == direction_id)
     assert blob["status"] == "staged"
     assert blob["staged_for_version"] == 7
@@ -968,7 +971,9 @@ async def test_update_direction_status_activate_now_clears_stage_marker(
         assert field not in body
     assert body["remediation_attempts"] == 0
 
-    project, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    project, row = await _load_project_and_direction(
+        db_session, project_id, direction_id
+    )
     blob = next(d for d in project.directions or [] if d.get("id") == direction_id)
     assert blob["status"] == "active"
     assert "staged_for_version" not in blob
@@ -1030,7 +1035,9 @@ async def test_delete_direction_removes_it(client: AsyncClient, db_session, mock
     assert resp.status_code == 200
     assert resp.json()["message"] == "Direction removed"
 
-    project, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    project, row = await _load_project_and_direction(
+        db_session, project_id, direction_id
+    )
     tombstone = next(d for d in project.directions or [] if d.get("id") == direction_id)
     assert tombstone["status"] == "rejected"
     assert "staged_for_version" not in tombstone
@@ -1120,6 +1127,82 @@ async def test_manual_research_409_when_research_in_flight(
         f"/api/admin/projects/{project_id}/directions/{other['id']}/research"
     )
     assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_manual_research_409_when_research_parked(
+    client: AsyncClient, db_session, mocker
+):
+    """The manual research endpoint must refuse to spawn when the direction already
+    has a PARKED research task. PARKED is non-terminal (waiting to wake) and must
+    hold the direction exactly like IN_PROGRESS or BLOCKED."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Already parked")
+    direction_id = direction["id"]
+
+    # Modern row: carries current_direction_id so the fast-path claim-key check fires.
+    parked_modern = Task(
+        project_id=uuid.UUID(project_id),
+        title="Research: parked modern",
+        payloads=[
+            {
+                "type": "research",
+                "current_direction_id": direction_id,
+                "directions": [direction],
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.PARKED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(parked_modern)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 409, resp.text
+    assert "in progress" in resp.text.lower()
+
+    # bypass_cooldown must NOT override the concurrency guard.
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+        "?bypass_cooldown=true"
+    )
+    assert resp.status_code == 409, resp.text
+
+
+@pytest.mark.asyncio
+async def test_manual_research_409_when_research_parked_legacy(
+    client: AsyncClient, db_session, mocker
+):
+    """Legacy payload shape (no current_direction_id, direction in 'directions' list)
+    with PARKED status must also return 409 — the directions-list fallback matcher
+    must treat PARKED as active."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Parked legacy shape")
+    direction_id = direction["id"]
+
+    parked_legacy = Task(
+        project_id=uuid.UUID(project_id),
+        title="Research: parked legacy",
+        # Legacy shape: directions list, no current_direction_id.
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
+        status=TaskStatus.PARKED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(parked_legacy)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 409, resp.text
+    assert "in progress" in resp.text.lower()
 
 
 @pytest.mark.asyncio
@@ -2814,12 +2897,12 @@ async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_merges_per_cycle_null_when_never_researched(
-    client: AsyncClient, mocker
-):
+async def test_merges_per_cycle_null_when_never_researched(client: AsyncClient, mocker):
     """GET directions returns null merges_per_cycle when direction has never been researched."""
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Never researched direction")
+    direction = await _add_direction(
+        client, project_id, text="Never researched direction"
+    )
     direction_id = direction["id"]
 
     resp = await client.get(f"/api/admin/projects/{project_id}/directions")
@@ -2898,7 +2981,9 @@ async def test_generalized_metrics_in_list_merge_legacy_aggregate_breakdown(
 ):
     """Legacy aggregate merge counts still appear in the breakdown beside live typed outcomes."""
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Direction with legacy agg")
+    direction = await _add_direction(
+        client, project_id, text="Direction with legacy agg"
+    )
     direction_id = direction["id"]
 
     from app.models import Project as ProjectModel
@@ -4408,17 +4493,13 @@ async def test_retire_direction_warns_when_dropping_below_parallelism_floor(
     body = await _retire_one_direction(db_session, mocker, ["d-a", "d-b", "d-c"])
     assert body["status"] == "ok"  # retire is not blocked
     warnings = body.get("warnings") or []
-    assert any(
-        "parallel" in w.lower() and "2 active" in w for w in warnings
-    ), warnings
+    assert any("parallel" in w.lower() and "2 active" in w for w in warnings), warnings
 
 
 @pytest.mark.asyncio
 async def test_retire_direction_no_warning_when_floor_preserved(db_session, mocker):
     """Retiring while 3 active directions remain emits no parallelism warning."""
-    body = await _retire_one_direction(
-        db_session, mocker, ["d-a", "d-b", "d-c", "d-d"]
-    )
+    body = await _retire_one_direction(db_session, mocker, ["d-a", "d-b", "d-c", "d-d"])
     assert body["status"] == "ok"
     warnings = body.get("warnings") or []
     assert not any("parallel" in w.lower() for w in warnings), warnings
@@ -4669,7 +4750,11 @@ async def test_set_problem_model_double_write_same_cycle_keeps_second_values(
     try:
         baseline = _operator_seeded_pm()
         await _attach_cycle_with_problem_model_baseline(
-            db_session, project, task_id, baseline_pm=baseline, current_pm=dict(baseline)
+            db_session,
+            project,
+            task_id,
+            baseline_pm=baseline,
+            current_pm=dict(baseline),
         )
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
@@ -4700,7 +4785,10 @@ async def test_set_problem_model_double_write_same_cycle_keeps_second_values(
                             "purpose": "Ship reliable billing.",
                             "current_focus": "Phase 2.",
                         },
-                        "context": {"project_type": "enterprise", "users": "Fortune 500"},
+                        "context": {
+                            "project_type": "enterprise",
+                            "users": "Fortune 500",
+                        },
                         "constraints": ["No PII in logs", "SOC2", "HIPAA"],
                     },
                 },
@@ -4731,7 +4819,11 @@ async def test_set_problem_model_operator_edit_between_writes_still_wins(db_sess
     try:
         baseline = _operator_seeded_pm()
         await _attach_cycle_with_problem_model_baseline(
-            db_session, project, task_id, baseline_pm=baseline, current_pm=dict(baseline)
+            db_session,
+            project,
+            task_id,
+            baseline_pm=baseline,
+            current_pm=dict(baseline),
         )
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
@@ -5225,9 +5317,9 @@ async def test_strategic_api_set_running_update_twice_in_one_cycle_both_persist(
         await db_session.refresh(project)
         assert project.running_update == "AGENT DOC B"
         ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
-        assert not any(
-            e.get("kind") == RUNNING_UPDATE_REJECTED_KIND for e in ledger
-        ), f"Second same-cycle write must not be recorded superseded; got {ledger}"
+        assert not any(e.get("kind") == RUNNING_UPDATE_REJECTED_KIND for e in ledger), (
+            f"Second same-cycle write must not be recorded superseded; got {ledger}"
+        )
     finally:
         _cleanup_strategic_overrides()
 
@@ -5353,8 +5445,7 @@ async def test_strategic_api_set_vision_operator_edit_preserved(db_session):
         # Agent's superseded value is recorded for next cycle.
         ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
         assert any(
-            e.get("agent_value") == "AGENT REWRITTEN PURPOSE."
-            for e in ledger
+            e.get("agent_value") == "AGENT REWRITTEN PURPOSE." for e in ledger
         ), f"Expected the agent's superseded purpose on the ledger; got {ledger}"
     finally:
         _cleanup_strategic_overrides()
@@ -5507,9 +5598,7 @@ async def test_strategic_api_create_message_rejects_over_limit(db_session):
         # Verify no message was created
         await db_session.refresh(project)
         messages = await db_session.execute(
-            sa_select(ProjectMessage).where(
-                ProjectMessage.project_id == project.id
-            )
+            sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
         )
         assert len(messages.scalars().all()) == 0
     finally:
@@ -7436,9 +7525,7 @@ async def test_cochange_decomposition_gated_by_runtime_flag(db_session, mocker):
         side_effect=lambda dedup, *a, **k: dedup,
     )
     # patch.dict snapshots/restores the whole runtime_config around the test.
-    mocker.patch.dict(
-        _ss.runtime_config, {"cochange_decomposition_enabled": False}
-    )
+    mocker.patch.dict(_ss.runtime_config, {"cochange_decomposition_enabled": False})
 
     # OFF (default): the splitter is never invoked.
     _, task_off, _ = await _setup_escalation_project(db_session, direction_id, None)
@@ -8102,9 +8189,9 @@ def test_direction_refractory_helper_uses_adaptive_tiers_and_saturation_multipli
         "consecutive_unproductive_cycles": 1,
     }
     stamp_direction_refractory(explicit_standard, now=now)
-    assert datetime.fromisoformat(explicit_standard["refractory_until"]) == now + timedelta(
-        minutes=135
-    )
+    assert datetime.fromisoformat(
+        explicit_standard["refractory_until"]
+    ) == now + timedelta(minutes=135)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8597,9 +8684,7 @@ async def test_get_directions_includes_context_fields_when_set(
 
 
 @pytest.mark.asyncio
-async def test_create_direction_with_acceptance_evidence(
-    client: AsyncClient, mocker
-):
+async def test_create_direction_with_acceptance_evidence(client: AsyncClient, mocker):
     """POST can author success_evidence/retirement_condition at create time;
     they round-trip into context exactly as the PATCH path stores them."""
     project_id = await _deploy_project(client, mocker)
@@ -9154,9 +9239,7 @@ async def test_operator_message_idempotency_key_dedupes(
         "idempotency_key": "key-double-submit-1",
     }
 
-    first = await client.post(
-        f"/api/admin/projects/{project_id}/messages", json=body
-    )
+    first = await client.post(f"/api/admin/projects/{project_id}/messages", json=body)
     assert first.status_code == 200, first.text
     assert first.json()["status"] == "created"
     assert first.json()["arming"] == "steering"
@@ -9164,9 +9247,7 @@ async def test_operator_message_idempotency_key_dedupes(
 
     # Identical retry with the same key — idempotent success, same row, and the
     # duplicate does NOT re-arm the strategist.
-    second = await client.post(
-        f"/api/admin/projects/{project_id}/messages", json=body
-    )
+    second = await client.post(f"/api/admin/projects/{project_id}/messages", json=body)
     assert second.status_code == 200, second.text
     assert second.json()["status"] == "duplicate"
     assert second.json()["id"] == first_id
@@ -9283,7 +9364,10 @@ async def test_operator_message_marker_is_operator_origin_and_bypasses_breaker(
     project_id = await _deploy_project(client, mocker)
     resp = await client.post(
         f"/api/admin/projects/{project_id}/messages",
-        json={"content": "The loop is stuck — pivot to the deploy bug", "message_type": "BLOCKER"},
+        json={
+            "content": "The loop is stuck — pivot to the deploy bug",
+            "message_type": "BLOCKER",
+        },
     )
     assert resp.status_code == 200, resp.text
 
@@ -9313,7 +9397,10 @@ async def test_operator_message_deferral_notice_when_cycle_active(
     project_id = await _deploy_project(client, mocker)
     resp = await client.post(
         f"/api/admin/projects/{project_id}/messages",
-        json={"content": "Reprioritize the auth regression", "message_type": "FEEDBACK"},
+        json={
+            "content": "Reprioritize the auth regression",
+            "message_type": "FEEDBACK",
+        },
     )
     assert resp.status_code == 200, resp.text
 
@@ -9357,9 +9444,7 @@ async def test_operator_message_deferral_notice_when_cycle_active(
 async def test_add_direction_emits_strategic_updated(client: AsyncClient, mocker):
     """POST /directions broadcasts a strategic_updated(directions) refetch signal."""
     project_id = await _deploy_project(client, mocker)
-    bcast = mocker.patch(
-        "app.strategic_events.broadcast_to_project", new=AsyncMock()
-    )
+    bcast = mocker.patch("app.strategic_events.broadcast_to_project", new=AsyncMock())
     resp = await client.post(
         f"/api/admin/projects/{project_id}/directions",
         json={"text": "Live-refresh signal", "priority": "medium"},
@@ -9376,9 +9461,7 @@ async def test_remove_direction_emits_strategic_updated(client: AsyncClient, moc
     """DELETE /directions/{id} broadcasts a strategic_updated(directions) signal."""
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id)
-    bcast = mocker.patch(
-        "app.strategic_events.broadcast_to_project", new=AsyncMock()
-    )
+    bcast = mocker.patch("app.strategic_events.broadcast_to_project", new=AsyncMock())
     resp = await client.delete(
         f"/api/admin/projects/{project_id}/directions/{direction['id']}"
     )
@@ -9476,7 +9559,9 @@ async def test_update_direction_round_trips_success_evidence_and_retirement_cond
         assert direction is not None, "direction not found after update"
         ctx = direction.get("context") or {}
         assert ctx.get("success_evidence") == "updated observable outcome"
-        assert ctx.get("retirement_condition") == "updated measurable retirement condition"
+        assert (
+            ctx.get("retirement_condition") == "updated measurable retirement condition"
+        )
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
@@ -9835,6 +9920,121 @@ async def test_strategic_api_update_direction_conflicts_with_unknown_id_returns_
                 },
             )
         assert resp.status_code == 400, resp.text
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_reject_direction_cancels_queued_tasks(
+    db_session, mocker
+):
+    """reject_direction cancels QUEUED tasks tied to the rejected direction."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    dir_id = "d-rej-cancel-01"
+    existing_dirs = [
+        {
+            "id": dir_id,
+            "text": "Direction to reject",
+            "status": "proposed",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        }
+    ]
+    project = Project(
+        name="P-reject-cancel",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=existing_dirs,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create enough QUEUED tasks to force the 5000-row batch loop to iterate twice.
+    queued_tasks = []
+    for i in range(5001):
+        t = Task(
+            project_id=project.id,
+            user_id="u1",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create", "prompt": f"task {i}"}],
+            context={"direction_id": dir_id},
+        )
+        db_session.add(t)
+        queued_tasks.append(t)
+    # One QUEUED task for a different direction — should NOT be cancelled
+    other_task = Task(
+        project_id=project.id,
+        user_id="u1",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "other"}],
+        context={"direction_id": "d-other"},
+    )
+    db_session.add(other_task)
+    await db_session.commit()
+
+    sr_task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    task_id = str(sr_task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "reject_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": dir_id,
+                        "rationale": "not aligned with focus",
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["op"] == "reject_direction"
+        assert body["cancelled_tasks"] == len(queued_tasks)
+
+        # All QUEUED tasks for the rejected direction are now CANCELLED
+        for t in queued_tasks:
+            await db_session.refresh(t)
+            assert t.status == TaskStatus.CANCELLED, (
+                f"Expected CANCELLED, got {t.status}"
+            )
+
+        # Task for a different direction is untouched
+        await db_session.refresh(other_task)
+        assert other_task.status == TaskStatus.QUEUED
+
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)

@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.direction_outcomes import (
+    PR_INELIGIBLE_TASK_TYPES,
     _SPAWN_GATE_REASON_MAX_LEN,
     _SPAWN_GATE_REASONS_SAMPLE_CAP,
     declared_merged_count,
@@ -30,10 +31,6 @@ from app.task_evaluators import (
 )
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
 
-# Task types that never open a PR. These are excluded from the
-# conversion_rate denominator so the metric means the same thing on every
-# surface: merged PRs / PR-eligible tasks created (NOT / all tasks created).
-PR_INELIGIBLE_TASK_TYPES = ("research", "investigate", "audit", "memo")
 _CHALLENGE_BOUNDARY_BUCKETS = (
     CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
     CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
@@ -93,7 +90,14 @@ def pr_ineligible_created_in_entry(entry: Dict[str, Any]) -> int:
     )
 
 
-def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+def pr_ineligible_created_in_aggregate(aggregate: Dict[str, Any]) -> int:
+    """Number of folded PR-ineligible tasks in a direction history aggregate."""
+    return aggregate.get("total_pr_ineligible_tasks_created") or 0
+
+
+def compute_spawn_gate_aggregate(
+    history: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
     """Aggregate research spawn-gate counters from a direction's research_history.
 
     Returns a compact dict or None when all counters are zero (no spawn-gate
@@ -139,7 +143,9 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
         )
         challenged_spawned += entry.get("research_spawn_gate_challenged_spawned") or 0
         challenged_merged += entry.get("research_spawn_gate_challenged_merged") or 0
-        unchallenged_spawned += entry.get("research_spawn_gate_unchallenged_spawned") or 0
+        unchallenged_spawned += (
+            entry.get("research_spawn_gate_unchallenged_spawned") or 0
+        )
         unchallenged_merged += entry.get("research_spawn_gate_unchallenged_merged") or 0
         exhaustion_count += (
             1 if entry.get("research_spawn_gate_wholesale_retry_exhausted") else 0
@@ -198,23 +204,28 @@ def compute_spawn_gate_aggregate(history: List[Dict[str, Any]]) -> Dict[str, Any
             entry.get("research_spawn_gate_cause_counts") or {}
         ).items():
             _cause_cat = str(_cause_cat).strip()
-            if _cause_cat:
+            _cnt = int(_cause_cnt or 0)
+            if _cause_cat and _cnt > 0:
                 cause_distribution[_cause_cat] = (
-                    cause_distribution.get(_cause_cat, 0) + int(_cause_cnt or 0)
+                    cause_distribution.get(_cause_cat, 0) + _cnt
                 )
-    if not any([
-        challenged,
-        refuted,
-        survived,
-        manifest_excluded_fail_closed,
-        adversarial_give_up,
-        challenged_spawned,
-        unchallenged_spawned,
-        exhaustion_count,
-    ]):
+    if not any(
+        [
+            challenged,
+            refuted,
+            survived,
+            manifest_excluded_fail_closed,
+            adversarial_give_up,
+            challenged_spawned,
+            unchallenged_spawned,
+            exhaustion_count,
+        ]
+    ):
         return None
     challenged_merge_rate = (
-        round(challenged_merged / challenged_spawned, 3) if challenged_spawned > 0 else None
+        round(challenged_merged / challenged_spawned, 3)
+        if challenged_spawned > 0
+        else None
     )
     unchallenged_merge_rate = (
         round(unchallenged_merged / unchallenged_spawned, 3)
@@ -571,9 +582,7 @@ async def compute_direction_progress(
                     entry.get("research_spawn_gate_unresolved_count") or 0
                 )
                 spawn_gate_manifest_excluded_fail_closed_count += (
-                    entry.get(
-                        "research_spawn_gate_manifest_excluded_fail_closed_count"
-                    )
+                    entry.get("research_spawn_gate_manifest_excluded_fail_closed_count")
                     or 0
                 )
                 spawn_gate_adversarial_give_up_count += (
@@ -630,17 +639,20 @@ async def compute_direction_progress(
                         _spawn_gate_seen_adversarial_give_up.add(_gu_title)
                         _gu_compact: Dict[str, str] = {"title": _gu_title}
                         if _gu_sample.get("direction_id"):
-                            _gu_compact["direction_id"] = str(_gu_sample["direction_id"])
+                            _gu_compact["direction_id"] = str(
+                                _gu_sample["direction_id"]
+                            )
                         spawn_gate_adversarial_give_up_samples.append(_gu_compact)
                 _spawn_gate_parse_outcome = str(
                     entry.get("research_spawn_gate_parse_outcome") or ""
                 ).strip()
                 if _spawn_gate_parse_outcome:
-                    spawn_gate_parse_outcome_distribution[
-                        _spawn_gate_parse_outcome
-                    ] = spawn_gate_parse_outcome_distribution.get(
-                        _spawn_gate_parse_outcome, 0
-                    ) + 1
+                    spawn_gate_parse_outcome_distribution[_spawn_gate_parse_outcome] = (
+                        spawn_gate_parse_outcome_distribution.get(
+                            _spawn_gate_parse_outcome, 0
+                        )
+                        + 1
+                    )
                 spawn_gate_challenged_spawned += (
                     entry.get("research_spawn_gate_challenged_spawned") or 0
                 )
@@ -654,7 +666,9 @@ async def compute_direction_progress(
                     entry.get("research_spawn_gate_unchallenged_merged") or 0
                 )
                 spawn_gate_exhaustion_count += (
-                    1 if entry.get("research_spawn_gate_wholesale_retry_exhausted") else 0
+                    1
+                    if entry.get("research_spawn_gate_wholesale_retry_exhausted")
+                    else 0
                 )
             elif entry_ts >= prev_window_start:
                 for scope, stats in (entry.get("scope_breakdown") or {}).items():
@@ -703,10 +717,13 @@ async def compute_direction_progress(
                 and t.vm_stopped_at >= window_start
             ):
                 continue
-            t_cost = get_vm_rate_per_second(
-                machine_type=t.__dict__.get("vm_machine_type"),
-                spot=bool(t.vm_spot),
-            ) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            t_cost = (
+                get_vm_rate_per_second(
+                    machine_type=t.__dict__.get("vm_machine_type"),
+                    spot=bool(t.vm_spot),
+                )
+                * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            )
             dir_cost += t_cost
             if t.vm_spot:
                 dir_spot_cost += t_cost
@@ -793,12 +810,18 @@ async def compute_direction_progress(
         lifetime_tasks_created = sum(
             h.get("tasks_created", 0) for h in _history_all
         ) + (_agg.get("total_tasks_created") or 0)
+        lifetime_pr_ineligible_tasks_created = sum(
+            pr_ineligible_created_in_entry(h) for h in _history_all
+        ) + pr_ineligible_created_in_aggregate(_agg)
+        lifetime_pr_eligible_tasks_created = (
+            lifetime_tasks_created - lifetime_pr_ineligible_tasks_created
+        )
         lifetime_tasks_failed = sum(h.get("tasks_failed", 0) for h in _history_all) + (
             _agg.get("total_tasks_failed") or 0
         )
         lifetime_conversion_rate = (
-            round(lifetime_verified_prs_merged / lifetime_tasks_created, 3)
-            if lifetime_tasks_created > 0
+            round(lifetime_verified_prs_merged / lifetime_pr_eligible_tasks_created, 3)
+            if lifetime_pr_eligible_tasks_created > 0
             else None
         )
         lifetime_autonomous_prs_merged = sum(
@@ -994,9 +1017,7 @@ async def compute_direction_progress(
             else None
         )
         spawn_gate_unchallenged_merge_rate = (
-            round(
-                spawn_gate_unchallenged_merged / spawn_gate_unchallenged_spawned, 3
-            )
+            round(spawn_gate_unchallenged_merged / spawn_gate_unchallenged_spawned, 3)
             if spawn_gate_unchallenged_spawned > 0
             else None
         )
@@ -1197,3 +1218,108 @@ async def compute_direction_progress(
             "composition": direction_portfolio_composition,
         },
     )
+
+
+def compute_spawn_gate_census(
+    tasks: List[Task],
+    window_start: datetime,  # noqa: ARG001 — retained for caller symmetry
+) -> Dict[str, Any]:
+    """Project-wide windowed census of spawn-gate activity from research task contexts.
+
+    Reads spawn-gate telemetry directly from each research task's ``context``
+    rather than from direction ``research_history``, so undirected cycles are
+    covered and multi-direction cycles are naturally deduplicated (one row per
+    ``task.id``).
+
+    Returns a census dict with per-cycle ``rows`` (one per research task) and
+    project-level aggregate counters.
+    """
+    from app.failure_classification import GRADER_DIAGNOSTIC_TRAIL_KEY  # noqa: PLC0415
+
+    rows: List[Dict[str, Any]] = []
+    seen_task_ids: set[str] = set()
+
+    gate_invoked_count = 0
+    graders_attempted_total = 0
+    parse_outcome_distribution: Dict[str, int] = {}
+    cause_distribution: Dict[str, int] = {}
+    exhaustion_count = 0
+    give_up_count = 0
+
+    for task in tasks:
+        task_id = str(task.id)
+        if task_id in seen_task_ids:
+            continue
+        seen_task_ids.add(task_id)
+
+        payload_type = (task.first_payload or {}).get("type")
+        if payload_type != "research":
+            continue
+
+        ctx = task.context or {}
+        if not isinstance(ctx, dict):
+            ctx = {}
+
+        challenged_count = int(ctx.get("research_spawn_gate_challenged_count") or 0)
+        trail = ctx.get(GRADER_DIAGNOSTIC_TRAIL_KEY)
+        if not isinstance(trail, list):
+            trail = []
+
+        gate_invoked = challenged_count > 0 or len(trail) > 0
+        graders_attempted = challenged_count if challenged_count > 0 else len(trail)
+
+        parse_outcome = (
+            str(ctx.get("research_spawn_gate_parse_outcome") or "").strip() or None
+        )
+
+        raw_cause_counts = ctx.get("research_spawn_gate_cause_counts")
+        task_cause_counts: Dict[str, int] = {}
+        if isinstance(raw_cause_counts, dict):
+            for cat, cnt in raw_cause_counts.items():
+                cat = str(cat).strip()
+                if cat:
+                    task_cause_counts[cat] = int(cnt or 0)
+
+        exhausted = bool(ctx.get("research_spawn_gate_wholesale_retry_exhausted"))
+
+        _give_up_ctx = ctx.get("finding_structural_give_up") or {}
+        task_give_up = int(
+            (_give_up_ctx.get("by_reason") or {}).get("adversarial_gate", 0)
+        )
+
+        rows.append(
+            {
+                "task_id": task_id,
+                "direction_id": ctx.get("direction_id") or None,
+                "gate_invoked": gate_invoked,
+                "graders_attempted": graders_attempted,
+                "parse_outcome": parse_outcome,
+                "cause_counts": task_cause_counts or None,
+                "exhausted": exhausted,
+                "give_up_count": task_give_up,
+            }
+        )
+
+        if gate_invoked:
+            gate_invoked_count += 1
+        graders_attempted_total += graders_attempted
+        if parse_outcome:
+            parse_outcome_distribution[parse_outcome] = (
+                parse_outcome_distribution.get(parse_outcome, 0) + 1
+            )
+        for cat, cnt in task_cause_counts.items():
+            cause_distribution[cat] = cause_distribution.get(cat, 0) + cnt
+        if exhausted:
+            exhaustion_count += 1
+        give_up_count += task_give_up
+
+    return {
+        "cycles_scanned": len(rows),
+        "gate_invoked_count": gate_invoked_count,
+        "graders_attempted_total": graders_attempted_total,
+        "exhaustion_count": exhaustion_count,
+        "give_up_count": give_up_count,
+        "parse_outcome_distribution": parse_outcome_distribution or None,
+        "cause_distribution": cause_distribution or None,
+        "rows": rows,
+    }

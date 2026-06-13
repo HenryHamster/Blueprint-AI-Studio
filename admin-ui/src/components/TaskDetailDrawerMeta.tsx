@@ -5,7 +5,7 @@ import { MarkdownContent } from './MarkdownContent';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import { hasTransitiveCycle } from '../utils/taskGraph';
-import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, type ComputeJob, type LiveReleaseEvidence } from '../api';
+import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, resolveViewportFailureDownloadUrl, type ComputeJob, type LiveReleaseEvidence } from '../api';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.utils';
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
@@ -141,7 +141,7 @@ function Sparkline({ values }: { values: number[] }) {
   );
 }
 
-const DEP_STATUS_COLORS: Record<string, string> = { COMPLETED: 'text-emerald-400', IN_PROGRESS: 'text-amber-400', FAILED: 'text-red-400', CANCELLED: 'text-neutral-500', EVALUATING: 'text-blue-400', PROVISIONING: 'text-blue-400', QUEUED: 'text-neutral-400' };
+const DEP_STATUS_COLORS: Record<string, string> = { COMPLETED: 'text-emerald-400', IN_PROGRESS: 'text-amber-400', FAILED: 'text-red-400', CANCELLED: 'text-neutral-500', EVALUATING: 'text-blue-400', PROVISIONING: 'text-blue-400', QUEUED: 'text-neutral-400', BLOCKED: 'text-amber-400', PARKED: 'text-purple-400' };
 function DependencyItem({ dep, depTask, hasCycle, onNavigateToTask }: { dep: string; depTask?: Task; hasCycle?: boolean; onNavigateToTask?: (id: string) => void }) {
   const statusColor = depTask ? (DEP_STATUS_COLORS[depTask.status] ?? 'text-neutral-400') : '';
   const label = depTask ? (depTask.title.length > 40 ? depTask.title.slice(0, 40) + '…' : depTask.title) : null;
@@ -776,6 +776,112 @@ function PanelReviewVerdictSection({ verdict }: { verdict: PanelReviewVerdict })
             </div>
           ))}
         </div>
+      </div>
+    </>
+  );
+}
+
+function AcceptanceEvidenceSection({ task }: { task: Task }) {
+  const verdict = task.context?.code_acceptance_verdict;
+  const [expanded, setExpanded] = useState(false);
+  const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null);
+  const [screenshotError, setScreenshotError] = useState<string | null>(null);
+  const [screenshotLoading, setScreenshotLoading] = useState(false);
+
+  if (!verdict) return null;
+
+  const { satisfied, proven, kind, reason } = verdict;
+
+  let badgeLabel: string;
+  let badgeClass: string;
+  if (proven) {
+    badgeLabel = 'proven';
+    badgeClass = 'text-emerald-400 bg-emerald-950/30 border-emerald-800/40';
+  } else if (satisfied) {
+    badgeLabel = 'satisfied';
+    badgeClass = 'text-amber-400 bg-amber-950/30 border-amber-800/40';
+  } else {
+    badgeLabel = 'fail-closed';
+    badgeClass = 'text-red-400 bg-red-950/30 border-red-800/40';
+  }
+
+  const handleToggleScreenshot = async () => {
+    if (expanded) {
+      setExpanded(false);
+      return;
+    }
+    setExpanded(true);
+    if (screenshotUrl !== null || screenshotError !== null) return;
+
+    const payload = task.payloads?.[0] as Record<string, unknown> | undefined;
+    const ae = payload?.acceptance_evidence as { component?: string; viewport_width?: number } | undefined;
+    const component = (ae?.component as string | undefined) ?? '';
+    const width = (ae?.viewport_width as number | undefined) ?? 0;
+
+    if (!component || !width || !task.project_id) {
+      setScreenshotError('Missing component or width to load screenshot.');
+      return;
+    }
+
+    setScreenshotLoading(true);
+    try {
+      const url = await resolveViewportFailureDownloadUrl(task.project_id as string, component, width);
+      setScreenshotUrl(url);
+    } catch (err) {
+      setScreenshotError(err instanceof Error ? err.message : 'Failed to load screenshot.');
+    } finally {
+      setScreenshotLoading(false);
+    }
+  };
+
+  return (
+    <>
+      <SectionHeader>Acceptance Evidence</SectionHeader>
+      <div className="space-y-3 bg-emerald-950/10 rounded-lg p-3 border border-emerald-900/30">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-neutral-500 w-28 shrink-0">Verdict</span>
+          <span className={`text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${badgeClass}`}>
+            {badgeLabel}
+          </span>
+        </div>
+        {kind && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-neutral-500 w-28 shrink-0">Kind</span>
+            <span className="text-xs font-mono text-neutral-300">{kind}</span>
+          </div>
+        )}
+        <div className="flex items-start gap-2">
+          <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Reason</span>
+          <span className="text-xs text-neutral-300 break-words min-w-0 flex-1">{reason}</span>
+        </div>
+        {kind === 'visual' && (
+          <div className="flex items-start gap-2">
+            <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Screenshot</span>
+            <div className="min-w-0 flex-1">
+              <button
+                data-viewport-allow-small-target
+                className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                onClick={handleToggleScreenshot}
+              >
+                {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                {expanded ? 'Hide screenshot' : 'View screenshot'}
+              </button>
+              {expanded && (
+                screenshotLoading ? (
+                  <p className="text-xs text-neutral-500 mt-2">Loading screenshot…</p>
+                ) : screenshotError ? (
+                  <p className="text-xs text-red-400 mt-2 break-words">{screenshotError}</p>
+                ) : screenshotUrl ? (
+                  <img
+                    src={screenshotUrl}
+                    alt="Viewport screenshot"
+                    className="mt-2 max-w-full rounded border border-neutral-700"
+                  />
+                ) : null
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </>
   );
@@ -1614,6 +1720,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           </>
         );
       })()}
+
+      <AcceptanceEvidenceSection task={task} />
 
       <TaskDiagnosticsPanel task={task} />
 

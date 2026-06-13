@@ -92,6 +92,25 @@ describe('VersionLifecyclePanel', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
   });
 
+  it('renders the promotion policy source and fallback reason', () => {
+    vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+
+    render(
+      <VersionLifecyclePanel
+        data={makeVersionLifecycleResponse({
+          promotion_policy_source: 'hardcoded_defaults',
+          promotion_policy_error: 'ScannerError: promotion_policy.yaml did not parse',
+        })}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+      />
+    );
+
+    expect(screen.getByTestId('promotion-policy-source')).toHaveTextContent('hardcoded_defaults');
+    expect(screen.getByTestId('promotion-policy-source-error')).toHaveTextContent('ScannerError: promotion_policy.yaml did not parse');
+  });
+
   describe('phase updates reflect immediately', () => {
     it('shows new phase immediately after successful phase change without waiting for refresh', async () => {
       const setVersionPhaseMock = vi.fn().mockResolvedValue({
@@ -1580,6 +1599,73 @@ describe('VersionLifecyclePanel', () => {
       // The native in-flight freshness must NOT render.
       expect(screen.queryByTestId('promotion-in-flight-freshness')).not.toBeInTheDocument();
     });
+
+    it('renders managed check-wait snapshot details', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makeCheckWaitState({
+                check_snapshot: {
+                  state: 'pending',
+                  classified_at: '2026-01-01T00:20:00Z',
+                  head_sha: 'cafebabecafebabecafebabecafebabecafebabe',
+                  total_checks: 12,
+                  checks: [
+                    { name: 'CI / Backend', status: 'in_progress' },
+                    { name: 'CI / Agent', status: 'queued' },
+                  ],
+                  truncated: true,
+                },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const snapshot = screen.getByTestId('promotion-check-wait-snapshot');
+      expect(snapshot).toHaveTextContent('ci:pending');
+      expect(snapshot).toHaveTextContent('head cafebab');
+      expect(snapshot).toHaveTextContent('12 checks');
+      expect(snapshot).toHaveTextContent('CI / Backend: in_progress');
+      expect(snapshot).toHaveTextContent('CI / Agent: queued');
+      expect(snapshot).toHaveTextContent('+10 more');
+    });
+
+    it('renders managed check-wait no-checks snapshot as absent CI', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: makeCheckWaitState({
+                ci_state: 'no_checks',
+                check_snapshot: {
+                  state: 'no_checks',
+                  classified_at: '2026-01-01T00:20:00Z',
+                  head_sha: '1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa',
+                  total_checks: 0,
+                  checks: [],
+                  truncated: false,
+                },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const snapshot = screen.getByTestId('promotion-check-wait-snapshot');
+      expect(snapshot).toHaveTextContent('ci:no_checks');
+      expect(snapshot).toHaveTextContent('0 checks');
+      expect(snapshot).toHaveTextContent('No check runs reported yet.');
+    });
   });
 
   describe('promotion blocker classification copy', () => {
@@ -2691,6 +2777,102 @@ describe('VersionLifecyclePanel', () => {
       );
       const panel = screen.getByTestId('challenged-vs-unchallenged');
       expect(panel).not.toHaveTextContent('refuted');
+    });
+  });
+
+  describe('out-of-band promotion badge', () => {
+    const oobPromotion: api.OutOfBandPromotion = {
+      source: 'operator_override',
+      recorded_at: '2026-06-01T12:00:00Z',
+      candidate_sha: 'abc1234567890def',
+      promoted_sha: 'def7890abc123456',
+    };
+
+    it('renders badge on current_version when out_of_band_promotion is set', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ out_of_band_promotion: oobPromotion }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('out-of-band-promotion-badge');
+      expect(badge).toBeInTheDocument();
+      expect(badge).toHaveTextContent('promoted out-of-band (operator override)');
+      expect(badge).toHaveTextContent('abc1234');
+      expect(badge).toHaveTextContent('def7890');
+    });
+
+    it('does not render badge on current_version when out_of_band_promotion is null', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ out_of_band_promotion: null }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('out-of-band-promotion-badge')).not.toBeInTheDocument();
+    });
+
+    it('renders badge on a recent_versions history row when out_of_band_promotion is set', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      const recentVersion: api.RecentVersion = {
+        version_number: 1,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        out_of_band_promotion: oobPromotion,
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 2 }),
+            recent_versions: [recentVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('out-of-band-promotion-badge');
+      expect(badge).toBeInTheDocument();
+      expect(badge).toHaveTextContent('promoted out-of-band (operator override)');
+      expect(badge).toHaveTextContent('abc1234');
+      expect(badge).toHaveTextContent('def7890');
+    });
+
+    it('does not render badge on history row when out_of_band_promotion is absent', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      const recentVersion: api.RecentVersion = {
+        version_number: 1,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 2 }),
+            recent_versions: [recentVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('out-of-band-promotion-badge')).not.toBeInTheDocument();
     });
   });
 });

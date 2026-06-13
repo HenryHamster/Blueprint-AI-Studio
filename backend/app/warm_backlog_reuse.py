@@ -830,9 +830,9 @@ def compute_dominant_reuse_dropout(window_hours: int = 24) -> dict:
 # unchanged; un-attributed events bucket under ``_UNATTRIBUTED_ACCOUNT`` in the
 # per-account breakdown while still counting toward the fleet-wide totals.
 
-_pool_lease_hit_events: deque = deque(maxlen=500)  # (datetime, account)
-_pool_cold_dispatch_events: deque = deque(maxlen=500)  # (datetime, account)
-_pool_lease_miss_events: deque = deque(maxlen=500)  # (datetime, reason, account)
+_pool_lease_hit_events: deque = deque(maxlen=500)  # (datetime, account, project_id)
+_pool_cold_dispatch_events: deque = deque(maxlen=500)  # (datetime, account, project_id)
+_pool_lease_miss_events: deque = deque(maxlen=500)  # (datetime, reason, account, project_id)
 
 # Bucket label for dispatches recorded without a resolved account (e.g. legacy
 # call sites that have not yet been wired to pass identity).
@@ -869,25 +869,29 @@ def _eligible_miss_count(miss_by_reason: dict) -> int:
     )
 
 
-def record_pool_lease_hit(account: str | None = None) -> None:
+def record_pool_lease_hit(account: str | None = None, *, project_id=None) -> None:
     """A queued task was served warm by leasing an IDLE pool member.
 
     ``account`` is the resolved account id the dispatch was served for; pass it
-    to attribute the warm claim in the per-account breakdown.
+    to attribute the warm claim in the per-account breakdown. ``project_id``
+    attributes the event to a specific project for the per-project funnel.
     """
-    _pool_lease_hit_events.append((_utcnow(), account))
+    _pool_lease_hit_events.append((_utcnow(), account, project_id))
 
 
-def record_pool_cold_dispatch(account: str | None = None) -> None:
+def record_pool_cold_dispatch(account: str | None = None, *, project_id=None) -> None:
     """A queued task cold-provisioned a VM (pool disabled, empty, or no match).
 
     ``account`` is the resolved account id the dispatch was served for; pass it
-    to attribute the cold dispatch in the per-account breakdown.
+    to attribute the cold dispatch in the per-account breakdown. ``project_id``
+    attributes the event to a specific project for the per-project funnel.
     """
-    _pool_cold_dispatch_events.append((_utcnow(), account))
+    _pool_cold_dispatch_events.append((_utcnow(), account, project_id))
 
 
-def record_pool_lease_miss(reason: str, account: str | None = None) -> None:
+def record_pool_lease_miss(
+    reason: str, account: str | None = None, *, project_id=None
+) -> None:
     """The pool was consulted but no member could be leased.
 
     reason should be one of: "no_idle_member" (pool empty / all leased),
@@ -896,9 +900,10 @@ def record_pool_lease_miss(reason: str, account: str | None = None) -> None:
     warm-pool allowlist — dispatch honors the same per-project scope the
     maintainer enforces), "lost_lease_race" (a peer dispatcher won the
     SKIP-LOCKED row). ``account`` is the resolved account id the lease was
-    attempted for; pass it to attribute the miss per account.
+    attempted for; pass it to attribute the miss per account. ``project_id``
+    attributes the event to a specific project for the per-project funnel.
     """
-    _pool_lease_miss_events.append((_utcnow(), reason, account))
+    _pool_lease_miss_events.append((_utcnow(), reason, account, project_id))
 
 
 def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
@@ -935,19 +940,19 @@ def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
     miss_by_reason: dict = {}
     hits = 0
     cold = 0
-    for ts, account in _pool_lease_hit_events:
+    for ts, account, _pid in _pool_lease_hit_events:
         if ts >= cutoff:
             hits += 1
             by_account.setdefault(_account_label(account), _new_bucket())[
                 "pool_lease_hits"
             ] += 1
-    for ts, account in _pool_cold_dispatch_events:
+    for ts, account, _pid in _pool_cold_dispatch_events:
         if ts >= cutoff:
             cold += 1
             by_account.setdefault(_account_label(account), _new_bucket())[
                 "cold_dispatches"
             ] += 1
-    for ts, reason, account in _pool_lease_miss_events:
+    for ts, reason, account, _pid in _pool_lease_miss_events:
         if ts >= cutoff:
             miss_by_reason[reason] = miss_by_reason.get(reason, 0) + 1
             bucket = by_account.setdefault(_account_label(account), _new_bucket())
@@ -997,6 +1002,45 @@ def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
         "lease_miss_by_reason": miss_by_reason,
         "lease_miss_total": sum(miss_by_reason.values()),
         "by_account": by_account,
+    }
+
+
+def get_project_pool_funnel_snapshot(project_id, window_hours: int = 24) -> dict:
+    """Per-project rolling funnel snapshot for the warm-pool dispatch path.
+
+    Identical semantics to :func:`get_pool_funnel_snapshot` but filtered to
+    events attributed to ``project_id``.  Only events recorded with a matching
+    ``project_id`` keyword argument are counted — events recorded without a
+    project_id are excluded.
+
+    ``eligible_hit_rate`` and ``eligible_dispatches`` use the same
+    :data:`POOL_ELIGIBLE_MISS_REASONS` exclusion set as the fleet guard, so
+    out-of-scope, suppressed, and cost_guard misses never enter a project's
+    denominator.  This is the rate :func:`app.warm_pool_maintainer.\
+evaluate_project_pool_cost_guard` acts on.
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    pid = str(project_id) if project_id is not None else None
+    miss_by_reason: dict = {}
+    hits = 0
+    for ts, _account, event_pid in _pool_lease_hit_events:
+        if ts >= cutoff and str(event_pid) == pid:
+            hits += 1
+    for ts, reason, _account, event_pid in _pool_lease_miss_events:
+        if ts >= cutoff and str(event_pid) == pid:
+            miss_by_reason[reason] = miss_by_reason.get(reason, 0) + 1
+
+    eligible_misses = _eligible_miss_count(miss_by_reason)
+    eligible_total = hits + eligible_misses
+    return {
+        "window_hours": window_hours,
+        "pool_lease_hits": hits,
+        "eligible_miss_total": eligible_misses,
+        "eligible_dispatches": eligible_total,
+        "eligible_hit_rate": (
+            round(hits / eligible_total, 4) if eligible_total else None
+        ),
+        "lease_miss_by_reason": miss_by_reason,
     }
 
 

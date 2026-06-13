@@ -318,6 +318,56 @@ describe('aggregateDirectionStats', () => {
     const result = aggregateDirectionStats(history, {});
     expect(result).not.toContain('by type:');
   });
+
+  it('subtracts ineligible type counts from conversion denominator', () => {
+    // 1 merged out of 2 total tasks, but 1 is web_research (ineligible) → 1/1 = 100%
+    const history = [{
+      tasks_created: 2,
+      prs_merged: 1,
+      type_breakdown: {
+        create: { created: 1, merged: 1, failed: 0 },
+        web_research: { created: 1, merged: 0, failed: 0 },
+      },
+    }];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).toContain('conversion: 100% (1/1 findings merged last 1 cycle)');
+  });
+
+  it('subtracts design and compute_experiment from conversion denominator', () => {
+    // 1 merged out of 4 total tasks, but 2 design + 1 compute_experiment are ineligible → 1/1 = 100%
+    const history = [{
+      tasks_created: 4,
+      prs_merged: 1,
+      type_breakdown: {
+        fix: { created: 1, merged: 1, failed: 0 },
+        design: { created: 2, merged: 0, failed: 0 },
+        compute_experiment: { created: 1, merged: 0, failed: 0 },
+      },
+    }];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).toContain('conversion: 100% (1/1 findings merged last 1 cycle)');
+  });
+
+  it('falls back gracefully when type_breakdown is absent (older entries)', () => {
+    // No type_breakdown: ineligible count treated as 0, denominator = tasks_created
+    const history = [{ tasks_created: 3, prs_merged: 1 }];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).toContain('conversion: 33% (1/3 findings merged last 1 cycle)');
+  });
+
+  it('omits conversion when all tasks are ineligible types', () => {
+    // Only research tasks, no PR-eligible work
+    const history = [{
+      tasks_created: 2,
+      prs_merged: 0,
+      type_breakdown: {
+        research: { created: 1, merged: 0, failed: 0 },
+        audit: { created: 1, merged: 0, failed: 0 },
+      },
+    }];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).not.toContain('conversion:');
+  });
 });
 
 describe('buildStrategicCompletionLogs', () => {

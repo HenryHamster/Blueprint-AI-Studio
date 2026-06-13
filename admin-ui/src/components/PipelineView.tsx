@@ -18,6 +18,7 @@ const STATUS_COLORS: Record<string, string> = {
   CANCELLED: 'bg-neutral-600',
   QUEUED: 'bg-neutral-500',
   BLOCKED: 'bg-amber-500',
+  PARKED: 'bg-purple-600/50',
 };
 
 type FilterType = 'All' | 'Active' | 'Blocked' | 'Failed' | 'Needs Review';
@@ -505,6 +506,12 @@ function RootGroup({
   const blockedInGroup = isSynthetic
     ? root.children.reduce((sum, c) => sum + countByStatus(c, 'BLOCKED'), 0)
     : countByStatus(root, 'BLOCKED');
+  const parkedInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'PARKED'), 0)
+    : countByStatus(root, 'PARKED');
+  const queuedInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'QUEUED'), 0)
+    : countByStatus(root, 'QUEUED');
 
   return (
     <div
@@ -564,6 +571,12 @@ function RootGroup({
               {blockedInGroup}
             </span>
           )}
+          {parkedInGroup > 0 && (
+            <span className="flex items-center gap-1 text-[10px] bg-purple-500/10 text-purple-400 px-2 py-0.5 rounded-full font-medium border border-purple-500/30" title={`${parkedInGroup} parked`}>
+              <span className="w-1.5 h-1.5 rounded-full bg-purple-400 shrink-0" />
+              {parkedInGroup}
+            </span>
+          )}
           {failedInGroup > 0 && (
             <span className="flex items-center gap-1 text-[10px] bg-red-500/10 text-red-400 px-2 py-0.5 rounded-full font-medium border border-red-500/30">
               <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
@@ -578,9 +591,9 @@ function RootGroup({
 
       {/* Progress bar */}
       {(() => {
-        const queuedInGroup = totalInGroup - completedInGroup - runningInGroup - failedInGroup - cancelledInGroup - blockedInGroup;
         const segments = [
           { count: queuedInGroup, color: 'bg-neutral-700' },
+          { count: parkedInGroup, color: 'bg-purple-600/50' },
           { count: blockedInGroup, color: 'bg-amber-500' },
           { count: provisioningInGroup, color: 'bg-sky-700/50' },
           { count: inProgressInGroup, color: 'bg-yellow-500' },

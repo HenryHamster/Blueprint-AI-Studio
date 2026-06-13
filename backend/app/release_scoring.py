@@ -13,6 +13,7 @@ keep working unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import Any
@@ -695,6 +696,23 @@ def _finding_match_key(finding: dict[str, str]) -> tuple[str, str]:
     )
 
 
+def _audit_finding_key(summary: str, file: str | None) -> str:
+    """Deterministic content key for a carried audit finding.
+
+    Mirrors the finding-hash convention used elsewhere
+    (``finding_deduplication.finding_hash`` → sha256 truncated to 16 hex) and
+    the ``_finding_match_key`` composition (normalized ``file`` + ``summary``).
+    The same finding content yields the same key across re-extractions so a
+    resolution ledger can durably key findings; a different ``file`` yields a
+    different key.  Computed from the already-normalized/truncated ``summary``
+    and ``file`` the carried payload stores, so the key is stable for what the
+    consumer actually sees.
+    """
+    norm_file = str(file or "").strip().lower()
+    norm_summary = str(summary or "").strip().lower()
+    return hashlib.sha256(f"{norm_file}|{norm_summary}".encode()).hexdigest()[:16]
+
+
 def _compute_audit_challenge_synthesis(
     primary_report: dict[str, Any] | None,
     challenge_report: dict[str, Any] | None,
@@ -919,6 +937,7 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
 
     out: list[dict[str, str]] = []
     for f in raw:
+        file_path = ""
         if isinstance(f, dict):
             sev = str(f.get("severity") or f.get("level") or "unknown").lower()
             if not _finding_is_verified(f, sev):
@@ -933,12 +952,19 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
                 or f.get("text")
                 or ""
             )
+            file_path = str(f.get("file") or f.get("path") or "").strip()
         else:
             sev = "unknown"
             summary = str(f)
         summary = str(summary).strip()[:_FINDING_SUMMARY_MAX]
         if summary:
-            out.append({"severity": sev, "summary": summary})
+            item: dict[str, str] = {"severity": sev, "summary": summary}
+            if file_path:
+                item["file"] = file_path[:_DETAIL_NAME_MAX]
+            # Deterministic content key so the same finding is stably
+            # identifiable across re-extractions (resolution-ledger keying).
+            item["key"] = _audit_finding_key(summary, item.get("file"))
+            out.append(item)
 
     out.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 3))
     return out[:_MAX_CARRIED_FINDINGS]
@@ -997,12 +1023,68 @@ def _extract_excluded_audit_findings(
             or f.get("text")
             or ""
         )
+        file_path = str(f.get("file") or f.get("path") or "").strip()
         summary = str(summary).strip()[:_FINDING_SUMMARY_MAX]
         if summary:
-            out.append({"severity": sev, "summary": summary, "unverified": "true"})
+            item: dict[str, str] = {
+                "severity": sev,
+                "summary": summary,
+                "unverified": "true",
+            }
+            if file_path:
+                item["file"] = file_path[:_DETAIL_NAME_MAX]
+            item["key"] = _audit_finding_key(summary, item.get("file"))
+            out.append(item)
 
     out.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 3))
     return out[:_MAX_CARRIED_FINDINGS]
+
+
+def _audit_findings_carry_meta(report: dict[str, Any] | None) -> dict[str, Any]:
+    """Pre-cap totals + truncation flags for the two carried-findings lists.
+
+    ``_extract_audit_findings`` / ``_extract_excluded_audit_findings`` cap at
+    ``_MAX_CARRIED_FINDINGS`` with no in-band signal that entries were dropped —
+    the v10 verdict carried exactly 12 findings (at the cap) so consumers could
+    not tell whether the list was complete.  This returns the pre-cap count and
+    an explicit truncated flag for each list, computed with the SAME filter
+    predicates the extract functions use so the totals agree with the capped
+    lists those functions return for the same report.
+    """
+    raw = _raw_audit_findings(report)
+
+    verified_total = 0
+    excluded_total = 0
+    for f in raw:
+        if isinstance(f, dict):
+            sev = str(f.get("severity") or f.get("level") or "unknown").lower()
+            summary = (
+                f.get("summary")
+                or f.get("description")
+                or f.get("title")
+                or f.get("text")
+                or ""
+            )
+        else:
+            sev = "unknown"
+            summary = str(f)
+        summary = str(summary).strip()[:_FINDING_SUMMARY_MAX]
+        if not summary:
+            continue
+        # Verified list: mirror _extract_audit_findings' scoring gate.
+        if isinstance(f, dict) and not _finding_is_verified(f, sev):
+            # Excluded list: only higher-severity findings the gate dropped.
+            if sev in _SEVERITIES_REQUIRING_VERIFICATION:
+                excluded_total += 1
+        else:
+            verified_total += 1
+
+    return {
+        "audit_findings_total": verified_total,
+        "audit_findings_truncated": verified_total > _MAX_CARRIED_FINDINGS,
+        "excluded_audit_findings_total": excluded_total,
+        "excluded_audit_findings_truncated": excluded_total > _MAX_CARRIED_FINDINGS,
+    }
 
 
 # Caps on the test-erosion / smoketest detail carried into last_qualification.

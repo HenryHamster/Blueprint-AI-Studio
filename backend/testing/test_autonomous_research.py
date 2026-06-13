@@ -536,7 +536,9 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _active_direction_with_cooldown_elapsed(direction_id: str, text: str = "Research direction") -> dict:
+def _active_direction_with_cooldown_elapsed(
+    direction_id: str, text: str = "Research direction"
+) -> dict:
     """Return an active direction whose last_researched_at is well past cooldown."""
     return {
         **_active_direction(direction_id, text),
@@ -553,7 +555,9 @@ async def test_research_spawn_defers_while_external_repo_bootstrap_pending(db_se
     build_config.bootstrap_completed_at is unset and has an active
     repo_bootstrap task must not spawn research work.
     """
-    direction = _active_direction_with_cooldown_elapsed("d-bootstrap-defer", "Ungrounded research")
+    direction = _active_direction_with_cooldown_elapsed(
+        "d-bootstrap-defer", "Ungrounded research"
+    )
     project = Project(
         name="Bootstrap Pending Research",
         user_id="test-user-123",
@@ -590,9 +594,13 @@ async def test_research_spawn_defers_while_external_repo_bootstrap_pending(db_se
 
 
 @pytest.mark.asyncio
-async def test_research_spawn_proceeds_when_external_repo_bootstrap_completed(db_session):
+async def test_research_spawn_proceeds_when_external_repo_bootstrap_completed(
+    db_session,
+):
     """_spawn_research_task proceeds normally once bootstrap_completed_at is set."""
-    direction = _active_direction_with_cooldown_elapsed("d-bootstrap-ok", "Grounded research")
+    direction = _active_direction_with_cooldown_elapsed(
+        "d-bootstrap-ok", "Grounded research"
+    )
     project = Project(
         name="Bootstrap Complete Research",
         user_id="test-user-123",
@@ -620,9 +628,13 @@ async def test_research_spawn_proceeds_when_external_repo_bootstrap_completed(db
 
 
 @pytest.mark.asyncio
-async def test_research_spawn_proceeds_for_self_repo_regardless_of_bootstrap(db_session):
+async def test_research_spawn_proceeds_for_self_repo_regardless_of_bootstrap(
+    db_session,
+):
     """_spawn_research_task is not gated on bootstrap for self-repo projects."""
-    direction = _active_direction_with_cooldown_elapsed("d-self-repo", "Self-repo research")
+    direction = _active_direction_with_cooldown_elapsed(
+        "d-self-repo", "Self-repo research"
+    )
     project = Project(
         name="Self Repo Research",
         user_id="test-user-123",
@@ -712,7 +724,109 @@ async def test_blocked_research_lane_keeps_direction_out_of_respawn(db_session):
 
 
 @pytest.mark.asyncio
-async def test_all_paused_directions_still_get_strategic_via_backstop(db_session, mocker):
+async def test_parked_research_keeps_direction_out_of_respawn(db_session):
+    """A direction whose prior research task is PARKED (non-terminal, waiting to
+    wake) must not be selected for a fresh autonomous cycle — PARKED is active in
+    the idempotency-key predicate and must be active in the busy-direction guard."""
+    direction = {
+        **_active_direction("d-parked1", "Waiting to wake"),
+        # 5h ago — well past the 4h cooldown, so only the PARKED task holds it.
+        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+    }
+    project = Project(
+        name="Parked Lane Hold",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parked = Task(
+        project_id=project.id,
+        title="Research: parked on wakeup",
+        payloads=[
+            {
+                "type": "research",
+                "current_direction_id": "d-parked1",
+                "directions": [direction],
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.PARKED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(parked)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 1, (
+        "No fresh research cycle should spawn while the direction's prior lane is "
+        "PARKED waiting to wake — only the pre-existing parked task remains"
+    )
+    assert research_tasks[0].id == parked.id
+
+
+@pytest.mark.asyncio
+async def test_parked_legacy_research_keeps_direction_out_of_respawn(db_session):
+    """Legacy PARKED research rows that only carry ``directions[0].id`` must
+    still hold the direction busy until they wake or reach a terminal status."""
+    direction = {
+        **_active_direction("d-parked-legacy1", "Waiting to wake"),
+        # 5h ago — well past the 4h cooldown, so only the PARKED task holds it.
+        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+    }
+    project = Project(
+        name="Legacy Parked Lane Hold",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parked = Task(
+        project_id=project.id,
+        title="Research: parked on wakeup",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.PARKED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(parked)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 1, (
+        "No fresh research cycle should spawn while the legacy PARKED lane is "
+        "waiting to wake — only the pre-existing parked task remains"
+    )
+    assert research_tasks[0].id == parked.id
+
+
+@pytest.mark.asyncio
+async def test_all_paused_directions_still_get_strategic_via_backstop(
+    db_session, mocker
+):
     """Regression: when every active direction is recommended_mode=pause, the
     wall-clock strategic backstop must still fire a strategic cycle.
 
@@ -734,9 +848,14 @@ async def test_all_paused_directions_still_get_strategic_via_backstop(db_session
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {**_active_direction("d-paused01", "Paused A"), "recommended_mode": "pause"},
+            {
+                **_active_direction("d-paused01", "Paused A"),
+                "recommended_mode": "pause",
+            },
         ],
-        vision={"purpose": "test"},  # purpose set so force_strategic relies on the backstop
+        vision={
+            "purpose": "test"
+        },  # purpose set so force_strategic relies on the backstop
     )
     db_session.add(project)
     await db_session.commit()
@@ -790,7 +909,10 @@ async def test_strategic_spawn_skipped_when_advisory_lock_held(db_session, mocke
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {**_active_direction("d-paused03", "Paused A"), "recommended_mode": "pause"},
+            {
+                **_active_direction("d-paused03", "Paused A"),
+                "recommended_mode": "pause",
+            },
         ],
         vision={"purpose": "test"},
     )
@@ -893,9 +1015,14 @@ async def test_all_paused_directions_skip_when_backstop_not_due(db_session, mock
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {**_active_direction("d-paused02", "Paused A"), "recommended_mode": "pause"},
+            {
+                **_active_direction("d-paused02", "Paused A"),
+                "recommended_mode": "pause",
+            },
         ],
-        vision={"purpose": "test"},  # purpose set; no stale strategic task → backstop idle
+        vision={
+            "purpose": "test"
+        },  # purpose set; no stale strategic task → backstop idle
     )
     db_session.add(project)
     await db_session.commit()
@@ -949,7 +1076,9 @@ async def test_refresh_marker_bypasses_spawn_cooldown_and_clears(db_session, moc
                 "count": 1,
             },
         },
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1090,7 +1219,9 @@ async def test_operator_refresh_fires_despite_tripped_breaker(db_session, mocker
                 "origin": "operator",
             },
         },
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1248,7 +1379,9 @@ async def test_qualification_refresh_deferred_behind_active_cycle_stays_silent(
         for m in msgs
         if (m.context or {}).get("event_type") == "strategic_steering_deferred"
     ]
-    assert steering == [], "qualification refresh must not post operator steering notice"
+    assert steering == [], (
+        "qualification refresh must not post operator steering notice"
+    )
 
 
 @pytest.mark.asyncio
@@ -1281,7 +1414,9 @@ async def test_operator_steering_consumed_posts_acted_confirmation(db_session, m
                 "excerpt": "Please refocus on the auth bug.",
             },
         },
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1350,7 +1485,9 @@ async def test_operator_marker_without_excerpt_posts_no_acted_confirmation(
                 # no excerpt — no message text was preserved
             },
         },
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1360,7 +1497,9 @@ async def test_operator_marker_without_excerpt_posts_no_acted_confirmation(
 
     await _spawn_research_task(project, db_session)
 
-    assert strategic_review_mock.called, "operator-origin refresh must still fire the spawn"
+    assert strategic_review_mock.called, (
+        "operator-origin refresh must still fire the spawn"
+    )
     await db_session.refresh(project)
     assert (project.vision or {}).get("_strategic_refresh") is None
 
@@ -1409,7 +1548,9 @@ async def test_qualification_consumed_posts_no_acted_confirmation(db_session, mo
                 # no origin → legacy qualification
             },
         },
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1520,7 +1661,11 @@ async def test_operator_refresh_deferred_on_payload_too_large_posts_once(
 
     strategic_review_mock = mocker.patch(
         "app.strategic_spawning._spawn_strategic_review",
-        new=AsyncMock(side_effect=PayloadTooLargeError(300_000, 262_144, [("design_doc", 200_000)])),
+        new=AsyncMock(
+            side_effect=PayloadTooLargeError(
+                300_000, 262_144, [("design_doc", 200_000)]
+            )
+        ),
     )
     mocker.patch(
         "app.strategic_spawning._spawn_design_doc_update",
@@ -1540,7 +1685,9 @@ async def test_operator_refresh_deferred_on_payload_too_large_posts_once(
                 "origin": "operator",
             },
         },
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -1575,7 +1722,9 @@ async def test_operator_refresh_deferred_on_payload_too_large_posts_once(
         for m in msgs
         if (m.context or {}).get("event_type") == "strategic_steering_deferred"
     ]
-    assert len(steering) == 1, "payload-too-large skip must post exactly one deferral notice"
+    assert len(steering) == 1, (
+        "payload-too-large skip must post exactly one deferral notice"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2278,8 +2427,7 @@ async def test_concurrent_spawn_ticks_create_exactly_one_research_task(
         return [
             d
             for d in (prj.directions or [])
-            if d.get("status") == "active"
-            and d.get("id") not in busy_direction_ids
+            if d.get("status") == "active" and d.get("id") not in busy_direction_ids
         ]
 
     mocker.patch(
@@ -2541,9 +2689,7 @@ async def test_pipelined_holder_blocks_later_primary_claim_under_direction_lock(
 
     assert result == "blocked"
 
-    rows = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    rows = await db_session.execute(select(Task).where(Task.project_id == project.id))
     research = [
         task
         for task in rows.scalars().all()
@@ -3863,7 +4009,9 @@ async def test_compute_experiment_finding_propagates_live_proof_contract(
             runtime_config["compute_experiment_spend_threshold_usd"] = prev_threshold
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 1
@@ -4714,7 +4862,9 @@ async def test_partial_adversarial_manifest_fail_closes_omitted_high_stakes_find
 
     kept = _make_finding("Keep challenge", direction["id"], scope="small")
     omitted = _make_finding("Drop challenge", direction["id"], scope="small")
-    kept_hash = hashlib.sha256((kept["title"] + kept["description"]).encode()).hexdigest()[:16]
+    kept_hash = hashlib.sha256(
+        (kept["title"] + kept["description"]).encode()
+    ).hexdigest()[:16]
 
     _patch_research_externals(mocker)
     mocker.patch("app.research_completion._is_high_stakes_finding", return_value=True)
@@ -5829,13 +5979,19 @@ async def test_research_history_verification_basis_distribution(db_session, mock
 
     task = await _make_research_task(project, direction, db_session)
 
-    code_f = {**_make_finding("Code verified finding", direction_id),
-              "verification_basis": "code_verified"}
-    path_f = {**_make_finding("Path verified finding", direction_id),
-              "verification_basis": "path_verified"}
+    code_f = {
+        **_make_finding("Code verified finding", direction_id),
+        "verification_basis": "code_verified",
+    }
+    path_f = {
+        **_make_finding("Path verified finding", direction_id),
+        "verification_basis": "path_verified",
+    }
     missing_f = _make_finding("Missing basis finding", direction_id)
-    invalid_f = {**_make_finding("Invalid basis finding", direction_id),
-                 "verification_basis": "guessed"}
+    invalid_f = {
+        **_make_finding("Invalid basis finding", direction_id),
+        "verification_basis": "guessed",
+    }
 
     _patch_research_externals(mocker)
     mocker.patch(
@@ -6393,7 +6549,9 @@ async def test_research_endpoint_ignores_last_researched_at_without_refractory(
 ):
     """A stale last_researched_at alone no longer blocks research; refractory_until does."""
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Legacy cooldown direction")
+    direction = await _add_direction(
+        client, project_id, text="Legacy cooldown direction"
+    )
     direction_id = direction["id"]
 
     recent_ts = (datetime.utcnow() - timedelta(hours=1)).isoformat()
@@ -7158,9 +7316,7 @@ async def test_problem_model_purpose_suppresses_force_strategic(db_session):
         "problem_model purpose must satisfy the no-purpose force-strategic arm"
     )
     # The active direction still gets normal research — the spawn itself works.
-    research = [
-        t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"
-    ]
+    research = [t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"]
     assert len(research) == 1
 
 
@@ -8665,6 +8821,113 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
     assert "Directed deferred finding" not in titles, (
         f"Undirected cycle must NOT steal directed-cycle leftovers, got: {titles}"
     )
+
+
+@pytest.mark.asyncio
+async def test_deferred_research_recovery_filters_before_cap_and_keeps_scope(
+    db_session,
+):
+    direction_a = _active_direction("d-recover-a1", "Recovery A")
+    direction_b = _active_direction("d-recover-b1", "Recovery B")
+    project = Project(
+        name="Deferred Recovery Busy Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction_a],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.now(timezone.utc)
+    target_finding = _make_finding("Recover direction A", direction_a["id"])
+    other_direction_finding = _make_finding("Skip direction B", direction_b["id"])
+    relevant_research = Task(
+        project_id=project.id,
+        title="Research: older relevant deferred row",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction_a],
+                "current_direction_id": direction_a["id"],
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "deferred_findings": [
+                target_finding,
+            ]
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(hours=8),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(relevant_research)
+
+    for i in range(20):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Research: recent deferred row {i}",
+                payloads=[
+                    {
+                        "type": "research",
+                        "directions": [direction_a],
+                        "current_direction_id": direction_a["id"],
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "deferred_findings": [
+                        {
+                            **other_direction_finding,
+                            "title": f"{other_direction_finding['title']} {i}",
+                            "finding_hash": f"hash-other-{i}",
+                        }
+                    ]
+                },
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(hours=5, minutes=i),
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Completed create with deferred context",
+            payloads=[{"type": "create", "base_branch": "main"}],
+            context={
+                "deferred_findings": [
+                    _make_finding("Ignore non-research deferred", direction_a["id"])
+                ]
+            },
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=1),
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status == TaskStatus.QUEUED,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    new_task = result.scalar_one()
+    assert new_task.first_payload.get("current_direction_id") == direction_a["id"]
+    prior_titles = {
+        f.get("title")
+        for f in (new_task.context or {}).get("prior_deferred_findings", [])
+    }
+    assert prior_titles == {"Recover direction A"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -11493,7 +11756,9 @@ async def test_strategic_max_interval_backstop_fires_when_stale(db_session, mock
         directions=[_active_direction("d-backstop01", "Test direction")],
         # purpose set → not force_strategic; count=1 → 1 % 6 != 0 → modulo inactive
         vision={"purpose": "test", "_research_spawn_count": 1},
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -11585,7 +11850,9 @@ async def test_strategic_max_interval_backstop_fires_when_all_directions_busy(
         autonomous_enabled=True,
         directions=[_active_direction(dir_id, "Busy direction")],
         vision={"purpose": "test", "_research_spawn_count": 1},
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -11900,9 +12167,7 @@ async def test_system_verification_all_present_flagged_verified(db_session, mock
     await db_session.commit()
     await db_session.refresh(project)
 
-    _patch_classify(
-        mocker, present_paths={"backend/app/a.py", "backend/app/b.py"}
-    )
+    _patch_classify(mocker, present_paths={"backend/app/a.py", "backend/app/b.py"})
 
     payload = await _spawn_and_get_research_payload(project, db_session)
     sv = payload.get("system_verification")
@@ -11946,7 +12211,10 @@ async def test_system_verification_does_not_mutate_design_doc(db_session, mocker
 async def test_system_verification_folds_into_direction_context(db_session, mocker):
     """The current direction's system verdict is folded into direction_design_context."""
     system_id = "sys-folded"
-    direction = {**_active_direction("d-sysverif-fold", "Improve folded"), "system_id": system_id}
+    direction = {
+        **_active_direction("d-sysverif-fold", "Improve folded"),
+        "system_id": system_id,
+    }
     project = Project(
         name="SysVerif Fold",
         user_id="test-user-123",
@@ -12166,7 +12434,9 @@ async def test_capability_verification_path_in_notes_flagged(db_session, mocker)
 async def test_capability_verification_passes_branch_context_to_symbol_checks(
     db_session, mocker
 ):
-    direction = _active_direction("d-capverif-symbol-ctx", "Improve symbol-aware capability")
+    direction = _active_direction(
+        "d-capverif-symbol-ctx", "Improve symbol-aware capability"
+    )
     project = Project(
         name="CapVerif Symbol Context",
         user_id="test-user-123",
@@ -12433,9 +12703,7 @@ async def test_undirected_guard_scoped_per_project(db_session):
     await db_session.refresh(p1)
     await db_session.refresh(p2)
 
-    await _add_cross_cutting_research(
-        db_session, p2.id, status=TaskStatus.IN_PROGRESS
-    )
+    await _add_cross_cutting_research(db_session, p2.id, status=TaskStatus.IN_PROGRESS)
     assert await _undirected_research_recently_active(p1.id, db_session) is False
     assert await _undirected_research_recently_active(p2.id, db_session) is True
 
@@ -12849,7 +13117,9 @@ async def test_directed_completed_guard_derives_from_operator_cooldown(db_sessio
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
-    prior_operator = _runtime_config.get("autonomous_direction_cooldown_minutes", sentinel)
+    prior_operator = _runtime_config.get(
+        "autonomous_direction_cooldown_minutes", sentinel
+    )
     _runtime_config.pop("completed_research_cooldown_minutes", None)
     _runtime_config["autonomous_direction_cooldown_minutes"] = 60
     try:
@@ -12884,7 +13154,9 @@ async def test_directed_completed_guard_derived_window_still_blocks_recent(db_se
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
-    prior_operator = _runtime_config.get("autonomous_direction_cooldown_minutes", sentinel)
+    prior_operator = _runtime_config.get(
+        "autonomous_direction_cooldown_minutes", sentinel
+    )
     _runtime_config.pop("completed_research_cooldown_minutes", None)
     _runtime_config["autonomous_direction_cooldown_minutes"] = 60
     try:
@@ -12920,7 +13192,9 @@ async def test_directed_completed_guard_explicit_key_overrides_operator_cooldown
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
-    prior_operator = _runtime_config.get("autonomous_direction_cooldown_minutes", sentinel)
+    prior_operator = _runtime_config.get(
+        "autonomous_direction_cooldown_minutes", sentinel
+    )
     _runtime_config["completed_research_cooldown_minutes"] = 120
     _runtime_config["autonomous_direction_cooldown_minutes"] = 60
     try:
@@ -12955,7 +13229,9 @@ async def test_directed_completed_guard_falls_back_when_no_keys_set(db_session):
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
-    prior_operator = _runtime_config.get("autonomous_direction_cooldown_minutes", sentinel)
+    prior_operator = _runtime_config.get(
+        "autonomous_direction_cooldown_minutes", sentinel
+    )
     _runtime_config.pop("completed_research_cooldown_minutes", None)
     _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
     try:
@@ -12992,9 +13268,7 @@ async def test_idle_research_skips_paused_project(db_session, mocker):
     spawn_spy = mocker.patch(
         "app.autonomous_research._spawn_research_task", new_callable=AsyncMock
     )
-    mocker.patch(
-        "app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock
-    )
+    mocker.patch("app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock)
     mocker.patch(
         "app.autonomous_research._spawn_residual_fingerprint_remediation",
         new_callable=AsyncMock,
@@ -13012,9 +13286,7 @@ async def test_idle_research_skips_paused_project(db_session, mocker):
     async def _session_cm():
         yield db_session
 
-    mocker.patch(
-        "app.autonomous_research.AsyncSessionLocal", lambda: _session_cm()
-    )
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", lambda: _session_cm())
 
     paused = Project(
         name="Idle Paused",
@@ -13065,9 +13337,7 @@ async def test_post_merge_research_skips_paused_project(db_session, mocker):
     async def _session_cm():
         yield db_session
 
-    mocker.patch(
-        "app.autonomous_research.AsyncSessionLocal", lambda: _session_cm()
-    )
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", lambda: _session_cm())
 
     owner, repo = "acme", "widgets"
     paused = Project(
@@ -13169,8 +13439,14 @@ async def test_operator_refresh_deferred_on_circuit_breaker_open_posts_once(db_s
 
         # No task spawned — the breaker halt aborts before the strategic block.
         tasks = (
-            await db_session.execute(select(Task).where(Task.project_id == project.id))
-        ).scalars().all()
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(tasks) == 0, "No task spawned while circuit breaker OPEN"
 
         # Marker preserved (steering not lost) and stamped notified.
@@ -13232,8 +13508,14 @@ async def test_operator_refresh_deferred_on_no_accounts_posts_once(
         await _spawn_research_task(project, db_session)
 
         tasks = (
-            await db_session.execute(select(Task).where(Task.project_id == project.id))
-        ).scalars().all()
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(tasks) == 0, "No task spawned when no accounts available"
 
         await db_session.refresh(project)
@@ -13300,6 +13582,105 @@ async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_ses
         _shared_state.circuit_breakers.pop(str(project.id), None)
 
 
+@pytest.mark.asyncio
+async def test_operator_refresh_deferred_behind_bootstrap_pending_posts_once(
+    db_session,
+):
+    """Operator steering pending behind repo_bootstrap posts once and stays queued."""
+    project = Project(
+        name="Operator deferred behind bootstrap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-bootstrap-op")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Bootstrap: operator deferred",
+            payloads=[{"type": "repo_bootstrap"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_strategic_refresh")
+    assert marker is not None and marker.get("notified") is True
+
+    steering = _deferred_steering_messages(
+        await _system_messages(db_session, project.id)
+    )
+    assert len(steering) == 1, "bootstrap-pending halt must post exactly one notice"
+
+    await _spawn_research_task(project, db_session)
+    steering2 = _deferred_steering_messages(
+        await _system_messages(db_session, project.id)
+    )
+    assert len(steering2) == 1, "deferral notice must not re-emit every tick"
+
+
+@pytest.mark.asyncio
+async def test_qualification_refresh_deferred_behind_bootstrap_pending_stays_silent(
+    db_session,
+):
+    """Qualification-origin refreshes stay silent while repo_bootstrap is pending."""
+    project = Project(
+        name="Qualification deferred behind bootstrap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-bootstrap-qual")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Bootstrap: qualification silent",
+            payloads=[{"type": "repo_bootstrap"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_strategic_refresh")
+    assert marker is not None and marker.get("notified") is None
+
+    steering = _deferred_steering_messages(
+        await _system_messages(db_session, project.id)
+    )
+    assert len(steering) == 0, "qualification-origin marker must stay silent"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Qualification-origin refresh must force a strategic tick when due
 # ─────────────────────────────────────────────────────────────────────────────
@@ -13328,7 +13709,9 @@ async def test_qualification_refresh_forces_strategic_tick_when_due_and_modulo_i
         vision={
             "purpose": "test",
             "_research_spawn_count": 1,  # 1 % 6 != 0, so modulo stays idle
-            "_strategic_refresh_last_fired_at": (now - timedelta(minutes=5)).isoformat(),
+            "_strategic_refresh_last_fired_at": (
+                now - timedelta(minutes=5)
+            ).isoformat(),
             "_strategic_refresh": {
                 "requested_at": now.isoformat(),
                 "reason": "post_qualification:promoted",
@@ -13336,7 +13719,9 @@ async def test_qualification_refresh_forces_strategic_tick_when_due_and_modulo_i
                 "origin": "qualification",
             },
         },
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -13363,9 +13748,7 @@ async def test_qualification_refresh_forces_strategic_tick_when_due_and_modulo_i
 
 
 @pytest.mark.asyncio
-async def test_qualification_refresh_parks_at_breaker_threshold(
-    db_session, mocker
-):
+async def test_qualification_refresh_parks_at_breaker_threshold(db_session, mocker):
     """A qualification-origin refresh must still park when the breaker is tripped."""
     strategic_review_mock = mocker.patch(
         "app.strategic_spawning._spawn_strategic_review",
@@ -13385,7 +13768,9 @@ async def test_qualification_refresh_parks_at_breaker_threshold(
             "purpose": "test",
             "_strategic_failures": 3,
             "_research_spawn_count": 1,
-            "_strategic_refresh_last_fired_at": (now - timedelta(minutes=5)).isoformat(),
+            "_strategic_refresh_last_fired_at": (
+                now - timedelta(minutes=5)
+            ).isoformat(),
             "_strategic_refresh": {
                 "requested_at": now.isoformat(),
                 "reason": "post_qualification:promoted",
@@ -13420,7 +13805,9 @@ async def test_qualification_refresh_parks_at_breaker_threshold(
 
 
 @pytest.mark.asyncio
-async def test_operator_refresh_still_forces_strategic_tick_when_due(db_session, mocker):
+async def test_operator_refresh_still_forces_strategic_tick_when_due(
+    db_session, mocker
+):
     """Operator-origin refreshes must keep bypassing the breaker when due."""
     strategic_review_mock = mocker.patch(
         "app.strategic_spawning._spawn_strategic_review",
@@ -13440,7 +13827,9 @@ async def test_operator_refresh_still_forces_strategic_tick_when_due(db_session,
             "purpose": "test",
             "_strategic_failures": 3,
             "_research_spawn_count": 1,
-            "_strategic_refresh_last_fired_at": (now - timedelta(minutes=5)).isoformat(),
+            "_strategic_refresh_last_fired_at": (
+                now - timedelta(minutes=5)
+            ).isoformat(),
             "_strategic_refresh": {
                 "requested_at": now.isoformat(),
                 "reason": "operator_steering",
@@ -13448,7 +13837,9 @@ async def test_operator_refresh_still_forces_strategic_tick_when_due(db_session,
                 "origin": "operator",
             },
         },
-        design_doc={"systems/api": {"id": "api", "status": "working"}},  # Has systems, so architecture isn't triggered
+        design_doc={
+            "systems/api": {"id": "api", "status": "working"}
+        },  # Has systems, so architecture isn't triggered
     )
     db_session.add(project)
     await db_session.commit()
@@ -13618,12 +14009,16 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
     assert len(tasks) == 0, "No task should be spawned when spend ceiling is exceeded"
 
     alerts = (
-        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
-    ).scalars().all()
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     ceiling_alerts = [a for a in alerts if "Spend ceiling" in a.title]
     assert len(ceiling_alerts) == 1, "Exactly one spend-ceiling alert should be created"
     assert "1.5000" in ceiling_alerts[0].message
@@ -13632,12 +14027,16 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
     # ── Part 2: alert deduplication — second call must not create a second alert ──
     await _spawn_research_task(project, db_session)
     alerts2 = (
-        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
-    ).scalars().all()
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     ceiling_alerts2 = [a for a in alerts2 if "Spend ceiling" in a.title]
     assert len(ceiling_alerts2) == 1, "Alert must be deduplicated — still exactly one"
 
-    assert mock_spend.call_count >= 2, "Spend function should be called each gate evaluation"
+    assert mock_spend.call_count >= 2, (
+        "Spend function should be called each gate evaluation"
+    )
 
     # ── Part 3: spend below ceiling → task spawned ──
     project2 = Project(
@@ -13662,7 +14061,9 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
     result2 = await db_session.execute(
         select(Task).where(Task.project_id == project2.id)
     )
-    tasks2 = [t for t in result2.scalars().all() if t.first_payload.get("type") == "research"]
+    tasks2 = [
+        t for t in result2.scalars().all() if t.first_payload.get("type") == "research"
+    ]
     assert len(tasks2) >= 1, "Task should be spawned when spend is below ceiling"
 
     # ── Part 4: no ceiling set → today's behavior, no alert, no spend query ──
@@ -13690,8 +14091,10 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
     )
     # Also assert no spend-ceiling alerts for project3
     alerts3 = (
-        await db_session.execute(select(Alert).where(Alert.project_id == project3.id))
-    ).scalars().all()
+        (await db_session.execute(select(Alert).where(Alert.project_id == project3.id)))
+        .scalars()
+        .all()
+    )
     ceiling_alerts3 = [a for a in alerts3 if "Spend ceiling" in a.title]
     assert len(ceiling_alerts3) == 0, "No alert when no ceiling is configured"
 
@@ -13774,7 +14177,9 @@ async def test_system_verification_carries_branch_sha_and_computed_at(
     assert sv is not None, "system_verification should be present"
     assert sv["real"]["status"] == "verified"
     assert "_computed_at" in sv, "_computed_at provenance stamp must be present"
-    assert sv["_branch_sha"] == "abc1234567890abc", "_branch_sha must match resolved SHA"
+    assert sv["_branch_sha"] == "abc1234567890abc", (
+        "_branch_sha must match resolved SHA"
+    )
     # Provenance keys are metadata, not system entries
     assert "real" in sv
     assert "_computed_at" not in sv["real"]
@@ -13880,19 +14285,26 @@ async def test_refresh_research_task_verification_overwrites_stale_stamp(
 
     # Task with stale spawn-time verification (old stamp, old SHA)
     stale_sv = {
-        "api": {"status": "claimed_absent", "claimed_status": "mature", "present": [], "missing": ["backend/app/api.py"]},
+        "api": {
+            "status": "claimed_absent",
+            "claimed_status": "mature",
+            "present": [],
+            "missing": ["backend/app/api.py"],
+        },
         "_computed_at": "2020-01-01T00:00:00",
         "_branch_sha": "oldsha",
     }
     task = Task(
         project_id=project.id,
         title="Research: Refresh verification",
-        payloads=[{
-            "type": "research",
-            "base_branch": "main",
-            "directions": [direction],
-            "system_verification": stale_sv,
-        }],
+        payloads=[
+            {
+                "type": "research",
+                "base_branch": "main",
+                "directions": [direction],
+                "system_verification": stale_sv,
+            }
+        ],
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )
@@ -13996,8 +14408,9 @@ async def test_no_findings_completion_stamps_saturation_and_refractory(
     db_session, mocker
 ):
     """When a research task completes with no actionable findings, the direction
-    must be marked possibly_saturated=True and stamped with refractory_until so
-    it cannot be immediately re-selected.
+    must be stamped with refractory_until and last_researched_at so it cannot be
+    immediately re-selected. possibly_saturated is NOT set on the first no-findings
+    cycle — saturation requires 3+ consecutive unproductive cycles.
 
     This closes the blind spot where the early-return gate in
     _handle_research_completion skipped _apply_direction_state_updates entirely,
@@ -14057,8 +14470,8 @@ async def test_no_findings_completion_stamps_saturation_and_refractory(
     dirs = project.directions or []
     target = next((d for d in dirs if d.get("id") == direction_id), None)
     assert target is not None, "Direction must still exist"
-    assert target.get("possibly_saturated") is True, (
-        "Direction must be marked saturated after no-findings completion"
+    assert target.get("possibly_saturated") is not True, (
+        "Direction must NOT be marked saturated after a single no-findings cycle"
     )
     assert target.get("last_researched_at") is not None, (
         "last_researched_at must be set so the cooldown applies"
@@ -14135,8 +14548,16 @@ async def test_empty_design_doc_forces_architecture_first_cycle(
     """When a project's design_doc has no architecture content (cycle 1), the
     strategic spawn runs the full architecture-first pipeline (design_doc_update
     -> strategic_review) regardless of the cycle-count modulus."""
-    mocker.patch("app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock, return_value=True)
-    mocker.patch("app.strategic_spawning._spawn_strategic_review", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
 
     # Create a project with an empty design_doc (only config blocks, no architecture)
     project = Project(
@@ -14144,7 +14565,10 @@ async def test_empty_design_doc_forces_architecture_first_cycle(
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-arch-test-1")],
-        vision={"purpose": "test architecture bootstrapping", "_research_spawn_count": 6},
+        vision={
+            "purpose": "test architecture bootstrapping",
+            "_research_spawn_count": 6,
+        },
         design_doc={
             # Only config blocks (underscore-prefixed) — no real architecture content
             "_auto_remediation": {"enabled": False},
@@ -14177,11 +14601,17 @@ async def test_empty_design_doc_forces_architecture_first_cycle(
 
     # Verify design_doc_update was called (architecture-first pipeline)
     from app.strategic_spawning import _spawn_design_doc_update
-    assert _spawn_design_doc_update.called, "design_doc_update should spawn on empty design_doc"
+
+    assert _spawn_design_doc_update.called, (
+        "design_doc_update should spawn on empty design_doc"
+    )
 
     # Verify strategic_review was NOT called directly (it's spawned by design_doc_update completion)
     from app.strategic_spawning import _spawn_strategic_review
-    assert not _spawn_strategic_review.called, "strategic_review should be deferred to design_doc_update completion"
+
+    assert not _spawn_strategic_review.called, (
+        "strategic_review should be deferred to design_doc_update completion"
+    )
 
 
 @pytest.mark.asyncio
@@ -14190,8 +14620,16 @@ async def test_populated_design_doc_respects_architecture_cadence(
 ) -> None:
     """When a project's design_doc has architecture content, the modulus cadence
     schedule continues unchanged (cycle 1 runs strategy-only, cycle 3 runs architecture)."""
-    mocker.patch("app.strategic_spawning._spawn_design_doc_update", new_callable=AsyncMock, return_value=True)
-    mocker.patch("app.strategic_spawning._spawn_strategic_review", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
 
     # Create a project with populated design_doc (has systems/* entries)
     project = Project(
@@ -14199,7 +14637,11 @@ async def test_populated_design_doc_respects_architecture_cadence(
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-arch-test-2")],
-        vision={"purpose": "test architecture cadence", "_strategic_cycle_count": 0, "_research_spawn_count": 6},
+        vision={
+            "purpose": "test architecture cadence",
+            "_strategic_cycle_count": 0,
+            "_research_spawn_count": 6,
+        },
         design_doc={
             # Has real architecture content
             "systems/auth": {
@@ -14238,11 +14680,17 @@ async def test_populated_design_doc_respects_architecture_cadence(
 
     # Verify strategic_review was called (strategy-only, no architecture)
     from app.strategic_spawning import _spawn_strategic_review
-    assert _spawn_strategic_review.called, "strategic_review should spawn on cycle 1 when design_doc is populated"
+
+    assert _spawn_strategic_review.called, (
+        "strategic_review should spawn on cycle 1 when design_doc is populated"
+    )
 
     # Verify design_doc_update was NOT called (no architecture on cycle 1)
     from app.strategic_spawning import _spawn_design_doc_update
-    assert not _spawn_design_doc_update.called, "design_doc_update should not spawn on cycle 1 with populated design_doc"
+
+    assert not _spawn_design_doc_update.called, (
+        "design_doc_update should not spawn on cycle 1 with populated design_doc"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -14299,15 +14747,13 @@ async def test_spawn_pending_resume_uses_stored_plan_output(db_session, mocker):
     await _handle_research_completion(task, "", db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
-    assert len(children) == 1, "Stored finding should be spawned via spawn-pending resume path"
+    assert len(children) == 1, (
+        "Stored finding should be spawned via spawn-pending resume path"
+    )
 
     await db_session.refresh(task)
     assert not (task.context or {}).get("_research_spawn_pending"), (
@@ -14342,10 +14788,15 @@ async def test_spawn_pending_marker_stamped_before_ensure_branch(db_session, moc
         return task_obj
 
     mocker.patch("app.task_completion._ensure_branch", new=_capture_and_passthrough)
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
-    mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
+    mocker.patch(
+        "app.research_completion._apply_structural_actionability_downgrade",
+        return_value=0,
+    )
     mocker.patch("app.research_completion._is_high_stakes_finding", return_value=False)
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch(
@@ -14394,7 +14845,9 @@ async def test_spawn_pending_marker_cleared_after_successful_spawn(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_mid_spawn_lock_timeout_replay_completes_spawn_exactly_once(db_session, mocker):
+async def test_mid_spawn_lock_timeout_replay_completes_spawn_exactly_once(
+    db_session, mocker
+):
     """Simulate a lock timeout inside _ensure_branch on the first pass.
 
     _ensure_branch's internal commit makes _research_spawn_pending and plan_output
@@ -14417,10 +14870,15 @@ async def test_mid_spawn_lock_timeout_replay_completes_spawn_exactly_once(db_ses
     task = await _make_research_task(project, direction, db_session)
 
     # Common patches (same as _patch_research_externals but without _ensure_branch).
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
-    mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
+    mocker.patch(
+        "app.research_completion._apply_structural_actionability_downgrade",
+        return_value=0,
+    )
     mocker.patch("app.research_completion._is_high_stakes_finding", return_value=False)
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.research_completion._parse_research_insights", return_value=[])
@@ -14434,10 +14892,14 @@ async def test_mid_spawn_lock_timeout_replay_completes_spawn_exactly_once(db_ses
             # (task.context mutation already applied by the stamp code above it)
             # then failing on the row-lock re-acquisition.
             await db_session.commit()
-            raise RuntimeError("lock timeout: simulated LockNotAvailableError mid-spawn")
+            raise RuntimeError(
+                "lock timeout: simulated LockNotAvailableError mid-spawn"
+            )
         return task_obj
 
-    mocker.patch("app.task_completion._ensure_branch", new=_ensure_branch_fail_then_pass)
+    mocker.patch(
+        "app.task_completion._ensure_branch", new=_ensure_branch_fail_then_pass
+    )
 
     # Pass 1: handler commits plan_output + _research_spawn_pending, then _ensure_branch fails.
     mocker.patch(
@@ -14461,11 +14923,7 @@ async def test_mid_spawn_lock_timeout_replay_completes_spawn_exactly_once(db_ses
     await _handle_research_completion(task, "", db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -14536,3 +14994,371 @@ def test_explicit_saturation_refractory_key_wins():
     _runtime_config["autonomous_direction_cooldown_minutes"] = 60
     _runtime_config["direction_saturation_refractory_minutes"] = 720
     assert direction_saturation_refractory_minutes() == 720.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pending strategic review retry cap and escalation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_pending_sr_project(db_session_fixture, **vision_overrides):
+    """Helper: create and return an unsaved Project with _pending_strategic_review marker."""
+    pending_sr = {
+        "design_doc_task_id": str(uuid.uuid4()),
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+        "error": "test error",
+        "cycle_id": "cyc-test-001",
+        "operator_steered": False,
+        "steering_excerpt": None,
+        **vision_overrides,
+    }
+    return Project(
+        name="Pending SR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-psr-test1", "Pending SR direction")],
+        vision={"purpose": "test", "_pending_strategic_review": pending_sr},
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_success_clears_marker_and_returns_early(db_session, mocker):
+    """Happy path: _spawn_strategic_review returns True → marker cleared, no tactical research."""
+    spawn_sr_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    project = _make_pending_sr_project(db_session)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    assert spawn_sr_mock.called, (
+        "_spawn_strategic_review must be called on a fresh pending marker"
+    )
+
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_pending_strategic_review") is None, (
+        "Marker must be cleared after successful retry"
+    )
+
+    # No tactical research tasks should have spawned
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 0, (
+        "Tactical research must not spawn when SR retry succeeded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_skip_falls_through_to_tactical(db_session, mocker):
+    """When _spawn_strategic_review returns False (active task), fall through; marker is preserved and attempt_count is incremented."""
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=False),
+    )
+
+    # Direction in refractory so no tactical research spawns after fall-through
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    project = Project(
+        name="Pending SR Skip Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-skip1", "Pending SR direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": datetime.now(timezone.utc).isoformat(),
+                "error": "skipped: active strategic task exists",
+                "cycle_id": "cyc-skip-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # Marker should still be present; attempt_count must be incremented so the cap/age escalation arms
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_pending_strategic_review")
+    assert marker is not None, "Marker must remain when SR spawn was skipped"
+    assert marker.get("attempt_count", 0) == 1, (
+        "attempt_count must be incremented on a skip so the cap/age safety valve eventually fires"
+    )
+    assert marker.get("first_attempted_at") is not None, (
+        "first_attempted_at must be stamped on first skip so the age window arms"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_skip_escalates_after_cap_reached(db_session, mocker):
+    """A marker behind a persistently-active strategic task (return-False) escalates after cap.
+
+    Starts with attempt_count == max_attempts - 1, mocks _spawn_strategic_review to
+    return False again, and verifies the marker is dropped and an alert is created —
+    proving the cap/age safety valve fires on the return-False path, not just on exceptions.
+    """
+    import app.shared_state as _ss
+
+    _ss.runtime_config["pending_sr_max_attempts"] = 3
+
+    spawn_sr_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=False),
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert",
+        new=AsyncMock(return_value=None),
+    )
+
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    first_attempted = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    project = Project(
+        name="Pending SR Skip Cap Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-skip-cap1", "Pending SR direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": first_attempted,
+                "error": "skipped: active strategic task exists",
+                "cycle_id": "cyc-skip-cap-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+                # Pre-seed attempt_count at max - 1; one more skip should push it to max
+                # and trigger the escalation on the NEXT cycle (cap check runs first)
+                "attempt_count": 3,
+                "first_attempted_at": first_attempted,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # When attempt_count >= max, the cap path fires BEFORE calling _spawn_strategic_review
+    assert not spawn_sr_mock.called, (
+        "_spawn_strategic_review must not be called when attempt_count >= max"
+    )
+    assert alert_mock.called, (
+        "Alert must be created when retry cap is exceeded (return-False path)"
+    )
+
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_pending_strategic_review") is None, (
+        "Marker must be dropped after cap is exceeded on return-False path"
+    )
+
+    _ss.runtime_config.pop("pending_sr_max_attempts", None)
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_exception_increments_count_and_falls_through(
+    db_session, mocker
+):
+    """When _spawn_strategic_review raises, attempt_count is bumped; tactical research may proceed."""
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(side_effect=RuntimeError("DB connection lost")),
+    )
+
+    # Direction in refractory so no tactical research spawns after fall-through
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    project = Project(
+        name="Pending SR Exception Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-exc1", "Pending SR direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": datetime.now(timezone.utc).isoformat(),
+                "error": "spawn error",
+                "cycle_id": "cyc-exc-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_pending_strategic_review")
+    assert marker is not None, "Marker must persist after exception"
+    assert marker.get("attempt_count", 0) == 1, (
+        "attempt_count must be incremented to 1 after the first exception"
+    )
+    assert marker.get("first_attempted_at") is not None, (
+        "first_attempted_at must be stamped on first exception"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_strategic_review_retry_failure_cap(db_session, mocker):
+    """When attempt_count >= pending_sr_max_attempts, drop the marker, fire an alert,
+    and allow tactical research to proceed normally."""
+    import app.shared_state as _ss
+
+    _ss.runtime_config["pending_sr_max_attempts"] = 3
+
+    spawn_sr_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert",
+        new=AsyncMock(return_value=None),
+    )
+
+    # Direction in refractory so no tactical research spawns after fall-through
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    project = Project(
+        name="Pending SR Cap Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-cap1", "Cap direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": (
+                    datetime.now(timezone.utc) - timedelta(hours=2)
+                ).isoformat(),
+                "error": "repeated failure",
+                "cycle_id": "cyc-cap-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+                "attempt_count": 3,
+                "first_attempted_at": (
+                    datetime.now(timezone.utc) - timedelta(hours=1)
+                ).isoformat(),
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # SR spawn must NOT be called — we're over the cap
+    assert not spawn_sr_mock.called, (
+        "_spawn_strategic_review must not be called when attempt_count >= max"
+    )
+
+    # Alert must be fired
+    assert alert_mock.called, "Alert must be created when retry cap is exceeded"
+    alert_msg = alert_mock.call_args[0][2] if alert_mock.call_args[0] else ""
+    assert "attempt_count" in alert_msg or "retry" in alert_msg.lower(), (
+        "Alert message should mention the cap-exceeded reason"
+    )
+
+    # Marker must be dropped
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_pending_strategic_review") is None, (
+        "Marker must be dropped after cap is exceeded"
+    )
+
+    _ss.runtime_config.pop("pending_sr_max_attempts", None)
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_age_exceeded_drops_marker_and_alerts(db_session, mocker):
+    """When the marker's first_attempted_at is older than pending_sr_max_age_hours,
+    drop the marker and fire an alert regardless of attempt_count."""
+    import app.shared_state as _ss
+
+    _ss.runtime_config["pending_sr_max_age_hours"] = 1  # 1-hour window for this test
+
+    spawn_sr_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert",
+        new=AsyncMock(return_value=None),
+    )
+
+    # Direction in refractory so no tactical research spawns after fall-through
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    stale_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    project = Project(
+        name="Pending SR Age Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-psr-age1", "Age direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(uuid.uuid4()),
+                "failed_at": stale_ts,
+                "error": "spawn error",
+                "cycle_id": "cyc-age-001",
+                "operator_steered": False,
+                "steering_excerpt": None,
+                "attempt_count": 1,  # Only 1 attempt — age alone triggers the drop
+                "first_attempted_at": stale_ts,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    assert not spawn_sr_mock.called, (
+        "_spawn_strategic_review must not be called when marker is stale"
+    )
+    assert alert_mock.called, "Alert must be created when marker age is exceeded"
+
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_pending_strategic_review") is None, (
+        "Stale marker must be dropped"
+    )
+
+    _ss.runtime_config.pop("pending_sr_max_age_hours", None)

@@ -207,6 +207,69 @@ else
   fi
 fi
 
+classify_push_error() {
+  local msg="$1"
+  if printf '%s' "$msg" | grep -qiE 'refusing to allow a GitHub App to create or update workflow|workflow(s)? permission|github app.*workflow'; then
+    echo "[pr] GitHub rejected the push because this GitHub App cannot create or update workflow files without the workflows permission." >&2
+    echo "[pr] Revert the workflow file(s) below before pushing, or move them to a branch/token path with workflows permission:" >&2
+    printf '%s\n' "$_WORKFLOW_CHANGES" | sed 's/^/[pr]   /' >&2
+    return 0
+  fi
+  if printf '%s' "$msg" | grep -qiE 'secret scanning|push protection|GH013|blocked by secret scanning|contains secrets'; then
+    echo "[pr] GitHub rejected the push because push protection or secret scanning blocked it." >&2
+    echo "[pr] Remove the secret or revert the offending file(s) before pushing, then retry." >&2
+    return 0
+  fi
+  if printf '%s' "$msg" | grep -qiE 'protected branch|branch protection|GH006|required status check|admin rights required'; then
+    echo "[pr] GitHub rejected the push because the branch is protected." >&2
+    echo "[pr] This push cannot succeed with force-with-lease; push to an unprotected branch or update branch protection." >&2
+    return 0
+  fi
+  return 1
+}
+
+# Fail fast on workflow-file edits. The GitHub App installation token used by
+# agent pushes cannot create/update workflow files unless the app has explicit
+# workflows permission, so these changes can never succeed from this seam.
+BASE_REF=""
+if git rev-parse --verify "origin/${cfg.baseBranch}" >/dev/null 2>&1; then
+  BASE_REF="origin/${cfg.baseBranch}"
+elif git rev-parse --verify "${cfg.baseBranch}" >/dev/null 2>&1; then
+  BASE_REF="${cfg.baseBranch}"
+fi
+_WORKFLOW_CHANGES=$(
+  {
+    if [ -n "$BASE_REF" ]; then
+      git -c core.quotepath=false diff --name-only "$BASE_REF...HEAD" 2>/dev/null || true
+    fi
+    git -c core.quotepath=false diff --name-only --cached 2>/dev/null || true
+    git -c core.quotepath=false diff --name-only 2>/dev/null || true
+    git -c core.quotepath=false ls-files --others --exclude-standard 2>/dev/null || true
+  } | grep '^[.]github/workflows/' | sort -u || true
+)
+if [ -n "$_WORKFLOW_CHANGES" ]; then
+  echo "[pr] GitHub App push blocked: workflow files changed, and this token cannot create or update them without workflows permission." >&2
+  echo "[pr] Revert these files before pushing, or move them to a branch/token path with workflows permission:" >&2
+  printf '%s\n' "$_WORKFLOW_CHANGES" | sed 's/^/[pr]   /' >&2
+  exit 1
+fi
+
+# Fail fast on obvious shell-accident junk files before git add -A.
+_SHELL_ARTIFACT_CHANGES=$(
+  git -c core.quotepath=false status --porcelain 2>/dev/null | while IFS= read -r _line; do
+    _path="\${_line:3}"
+    case "$_path" in *" -> "*) _path="\${_path##* -> }" ;; esac
+    _base="\${_path##*/}"
+    case "$_base" in *[A-Za-z0-9._]*|"") ;; *) printf '%s\n' "$_path" ;; esac
+  done | sort -u
+)
+if [ -n "$_SHELL_ARTIFACT_CHANGES" ]; then
+  echo "[pr] Suspicious shell-artifact file(s) found in pending changes." >&2
+  echo "[pr] Remove these files, or rename them to an intentional non-punctuation name, then re-run ./pr open:" >&2
+  printf '%s\n' "$_SHELL_ARTIFACT_CHANGES" | sed 's/^/[pr]   /' >&2
+  exit 1
+fi
+
 # 2. Stage and commit any pending changes
 if [ -n "$(git status --porcelain)" ]; then
   git add -A
@@ -254,6 +317,9 @@ for attempt in 1 2 3; do
   if git push --force-with-lease origin "${cfg.workBranch}" 2>/tmp/pr_push.log; then
     PUSH_OK=1
     break
+  fi
+  if classify_push_error "$(cat /tmp/pr_push.log)"; then
+    exit 1
   fi
   if grep -q 'stale info' /tmp/pr_push.log; then
     echo "[pr] push attempt $attempt: stale lease, fetching + retrying..."

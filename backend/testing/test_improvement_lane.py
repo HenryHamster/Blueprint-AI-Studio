@@ -15,6 +15,7 @@ from sqlmodel import SQLModel, select
 from app.improvement_lane_ops import (
     LaneCASError,
     LaneCheckpointError,
+    LaneOwnerMismatchError,
     cas_transition,
     checkpoint_lane,
     create_lane,
@@ -30,6 +31,8 @@ from app.models import (
 from app.payload_schemas import LaneCheckpointPayload, LaneCheckpointValidated
 from app.review_fix_lane_pilot import (
     LANE_CHAIN_ID_KEY,
+    ensure_chain_lane,
+    get_chain_lane,
     kill_project_lanes,
     retire_chain_lane,
 )
@@ -209,6 +212,66 @@ async def test_cas_transition_active_to_killed(db: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_cas_transition_proposed_to_killed(db: AsyncSession):
+    """PROPOSED -> KILLED should succeed (stale/failed-activation aging) and
+    stamp retired_at while clearing any current_task_id binding."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/t3k",
+        base_branch="main",
+    )
+    # A PROPOSED lane that briefly bound a task during a failed activation.
+    lane.current_task_id = uuid.uuid4()
+    await db.commit()
+
+    updated = await cas_transition(
+        db,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.KILLED,
+    )
+    await db.commit()
+
+    assert updated.status == ImprovementLaneStatus.KILLED.value
+    assert updated.retired_at is not None
+    assert updated.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_cas_transition_proposed_to_retired(db: AsyncSession):
+    """PROPOSED -> RETIRED should succeed (chain merged/closed before the lane
+    ever activated)."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/t3r",
+        base_branch="main",
+    )
+    await db.commit()
+
+    updated = await cas_transition(
+        db,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.RETIRED,
+    )
+    await db.commit()
+
+    assert updated.status == ImprovementLaneStatus.RETIRED.value
+    assert updated.retired_at is not None
+    assert updated.current_task_id is None
+
+
+@pytest.mark.asyncio
 async def test_cas_transition_parked_to_active(db: AsyncSession):
     """PARKED -> ACTIVE should succeed (resume path)."""
     project_id = await _make_project(db)
@@ -310,11 +373,11 @@ async def test_checkpoint_lane_appends_record_and_parks(db: AsyncSession):
         branch_name="lane/chk1",
         base_branch="main",
     )
+    task_id = uuid.uuid4()
     lane.status = ImprovementLaneStatus.ACTIVE.value
-    lane.current_task_id = uuid.uuid4()
+    lane.current_task_id = task_id
     await db.commit()
 
-    task_id = uuid.uuid4()
     cp = LaneCheckpointPayload(
         sha="abc1234",
         summary="Implement login endpoint",
@@ -409,7 +472,9 @@ async def test_checkpoint_lane_rolling_window(db: AsyncSession):
     await db.commit()
 
     # Seed the checkpoints list with _LANE_CHECKPOINT_LIMIT existing entries.
-    lane.checkpoints = [{"seq": i, "sha": f"sha{i:04d}"} for i in range(_LANE_CHECKPOINT_LIMIT)]
+    lane.checkpoints = [
+        {"seq": i, "sha": f"sha{i:04d}"} for i in range(_LANE_CHECKPOINT_LIMIT)
+    ]
     lane.checkpoint_seq = _LANE_CHECKPOINT_LIMIT
     await db.commit()
 
@@ -445,6 +510,43 @@ async def test_checkpoint_lane_not_active_raises(db: AsyncSession):
     cp = LaneCheckpointPayload(sha="abc1234", summary="bad checkpoint attempt")
     with pytest.raises(LaneCheckpointError, match="must be ACTIVE"):
         await checkpoint_lane(db, lane.id, "create", uuid.uuid4(), cp)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_lane_rejects_non_owner_task(db: AsyncSession):
+    """checkpoint_lane raises LaneOwnerMismatchError when task_id != current_task_id.
+
+    The lane's status, current_task_id, and last_checkpoint_sha must remain
+    unchanged after the rejection — the new owner is unaffected.
+    """
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/owner1",
+        base_branch="main",
+    )
+    owner_id = uuid.uuid4()
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    lane.current_task_id = owner_id
+    lane.last_checkpoint_sha = "original_sha"
+    await db.commit()
+
+    stale_task_id = uuid.uuid4()
+    cp = LaneCheckpointPayload(sha="stale_sha", summary="stale checkpoint attempt")
+    with pytest.raises(LaneOwnerMismatchError, match=str(owner_id)):
+        await checkpoint_lane(db, lane.id, "create", stale_task_id, cp)
+
+    # Verify the lane is untouched — the DB session may have partial state,
+    # so re-fetch to confirm.
+    await db.rollback()
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
+    assert refreshed.current_task_id == owner_id
+    assert refreshed.last_checkpoint_sha == "original_sha"
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +620,37 @@ def test_merge_manifest_patch_bounded():
 
     merged = _merge_manifest_patch(existing, patch)
     size = len(json.dumps(merged, default=str).encode())
-    assert size <= _LANE_MANIFEST_MAX_BYTES, f"merged manifest exceeds 8KB: {size} bytes"
+    assert size <= _LANE_MANIFEST_MAX_BYTES, (
+        f"merged manifest exceeds 8KB: {size} bytes"
+    )
+
+
+def test_merge_manifest_patch_eviction_priority_phase_log_before_critical_files():
+    """When phase_log and critical_files are the same length, phase_log is evicted first."""
+    import json
+
+    from app.improvement_lane_ops import _merge_manifest_patch
+    from app.models import _LANE_MANIFEST_MAX_BYTES
+
+    # Build a manifest over the byte limit with equal-length phase_log and critical_files.
+    item = "x" * 200
+    existing = {
+        "phase_log": [item] * 25,
+        "critical_files": [item] * 25,
+    }
+    # Confirm it's already over budget so trimming fires.
+    assert len(json.dumps(existing, default=str).encode()) > _LANE_MANIFEST_MAX_BYTES
+
+    # A no-op patch — just trigger the trim of the existing manifest.
+    merged = _merge_manifest_patch(existing, {})
+
+    phase_log_len = len(merged.get("phase_log", []))
+    critical_files_len = len(merged.get("critical_files", []))
+
+    assert phase_log_len < critical_files_len, (
+        f"phase_log ({phase_log_len}) should be shorter than "
+        f"critical_files ({critical_files_len}) after eviction"
+    )
 
 
 def test_merge_manifest_patch_bounded_with_all_append_only_lists():
@@ -543,7 +675,9 @@ def test_merge_manifest_patch_bounded_with_all_append_only_lists():
 
     merged = _merge_manifest_patch(existing, patch)
     size = len(json.dumps(merged, default=str).encode())
-    assert size <= _LANE_MANIFEST_MAX_BYTES, f"merged manifest exceeds 8KB: {size} bytes"
+    assert size <= _LANE_MANIFEST_MAX_BYTES, (
+        f"merged manifest exceeds 8KB: {size} bytes"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +705,9 @@ def test_lane_checkpoint_payload_manifest_patch_too_large():
     """manifest_patch > 8KB should raise a validation error."""
     big_data = {"key": "x" * 9000}
     with pytest.raises(Exception, match="8KB"):
-        LaneCheckpointPayload(sha="abc1234", summary="overflow", manifest_patch=big_data)
+        LaneCheckpointPayload(
+            sha="abc1234", summary="overflow", manifest_patch=big_data
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +739,15 @@ def test_build_lane_manifest_patch_uses_known_list_fields():
             "review_loop": {
                 "iteration": 2,
                 "review_history": [
-                    {"issues": [{"severity": "major", "description": "null case", "file": "a.ts"}]},
+                    {
+                        "issues": [
+                            {
+                                "severity": "major",
+                                "description": "null case",
+                                "file": "a.ts",
+                            }
+                        ]
+                    },
                 ],
                 "fix_agent_responses": [
                     {"response_type": "disputed", "claim": "flag is intentional"},
@@ -616,12 +760,21 @@ def test_build_lane_manifest_patch_uses_known_list_fields():
 
     # Only the bounded list-field keys the merge understands appear.
     assert set(patch).issubset(
-        {"progress", "remaining", "critical_files", "failing_tests", "risks", "phase_log"}
+        {
+            "progress",
+            "remaining",
+            "critical_files",
+            "failing_tests",
+            "risks",
+            "phase_log",
+        }
     )
     assert patch["phase_log"] == ["fix PR#42 iter2: addressed review"]
     # changed + investigated files, deduped, order-preserving.
     assert patch["critical_files"] == [
-        "backend/app/foo.py", "agent/src/bar.ts", "backend/app/baz.py",
+        "backend/app/foo.py",
+        "agent/src/bar.ts",
+        "backend/app/baz.py",
     ]
     assert patch["failing_tests"] == ["test_foo failed: AssertionError"]
     assert patch["remaining"] == ["[MAJOR] [a.ts] null case"]
@@ -641,14 +794,22 @@ def test_build_lane_manifest_patch_is_size_bounded():
     """A pathological set of long strings is trimmed under the patch byte bound."""
     import json
 
-    from app.review_fix_lane_pilot import _MANIFEST_PATCH_MAX_BYTES, build_lane_manifest_patch
+    from app.review_fix_lane_pilot import (
+        _MANIFEST_PATCH_MAX_BYTES,
+        build_lane_manifest_patch,
+    )
 
     task = _FakeTask(
         context={
             "_pr_changed_files": ["x" * 500 for _ in range(40)],
             "review_loop": {
                 "review_history": [
-                    {"issues": [{"severity": "major", "description": "y" * 500} for _ in range(40)]},
+                    {
+                        "issues": [
+                            {"severity": "major", "description": "y" * 500}
+                            for _ in range(40)
+                        ]
+                    },
                 ],
                 "fix_agent_responses": [{"claim": "z" * 500} for _ in range(40)],
             },
@@ -675,7 +836,8 @@ def test_build_lane_manifest_patch_accumulates_under_8kb_across_phases():
         task = _FakeTask(
             context={
                 "_pr_changed_files": [
-                    f"deeply/nested/path/{i}/file_{j}_" + "x" * 160 + ".py" for j in range(6)
+                    f"deeply/nested/path/{i}/file_{j}_" + "x" * 160 + ".py"
+                    for j in range(6)
                 ],
                 "review_loop": {
                     "iteration": i,
@@ -737,7 +899,10 @@ def test_build_fix_resume_block_none_when_empty():
 
     assert build_fix_resume_block(None) is None
     empty = SimpleNamespace(
-        manifest={}, last_checkpoint_sha=None, last_checkpoint_phase=None, checkpoint_seq=0,
+        manifest={},
+        last_checkpoint_sha=None,
+        last_checkpoint_phase=None,
+        checkpoint_seq=0,
     )
     assert build_fix_resume_block(empty) is None
 
@@ -747,7 +912,10 @@ def test_build_fix_resume_block_is_size_bounded():
     import json
     from types import SimpleNamespace
 
-    from app.review_fix_lane_pilot import _RESUME_BLOCK_MAX_BYTES, build_fix_resume_block
+    from app.review_fix_lane_pilot import (
+        _RESUME_BLOCK_MAX_BYTES,
+        build_fix_resume_block,
+    )
 
     lane = SimpleNamespace(
         manifest={
@@ -812,6 +980,55 @@ async def test_chain_terminal_retires_lane_and_releases_reservation(db: AsyncSes
 
 
 @pytest.mark.asyncio
+async def test_retire_chain_lane_records_force_expired_and_clears_hard_anchor(
+    db: AsyncSession,
+):
+    """Retiring a chain force-expires the lane's reservation: the hard ceiling
+    anchor is cleared AND the force-expired expiry-cause counter is incremented so
+    a low warm_resume_fraction stays diagnosable."""
+    from app.time_utils import _utcnow
+    from datetime import timedelta
+
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id="d-retire-cause",
+        title="Retire records cause",
+        goal="goal",
+        branch_name="lane/retire-cause",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    member = PoolVm(
+        vm_instance_id="pool-vm-retire-cause",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+        reservation_expires_at=_utcnow() + timedelta(seconds=300),
+        reservation_hard_expires_at=_utcnow() + timedelta(seconds=3600),
+    )
+    db.add(member)
+    await db.commit()
+
+    ctx = {LANE_CHAIN_ID_KEY: str(lane.id)}
+    assert await retire_chain_lane(db, ctx) is True
+    await db.commit()
+
+    await db.refresh(member)
+    assert member.reserved_lane_id is None
+    assert member.reservation_expires_at is None
+    assert member.reservation_hard_expires_at is None, (
+        "the hard ceiling anchor must be cleared on force-expiry"
+    )
+
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.reservation_force_expired_count == 1
+    assert refreshed.reservation_claimed_by_fix_count == 0
+    assert refreshed.reservation_expired_before_fix_count == 0
+
+
+@pytest.mark.asyncio
 async def test_retire_chain_lane_parked_becomes_retired(db: AsyncSession):
     """retire_chain_lane CASes PARKED -> RETIRED as well."""
     project_id = await _make_project(db)
@@ -866,6 +1083,38 @@ async def test_retire_chain_lane_noop_without_chain_id(db: AsyncSession):
     """retire_chain_lane returns False and is a no-op when ctx lacks LANE_CHAIN_ID_KEY."""
     did_retire = await retire_chain_lane(db, {})
     assert did_retire is False
+
+
+@pytest.mark.asyncio
+async def test_retire_chain_lane_shadow_parked_no_reservation(db: AsyncSession):
+    """Shadow-mode (armless) lanes have no warm-pool reservation but accumulate
+    PARKED rows.  retire_chain_lane must still CAS PARKED -> RETIRED and return
+    True even when no PoolVm is reserved for the lane."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="Shadow lane",
+        goal="Shadow goal",
+        branch_name="lane/shadow-retire",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    # No PoolVm reservation — this is the shadow (armless) path.
+    await db.commit()
+
+    ctx = {LANE_CHAIN_ID_KEY: str(lane.id)}
+    did_retire = await retire_chain_lane(db, ctx)
+    await db.commit()
+
+    assert did_retire is True, (
+        "retire_chain_lane must return True for PARKED shadow lane"
+    )
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value, (
+        f"Shadow PARKED lane must become RETIRED at chain end, got {refreshed.status}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -944,8 +1193,12 @@ async def test_kill_project_lanes_skips_already_terminal(db: AsyncSession):
 
     assert count == 0
     # Statuses unchanged.
-    assert (await db.get(ImprovementLane, lane_retired.id)).status == ImprovementLaneStatus.RETIRED.value
-    assert (await db.get(ImprovementLane, lane_killed.id)).status == ImprovementLaneStatus.KILLED.value
+    assert (
+        await db.get(ImprovementLane, lane_retired.id)
+    ).status == ImprovementLaneStatus.RETIRED.value
+    assert (
+        await db.get(ImprovementLane, lane_killed.id)
+    ).status == ImprovementLaneStatus.KILLED.value
 
 
 # ---------------------------------------------------------------------------
@@ -998,15 +1251,90 @@ async def test_sweep_exhausted_lane_budgets_kills_over_budget(db: AsyncSession):
 
     await db.commit()
 
-    with patch("app.runtime_config_state.is_improvement_lanes_enabled", return_value=True):
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
         count = await sweep_exhausted_lane_budgets(db)
     await db.commit()
 
     assert count == 1
-    assert (await db.get(ImprovementLane, lane_over.id)).status == ImprovementLaneStatus.KILLED.value
+    assert (
+        await db.get(ImprovementLane, lane_over.id)
+    ).status == ImprovementLaneStatus.KILLED.value
     # at-budget and under-budget lanes must not be touched
-    assert (await db.get(ImprovementLane, lane_at.id)).status == ImprovementLaneStatus.ACTIVE.value
-    assert (await db.get(ImprovementLane, lane_under.id)).status == ImprovementLaneStatus.ACTIVE.value
+    assert (
+        await db.get(ImprovementLane, lane_at.id)
+    ).status == ImprovementLaneStatus.ACTIVE.value
+    assert (
+        await db.get(ImprovementLane, lane_under.id)
+    ).status == ImprovementLaneStatus.ACTIVE.value
+
+
+# ---------------------------------------------------------------------------
+# ensure_chain_lane — activation failure must not bind the chain
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_lane_activation_does_not_bind_chain(db: AsyncSession):
+    """ensure_chain_lane must not write LANE_CHAIN_ID_KEY when CAS PROPOSED->ACTIVE
+    fails.  The function must return None so the chain falls through to classic relay.
+    No PROPOSED lane must remain referenced by the chain context."""
+    from app.improvement_lane_ops import LaneCASError
+
+    project_id = await _make_project(db)
+    ctx: dict = {}
+
+    async def _fail_on_activate(session, lane_id, expected, next_status, **kw):
+        if next_status == ImprovementLaneStatus.ACTIVE:
+            raise LaneCASError("simulated CAS race on activation")
+        # Cleanup call (PROPOSED->RETIRED) — best-effort, may be suppressed.
+
+    with patch(
+        "app.improvement_lane_ops.cas_transition", side_effect=_fail_on_activate
+    ):
+        result = await ensure_chain_lane(
+            db,
+            project_id=project_id,
+            ctx=ctx,
+            title="Test lane",
+            branch_name="lane/test-activation-fail",
+            base_branch="main",
+            direction_id=None,
+            current_task_id=None,
+        )
+
+    # Return must be None — activation failed so no lane is usable.
+    assert result is None
+
+    # Chain context must not carry a lane binding — no PROPOSED lane referenced.
+    assert LANE_CHAIN_ID_KEY not in ctx
+
+    # get_chain_lane must also return None for the empty ctx.
+    lane_via_get = await get_chain_lane(db, ctx)
+    assert lane_via_get is None
+
+
+@pytest.mark.asyncio
+async def test_get_chain_lane_ignores_proposed_lane(db: AsyncSession):
+    """get_chain_lane returns None for a PROPOSED lane — only ACTIVE/PARKED are valid."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/proposed-guard",
+        base_branch="main",
+    )
+    await db.commit()
+    # Lane is in PROPOSED status (the default from create_lane).
+    assert lane.status == ImprovementLaneStatus.PROPOSED.value
+
+    ctx = {LANE_CHAIN_ID_KEY: str(lane.id)}
+    result = await get_chain_lane(db, ctx)
+    assert result is None, "get_chain_lane must not return a PROPOSED lane"
 
 
 @pytest.mark.asyncio
@@ -1029,9 +1357,380 @@ async def test_sweep_exhausted_lane_budgets_inert_when_disabled(db: AsyncSession
     lane_over.phase_requeues = _LANE_MAX_PHASE_REQUEUES + 1
     await db.commit()
 
-    with patch("app.runtime_config_state.is_improvement_lanes_enabled", return_value=False):
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=False
+    ):
         count = await sweep_exhausted_lane_budgets(db)
 
     assert count == 0
     # Lane must remain ACTIVE — the sweep was entirely inert.
-    assert (await db.get(ImprovementLane, lane_over.id)).status == ImprovementLaneStatus.ACTIVE.value
+    assert (
+        await db.get(ImprovementLane, lane_over.id)
+    ).status == ImprovementLaneStatus.ACTIVE.value
+
+
+# ── confirm_lane_warm_resume unit tests ──────────────────────────────────────
+
+
+def test_confirm_lane_warm_resume_with_checkpoint():
+    """has_checkpoint=True stamps both receipt keys as True."""
+    from app.capability_trial_verdict import (
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+    ctx: dict = {}
+    confirm_lane_warm_resume(ctx, has_checkpoint=True)
+
+    assert ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] is True
+    assert ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] is True
+
+
+def test_confirm_lane_warm_resume_without_checkpoint():
+    """has_checkpoint=False stamps warm key True but checkpoint key False."""
+    from app.capability_trial_verdict import (
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+    ctx: dict = {}
+    confirm_lane_warm_resume(ctx, has_checkpoint=False)
+
+    assert ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] is True
+    assert ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] is False
+
+
+def test_confirm_lane_warm_resume_empty_dict():
+    """Calling on an empty dict produces exactly the two receipt keys."""
+    from app.capability_trial_verdict import (
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+    ctx: dict = {}
+    confirm_lane_warm_resume(ctx, has_checkpoint=True)
+
+    assert set(ctx.keys()) == {
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+    }
+
+
+def test_confirm_lane_warm_resume_existing_keys_overwritten():
+    """Stale values in ctx are overwritten; no duplication or extra keys introduced."""
+    from app.capability_trial_verdict import (
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+    ctx: dict = {
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY: False,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY: False,
+        "other_key": "preserved",
+    }
+    confirm_lane_warm_resume(ctx, has_checkpoint=True)
+
+    assert ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] is True
+    assert ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] is True
+    assert ctx["other_key"] == "preserved"
+
+
+# ---------------------------------------------------------------------------
+# sweep_stranded_lanes — Class 3: PARKED lane retirement via terminal spawn_reason
+# ---------------------------------------------------------------------------
+
+
+async def _make_parked_lane(session, project_id, *, parked_ago_seconds: int = 7200):
+    """Create a PARKED lane with parked_at set to `parked_ago_seconds` ago."""
+    from datetime import datetime, timedelta
+
+    lane = await create_lane(
+        session,
+        project_id=project_id,
+        direction_id=None,
+        title="Parked test lane",
+        goal="G",
+        branch_name=f"lane/parked-{uuid.uuid4().hex[:8]}",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    lane.parked_at = datetime.utcnow() - timedelta(seconds=parked_ago_seconds)
+    await session.commit()
+    return lane
+
+
+async def _make_terminal_task(session, project_id, lane_id, spawn_reason: str):
+    """Create a terminal Task with LANE_CHAIN_ID_KEY and spawn_reason set."""
+    from app.models import Task, TaskStatus
+    from app.review_pipeline import SPAWN_REASON_KEY
+
+    task = Task(
+        project_id=project_id,
+        title="terminal task",
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_review_fix_lane_id": str(lane_id),
+            SPAWN_REASON_KEY: spawn_reason,
+        },
+    )
+    session.add(task)
+    await session.commit()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_retires_parked_lane_already_merged(
+    db: AsyncSession,
+):
+    """PARKED lane older than threshold with a terminal task carrying
+    spawn_reason='already_merged' must be retired."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    await _make_terminal_task(db, project_id, lane.id, "already_merged")
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_retires_pr_closed_unmerged(
+    db: AsyncSession,
+):
+    """PARKED lane older than threshold with spawn_reason='pr_closed_unmerged'
+    must also be retired."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    await _make_terminal_task(db, project_id, lane.id, "pr_closed_unmerged")
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_skips_lane_with_live_chain_task(
+    db: AsyncSession,
+):
+    """PARKED lane older than threshold but with a non-terminal (IN_PROGRESS) chain
+    task must NOT be retired — the chain is still live."""
+    from app.models import Task, TaskStatus
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+
+    live_task = Task(
+        project_id=project_id,
+        title="live fix task",
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={"_review_fix_lane_id": str(lane.id)},
+    )
+    db.add(live_task)
+    await db.commit()
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PARKED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_skips_recent_parked_lane(
+    db: AsyncSession,
+):
+    """PARKED lane within the threshold window must not be touched even if
+    the chain terminal spawn_reason matches."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    # parked only 60 seconds ago — well within the 3600s threshold
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=60)
+    await _make_terminal_task(db, project_id, lane.id, "already_merged")
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PARKED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_cas_miss_is_noop(db: AsyncSession):
+    """A concurrent CAS miss on a PARKED lane must not raise and must not
+    increment the returned count."""
+    from app.improvement_lane_ops import LaneCASError
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    await _make_terminal_task(db, project_id, lane.id, "already_merged")
+
+    async def _raise_cas(session, lane_id, expected, next_status, **kw):
+        raise LaneCASError("simulated concurrent transition")
+
+    with (
+        patch(
+            "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+        ),
+        patch("app.improvement_lane_ops.cas_transition", side_effect=_raise_cas),
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+
+    # CAS miss is a no-op — count stays 0, lane unchanged
+    assert count == 0
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.PARKED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_retires_lane_with_failed_task(
+    db: AsyncSession,
+):
+    """PARKED lane older than threshold whose only chain task is FAILED must be
+    retired regardless of spawn_reason — all chain tasks are terminal."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    # spawn_reason is 'spawned' — previously would have been excluded; now irrelevant.
+    await _make_terminal_task(db, project_id, lane.id, "spawned")
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_retires_lane_with_no_chain_tasks(
+    db: AsyncSession,
+):
+    """PARKED lane older than threshold with zero chain tasks must be retired —
+    the chain never ran or completed without leaving a task row."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    # No tasks at all — zero chain tasks is the empty-terminal case.
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class3_retires_lane_releases_reservation(
+    db: AsyncSession,
+):
+    """PARKED lane retirement must release the PoolVm reservation so the member
+    is immediately available to other lanes."""
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+    lane = await _make_parked_lane(db, project_id, parked_ago_seconds=7200)
+    await _make_terminal_task(db, project_id, lane.id, "already_merged")
+
+    member = PoolVm(
+        vm_instance_id="pool-vm-class3-retire-1",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+    )
+    db.add(member)
+    await db.commit()
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(
+            db,
+            datetime.utcnow(),
+            runtime_config={"improvement_lane_parked_terminal_stale_seconds": 3600},
+        )
+    await db.commit()
+
+    assert count == 1
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value
+    await db.refresh(member)
+    assert member.reserved_lane_id is None
+    assert member.reservation_expires_at is None

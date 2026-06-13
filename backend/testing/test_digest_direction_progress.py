@@ -186,14 +186,18 @@ async def test_digest_direction_progress_authoritative_portfolio_includes_quiet(
                 "id": "dir-busy",
                 "text": "Busy direction",
                 "status": "active",
-                "research_history": [{"timestamp": _utcnow().isoformat(), "autonomous_prs_merged": 11}],
+                "research_history": [
+                    {"timestamp": _utcnow().isoformat(), "autonomous_prs_merged": 11}
+                ],
                 "history_aggregate": {"total_operator_actions": 0},
             },
             {
                 "id": "dir-quiet",
                 "text": "Quiet direction",
                 "status": "held",
-                "research_history": [{"timestamp": _utcnow().isoformat(), "autonomous_prs_merged": 12}],
+                "research_history": [
+                    {"timestamp": _utcnow().isoformat(), "autonomous_prs_merged": 12}
+                ],
                 "history_aggregate": {"total_operator_actions": 0},
             },
         ]
@@ -262,7 +266,10 @@ async def test_digest_direction_progress_authoritative_portfolio_all_quiet(
     portfolio = data["direction_portfolio"]
     assert portfolio["active_count"] == 2
     assert portfolio["self_sufficient_count"] == 0
-    assert [entry["quiet_this_window"] for entry in portfolio["composition"]] == [True, True]
+    assert [entry["quiet_this_window"] for entry in portfolio["composition"]] == [
+        True,
+        True,
+    ]
 
 
 @pytest.mark.asyncio
@@ -2561,8 +2568,305 @@ def test_compute_spawn_gate_aggregate_cause_distribution_absent_when_no_cause():
     from app.digest_direction_progress import compute_spawn_gate_aggregate
 
     history = [
-        {"research_spawn_gate_challenged_count": 2, "research_spawn_gate_survived_count": 1},
+        {
+            "research_spawn_gate_challenged_count": 2,
+            "research_spawn_gate_survived_count": 1,
+        },
     ]
     result = compute_spawn_gate_aggregate(history)
     assert result is not None
     assert result.get("cause_distribution") is None
+
+
+def test_compute_spawn_gate_aggregate_zero_cause_counts_excluded():
+    """cause_distribution excludes categories whose counts are zero (healthy/resolved cycle)."""
+    from app.digest_direction_progress import compute_spawn_gate_aggregate
+
+    history = [
+        {
+            "research_spawn_gate_challenged_count": 2,
+            "research_spawn_gate_survived_count": 2,
+            "research_spawn_gate_unresolved_count": 0,
+            "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 0},
+        },
+    ]
+    result = compute_spawn_gate_aggregate(history)
+    assert result is not None
+    # Zero-count cause must not pollute cause_distribution
+    assert result.get("cause_distribution") is None
+
+
+def test_compute_spawn_gate_aggregate_mixed_cause_counts():
+    """cause_distribution only accumulates non-zero counts; zero entries are silently dropped."""
+    from app.digest_direction_progress import compute_spawn_gate_aggregate
+
+    history = [
+        {
+            "research_spawn_gate_challenged_count": 3,
+            "research_spawn_gate_unresolved_count": 2,
+            "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 2, "RATE_LIMIT": 0},
+        },
+        {
+            "research_spawn_gate_challenged_count": 1,
+            "research_spawn_gate_unresolved_count": 0,
+            "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 0},
+        },
+    ]
+    result = compute_spawn_gate_aggregate(history)
+    assert result is not None
+    cause_dist = result.get("cause_distribution")
+    assert cause_dist is not None
+    assert cause_dist.get("AGENT_TIMEOUT") == 2
+    # RATE_LIMIT had count 0 — must be absent
+    assert "RATE_LIMIT" not in cause_dist
+
+
+# ---------------------------------------------------------------------------
+# compute_spawn_gate_census — pure-function tests (no DB required)
+# ---------------------------------------------------------------------------
+
+
+def _make_census_task(
+    task_id=None,
+    task_type="research",
+    challenged_count=0,
+    parse_outcome=None,
+    cause_counts=None,
+    exhausted=False,
+    give_up_adversarial=0,
+    direction_id=None,
+):
+    """Build a minimal Task-like object for compute_spawn_gate_census."""
+    import uuid as _uuid
+
+    from unittest.mock import MagicMock
+
+    t = MagicMock()
+    t.id = task_id or _uuid.uuid4()
+    ctx: dict = {}
+    if direction_id:
+        ctx["direction_id"] = direction_id
+    if challenged_count:
+        ctx["research_spawn_gate_challenged_count"] = challenged_count
+    if parse_outcome:
+        ctx["research_spawn_gate_parse_outcome"] = parse_outcome
+    if cause_counts:
+        ctx["research_spawn_gate_cause_counts"] = cause_counts
+    if exhausted:
+        ctx["research_spawn_gate_wholesale_retry_exhausted"] = True
+    if give_up_adversarial:
+        ctx["finding_structural_give_up"] = {
+            "by_reason": {"adversarial_gate": give_up_adversarial}
+        }
+    t.context = ctx
+    t.first_payload = {"type": task_type}
+    return t
+
+
+def test_compute_spawn_gate_census_empty():
+    """Returns zero aggregates when no research tasks are present."""
+    from app.digest_direction_progress import compute_spawn_gate_census
+    from datetime import datetime
+
+    result = compute_spawn_gate_census([], window_start=datetime.utcnow())
+    assert result["cycles_scanned"] == 0
+    assert result["gate_invoked_count"] == 0
+    assert result["graders_attempted_total"] == 0
+    assert result["exhaustion_count"] == 0
+    assert result["give_up_count"] == 0
+    assert result["parse_outcome_distribution"] is None
+    assert result["cause_distribution"] is None
+    assert result["rows"] == []
+
+
+def test_compute_spawn_gate_census_skips_non_research_tasks():
+    """Non-research tasks are excluded from the census."""
+    from app.digest_direction_progress import compute_spawn_gate_census
+    from datetime import datetime
+
+    tasks = [
+        _make_census_task(task_type="create", challenged_count=3),
+        _make_census_task(task_type="research", challenged_count=2),
+    ]
+    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    assert result["cycles_scanned"] == 1
+    assert result["graders_attempted_total"] == 2
+
+
+def test_compute_spawn_gate_census_deduplicates_by_task_id():
+    """Duplicate task objects with the same id are counted once."""
+    from app.digest_direction_progress import compute_spawn_gate_census
+    from datetime import datetime
+    import uuid
+
+    tid = uuid.uuid4()
+    t1 = _make_census_task(task_id=tid, challenged_count=3)
+    t2 = _make_census_task(task_id=tid, challenged_count=3)
+    result = compute_spawn_gate_census([t1, t2], window_start=datetime.utcnow())
+    assert result["cycles_scanned"] == 1
+    assert result["gate_invoked_count"] == 1
+
+
+def test_compute_spawn_gate_census_aggregates_trail_and_cause():
+    """Cause distribution and parse_outcome_distribution accumulate across tasks."""
+    from app.digest_direction_progress import compute_spawn_gate_census
+    from datetime import datetime
+
+    tasks = [
+        _make_census_task(
+            challenged_count=3,
+            parse_outcome="no_verdict_returned",
+            cause_counts={"AGENT_TIMEOUT": 2},
+            exhausted=True,
+        ),
+        _make_census_task(
+            challenged_count=2,
+            parse_outcome="no_verdict_returned",
+            cause_counts={"AGENT_TIMEOUT": 1, "RATE_LIMIT": 1},
+        ),
+        _make_census_task(
+            challenged_count=1,
+            parse_outcome="verdict_parsed",
+            cause_counts=None,
+        ),
+    ]
+    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    assert result["cycles_scanned"] == 3
+    assert result["gate_invoked_count"] == 3
+    assert result["graders_attempted_total"] == 6
+    assert result["exhaustion_count"] == 1
+    cause_dist = result["cause_distribution"]
+    assert cause_dist is not None
+    assert cause_dist["AGENT_TIMEOUT"] == 3
+    assert cause_dist["RATE_LIMIT"] == 1
+    parse_dist = result["parse_outcome_distribution"]
+    assert parse_dist is not None
+    assert parse_dist["no_verdict_returned"] == 2
+    assert parse_dist["verdict_parsed"] == 1
+
+
+def test_compute_spawn_gate_census_covers_undirected_tasks():
+    """Research tasks without a direction_id are included in the census."""
+    from app.digest_direction_progress import compute_spawn_gate_census
+    from datetime import datetime
+
+    tasks = [
+        _make_census_task(challenged_count=2, direction_id=None),
+        _make_census_task(challenged_count=1, direction_id="dir-1"),
+    ]
+    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    assert result["cycles_scanned"] == 2
+    directions = [r["direction_id"] for r in result["rows"]]
+    assert None in directions
+    assert "dir-1" in directions
+
+
+def test_compute_spawn_gate_census_give_up_count():
+    """give_up_count totals adversarial_gate give-ups from finding_structural_give_up."""
+    from app.digest_direction_progress import compute_spawn_gate_census
+    from datetime import datetime
+
+    tasks = [
+        _make_census_task(give_up_adversarial=3),
+        _make_census_task(give_up_adversarial=2),
+    ]
+    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    assert result["give_up_count"] == 5
+
+
+def test_compute_spawn_gate_census_gate_not_invoked_when_no_challenged():
+    """gate_invoked is False when challenged_count is zero and trail is empty."""
+    from app.digest_direction_progress import compute_spawn_gate_census
+    from datetime import datetime
+
+    tasks = [_make_census_task(challenged_count=0)]
+    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    assert result["gate_invoked_count"] == 0
+    assert result["rows"][0]["gate_invoked"] is False
+
+
+@pytest.mark.asyncio
+async def test_conversion_denominator_excludes_knowledge_and_compute_children(
+    client: AsyncClient, db_session
+):
+    """conversion_rate denominator excludes web_research, design, compute_experiment tasks.
+
+    A direction that emits 2 knowledge findings (web_research + design) and 2
+    implementation findings (create), with both implementations merged, must report
+    conversion_rate=1.0 (2/2), not 0.5 (2/4).  This is the acceptance gate for the
+    'fix: exclude never-PR child types from conversion stats' change.
+    """
+    from app.digest_direction_progress import pr_ineligible_created_in_entry
+
+    entry = {
+        "timestamp": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+        "prs_merged": 2,
+        "verified_prs_merged": 2,
+        "tasks_created": 4,
+        "type_breakdown": {
+            "create": {"created": 2, "merged": 2, "failed": 0},
+            "web_research": {"created": 1, "merged": 0, "failed": 0},
+            "design": {"created": 1, "merged": 0, "failed": 0},
+        },
+    }
+
+    # pr_ineligible_created_in_entry must count web_research + design as ineligible
+    assert pr_ineligible_created_in_entry(entry) == 2
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-knowledge",
+                "text": "Direction with knowledge children",
+                "status": "active",
+                "research_history": [entry],
+                "history_aggregate": {
+                    "total_cycles": 1,
+                    "total_prs_merged": 1,
+                    "total_verified_prs_merged": 1,
+                    "total_tasks_created": 3,
+                    "total_pr_ineligible_tasks_created": 2,
+                },
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research cycle",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-knowledge"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    # 2 merged / 2 PR-eligible (create tasks only) = 1.0, NOT 2/4 = 0.5.
+    # Lifetime uses the same denominator, including folded aggregate ineligible counts:
+    # (2 + 1) verified merges / ((4 + 3) created - (2 + 2) ineligible) = 1.0.
+    assert dp["prs_merged"] == 2
+    assert dp["conversion_rate"] == 1.0
+    assert dp["lifetime_conversion_rate"] == 1.0
+    assert dp["pr_eligible_tasks_created"] == 2
+
+    # Also verify compute_experiment is excluded
+    entry_ce = {
+        "timestamp": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+        "prs_merged": 0,
+        "tasks_created": 3,
+        "type_breakdown": {
+            "compute_experiment": {"created": 2, "merged": 0, "failed": 0},
+            "fix": {"created": 1, "merged": 0, "failed": 0},
+        },
+    }
+    assert pr_ineligible_created_in_entry(entry_ce) == 2

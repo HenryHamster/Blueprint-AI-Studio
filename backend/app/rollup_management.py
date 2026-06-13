@@ -3694,6 +3694,7 @@ async def _check_and_trigger_rollup(
                                 SPAWN_REASON_DEFERRED,
                                 SPAWN_REASON_DEDUP,
                                 SPAWN_REASON_ALREADY_MERGED,
+                                SPAWN_REASON_PR_CLOSED_UNMERGED,
                             )
 
                             spawn_reason = (parent.context or {}).get(SPAWN_REASON_KEY)
@@ -3713,6 +3714,11 @@ async def _check_and_trigger_rollup(
                                 # PR merged while we were preparing the fix — no-op.
                                 logger.info(
                                     f"[ROLLUP] PR #{rollup_pr_number} merged mid-flight — no fix needed"
+                                )
+                            elif spawn_reason == SPAWN_REASON_PR_CLOSED_UNMERGED:
+                                # PR closed without merging — no fix needed.
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} closed without merge — no fix needed"
                                 )
                             else:
                                 # cap / stuck / unknown — terminal.
@@ -3881,6 +3887,7 @@ async def _check_and_trigger_rollup(
                             SPAWN_REASON_DEFERRED,
                             SPAWN_REASON_DEDUP,
                             SPAWN_REASON_ALREADY_MERGED,
+                            SPAWN_REASON_PR_CLOSED_UNMERGED,
                         )
 
                         spawn_reason = (parent.context or {}).get(SPAWN_REASON_KEY)
@@ -3895,6 +3902,10 @@ async def _check_and_trigger_rollup(
                         elif spawn_reason == SPAWN_REASON_ALREADY_MERGED:
                             logger.info(
                                 f"[ROLLUP] PR #{rollup_pr_number} merged mid-flight — no review needed"
+                            )
+                        elif spawn_reason == SPAWN_REASON_PR_CLOSED_UNMERGED:
+                            logger.info(
+                                f"[ROLLUP] PR #{rollup_pr_number} closed without merge — no review needed"
                             )
                         else:
                             parent.status = TaskStatus.FAILED

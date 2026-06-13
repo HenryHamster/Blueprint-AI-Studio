@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { apiFetch } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
-import { parseTimestamp } from '../utils/time';
+import { parseTimestamp, timeAgo } from '../utils/time';
 import type { AccountHealthEntry } from './PoolAccountHealthPanel';
 
 interface QuarantineStatus {
@@ -140,6 +140,13 @@ export function ProviderModelBreakdownPanel({
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [hideSingleAccount, setHideSingleAccount] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Poll-failure / response-staleness tracking. Previously load() swallowed
+  // failures silently, so a persistent outage left the last-good rows rendered
+  // as current indefinitely and an initial failure unmounted the panel.
+  const [pollError, setPollError] = useState(false);
+  const [hasSucceeded, setHasSucceeded] = useState(false);
+  const [servedStale, setServedStale] = useState(false);
+  const [generatedAt, setGeneratedAt] = useState<string | null>(null);
 
   const labelFor = (accountId: string) =>
     healthAccounts?.find(a => a.account_id === accountId)?.label ?? accountId.slice(0, 12);
@@ -152,25 +159,73 @@ export function ProviderModelBreakdownPanel({
       if (res.ok) {
         const json = await res.json();
         setRows(json.rows ?? []);
+        setServedStale(json.served_stale === true);
+        setGeneratedAt(typeof json.generated_at === 'string' ? json.generated_at : null);
+        setPollError(false);
+        setHasSucceeded(true);
+      } else {
+        setPollError(true);
       }
-    } catch { /* silent */ } finally {
+    } catch {
+      setPollError(true);
+    } finally {
       setLoading(false);
     }
   };
 
   usePoller(load, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId] });
 
-  if (loading || rows.length === 0) return null;
+  // Initial fetch still in flight (no success and no failure yet) — render nothing.
+  if (loading && !hasSucceeded && !pollError) return null;
+
+  // Initial fetch FAILED before any success — surface an explicit error instead
+  // of silently unmounting, so the operator sees the panel is not just empty.
+  if (!hasSucceeded && pollError) {
+    return (
+      <section>
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+          Provider / Model Breakdown
+        </h2>
+        <div className="bg-neutral-900/50 border border-red-500/30 rounded-lg px-3 py-2 text-[11px] text-red-300">
+          Could not load the provider/model breakdown — the endpoint is unreachable. Retrying…
+        </div>
+      </section>
+    );
+  }
+
+  // Succeeded at least once but the data set is genuinely empty — nothing to show.
+  if (rows.length === 0) return null;
 
   const visible = hideSingleAccount ? rows.filter(r => r.distinct_accounts >= 2) : rows;
   if (visible.length === 0) return null;
 
+  // A response served from the cache fallback, OR a poll that has started
+  // failing after a prior success, means the rows below are last-good — not a
+  // live reading. Mark them so the success-rate / quarantine rows are not
+  // presented as current.
+  const showStale = servedStale || pollError;
+  const asOfLabel = generatedAt ? timeAgo(generatedAt) : null;
+
   return (
     <section>
       <div className="flex items-center justify-between mb-2">
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">
-          Provider / Model Breakdown
-        </h2>
+        <div className="flex items-center gap-2">
+          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">
+            Provider / Model Breakdown
+          </h2>
+          {showStale && (
+            <span
+              className="text-[9px] font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/15 text-amber-300"
+              title={
+                pollError
+                  ? `Polling is failing — these rows are the last-good reading${asOfLabel ? ` from ${asOfLabel}` : ''}`
+                  : `Served from cache fallback — these rows are not a live reading${asOfLabel ? `; data is from ${asOfLabel}` : ''}`
+              }
+            >
+              stale{asOfLabel ? ` · as of ${asOfLabel}` : ''}
+            </span>
+          )}
+        </div>
         {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
         <button
           onClick={() => setHideSingleAccount(v => !v)}

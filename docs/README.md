@@ -27,7 +27,7 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
   - Database indexes and schema versioning
 
 - **[PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md)** — Task payload reference
-  - Payload structure for all 26 task types
+  - Payload structure for supported task types
   - Field validation rules and constraints
   - Complete examples for each task type
   - How to extend payloads
@@ -225,9 +225,9 @@ QUEUED → PROVISIONING → IN_PROGRESS → EVALUATING? → COMPLETED/FAILED/CAN
 See [TASK_LIFECYCLE.md](TASK_LIFECYCLE.md) for complete lifecycle details, [DATA_MODELS.md — TaskStatus](DATA_MODELS.md#taskstatus) for enum definition, and [BACKEND_MODULES.md — task_lifecycle.py](BACKEND_MODULES.md#task_lifecyclepy) for implementation.
 
 ### Task Types
-26 types: create, review, panel_review, fix, verify_tests, plan, research, strategic_review, design_doc_update, security_audit, qa, deps, docs, smoketest, migrate, debug, perf, investigate, self_audit, release_audit, release_audit_challenge, memo, compute_experiment, web_research, design, refactor.
+27 bespoke agent task types: create, review, panel_review, fix, verify_tests, plan, research, strategic_review, design_doc_update, security_audit, qa, deps, docs, smoketest, migrate, debug, perf, investigate, self_audit, release_audit, release_audit_challenge, memo, compute_experiment, web_research, design, refactor, repo_bootstrap.
 
-See [PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md) for payload configuration for each type, and [AGENT_HANDLERS.md](AGENT_HANDLERS.md) for handler implementation.
+See [PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md) for payload configuration, [AGENT_HANDLERS.md](AGENT_HANDLERS.md) for handler implementation, and `agent/src/taskCapabilities.ts` for the canonical agent-side dispatch list.
 
 ### Autonomous Research Cycle
 ```
@@ -249,7 +249,7 @@ See [API_REFERENCE.md — WebSocket](API_REFERENCE.md#websocket-message-format).
 A: [DATA_MODELS.md](DATA_MODELS.md) describes all models. The actual migration files are in `backend/alembic/versions/`.
 
 **Q: How do I add a new task type?**
-A: Create a handler in `agent/src/handlers/`, register it in `index.ts`, and document in [AGENT_HANDLERS.md](AGENT_HANDLERS.md).
+A: Add the backend capability entry, add the agent type in `agent/src/taskCapabilities.ts`, create or reuse a handler in `agent/src/handlers/`, register bespoke handlers in `agent/src/handlers/index.ts`, and document the payload/handler in [PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md) and [AGENT_HANDLERS.md](AGENT_HANDLERS.md).
 
 **Q: What's the difference between routes in different router files?**
 A: Router files in `backend/app/routers/` are organized by feature:

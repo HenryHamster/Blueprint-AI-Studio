@@ -197,6 +197,9 @@ from app.pipeline_health_state import (  # noqa: F401
 
 # --- Autonomous loop / anomaly timing ---
 last_idle_check: datetime | None = None
+# Throttle anchor for the orchestrator's _check_evergreen_fill() sibling
+# (utilization-triggered evergreen backlog auto-fill, direction d-2877ddc7).
+last_evergreen_check: datetime | None = None
 # Last time _compute_research_anomalies completed successfully for ANY project.
 # Used by /api/admin/anomaly-tracker/snapshot so operators can detect a silent
 # writer failure (corrupted shared_state, swallowed exception). Ephemeral —

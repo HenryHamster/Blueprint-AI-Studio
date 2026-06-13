@@ -7,7 +7,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func
+from sqlalchemy import case, exists, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -170,6 +170,26 @@ def research_direction_claim_key(
 def research_idempotency_key(project_id, direction_id) -> str:
     """Compatibility wrapper for the canonical primary research claim key."""
     return research_direction_claim_key(project_id, direction_id)
+
+
+def _research_payload_direction_id(payload: dict) -> str | None:
+    """Return the direction id from a research payload.
+
+    New rows stamp ``current_direction_id``; legacy single-direction payloads
+    only carried ``directions[0].id``. Keep both forms so parked and in-flight
+    legacy rows still retain direction ownership.
+    """
+    current_direction_id = payload.get("current_direction_id")
+    if current_direction_id:
+        return current_direction_id
+    return next(
+        (
+            d.get("id")
+            for d in (payload.get("directions") or [])
+            if isinstance(d, dict) and d.get("id")
+        ),
+        None,
+    )
 
 
 def _research_spawn_lock_key(project_id) -> int:
@@ -360,9 +380,7 @@ async def _maybe_notify_operator_refresh_deferred(
         )
 
         await post_strategic_steering_deferred_message(session, project.id, reason)
-        await with_vision_locked(
-            session, project.id, mark_strategic_refresh_notified
-        )
+        await with_vision_locked(session, project.id, mark_strategic_refresh_notified)
         await session.commit()
         logger.info(
             "[STRATEGIC] operator steering refresh deferred for project %s (%s) "
@@ -406,8 +424,7 @@ async def _maybe_notify_operator_steering_acted(
         )
     except Exception:
         logger.exception(
-            "[STRATEGIC] failed to post operator steering confirmation for "
-            "project %s",
+            "[STRATEGIC] failed to post operator steering confirmation for project %s",
             project.id,
         )
 
@@ -644,7 +661,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # prevents ungrounded findings against a half-onboarded repo. Terminal bootstraps
     # (FAILED/COMPLETED) proceed gracefully so a degraded bootstrap never deadlocks.
     from app.strategic_spawning import _bootstrap_pending
+
     if await _bootstrap_pending(project, session):
+        await _maybe_notify_operator_refresh_deferred(
+            project,
+            session,
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+        )
         logger.info(
             "[AUTONOMOUS] Deferring research spawn for project %s — "
             "repo_bootstrap task is pending (bootstrap_completed_at not set)",
@@ -696,30 +719,21 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         _no_resurrection_count = func.json_extract(
             Task.context, "$._resurrection_count"
         ).is_(None)
+    active_research_statuses = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+        TaskStatus.BLOCKED,
+        TaskStatus.PARKED,
+    ]
     active_research = (
         (
             await session.execute(
                 select(Task).where(
                     Task.project_id == project.id,
                     or_(
-                        Task.status.in_(
-                            [
-                                TaskStatus.QUEUED,
-                                TaskStatus.PROVISIONING,
-                                TaskStatus.IN_PROGRESS,
-                                TaskStatus.EVALUATING,
-                                # BLOCKED research parents still structurally
-                                # occupy their direction: a lane parked on an
-                                # unresolved upstream prerequisite is wanted-but-
-                                # not-runnable, not done. Treating it as busy
-                                # keeps the prerequisite-gating model consistent
-                                # — the direction stays held until the lane
-                                # resumes (foundation lands / recheck) or is
-                                # explicitly resolved, instead of drifting back
-                                # into autonomous selection after the cooldown.
-                                TaskStatus.BLOCKED,
-                            ]
-                        ),
+                        Task.status.in_(active_research_statuses),
                         and_(
                             Task.status == TaskStatus.FAILED,
                             Task.updated_at >= resurrection_lookback,
@@ -799,7 +813,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     for rt in recently_spawned:
         rpayload = rt.first_payload
         if rpayload.get("type") == "research":
-            rdid = rpayload.get("current_direction_id")
+            rdid = _research_payload_direction_id(rpayload)
             if rdid:
                 recent_research_by_direction.setdefault(rdid, []).append(rt.id)
 
@@ -808,7 +822,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         if payload.get("type") == "research":
             # current_direction_id identifies the targeted direction; null means
             # undirected/cross-cutting analysis which doesn't block any direction.
-            current_did = payload.get("current_direction_id")
+            current_did = _research_payload_direction_id(payload)
             if not current_did:
                 continue
             # Pipeline new research alongside long-EVALUATING parents: once children
@@ -847,9 +861,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         # status, including CANCELLED) — exclude self.
                         recent_others = [
                             rid
-                            for rid in recent_research_by_direction.get(
-                                current_did, []
-                            )
+                            for rid in recent_research_by_direction.get(current_did, [])
                             if rid != t.id
                         ]
                         if not recent_others:
@@ -935,8 +947,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # intervene (and exactly when the breaker is likely tripped).
         # Automated qualification refreshes still park under the breaker.
         _breaker_gate_ok = (
-            not refresh_breaker_applies(project.vision)
-            or strategic_failures < 3
+            not refresh_breaker_applies(project.vision) or strategic_failures < 3
         )
         if _breaker_gate_ok and strategic_refresh_due(
             project.vision, now, min_interval_seconds=_refresh_min_interval
@@ -995,6 +1006,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 ORIGIN_QUALIFICATION as _OQ,
                 request_strategic_refresh as _req_strat,
             )
+
             await _req_strat(
                 session,
                 project.id,
@@ -1206,32 +1218,100 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # rather than waiting up to 6 more research spawns (~3+ hours).
     pending_sr = (project.vision or {}).get("_pending_strategic_review")
     if pending_sr:
-        try:
-            from app.strategic_spawning import _spawn_strategic_review
+        _sr_attempt_count = pending_sr.get("attempt_count", 0)
+        _sr_first_attempted_at = pending_sr.get("first_attempted_at")
+        _sr_max_attempts = _runtime_config.get("pending_sr_max_attempts", 3)
+        _sr_max_age_hours = _runtime_config.get("pending_sr_max_age_hours", 24)
 
-            if await _spawn_strategic_review(
-                project,
-                session,
-                cycle_id=pending_sr.get("cycle_id"),
-                operator_steered=bool(pending_sr.get("operator_steered")),
-                steering_excerpt=pending_sr.get("steering_excerpt"),
-            ):
-                def _clear_pending_sr(vision: dict) -> None:
-                    vision.pop("_pending_strategic_review", None)
+        # Check if the marker has exceeded the retry cap or age window.
+        _sr_age_exceeded = False
+        if _sr_first_attempted_at:
+            try:
+                _first_dt = datetime.fromisoformat(_sr_first_attempted_at).replace(
+                    tzinfo=timezone.utc
+                )
+                _sr_age_exceeded = (
+                    _utcnow().replace(tzinfo=timezone.utc) - _first_dt
+                ) > timedelta(hours=_sr_max_age_hours)
+            except (ValueError, TypeError):
+                pass
 
-                await with_vision_locked(session, project.id, _clear_pending_sr)
-                logger.info(
-                    f"[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get('failed_at')})"
-                )
-            else:
-                logger.warning(
-                    f"[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}"
-                )
-        except Exception:
-            logger.exception(
-                f"[STRATEGIC] Retry of pending strategic review failed for project {project.id}"
+        if _sr_attempt_count >= _sr_max_attempts or _sr_age_exceeded:
+            _reason = (
+                f"attempt_count={_sr_attempt_count} >= max={_sr_max_attempts}"
+                if _sr_attempt_count >= _sr_max_attempts
+                else f"marker age exceeded {_sr_max_age_hours}h (first_attempted_at={_sr_first_attempted_at})"
             )
-        return  # Don't spawn tactical research this cycle
+            logger.error(
+                f"[STRATEGIC] Pending SR cap/age exceeded for project {project.id}: {_reason} — dropping marker and alerting"
+            )
+
+            def _drop_pending_sr(vision: dict) -> None:
+                vision.pop("_pending_strategic_review", None)
+
+            await with_vision_locked(session, project.id, _drop_pending_sr)
+
+            from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
+
+            await _create_strategic_alert(
+                project.id,
+                session,
+                f"Pending strategic review retry abandoned after {_reason}. "
+                f"Original failure: {pending_sr.get('error', 'unknown')}",
+            )
+            # Fall through to tactical research below
+        else:
+            try:
+                from app.strategic_spawning import _spawn_strategic_review
+
+                if await _spawn_strategic_review(
+                    project,
+                    session,
+                    cycle_id=pending_sr.get("cycle_id"),
+                    operator_steered=bool(pending_sr.get("operator_steered")),
+                    steering_excerpt=pending_sr.get("steering_excerpt"),
+                ):
+
+                    def _clear_pending_sr(vision: dict) -> None:
+                        vision.pop("_pending_strategic_review", None)
+
+                    await with_vision_locked(session, project.id, _clear_pending_sr)
+                    logger.info(
+                        f"[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get('failed_at')})"
+                    )
+                    return  # Don't spawn tactical research this cycle
+                else:
+                    logger.warning(
+                        f"[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}"
+                    )
+                    _now_iso = _utcnow().isoformat()
+
+                    def _bump_pending_sr_skip(vision: dict) -> None:
+                        marker = vision.get("_pending_strategic_review")
+                        if marker is None:
+                            return
+                        marker["attempt_count"] = marker.get("attempt_count", 0) + 1
+                        if not marker.get("first_attempted_at"):
+                            marker["first_attempted_at"] = _now_iso
+
+                    await with_vision_locked(session, project.id, _bump_pending_sr_skip)
+                    # Fall through to tactical research
+            except Exception:
+                logger.exception(
+                    f"[STRATEGIC] Retry of pending strategic review failed for project {project.id}"
+                )
+                _now_iso = _utcnow().isoformat()
+
+                def _bump_pending_sr(vision: dict) -> None:
+                    marker = vision.get("_pending_strategic_review")
+                    if marker is None:
+                        return
+                    marker["attempt_count"] = marker.get("attempt_count", 0) + 1
+                    if not marker.get("first_attempted_at"):
+                        marker["first_attempted_at"] = _now_iso
+
+                await with_vision_locked(session, project.id, _bump_pending_sr)
+                # Fall through to tactical research
 
     # Strategic cycle check — runs BEFORE the research blocking guard so it's
     # never blocked by an active tactical research task.  The design_doc_update
@@ -1250,6 +1330,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             + d.get("history_aggregate", {}).get("total_cycles", 0)
             for d in all_active_directions
         )
+
         def _seed_research_spawn_count(vision: dict) -> None:
             vision["_research_spawn_count"] = research_spawn_count
 
@@ -1384,9 +1465,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         "— a strategic-refresh is pending (%s)",
                         cooldown_minutes,
                         project.id,
-                        (project.vision or {}).get("_strategic_refresh", {}).get(
-                            "reason"
-                        ),
+                        (project.vision or {})
+                        .get("_strategic_refresh", {})
+                        .get("reason"),
                     )
                 else:
                     logger.info(
@@ -1969,7 +2050,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             )
             if absent_symbols and status != "claimed_absent":
                 status = "claimed_absent"
-            system_verification[dkey[len("systems/"):]] = {
+            system_verification[dkey[len("systems/") :]] = {
                 "status": status,
                 "claimed_status": str(dval.get("status", "")),
                 "present": present,
@@ -2033,7 +2114,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             )
             if absent_symbols and status != "claimed_absent":
                 status = "claimed_absent"
-            capability_verification[dkey[len("capabilities/"):]] = {
+            capability_verification[dkey[len("capabilities/") :]] = {
                 "status": status,
                 "claimed_status": str(dval.get("status", "")),
                 "present": present,
@@ -2197,6 +2278,94 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
         # Recover deferred findings from recent completed research tasks.
         task_context: dict = {}
+        if resolve_dialect_name(session) == "postgresql":
+            deferred_findings_filters = [
+                Task.context.has_key("deferred_findings"),
+                case(
+                    (
+                        func.jsonb_typeof(Task.context["deferred_findings"]) == "array",
+                        func.jsonb_array_length(Task.context["deferred_findings"]),
+                    ),
+                    else_=0,
+                )
+                > 0,
+            ]
+        else:
+            deferred_findings_filters = [
+                func.json_type(Task.context, "$.deferred_findings") == "array",
+                func.json_array_length(Task.context, "$.deferred_findings") > 0,
+            ]
+        if current_dir_id:
+            if resolve_dialect_name(session) == "postgresql":
+                deferred_findings_scope_rows = func.jsonb_array_elements(
+                    Task.context["deferred_findings"]
+                ).table_valued("value")
+                deferred_findings_scope_filter = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.jsonb_extract_path_text(
+                            deferred_findings_scope_rows.c.value,
+                            "direction_id",
+                        )
+                        == current_dir_id
+                    )
+                )
+            else:
+                deferred_findings_scope_rows = func.json_each(
+                    Task.context, "$.deferred_findings"
+                ).table_valued("key", "value")
+                deferred_findings_scope_filter = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.coalesce(
+                            func.json_extract(
+                                deferred_findings_scope_rows.c.value,
+                                "$.direction_id",
+                            ),
+                            "",
+                        )
+                        == current_dir_id
+                    )
+                )
+        else:
+            if resolve_dialect_name(session) == "postgresql":
+                deferred_findings_scope_rows = func.jsonb_array_elements(
+                    Task.context["deferred_findings"]
+                ).table_valued("value")
+                deferred_findings_scope_filter = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.coalesce(
+                            func.jsonb_extract_path_text(
+                                deferred_findings_scope_rows.c.value,
+                                "direction_id",
+                            ),
+                            "",
+                        )
+                        == ""
+                    )
+                )
+            else:
+                deferred_findings_scope_rows = func.json_each(
+                    Task.context, "$.deferred_findings"
+                ).table_valued("key", "value")
+                deferred_findings_scope_filter = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.coalesce(
+                            func.json_extract(
+                                deferred_findings_scope_rows.c.value,
+                                "$.direction_id",
+                            ),
+                            "",
+                        )
+                        == ""
+                    )
+                )
         prev_research_rows = (
             (
                 await session.execute(
@@ -2204,6 +2373,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     .where(
                         Task.project_id == project.id,
                         Task.status == TaskStatus.COMPLETED,
+                        Task.payloads[0]["type"].as_string() == "research",
+                        *deferred_findings_filters,
+                        deferred_findings_scope_filter,
                     )
                     .order_by(Task.created_at.desc())
                     .limit(20)
@@ -2212,9 +2384,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             .scalars()
             .all()
         )
-        prev_research_rows = [
-            r for r in prev_research_rows if (r.context or {}).get("deferred_findings")
-        ]
         from app.finding_deduplication import finding_hash as _finding_hash
 
         _deferred_ttl_days = int(_runtime_config.get("deferred_finding_ttl_days", 7))
@@ -2228,7 +2397,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     continue
                 f_dir_id = f.get("direction_id")
                 if current_dir_id:
-                    if f_dir_id and f_dir_id != current_dir_id:
+                    if f_dir_id != current_dir_id:
                         continue
                 else:
                     if f_dir_id:
@@ -2267,9 +2436,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 f"research cycle(s) into new research task for direction {current_dir_id or 'undirected'}"
             )
 
-        await acquire_direction_research_spawn_lock(
-            session, project.id, current_dir_id
-        )
+        await acquire_direction_research_spawn_lock(session, project.id, current_dir_id)
         if current_dir_id is not None:
             locked_direction_research = [
                 task
@@ -2278,15 +2445,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         await session.execute(
                             select(Task).where(
                                 Task.project_id == project.id,
-                                Task.status.in_(
-                                    [
-                                        TaskStatus.QUEUED,
-                                        TaskStatus.PROVISIONING,
-                                        TaskStatus.IN_PROGRESS,
-                                        TaskStatus.EVALUATING,
-                                        TaskStatus.BLOCKED,
-                                    ]
-                                ),
+                                Task.status.in_(active_research_statuses),
                             )
                         )
                     )
@@ -2294,7 +2453,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     .all()
                 )
                 if task.first_payload.get("type") == "research"
-                and task.first_payload.get("current_direction_id") == current_dir_id
+                and _research_payload_direction_id(task.first_payload) == current_dir_id
             ]
             is_pipelined_spawn = current_dir_id in pipelined_direction_ids
             if is_pipelined_spawn:
@@ -2320,9 +2479,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 locked_updated = locked_parent.updated_at
                 if locked_updated is not None and locked_updated.tzinfo is not None:
                     locked_updated = locked_updated.replace(tzinfo=None)
-                if locked_updated is None or (
-                    (now - locked_updated).total_seconds() / 60
-                ) < evaluating_timeout_minutes:
+                if (
+                    locked_updated is None
+                    or ((now - locked_updated).total_seconds() / 60)
+                    < evaluating_timeout_minutes
+                ):
                     logger.info(
                         "[AUTONOMOUS] Skipping pipelined research for project %s "
                         "direction %s under lock — parent is no longer stale enough",
@@ -2331,25 +2492,20 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     )
                     continue
                 locked_parent_has_active_children = (
-                    (
-                        await session.execute(
-                            select(Task.id).where(
-                                Task.parent_task_id == locked_parent.id,
-                                Task.status.in_(
-                                    [
-                                        TaskStatus.QUEUED,
-                                        TaskStatus.PROVISIONING,
-                                        TaskStatus.IN_PROGRESS,
-                                        TaskStatus.EVALUATING,
-                                    ]
-                                ),
-                            )
+                    await session.execute(
+                        select(Task.id).where(
+                            Task.parent_task_id == locked_parent.id,
+                            Task.status.in_(
+                                [
+                                    TaskStatus.QUEUED,
+                                    TaskStatus.PROVISIONING,
+                                    TaskStatus.IN_PROGRESS,
+                                    TaskStatus.EVALUATING,
+                                ]
+                            ),
                         )
                     )
-                    .scalars()
-                    .first()
-                    is not None
-                )
+                ).scalars().first() is not None
                 locked_parent_has_open_pr = bool(
                     ((locked_parent.context or {}).get("review_loop") or {}).get(
                         "pr_number"
@@ -2757,7 +2913,6 @@ from app.autonomous_research_residual import (
 )
 
 
-
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
     from app.anomaly_detection import _expire_stale_proposals
@@ -2889,7 +3044,9 @@ async def refresh_research_task_verification(
     verification_kwargs = await resolve_branch_verification_context(session, project)
 
     system_verification: dict = {}
-    for dkey in sorted(k for k in doc if isinstance(k, str) and k.startswith("systems/")):
+    for dkey in sorted(
+        k for k in doc if isinstance(k, str) and k.startswith("systems/")
+    ):
         dval = doc[dkey]
         if not isinstance(dval, dict):
             continue
@@ -2914,7 +3071,7 @@ async def refresh_research_task_verification(
         )
         if absent_symbols and status != "claimed_absent":
             status = "claimed_absent"
-        system_verification[dkey[len("systems/"):]] = {
+        system_verification[dkey[len("systems/") :]] = {
             "status": status,
             "claimed_status": str(dval.get("status", "")),
             "present": present,
@@ -2960,7 +3117,7 @@ async def refresh_research_task_verification(
         )
         if absent_symbols and status != "claimed_absent":
             status = "claimed_absent"
-        capability_verification[dkey[len("capabilities/"):]] = {
+        capability_verification[dkey[len("capabilities/") :]] = {
             "status": status,
             "claimed_status": str(dval.get("status", "")),
             "present": present,

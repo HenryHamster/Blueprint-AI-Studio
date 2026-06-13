@@ -4,13 +4,13 @@ import asyncio
 import logging
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Dict
 
-from sqlalchemy import update, text
+from sqlalchemy import func, update, text
 from sqlmodel import select
 
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.models import (
     Task,
     TaskStatus,
@@ -24,7 +24,7 @@ import app.shared_state as _shared_state
 # keep taking effect on the moved sweeps.
 from app.broadcast import broadcast_to_project  # noqa: F401
 from app.task_capabilities import WRITE_TASK_TYPES  # noqa: F401
-from app.time_utils import _utcnow
+from app.time_utils import _coerce_naive_utc, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,9 @@ class _DeployPauseSnapshot:
         "total_manual_paused_seconds",
     )
 
-    def __init__(self, paused_at, total_manual_paused_seconds, total_auto_paused_seconds):
+    def __init__(
+        self, paused_at, total_manual_paused_seconds, total_auto_paused_seconds
+    ):
         self.paused_at = paused_at
         self.total_manual_paused_seconds = total_manual_paused_seconds
         self.total_auto_paused_seconds = total_auto_paused_seconds
@@ -116,6 +118,104 @@ async def _bounded(coro, timeout_s: float, *, what: str):
         raise
 
 
+def _parse_naive_utc_iso(raw_value: str | None) -> datetime | None:
+    if not raw_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _coerce_naive_utc(parsed)
+
+
+async def _collect_gcp_cleanup_active_vm_ids(session) -> set[str]:
+    """Return the VM ids that should survive the generic GCP orphan sweep."""
+    active_vm_ids = (
+        await session.execute(
+            select(Task.vm_instance_id).where(
+                Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
+            )
+        )
+    ).scalars().all()
+    active_vm_ids = {vid for vid in active_vm_ids if vid}
+
+    # Warm-handoff successors pin their source VM via QUEUED context; keep the
+    # source alive until the deadline elapses so the successor can claim it
+    # warm instead of cold-provisioning.
+    if resolve_dialect_name(session) == "postgresql":
+        warm_target_present = Task.context.has_key("warm_target_vm_id")
+    else:
+        warm_target_present = func.json_extract(
+            Task.context, "$.warm_target_vm_id"
+        ).isnot(None)
+    warm_handoff_rows = (
+        await session.execute(
+            select(Task.context).where(
+                Task.status == TaskStatus.QUEUED,
+                warm_target_present,
+            )
+        )
+    ).scalars().all()
+    now = _utcnow()
+    warm_handoff_vm_ids: set[str] = set()
+    for ctx in warm_handoff_rows:
+        if not isinstance(ctx, dict):
+            continue
+        target = ctx.get("warm_target_vm_id")
+        if not isinstance(target, str) or not target:
+            continue
+        deadline = _parse_naive_utc_iso(
+            ctx.get("warm_handoff_deadline")
+            if isinstance(ctx.get("warm_handoff_deadline"), str)
+            else None
+        )
+        if deadline is not None and deadline > now:
+            warm_handoff_vm_ids.add(target)
+
+    # Spare live warm-pool members: a pre-provisioned idle pool VM has NO Task
+    # row, so without this it would be deleted within minutes.
+    # RETIRING members are excluded (get_live_pool_vm_ids) so genuinely
+    # orphaned/retiring pool VMs are still reclaimed. Gated on the feature flag:
+    # when warm_pool_enabled is off BOTH pool reapers (maintainer + idle sweep)
+    # are inert, so exempting members here would leak them (and their billed GCP
+    # VMs) forever. With the gate off, this generic cleanup reclaims the
+    # now-unmanaged members.
+    from app.warm_pool import pool_vm_cleanup_exemptions
+
+    # Compute-job VMs (compute-job-vm-*) have NO Task row; the orphan sweep now
+    # inventories them, so a RUNNING job's VM must be held active here or it
+    # would be deleted out from under the monitor.
+    from app.compute_jobs import active_compute_job_vm_ids
+
+    # Parked tasks are QUEUED (not PROVISIONING/IN_PROGRESS) but still hold a
+    # live VM during the park-and-retarget cooldown window.
+    # Without this exemption the orphan sweep would delete the held VM within 5
+    # minutes — well inside the up-to-1800s park budget.
+    parked_rows = (
+        await session.execute(
+            select(Task.vm_instance_id, Task.context).where(
+                Task.status == TaskStatus.QUEUED,
+                Task.vm_instance_id.is_not(None),
+            )
+        )
+    ).all()
+    parked_vm_ids = {
+        vid
+        for vid, ctx in parked_rows
+        if vid
+        and isinstance(ctx, dict)
+        and ctx.get("parked_for_retarget")
+    }
+
+    return (
+        active_vm_ids
+        | warm_handoff_vm_ids
+        | await pool_vm_cleanup_exemptions(session)
+        | await active_compute_job_vm_ids(session)
+        | parked_vm_ids
+    )
+
+
 async def gcp_cleanup_service():
     """
     Background worker that runs every 5 minutes to ensure GCP VMs are in sync with the database.
@@ -127,53 +227,7 @@ async def gcp_cleanup_service():
     while True:
         try:
             async with AsyncSessionLocal() as session:
-                # Get all active tasks that should have a VM running
-                stmt = select(Task.vm_instance_id).where(
-                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
-                )
-                active_vm_ids = (await session.execute(stmt)).scalars().all()
-                active_vm_ids = [vid for vid in active_vm_ids if vid]
-                # Spare live warm-pool members: a pre-provisioned idle pool VM has
-                # NO Task row, so without this it would be deleted within minutes.
-                # RETIRING members are excluded (get_live_pool_vm_ids) so genuinely
-                # orphaned/retiring pool VMs are still reclaimed. Gated on the
-                # feature flag: when warm_pool_enabled is off BOTH pool reapers
-                # (maintainer + idle sweep) are inert, so exempting members here
-                # would leak them (and their billed GCP VMs) forever. With the gate
-                # off, this generic cleanup reclaims the now-unmanaged members.
-                from app.warm_pool import pool_vm_cleanup_exemptions
-
-                # Compute-job VMs (compute-job-vm-*) have NO Task row; the orphan
-                # sweep now inventories them, so a RUNNING job's VM must be held
-                # active here or it would be deleted out from under the monitor.
-                from app.compute_jobs import active_compute_job_vm_ids
-
-                # Parked tasks are QUEUED (not PROVISIONING/IN_PROGRESS) but still
-                # hold a live VM during the park-and-retarget cooldown window.
-                # Without this exemption the orphan sweep would delete the held VM
-                # within 5 minutes — well inside the up-to-1800s park budget.
-                _parked_rows = (
-                    await session.execute(
-                        select(Task.vm_instance_id, Task.context).where(
-                            Task.status == TaskStatus.QUEUED,
-                            Task.vm_instance_id.is_not(None),
-                        )
-                    )
-                ).all()
-                parked_vm_ids = {
-                    vid
-                    for vid, ctx in _parked_rows
-                    if vid
-                    and isinstance(ctx, dict)
-                    and ctx.get("parked_for_retarget")
-                }
-
-                active_vm_ids = list(
-                    set(active_vm_ids)
-                    | await pool_vm_cleanup_exemptions(session)
-                    | await active_compute_job_vm_ids(session)
-                    | parked_vm_ids
-                )
+                active_vm_ids = list(await _collect_gcp_cleanup_active_vm_ids(session))
 
                 # Run cleanup with a hard timeout. 270s, not 120: deleting a
                 # RUNNING/STOPPING orphan blocks through the guest shutdown
@@ -631,4 +685,5 @@ from app.recovery_sweeps import (  # noqa: F401
     _recover_orphaned_tasks,
     _sweep_stranded_sidecar_sources,
     _sweep_bootstrap_recovery,
+    _sweep_lane_baseline_backfill,
 )

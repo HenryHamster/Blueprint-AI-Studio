@@ -16,7 +16,7 @@ os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
 
 from fastapi.routing import APIRoute
 
-from app.auth import get_current_user, require_admin
+from app.auth import get_current_user, get_metrics_reader, require_admin
 from app.main import app
 
 # Intentional exceptions — expected to be empty.
@@ -25,7 +25,9 @@ from app.main import app
 # explaining why auth is intentionally absent.
 ALLOWLIST: set[str] = set()
 
-_AUTH_CALLABLES = frozenset({get_current_user, require_admin})
+# get_metrics_reader is a narrowly scoped read-only auth dep that accepts
+# agent JWTs; it is a valid auth callable for metrics-only endpoints.
+_AUTH_CALLABLES = frozenset({get_current_user, require_admin, get_metrics_reader})
 
 
 def _collect_dep_callables(dependant, visited: set) -> set:

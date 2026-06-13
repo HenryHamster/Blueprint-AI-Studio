@@ -29,6 +29,7 @@ from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import AsyncSessionLocal
 from app.models import (
@@ -43,10 +44,13 @@ from app.models import (
 )
 from app.time_utils import _utcnow
 from app.warm_pool import (
+    clear_lane_warm_workspace_if_matching_member,
     IDLE_POOL_STATES,
     LIVE_POOL_STATES,
+    WARM_POOL_PIN_KEY,
     count_idle_pool_vms,
     count_live_pool_vms,
+    count_pending_pool_leases,
     is_pool_vm_image_stale,
     is_project_warm_pool_scoped,
     is_warm_pool_enabled,
@@ -150,44 +154,6 @@ def _demand_window_minutes(runtime_config) -> int:
 
 
 _COST_GUARD_ALERT_TITLE = "Warm pool cost guard engaged: idle spend not amortized"
-
-
-async def _compute_project_pool_hit_rate(
-    session, project_id: uuid.UUID, cutoff: datetime
-) -> dict:
-    """DB-derived warm-pool hit rate for one project within the rolling window.
-
-    Queries Task rows with ``vm_dispatched_at >= cutoff`` for the given project.
-    Counts rows whose ``context['_timing']['warm_claim_origin']`` equals
-    ``WARM_POOL_ORIGIN`` as pool hits; total dispatched tasks as the denominator.
-    Returns ``{"hits": int, "total_dispatches": int, "hit_rate": float | None}``
-    where ``hit_rate`` is None when there are no dispatches in the window.
-    """
-    from app.warm_pool import WARM_POOL_ORIGIN
-
-    tasks = list(
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id,
-                    Task.vm_dispatched_at >= cutoff,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    total = len(tasks)
-    hits = 0
-    for task in tasks:
-        timing = (task.context or {}).get("_timing") or {}
-        if timing.get("warm_claim_origin") == WARM_POOL_ORIGIN:
-            hits += 1
-    return {
-        "hits": hits,
-        "total_dispatches": total,
-        "hit_rate": (hits / total) if total > 0 else None,
-    }
 
 
 def _cost_guard_config(runtime_config) -> dict:
@@ -308,26 +274,34 @@ async def evaluate_project_pool_cost_guard(
     """Per-project warm-pool cost guard: same logic as the fleet guard, scoped to one project.
 
     Uses ``_compute_windowed_idle_cost(session, project_id, cutoff)`` for
-    per-project idle cost and ``_compute_project_pool_hit_rate`` for a
-    DB-derived warm-pool hit rate. Engages when ALL hold over the rolling window:
-    enough dispatches to trust the rate (``min_dispatches``), a hit rate below
-    the floor, and idle cost above the materiality floor. Returns the same shape
-    dict as ``evaluate_pool_cost_guard`` so callers can use either.
+    per-project idle cost and the in-memory per-project pool funnel
+    (``get_project_pool_funnel_snapshot``) for hit-rate measurement.  Engages
+    when ALL hold over the rolling window: enough ELIGIBLE dispatches to trust
+    the rate (``min_dispatches``), an eligible hit rate below the floor, and
+    idle cost above the materiality floor.  Returns the same shape dict as
+    ``evaluate_pool_cost_guard`` so callers can use either.
+
+    Gates on ``eligible_hit_rate`` / ``eligible_dispatches`` — hits + only the
+    misses where the pool was genuinely able to serve the task.  Dependency-
+    pinned, never-consulted cold dispatches, out-of-scope, suppressed, and
+    cost-guard misses are excluded so thin or structurally ineligible demand
+    never triggers a false drain.
 
     Called once per project per maintainer tick, only when the fleet-level guard
     has NOT already engaged (the fleet guard acts as a global safety valve; when
     it fires, all projects drain without individual evaluation).
     """
     from app.efficiency_snapshot import _compute_windowed_idle_cost
+    from app.warm_backlog_reuse import get_project_pool_funnel_snapshot
 
     cfg = _cost_guard_config(runtime_config)
     _guard_cutoff = _utcnow() - timedelta(hours=cfg["window_hours"])
     idle_cost = (await _compute_windowed_idle_cost(session, project_id, _guard_cutoff))[
         "total"
     ]
-    funnel = await _compute_project_pool_hit_rate(session, project_id, _guard_cutoff)
-    hit_rate = funnel["hit_rate"]
-    total = funnel["total_dispatches"]
+    funnel = get_project_pool_funnel_snapshot(project_id, cfg["window_hours"])
+    hit_rate = funnel["eligible_hit_rate"]
+    total = funnel["eligible_dispatches"]
 
     engaged = (
         cfg["enabled"]
@@ -339,9 +313,9 @@ async def evaluate_project_pool_cost_guard(
     reason = None
     if engaged:
         reason = (
-            f"Project pool hit rate {hit_rate:.1%} is below the "
+            f"Project eligible pool hit rate {hit_rate:.1%} is below the "
             f"{cfg['min_hit_rate']:.0%} floor over {cfg['window_hours']}h "
-            f"({total} dispatches) while idle spend is ${idle_cost:.2f} "
+            f"({total} eligible dispatches) while idle spend is ${idle_cost:.2f} "
             f"— draining idle members and pausing provisioning until the hit rate "
             f"recovers."
         )
@@ -566,6 +540,48 @@ async def retire_and_delete_pool_vm(
         "[WARM-POOL] retired pool VM vm_instance_id=%s reason=%s", vm_id, reason
     )
     return True
+
+
+async def drain_global_warm_pool(*, session_factory=AsyncSessionLocal) -> int:
+    """Drain every live pool member fleet-wide (all projects).
+
+    Called when warm_pool_enabled is flipped False via the settings path so the
+    PoolVm registry converges with physical VM cleanup. Retires each live member
+    (PROVISIONING / IDLE / LEASED) via retire_and_delete_pool_vm with the same
+    compare-and-swap safety as the per-project drain: a member claimed by a peer
+    between the scan and the atomic UPDATE is skipped (rowcount==0), not torn
+    down twice. Returns the count of members this call retired.
+    """
+    retired = 0
+    async with session_factory() as session:
+        members = list(
+            (
+                await session.execute(
+                    select(PoolVm).where(PoolVm.state.in_(LIVE_POOL_STATES))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        member_ids = [m.id for m in members]
+        for member_id in member_ids:
+            member = await session.get(PoolVm, member_id)
+            if member is None:
+                continue
+            try:
+                if await retire_and_delete_pool_vm(
+                    session, member, reason="pool_global_disable"
+                ):
+                    retired += 1
+            except Exception:
+                logger.warning(
+                    "[WARM-POOL] global-disable drain failed for member %s",
+                    member_id,
+                    exc_info=True,
+                )
+    if retired:
+        logger.info("[WARM-POOL] global-disable drain retired %d members", retired)
+    return retired
 
 
 async def _default_pool_provision_fn(
@@ -1099,7 +1115,10 @@ async def run_pool_maintainer_cycle(
         )
         idle_pool = await count_idle_pool_vms(session)
         live_pool = await count_live_pool_vms(session)
-        dispatch_slots_remaining = max(0, max_concurrent - active_tasks - idle_pool)
+        pending_leases = await count_pending_pool_leases(session)
+        dispatch_slots_remaining = max(
+            0, max_concurrent - active_tasks - idle_pool - pending_leases
+        )
         pool_budget_remaining = max(0, pool_max - live_pool)
 
         for project_id in project_ids:
@@ -1195,10 +1214,13 @@ async def pool_maintainer_service():
 async def sweep_exhausted_lane_budgets(session) -> int:
     """Kill ACTIVE ImprovementLane rows whose phase_requeues budget is exhausted.
 
-    mark_checkpoint_missing leaves over-budget lanes ACTIVE "so the sweep can
-    surface them to the strategist" — this is that sweep.  CAS each matching
-    lane to KILLED so the rows reach a terminal state and stop polluting the
-    warm-resume and checkpoint-loss denominators.
+    The live review-spawn path now closes an exhausted lane INLINE the moment the
+    requeue budget is crossed (review_fix_lane_pilot.close_lane_checkpoint_exhausted
+    via checkpoint_or_recover_phase), so this sweep is a BACKSTOP for any
+    over-budget lane that escaped inline handling (e.g. a row whose budget was
+    bumped past the cap by an out-of-band path, or a lane left ACTIVE by an older
+    code version).  CAS each matching lane to KILLED so the rows reach a terminal
+    state and stop polluting the warm-resume and checkpoint-loss denominators.
 
     Returns the count of lanes killed.  Inert when improvement_lanes_enabled
     is False.
@@ -1211,13 +1233,19 @@ async def sweep_exhausted_lane_budgets(session) -> int:
         return 0
 
     exhausted = (
-        await session.execute(
-            select(ImprovementLane).where(
-                ImprovementLane.status == ImprovementLaneStatus.ACTIVE.value,
-                ImprovementLane.phase_requeues > _LANE_MAX_PHASE_REQUEUES,
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.status == ImprovementLaneStatus.ACTIVE.value,
+                    ImprovementLane.phase_requeues > _LANE_MAX_PHASE_REQUEUES,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
+
+    from app.warm_pool import record_lane_reservation_cause
 
     killed = 0
     for lane in exhausted:
@@ -1234,6 +1262,21 @@ async def sweep_exhausted_lane_budgets(session) -> int:
                 lane.id,
                 lane.phase_requeues,
             )
+            reserved = (
+                (
+                    await session.execute(
+                        select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for member in reserved:
+                member.reserved_lane_id = None
+                member.reservation_expires_at = None
+                member.reservation_hard_expires_at = None
+                session.add(member)
+                await record_lane_reservation_cause(session, lane.id, "force_expired")
         except LaneCASError as exc:  # noqa: PERF203 — CAS miss per iteration is intentional
             logger.debug(
                 "[WARM-POOL] exhausted-budget CAS miss lane=%s: %s", lane.id, exc
@@ -1241,6 +1284,289 @@ async def sweep_exhausted_lane_budgets(session) -> int:
     if killed:
         await session.commit()
     return killed
+
+
+# Default age, in seconds, after which a still-PROPOSED lane is treated as a
+# failed/abandoned activation and aged to a terminal state. A lane is created
+# PROPOSED and advanced to ACTIVE essentially immediately on dispatch, so a row
+# lingering in PROPOSED past this window means activation never completed.
+# Overridable via runtime_config["improvement_lane_proposed_stale_seconds"].
+_PROPOSED_STALE_SECONDS_DEFAULT = 1800
+
+# Task statuses that mean a lane's bound phase task is finished (or void) and the
+# lane is therefore stranded if it is still ACTIVE — no checkpoint will ever land
+# from this task. Mirrors the terminal set the pool lease-orphan reclaim uses,
+# minus EVALUATING: an EVALUATING lane task is still legitimately in flight
+# (waiting on its own children), so it must NOT be reconciled as stranded.
+_LANE_TERMINAL_TASK_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+)
+
+
+async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int:
+    """Reconcile improvement lanes stranded OUTSIDE the pilot's checkpoint seam.
+
+    Two strand classes that no other code path observes:
+
+    1. An ACTIVE lane whose ``current_task_id`` references a TERMINAL task
+       (COMPLETED / FAILED / CANCELLED), whose task row no longer exists
+       (vanished), or that has no bound task at all. The phase task died outside
+       the pilot's checkpoint handling — operator/admin cancel, reaper kill, or
+       an agent crash before any checkpoint attempt — so ``mark_checkpoint_missing``
+       never fired and ``phase_requeues`` never incremented. Route each through
+       the lane's BOUNDED recovery: reuse ``mark_checkpoint_missing`` to bump the
+       requeue counter and decide. While UNDER budget, requeue-from-checkpoint by
+       clearing the stale binding (CAS ACTIVE -> PARKED, ``clear_task=True``) so
+       the next resume re-dispatches the phase from durable checkpoint context;
+       once the budget is exhausted, CAS ACTIVE -> KILLED.
+
+    2. A PROPOSED lane whose ``created_at`` is older than the staleness threshold
+       — activation never completed. CAS PROPOSED -> KILLED (abandoned/
+       failed-activation semantics; the edge added alongside this sweep).
+
+    Detection uses the ``ix_improvementlane_project_status`` index path (a
+    status-filtered scan — the model's documented "scan ACTIVE lanes looking for
+    stuck tasks" hot path). EVERY mutation goes through ``cas_transition`` (SELECT
+    … FOR UPDATE), so concurrent maintainer/sweep ticks and stale reads safely
+    no-op: the CAS loser logs and continues, never double-killing.
+
+    Inert when ``improvement_lanes_enabled`` is False. Runs independently of
+    ``warm_pool_enabled`` (called from :func:`sweep_idle_pool_vms` before the
+    warm-pool gate) so shadow-lane mode still reconciles. Returns the count of
+    lanes transitioned.
+    """
+    from app.improvement_lane_ops import (
+        LaneCASError,
+        cas_transition,
+        mark_checkpoint_missing,
+    )
+    from app.models import ImprovementLaneStatus
+    from app.runtime_config_state import is_improvement_lanes_enabled
+    from app.warm_pool import record_lane_reservation_cause
+
+    if not is_improvement_lanes_enabled():
+        return 0
+
+    transitioned = 0
+
+    # --- Class 1: ACTIVE lanes whose bound phase task is terminal/vanished ---
+    active_lanes = (
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.status == ImprovementLaneStatus.ACTIVE.value
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for lane in active_lanes:
+        stranded = False
+        if lane.current_task_id is None:
+            stranded = True
+        else:
+            task = await session.get(Task, lane.current_task_id)
+            if task is None or task.status in _LANE_TERMINAL_TASK_STATUSES:
+                stranded = True
+        if not stranded:
+            continue
+
+        # Bounded recovery: increment the requeue counter via the shared
+        # primitive, then either requeue-from-checkpoint (park, clearing the
+        # stale binding) while under budget or terminate once exhausted.
+        try:
+            _, should_requeue = await mark_checkpoint_missing(
+                session, lane.id, reason="stranded_terminal_task"
+            )
+            if should_requeue:
+                await cas_transition(
+                    session,
+                    lane.id,
+                    ImprovementLaneStatus.ACTIVE,
+                    ImprovementLaneStatus.PARKED,
+                    clear_task=True,
+                )
+                logger.info(
+                    "[WARM-POOL] reconciled stranded ACTIVE lane %s -> PARKED "
+                    "(requeue-from-checkpoint; phase_requeues=%d)",
+                    lane.id,
+                    lane.phase_requeues,
+                )
+            else:
+                await cas_transition(
+                    session,
+                    lane.id,
+                    ImprovementLaneStatus.ACTIVE,
+                    ImprovementLaneStatus.KILLED,
+                )
+                logger.info(
+                    "[WARM-POOL] reconciled stranded ACTIVE lane %s -> KILLED "
+                    "(requeue budget exhausted; phase_requeues=%d)",
+                    lane.id,
+                    lane.phase_requeues,
+                )
+                reserved = (
+                    (
+                        await session.execute(
+                            select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for member in reserved:
+                    member.reserved_lane_id = None
+                    member.reservation_expires_at = None
+                    member.reservation_hard_expires_at = None
+                    session.add(member)
+                    await record_lane_reservation_cause(
+                        session, lane.id, "force_expired"
+                    )
+            transitioned += 1
+        except LaneCASError as exc:
+            # Concurrent maintainer/sweep tick already transitioned this lane —
+            # the loser no-ops rather than double-killing.
+            logger.debug("[WARM-POOL] stranded-lane CAS miss lane=%s: %s", lane.id, exc)
+
+    # --- Class 2: stale PROPOSED lanes whose activation never completed ---
+    stale_seconds = int(
+        runtime_config.get(
+            "improvement_lane_proposed_stale_seconds",
+            _PROPOSED_STALE_SECONDS_DEFAULT,
+        )
+        or _PROPOSED_STALE_SECONDS_DEFAULT
+    )
+    proposed_cutoff = now - timedelta(seconds=stale_seconds)
+    stale_proposed = (
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.status == ImprovementLaneStatus.PROPOSED.value,
+                    ImprovementLane.created_at < proposed_cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for lane in stale_proposed:
+        try:
+            await cas_transition(
+                session,
+                lane.id,
+                ImprovementLaneStatus.PROPOSED,
+                ImprovementLaneStatus.KILLED,
+            )
+            transitioned += 1
+            logger.info(
+                "[WARM-POOL] aged stale PROPOSED lane %s -> KILLED "
+                "(created_at=%s, threshold=%ds)",
+                lane.id,
+                lane.created_at,
+                stale_seconds,
+            )
+        except LaneCASError as exc:  # noqa: PERF203 — CAS miss per lane is intentional
+            logger.debug(
+                "[WARM-POOL] stale-PROPOSED CAS miss lane=%s: %s", lane.id, exc
+            )
+
+    # --- Class 3: PARKED lanes whose entire chain is terminal with no live tasks ---
+    # retire_chain_lane is only called from review_pipeline.py guard paths (on the
+    # NEXT spawn attempt). If the chain ends for any reason (merged PR, cancelled
+    # task, operator kill, best-effort retire threw and was swallowed) and no further
+    # spawn occurs, the lane stays PARKED indefinitely. Detect this by finding
+    # PARKED lanes older than a threshold that have NO non-terminal chain tasks.
+    # A lane is safe to retire when zero tasks carry its lane ID in a live
+    # (non-terminal) status — regardless of what spawn_reason the last terminal
+    # task carried. A lane that still has an active/queued chain task is legitimately
+    # awaiting its fix and must NOT be retired.
+    parked_stale_seconds = int(
+        runtime_config.get(
+            "improvement_lane_parked_terminal_stale_seconds",
+            3600,
+        )
+        or 3600
+    )
+    parked_cutoff = now - timedelta(seconds=parked_stale_seconds)
+
+    stale_parked = (
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.status == ImprovementLaneStatus.PARKED.value,
+                    ImprovementLane.parked_at < parked_cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for lane in stale_parked:
+        lane_id_str = str(lane.id)
+        # Find non-terminal tasks belonging to this lane's chain. Use Python-side
+        # context filtering to stay dialect-agnostic (SQLite / Postgres).
+        # If any non-terminal task references this lane, the chain is still live.
+        live_tasks = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == lane.project_id,
+                        Task.status.notin_(list(_LANE_TERMINAL_TASK_STATUSES)),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        chain_is_live = any(
+            (t.context or {}).get("_review_fix_lane_id") == lane_id_str
+            for t in live_tasks
+        )
+        if chain_is_live:
+            continue
+        try:
+            await cas_transition(
+                session,
+                lane.id,
+                ImprovementLaneStatus.PARKED,
+                ImprovementLaneStatus.RETIRED,
+            )
+            logger.info(
+                "[WARM-POOL] retired stale PARKED lane %s -> RETIRED "
+                "(no live chain tasks; parked_at=%s)",
+                lane.id,
+                lane.parked_at,
+            )
+            reserved = (
+                (
+                    await session.execute(
+                        select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for member in reserved:
+                member.reserved_lane_id = None
+                member.reservation_expires_at = None
+                member.reservation_hard_expires_at = None
+                session.add(member)
+                await record_lane_reservation_cause(session, lane.id, "force_expired")
+            transitioned += 1
+        except LaneCASError as exc:
+            logger.debug(
+                "[WARM-POOL] stale-PARKED retirement CAS miss lane=%s: %s", lane.id, exc
+            )
+
+    if transitioned:
+        await session.commit()
+    return transitioned
 
 
 async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
@@ -1261,15 +1587,19 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     sweep or the maintainer) wins the claim is the only one that tears the member
     down; the loser no-ops.
     """
-    # Lane-budget sweep runs independently of warm_pool_enabled so that
+    # Lane reconciliation sweeps run independently of warm_pool_enabled so that
     # shadow-lane mode (improvement_lanes_enabled=True, warm_pool_enabled=False)
-    # still closes over-budget lanes instead of leaving them ACTIVE forever.
+    # still closes stranded/over-budget lanes instead of leaving them ACTIVE or
+    # PROPOSED forever. The budget sweep runs first so any ACTIVE lane already
+    # over its phase_requeues budget is KILLED before the stranded-lane sweep
+    # scans ACTIVE rows (avoiding a redundant second look at the same lane).
     await sweep_exhausted_lane_budgets(session)
+    await sweep_stranded_lanes(session, now, runtime_config=runtime_config)
 
     if not is_warm_pool_enabled():
         return 0
 
-    from app.warm_vm_state import is_vm_alive
+    from app.warm_vm_state import is_pool_vm_alive
 
     idle_ttl = int(runtime_config.get("warm_pool_idle_ttl_seconds", 1800) or 1800)
     hb_stale = int(runtime_config.get("warm_pool_heartbeat_stale_seconds", 300) or 300)
@@ -1295,52 +1625,151 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     stale_vm_ids = await _stale_pool_image_ids()
     idle_cutoff = now - timedelta(seconds=idle_ttl)
 
-    # --- Pass 1: clear EXPIRED lane reservations on IDLE members ---
-    # A reservation that has outlived its TTL is cleared so the member rejoins
-    # the general pool. The reserved idle cost is settled to the fleet ledger
-    # (PoolIdleSpan via settle_pool_vm_idle_cost) AND attributed to the lane's
-    # reserved_idle_cost_usd_total so warm-park overhead is visible in lane
-    # rollups. This is a soft mutation (no reaping, member stays IDLE).
+    # --- Pass 1: liveness-aware lane-reservation sweep on IDLE members ---
+    # A reservation whose SOFT TTL has lapsed is examined. The legacy behavior
+    # (always clear on soft expiry) surrendered the warm member mid-review and
+    # made the review-fix lane pilot un-measurable. Now the soft TTL is RE-STAMPED
+    # forward (the member stays reserved) while the owning lane is still PARKED
+    # awaiting its fix and the HARD absolute ceiling has not elapsed; otherwise the
+    # reservation is cleared and the member rejoins the general pool. In all cases
+    # accrued reserved-idle cost is settled to the fleet ledger (PoolIdleSpan via
+    # settle_pool_vm_idle_cost) AND attributed to the lane's
+    # reserved_idle_cost_usd_total so warm-park overhead stays visible in lane
+    # rollups. Every mutation is a soft one (no reaping, member stays IDLE) under a
+    # FOR UPDATE row re-check so a liveness read can never open a TOCTOU window.
     from app.efficiency_snapshot import settle_pool_vm_idle_cost
+    from app.improvement_lane_ops import _TERMINAL_STATUSES
+    from app.models import ImprovementLaneStatus
     from app.runtime_config_state import is_improvement_lanes_enabled
+    from app.warm_pool import record_lane_reservation_cause
 
-    expired_reserved = list(
+    soft_ttl = int(
+        runtime_config.get("warm_pool_lane_reservation_ttl_seconds", 1800) or 1800
+    )
+
+    expired_reserved_candidates = list(
         (
             await session.execute(
-                select(PoolVm).where(
+                select(
+                    PoolVm.id,
+                    PoolVm.vm_instance_id,
+                    PoolVm.reserved_lane_id,
+                    PoolVm.reservation_expires_at,
+                ).where(
                     PoolVm.state == PoolVmState.IDLE,
                     PoolVm.reserved_lane_id.isnot(None),
                     PoolVm.reservation_expires_at.isnot(None),
                     PoolVm.reservation_expires_at <= now,
                 )
             )
-        )
-        .scalars()
-        .all()
+        ).all()
     )
-    for member in expired_reserved:
-        lane_id = member.reserved_lane_id
-        # Settle idle cost for the fleet ledger; this also advances idle_since
-        # to `now` so the same span is never billed twice.
-        accrued = settle_pool_vm_idle_cost(member, now=now, session=session)
-        member.reserved_lane_id = None
-        member.reservation_expires_at = None
-        session.add(member)
-        # Attribute the reserved-idle cost to the lane (additional write).
-        if accrued > 0 and lane_id is not None and is_improvement_lanes_enabled():
+    cleared_expired_reservations = 0
+    extended_reservations = 0
+    for member_id, vm_instance_id, lane_id, expires_at in expired_reserved_candidates:
+        locked_member = (
+            (
+                await session.execute(
+                    select(PoolVm)
+                    .where(
+                        PoolVm.id == member_id,
+                        PoolVm.state == PoolVmState.IDLE,
+                        PoolVm.reserved_lane_id == lane_id,
+                        PoolVm.reservation_expires_at == expires_at,
+                        PoolVm.reservation_expires_at <= now,
+                    )
+                    .with_for_update(skip_locked=True)
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked_member is None:
+            continue
+
+        # Re-read liveness and the hard ceiling UNDER the row lock (no TOCTOU).
+        lane = None
+        if lane_id is not None and is_improvement_lanes_enabled():
             lane = await session.get(ImprovementLane, lane_id)
-            if lane is not None:
-                lane.reserved_idle_cost_usd_total = (
-                    lane.reserved_idle_cost_usd_total or 0.0
-                ) + accrued
-                session.add(lane)
+        # The chain is still legitimately awaiting its fix only while the lane is
+        # PARKED (a phase completed; the next/fix phase has not been dispatched).
+        # A terminal/missing/otherwise-non-PARKED lane is no longer awaiting a fix.
+        chain_awaiting_fix = (
+            lane is not None
+            and lane.status == ImprovementLaneStatus.PARKED.value
+            and lane.status not in _TERMINAL_STATUSES
+        )
+        hard_anchor = locked_member.reservation_hard_expires_at
+        hard_elapsed = hard_anchor is None or hard_anchor <= now
+
+        # Settle accrued reserved-idle cost on EVERY touch (extend or clear) and
+        # attribute it to the lane so reserved-idle spend stays honest regardless
+        # of how long the reservation is held.
+        accrued = settle_pool_vm_idle_cost(locked_member, now=now, session=session)
+        if lane is not None and accrued > 0:
+            lane.reserved_idle_cost_usd_total = (
+                lane.reserved_idle_cost_usd_total or 0.0
+            ) + accrued
+            session.add(lane)
+
+        if chain_awaiting_fix and not hard_elapsed:
+            # Liveness extension: keep the member reserved across the long review.
+            # Re-stamp the SOFT TTL forward (so the lease predicate still treats it
+            # as actively reserved and no general request can grab it), bounded by
+            # the hard ceiling which is never re-stamped. settle_pool_vm_idle_cost
+            # already reset idle_since to now, so the idle-TTL reaper won't age it
+            # out during the wait either.
+            extended_to = min(now + timedelta(seconds=soft_ttl), hard_anchor)
+            locked_member.reservation_expires_at = extended_to
+            session.add(locked_member)
+            extended_reservations += 1
+            logger.debug(
+                "[WARM-POOL] extended lane reservation vm=%s lane=%s -> %s "
+                "(hard ceiling %s)",
+                locked_member.vm_instance_id,
+                lane_id,
+                extended_to,
+                hard_anchor,
+            )
+            continue
+
+        # Clear: either the hard ceiling forced release (pool-capacity protection)
+        # or the chain is no longer awaiting its fix. Classify the cause so a low
+        # warm_resume_fraction is diagnosable on the lanes surface.
+        cause = (
+            "force_expired"
+            if hard_elapsed and hard_anchor is not None
+            else ("expired_before_fix")
+        )
+        locked_member.reserved_lane_id = None
+        locked_member.reservation_expires_at = None
+        locked_member.reservation_hard_expires_at = None
+        session.add(locked_member)
+        cleared_expired_reservations += 1
+        # Correct workspace state: the lane's WARM_RESERVED claim is no longer
+        # valid — degrade to COLD (mirroring Pass 2's reaped-member degradation)
+        # so the lane's next phase cold-preps, and record the expiry cause.
+        if lane is not None:
+            if await clear_lane_warm_workspace_if_matching_member(
+                session,
+                lane_id,
+                vm_instance_id,
+            ):
+                logger.debug(
+                    "[WARM-POOL] expired reservation vm=%s — degraded lane %s to COLD",
+                    locked_member.vm_instance_id,
+                    lane_id,
+                )
+            await record_lane_reservation_cause(session, lane_id, cause)
         logger.debug(
-            "[WARM-POOL] cleared expired lane reservation vm=%s lane=%s accrued=$%.4f",
-            member.vm_instance_id,
+            "[WARM-POOL] cleared lane reservation vm=%s lane=%s cause=%s accrued=$%.4f",
+            locked_member.vm_instance_id,
             lane_id,
+            cause,
             accrued,
         )
-    if expired_reserved:
+    if cleared_expired_reservations or extended_reservations:
         await session.commit()
 
     # --- Pass 2: main reaper loop ---
@@ -1387,6 +1816,10 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
         if member is None:
             continue  # retired/deleted by a peer since the lock-free scan
         reason: str | None = None
+        # Captures the id of a QUEUED task whose warm-pool pin must be cleared
+        # after the owning member is reclaimed (so the orchestrator can cold-
+        # dispatch the task). Set only for the QUEUED-pin LEASED reclaim path.
+        _queued_warm_pin_task_id: uuid.UUID | None = None
         if member.state == PoolVmState.RETIRING:
             # Stuck mid-teardown from a prior interrupted sweep — finish it.
             reason = "pool_retiring_cleanup"
@@ -1395,17 +1828,20 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
             # handoff; once it passes, a still-LEASED member is reclaimable ONLY
             # when BOTH (a) its leased task already reached a terminal state (or
             # vanished) — the lease is fulfilled/void — AND (b) its VM is no longer
-            # heartbeating, so we never tear down a VM that is still running its
-            # task OR was deferred and reused for fresh backlog work (the pool/
-            # backlog-reuse intersection). When LEASED rows are never reclaimed a
-            # completed/failed member stays LEASED forever, keeps counting as a
-            # live pool member, and the pool self-exhausts (replenishment halts
-            # once phantom LEASED rows saturate the budget). Reading lease_expires_at
-            # here is the expiry/reclaim path the lease write was always for.
+            # heartbeating (in-memory OR durable stamp), so we never tear down a VM
+            # that is still running its task OR was deferred and reused for fresh
+            # backlog work (the pool/backlog-reuse intersection). When LEASED rows
+            # are never reclaimed a completed/failed member stays LEASED forever,
+            # keeps counting as a live pool member, and the pool self-exhausts
+            # (replenishment halts once phantom LEASED rows saturate the budget).
+            # Reading lease_expires_at here is the expiry/reclaim path the lease
+            # write was always for.
             if (
                 member.lease_expires_at is not None
                 and member.lease_expires_at < now
-                and not is_vm_alive(member.vm_instance_id, max_age_seconds=hb_stale)
+                and not is_pool_vm_alive(
+                    member.vm_instance_id, member.last_heartbeat_at, hb_stale
+                )
             ):
                 leased_task = (
                     await session.get(Task, member.leased_task_id)
@@ -1429,18 +1865,45 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                     TaskStatus.FAILED,
                     TaskStatus.CANCELLED,
                     TaskStatus.EVALUATING,
+                    # BLOCKED/PARKED tasks relinquish their VM — the pool member
+                    # must be reclaimed as a durable backstop in case the proactive
+                    # park/block retire path failed (e.g. pool was disabled at park
+                    # time, or the member was never in LEASED state to begin with).
+                    TaskStatus.BLOCKED,
+                    TaskStatus.PARKED,
                 ):
                     reason = "pool_lease_orphaned"
+                elif leased_task.status == TaskStatus.QUEUED and (
+                    leased_task.context or {}
+                ).get(WARM_POOL_PIN_KEY):
+                    # Handoff window expired, VM is dead, but the task never
+                    # claimed its warm slot — it is still QUEUED with a pin
+                    # pointing at this dead member. Reclaim the member and clear
+                    # the warm-pool pin so the orchestrator can cold-dispatch.
+                    reason = "pool_lease_orphaned"
+                    _queued_warm_pin_task_id = leased_task.id
         elif is_pool_vm_image_stale(member, stale_vm_ids):
             reason = "pool_stale_image"
         elif (
             member.state == PoolVmState.IDLE
             and member.idle_since is not None
             and member.idle_since < idle_cutoff
+            # An actively-reserved member (reservation not yet expired) is being
+            # held for a lane's fix across a long review — do NOT idle-TTL-reap it
+            # out from under the reservation. Pass 1 above re-stamps the soft TTL
+            # while the lane stays alive (bounded by the hard ceiling), so once the
+            # hard ceiling elapses Pass 1 clears the reservation and the member
+            # becomes idle-TTL-reapable on the next sweep. Pool capacity is still
+            # protected: the hard ceiling always wins.
+            and not (
+                member.reserved_lane_id is not None
+                and member.reservation_expires_at is not None
+                and member.reservation_expires_at > now
+            )
         ):
             reason = "pool_idle_ttl"
-        elif zombie_teardown_armed and not is_vm_alive(
-            member.vm_instance_id, max_age_seconds=hb_stale
+        elif zombie_teardown_armed and not is_pool_vm_alive(
+            member.vm_instance_id, member.last_heartbeat_at, hb_stale
         ):
             # Zombie: no heartbeat within the liveness window. Guarded with an
             # idle_since/created_at grace so a member still booting (just
@@ -1464,16 +1927,47 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                 session, member, reason=reason, claim_grace_seconds=claim_grace
             ):
                 retired += 1
+                # Clear the warm-pool pin from a QUEUED task whose handoff window
+                # expired so the orchestrator can cold-dispatch it instead of
+                # waiting indefinitely for a dead VM to claim it.
+                if _queued_warm_pin_task_id is not None:
+                    fresh_queued = await session.get(Task, _queued_warm_pin_task_id)
+                    if (
+                        fresh_queued is not None
+                        and fresh_queued.status == TaskStatus.QUEUED
+                    ):
+                        ctx = dict(fresh_queued.context or {})
+                        ctx.pop("warm_target_vm_id", None)
+                        ctx.pop(WARM_POOL_PIN_KEY, None)
+                        fresh_queued.context = ctx
+                        flag_modified(fresh_queued, "context")
+                        session.add(fresh_queued)
+                        await session.commit()
+                        logger.info(
+                            "[WARM-POOL] cleared warm-pool pin from QUEUED task %s "
+                            "(orphaned lease on vm %s reclaimed; "
+                            "task restored to cold-dispatch queue)",
+                            _queued_warm_pin_task_id,
+                            vm_id,
+                        )
                 # Affinity degradation: reaping a reserved member breaks the
                 # lane's workspace continuity. Silently degrade so the lane's
                 # next resume cold-preps rather than waiting on a VM that is
                 # gone. Affinity is an OPTIMIZATION, never a correctness dep.
                 if reserved_lane_id is not None and is_improvement_lanes_enabled():
                     try:
+                        from app.warm_pool import record_lane_reservation_cause
+
                         lane = await session.get(ImprovementLane, reserved_lane_id)
-                        if lane is not None and lane.workspace_state != "COLD":
-                            lane.workspace_state = "COLD"
-                            session.add(lane)
+                        if lane is not None:
+                            if lane.workspace_state != "COLD":
+                                lane.workspace_state = "COLD"
+                                session.add(lane)
+                            # The warm member vanished before the fix could claim
+                            # it — a forced release of the reservation.
+                            await record_lane_reservation_cause(
+                                session, reserved_lane_id, "force_expired"
+                            )
                             await session.commit()
                             logger.info(
                                 "[WARM-POOL] reserved member %s reaped (reason=%s) — "

@@ -189,9 +189,7 @@ async def update_design_doc(
             if project
             else {}
         )
-        value = await ground_design_doc_value(
-            value, payload.key, **verification_kwargs
-        )
+        value = await ground_design_doc_value(value, payload.key, **verification_kwargs)
         return {"key": payload.key, "value": value}
 
     if not payload.key or not isinstance(payload.key, str):
@@ -232,7 +230,7 @@ async def update_design_doc(
             file_to_system_map: dict[str, str] = {}
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
-                    sys_id = doc_key[len("systems/"):]
+                    sys_id = doc_key[len("systems/") :]
                     for fpath in doc_val.get("modules", []):
                         if isinstance(fpath, str):
                             file_to_system_map[fpath] = sys_id
@@ -244,7 +242,7 @@ async def update_design_doc(
             file_to_system_deleted_map: dict[str, str] = {}
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
-                    sys_id = doc_key[len("systems/"):]
+                    sys_id = doc_key[len("systems/") :]
                     for fpath in doc_val.get("modules", []):
                         if isinstance(fpath, str):
                             file_to_system_deleted_map[fpath] = sys_id
@@ -322,7 +320,7 @@ async def update_playbook(
                 pending_source = v.get("pending_source")
                 if pending_source and pending_source != my_id:
                     continue
-            keys.append(k[len("playbook/"):])
+            keys.append(k[len("playbook/") :])
         return {"status": "ok", "op": op, "keys": keys}
 
     if op == "get":
@@ -338,7 +336,7 @@ async def update_playbook(
                 pending_source = v.get("pending_source")
                 if pending_source and pending_source != my_id:
                     continue
-                short_key = k[len("playbook/"):]
+                short_key = k[len("playbook/") :]
                 entries[short_key] = {
                     "content": v.get("content", ""),
                     "updated_at": v.get("updated_at", ""),
@@ -1279,18 +1277,20 @@ async def strategic_operation(
         challenge_verdict = "missing"
         challenge_rationale = ""
         if isinstance(challenge_record, dict):
-            challenge_status = str(
-                challenge_record.get("status", "invalid") or "invalid"
-            ).strip().lower()
+            challenge_status = (
+                str(challenge_record.get("status", "invalid") or "invalid")
+                .strip()
+                .lower()
+            )
             challenge_verdict = "missing_approval"
             for item in challenge_record.get("retirement_approvals") or []:
                 if not isinstance(item, dict):
                     continue
                 if str(item.get("direction_id", "")).strip() != str(dir_id).strip():
                     continue
-                challenge_verdict = str(
-                    item.get("verdict", "missing") or "missing"
-                ).strip().lower()
+                challenge_verdict = (
+                    str(item.get("verdict", "missing") or "missing").strip().lower()
+                )
                 challenge_rationale = str(item.get("rationale", "")).strip()[
                     :STRATEGIC_RATIONALE_MAX
                 ]
@@ -1434,9 +1434,7 @@ async def strategic_operation(
         # the fleet fans out across, so retiring below the healthy floor caps max
         # parallelism and leaves VM capacity idle. ``directions`` already reflects
         # this retire (the row was flipped to "expired" above).
-        _active_after = sum(
-            1 for d in directions if d.get("status") == "active"
-        )
+        _active_after = sum(1 for d in directions if d.get("status") == "active")
         if _active_after < MIN_HEALTHY_ACTIVE_DIRECTIONS:
             warnings.append(
                 f"Only {_active_after} active direction(s) remain after this "
@@ -1610,7 +1608,8 @@ async def strategic_operation(
             "_strategic_proposals_approved": ctx.get("_strategic_proposals_approved", 0)
             + 1,
             "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
-            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", [])) + [dir_id],
+            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))
+            + [dir_id],
             "_strategic_api_called": True,
         }
         flag_modified(task, "context")
@@ -1671,24 +1670,32 @@ async def strategic_operation(
             rejected.append(tombstone)
             rejected = rejected[-20:]
             remaining = non_rejected + rejected
-        # Cancel QUEUED tasks tied to this direction (same as the user DELETE flow)
-        cancelled_result = await session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.status == TaskStatus.QUEUED,
-                Task.context["direction_id"].as_string() == dir_id,
-            )
-        )
-        cancelled_tasks = cancelled_result.scalars().all()
         vm_ids_to_delete: List[str] = []
-        for t in cancelled_tasks:
-            t.status = TaskStatus.CANCELLED
-            t.latest_status_message = (
-                f"Cancelled: proposal {dir_id} was rejected by strategic review"
+        cancelled_count = 0
+        while True:
+            cancelled_result = await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.status == TaskStatus.QUEUED,
+                    Task.context["direction_id"].as_string() == dir_id,
+                )
+                .order_by(Task.created_at.asc(), Task.id.asc())
+                .limit(5000)
             )
-            session.add(t)
-            if t.vm_instance_id:
-                vm_ids_to_delete.append(t.vm_instance_id)
+            cancelled_tasks = cancelled_result.scalars().all()
+            if not cancelled_tasks:
+                break
+            for t in cancelled_tasks:
+                t.status = TaskStatus.CANCELLED
+                t.latest_status_message = (
+                    f"Cancelled: proposal {dir_id} was rejected by strategic review"
+                )
+                session.add(t)
+                if t.vm_instance_id:
+                    vm_ids_to_delete.append(t.vm_instance_id)
+            cancelled_count += len(cancelled_tasks)
+            await session.flush()
         _d = remaining
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
@@ -1697,7 +1704,8 @@ async def strategic_operation(
             "_strategic_proposals_rejected": ctx.get("_strategic_proposals_rejected", 0)
             + 1,
             "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1,
-            "_strategic_retired_ids": list(ctx.get("_strategic_retired_ids", [])) + [dir_id],
+            "_strategic_retired_ids": list(ctx.get("_strategic_retired_ids", []))
+            + [dir_id],
             "_strategic_api_called": True,
         }
         flag_modified(task, "context")
@@ -1707,6 +1715,7 @@ async def strategic_operation(
             # Lazy import avoids a circular dependency: main.py includes this
             # router, and _ensure_vm_deleted is defined in main.py.
             from app.vm_lifecycle import _ensure_vm_deleted as _main_ensure_vm_deleted
+
             await _main_ensure_vm_deleted(vm_id, reason="proposal_rejected")
         await _emit_updated(
             STRATEGIC_KIND_DIRECTIONS,
@@ -1714,14 +1723,14 @@ async def strategic_operation(
             changed_count=1,
         )
         logger.info(
-            f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {len(cancelled_tasks)} tasks)"
+            f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {cancelled_count} tasks)"
         )
         return _resp(
             {
                 "status": "ok",
                 "op": "reject_direction",
                 "direction_id": dir_id,
-                "cancelled_tasks": len(cancelled_tasks),
+                "cancelled_tasks": cancelled_count,
             }
         )
 
@@ -1749,9 +1758,7 @@ async def strategic_operation(
         # unambiguously absent. Best-effort — indeterminate never flags, never
         # fails message creation. (project is already locked above.)
         if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
-            warning = await _compute_message_citation_warning(
-                session, project, content
-            )
+            warning = await _compute_message_citation_warning(session, project, content)
             if warning:
                 msg_ctx = {**msg_ctx, "_provenance_warnings": warning}
         new_msg = ProjectMessage(
@@ -1797,6 +1804,7 @@ async def strategic_operation(
             is_bug_class as _is_bug_class,
             link_message_to_outcome as _link_message_to_outcome,
         )
+
         if _is_bug_class(msg) and (owned_by_direction or owned_by_task_id):
             # Bug-class message with ownership info: record forward link and move
             # to 'linked' state. Terminal 'resolved' happens when outcome lands.
@@ -2168,10 +2176,14 @@ async def strategic_operation(
                 _consolidated, project.capability_proof_records
             )
             flag_modified(project, "capability_proof_records")
-            if not isinstance(getattr(project, "capability_adoption_verdicts", None), dict):
+            if not isinstance(
+                getattr(project, "capability_adoption_verdicts", None), dict
+            ):
                 project.capability_adoption_verdicts = {}
-            project.capability_adoption_verdicts = carry_adoption_verdicts_for_consolidation(
-                _consolidated, project.capability_adoption_verdicts
+            project.capability_adoption_verdicts = (
+                carry_adoption_verdicts_for_consolidation(
+                    _consolidated, project.capability_adoption_verdicts
+                )
             )
             flag_modified(project, "capability_adoption_verdicts")
         session.add(project)
@@ -2698,6 +2710,149 @@ async def strategic_operation(
 
 
 # ---------------------------------------------------------------------------
+# Agent write op: audit finding resolution
+# ---------------------------------------------------------------------------
+
+# Task types that perform fix-first verification and are authorized to record
+# audit finding resolution state.
+_AUDIT_FINDING_RESOLUTION_TASK_TYPES: frozenset[str] = frozenset(
+    {
+        "release_audit",
+        "release_audit_challenge",
+        "research",
+        "strategic_review",
+    }
+)
+
+_VALID_RESOLUTION_STATES: frozenset[str] = frozenset({"resolved", "stale"})
+
+# Task types that carry a stable release_version_id in their context (stamped
+# at spawn time) and must be checked for version staleness before writing.
+_AUDIT_BOUND_VERSION_TASK_TYPES: frozenset[str] = frozenset(
+    {"release_audit", "release_audit_challenge"}
+)
+
+
+class AuditFindingResolutionOp(BaseModel):
+    task_id: uuid.UUID
+    finding_key: str
+    state: str  # 'resolved' | 'stale'
+    severity: str | None = None
+    note: str | None = None
+    resolving_ref: str | None = None
+    verified_against_sha: str | None = None
+
+
+@router.post("/api/agent/audit-finding-resolution")
+@limiter.limit("30/minute")
+async def agent_audit_finding_resolution(
+    request: Request,
+    payload: AuditFindingResolutionOp,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Agent endpoint to mark a release audit finding resolved or stale."""
+    if str(payload.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    if token.get("task_type") not in _AUDIT_FINDING_RESOLUTION_TASK_TYPES:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Task type '{token.get('task_type')}' is not authorized "
+                "for audit finding resolution"
+            ),
+        )
+
+    if payload.state not in _VALID_RESOLUTION_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid state '{payload.state}'; must be one of {sorted(_VALID_RESOLUTION_STATES)}",
+        )
+
+    if not payload.finding_key or len(payload.finding_key) > 64:
+        raise HTTPException(
+            status_code=400,
+            detail="finding_key is required and must be at most 64 characters",
+        )
+
+    task = await session.get(Task, payload.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    project = await _lock_project_or_429(session, task.project_id)
+
+    from app.release_version import current_open_version  # noqa: PLC0415
+
+    open_version = await current_open_version(session, project.id)
+    if open_version is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No open release version",
+        )
+
+    # release_audit and release_audit_challenge tasks carry a stable
+    # release_version_id in their context (stamped at spawn time).  Use that
+    # binding to attribute the resolution to the correct version, and reject
+    # the write if the task's bound version is no longer the open one — an
+    # older candidate must not mark findings resolved on a later open version.
+    task_type = token.get("task_type")
+    resolution_version_id = open_version.id
+    if task_type in _AUDIT_BOUND_VERSION_TASK_TYPES:
+        bound_str = (task.context or {}).get("release_version_id")
+        if bound_str:
+            try:
+                bound_id = uuid.UUID(bound_str)
+            except (ValueError, AttributeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid release_version_id in task context",
+                )
+            if bound_id != open_version.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Task is bound to release version {bound_id} "
+                        f"but the current open version is {open_version.id}; "
+                        "resolution rejected to prevent cross-version attribution"
+                    ),
+                )
+            resolution_version_id = bound_id
+
+    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415
+
+    await apply_finding_resolution(
+        session,
+        project.id,
+        resolution_version_id,
+        payload.finding_key,
+        payload.state,
+        severity=payload.severity,
+        note=payload.note,
+        resolving_ref=payload.resolving_ref,
+        verified_against_sha=payload.verified_against_sha,
+    )
+    await session.commit()
+
+    logger.info(
+        "[AUDIT_FINDING] task %s (%s) marked finding '%s' as '%s' "
+        "for project %s version %s",
+        task.id,
+        task_type or "?",
+        payload.finding_key,
+        payload.state,
+        project.id,
+        resolution_version_id,
+    )
+    return {
+        "status": "ok",
+        "finding_key": payload.finding_key,
+        "state": payload.state,
+        "release_version_id": str(resolution_version_id),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Admin read endpoint: build-config confirmed commands
 # ---------------------------------------------------------------------------
 
@@ -2745,4 +2900,24 @@ async def admin_get_build_config_commands(
                 "commands_stale": is_commands_stale(confirmed_at),
             }
         )
-    return {"project_id": str(project_id), "directories": result}
+
+    # Surface the bootstrap command-memory outcome recorded separately from the
+    # repo overview, so operators can distinguish a confirmed write-back from a
+    # bootstrap that produced an overview but failed to confirm/write commands.
+    # Absent on legacy projects (keys never stamped) -> command_memory is None.
+    cm_status = cfg.get("bootstrap_command_memory_status")
+    command_memory = None
+    if cm_status is not None:
+        command_memory = {
+            "status": cm_status,
+            "complete": cfg.get("bootstrap_command_memory_complete"),
+            "detail": cfg.get("bootstrap_command_memory_detail"),
+            "paths": cfg.get("bootstrap_command_memory_paths"),
+            "updated_at": cfg.get("bootstrap_command_memory_updated_at"),
+        }
+
+    return {
+        "project_id": str(project_id),
+        "directories": result,
+        "command_memory": command_memory,
+    }

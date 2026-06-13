@@ -24,10 +24,10 @@ from sqlalchemy.orm.attributes import flag_modified
 logger = logging.getLogger(__name__)
 
 # ── Default thresholds (configurable via config dict) ────────────────────────
-_DEFAULT_MIN_N_PER_ARM = 30          # minimum tasks per arm before deciding
-_DEFAULT_ADOPT_LIFT = 0.05           # lift >= this → adopt
-_DEFAULT_REJECT_LIFT = -0.03         # lift <= this → reject
-_DEFAULT_FUTILITY_N_MULTIPLIER = 3   # futility_n = min_n_per_arm * this
+_DEFAULT_MIN_N_PER_ARM = 30  # minimum tasks per arm before deciding
+_DEFAULT_ADOPT_LIFT = 0.05  # lift >= this → adopt
+_DEFAULT_REJECT_LIFT = -0.03  # lift <= this → reject
+_DEFAULT_FUTILITY_N_MULTIPLIER = 3  # futility_n = min_n_per_arm * this
 
 
 def _default_config() -> dict[str, Any]:
@@ -58,14 +58,16 @@ class TrialDefinition(_TrialDefinitionRequired, total=False):
 
 _LANE_PILOT_MIN_N = 30
 # KILL conditions
-_LANE_PILOT_KILL_MERGE_RATE_FLOOR = -0.03     # lift (lane_rate - control_rate) <= this
-_LANE_PILOT_KILL_COST_CEILING = 0.10          # cost-per-merged-PR >= +10% vs control
-_LANE_PILOT_KILL_GATE_VIOLATIONS_MAX = 3      # >= this → KILL + immediate operator alert
+_LANE_PILOT_KILL_MERGE_RATE_FLOOR = -0.03  # lift (lane_rate - control_rate) <= this
+_LANE_PILOT_KILL_COST_CEILING = 0.10  # cost-per-merged-PR >= +10% vs control
+_LANE_PILOT_KILL_GATE_VIOLATIONS_MAX = 3  # >= this → KILL + immediate operator alert
 _LANE_PILOT_KILL_CHECKPOINT_LOSS_CEILING = 0.05  # checkpoint-loss rate > this
-_LANE_PILOT_FUTILITY_N = 90                   # n per arm without reaching adopt → KILL
+_LANE_PILOT_FUTILITY_N = 90  # n per arm without reaching adopt → KILL
 # ADOPT conditions
-_LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR = -0.01   # merge-rate lift must exceed this (non-inferiority)
-_LANE_PILOT_ADOPT_COST_IMPROVEMENT = 0.05    # cost-per-merged-PR must improve >= this
+_LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR = (
+    -0.01
+)  # merge-rate lift must exceed this (non-inferiority)
+_LANE_PILOT_ADOPT_COST_IMPROVEMENT = 0.05  # cost-per-merged-PR must improve >= this
 # Engagement guard: futility KILL is suppressed when warm-resume engagement is below
 # this fraction among lane-arm fix tasks.  A trial that never exercised warm-resume
 # cannot produce a valid futility verdict — the treatment was never delivered.
@@ -73,7 +75,7 @@ _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT = 0.50
 
 # ── Canonical exported keys (downstream pilot-wiring subtask imports these) ──
 LANE_PILOT_CAP_NAME = "review_fix_lane"
-LANE_PILOT_ASSIGNMENT_KEY = "_review_fix_lane_arm"        # intent-to-treat arm key
+LANE_PILOT_ASSIGNMENT_KEY = "_review_fix_lane_arm"  # intent-to-treat arm key
 LANE_PILOT_WARM_RESUME_RECEIPT_KEY = "_review_fix_warm_resume"
 LANE_PILOT_CHECKPOINT_RECEIPT_KEY = "_review_fix_checkpoint"
 
@@ -84,14 +86,22 @@ _SUFFICIENT_DATA_CONTINUE_REASONS = frozenset({"ambiguous_lift", "receipt_only_t
 
 class LanePilotAggregates(TypedDict, total=False):
     """Per-arm aggregate statistics consumed by evaluate_lane_pilot_verdict."""
+
     n_lane: int
     n_control: int
     lane_merge_rate: float | None
     control_merge_rate: float | None
     lane_cost_per_merged: float | None
     control_cost_per_merged: float | None
+    lane_runtime_cost_per_merged: float | None
+    control_runtime_cost_per_merged: float | None
+    lane_reserved_idle_cost_per_merged: float | None
+    control_reserved_idle_cost_per_merged: float | None
     gate_integrity_violations: int
     checkpoint_loss_rate: float | None
+    # Diagnostic counters for the attempt-level checkpoint-loss formula.
+    checkpoint_attempts_total: int
+    checkpoint_requeues_total: int
     # Treatment-engagement telemetry (optional; absent when no fix tasks yet).
     # warm_resume_fraction: fraction of lane-arm fix tasks that carried the
     #   warm-resume receipt (actually claimed a warm workspace).
@@ -100,6 +110,10 @@ class LanePilotAggregates(TypedDict, total=False):
     warm_resume_fraction: float | None
     checkpoint_fraction: float | None
     lane_fix_tasks_sampled: int
+    # Shadow-pilot arm count (pilot_arm="shadow"). Shadow arms are EXCLUDED from
+    # n_lane/n_control and from min_n threshold checks so they never influence
+    # KILL/ADOPT verdict decisions — they are observational only.
+    n_shadow: int
 
 
 def is_lane_pilot_arm_member(context: dict[str, Any]) -> str | None:
@@ -143,6 +157,10 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
     control_merge_rate = aggregates.get("control_merge_rate")
     lane_cost = aggregates.get("lane_cost_per_merged")
     control_cost = aggregates.get("control_cost_per_merged")
+    lane_runtime_cost = aggregates.get("lane_runtime_cost_per_merged")
+    control_runtime_cost = aggregates.get("control_runtime_cost_per_merged")
+    lane_reserved_idle_cost = aggregates.get("lane_reserved_idle_cost_per_merged")
+    control_reserved_idle_cost = aggregates.get("control_reserved_idle_cost_per_merged")
     gate_violations = int(aggregates.get("gate_integrity_violations") or 0)
     checkpoint_loss = aggregates.get("checkpoint_loss_rate")
     warm_resume_fraction = aggregates.get("warm_resume_fraction")
@@ -168,6 +186,10 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
         "control_merge_rate": control_merge_rate,
         "lane_cost_per_merged": lane_cost,
         "control_cost_per_merged": control_cost,
+        "lane_runtime_cost_per_merged": lane_runtime_cost,
+        "control_runtime_cost_per_merged": control_runtime_cost,
+        "lane_reserved_idle_cost_per_merged": lane_reserved_idle_cost,
+        "control_reserved_idle_cost_per_merged": control_reserved_idle_cost,
         "gate_integrity_violations": gate_violations,
         "checkpoint_loss_rate": checkpoint_loss,
         "warm_resume_fraction": warm_resume_fraction,
@@ -181,37 +203,77 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
 
     # ── KILL checks (ordered; first match wins) ───────────────────────────────
     if immediate_alert:
-        return {**base, "verdict": "KILL", "verdict_reason": "gate_integrity_violations_exceeded", "immediate_alert": True}
+        return {
+            **base,
+            "verdict": "KILL",
+            "verdict_reason": "gate_integrity_violations_exceeded",
+            "immediate_alert": True,
+        }
 
     if n_lane < _LANE_PILOT_MIN_N or n_control < _LANE_PILOT_MIN_N:
-        return {**base, "verdict": "CONTINUE", "verdict_reason": "insufficient_data", "immediate_alert": False}
+        return {
+            **base,
+            "verdict": "CONTINUE",
+            "verdict_reason": "insufficient_data",
+            "immediate_alert": False,
+        }
 
     if lane_merge_rate is not None and control_merge_rate is not None:
         merge_lift = lane_merge_rate - control_merge_rate
         if merge_lift <= _LANE_PILOT_KILL_MERGE_RATE_FLOOR:
-            return {**base, "verdict": "KILL", "verdict_reason": "lane_merge_rate_below_floor", "immediate_alert": False}
+            return {
+                **base,
+                "verdict": "KILL",
+                "verdict_reason": "lane_merge_rate_below_floor",
+                "immediate_alert": False,
+            }
 
     if lane_cost is not None and control_cost is not None and control_cost > 0:
         cost_delta = (lane_cost - control_cost) / control_cost
         if cost_delta >= _LANE_PILOT_KILL_COST_CEILING:
-            return {**base, "verdict": "KILL", "verdict_reason": "lane_cost_ceiling_exceeded", "immediate_alert": False}
+            return {
+                **base,
+                "verdict": "KILL",
+                "verdict_reason": "lane_cost_ceiling_exceeded",
+                "cost_delta_pct": round(cost_delta * 100, 2),
+                "immediate_alert": False,
+            }
 
-    if checkpoint_loss is not None and checkpoint_loss > _LANE_PILOT_KILL_CHECKPOINT_LOSS_CEILING:
-        return {**base, "verdict": "KILL", "verdict_reason": "checkpoint_loss_rate_exceeded", "immediate_alert": False}
+    if (
+        checkpoint_loss is not None
+        and checkpoint_loss > _LANE_PILOT_KILL_CHECKPOINT_LOSS_CEILING
+    ):
+        return {
+            **base,
+            "verdict": "KILL",
+            "verdict_reason": "checkpoint_loss_rate_exceeded",
+            "immediate_alert": False,
+        }
 
     adopt_criteria_met = (
-        lane_merge_rate is not None and control_merge_rate is not None
+        lane_merge_rate is not None
+        and control_merge_rate is not None
         and (lane_merge_rate - control_merge_rate) > _LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR
-        and lane_cost is not None and control_cost is not None and control_cost > 0
-        and (control_cost - lane_cost) / control_cost >= _LANE_PILOT_ADOPT_COST_IMPROVEMENT
+        and lane_cost is not None
+        and control_cost is not None
+        and control_cost > 0
+        and (control_cost - lane_cost) / control_cost
+        >= _LANE_PILOT_ADOPT_COST_IMPROVEMENT
         and gate_violations == 0
     )
-    if n_lane >= _LANE_PILOT_FUTILITY_N and n_control >= _LANE_PILOT_FUTILITY_N and not adopt_criteria_met:
+    if (
+        n_lane >= _LANE_PILOT_FUTILITY_N
+        and n_control >= _LANE_PILOT_FUTILITY_N
+        and not adopt_criteria_met
+    ):
         # Engagement guard: if the treatment was never delivered (warm-resume
         # engagement below threshold), futility cannot be concluded — the trial
         # accrued arm counts without the treatment actually running.  Emit
         # CONTINUE so the operator can diagnose the infrastructure gap.
-        if warm_resume_fraction is not None and warm_resume_fraction < _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT:
+        if (
+            warm_resume_fraction is not None
+            and warm_resume_fraction < _LANE_PILOT_FUTILITY_MIN_ENGAGEMENT
+        ):
             return {
                 **base,
                 "verdict": "CONTINUE",
@@ -219,13 +281,28 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
                 "immediate_alert": True,
                 "engagement_low": True,
             }
-        return {**base, "verdict": "KILL", "verdict_reason": "futility_at_max_n", "immediate_alert": False}
+        return {
+            **base,
+            "verdict": "KILL",
+            "verdict_reason": "futility_at_max_n",
+            "immediate_alert": False,
+        }
 
     # ── ADOPT check ───────────────────────────────────────────────────────────
     if adopt_criteria_met:
-        return {**base, "verdict": "ADOPT", "verdict_reason": "adopt_criteria_met", "immediate_alert": False}
+        return {
+            **base,
+            "verdict": "ADOPT",
+            "verdict_reason": "adopt_criteria_met",
+            "immediate_alert": False,
+        }
 
-    return {**base, "verdict": "CONTINUE", "verdict_reason": "accumulating_data", "immediate_alert": False}
+    return {
+        **base,
+        "verdict": "CONTINUE",
+        "verdict_reason": "accumulating_data",
+        "immediate_alert": False,
+    }
 
 
 TRIAL_DEFINITIONS: list[TrialDefinition] = [
@@ -513,6 +590,172 @@ def record_trial_verdict(
         )
 
 
+async def raise_capability_verdict_notice(
+    session: Any,
+    project_id: Any,
+    cap_name: str,
+    prior_verdict: str | None,
+    new_verdict: str,
+    entry: dict[str, Any],
+) -> None:
+    """Record a durable operator notice when a capability trial transitions to a decided verdict.
+
+    Deduplicated on cap_name + new_verdict so a verdict reversal (adopt → reject)
+    fires a new notice while repeated re-evaluations of the same standing decided
+    verdict are silent.
+    """
+    from sqlalchemy import select
+
+    from app.models import MessageType, ProjectMessage
+
+    dedupe_key = f"capability_verdict_decided_{cap_name}_{new_verdict}"
+    existing = (
+        (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == "open",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    already = any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing)
+    if already:
+        return
+
+    lift = entry.get("lift")
+    n_with = entry.get("n_with")
+    n_without = entry.get("n_without")
+    verdict_reason = entry.get("verdict_reason", "")
+    transition_desc = (
+        f"{prior_verdict} → {new_verdict}"
+        if prior_verdict
+        else f"undecided → {new_verdict}"
+    )
+    content = (
+        f"[CAPABILITY-TRIAL] {cap_name} decided: {new_verdict} ({transition_desc}) "
+        f"reason={verdict_reason} lift={lift} n_with={n_with} n_without={n_without}"
+    )
+    session.add(
+        ProjectMessage(
+            project_id=project_id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=content,
+            context={
+                "event_type": "capability_verdict_decided",
+                "dedupe_key": dedupe_key,
+                "cap_name": cap_name,
+                "prior_verdict": prior_verdict,
+                "new_verdict": new_verdict,
+                "verdict_reason": verdict_reason,
+                "lift": lift,
+                "n_with": n_with,
+                "n_without": n_without,
+            },
+        )
+    )
+
+
+async def persist_trial_verdicts_in_transaction(
+    source_session: Any,
+    project_id: Any,
+    *,
+    pending_verdicts: list[tuple[str, dict[str, Any]]],
+    gate_alert_detail: str | None = None,
+) -> dict[str, Any]:
+    """Durably persist a batch of trial verdicts (and an optional gate alert).
+
+    Digest computation runs on read/request sessions that may be rolled back by
+    the caller after the response payload is built (the FastAPI session
+    dependency closes WITHOUT committing; the precompute path's commit is
+    contingent on the L2 cache write succeeding). Verdict recording and
+    gate-integrity alerts are durable controls, so — exactly like
+    ``apply_lane_pilot_kill_in_transaction`` — they must not depend on that
+    outer session committing.
+
+    This opens its OWN committing session, RE-FETCHES the project fresh inside
+    it (so ``record_trial_verdict``'s KILL-survival and insufficient-data
+    self-revert guards evaluate against current committed state, never a stale
+    early-fetched row), applies every pending verdict, raises the gate-integrity
+    alert when ``gate_alert_detail`` is provided, then commits. On any exception
+    it rolls back and re-raises.
+
+    Returns a snapshot dict of the project's adoption verdicts after the commit,
+    so callers can build a display payload that mirrors exactly what is durably
+    persisted (rather than what was naively computed).
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.database import resolve_async_engine
+    from app.models import Project
+
+    factory = async_sessionmaker(
+        resolve_async_engine(source_session),
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with factory() as session:
+        try:
+            project = await session.get(Project, project_id)
+            if project is None:
+                raise ValueError(
+                    f"Project {project_id} not found for durable trial-verdict persist"
+                )
+            for cap_name, entry in pending_verdicts:
+                prior_verdict = (
+                    (project.capability_adoption_verdicts or {}).get(cap_name) or {}
+                ).get("verdict")
+                record_trial_verdict(project, cap_name, entry)
+                actual_verdict = (
+                    (project.capability_adoption_verdicts or {}).get(cap_name) or {}
+                ).get("verdict")
+                if (
+                    actual_verdict in _DECIDED_VERDICTS
+                    and actual_verdict != prior_verdict
+                    and entry.get("evidence_source") != "strategic_review"
+                ):
+                    await raise_capability_verdict_notice(
+                        session,
+                        project_id,
+                        cap_name,
+                        prior_verdict,
+                        actual_verdict,
+                        entry,
+                    )
+                    try:
+                        from app.strategic_trigger import request_strategic_refresh
+
+                        await request_strategic_refresh(
+                            session,
+                            project_id,
+                            f"capability_verdict:{cap_name}:{actual_verdict}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[CAPABILITY_TRIAL] strategic refresh arm failed for "
+                            "%s verdict transition on project %s (non-fatal)",
+                            cap_name,
+                            project_id,
+                        )
+            if gate_alert_detail is not None:
+                # Lazy import to avoid an import cycle: review_fix_lane_pilot
+                # imports record_trial_verdict from this module.
+                from app.review_fix_lane_pilot import raise_gate_integrity_alert
+
+                await raise_gate_integrity_alert(
+                    session, project_id, detail=gate_alert_detail
+                )
+            await session.commit()
+            verdicts = get_trial_verdicts(project)
+            return dict(verdicts) if isinstance(verdicts, dict) else {}
+        except Exception:
+            await session.rollback()
+            raise
+
+
 def get_trial_verdicts(project: Any) -> dict[str, Any]:
     """Return the current adoption-verdict dict from a project, or empty dict."""
     verdicts = getattr(project, "capability_adoption_verdicts", None)
@@ -567,7 +810,9 @@ def carry_adoption_verdicts_for_consolidation(
                 abs_entry = adoption_verdicts.get(abs_name)
             if not isinstance(abs_entry, dict):
                 continue
-            if best_absorbed is None or _verdict_priority(abs_entry) > _verdict_priority(best_absorbed):
+            if best_absorbed is None or _verdict_priority(
+                abs_entry
+            ) > _verdict_priority(best_absorbed):
                 best_absorbed = abs_entry
 
         # Drop absorbed keys.

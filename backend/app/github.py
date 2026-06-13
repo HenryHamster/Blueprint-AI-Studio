@@ -655,7 +655,9 @@ async def commit_file_changes(
 
     # 1. Current branch tip commit.
     ref_resp = await _github_request(
-        "GET", f"{base}/git/ref/heads/{quote(branch, safe='')}", headers,
+        "GET",
+        f"{base}/git/ref/heads/{quote(branch, safe='')}",
+        headers,
         project_id=project_id,
     )
     tip_sha = _json(ref_resp, 200, "get-ref")["object"]["sha"]
@@ -670,7 +672,9 @@ async def commit_file_changes(
     tree_entries: list[dict] = []
     for path, content in upserts.items():
         blob_resp = await _github_request(
-            "POST", f"{base}/git/blobs", headers,
+            "POST",
+            f"{base}/git/blobs",
+            headers,
             json={"content": content, "encoding": "utf-8"},
             project_id=project_id,
         )
@@ -686,7 +690,9 @@ async def commit_file_changes(
 
     # 4. New tree on top of the existing base tree.
     tree_resp = await _github_request(
-        "POST", f"{base}/git/trees", headers,
+        "POST",
+        f"{base}/git/trees",
+        headers,
         json={"base_tree": base_tree_sha, "tree": tree_entries},
         project_id=project_id,
     )
@@ -694,7 +700,9 @@ async def commit_file_changes(
 
     # 5. Commit parented on the current tip.
     commit_create_resp = await _github_request(
-        "POST", f"{base}/git/commits", headers,
+        "POST",
+        f"{base}/git/commits",
+        headers,
         json={"message": message, "tree": new_tree_sha, "parents": [tip_sha]},
         project_id=project_id,
     )
@@ -702,7 +710,9 @@ async def commit_file_changes(
 
     # 6. Fast-forward the branch ref to the new commit.
     update_resp = await _github_request(
-        "PATCH", f"{base}/git/refs/heads/{quote(branch, safe='')}", headers,
+        "PATCH",
+        f"{base}/git/refs/heads/{quote(branch, safe='')}",
+        headers,
         json={"sha": new_commit_sha, "force": False},
         project_id=project_id,
     )
@@ -776,6 +786,8 @@ from app.github_refs import (  # noqa: F401
     get_commit_date,
     list_pull_requests_for_commit,
     is_ancestor_of,
+    list_recent_commit_messages,
+    check_squash_referenced,
     get_files_changed_between_refs,
     agent_image_rebake_expected,
     AGENT_IMAGE_BAKE_PATHS,

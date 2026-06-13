@@ -227,14 +227,22 @@ def _files(*paths: str) -> list[dict]:
     return [{"filename": p, "status": "added"} for p in paths]
 
 
+def _migration_file(path: str, revision: str, down_revision: str | None) -> dict:
+    """Create a pr_files entry for a migration file with a per-file patch."""
+    down = "None" if down_revision is None else f"'{down_revision}'"
+    src = (
+        f"revision = '{revision}'\ndown_revision = {down}\n\ndef upgrade():\n    pass\n"
+    )
+    body = "".join(f"+{line}\n" for line in src.splitlines())
+    return {"filename": path, "status": "added", "patch": f"@@ -0,0 +1,5 @@\n{body}"}
+
+
 async def test_guard_clean_rollup_ok():
-    diff = _added_file_diff("backend/alembic/versions/0124_a.py", "0124", "0123")
-    with (
-        patch(
-            "app.github.get_pr_files",
-            return_value=_files("backend/alembic/versions/0124_a.py"),
-        ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
+    with patch(
+        "app.github.get_pr_files",
+        return_value=[
+            _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123")
+        ],
     ):
         assert await _validate_rollup_migration_chain("t", "o", "r", 1) == ("ok", None)
 
@@ -242,43 +250,31 @@ async def test_guard_clean_rollup_ok():
 async def test_guard_no_migrations_ok_skips_diff():
     with (
         patch("app.github.get_pr_files", return_value=_files("backend/app/models.py")),
-        patch("app.github.get_pull_request_diff", side_effect=AssertionError) as diff_m,
+        patch("app.github.get_pull_request", side_effect=AssertionError) as pr_m,
     ):
         assert await _validate_rollup_migration_chain("t", "o", "r", 1) == ("ok", None)
-        diff_m.assert_not_called()
+        pr_m.assert_not_called()
 
 
 async def test_guard_duplicate_revision_blocks():
-    diff = _added_file_diff(
-        "backend/alembic/versions/0124_a.py", "0124", "0123"
-    ) + _added_file_diff("backend/alembic/versions/0124_b.py", "0124", "0123")
-    with (
-        patch(
-            "app.github.get_pr_files",
-            return_value=_files(
-                "backend/alembic/versions/0124_a.py",
-                "backend/alembic/versions/0124_b.py",
-            ),
-        ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
+    with patch(
+        "app.github.get_pr_files",
+        return_value=[
+            _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123"),
+            _migration_file("backend/alembic/versions/0124_b.py", "0124", "0123"),
+        ],
     ):
         status, reason = await _validate_rollup_migration_chain("t", "o", "r", 1)
     assert status == "block" and "duplicate" in reason.lower()
 
 
 async def test_guard_two_heads_blocks():
-    diff = _added_file_diff(
-        "backend/alembic/versions/0124_a.py", "0124", "0123"
-    ) + _added_file_diff("backend/alembic/versions/0125_b.py", "0125", "0123")
-    with (
-        patch(
-            "app.github.get_pr_files",
-            return_value=_files(
-                "backend/alembic/versions/0124_a.py",
-                "backend/alembic/versions/0125_b.py",
-            ),
-        ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
+    with patch(
+        "app.github.get_pr_files",
+        return_value=[
+            _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123"),
+            _migration_file("backend/alembic/versions/0125_b.py", "0125", "0123"),
+        ],
     ):
         status, reason = await _validate_rollup_migration_chain("t", "o", "r", 1)
     assert status == "block" and "head" in reason.lower()
@@ -286,13 +282,11 @@ async def test_guard_two_heads_blocks():
 
 async def test_guard_filename_revision_desync_blocks():
     # File 0125_x.py declares revision 0124 -> desync must BLOCK auto-merge.
-    diff = _added_file_diff("backend/alembic/versions/0125_x.py", "0124", "0123")
-    with (
-        patch(
-            "app.github.get_pr_files",
-            return_value=_files("backend/alembic/versions/0125_x.py"),
-        ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
+    with patch(
+        "app.github.get_pr_files",
+        return_value=[
+            _migration_file("backend/alembic/versions/0125_x.py", "0124", "0123")
+        ],
     ):
         status, reason = await _validate_rollup_migration_chain("t", "o", "r", 1)
     assert status == "block"
@@ -300,13 +294,18 @@ async def test_guard_filename_revision_desync_blocks():
     assert "0125" in reason and "0124" in reason
 
 
-async def test_guard_empty_diff_defers_failsafe():
+async def test_guard_missing_patch_defers_failsafe():
+    # A migration file with no per-file patch triggers the contents-API fallback;
+    # if that fallback also fails the guard must defer, never wave through.
     with (
         patch(
             "app.github.get_pr_files",
             return_value=_files("backend/alembic/versions/0124_a.py"),
         ),
-        patch("app.github.get_pull_request_diff", return_value=""),
+        patch(
+            "app.github.get_pull_request",
+            side_effect=RuntimeError("network error"),
+        ),
     ):
         status, reason = await _validate_rollup_migration_chain("t", "o", "r", 1)
     assert status == "defer" and reason
@@ -417,13 +416,13 @@ def test_validate_combined_empty_added_passes():
 
 async def test_guard_with_target_branch_clean_passes():
     """Guard passes when rollup migration correctly anchors to the target head."""
-    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
     with (
         patch(
             "app.github.get_pr_files",
-            return_value=_files("backend/alembic/versions/0137_new.py"),
+            return_value=[
+                _migration_file("backend/alembic/versions/0137_new.py", "0137", "0136")
+            ],
         ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
         patch(
             "app.github.list_versions_at_ref",
             return_value=["0135_one.py", "0136_prev.py"],
@@ -437,13 +436,13 @@ async def test_guard_with_target_branch_clean_passes():
 
 async def test_guard_with_target_branch_duplicate_blocks():
     """Guard blocks when the rollup adds a revision already on the target branch."""
-    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
     with (
         patch(
             "app.github.get_pr_files",
-            return_value=_files("backend/alembic/versions/0137_new.py"),
+            return_value=[
+                _migration_file("backend/alembic/versions/0137_new.py", "0137", "0136")
+            ],
         ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
         patch(
             "app.github.list_versions_at_ref",
             return_value=["0136_prev.py", "0137_existing.py"],
@@ -460,13 +459,13 @@ async def test_guard_with_target_branch_duplicate_blocks():
 async def test_guard_with_target_branch_stale_anchor_blocks():
     """Guard blocks when the rollup migration anchors to a stale down_revision."""
     # head is 0137 but rollup chains off 0136 (stale)
-    diff = _added_file_diff("backend/alembic/versions/0138_new.py", "0138", "0136")
     with (
         patch(
             "app.github.get_pr_files",
-            return_value=_files("backend/alembic/versions/0138_new.py"),
+            return_value=[
+                _migration_file("backend/alembic/versions/0138_new.py", "0138", "0136")
+            ],
         ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
         patch(
             "app.github.list_versions_at_ref",
             return_value=["0136_prev.py", "0137_other.py"],
@@ -481,13 +480,13 @@ async def test_guard_with_target_branch_stale_anchor_blocks():
 
 async def test_guard_with_target_branch_list_error_defers():
     """Guard defers (never waves through) when target branch listing fails."""
-    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
     with (
         patch(
             "app.github.get_pr_files",
-            return_value=_files("backend/alembic/versions/0137_new.py"),
+            return_value=[
+                _migration_file("backend/alembic/versions/0137_new.py", "0137", "0136")
+            ],
         ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
         patch(
             "app.github.list_versions_at_ref",
             side_effect=RuntimeError("network error"),
@@ -507,13 +506,13 @@ async def test_enforce_guard_clean_chain_allows_merge():
     """An ``ok`` verdict returns (True, None) — safe to merge."""
     from app.rollup_migration_validation import enforce_premerge_migration_guard
 
-    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
     with (
         patch(
             "app.github.get_pr_files",
-            return_value=_files("backend/alembic/versions/0137_new.py"),
+            return_value=[
+                _migration_file("backend/alembic/versions/0137_new.py", "0137", "0136")
+            ],
         ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
         patch(
             "app.github.list_versions_at_ref",
             return_value=["0135_one.py", "0136_prev.py"],
@@ -529,13 +528,13 @@ async def test_enforce_guard_dual_head_holds_merge():
     """A ``block`` verdict returns (False, reason) — do not merge."""
     from app.rollup_migration_validation import enforce_premerge_migration_guard
 
-    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
     with (
         patch(
             "app.github.get_pr_files",
-            return_value=_files("backend/alembic/versions/0137_new.py"),
+            return_value=[
+                _migration_file("backend/alembic/versions/0137_new.py", "0137", "0136")
+            ],
         ),
-        patch("app.github.get_pull_request_diff", return_value=diff),
         patch(
             "app.github.list_versions_at_ref",
             return_value=["0136_prev.py", "0137_existing.py"],
@@ -581,7 +580,9 @@ def test_plan_reconciliation_collision_renumbers_and_rechains():
     rev, down = parse_revision_identifiers(plan["new_source"])
     assert (rev, down) == ("0138", "0137")
     assert (
-        validate_combined_migration_chain(existing, {plan["new_path"]: plan["new_source"]})
+        validate_combined_migration_chain(
+            existing, {plan["new_path"]: plan["new_source"]}
+        )
         is None
     )
     # The single-migration plan also exposes the unified upserts/deletes shape:
@@ -673,9 +674,7 @@ def test_plan_reconciliation_multi_migration_collision_renumbers_full_tail_monot
     assert (tail_rev, tail_down) == ("0126", "0125")
     assert plan["expected_schema_revision"] == "0126"
     # The full reconciled added set revalidates clean against the target.
-    reconciled = {
-        p: s for p, s in added.items() if p not in plan["deletes"]
-    }
+    reconciled = {p: s for p, s in added.items() if p not in plan["deletes"]}
     reconciled.update(plan["upserts"])
     assert validate_combined_migration_chain(existing, reconciled) is None
     # Monotonicity property: the numeric-max revision IS the structural head.
@@ -729,9 +728,15 @@ def test_plan_reconciliation_fanout_returns_none():
     back-merge fan-out guard rejects."""
     existing = ["0136_prev.py", "0137_head.py"]
     added = {
-        "backend/alembic/versions/0137_c.py": _migration_src("0137", "0136"),  # root, collides
-        "backend/alembic/versions/0138_d.py": _migration_src("0138", "0137"),  # child A → head
-        "backend/alembic/versions/0139_e.py": _migration_src("0139", "0137"),  # child B → head
+        "backend/alembic/versions/0137_c.py": _migration_src(
+            "0137", "0136"
+        ),  # root, collides
+        "backend/alembic/versions/0138_d.py": _migration_src(
+            "0138", "0137"
+        ),  # child A → head
+        "backend/alembic/versions/0139_e.py": _migration_src(
+            "0139", "0137"
+        ),  # child B → head
     }
     assert plan_migration_reconciliation(existing, added) is None
 
@@ -934,11 +939,7 @@ def test_plan_integration_collision_linear_tail_renumbers_full_tail_monotonic():
     assert (e_rev, e_down) == ("0140", "0139")
     assert plan["expected_schema_revision"] == "0140"
     # The full reconciled integration set revalidates clean.
-    reconciled = {
-        p: s
-        for p, s in integration.items()
-        if p not in plan["deletes"]
-    }
+    reconciled = {p: s for p, s in integration.items() if p not in plan["deletes"]}
     reconciled.update(plan["upserts"])
     assert validate_combined_migration_chain(target, reconciled) is None
     # Monotonicity property: the numeric-max revision IS the structural head.
@@ -961,9 +962,7 @@ def test_plan_integration_tail_chain_is_monotonic():
     }
     plan = plan_integration_side_renumber(target, integration)
     assert plan is not None
-    reconciled = {
-        p: s for p, s in integration.items() if p not in plan["deletes"]
-    }
+    reconciled = {p: s for p, s in integration.items() if p not in plan["deletes"]}
     reconciled.update(plan["upserts"])
     reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
     # Every renumbered node points strictly downward to a lower revision number.

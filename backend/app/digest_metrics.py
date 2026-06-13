@@ -33,6 +33,7 @@ from app.models import (
     get_task_total_vm_cost_usd,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
+
 # Remediation funnel + recurring-failure-pattern helpers relocated to their own
 # module. Re-exported here so existing import paths are unchanged.
 from app.digest_remediation import (  # noqa: F401
@@ -75,6 +76,7 @@ from app.sr_review_quality_metrics import (  # noqa: F401
 from app.failure_classification import (
     AGENT_STALLED,
     AGENT_TIMEOUT,
+    APPROVED_CAP_PR_CLOSED,
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
     CODE_ERROR,
@@ -121,6 +123,7 @@ _FAILURE_CLASS_LABELS = {
     NO_PROGRESS_TIMEOUT: "No-Progress Timeout",
     PARK_WAKE_TIMEOUT: "Park/Wake — source never fired (timed out)",
     PARK_WAKE_STRANDED: "Park/Wake — stranded (no live wake registration)",
+    APPROVED_CAP_PR_CLOSED: "Approved Cap PR Closed — fix-loop cap hit post-approval",
 }
 
 _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5
@@ -157,7 +160,9 @@ def _compute_first_attempt_breakdowns(
     ]
     sample_size = len(measured)
 
-    _defs = trial_definitions if trial_definitions is not None else get_trial_definitions()
+    _defs = (
+        trial_definitions if trial_definitions is not None else get_trial_definitions()
+    )
     _min_lift_sample = 5
     trial_breakdowns: Dict[str, Any] = {}
     for _td in _defs:
@@ -168,7 +173,8 @@ def _compute_first_attempt_breakdowns(
         # pre-date the assignment field (i.e. _assign_key is absent).
         _assign_key = _td.get("assignment_key", _ctx_key)
         _with_arm = [
-            t for t in measured
+            t
+            for t in measured
             if (t.context or {}).get(_assign_key) is True
             or (
                 (t.context or {}).get(_assign_key) is None
@@ -176,7 +182,8 @@ def _compute_first_attempt_breakdowns(
             )
         ]
         _without_arm = [
-            t for t in measured
+            t
+            for t in measured
             if (t.context or {}).get(_assign_key) is False
             or (
                 (t.context or {}).get(_assign_key) is None
@@ -212,7 +219,9 @@ def _compute_first_attempt_breakdowns(
                 1 for t in _with_arm if (t.context or {}).get(_ctx_key) is True
             )
             _trial_entry["compliance"] = {
-                "with_rate": round(_receipt_true / _receipt_n, 2) if _receipt_n else None,
+                "with_rate": round(_receipt_true / _receipt_n, 2)
+                if _receipt_n
+                else None,
                 "without_rate": round((_receipt_n - _receipt_true) / _receipt_n, 2)
                 if _receipt_n
                 else None,
@@ -223,7 +232,11 @@ def _compute_first_attempt_breakdowns(
         tasks = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
         a = [t for t in tasks if (t.context or {}).get(flag) is True]
         b = [t for t in tasks if (t.context or {}).get(flag) is False]
-        return round(_fa_rate(a) - _fa_rate(b), 2) if len(a) >= 10 and len(b) >= 10 else None
+        return (
+            round(_fa_rate(a) - _fa_rate(b), 2)
+            if len(a) >= 10 and len(b) >= 10
+            else None
+        )
 
     playbook_lift = _lift("_had_playbook", measured)
     arch_context_lift = _lift("_had_arch_context", measured)
@@ -265,7 +278,9 @@ def _compute_first_attempt_breakdowns(
     if prev_terminal_tasks is not None:
         prev_playbook_lift = _lift("_had_playbook", prev_terminal_tasks)
         prev_arch_context_lift = _lift("_had_arch_context", prev_terminal_tasks)
-        playbook_lift_trend = _format_compliance_trend(playbook_lift, prev_playbook_lift)
+        playbook_lift_trend = _format_compliance_trend(
+            playbook_lift, prev_playbook_lift
+        )
         arch_context_lift_trend = _format_compliance_trend(
             arch_context_lift, prev_arch_context_lift
         )
@@ -391,9 +406,7 @@ async def compute_trial_arm_accumulation(
         )
         succ_expr = func.json_extract(Task.context, "$._first_attempt_succeeded")
         _assign_flag_expr = (
-            case((_primary_expr.is_not(None), 1), else_=0)
-            if _has_assignment
-            else None
+            case((_primary_expr.is_not(None), 1), else_=0) if _has_assignment else None
         )
     else:
         _primary_expr = Task.context[_assign_key].astext
@@ -405,9 +418,7 @@ async def compute_trial_arm_accumulation(
         )
         succ_expr = Task.context["_first_attempt_succeeded"].astext
         _assign_flag_expr = (
-            case((_primary_expr.is_not(None), 1), else_=0)
-            if _has_assignment
-            else None
+            case((_primary_expr.is_not(None), 1), else_=0) if _has_assignment else None
         )
 
     filters = [
@@ -583,11 +594,19 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
             well_formed += 1
         for schema, count in (summary.get("format_miss_by_schema") or {}).items():
             miss_by_schema[str(schema)] += int(count)
-        for schema, count in (summary.get("format_repair_attempts_by_schema") or {}).items():
+        for schema, count in (
+            summary.get("format_repair_attempts_by_schema") or {}
+        ).items():
             repair_attempts_by_schema[str(schema)] += int(count)
-        for schema, count in (summary.get("format_repair_successes_by_schema") or {}).items():
+        for schema, count in (
+            summary.get("format_repair_successes_by_schema") or {}
+        ).items():
             repair_successes_by_schema[str(schema)] += int(count)
-    all_schemas = set(miss_by_schema) | set(repair_attempts_by_schema) | set(repair_successes_by_schema)
+    all_schemas = (
+        set(miss_by_schema)
+        | set(repair_attempts_by_schema)
+        | set(repair_successes_by_schema)
+    )
     by_schema = {
         schema: {
             "format_miss": miss_by_schema.get(schema, 0),
@@ -616,7 +635,9 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     }
 
 
-def _format_compliance_trend(curr_rate: float | None, prev_rate: float | None) -> str | None:
+def _format_compliance_trend(
+    curr_rate: float | None, prev_rate: float | None
+) -> str | None:
     """Compute improving/declining/stable trend using ±0.05 threshold (mirrors _compute_first_attempt_breakdowns)."""
     if curr_rate is None or prev_rate is None:
         return None
@@ -679,7 +700,9 @@ def compute_format_compliance_metrics(
     if prev_terminal_tasks is not None:
         prev_overall = _accumulate_format_compliance(prev_terminal_tasks)
         overall["prev_format_compliance_rate"] = prev_overall["format_compliance_rate"]
-        overall["prev_self_repair_success_rate"] = prev_overall["self_repair_success_rate"]
+        overall["prev_self_repair_success_rate"] = prev_overall[
+            "self_repair_success_rate"
+        ]
         overall["trend"] = _format_compliance_trend(
             overall["format_compliance_rate"], prev_overall["format_compliance_rate"]
         )
@@ -693,11 +716,18 @@ def compute_format_compliance_metrics(
 
         for task_type in set(by_type) | set(prev_by_type_groups):
             curr_block = by_type.get(task_type) or _accumulate_format_compliance([])
-            prev_block = _accumulate_format_compliance(prev_by_type_groups.get(task_type) or [])
-            curr_block["prev_format_compliance_rate"] = prev_block["format_compliance_rate"]
-            curr_block["prev_self_repair_success_rate"] = prev_block["self_repair_success_rate"]
+            prev_block = _accumulate_format_compliance(
+                prev_by_type_groups.get(task_type) or []
+            )
+            curr_block["prev_format_compliance_rate"] = prev_block[
+                "format_compliance_rate"
+            ]
+            curr_block["prev_self_repair_success_rate"] = prev_block[
+                "self_repair_success_rate"
+            ]
             curr_block["trend"] = _format_compliance_trend(
-                curr_block["format_compliance_rate"], prev_block["format_compliance_rate"]
+                curr_block["format_compliance_rate"],
+                prev_block["format_compliance_rate"],
             )
             by_type[task_type] = curr_block
 
@@ -1099,9 +1129,9 @@ _TERMINAL_OUTCOME_KEYS = frozenset(
         "repeat_fingerprint_halt",
     }
 )
-_ESCALATION_OUTCOME_KEYS = frozenset(
-    {"stuck", "standoff", "repeat_fingerprint_halt"}
-)
+_ESCALATION_OUTCOME_KEYS = frozenset({"stuck", "standoff", "repeat_fingerprint_halt"})
+
+
 def _outer_loop_pct(values: List[int], p: int) -> Optional[int]:
     """Nearest-rank percentile over a list of ints (None when empty)."""
     if not values:
@@ -1149,9 +1179,7 @@ def _outer_loop_terminal_outcome(t: "Task") -> Optional[str]:
     return None
 
 
-def _group_outer_loop_chains(
-    all_tasks: List[Task], window_start: "datetime"
-) -> tuple:
+def _group_outer_loop_chains(all_tasks: List[Task], window_start: "datetime") -> tuple:
     """Group in-window review-loop tasks into PR-chains.
 
     Returns ``(tasks_by_id, chains, task_id_to_chain)`` where ``chains`` maps a
@@ -1224,7 +1252,9 @@ def _scan_escalation_alerts(
     return alert_reasons_by_chain, escalation_by_reason, escalated_task_ids
 
 
-def _resolve_chain_outcome(outcome_tasks: List[Task], chain_reasons: set) -> Optional[str]:
+def _resolve_chain_outcome(
+    outcome_tasks: List[Task], chain_reasons: set
+) -> Optional[str]:
     """Resolve a PR-chain's single terminal outcome.
 
     Definitive terminal states (merged > cap-exhausted > rejected) win over a
@@ -1296,7 +1326,9 @@ def _outer_loop_chain_observation(
         # so the chain's churn is the MAX seen (summing would double-count).
         chain_churn = max(chain_churn, int(rl.get("churn_detections") or 0))
         drift = rl.get("drift_signal")
-        if isinstance(drift, dict) and (drift.get("drift_in") or drift.get("drift_out")):
+        if isinstance(drift, dict) and (
+            drift.get("drift_in") or drift.get("drift_out")
+        ):
             chain_has_drift = True
 
     project_id = None
@@ -1346,7 +1378,9 @@ def _resolve_outer_loop_chains(
         latest_created = None
         for t in chain_tasks:
             created = t.created_at
-            if created is not None and (latest_created is None or created > latest_created):
+            if created is not None and (
+                latest_created is None or created > latest_created
+            ):
                 latest_created = created
         obs["_latest_created"] = latest_created
         rows.append(obs)
@@ -1457,7 +1491,9 @@ def _lane_waste_task_row(t: "Task") -> Dict[str, Any]:
         "counts_toward_cap": task_counts_toward_review_cap(t),
         "iteration": int(iteration) if isinstance(iteration, (int, float)) else None,
         "created_at": t.created_at.isoformat() if t.created_at else None,
-        "started_at": t.started_at.isoformat() if getattr(t, "started_at", None) else None,
+        "started_at": t.started_at.isoformat()
+        if getattr(t, "started_at", None)
+        else None,
         "completed_at": _lane_waste_completed_at(t),
     }
 
@@ -1557,9 +1593,7 @@ def compute_lane_waste_diagnostics(
             }
         )
 
-    chain_rows.sort(
-        key=lambda r: r["_latest_created"] or datetime.min, reverse=True
-    )
+    chain_rows.sort(key=lambda r: r["_latest_created"] or datetime.min, reverse=True)
     for r in chain_rows:
         r.pop("_latest_created", None)
 
@@ -1733,9 +1767,7 @@ def compute_outer_loop_convergence(
     # _build_digest_narrative; emits None on empty/ambiguous windows.
     dominant_blocker: Optional[Dict[str, Any]] = None
     if non_converged_total > 0:
-        ranked = sorted(
-            blocker_cause_counts.items(), key=lambda kv: (-kv[1], kv[0])
-        )
+        ranked = sorted(blocker_cause_counts.items(), key=lambda kv: (-kv[1], kv[0]))
         top_cause, top_count = ranked[0]
         second_count = ranked[1][1] if len(ranked) > 1 else 0
         if (
@@ -1776,14 +1808,10 @@ def compute_outer_loop_convergence(
             "churn": round(churn_pr_count / len(chains), 3) if chains else None,
             "stuck": round(stuck_pr_count / len(chains), 3) if chains else None,
             "standoff": round(standoff_pr_count / len(chains), 3) if chains else None,
-            "repeat_fingerprint": round(
-                repeat_fingerprint_pr_count / len(chains), 3
-            )
+            "repeat_fingerprint": round(repeat_fingerprint_pr_count / len(chains), 3)
             if chains
             else None,
-            "overall_escalations": round(
-                overall_escalation_pr_count / len(chains), 3
-            )
+            "overall_escalations": round(overall_escalation_pr_count / len(chains), 3)
             if chains
             else None,
         },
@@ -2028,7 +2056,9 @@ def compute_parked_blocker_summary(blocked_tasks: List[Task]) -> Dict[str, Any]:
         hold_reason = None
         if is_recut_escalated:
             outcome = ctx.get("_recut_last_outcome", "unknown")
-            hold_reason = f"Base re-cut {outcome}" if outcome != "unknown" else "Base re-cut hold"
+            hold_reason = (
+                f"Base re-cut {outcome}" if outcome != "unknown" else "Base re-cut hold"
+            )
         elif is_blocked_escalated:
             hold_reason = None  # blocked_reason will be populated from blocker_kind
 
@@ -2362,7 +2392,9 @@ def _genuine_duplicate_reason(ti: "Task", fi: set, tj: "Task", fj: set):
         return f"shared capability '{sorted(shared_caps)[0]}'"
     union = fi | fj
     if union and len(fi & fj) / len(union) >= _FOUNDATION_CONVERGE_THRESHOLD:
-        return f"near-identical file sets ({round(len(fi & fj) / len(union), 3)} Jaccard)"
+        return (
+            f"near-identical file sets ({round(len(fi & fj) / len(union), 3)} Jaccard)"
+        )
     return None
 
 
@@ -2600,9 +2632,7 @@ async def compute_park_wake_health(
         fired_filters.append(TaskWakeRegistration.project_id == project_id)
     fired_undelivered_count = (
         await session.execute(
-            select(func.count())
-            .select_from(TaskWakeRegistration)
-            .where(*fired_filters)
+            select(func.count()).select_from(TaskWakeRegistration).where(*fired_filters)
         )
     ).scalar() or 0
     oldest_fired_at = (
@@ -2622,6 +2652,7 @@ async def compute_park_wake_health(
         _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD,
         get_wake_delivery_stall_cycles,
     )
+
     delivery_stalled = (
         get_wake_delivery_stall_cycles() >= _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD
     )
@@ -2638,12 +2669,14 @@ async def compute_park_wake_health(
     if project_id is not None:
         _timeout_task_filters.append(Task.project_id == project_id)
     _timeout_ctxs = (
-        await session.execute(
-            select(Task.context)
-            .where(*_timeout_task_filters)
-            .limit(500)
+        (
+            await session.execute(
+                select(Task.context).where(*_timeout_task_filters).limit(500)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     timeout_by_cause: Dict[str, int] = {}
     for _ctx in _timeout_ctxs:
@@ -2810,9 +2843,7 @@ async def compute_dependency_health_signals(
     resumed = (
         (
             await session.execute(
-                select(Task)
-                .where(*resume_filters)
-                .limit(_BLOCKED_RESUME_LIST_LIMIT)
+                select(Task).where(*resume_filters).limit(_BLOCKED_RESUME_LIST_LIMIT)
             )
         )
         .scalars()
@@ -2829,11 +2860,7 @@ async def compute_dependency_health_signals(
     if project_id is not None:
         give_up_filters.append(Task.project_id == project_id)
     finding_give_up = (
-        (
-            await session.execute(
-                select(Task).where(*give_up_filters).limit(1000)
-            )
-        )
+        (await session.execute(select(Task).where(*give_up_filters).limit(1000)))
         .scalars()
         .all()
     )
@@ -2896,9 +2923,7 @@ async def compute_wake_post_commit_health_signals(
 
     stuck_count = (
         await session.execute(
-            select(func.count())
-            .select_from(TaskWakeRegistration)
-            .where(*filters)
+            select(func.count()).select_from(TaskWakeRegistration).where(*filters)
         )
     ).scalar() or 0
 
@@ -3027,7 +3052,9 @@ async def compute_merge_gate_fleet_health(
     most_common_reason = None
     # When a window is provided, use the windowed tally; otherwise use the
     # all-time tally for completeness.
-    histogram_to_use = windowed_reason_histogram if window_start is not None else reason_histogram
+    histogram_to_use = (
+        windowed_reason_histogram if window_start is not None else reason_histogram
+    )
     if histogram_to_use:
         # Deterministic tie-break: highest count, then reason key (mirrors
         # ci_resolution.merge_gate_runtime_block's per-project tie-break).
@@ -3715,6 +3742,29 @@ def compute_digest_cost_economics(
         for _k, _v in ff.items():
             pipeline_filter_funnel[_k] = pipeline_filter_funnel.get(_k, 0) + (_v or 0)
 
+    # LLM-dollar companions: total LLM spend, LLM share of combined (VM+LLM) spend,
+    # and median LLM cost per merged PR. Uses the same pricing helpers as the
+    # efficiency snapshot and llm-cost-breakdown endpoint so all figures reconcile.
+    from app.efficiency_snapshot import _task_llm_cost
+
+    _total_llm_cost_raw = 0.0
+    _merged_llm_costs: list[float] = []
+    for t in all_tasks:
+        if not (t.vm_stopped_at is None or t.vm_stopped_at >= window_start):
+            continue
+        llm_cost, _unpriced = _task_llm_cost(t)
+        _total_llm_cost_raw += llm_cost
+        if has_landed_signal(t):
+            _merged_llm_costs.append(llm_cost)
+    total_llm_cost_usd = round(_total_llm_cost_raw, 4)
+    _combined_raw = _total_compute_cost_raw + _total_llm_cost_raw
+    llm_share_of_combined_cost = (
+        round(_total_llm_cost_raw / _combined_raw, 4) if _combined_raw > 0 else None
+    )
+    median_llm_cost_per_merged_pr = (
+        round(statistics.median(_merged_llm_costs), 4) if _merged_llm_costs else None
+    )
+
     return {
         "total_estimated_cost_usd": total_estimated_cost_usd,
         "total_spot_cost_usd": total_spot_cost_usd,
@@ -3736,6 +3786,10 @@ def compute_digest_cost_economics(
         # per-direction outcome fields — see retirement note above).
         "overall_type_distribution": overall_type_distribution,
         "pipeline_filter_funnel": pipeline_filter_funnel,
+        # LLM-dollar companions (additive; existing VM-only fields unchanged).
+        "total_llm_cost_usd": total_llm_cost_usd,
+        "llm_share_of_combined_cost": llm_share_of_combined_cost,
+        "median_llm_cost_per_merged_pr": median_llm_cost_per_merged_pr,
     }
 
 
@@ -3939,7 +3993,10 @@ def compute_timeout_rate(
         "timeout_count": timeout_count,
         "overall_rate": _rate(timeout_count),
         "by_subtype": {
-            subtype: {"count": subtype_counts[subtype], "rate": _rate(subtype_counts[subtype])}
+            subtype: {
+                "count": subtype_counts[subtype],
+                "rate": _rate(subtype_counts[subtype]),
+            }
             for subtype in TIMEOUT_SUBTYPES
         },
         "dominant_subtype": dominant,
@@ -4027,12 +4084,12 @@ def _format_timeout_rate_drift(drift: Dict[str, Any] | None) -> str | None:
         direction = "unchanged"
     if direction == "unchanged":
         return f"Agent-timeout rate {cur_pct}%, unchanged from baseline."
-    return (
-        f"Agent-timeout rate {cur_pct}%, {direction} from a baseline of {base_pct}%."
-    )
+    return f"Agent-timeout rate {cur_pct}%, {direction} from a baseline of {base_pct}%."
 
 
-def _compute_dominant_timeout_subtype(timeout_tasks: List[Dict[str, Any]]) -> str | None:
+def _compute_dominant_timeout_subtype(
+    timeout_tasks: List[Dict[str, Any]],
+) -> str | None:
     """Compute the dominant timeout subtype from a list of timeout failure entries.
 
     Returns the subtype string if one clearly dominates (present in >=2 tasks and
@@ -4215,12 +4272,19 @@ def compute_narrative_summary(
             churn_dir = compute_churn_direction(buckets)
         if len(buckets) >= 2:
             has_churn_signal = any(
-                (b.get("incidence_counts", {}).get("churn") or b.get("churn_total") or 0) > 0
+                (
+                    b.get("incidence_counts", {}).get("churn")
+                    or b.get("churn_total")
+                    or 0
+                )
+                > 0
                 for b in buckets
             )
             if has_churn_signal:
                 verdict = f"Review/fix churn is {churn_dir}"
-                dominant_blocker = outer_loop_convergence_summary.get("dominant_blocker")
+                dominant_blocker = outer_loop_convergence_summary.get(
+                    "dominant_blocker"
+                )
                 if (
                     dominant_blocker
                     and dominant_blocker.get("count")
@@ -4524,6 +4588,127 @@ def compute_retry_analytics(
         "avg_retries_before_failure": avg_retries_before_failure,
         "retry_success_rate_by_class": retry_success_rate_by_class,
         "retry_wasted_rate": retry_wasted_rate,
+    }
+
+
+def compute_llm_rework_cost(
+    failed_tasks: List[Task],
+    cancelled_tasks: List[Task],
+    completed_tasks: List[Task],
+    window_start: "datetime",
+) -> Dict[str, Any]:
+    """LLM-dollar cost attributable to rework, priced from Task.attempt_history.
+
+    Three buckets:
+      (a) retry_overhead_llm_usd — LLM tokens burned by prior attempts on tasks
+          that were retried (attempt_number > 1), covering both failed retries
+          (still failing) and successful retries (eventually completed).
+      (b) admin_cancel_llm_usd — total LLM spend on non-genuinely-cancelled tasks
+          (superseded by fix, cascade-killed, deduplicated by the orchestrator).
+          These tasks consumed tokens but produced no merge. When the ADMIN_CANCEL
+          failure class lands, bucket (b) should key off that class instead.
+      (c) terminal_failed_llm_usd — total LLM spend on tasks that failed and never
+          produced a merged PR.
+
+    Attempts whose (provider, model) pair is absent or has no entry in
+    LLM_TOKEN_PRICING accumulate to unattributed_input_tokens /
+    unattributed_output_tokens rather than being silently dropped.
+
+    Pure function — no database calls.
+    """
+    from app.efficiency_snapshot import (
+        LLM_TOKEN_PRICING,
+        _llm_attempt_nonnegative_int,
+        _task_llm_attempts,
+    )
+    from app.direction_outcomes import _is_non_genuine_cancelled
+
+    def _price_attempts(attempts):
+        cost = 0.0
+        ua_input = 0
+        ua_output = 0
+        for provider, model, it, ot, _ in attempts:
+            if not provider or not model:
+                ua_input += it
+                ua_output += ot
+                continue
+            key = (provider.lower(), model.lower())
+            pricing = LLM_TOKEN_PRICING.get(key)
+            if pricing:
+                cost += it * pricing[0] + ot * pricing[1]
+            else:
+                ua_input += it
+                ua_output += ot
+        return cost, ua_input, ua_output
+
+    def _prior_attempts(task):
+        """Attempt tuples for banked prior attempts only (not the current attempt)."""
+        history = task.attempt_history or []
+        result = []
+        for attempt in history:
+            ap = attempt.get("provider")
+            am = attempt.get("model")
+            if ap and am:
+                pass
+            elif not ap and not am:
+                ap, am = task.provider, task.model
+            else:
+                ap, am = None, None  # chimera degrade — mirrors _task_llm_attempts
+            it = _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens"))
+            ot = _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens"))
+            ct = _llm_attempt_nonnegative_int(attempt.get("llm_call_count"))
+            result.append((ap, am, it, ot, ct))
+        return result
+
+    # Bucket (a): prior attempts on retried tasks
+    retry_cost = 0.0
+    retry_ua_input = 0
+    retry_ua_output = 0
+    for t in failed_tasks + completed_tasks:
+        if (t.context or {}).get("_attempt_number", 0) > 1:
+            c, ui, uo = _price_attempts(_prior_attempts(t))
+            retry_cost += c
+            retry_ua_input += ui
+            retry_ua_output += uo
+
+    # Bucket (b): non-genuinely-cancelled tasks (superseded/deduplicated/cascade)
+    cancel_cost = 0.0
+    cancel_ua_input = 0
+    cancel_ua_output = 0
+    for t in cancelled_tasks:
+        if _is_non_genuine_cancelled(t):
+            c, ui, uo = _price_attempts(_task_llm_attempts(t))
+            cancel_cost += c
+            cancel_ua_input += ui
+            cancel_ua_output += uo
+
+    # Bucket (c): terminal failures that never produced a merged PR.
+    # For retried tasks (attempt_number > 1), prior attempts are already counted
+    # in bucket (a); only price the current attempt here to avoid double-counting.
+    failed_cost = 0.0
+    failed_ua_input = 0
+    failed_ua_output = 0
+    for t in failed_tasks:
+        if not has_landed_signal(t):
+            prior = _prior_attempts(t)
+            all_attempts = _task_llm_attempts(t)
+            current_only = all_attempts[len(prior):]
+            c, ui, uo = _price_attempts(current_only)
+            failed_cost += c
+            failed_ua_input += ui
+            failed_ua_output += uo
+
+    total_attributed = retry_cost + cancel_cost + failed_cost
+    total_ua_input = retry_ua_input + cancel_ua_input + failed_ua_input
+    total_ua_output = retry_ua_output + cancel_ua_output + failed_ua_output
+
+    return {
+        "retry_overhead_llm_usd": round(retry_cost, 6),
+        "admin_cancel_llm_usd": round(cancel_cost, 6),
+        "terminal_failed_llm_usd": round(failed_cost, 6),
+        "unattributed_input_tokens": total_ua_input,
+        "unattributed_output_tokens": total_ua_output,
+        "total_attributed_llm_usd": round(total_attributed, 6),
     }
 
 
@@ -4870,7 +5055,9 @@ def compute_research_output_quality(
     """
     surviving_ratios: List[float] = []
     agrees = disagrees = indeterminate = 0
-    basis_counts: Dict[str, int] = {tier: 0 for tier in _RESEARCH_VERIFICATION_BASIS_TIERS}
+    basis_counts: Dict[str, int] = {
+        tier: 0 for tier in _RESEARCH_VERIFICATION_BASIS_TIERS
+    }
 
     for task in tasks:
         payload_type = (task.first_payload or {}).get("type")
@@ -4884,9 +5071,7 @@ def compute_research_output_quality(
             if plan_output_by_task_id is not None
             else task.plan_output
         )
-        findings = [
-            f for f in (raw_findings or []) if isinstance(f, dict)
-        ]
+        findings = [f for f in (raw_findings or []) if isinstance(f, dict)]
         if not findings:
             continue
 
@@ -4897,7 +5082,7 @@ def compute_research_output_quality(
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
-        for record in (ctx.get(_RESEARCH_CHALLENGE_HISTORY_KEY) or []):
+        for record in ctx.get(_RESEARCH_CHALLENGE_HISTORY_KEY) or []:
             if not isinstance(record, dict):
                 continue
             agreement = str(record.get("agreement") or "").lower()

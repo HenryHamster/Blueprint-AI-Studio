@@ -80,6 +80,8 @@ from app.admin_task_mutations import (
     _handle_task_pr_approval,
     modify_task_apply,
 )
+from app.task_blocked import strip_fresh_attempt_context
+from app.time_utils import clear_retry_after
 from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
     router as _operator_triggers_router,
@@ -470,7 +472,7 @@ async def get_all_tasks(
         }
         result_list.append(task_dict)
 
-    # Global counts (not affected by pagination/filters) — single query via CASE/WHEN
+    # Global counts scoped to the caller's member projects — single query via CASE/WHEN
     _counts_row = (
         await session.execute(
             select(
@@ -486,18 +488,51 @@ async def get_all_tasks(
                 ),
                 func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
                 func.count(case((Task.status == TaskStatus.QUEUED, 1))),
-            ).select_from(Task)
+            )
+            .select_from(Task)
+            .where(Task.project_id.in_(_user_project_ids(current_user["user_id"])))
         )
     ).one()
     active_count, evaluating_count, queued_count = _counts_row
 
-    return {
+    response: Dict[str, Any] = {
         "tasks": result_list,
         "total": total,
         "active_count": active_count,
         "evaluating_count": evaluating_count,
         "queued_count": queued_count,
     }
+
+    if project_id is not None:
+        _scoped_row = (
+            await session.execute(
+                select(
+                    func.count(
+                        case(
+                            (
+                                Task.status.in_(
+                                    [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
+                                ),
+                                1,
+                            )
+                        )
+                    ),
+                    func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
+                    func.count(case((Task.status == TaskStatus.QUEUED, 1))),
+                )
+                .select_from(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.project_id.in_(_user_project_ids(current_user["user_id"])),
+                )
+            )
+        ).one()
+        scoped_active, scoped_evaluating, scoped_queued = _scoped_row
+        response["scoped_active_count"] = scoped_active
+        response["scoped_evaluating_count"] = scoped_evaluating
+        response["scoped_queued_count"] = scoped_queued
+
+    return response
 
 
 class BulkArchiveRequest(BaseModel):
@@ -585,6 +620,7 @@ class BulkActionRequest(BaseModel):
 async def _bulk_retry_one_task(
     task_id: uuid.UUID,
     request_session: AsyncSession,
+    preloaded_has_children: bool | None = None,
 ) -> str | None:
     """Run the retry mutation for a single task in its own short-lived session.
 
@@ -639,44 +675,37 @@ async def _bulk_retry_one_task(
             _terminated_task_ids.pop(str(task.id), None)
             task_type = (task.first_payload).get("type", "")
             is_parent_type = task_type in ("research", "plan")
-            children = []
-            if is_parent_type:
-                children = (
+            if preloaded_has_children is not None:
+                # Use pre-fetched boolean (batch query in bulk_action_tasks)
+                # to avoid a per-task child query. _requeue_parent_task does
+                # its own children query internally when called.
+                has_children = preloaded_has_children
+            elif is_parent_type:
+                has_children = bool(
                     (
                         await scoped_session.execute(
-                            select(Task).where(Task.parent_task_id == task.id)
+                            select(Task.id)
+                            .where(Task.parent_task_id == task.id)
+                            .limit(1)
                         )
                     )
                     .scalars()
-                    .all()
+                    .first()
                 )
+            else:
+                has_children = False
             old_vm: str | None = None
-            if children:
+            if has_children:
                 await _requeue_parent_task(task, scoped_session)
             else:
                 old_vm = task.vm_instance_id
                 task.attempt_count = 0
                 task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                 task.last_heartbeat = None
-                # Reset retry counters for a clean slate — matches single-task admin retry
-                bulk_ctx = dict(task.context or {})
-                bulk_ctx.pop("provision_failures", None)
-                bulk_ctx.pop("retry_after", None)
-                bulk_ctx.pop("max_plan_account_id", None)
-                bulk_ctx.pop("llm_account_id", None)
-                bulk_ctx.pop("llm_provider", None)
-                bulk_ctx.pop("llm_auth_mode", None)
-                bulk_ctx.pop("llm_model", None)
-                bulk_ctx.pop("llm_execution_mode", None)
-                bulk_ctx.pop("blacklisted_accounts", None)
-                bulk_ctx.pop("provision_failed_accounts", None)
-                bulk_ctx.pop("_slot_released", None)
-                bulk_ctx.pop("_api_failure_retries", None)
-                # Clear the previous attempt's failure verdict — see the
-                # single-task requeue path (admin_task_mutations.py) for why a
-                # stale failure_class/failure_category poisons reclassification.
-                bulk_ctx.pop("failure_class", None)
-                bulk_ctx.pop("failure_category", None)
+                # Reset attempt-scoped state for a clean slate — matches
+                # single-task admin retry.
+                clear_retry_after(task)
+                bulk_ctx = strip_fresh_attempt_context(task.context or {})
                 task.context = bulk_ctx
             history = TaskHistory(
                 task_id=task.id,
@@ -752,6 +781,52 @@ async def bulk_action_tasks(
     else:
         fetched = {}
 
+    # ── Phase 1.5: batch-prefetch children for cancel cascade ───────────────
+    # Pre-fetch all active children for cancel actions in a single query so
+    # the per-task cancel loop does not issue one child query per parent task.
+    # The dict maps parent_task_id → list[Task] and is built before any
+    # commits, so the loaded objects are fresh (no session-expiry lazy loads).
+    from collections import defaultdict as _defaultdict
+
+    _cancel_children_by_parent: dict[uuid.UUID, list] = _defaultdict(list)
+    if body.action == "cancel" and valid_map:
+        _child_result = await session.execute(
+            select(Task).where(
+                Task.parent_task_id.in_(list(valid_map.values())),
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    ]
+                ),
+            )
+        )
+        for _child in _child_result.scalars().all():
+            _cancel_children_by_parent[_child.parent_task_id].append(_child)
+
+    # Pre-fetch which retry parent-type tasks have children (single query).
+    # Passed into _bulk_retry_one_task to skip its per-task child query.
+    _retry_parent_has_children: dict[uuid.UUID, bool] = {}
+    if body.action == "retry":
+        _parent_type_ids = [
+            task_obj.id
+            for task_obj in fetched.values()
+            if (task_obj.first_payload or {}).get("type") in ("research", "plan")
+        ]
+        if _parent_type_ids:
+            _child_parent_rows = (
+                await session.execute(
+                    select(Task.parent_task_id)
+                    .where(Task.parent_task_id.in_(_parent_type_ids))
+                    .distinct()
+                )
+            ).scalars().all()
+            _parents_with_children = set(_child_parent_rows)
+            for _pid in _parent_type_ids:
+                _retry_parent_has_children[_pid] = _pid in _parents_with_children
+
     # ── Phase 2: per-task processing ────────────────────────────────────────
     # Phase C2 (H-C3): retry path runs in its own scoped session per task so
     # _requeue_parent_task is not called inside the bulk transaction's lock
@@ -770,7 +845,13 @@ async def bulk_action_tasks(
 
         try:
             if body.action == "retry":
-                old_vm = await _bulk_retry_one_task(valid_map[raw_id], session)
+                old_vm = await _bulk_retry_one_task(
+                    valid_map[raw_id],
+                    session,
+                    preloaded_has_children=_retry_parent_has_children.get(
+                        valid_map[raw_id]
+                    ),
+                )
 
                 # Delete old VM after commit, same as modify_task
                 if old_vm:
@@ -852,6 +933,21 @@ async def bulk_action_tasks(
                     )
                     continue
 
+                # Use pre-fetched children (batch query before loop, no N+1)
+                active_children = _cancel_children_by_parent.get(task.id, [])
+
+                # Save VM and account info before any commit so we can access
+                # them after session.commit() expires ORM object attributes.
+                parent_vm_id = task.vm_instance_id
+                parent_acct_id = (task.context or {}).get("max_plan_account_id")
+                child_vm_info = [
+                    (
+                        child.vm_instance_id,
+                        (child.context or {}).get("max_plan_account_id"),
+                    )
+                    for child in active_children
+                ]
+
                 task.status = TaskStatus.CANCELLED
                 if task.vm_provisioned_at:
                     task.vm_stopped_at = _utcnow()
@@ -885,45 +981,9 @@ async def bulk_action_tasks(
                 )
                 session.add(task)
                 session.add(history)
-                # Commit terminal status first so agents detect cancellation
-                await session.commit()
 
-                # Delete VM immediately (no graceful sleep for bulk operations)
-                if task.vm_instance_id:
-                    from app.vm_lifecycle import _ensure_vm_deleted
-
-                    await _ensure_vm_deleted(task, reason="admin_bulk_cancel")
-                    acct_id = (task.context or {}).get("max_plan_account_id")
-                    if acct_id:
-                        from app.max_plan_pool import release_max_plan_account
-
-                        await release_max_plan_account(acct_id)
-
-                # Cascade cancellation to active children
-                from app.vm_lifecycle import _ensure_vm_deleted as _cancel_vm
-                from app.max_plan_pool import (
-                    release_max_plan_account as _cancel_release,
-                )
-
-                active_children = (
-                    (
-                        await session.execute(
-                            select(Task).where(
-                                Task.parent_task_id == task.id,
-                                Task.status.in_(
-                                    [
-                                        TaskStatus.QUEUED,
-                                        TaskStatus.PROVISIONING,
-                                        TaskStatus.IN_PROGRESS,
-                                        TaskStatus.EVALUATING,
-                                    ]
-                                ),
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
+                # Cascade cancellation to active children while objects are
+                # still fresh (before commit expires them).
                 for child in active_children:
                     child.status = TaskStatus.CANCELLED
                     if child.vm_provisioned_at:
@@ -932,21 +992,31 @@ async def bulk_action_tasks(
                     session.add(child)
                 # Close orphan PRs on each cascaded child too. Done before
                 # commit so the GitHub call is grouped with the cancel.
-                from app.task_lifecycle import (
-                    close_orphan_pr_if_any,
-                )
-
                 for child in active_children:
                     await close_orphan_pr_if_any(
                         child, session, reason="admin_bulk_cancel_cascade"
                     )
+
                 await session.commit()
-                for child in active_children:
-                    if child.vm_instance_id:
-                        await _cancel_vm(child, reason="parent_bulk_cancelled")
-                    child_acct = (child.context or {}).get("max_plan_account_id")
-                    if child_acct:
-                        await _cancel_release(child_acct)
+
+                # Delete VMs using values saved before commit (avoids lazy
+                # loads on expired ORM objects).
+                from app.vm_lifecycle import _ensure_vm_deleted
+                from app.max_plan_pool import release_max_plan_account
+
+                if parent_vm_id:
+                    await _ensure_vm_deleted(parent_vm_id, reason="admin_bulk_cancel")
+                    if parent_acct_id:
+                        await release_max_plan_account(parent_acct_id)
+
+                for child_vm_id, child_acct_id in child_vm_info:
+                    if child_vm_id:
+                        await _ensure_vm_deleted(
+                            child_vm_id, reason="parent_bulk_cancelled"
+                        )
+                    if child_acct_id:
+                        await release_max_plan_account(child_acct_id)
+
                 if active_children:
                     logger.info(
                         f"[ADMIN] Bulk cancel cascaded to {len(active_children)} children of task {task.id}"

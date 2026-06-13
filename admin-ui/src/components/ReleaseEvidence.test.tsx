@@ -31,6 +31,59 @@ const fullEvidence: LiveReleaseEvidence = {
   ],
 };
 
+import { servingStatusClass } from './ReleaseEvidence.utils';
+
+describe('servingStatusClass', () => {
+  test('serving_confirmed → emerald (green)', () => {
+    const cls = servingStatusClass('serving_confirmed');
+    expect(cls).toContain('emerald');
+    expect(cls).not.toContain('red');
+    expect(cls).not.toContain('amber');
+  });
+
+  test('deploy_failed → red (not amber, not neutral)', () => {
+    const cls = servingStatusClass('deploy_failed');
+    expect(cls).toContain('red');
+    expect(cls).not.toContain('amber');
+    expect(cls).not.toContain('emerald');
+  });
+
+  test('renders deploy_failed with failure styling distinct from unconfirmed', () => {
+    const failedCls = servingStatusClass('deploy_failed');
+    const unconfirmedCls = servingStatusClass('unconfirmed');
+    expect(failedCls).not.toBe(unconfirmedCls);
+    expect(failedCls).toContain('red');
+    expect(unconfirmedCls).toContain('amber');
+  });
+
+  test('confirmation_timed_out → amber', () => {
+    const cls = servingStatusClass('confirmation_timed_out');
+    expect(cls).toContain('amber');
+    expect(cls).not.toContain('red');
+    expect(cls).not.toContain('emerald');
+  });
+
+  test('unconfirmed → amber', () => {
+    const cls = servingStatusClass('unconfirmed');
+    expect(cls).toContain('amber');
+    expect(cls).not.toContain('red');
+    expect(cls).not.toContain('emerald');
+  });
+
+  test('unknown status → neutral (not amber, not red, not green)', () => {
+    const cls = servingStatusClass('some_future_status');
+    expect(cls).toContain('neutral');
+    expect(cls).not.toContain('red');
+    expect(cls).not.toContain('amber');
+    expect(cls).not.toContain('emerald');
+  });
+
+  test('null and undefined → neutral', () => {
+    expect(servingStatusClass(null)).toContain('neutral');
+    expect(servingStatusClass(undefined)).toContain('neutral');
+  });
+});
+
 describe('ReleaseEvidence helpers', () => {
   test('shortPromotedSha truncates to 8 chars and tolerates missing values', () => {
     expect(shortPromotedSha('abcdef1234567890')).toBe('abcdef12');
@@ -84,6 +137,20 @@ describe('ReleaseEvidencePanel', () => {
     // No version chip and no SHA prefix when those fields are absent.
     expect(panel.textContent).not.toContain('v8');
     expect(panel.textContent).not.toContain('sha ');
+  });
+
+  test('deploy_failed aggregate status badge has red styling, not amber', () => {
+    const { getByTestId } = render(
+      <ReleaseEvidencePanel evidence={{ aggregate_serving_status: 'deploy_failed' }} />,
+    );
+    const panel = getByTestId('release-evidence-panel');
+    const statusBadge = Array.from(panel.querySelectorAll('span')).find(
+      (el) => el.textContent === 'deploy_failed',
+    );
+    expect(statusBadge).toBeDefined();
+    if (!statusBadge) throw new Error('status badge not found');
+    expect(statusBadge.className).toContain('red');
+    expect(statusBadge.className).not.toContain('amber');
   });
 });
 

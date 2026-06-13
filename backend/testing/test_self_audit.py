@@ -1107,3 +1107,56 @@ class TestAutoModeRecover:
 
         await db_session.refresh(project)
         assert project.directions[0]["recommended_mode"] == "audit"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_system_id_in_batch_does_not_raise(
+        self, db_session, mock_broadcast
+    ):
+        """Two findings with the same system_id in one batch upsert to a single row."""
+        project = await _seed_project_with_member(db_session)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+
+        # Two findings share the same system_id — the second should update,
+        # not insert, avoiding UniqueConstraint(project_id, system_id) violation.
+        logs = json.dumps(
+            {
+                "findings": [
+                    {
+                        "system_id": "sys-dup",
+                        "score": 40,
+                        "recommended_mode": "audit",
+                        "top_issues": ["first"],
+                        "evidence": [],
+                    },
+                    {
+                        "system_id": "sys-dup",
+                        "score": 80,
+                        "recommended_mode": "ship",
+                        "top_issues": ["second"],
+                        "evidence": [],
+                    },
+                ]
+            }
+        )
+
+        # Must not raise IntegrityError
+        await _handle_self_audit_completion(task, logs, db_session)
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(SystemMaturity).where(
+                        SystemMaturity.project_id == project.id,
+                        SystemMaturity.system_id == "sys-dup",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Only one row for the system_id — the second finding wins
+        assert len(rows) == 1
+        assert rows[0].score == 80
+        assert rows[0].recommended_mode == "ship"

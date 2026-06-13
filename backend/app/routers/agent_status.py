@@ -50,7 +50,7 @@ from app.shared_state import (
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 import app.orchestrator as _orch
-from app.broadcast import broadcast_to_project
+from app.broadcast import broadcast_to_project, _sanitize_log
 from app.routers.agent import verify_agent_token
 from app.sr_blind_spots import filter_disallowed_blind_spots
 from app.max_plan_pool import (
@@ -188,6 +188,14 @@ def _task_pr_number(task: Task) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _sanitize_log_tail(text: str, max_chars: int) -> str:
+    """Redact secrets before trimming a log tail for durable storage."""
+    sanitized = _sanitize_log(text)
+    if len(sanitized) <= max_chars:
+        return sanitized
+    return sanitized[-max_chars:]
 
 
 _STOPWORDS = frozenset(
@@ -772,7 +780,10 @@ async def update_agent_status(
             # (carrying the pre-park vm_instance_id) but finds vm_instance_id=None
             # in the DB. Return "parked" so the agent gets an accurate status
             # instead of a misleading 404.
-            if check_task.status == TaskStatus.PARKED and check_task.vm_instance_id is None:
+            if (
+                check_task.status == TaskStatus.PARKED
+                and check_task.vm_instance_id is None
+            ):
                 logger.info(
                     f"[AGENT STATUS] Stale callback on PARKED task {check_task.id} "
                     f"(vm_instance_id cleared by park); returning parked no-op"
@@ -893,7 +904,7 @@ async def update_agent_status(
                     await session.rollback()
                 return {
                     "status": "post_commit_retry_pending",
-                    "task_id": str(task.id),
+                    "task_id": _task_id_str,
                 }
             except Exception as e:
                 # A disconnection-class DB error on the retry path is deploy-cutover
@@ -970,7 +981,7 @@ async def update_agent_status(
             source_metadata=pr.source_metadata or {},
             wake_action=pr.wake_action,
             deadline_at=deadline_at,
-            reason=pr.reason or payload.logs,
+            reason=pr.reason or (_sanitize_log(payload.logs) if payload.logs else None),
         )
         session.add(task)
         await session.commit()
@@ -1021,7 +1032,7 @@ async def update_agent_status(
     if payload.logs and (
         not payload.artifact_type or payload.status == TaskStatus.FAILED
     ):
-        task.latest_status_message = payload.logs[-8000:]
+        task.latest_status_message = _sanitize_log_tail(payload.logs, 8000)
     # Persist the structured provider-run error report BEFORE failure-category
     # normalization so normalize_agent_failure_category consumes it as the
     # primary classification signal. On a FAILED status WITHOUT a report (old
@@ -1120,6 +1131,12 @@ async def update_agent_status(
             ctx["repo_overview"] = payload.repo_overview.model_dump()
         else:
             ctx.pop("repo_overview", None)
+        # Command write-back outcome is reported independently of repo_overview
+        # so completion can record command-memory truthfully even when the
+        # overview persisted cleanly. Older agents omit it (left absent here),
+        # which the completion handler degrades to "unknown".
+        if payload.command_memory is not None:
+            ctx["command_memory"] = payload.command_memory.model_dump()
         task.context = ctx
         flag_modified(task, "context")
     if payload.file_change_details:
@@ -1155,6 +1172,18 @@ async def update_agent_status(
             ctx = dict(task.context or {})
             ctx["prompt_fingerprint"] = payload.prompt_fingerprint
             task.context = ctx
+
+    if payload.workspace_prep is not None:
+        from app.review_fix_lane_pilot import record_workspace_prep_outcome
+
+        ctx = dict(task.context or {})
+        record_workspace_prep_outcome(
+            ctx,
+            payload.workspace_prep.model_dump(),
+            task_type=str((task.first_payload or {}).get("type") or ""),
+        )
+        task.context = ctx
+        flag_modified(task, "context")
 
     if payload.status == TaskStatus.COMPLETED:
         await record_artifact_consumptions_for_task(
@@ -1203,7 +1232,7 @@ async def update_agent_status(
                     repo_url=payload.repo_url,
                     pr_url=payload.pr_url,
                     storage_uri=payload.storage_uri,
-                    logs=payload.logs,
+                    logs=_sanitize_log(payload.logs) if payload.logs else None,
                 )
                 if should_stamp_and_deliver:
                     stamp_artifact_logical_key(artifact, task)
@@ -1270,7 +1299,7 @@ async def update_agent_status(
                 repo_url=payload.repo_url,
                 pr_url=payload.pr_url,
                 storage_uri=payload.storage_uri,
-                logs=payload.logs,
+                logs=_sanitize_log(payload.logs) if payload.logs else None,
             )
             if should_stamp_and_deliver:
                 stamp_artifact_logical_key(artifact, task)
@@ -1316,7 +1345,7 @@ async def update_agent_status(
             {
                 "task_id": str(task.id),
                 "artifact_type": payload.artifact_type,
-                "logs": payload.logs,
+                "logs": _sanitize_log(payload.logs) if payload.logs else None,
                 "storage_uri": payload.storage_uri,
             },
         )
@@ -1492,6 +1521,28 @@ async def update_agent_status(
                         ),
                     )
                     task.vm_stopped_at = _utcnow()
+                    # Retire any LEASED pool member before the commit. enter_blocked_state
+                    # does not clear vm_instance_id, so the linkage is still intact here.
+                    # The terminal-completion path never fires for BLOCKED tasks, so this
+                    # is the last chance to release the member before it leaks permanently.
+                    try:
+                        from app.models import PoolVmState  # noqa: PLC0415
+                        from app.warm_pool import (  # noqa: PLC0415
+                            is_warm_pool_enabled,
+                            mark_pool_vm_retiring,
+                        )
+
+                        if task.vm_instance_id and is_warm_pool_enabled():
+                            await mark_pool_vm_retiring(
+                                session,
+                                task.vm_instance_id,
+                                source_states=(PoolVmState.LEASED,),
+                            )
+                    except Exception:
+                        logger.warning(
+                            "[AGENT STATUS] pool-member retire failed for BLOCKED task %s",
+                            task.id,
+                        )
                     session.add(task)
                     await session.commit()
                     # Surface one deduplicated, operator-visible precondition
@@ -1797,8 +1848,7 @@ async def update_agent_status(
                         if (
                             acct_id_for_blacklist
                             and (
-                                failure_class == "RATE_LIMIT"
-                                or quota_cooldown_failure
+                                failure_class == "RATE_LIMIT" or quota_cooldown_failure
                             )
                             and acct_id_for_blacklist not in park_blacklisted
                         ):
@@ -2045,7 +2095,9 @@ async def update_agent_status(
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     task.last_heartbeat = None
                     task.started_at = None
-                    task.latest_status_message = "Dead auth session — requeued onto different account"
+                    task.latest_status_message = (
+                        "Dead auth session — requeued onto different account"
+                    )
                     from app.routers.agent import _terminated_task_ids
 
                     _terminated_task_ids.pop(str(task.id), None)
@@ -2081,7 +2133,7 @@ async def update_agent_status(
                 if payload.logs and (
                     not payload.artifact_type or payload.status == TaskStatus.FAILED
                 ):
-                    task.latest_status_message = payload.logs[-8000:]
+                    task.latest_status_message = _sanitize_log_tail(payload.logs, 8000)
                 # Re-apply the structured error report (mirrors the pre-commit
                 # block at ~line 1075) so the normalize call below still sees
                 # it as the primary signal after session recovery.
@@ -3153,7 +3205,7 @@ async def update_agent_status(
                             "type": "debug",
                             "failed_task_id": str(task.id),
                             "failed_task_title": task.title,
-                            "error_logs": (payload.logs or "")[:20000],
+                            "error_logs": _sanitize_log_tail(payload.logs or "", 20000),
                             "base_branch": base_branch,
                             "failed_task_prompt": (
                                 failed_task_payload.get("prompt")

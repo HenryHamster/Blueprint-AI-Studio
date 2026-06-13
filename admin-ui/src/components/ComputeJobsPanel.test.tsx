@@ -423,6 +423,51 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('compute-rpc-diagnostic')).toBeNull();
   });
 
+  test('provisioning-phase terminal job shows vm_phase, sanitized cause and launch contract', async () => {
+    // A $0 TIMED_OUT job that died before the VM reached RUNNING: the panel
+    // surfaces the provisioning cause and the requested launch contract, and
+    // suppresses the generic retry-oriented RPC warning.
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'TIMED_OUT',
+        outcome: 'TIMED_OUT',
+        final_cost_usd: 0,
+        terminal_reason: 'compute job timed out while provisioning',
+        vm_phase: 'provisioning',
+        launch_contract: { requested_deadline_seconds: 600, provisioning_model: 'best_effort' },
+        compute_rpc_diagnostic: makeDiagnostic({
+          operation: 'launch',
+          error_type: 'QuotaExceeded',
+          error_message: 'GPU quota exhausted in zone us-central1-a',
+        }),
+      }),
+    ]);
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-provisioning-cause');
+    expect(block.textContent).toContain('provisioning');
+    expect(block.textContent).toContain('launch');
+    expect(block.textContent).toContain('QuotaExceeded');
+    expect(block.textContent).toContain('GPU quota exhausted in zone us-central1-a');
+    expect(block.textContent).toContain('requested deadline 600s');
+    expect(block.textContent).toContain('provisioning model best_effort');
+    // The terminal_reason still renders, and the generic RPC warning is suppressed.
+    expect(queryByTestId('compute-rpc-diagnostic')).toBeNull();
+  });
+
+  test('terminal job without provisioning fields falls back to terminal_reason only', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'TIMED_OUT',
+        outcome: 'TIMED_OUT',
+        final_cost_usd: 0,
+        terminal_reason: 'compute job timed out while provisioning',
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute job timed out while provisioning');
+    expect(queryByTestId('compute-provisioning-cause')).toBeNull();
+  });
+
   test('kill failure surfaces the backend explanation, not a generic message', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     fetchComputeJobs.mockResolvedValue([makeJob()]);

@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
 import { API_BASE_URL, apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject, fetchWarmPoolTargets, setWarmPoolTargetForProject, fetchEfficiencyAxes } from '../api';
 import type { PoolPayoffVerdict, PoolPayoffState } from '../api';
-import { parseTimestamp, formatTimeOnly } from '../utils/time';
+import { parseTimestamp, formatTimeOnly, snapshotFreshness } from '../utils/time';
 import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics, PoolHitRateEstimate, WarmPoolTargets, WarmReuseDropoutDiagnostic, WarmReuseDropoutTrendBucket } from '../types/warmVm';
 import type { Project } from '../types/project';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
@@ -11,6 +11,8 @@ import { usePoller } from '../hooks/usePoller';
 
 const POLL_INTERVAL_MS = 10_000;
 const STORAGE_KEY = 'blueprint-admin:warmVmPanelCollapsed';
+const SNAPSHOT_STALE_AFTER_SECONDS = 120;
+const STALE_CLASSES = 'opacity-60 saturate-50';
 
 function ageSecs(iso: string | null): number | null {
   if (!iso) return null;
@@ -178,6 +180,12 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
   const accountRetargetOn = data?.warm_pool_account_retarget_enabled ?? data?.account_retarget_enabled ?? false;
   const crossProviderRetargetOn = data?.warm_pool_cross_provider_retarget_enabled ?? false;
   const overThreshold = clearsHour > 5;
+  const { asOfLabel, stale: freshnessStale } = snapshotFreshness(
+    data?.precomputed_at,
+    data?.precompute_age_seconds,
+    SNAPSHOT_STALE_AFTER_SECONDS,
+  );
+  const stale = freshnessStale || data?.served_stale === true;
 
   return (
     <div className="mb-3 shrink-0">
@@ -325,10 +333,18 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
             </span>
           )}
         </button>
+        {data && asOfLabel && (
+          <span
+            className={`text-[10px] ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-500'}`}
+            title={stale ? 'Cached snapshot is stale — may not reflect current VM fleet state' : 'When this VM fleet snapshot was computed'}
+          >
+            {stale && '⚠ '}as of {asOfLabel}{stale && ' · stale'}
+          </span>
+        )}
       </div>
 
       {!collapsed && (
-        <div className="mt-2 bg-neutral-900 border border-neutral-800 rounded-lg p-3 text-xs">
+        <div className={`mt-2 bg-neutral-900 border border-neutral-800 rounded-lg p-3 text-xs ${stale && data && !error ? STALE_CLASSES : ''}`}>
           {error && (
             <div className="text-red-400 mb-2">Failed to load warm-VM state: {error}</div>
           )}

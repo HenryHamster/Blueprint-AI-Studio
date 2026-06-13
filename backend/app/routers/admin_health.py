@@ -6,7 +6,8 @@ import logging
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -524,18 +525,17 @@ async def _compute_health_overview(
         )
 
     # --- 4b. Warm-VM continuity circuit breaker ---
-    if _shared_state.runtime_config.get(
-        "warm_continuity_enabled", False
-    ) and _shared_state.is_warm_continuity_suppressed():
+    if (
+        _shared_state.runtime_config.get("warm_continuity_enabled", False)
+        and _shared_state.is_warm_continuity_suppressed()
+    ):
         sup_until = _shared_state.warm_continuity_suppressed_until
         clears = _shared_state.count_recent_warm_pin_clears(3600)
         threshold = _shared_state.runtime_config.get(
             "warm_pin_clear_rate_threshold", 10
         )
         cooldown_min = (
-            _shared_state.runtime_config.get(
-                "warm_continuity_cooldown_seconds", 1800
-            )
+            _shared_state.runtime_config.get("warm_continuity_cooldown_seconds", 1800)
             // 60
         )
         sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
@@ -553,9 +553,10 @@ async def _compute_health_overview(
         )
 
     # --- 4c. Warm-backlog reuse circuit breaker ---
-    if _shared_state.runtime_config.get(
-        "warm_backlog_reuse_enabled", False
-    ) and _shared_state.is_warm_backlog_reuse_suppressed():
+    if (
+        _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False)
+        and _shared_state.is_warm_backlog_reuse_suppressed()
+    ):
         sup_until = _shared_state.warm_backlog_reuse_suppressed_until
         failures = _shared_state.count_recent_backlog_reuse_failures(3600)
         threshold = _shared_state.runtime_config.get(
@@ -582,17 +583,17 @@ async def _compute_health_overview(
         )
 
     # --- 4d. Warm-pool claim circuit breaker ---
-    if _shared_state.runtime_config.get(
-        "warm_pool_enabled", False
-    ) and _shared_state.is_warm_pool_suppressed():
+    if (
+        _shared_state.runtime_config.get("warm_pool_enabled", False)
+        and _shared_state.is_warm_pool_suppressed()
+    ):
         sup_until = _shared_state.warm_pool_suppressed_until
         failures = _shared_state.count_recent_pool_claim_failures(3600)
         threshold = _shared_state.runtime_config.get(
             "warm_pool_failure_rate_threshold", 5
         )
         cooldown_min = (
-            _shared_state.runtime_config.get("warm_pool_cooldown_seconds", 1800)
-            // 60
+            _shared_state.runtime_config.get("warm_pool_cooldown_seconds", 1800) // 60
         )
         sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
         actionable_issues.append(
@@ -759,10 +760,28 @@ async def get_warm_vm_state(
     same for every admin caller. Default TTL 15s; tune in digest_cache.
     """
     cache_key = ("warm-vm-state",)
-    return await cache.get_or_compute(
+    result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_warm_vm_state(session=session),
     )
+    generated_at = result.get("generated_at") if isinstance(result, dict) else None
+    age_seconds: float | None = None
+    if generated_at:
+        try:
+            age_seconds = max(
+                0.0,
+                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
+            )
+        except (ValueError, TypeError):
+            age_seconds = None
+    annotated = annotate_precompute_metadata(
+        result,
+        precomputed=False,
+        precomputed_at=generated_at,
+        precompute_age_seconds=age_seconds,
+    )
+    annotated["served_stale"] = served_stale
+    return annotated
 
 
 # Phase F3 (H2): hard cap on each warm-vm-state scan. The endpoint is admin-
@@ -1107,7 +1126,9 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         ),
         # Backward-compatible alias for the account-retarget hint/callout path.
         "account_retarget_enabled": bool(
-            _shared_state.runtime_config.get("warm_pool_account_retarget_enabled", False)
+            _shared_state.runtime_config.get(
+                "warm_pool_account_retarget_enabled", False
+            )
         ),
         "next_role_poll_timeout_secs": int(
             _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)
@@ -1116,6 +1137,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         "spawn_pin_funnel": _get_spawn_pin_funnel(),
         "backlog_reuse_funnel": await _get_backlog_reuse_funnel(session),
         "pool_metrics": await _get_pool_metrics(session),
+        "generated_at": now.isoformat(),
     }
 
 
@@ -1179,12 +1201,12 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
                 from app.warm_pool_maintainer import evaluate_project_pool_cost_guard
 
                 for pid in project_ids:
-                    cost_guard_by_project[str(pid)] = (
-                        await evaluate_project_pool_cost_guard(
-                            session,
-                            pid,
-                            runtime_config=_shared_state.runtime_config,
-                        )
+                    cost_guard_by_project[
+                        str(pid)
+                    ] = await evaluate_project_pool_cost_guard(
+                        session,
+                        pid,
+                        runtime_config=_shared_state.runtime_config,
                     )
             except Exception:  # noqa: BLE001 — best-effort diagnostic, never blank panel
                 cost_guard_by_project = {}
@@ -1248,14 +1270,22 @@ async def _get_backlog_reuse_funnel(session: AsyncSession) -> dict:
 
         snap = get_reuse_funnel_snapshot()
         snap.update(compute_dominant_reuse_dropout())
-        rows = (await session.execute(
-            select(Project).options(load_only(Project.id, Project.design_doc)).limit(500)
-        )).scalars().all()
+        rows = (
+            (
+                await session.execute(
+                    select(Project)
+                    .options(load_only(Project.id, Project.design_doc))
+                    .limit(500)
+                )
+            )
+            .scalars()
+            .all()
+        )
         buckets = []
         for project in rows:
-            for entry in (
-                (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
-            ).get("snapshots") or []:
+            for entry in ((project.design_doc or {}).get(DESIGN_DOC_KEY) or {}).get(
+                "snapshots"
+            ) or []:
                 block = entry.get("reuse_dropout")
                 if not isinstance(block, dict):
                     continue
@@ -1313,17 +1343,107 @@ async def get_fleet_utilization(
     user. Returns all snapshot fields plus a derived ``saturation`` label.
     """
     cache_key = ("fleet-utilization",)
-    return await cache.get_or_compute(
+    result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_fleet_utilization(session=session),
     )
+    generated_at = result.get("generated_at") if isinstance(result, dict) else None
+    age_seconds: float | None = None
+    if generated_at:
+        try:
+            age_seconds = max(
+                0.0,
+                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
+            )
+        except (ValueError, TypeError):
+            age_seconds = None
+    annotated = annotate_precompute_metadata(
+        result,
+        precomputed=False,
+        precomputed_at=generated_at,
+        precompute_age_seconds=age_seconds,
+    )
+    annotated["served_stale"] = served_stale
+    return annotated
 
 
 async def _compute_fleet_utilization(*, session: AsyncSession) -> Dict[str, Any]:
     """Compute the fleet-utilization payload (cached by caller)."""
+    now = _utcnow()
     snapshot = await get_fleet_utilization_snapshot(session)
     saturation = _derive_saturation(snapshot.get("util_avg"), snapshot.get("util_now"))
-    return {**snapshot, "saturation": saturation}
+    return {**snapshot, "saturation": saturation, "generated_at": now.isoformat()}
+
+
+@router.get("/evergreen-fill")
+async def get_evergreen_fill(
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Why did (or didn't) evergreen fill spawn? Mode + decision funnel.
+
+    Surfaces the in-memory fill observability counters recorded by
+    ``app.evergreen_backlog`` (same funnel pattern as the warm-reuse endpoints),
+    answering "why didn't anything spawn?" directly from closed-vocabulary reasons.
+    """
+    from app import evergreen_backlog
+    from app.shared_state import runtime_config as _runtime_config
+
+    return {
+        "mode": _runtime_config.get("evergreen_fill_mode", "off"),
+        "observability": evergreen_backlog.get_fill_observability(),
+    }
+
+
+class _EvergreenEnrollBody(BaseModel):
+    finding_key: str
+    title: str
+    detail: str | None = None
+    direction_id: str | None = None
+    provenance: str = "manual"
+
+
+@router.post("/projects/{project_id}/evergreen-backlog")
+async def enroll_evergreen_backlog_item(
+    project_id: uuid.UUID,
+    payload: _EvergreenEnrollBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Enroll one curated candidate into the project's evergreen backlog.
+
+    Membership/role-gated via ``_get_user_project_with_role`` (member).
+    Idempotent: re-enrolling an existing ``(project_id, finding_key)`` returns
+    the existing row (``enrolled: True``).  Returns ``enrolled: False`` only on
+    the rare unrecoverable concurrent-insert race.
+    """
+    from app import evergreen_backlog
+    from app.admin_helpers import _get_user_project_with_role
+
+    finding_key = (payload.finding_key or "").strip()
+    if not finding_key:
+        raise HTTPException(status_code=400, detail="finding_key must be non-empty")
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="member"
+    )
+    item = await evergreen_backlog.enroll_backlog_item(
+        session,
+        project_id=project_id,
+        finding_key=finding_key,
+        title=payload.title,
+        detail=payload.detail,
+        direction_id=payload.direction_id,
+        provenance=payload.provenance,
+    )
+    if item is None:
+        return {"enrolled": False, "reason": "unrecoverable_race"}
+    await session.commit()
+    return {
+        "enrolled": True,
+        "item_id": str(item.id),
+        "finding_key": item.finding_key,
+        "status": item.status,
+    }
 
 
 @router.get("/pr-behind-detector-stats")

@@ -838,6 +838,7 @@ class RepoBootstrapOverview(BaseModel):
     test_layout: str | None = None
     key_conventions: str | None = None
     environment_requirements: str | None = None
+    source_revision: str | None = None
 
 
 # ---------------------------------------------------------------------------

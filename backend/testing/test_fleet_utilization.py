@@ -212,3 +212,221 @@ async def test_zero_capacity_yields_none(monkeypatch):
     assert snap["util_now"] is None
     assert snap["util_avg"] is None
     assert snap["cooled_accounts"] == 0
+
+
+# ── VM-slot fields ───────────────────────────────────────────────────────────
+
+
+async def test_vm_cap_surfaced_without_session(monkeypatch):
+    """vm_cap is available even when session=None; DB-derived VM fields are None."""
+    import app.runtime_config_state as rcs
+
+    monkeypatch.setitem(rcs.runtime_config, "max_concurrent_vms", 12)
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    snap = await get_fleet_utilization_snapshot(session=None)
+    assert snap["vm_cap"] == 12
+    assert snap["active_task_vms"] is None
+    assert snap["managed_vm_count"] is None
+    assert snap["idle_pool_vms"] is None
+    assert snap["vm_slots_available"] is None
+    assert snap["vm_saturation"] is None
+
+
+async def test_vm_slot_fields_with_session(monkeypatch):
+    """With a mock session the VM-slot derivation math is exercised end-to-end."""
+    import app.runtime_config_state as rcs
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setitem(rcs.runtime_config, "max_concurrent_vms", 10)
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    monkeypatch.setattr(
+        max_plan_pool, "_account_available_for_model", lambda acct, model: True
+    )
+
+    # managed=6, idle_pool=1 → effective = max(3, 6-1)=5; slots_available=5
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 6)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: True)
+
+    class _FakeResult:
+        def scalar(self):
+            return 3
+
+        def all(self):
+            return []
+
+    class _FakeSession:
+        async def execute(self, stmt):
+            # First call returns active count, second returns rows for occupancy
+            return _FakeResult()
+
+    # Patch count_idle_pool_vms to return 1
+    async def _fake_idle(session, **kw):
+        return 1
+
+    monkeypatch.setattr(warm_pool, "count_idle_pool_vms", _fake_idle)
+
+    snap = await get_fleet_utilization_snapshot(session=_FakeSession())
+    assert snap["vm_cap"] == 10
+    assert snap["active_task_vms"] == 3
+    assert snap["managed_vm_count"] == 6
+    assert snap["idle_pool_vms"] == 1
+    # effective = max(3, 6-1) = 5; slots_available = 10-5 = 5
+    assert snap["vm_slots_available"] == 5
+    assert snap["vm_saturation"] == "healthy"  # 5/10 = 0.5 < 0.70
+
+
+async def test_vm_saturation_saturated_when_slots_zero(monkeypatch):
+    """vm_saturation is 'saturated' when vm_slots_available == 0."""
+    import app.runtime_config_state as rcs
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setitem(rcs.runtime_config, "max_concurrent_vms", 5)
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+
+    # managed=5, idle=0 → effective=max(5,5)=5; slots=5-5=0
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 5)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: False)
+
+    class _FakeResult:
+        def scalar(self):
+            return 5
+
+        def all(self):
+            return []
+
+    class _FakeSession:
+        async def execute(self, stmt):
+            return _FakeResult()
+
+    snap = await get_fleet_utilization_snapshot(session=_FakeSession())
+    assert snap["vm_slots_available"] == 0
+    assert snap["vm_saturation"] == "saturated"
+
+
+async def test_vm_saturation_busy_threshold(monkeypatch):
+    """effective/vm_cap in [0.70, 0.90) → 'busy'."""
+    import app.runtime_config_state as rcs
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setitem(rcs.runtime_config, "max_concurrent_vms", 10)
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+
+    # active=8, managed=8, idle=0 → effective=8; 8/10=0.80 → busy
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 8)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: False)
+
+    class _FakeResult:
+        def scalar(self):
+            return 8
+
+        def all(self):
+            return []
+
+    class _FakeSession:
+        async def execute(self, stmt):
+            return _FakeResult()
+
+    snap = await get_fleet_utilization_snapshot(session=_FakeSession())
+    assert snap["vm_slots_available"] == 2
+    assert snap["vm_saturation"] == "busy"
+
+
+async def test_vm_saturation_effective_uses_max_of_active_vs_managed(monkeypatch):
+    """effective = max(active_task_vms, managed_vm_count - idle_pool_vms)."""
+    import app.runtime_config_state as rcs
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setitem(rcs.runtime_config, "max_concurrent_vms", 10)
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+
+    # active=9 (high), managed=6, idle=2 → managed-idle=4; effective=max(9,4)=9
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 6)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: True)
+
+    class _FakeResult:
+        def scalar(self):
+            return 9
+
+        def all(self):
+            return []
+
+    class _FakeSession:
+        async def execute(self, stmt):
+            return _FakeResult()
+
+    async def _fake_idle(session, **kw):
+        return 2
+
+    monkeypatch.setattr(warm_pool, "count_idle_pool_vms", _fake_idle)
+
+    snap = await get_fleet_utilization_snapshot(session=_FakeSession())
+    assert snap["vm_slots_available"] == 1  # 10 - 9 = 1
+    assert snap["vm_saturation"] == "saturated"  # 9/10 = 0.90 >= 0.90
+
+
+# ── VM-slot segment in strategic axis formatter ──────────────────────────────
+
+
+def test_format_includes_vm_slot_segment():
+    line = _format_fleet_utilization_axis(
+        {
+            "active_now": 3,
+            "nominal_capacity": 15,
+            "util_now": 0.2,
+            "util_avg": 0.25,
+            "window_hours": 24,
+            "cooled_accounts": 0,
+            "usable_capacity": 15,
+            "vm_cap": 10,
+            "active_task_vms": 3,
+            "managed_vm_count": 6,
+            "idle_pool_vms": 1,
+            "vm_slots_available": 5,
+        }
+    )
+    assert "vm 5/10, 5 free" in line
+
+
+def test_format_vm_saturated_marker():
+    line = _format_fleet_utilization_axis(
+        {
+            "active_now": 10,
+            "nominal_capacity": 15,
+            "util_now": 0.67,
+            "util_avg": 0.67,
+            "window_hours": 24,
+            "cooled_accounts": 0,
+            "usable_capacity": 15,
+            "vm_cap": 10,
+            "active_task_vms": 10,
+            "managed_vm_count": 10,
+            "idle_pool_vms": 0,
+            "vm_slots_available": 0,
+        }
+    )
+    assert "[SATURATED]" in line
+    assert "0 free" in line
+
+
+def test_format_omits_vm_segment_when_no_vm_cap():
+    line = _format_fleet_utilization_axis(
+        {
+            "active_now": 3,
+            "nominal_capacity": 15,
+            "util_now": 0.2,
+            "util_avg": 0.25,
+            "window_hours": 24,
+            "cooled_accounts": 0,
+            "usable_capacity": 15,
+            "vm_cap": None,
+        }
+    )
+    assert "vm" not in line

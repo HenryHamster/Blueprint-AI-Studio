@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { snapshotFreshness } from '../utils/time';
 
 // ---------- types ----------
 
@@ -95,19 +96,50 @@ function formatResetAt(iso: string | null): string {
   return d.toLocaleString();
 }
 
+function formatTimeOnly(iso: string | null): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+}
+
 // ---------- component ----------
 
-export function PoolAccountHealthPanel({ accounts, loading }: {
+// Response is considered visibly stale once the cache fallback is older than
+// this many seconds (3 polls of the 30s dashboard refresh). Distinct from the
+// per-account usage_snapshot.stale flag, which is a provider-side probe signal.
+const RESPONSE_STALE_AFTER_SECONDS = 90;
+
+export function PoolAccountHealthPanel({ accounts, loading, servedStale = false, generatedAt = null }: {
   accounts: AccountHealthEntry[] | null;
   loading: boolean;
+  // Response-level cache-fallback freshness (additive; covers the WHOLE
+  // response, not one account's provider snapshot). When the backend served a
+  // last-good payload on compute failure, servedStale is true and generatedAt
+  // is the payload's original timestamp.
+  servedStale?: boolean;
+  generatedAt?: string | null;
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   if (loading) return <Skeleton className="h-16 w-full" />;
   if (!accounts || accounts.length === 0) return null;
 
+  const freshness = snapshotFreshness(generatedAt, null, RESPONSE_STALE_AFTER_SECONDS);
+  const showStale = servedStale;
+
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Account Health</h2>
+      <div className="flex items-center gap-2 mb-2">
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Provider Account Health</h2>
+        {showStale && (
+          <span
+            className="text-[9px] font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/15 text-amber-300"
+            title={`This whole panel is a cached fallback — the backend could not recompute it on the last poll${freshness.asOfLabel ? `; data is from ${freshness.asOfLabel}` : ''}`}
+          >
+            stale{freshness.asOfLabel ? ` · as of ${freshness.asOfLabel}` : ''}
+          </span>
+        )}
+      </div>
       <div className="space-y-1">
         {accounts.map(acct => {
           const expanded = expandedId === acct.account_id;
@@ -146,7 +178,7 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                   {acct.usage_snapshot && (
                     acct.usage_snapshot.known ? (
                       <span
-                        className="flex items-center gap-1 text-[10px] font-mono"
+                        className={`flex items-center gap-1 text-[10px] font-mono${acct.usage_snapshot.stale ? ' opacity-60' : ''}`}
                         title={`Usage headroom — 5h / 7d window utilization${acct.usage_snapshot.stale ? ' (stale)' : ''}`}
                       >
                         <span className={usageColor(acct.usage_snapshot.five_hour_utilization)}>
@@ -155,7 +187,11 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                         <span className={usageColor(acct.usage_snapshot.seven_day_utilization)}>
                           7d {acct.usage_snapshot.seven_day_utilization == null ? '?' : `${Math.round(acct.usage_snapshot.seven_day_utilization)}%`}
                         </span>
-                        {acct.usage_snapshot.stale && <span className="text-neutral-500" title="Snapshot is stale">~</span>}
+                        {acct.usage_snapshot.stale && (
+                          <span className="text-neutral-400" title={`Snapshot is stale${acct.usage_snapshot.probed_at ? ` (probed at ${acct.usage_snapshot.probed_at})` : ''}`}>
+                            stale{acct.usage_snapshot.probed_at ? ` @${formatTimeOnly(acct.usage_snapshot.probed_at)}` : ''}
+                          </span>
+                        )}
                       </span>
                     ) : (
                       <span

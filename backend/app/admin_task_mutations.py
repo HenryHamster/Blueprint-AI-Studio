@@ -328,7 +328,7 @@ async def _apply_status_mutation(
         # task moved from BLOCKED/failed-retry back to QUEUED would still look and
         # classify as blocked work (stale context['blocker'], budget-exempt
         # failure_class) on its next dispatch. Safe no-op on never-blocked tasks.
-        from app.task_blocked import clear_blocker_metadata
+        from app.task_blocked import clear_blocker_metadata, strip_fresh_attempt_context
 
         clear_blocker_metadata(task)
 
@@ -357,26 +357,10 @@ async def _apply_status_mutation(
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             task.last_heartbeat = None
             task.started_at = None
-            requeue_ctx = dict(task.context or {})
-            requeue_ctx.pop("provision_failures", None)
-            requeue_ctx.pop("retry_after", None)
-            requeue_ctx.pop("max_plan_account_id", None)
-            requeue_ctx.pop("llm_account_id", None)
-            requeue_ctx.pop("llm_provider", None)
-            requeue_ctx.pop("llm_auth_mode", None)
-            requeue_ctx.pop("llm_model", None)
-            requeue_ctx.pop("llm_execution_mode", None)
-            requeue_ctx.pop("blacklisted_accounts", None)
-            requeue_ctx.pop("provision_failed_accounts", None)
-            requeue_ctx.pop("_slot_released", None)
-            requeue_ctx.pop("_api_failure_retries", None)
-            # Clear the previous attempt's failure verdict too: classify_failure
-            # short-circuits on a persisted failure_class/failure_category, so a
-            # stale CODE_ERROR from the pre-requeue attempt would mask the NEXT
-            # failure's real cause (e.g. an infra death re-labelled CODE_ERROR
-            # at 0.9 confidence, burning the fresh attempt budget).
-            requeue_ctx.pop("failure_class", None)
-            requeue_ctx.pop("failure_category", None)
+            # Clear attempt-scoped state: stale retry counters, runtime account
+            # routing, failure verdicts, blocker state, and dispatch-prep crash
+            # counters must not poison the fresh attempt.
+            requeue_ctx = strip_fresh_attempt_context(task.context or {})
             task.context = requeue_ctx
             changes["attempt_count"] = 0
             changes["vm_instance_id"] = task.vm_instance_id

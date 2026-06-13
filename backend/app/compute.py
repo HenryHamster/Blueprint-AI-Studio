@@ -31,6 +31,7 @@ from pathlib import Path
 # E402; no circular-import risk because compute_manifest does not import
 # compute.
 from app.compute_manifest import validate_payload_uri, build_agent_secret_manifest
+from app.database import AsyncSessionLocal
 
 # Quota-scope classification (project-global vs regional vs zonal blast radius
 # for provisioning errors) lives in app.provision_error_scope — extracted to
@@ -229,7 +230,9 @@ def _zone_success_rate(zone: str, *, gpu: bool = False) -> float:
     return sum(outcomes) / len(outcomes)
 
 
-def _zone_blocked_until(zone: str, now: datetime, *, gpu: bool = False) -> datetime | None:
+def _zone_blocked_until(
+    zone: str, now: datetime, *, gpu: bool = False
+) -> datetime | None:
     """Effective blocking expiry for a zone: the latest of its own cooldown,
     its region's quota cooldown, and the project-global quota cooldown.
     When ``gpu=True`` uses the GPU-isolated health/quota state so GPU failures
@@ -420,6 +423,28 @@ GPU_FALLBACK_ZONES: dict[str, list[tuple[str, str]]] = {
     _accel: [(_zone, _REGION_SUBNETS[_zone.rsplit("-", 1)[0]]) for _zone in _zones]
     for _accel, _zones in _GPU_ZONE_NAMES.items()
 }
+
+
+def _all_managed_zones() -> list[str]:
+    """Deduplicated union of CPU fleet zones and GPU job zones, CPU-first.
+
+    CPU zones from FALLBACK_ZONES appear first so identity/cleanup probes hit
+    the common case before searching GPU-only zones. GPU-only zones (those in
+    GPU_FALLBACK_ZONES but absent from FALLBACK_ZONES) are appended in the
+    order they first appear across accelerators. Used by find_vm_zone,
+    stop_vm, _delete_gcp, and _cleanup_gcp so GPU compute-job VMs in
+    accelerator-specific zones are discoverable after a process restart and
+    are included in orphan cleanup.
+    """
+    cpu_zones = [z for z, _ in FALLBACK_ZONES]
+    seen: set[str] = set(cpu_zones)
+    result = list(cpu_zones)
+    for zone_list in GPU_FALLBACK_ZONES.values():
+        for z, _ in zone_list:
+            if z not in seen:
+                seen.add(z)
+                result.append(z)
+    return result
 
 
 def gpu_zone_candidates(accelerator: str) -> list[tuple[str, str]]:
@@ -749,7 +774,9 @@ def _ensure_gpu_image_family_valid() -> None:
                 )
             except Exception as revalidate_err:
                 _gpu_image_family_last_check = now
-                logger.exception("[COMPUTE] GPU image family re-validation still failing")
+                logger.exception(
+                    "[COMPUTE] GPU image family re-validation still failing"
+                )
                 raise RuntimeError(
                     f"GPU provisioning disabled: image family '{GPU_IMAGE_FAMILY}' "
                     f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s."
@@ -938,7 +965,7 @@ def find_vm_zone(vm_name: str) -> str | None:
     cached = _vm_zones.get(vm_name)
     if cached and cached != "unknown":
         return cached
-    for zone, _ in FALLBACK_ZONES:
+    for zone in _all_managed_zones():
         status = get_vm_status(vm_name, zone)
         # get_vm_status returns a synthetic "DELETED" for a 404 (not in this
         # zone); any other non-None status means the VM lives in this zone.
@@ -1164,7 +1191,9 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
     )
     return {
         "total_observed": len(observations),
-        "unknown_count": sum(1 for obs in observations.values() if not obs.get("source_sha")),
+        "unknown_count": sum(
+            1 for obs in observations.values() if not obs.get("source_sha")
+        ),
         "mixed": len([b for b in buckets_out if b["source_sha"]]) > 1,
         "buckets": buckets_out,
     }
@@ -1542,7 +1571,8 @@ async def _provision_local(
         provider_metadata=provider_metadata,
         provider_settings=provider_settings,
     )
-    env = {**os.environ, **_materialize_local_manifest(vm_instance_id, manifest)}
+    env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
+    env.update(_materialize_local_manifest(vm_instance_id, manifest))
     env["PAYLOAD_URI"] = payload_uri or ""
 
     agent_dir = os.path.abspath(AGENT_DIR)
@@ -2045,7 +2075,9 @@ async def _provision_gcp(
         # orchestrator/reaper INFRA_PROVISION_PATTERNS classify it infra-wide
         # (requeue without burning task retry budget). GPU jobs use the isolated
         # GPU quota state so a GPUS_ALL_REGIONS event never blocks CPU provisions.
-        _active_global_quota = _gpu_global_quota_state if is_gpu else _global_quota_state
+        _active_global_quota = (
+            _gpu_global_quota_state if is_gpu else _global_quota_state
+        )
         global_quota_cd = _active_global_quota.get("cooldown_expires_at")
         if global_quota_cd and now_pre < global_quota_cd:
             remaining = (global_quota_cd - now_pre).total_seconds()
@@ -2058,15 +2090,18 @@ async def _provision_gcp(
         _active_zone_health = _gpu_zone_health if is_gpu else _zone_health
         _active_zone_failures = _gpu_zone_failures if is_gpu else _zone_failures
         _record_global_quota = (
-            _record_gpu_global_quota_exhaustion if is_gpu
+            _record_gpu_global_quota_exhaustion
+            if is_gpu
             else _record_global_quota_exhaustion
         )
         _record_region_quota = (
-            _record_gpu_region_quota_exhaustion if is_gpu
+            _record_gpu_region_quota_exhaustion
+            if is_gpu
             else _record_region_quota_exhaustion
         )
         _clear_quota_success = (
-            _clear_gpu_quota_cooldowns_after_success if is_gpu
+            _clear_gpu_quota_cooldowns_after_success
+            if is_gpu
             else _clear_quota_cooldowns_after_success
         )
         # GPU jobs draw from the per-accelerator GPU-availability (zone, subnet)
@@ -2084,7 +2119,8 @@ async def _provision_gcp(
         else:
             active_zones = _active_fallback_zones()
         healthy_zones = [
-            (z, s) for z, s in active_zones
+            (z, s)
+            for z, s in active_zones
             if _zone_blocked_until(z, now_pre, gpu=is_gpu) is None
         ]
         cooled_zones = [(z, s) for z, s in active_zones if (z, s) not in healthy_zones]
@@ -2675,7 +2711,7 @@ async def stop_vm(vm_instance_id: str, *, reason: str) -> bool:
             known_zone = _vm_zones.get(vm_instance_id)
         if known_zone:
             zones_to_try.append(known_zone)
-        zones_to_try.extend(z for z, _ in FALLBACK_ZONES if z not in zones_to_try)
+        zones_to_try.extend(z for z in _all_managed_zones() if z not in zones_to_try)
 
         for zone in zones_to_try:
             try:
@@ -2723,7 +2759,9 @@ async def stop_vm(vm_instance_id: str, *, reason: str) -> bool:
                 e,
             )
         else:
-            logger.warning("[VM STOP] Failed to stop VM %s", vm_instance_id, exc_info=True)
+            logger.warning(
+                "[VM STOP] Failed to stop VM %s", vm_instance_id, exc_info=True
+            )
         return False
 
 
@@ -2773,7 +2811,7 @@ async def _delete_gcp(vm_instance_id: str):
             known_zone = _vm_zones.pop(vm_instance_id, None)
         if known_zone:
             zones_to_try.append(known_zone)
-        zones_to_try.extend(z for z, _ in FALLBACK_ZONES if z not in zones_to_try)
+        zones_to_try.extend(z for z in _all_managed_zones() if z not in zones_to_try)
 
         for zone in zones_to_try:
             try:
@@ -2857,6 +2895,14 @@ class CleanupResult:
         self.failed: list[str] = []
 
 
+async def _refresh_gcp_cleanup_active_vm_ids() -> set[str]:
+    """Re-read the live exemption set immediately before deleting orphans."""
+    from app.services import _collect_gcp_cleanup_active_vm_ids
+
+    async with AsyncSessionLocal() as session:
+        return await _collect_gcp_cleanup_active_vm_ids(session)
+
+
 async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
     """Scan all zones for orphaned VMs and delete them.
 
@@ -2869,7 +2915,9 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
     active_set = set(active_vm_ids)
 
     # Phase 1: Parallel zone listing (semaphore-bounded)
-    unique_zones = list({z for z, _ in FALLBACK_ZONES})
+    # Use _all_managed_zones() so GPU compute-job VMs in accelerator-specific
+    # zones (e.g. us-east1-d, us-east4-c) are included in the orphan sweep.
+    unique_zones = list(dict.fromkeys(_all_managed_zones()))
     logger.info(
         f"[GCP CLEANUP] Cycle starting — scanning {len(unique_zones)} zones, DB active: {len(active_vm_ids)}"
     )
@@ -2890,7 +2938,9 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
         all_vms.extend(zr)
 
     result.total_gcp_vms = len(all_vms)
-    result.agent_vm_count = sum(1 for name, _, _ in all_vms if name.startswith("agent-vm-"))
+    result.agent_vm_count = sum(
+        1 for name, _, _ in all_vms if name.startswith("agent-vm-")
+    )
     orphans = [
         (name, zone, status) for name, zone, status in all_vms if name not in active_set
     ]
@@ -2900,6 +2950,28 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
         f"[GCP CLEANUP] GCP inventory: {result.total_gcp_vms} VMs, "
         f"DB active: {len(active_vm_ids)}, orphans: {result.orphan_count}"
     )
+
+    if not orphans:
+        return result
+
+    # Revalidate the classification right before deleting anything so a VM that
+    # just became active after the inventory snapshot is not reaped by stale
+    # state from the start of the sweep.
+    fresh_active_set = await _refresh_gcp_cleanup_active_vm_ids()
+    if fresh_active_set != active_set:
+        refreshed_orphans = [
+            (name, zone, status)
+            for name, zone, status in orphans
+            if name not in fresh_active_set
+        ]
+        if len(refreshed_orphans) != len(orphans):
+            logger.info(
+                "[GCP CLEANUP] Revalidated before delete — orphans %d -> %d",
+                len(orphans),
+                len(refreshed_orphans),
+            )
+        orphans = refreshed_orphans
+        result.orphan_count = len(orphans)
 
     if not orphans:
         return result
@@ -2938,6 +3010,12 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
         _delete_orphan(name, zone, status) for name, zone, status in orphans
     ]
     await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # Adjust agent_vm_count to reflect post-deletion inventory so the
+    # orchestrator dispatch headroom is freed immediately rather than waiting
+    # for the next cache TTL cycle.
+    deleted_agent_vms = sum(1 for n in result.deleted if n.startswith("agent-vm-"))
+    result.agent_vm_count = max(0, result.agent_vm_count - deleted_agent_vms)
 
     if result.deleted or result.failed:
         logger.info(

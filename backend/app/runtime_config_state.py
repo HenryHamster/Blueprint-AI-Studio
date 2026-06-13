@@ -89,6 +89,38 @@ runtime_config: Dict = {
     "max_autonomous_tasks_per_hour": 12,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
+    # --- Utilization-triggered evergreen backlog auto-fill (d-2877ddc7) ---
+    # Phase-0, defaulted OFF. When idle (low utilization) or all active
+    # directions are parked/proof-waiting, spawn ONE low-priority research probe
+    # from the curated EvergreenBacklogItem ledger — additive parallelism that
+    # never competes with the release-critical path.
+    #   off     — never act (default).
+    #   observe — evaluate + record the would-be decision, create nothing.
+    #   enforce — act on a CREATE decision.
+    "evergreen_fill_mode": os.getenv("EVERGREEN_FILL_MODE", "off").lower()
+    if os.getenv("EVERGREEN_FILL_MODE", "off").lower() in ("off", "observe", "enforce")
+    else "off",
+    # Throttle interval for the orchestrator's _check_evergreen_fill() sibling.
+    "evergreen_fill_interval_minutes": int(
+        os.getenv("EVERGREEN_FILL_INTERVAL_MINUTES", "15")
+    ),
+    # Utilization at/above which the fleet is "busy" — no idle-fill trigger.
+    "evergreen_fill_util_threshold": float(
+        os.getenv("EVERGREEN_FILL_UTIL_THRESHOLD", "0.5")
+    ),
+    # Minimum free VM slots required before an evergreen probe may spawn.
+    "evergreen_fill_min_free_slots": int(
+        os.getenv("EVERGREEN_FILL_MIN_FREE_SLOTS", "2")
+    ),
+    # Hard cap on concurrently-live evergreen probes (status == spawned).
+    "evergreen_fill_max_active": int(os.getenv("EVERGREEN_FILL_MAX_ACTIVE", "1")),
+    # Per-project daily cap on evergreen probe spawns.
+    "evergreen_fill_daily_cap": int(os.getenv("EVERGREEN_FILL_DAILY_CAP", "3")),
+    # Allow enrolling backlog items from deferred research memos (provenance).
+    "evergreen_fill_deferred_memo_enrollment": os.getenv(
+        "EVERGREEN_FILL_DEFERRED_MEMO_ENROLLMENT", "false"
+    ).lower()
+    in ("1", "true", "yes"),
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:
@@ -642,18 +674,25 @@ runtime_config: Dict = {
     # warm_continuity_enabled / warm_backlog_reuse_enabled.
     "warm_pool_enabled": False,
     # Master switch for the v10 persistent improvement lane substrate (knowledge
-    # doc 18840e55). Default False so ALL lane code is INERT until the full
-    # substrate lands and the flag is flipped. First enabled mode is SHADOW:
-    # lanes attach to eligible create-chains and checkpoint enforcement runs,
-    # but no workspace reservations and no prompt changes — validating the
-    # checkpoint contract with zero pool impact.
+    # doc 18840e55). Default False so ALL lane code is INERT. When this is True
+    # and review_fix_lane_pilot_enabled is False, the review-fix path runs in
+    # SHADOW: eligible self-repo chains create armless lanes and exercise real
+    # SHA-verified checkpoint/CAS transitions, but take no workspace reservation,
+    # attach no warm-resume prompt/dispatch context, and do not alter spawning.
     "improvement_lanes_enabled": False,
     # Review-fix lane pilot (knowledge doc 18840e55, pilot/matched-control/kill
     # sections). Lane-izes ONLY the fix side of the review -> fix -> re-review
-    # loop for the Blueprint self-repo. Requires improvement_lanes_enabled too;
-    # a KILL verdict flips this back to False so every chain degrades to classic.
-    # Default False — fully inert (classic spawn path byte-for-byte unchanged).
+    # loop for the Blueprint self-repo. Requires improvement_lanes_enabled too.
+    # False means either fully inert (master off) or SHADOW (master on); True
+    # means full pilot with ITT arm assignment, warm reservation, fix-side lane
+    # dispatch/prompt context, recovery requeues, and KILL/ADOPT measurement.
+    # A KILL verdict flips this back to False so every chain leaves full pilot.
     "review_fix_lane_pilot_enabled": False,
+    # Three-value pilot mode: "off" (inert), "shadow" (arm assignment +
+    # checkpoints, no warm reservation or fix routing), "on" (full pilot).
+    # Takes precedence over the boolean pair when set to "shadow" or "on".
+    # Default "off" preserves the legacy boolean-flag semantics.
+    "review_fix_lane_pilot_mode": "off",
     # Account-agnostic lease: when True, a same-tenant IDLE pool member may be
     # leased for a task whose resolved account (and model) differ from the
     # member's frozen boot account, and the warm-claim path re-materializes the
@@ -738,13 +777,29 @@ runtime_config: Dict = {
     # project (no recent demand, no members) is never seeded. Read by
     # warm_pool_maintainer._demand_active_projects.
     "warm_pool_demand_window_minutes": 30,
-    # TTL (seconds) for a lane-scoped workspace reservation set on pool member
-    # release. A member returned to IDLE with a lane id is held for the matching
-    # lane's next phase for this window; after expiry it becomes generally
-    # claimable by any request. Defaults to 15 min — enough to span the gap
-    # between a phase completing (lane parks) and the next phase being dispatched.
-    # Inert when improvement_lanes_enabled is False.
-    "warm_pool_lane_reservation_ttl_seconds": 900,
+    # SOFT TTL (seconds) for a lane-scoped workspace reservation set on pool
+    # member release. A member returned to IDLE with a lane id is held for the
+    # matching lane's next phase for this window. The maintainer's liveness-aware
+    # sweep RE-STAMPS this forward while the owning lane is still PARKED awaiting
+    # its fix (bounded by warm_pool_lane_reservation_hard_cap_seconds), so a soft
+    # expiry no longer immediately surrenders the member mid-review. Re-grounded
+    # from 15 min to 30 min: a lane-arm review is deliberately forced COLD, so the
+    # reservation must span cold VM provisioning + a full review agent run +
+    # evaluation + the fix's queue/dispatch latency. The admin lane-diag endpoint
+    # (GET /api/admin/lane-diag) per-PR ``review_seconds`` medians show that cold
+    # window routinely exceeds 15 min; 30 min comfortably spans a real cold review
+    # before the liveness sweep even has to extend it. Inert when
+    # improvement_lanes_enabled is False.
+    "warm_pool_lane_reservation_ttl_seconds": 1800,
+    # HARD absolute ceiling (seconds) on a lane reservation's TOTAL lifetime. The
+    # liveness-aware sweep may re-stamp the soft TTL above to keep a member
+    # reserved across a long review, but it can NEVER extend past this cap (anchored
+    # by PoolVm.reservation_hard_expires_at, stamped once at reservation creation
+    # and never re-stamped). Once the cap elapses the sweep ALWAYS frees the member
+    # even when the lane still looks alive, so a stuck/zombie lane cannot pin a warm
+    # VM indefinitely. Defaults to 90 min — generous headroom over the re-grounded
+    # 30 min soft TTL for a worst-case slow review while still bounding the pin.
+    "warm_pool_lane_reservation_hard_cap_seconds": 5400,
     # Circuit-breaker thresholds for POOL-served claims. When pool leases or
     # pool-leased tasks fail (lease/finalize error, a leased VM found tearing
     # down, or a FAILED pool task) more than the threshold within a 1h rolling
@@ -1249,6 +1304,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("safeguard_challenge_gate_mode", raw_mode)
+                if "evergreen_fill_deferred_memo_enrollment" in config_json:
+                    _set(
+                        "evergreen_fill_deferred_memo_enrollment",
+                        bool(config_json["evergreen_fill_deferred_memo_enrollment"]),
+                    )
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",
@@ -1306,6 +1366,10 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "review_fix_lane_pilot_enabled",
                         bool(config_json["review_fix_lane_pilot_enabled"]),
                     )
+                if "review_fix_lane_pilot_mode" in config_json:
+                    raw_mode = str(config_json["review_fix_lane_pilot_mode"]).lower()
+                    if raw_mode in ("off", "shadow", "on"):
+                        _set("review_fix_lane_pilot_mode", raw_mode)
                 if "warm_pool_enabled" in config_json:
                     _set(
                         "warm_pool_enabled",
@@ -1685,3 +1749,48 @@ def is_review_fix_lane_pilot_enabled() -> bool:
     if not is_improvement_lanes_enabled():
         return False
     return bool(runtime_config.get("review_fix_lane_pilot_enabled", False))
+
+
+def is_review_fix_lane_shadow_enabled() -> bool:
+    """Return True for checkpoint-only review-fix lane shadow mode.
+
+    Shadow is the first enabled state of the substrate: the master switch is on
+    but the full pilot flag is off. Callers must still apply project eligibility
+    and durable KILL checks before creating shadow lanes.
+    """
+    return is_improvement_lanes_enabled() and not bool(
+        runtime_config.get("review_fix_lane_pilot_enabled", False)
+    )
+
+
+def get_lane_pilot_mode() -> str:
+    """Return the three-value pilot mode: 'off', 'shadow', or 'on'.
+
+    Derives the canonical mode from the explicit ``review_fix_lane_pilot_mode``
+    key when it is set to 'shadow' or 'on', then falls back to the legacy pair
+    (improvement_lanes_enabled + review_fix_lane_pilot_enabled) so existing
+    deployments that only use the boolean flags continue to work.
+    """
+    explicit = str(runtime_config.get("review_fix_lane_pilot_mode", "off"))
+    if explicit in ("shadow", "on"):
+        return explicit
+    # Legacy fallback: derive from the boolean flags.
+    if is_review_fix_lane_pilot_enabled():
+        return "on"
+    if is_review_fix_lane_shadow_enabled():
+        # Classic armless shadow (master on, pilot off) is NOT the new shadow
+        # pilot mode — it is preserved as the "off" baseline for the three-value
+        # scale, accessible via the substrate's original boolean semantics.
+        return "off"
+    return "off"
+
+
+def is_review_fix_lane_pilot_shadow_mode_enabled() -> bool:
+    """Return True when the pilot shadow mode is active.
+
+    Shadow mode (mode == 'shadow') runs arm assignment and checkpoint writing
+    but skips warm-pool reservations and fix-task lane routing.  Requires the
+    substrate master switch (improvement_lanes_enabled) to be True so lane rows
+    can actually be created.
+    """
+    return is_improvement_lanes_enabled() and get_lane_pilot_mode() == "shadow"

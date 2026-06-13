@@ -11,7 +11,7 @@ Covers:
 
 import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from unittest.mock import AsyncMock
@@ -21,9 +21,11 @@ from sqlalchemy import select
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
+    PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
     PIPELINE_TASK_STALE_MINUTES,
     SPAWN_REASON_BLOCKED_REPEAT,
     SPAWN_REASON_KEY,
+    SPAWN_REASON_PERSISTENT_CONFLICT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
@@ -54,6 +56,7 @@ from app.review_pipeline import (
     _is_test_file,
     _is_verification_only_rejection,
     _max_review_iterations,
+    _recent_consecutive_lane_count,
     _spawn_pipeline_task,
     maybe_spawn_cross_cutting_safeguard,
     post_merge_summary_comment,
@@ -378,7 +381,9 @@ async def test_requeue_carries_forward_prior_review_iterations(db_session, mocke
     _prior_review_iterations_consumed, and the clone's cap reflects the deduction."""
     from app.task_lifecycle import _requeue_parent_task
 
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     project = await _make_db_project(db_session)
     parent = make_task(
@@ -1027,7 +1032,9 @@ async def test_review_spawns_when_all_prior_fixes_terminal(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_idempotency_collision_with_raced_out_task_does_not_raise(db_session, mocker):
+async def test_idempotency_collision_with_raced_out_task_does_not_raise(
+    db_session, mocker
+):
     """Regression: when a same-key spawn collides on the ux_task_active_idempotency_key
     partial unique index but the colliding task has raced OUT of the active-status
     window (e.g. QUEUED -> BLOCKED on a file-conflict lock) so the active-only
@@ -1081,8 +1088,12 @@ async def test_idempotency_collision_with_raced_out_task_does_not_raise(db_sessi
     # First spawn: pre-check mocked to None, so the INSERT succeeds and a real
     # task with the computed idempotency_key now exists in an active status.
     task1, created1 = await _spawn_pipeline_task(
-        source_task, "verify_tests", db_session,
-        pr_number=222, branch="feat/x", base_branch="main",
+        source_task,
+        "verify_tests",
+        db_session,
+        pr_number=222,
+        branch="feat/x",
+        base_branch="main",
         original_task_id=str(original_task.id),
     )
     assert created1 is True
@@ -1093,8 +1104,12 @@ async def test_idempotency_collision_with_raced_out_task_does_not_raise(db_sessi
     # index → recovery active-only lookup (mocked) also misses → the broadened
     # status-agnostic re-query must still find task1. Pre-fix this re-raised.
     task2, created2 = await _spawn_pipeline_task(
-        source_task, "verify_tests", db_session,
-        pr_number=222, branch="feat/x", base_branch="main",
+        source_task,
+        "verify_tests",
+        db_session,
+        pr_number=222,
+        branch="feat/x",
+        base_branch="main",
         original_task_id=str(original_task.id),
     )
     assert created2 is False
@@ -1103,9 +1118,7 @@ async def test_idempotency_collision_with_raced_out_task_does_not_raise(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_spawn_lock_timeout_defers_without_poisoning_session(
-    db_session, mocker
-):
+async def test_spawn_lock_timeout_defers_without_poisoning_session(db_session, mocker):
     """Regression for prod burst 2026-06-07 01:05: the spawn commit was
     cancelled by Postgres' lock_timeout (asyncpg LockNotAvailableError waiting
     on a peer's uncommitted same-key insert). Pre-fix the error propagated with
@@ -1197,8 +1210,12 @@ async def test_spawn_lock_timeout_defers_without_poisoning_session(
     # the path the prod burst hit (verify_tests delegates to a separate
     # spawner and is not the regression surface here).
     spawned, created = await _spawn_pipeline_task(
-        source_task, "fix", db_session,
-        pr_number=333, branch="feat/y", base_branch="main",
+        source_task,
+        "fix",
+        db_session,
+        pr_number=333,
+        branch="feat/y",
+        base_branch="main",
         original_task_id=str(original_task.id),
         fix_prompt="Address the review feedback on PR #333",
     )
@@ -1217,11 +1234,7 @@ async def test_spawn_lock_timeout_defers_without_poisoning_session(
 
     # Nothing was spawned and the poison rows were rolled back.
     rows = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.project_id == project.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
         .scalars()
         .all()
     )
@@ -1368,7 +1381,9 @@ async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1482,7 +1497,9 @@ async def test_cap_exhaustion_skips_approval_when_gates_disabled(db_session, moc
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1593,14 +1610,14 @@ def _mock_cap_exhaustion_github(mocker):
 
 
 @pytest.mark.asyncio
-async def test_cap_exhaustion_after_approve_lands_cancelled_no_code_error(
-    db_session, mocker
-):
+async def test_approved_cap_exhaustion_records_distinct_outcome(db_session, mocker):
     """FIX D: when the review-fix cap is reached on an already-APPROVED PR
     (orig.review_loop.review_approved=True, no outstanding CHANGES_REQUESTED),
     the orig lands CANCELLED with failure_detail=cap_exhausted_after_approve and
-    NO CODE_ERROR is recorded — it is benign merge-mechanics churn, not a code
-    failure."""
+    records a distinct non-CODE_ERROR outcome so approved merge-mechanics churn
+    is queryable without looking like a code failure."""
+    from app.failure_classification import APPROVED_CAP_PR_CLOSED
+
     _mock_cap_exhaustion_github(mocker)
     alert_mock = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
@@ -1620,6 +1637,7 @@ async def test_cap_exhaustion_after_approve_lands_cancelled_no_code_error(
         payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
         context={
             "scope": "small",
+            "direction_id": "dir-approved-cap",
             "review_loop": {"review_approved": True, "pr_number": 404},
         },
     )
@@ -1655,16 +1673,26 @@ async def test_cap_exhaustion_after_approve_lands_cancelled_no_code_error(
         f"Cap-after-approve must land CANCELLED, got {orig.status}"
     )
     assert (orig.context or {}).get("failure_detail") == "cap_exhausted_after_approve"
-    assert (orig.context or {}).get("failure_category") != "CODE_ERROR", (
-        "No CODE_ERROR must be recorded for a benign post-approval cap"
-    )
+    assert (orig.context or {}).get("failure_category") == APPROVED_CAP_PR_CLOSED
+    assert "merge mechanics exhausted the cap" in (orig.latest_status_message or "")
     assert (orig.context or {}).get("pr_rejected") is not True, (
         "An approved PR is not a rejection — pr_rejected must not be set"
     )
-    # No failure-side accounting / alert for a non-genuine outcome.
+    # No failure alert for a non-genuine outcome, but durable accounting records
+    # the distinct approved-cap class for digest/analytics visibility.
     alert_mock.assert_not_called()
-    rec_task.assert_not_called()
-    rec_dir.assert_not_called()
+    rec_task.assert_called_once_with(
+        success=False,
+        failure_class=APPROVED_CAP_PR_CLOSED,
+        task_id=str(orig.id),
+        task_type="create",
+    )
+    rec_dir.assert_called_once_with(
+        "dir-approved-cap",
+        success=False,
+        failure_class=APPROVED_CAP_PR_CLOSED,
+        project_id=str(project.id),
+    )
 
 
 @pytest.mark.asyncio
@@ -1709,9 +1737,7 @@ async def test_cap_exhaustion_with_outstanding_changes_requested_stays_failed(
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
-        payloads=[
-            {"type": "fix", "pr_number": 405, "original_task_id": str(orig.id)}
-        ],
+        payloads=[{"type": "fix", "pr_number": 405, "original_task_id": str(orig.id)}],
         context={
             "review_loop": {
                 "pr_number": 405,
@@ -1924,7 +1950,9 @@ async def test_code_error_failed_tasks_do_count_toward_global_cap(db_session, mo
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     project = await _make_db_project(db_session)
 
@@ -2147,7 +2175,9 @@ async def test_cap_exhaustion_records_task_and_direction_result(db_session, mock
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2239,7 +2269,9 @@ async def test_cap_exhaustion_records_remediation_failure_on_direction(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -4223,9 +4255,7 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_second_opinion_state_not_propagated_to_spawned_tasks(
-    db_session, mocker
-):
+async def test_second_opinion_state_not_propagated_to_spawned_tasks(db_session, mocker):
     """The second-opinion key family is task-local review state and must NOT
     ride the review→fix→review context copy. Regression (PR #9243): an
     inherited reconciliation record fired the single-shot re-entry override on
@@ -6231,6 +6261,245 @@ async def test_fix_prompt_does_not_duplicate_prior_review_feedback(db_session, m
         assert f"LEGACY-PRIOR-FEEDBACK-{i}" not in spawned_prompt
 
 
+@pytest.mark.asyncio
+async def test_supersede_churn_halts_after_limit(db_session, mocker):
+    """Two consecutive supersessions with no counted run in between must stop
+    respawning and escalate the chain original."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.review_pipeline._REVIEW_SUPERSEDE_CHURN_LIMIT", 2)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    stale_started = _utcnow_for_test() - timedelta(
+        minutes=PIPELINE_TASK_STALE_MINUTES + 5
+    )
+    stale_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 701,
+                "branch": "feat/s",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        started_at=stale_started,
+    )
+    db_session.add(stale_review)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 701,
+                "branch": "feat/s",
+                "base_branch": "main",
+                "prompt": "Build X",
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(stale_review)
+    await db_session.refresh(source_task)
+
+    first_result, first_created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=701,
+        branch="feat/s",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert first_created is True and first_result is not None
+    await db_session.commit()
+
+    await db_session.refresh(stale_review)
+    assert stale_review.status == TaskStatus.CANCELLED
+    assert (stale_review.context or {}).get("failure_detail") == (
+        "superseded_by_review_pipeline"
+    )
+
+    first_result.started_at = stale_started
+    first_result.last_heartbeat = None
+    db_session.add(first_result)
+    await db_session.commit()
+    await db_session.refresh(first_result)
+
+    second_result, second_created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=701,
+        branch="feat/s",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+
+    assert second_created is False
+    assert second_result is None
+    await db_session.refresh(original_task)
+    assert (original_task.context or {}).get("_review_supersede_churn_count") == 2
+    assert (original_task.context or {}).get("review_loop_terminal_outcome", {}).get(
+        "kind"
+    ) == "supersession_churn_halt"
+    assert original_task.requires_approval is True
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.task_id == original_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "supersession-churn" in alerts[0].title
+    assert "PR #701" in alerts[0].title
+    assert (
+        (original_task.context or {})
+        .get("review_loop_terminal_outcome", {})
+        .get("detail")
+    )
+
+
+@pytest.mark.asyncio
+async def test_supersede_churn_resets_after_counted_run(db_session, mocker):
+    """A cap-counted non-infra run between supersessions must reset the streak."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.review_pipeline._REVIEW_SUPERSEDE_CHURN_LIMIT", 2)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    stale_started = _utcnow_for_test() - timedelta(
+        minutes=PIPELINE_TASK_STALE_MINUTES + 5
+    )
+    stale_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 702,
+                "branch": "feat/r",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        started_at=stale_started,
+    )
+    db_session.add(stale_review)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 702,
+                "branch": "feat/r",
+                "base_branch": "main",
+                "prompt": "Build X",
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(stale_review)
+    await db_session.refresh(source_task)
+
+    first_result, first_created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=702,
+        branch="feat/r",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert first_created is True and first_result is not None
+    await db_session.commit()
+
+    counted_source = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 702,
+                "branch": "feat/r",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(counted_source)
+    await db_session.commit()
+    await db_session.refresh(counted_source)
+
+    first_result.started_at = stale_started
+    first_result.last_heartbeat = None
+    db_session.add(first_result)
+    await db_session.commit()
+    await db_session.refresh(first_result)
+
+    second_result, second_created = await _spawn_pipeline_task(
+        counted_source,
+        "review",
+        db_session,
+        pr_number=702,
+        branch="feat/r",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+
+    assert second_created is True and second_result is not None
+    await db_session.refresh(original_task)
+    assert (original_task.context or {}).get("_review_supersede_churn_count") == 1
+    assert (original_task.context or {}).get("review_loop_terminal_outcome") is None
+
+
 def _utcnow_for_test():
     """Naive UTC timestamp matching app/time_utils.py _utcnow()."""
     from datetime import datetime, timezone
@@ -6815,12 +7084,18 @@ async def test_churn_cap_reduction_durable_across_spawns(db_session, mocker):
         {
             "iteration": 0,
             "feedback": "f0",
-            "issues": [_issue("missing null check in function_alpha"), _issue("off by one in loop_beta")],
+            "issues": [
+                _issue("missing null check in function_alpha"),
+                _issue("off by one in loop_beta"),
+            ],
         },
         {
             "iteration": 1,
             "feedback": "f1",
-            "issues": [_issue("array bounds in handler_gamma"), _issue("type mismatch in parser_delta")],
+            "issues": [
+                _issue("array bounds in handler_gamma"),
+                _issue("type mismatch in parser_delta"),
+            ],
         },
     ]
     # First spawn: iteration 2, detects churn, reduces cap.
@@ -6864,7 +7139,10 @@ async def test_churn_cap_reduction_durable_across_spawns(db_session, mocker):
         original_task_id=str(original_task.id),
         fix_prompt="Please fix.",
         current_feedback="f2",
-        current_issues=[_issue("undefined reference in context_epsilon"), _issue("missing import in config_zeta")],
+        current_issues=[
+            _issue("undefined reference in context_epsilon"),
+            _issue("missing import in config_zeta"),
+        ],
     )
 
     assert first_result is not None
@@ -9210,7 +9488,9 @@ def _mock_merge_success_deps(mocker):
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     # Branch cleanup + playbook touch GitHub/DB — no-op them (they're guarded
     # in the handler anyway; mocking keeps the test focused + fast).
-    mocker.patch("app.task_lifecycle._cleanup_branches", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.task_lifecycle._cleanup_branches", new=AsyncMock(return_value=None)
+    )
     mocker.patch(
         "app.review_learning.extract_review_feedback_to_playbook",
         new=AsyncMock(return_value=None),
@@ -9245,7 +9525,9 @@ def _mock_small_auto_merge_deps(mocker):
     )
     mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.task_lifecycle._cleanup_branches", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.task_lifecycle._cleanup_branches", new=AsyncMock(return_value=None)
+    )
 
 
 @pytest.mark.skipif(
@@ -9333,10 +9615,14 @@ async def test_merge_success_caller_blocks_then_runs_one_shots(db_session, mocke
             # UPDATE on the Task row (the Postgres table is `task`, mapped via
             # the model — not a raw `tasks` literal).
             held = (
-                await peer.execute(
-                    select(Task).where(Task.id == parent_id).with_for_update()
+                (
+                    await peer.execute(
+                        select(Task).where(Task.id == parent_id).with_for_update()
+                    )
                 )
-            ).scalars().first()
+                .scalars()
+                .first()
+            )
             assert held is not None
             # Hold long enough that the caller MUST block on the parent row when
             # it reaches the (fast, mocked) merge-success bookkeeping — but well
@@ -9370,9 +9656,7 @@ async def test_merge_success_caller_blocks_then_runs_one_shots(db_session, mocke
 
 
 @pytest.mark.asyncio
-async def test_merge_success_caller_runs_one_shots_when_uncontended(
-    db_session, mocker
-):
+async def test_merge_success_caller_runs_one_shots_when_uncontended(db_session, mocker):
     """C4 fix B/C (non-PG baseline): with no contention the merge-success caller
     acquires the parent and runs the one-shot transition. Mirrors the contended
     test's assertions so the happy path is covered on SQLite too (where blocking
@@ -9434,6 +9718,93 @@ async def test_merge_success_caller_runs_one_shots_when_uncontended(
 
     assert refetched_parent.status == TaskStatus.COMPLETED
     assert (refetched_parent.context or {}).get("pr_merged") is True
+
+
+@pytest.mark.asyncio
+async def test_approve_verdict_retires_improvement_lane(db_session, mocker):
+    """When _process_post_commit processes an APPROVE verdict on a review task
+    that carries LANE_CHAIN_ID_KEY, it must retire the chain's ImprovementLane
+    so the lane reaches a terminal state immediately rather than staying
+    ACTIVE/PARKED until the next TTL sweep.
+
+    Regression: retire_chain_lane is called with task.context inside the
+    `if verdict == 'APPROVE':` block; removing or bypassing that call would
+    leave the lane live indefinitely — not caught by unit tests on
+    retire_chain_lane alone."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.improvement_lane_ops import create_lane
+    from app.models import ImprovementLane, ImprovementLaneStatus
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY
+
+    _mock_merge_success_deps(mocker)
+
+    project = await _make_db_project(db_session)
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/approve-retire",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    await db_session.flush()
+
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={},
+    )
+    await _persist(db_session, parent)
+
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 7777,
+                "branch": "lane/approve-retire",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "review_loop": {
+                "pr_number": 7777,
+                "branch": "lane/approve-retire",
+                "base_branch": "main",
+                "original_task_id": str(parent.id),
+                "iteration": 1,
+                "review_approved": True,
+                "ci_passed": True,
+            },
+        },
+        latest_status_message="APPROVE",
+    )
+    review_task.vm_instance_id = f"agent-vm-lane-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="APPROVE",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refreshed_lane = await fresh.get(ImprovementLane, lane.id)
+
+    assert refreshed_lane.status == ImprovementLaneStatus.RETIRED.value, (
+        f"Lane must be RETIRED after APPROVE verdict, got {refreshed_lane.status}"
+    )
 
 
 @pytest.mark.asyncio
@@ -9499,9 +9870,7 @@ async def test_small_auto_merge_to_distinct_promotion_target_alerts_without_pr_m
 
 
 @pytest.mark.asyncio
-async def test_small_auto_merge_on_single_branch_sets_pr_merged(
-    db_session, mocker
-):
+async def test_small_auto_merge_on_single_branch_sets_pr_merged(db_session, mocker):
     from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
     from app.task_lifecycle import _process_post_commit
     from app.schemas import AgentStatusPayload
@@ -9655,9 +10024,7 @@ def test_is_custom_staged_rollup_root_true_for_release_candidate_root():
         context={"_is_rollup_review": True, "rollup_pr_number": 6264},
     )
 
-    assert (
-        is_custom_staged_rollup_root(parent, project, "release/candidate-1") is True
-    )
+    assert is_custom_staged_rollup_root(parent, project, "release/candidate-1") is True
 
 
 def test_is_custom_staged_rollup_root_false_for_default_research_branch():
@@ -10064,9 +10431,7 @@ async def test_repeat_fingerprint_creates_escalation_alert(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    common_failure = (
-        "[wrapper] ./check failed: error while loading shared libraries: libatk-1.0.so.0"
-    )
+    common_failure = "[wrapper] ./check failed: error while loading shared libraries: libatk-1.0.so.0"
     earlier_fix = make_task(
         project_id=project.id,
         status=TaskStatus.FAILED,
@@ -10115,7 +10480,9 @@ async def test_repeat_fingerprint_creates_escalation_alert(db_session, mocker):
     assert "repeat-fingerprint halt" in alerts[0].title
     assert "PR #905" in alerts[0].title
     terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
-    assert terminal_outcome and terminal_outcome.get("kind") == "repeat_fingerprint_halt"
+    assert (
+        terminal_outcome and terminal_outcome.get("kind") == "repeat_fingerprint_halt"
+    )
     assert terminal_outcome.get("reason") == "repeat-fingerprint"
 
     # Re-entry (idempotent halt) must not create a second Alert.
@@ -10168,9 +10535,7 @@ class TestDetectFixAllIssueClass:
         assert detect_fix_all_issue_class(issues) is True
 
     def test_all_instances_cue_triggers(self):
-        issues = [
-            _issue("Fix all instances of the unguarded dict access", "CRITICAL")
-        ]
+        issues = [_issue("Fix all instances of the unguarded dict access", "CRITICAL")]
         assert detect_fix_all_issue_class(issues) is True
 
     def test_minor_only_does_not_trigger(self):
@@ -10306,9 +10671,21 @@ async def test_early_nonconvergence_escalates_at_K_blocks_spawn(db_session, mock
     # Prior rounds form a low-but-nonzero plateau. iteration=K means the current
     # (incoming) round is the K-th — escalation should fire.
     plateau_history = [
-        {"iteration": 0, "verdict": "REQUEST_CHANGES", "issues": [_issue("a1"), _issue("a2"), _issue("a3")]},
-        {"iteration": 1, "verdict": "REQUEST_CHANGES", "issues": [_issue("b1"), _issue("b2")]},
-        {"iteration": 2, "verdict": "REQUEST_CHANGES", "issues": [_issue("c1"), _issue("c2")]},
+        {
+            "iteration": 0,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue("a1"), _issue("a2"), _issue("a3")],
+        },
+        {
+            "iteration": 1,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue("b1"), _issue("b2")],
+        },
+        {
+            "iteration": 2,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue("c1"), _issue("c2")],
+        },
     ]
     source_task = make_task(
         project_id=project.id,
@@ -10476,9 +10853,7 @@ async def test_cap_preserves_nonempty_mergeable_rollup_pr(db_session, mocker):
     """FIX #3b: capping a NON-EMPTY, conflict-free ROLLUP PR on REQUEST_CHANGES
     leaves the PR OPEN, flags requires_approval, records NO CODE_ERROR, and does
     NOT close the PR."""
-    close_mock = _mock_preservable_pr(
-        mocker, changed_files=4, mergeable_state="clean"
-    )
+    close_mock = _mock_preservable_pr(mocker, changed_files=4, mergeable_state="clean")
     alert_mock = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
@@ -10544,9 +10919,7 @@ async def test_cap_preserves_nonempty_mergeable_rollup_pr(db_session, mocker):
 async def test_cap_closes_empty_rollup_pr(db_session, mocker):
     """GUARDRAIL: an EMPTY rollup PR (changed_files == 0) is not preservable —
     it keeps today's close + FAIL + CODE_ERROR path."""
-    close_mock = _mock_preservable_pr(
-        mocker, changed_files=0, mergeable_state="clean"
-    )
+    close_mock = _mock_preservable_pr(mocker, changed_files=0, mergeable_state="clean")
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
@@ -10603,9 +10976,7 @@ async def test_cap_closes_empty_rollup_pr(db_session, mocker):
 async def test_cap_closes_conflicted_rollup_pr(db_session, mocker):
     """GUARDRAIL: a genuinely-conflicted rollup PR (mergeable_state == 'dirty')
     cannot be hand-merged, so it keeps the close + FAIL + CODE_ERROR path."""
-    close_mock = _mock_preservable_pr(
-        mocker, changed_files=4, mergeable_state="dirty"
-    )
+    close_mock = _mock_preservable_pr(mocker, changed_files=4, mergeable_state="dirty")
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
@@ -10662,9 +11033,7 @@ async def test_cap_closes_nonrollup_pr_even_if_mergeable(db_session, mocker):
     """GUARDRAIL: a non-rollup chain PR is not preserved — only rollup PRs
     aggregate already-completed sibling work worth keeping open. A plain create
     task keeps the close + FAIL + CODE_ERROR path."""
-    close_mock = _mock_preservable_pr(
-        mocker, changed_files=4, mergeable_state="clean"
-    )
+    close_mock = _mock_preservable_pr(mocker, changed_files=4, mergeable_state="clean")
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
@@ -10996,7 +11365,11 @@ async def test_pr_number_match_matches_seeded_pr_number_end_to_end(db_session):
     await _persist(db_session, target, other)
 
     rows = (
-        (await db_session.execute(select(Task).where(_pr_number_match(db_session, 7099))))
+        (
+            await db_session.execute(
+                select(Task).where(_pr_number_match(db_session, 7099))
+            )
+        )
         .scalars()
         .all()
     )
@@ -11030,9 +11403,7 @@ class TestIsVerificationOnlyRejection:
         assert _is_verification_only_rejection(issues, "") is True
 
     def test_stale_workspace_install_failure_is_verification_only(self):
-        issues = [
-            self._issue("Stale workspace: could not install deps, npm ci failed")
-        ]
+        issues = [self._issue("Stale workspace: could not install deps, npm ci failed")]
         assert _is_verification_only_rejection(issues, "") is True
 
     def test_build_failed_pass_status_is_verification_only(self):
@@ -11043,7 +11414,8 @@ class TestIsVerificationOnlyRejection:
         # No issues, but the prose feedback is a pure could-not-verify note.
         assert (
             _is_verification_only_rejection(
-                [], "Unable to verify — pytest unavailable, the CI check was not verifiable"
+                [],
+                "Unable to verify — pytest unavailable, the CI check was not verifiable",
             )
             is True
         )
@@ -11058,7 +11430,9 @@ class TestIsVerificationOnlyRejection:
     # ── negative: any concrete code defect respects the verdict ───────────
 
     def test_concrete_logic_bug_blocks(self):
-        issues = [self._issue("Off-by-one error in the loop bound — reads past the array")]
+        issues = [
+            self._issue("Off-by-one error in the loop bound — reads past the array")
+        ]
         assert _is_verification_only_rejection(issues, "") is False
 
     def test_concrete_defect_mixed_with_verification_still_blocks(self):
@@ -11066,7 +11440,9 @@ class TestIsVerificationOnlyRejection:
         # anywhere in the blocking set keeps the verdict.
         issues = [
             self._issue("could not run ./check"),
-            self._issue("SQL injection in the query builder — user input is interpolated"),
+            self._issue(
+                "SQL injection in the query builder — user input is interpolated"
+            ),
         ]
         assert _is_verification_only_rejection(issues, "") is False
 
@@ -11426,6 +11802,79 @@ async def test_already_merged_skip_retires_active_lane(db_session, mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_pr_closed_unmerged_skips_spawn_and_retires_lane(db_session, mocker):
+    """When a chain's PR was closed without merge, _spawn_pipeline_task must skip
+    the spawn and retire the chain's ImprovementLane so it reaches RETIRED rather
+    than staying PARKED indefinitely."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+
+    from app.improvement_lane_ops import create_lane
+    from app.models import ImprovementLaneStatus
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/closed-unmerged",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    await db_session.flush()
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small", "pr_closed_unmerged": True},
+    )
+    db_session.add(original_task)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9998,
+                "branch": "lane/closed-unmerged",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+            LANE_CHAIN_ID_KEY: str(lane.id),
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=9998,
+        branch="lane/closed-unmerged",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None and created is False, (
+        "Review spawn must be skipped for a PR closed without merge"
+    )
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.RETIRED.value, (
+        f"Lane must be RETIRED after pr_closed_unmerged skip, got {lane.status}"
+    )
+
+
 # ── clear_review_escalation_approval_gate (stale stuck-hold release) ──────────
 
 
@@ -11466,12 +11915,16 @@ def test_clear_gate_releases_stuck_hold_and_stamps_resolution():
     assert outcome["iterations"] == 4
 
 
-@pytest.mark.parametrize("kind", ["standoff", "repeat_fingerprint_halt"])
+@pytest.mark.parametrize(
+    "kind", ["standoff", "repeat_fingerprint_halt", "supersession_churn_halt"]
+)
 def test_clear_gate_releases_other_resolvable_escalation_kinds(kind):
     from app.review_loop_convergence import clear_review_escalation_approval_gate
 
     task = _escalation_gated_task(kind=kind)
-    assert clear_review_escalation_approval_gate(task, resolved_by="review_approve_pr_9179")
+    assert clear_review_escalation_approval_gate(
+        task, resolved_by="review_approve_pr_9179"
+    )
     assert task.requires_approval is False
 
 
@@ -11534,48 +11987,99 @@ class TestClassifyIterationLane:
 
     def test_panel_review_is_arbitration(self):
         from app.review_pipeline import classify_iteration_lane, LANE_ARBITRATION
+
         t = self._task(payload_type="panel_review")
         assert classify_iteration_lane(t) == LANE_ARBITRATION
 
     def test_merge_conflict_is_conflict(self):
         from app.review_pipeline import classify_iteration_lane, LANE_CONFLICT
+
         t = self._task(fix_reason="merge_conflict")
         assert classify_iteration_lane(t) == LANE_CONFLICT
 
     def test_update_branch_failed_is_conflict(self):
         from app.review_pipeline import classify_iteration_lane, LANE_CONFLICT
+
         t = self._task(fix_reason="update_branch_failed")
         assert classify_iteration_lane(t) == LANE_CONFLICT
 
     def test_ci_failure_is_ci(self):
         from app.review_pipeline import classify_iteration_lane, LANE_CI
+
         t = self._task(fix_reason="ci_failure")
         assert classify_iteration_lane(t) == LANE_CI
 
     def test_code_review_is_review_convergence(self):
         from app.review_pipeline import classify_iteration_lane, LANE_REVIEW_CONVERGENCE
+
         t = self._task(fix_reason="code_review")
         assert classify_iteration_lane(t) == LANE_REVIEW_CONVERGENCE
 
     def test_no_fix_reason_is_review_convergence(self):
         from app.review_pipeline import classify_iteration_lane, LANE_REVIEW_CONVERGENCE
+
         t = self._task()
         assert classify_iteration_lane(t) == LANE_REVIEW_CONVERGENCE
 
     def test_review_type_is_review_convergence(self):
         from app.review_pipeline import classify_iteration_lane, LANE_REVIEW_CONVERGENCE
+
         t = self._task(payload_type="review")
         assert classify_iteration_lane(t) == LANE_REVIEW_CONVERGENCE
 
     def test_panel_review_overrides_fix_reason(self):
         """payload_type=panel_review takes priority regardless of fix_reason."""
         from app.review_pipeline import classify_iteration_lane, LANE_ARBITRATION
+
         ctx = {"review_loop": {"fix_reason": "ci_failure"}}
         t = make_task(
             payloads=[{"type": "panel_review", "pr_number": 1}],
             context=ctx,
         )
         assert classify_iteration_lane(t) == LANE_ARBITRATION
+
+
+class TestRecentConsecutiveLaneCount:
+    """Unit tests for the persistent-conflict recent segment counter."""
+
+    def _task(self, fix_reason: str, minutes: int) -> Task:
+        task = make_task(
+            payloads=[{"type": "fix", "pr_number": 1}],
+            context={"review_loop": {"fix_reason": fix_reason}},
+            status=TaskStatus.COMPLETED,
+        )
+        task.created_at = datetime(2026, 6, 1, 12, minutes, tzinfo=timezone.utc)
+        return task
+
+    def test_counts_only_newest_uninterrupted_lane_segment(self):
+        from app.review_pipeline import LANE_CONFLICT
+
+        tasks = [
+            self._task("merge_conflict", 1),
+            self._task("code_review", 2),
+            self._task("merge_conflict", 3),
+        ]
+
+        assert _recent_consecutive_lane_count(tasks, LANE_CONFLICT) == 1
+
+    def test_skips_non_cap_counting_tasks_before_segment_break(self):
+        from app.review_pipeline import LANE_CONFLICT
+
+        skipped_review = self._task("code_review", 4)
+        tasks = [
+            self._task("merge_conflict", 1),
+            self._task("merge_conflict", 2),
+            skipped_review,
+        ]
+
+        assert (
+            _recent_consecutive_lane_count(
+                tasks,
+                LANE_CONFLICT,
+                counts_toward_cap=lambda task: task is not skipped_review,
+            )
+            == 2
+        )
 
 
 # ── per-lane sub-cap tests ─────────────────────────────────────────────────────
@@ -11588,7 +12092,9 @@ def _mock_lane_cap_github(mocker):
         new_callable=AsyncMock,
         return_value=("tok", "o", "r"),
     )
-    mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
@@ -11619,25 +12125,55 @@ async def test_conflict_lane_sub_cap_blocks_spawn(db_session, mocker):
 
     # 4 completed merge-conflict fix iterations — reaches the conflict sub-cap.
     for _ in range(4):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix", "pr_number": 9100, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "fix",
+                        "pr_number": 9100,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "review_loop": {
+                        "fix_reason": "merge_conflict",
+                        "original_task_id": str(original_task.id),
+                    }
+                },
+            )
+        )
 
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "fix", "pr_number": 9100, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
-        context={"scope": "large", "review_loop": {"iteration": 4, "original_task_id": str(original_task.id)}},
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9100,
+                "branch": "b",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "large",
+            "review_loop": {"iteration": 4, "original_task_id": str(original_task.id)},
+        },
     )
     db_session.add(source_task)
     await db_session.commit()
     await db_session.refresh(source_task)
 
     # Attempt a 5th merge-conflict spawn — must be blocked by sub-cap.
-    mocker.patch.dict(runtime_config, {"review_lane_cap_conflict": 4})
+    # Suppress the persistent-conflict early escalation (threshold > 4) so this
+    # test exercises the lane sub-cap path specifically.
+    mocker.patch.dict(
+        runtime_config,
+        {"review_lane_cap_conflict": 4, "review_persistent_conflict_threshold": 10},
+    )
     result, created = await _spawn_pipeline_task(
         source_task,
         "fix",
@@ -11696,24 +12232,55 @@ async def test_conflict_lane_sub_cap_rollup_preserves_for_handmerge(db_session, 
 
     # 4 completed merge-conflict fix iterations — reaches the conflict sub-cap.
     for _ in range(4):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix", "pr_number": 9110, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "fix",
+                        "pr_number": 9110,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "review_loop": {
+                        "fix_reason": "merge_conflict",
+                        "original_task_id": str(original_task.id),
+                    }
+                },
+            )
+        )
 
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "fix", "pr_number": 9110, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
-        context={"scope": "large", "_is_rollup_review": True, "review_loop": {"iteration": 4, "original_task_id": str(original_task.id)}},
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9110,
+                "branch": "b",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "large",
+            "_is_rollup_review": True,
+            "review_loop": {"iteration": 4, "original_task_id": str(original_task.id)},
+        },
     )
     db_session.add(source_task)
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    mocker.patch.dict(runtime_config, {"review_lane_cap_conflict": 4})
+    # Suppress persistent-conflict early escalation (threshold > 4) so this
+    # test exercises the rollup preserve-for-handmerge path at the lane sub-cap.
+    mocker.patch.dict(
+        runtime_config,
+        {"review_lane_cap_conflict": 4, "review_persistent_conflict_threshold": 10},
+    )
     result, created = await _spawn_pipeline_task(
         source_task,
         "fix",
@@ -11732,12 +12299,16 @@ async def test_conflict_lane_sub_cap_rollup_preserves_for_handmerge(db_session, 
     # Preserve-for-handmerge path: orig flagged, PR NOT closed.
     await db_session.refresh(original_task)
     assert original_task.requires_approval is True
-    assert (original_task.context or {}).get("failure_detail") == "review_cap_preserved_for_handmerge"
+    assert (original_task.context or {}).get(
+        "failure_detail"
+    ) == "review_cap_preserved_for_handmerge"
     close_pr_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_conflict_lane_exhaustion_does_not_block_review_convergence(db_session, mocker):
+async def test_conflict_lane_exhaustion_does_not_block_review_convergence(
+    db_session, mocker
+):
     """Conflict lane exhausted → review_convergence spawns are unaffected."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     _mock_lane_cap_github(mocker)
@@ -11757,18 +12328,43 @@ async def test_conflict_lane_exhaustion_does_not_block_review_convergence(db_ses
 
     # Conflict lane at cap.
     for _ in range(4):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix", "pr_number": 9101, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "fix",
+                        "pr_number": 9101,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "review_loop": {
+                        "fix_reason": "merge_conflict",
+                        "original_task_id": str(original_task.id),
+                    }
+                },
+            )
+        )
 
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "review", "pr_number": 9101, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
-        context={"scope": "large", "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)}},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9101,
+                "branch": "b",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "large",
+            "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+        },
     )
     db_session.add(source_task)
     await db_session.commit()
@@ -11817,18 +12413,38 @@ async def test_arbitration_lane_exhaustion_routes_as_standoff(db_session, mocker
 
     # 2 completed panel_review tasks — arbitration lane at cap.
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "panel_review", "pr_number": 9102, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "panel_review",
+                        "pr_number": 9102,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={"review_loop": {"original_task_id": str(original_task.id)}},
+            )
+        )
 
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "panel_review", "pr_number": 9102, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
-        context={"scope": "large", "review_loop": {"iteration": 2, "original_task_id": str(original_task.id)}},
+        payloads=[
+            {
+                "type": "panel_review",
+                "pr_number": 9102,
+                "branch": "b",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "large",
+            "review_loop": {"iteration": 2, "original_task_id": str(original_task.id)},
+        },
     )
     db_session.add(source_task)
     await db_session.commit()
@@ -11851,7 +12467,9 @@ async def test_arbitration_lane_exhaustion_routes_as_standoff(db_session, mocker
     assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_STUCK
     # The original task should be marked requires_approval.
     await db_session.refresh(original_task)
-    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
+    terminal_outcome = (original_task.context or {}).get(
+        "review_loop_terminal_outcome"
+    ) or {}
     assert terminal_outcome.get("kind") == "standoff"
     assert terminal_outcome.get("reason") == "arbitration_lane_exhausted"
 
@@ -11880,31 +12498,72 @@ async def test_non_review_collective_cap_blocks_ci_spawn(db_session, mocker):
 
     # 4 conflict + 4 CI = 8 non-review iterations.
     for _ in range(4):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix", "pr_number": 9103, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "fix",
+                        "pr_number": 9103,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "review_loop": {
+                        "fix_reason": "merge_conflict",
+                        "original_task_id": str(original_task.id),
+                    }
+                },
+            )
+        )
     for _ in range(4):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix", "pr_number": 9103, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"fix_reason": "ci_failure", "original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "fix",
+                        "pr_number": 9103,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "review_loop": {
+                        "fix_reason": "ci_failure",
+                        "original_task_id": str(original_task.id),
+                    }
+                },
+            )
+        )
 
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "fix", "pr_number": 9103, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
-        context={"scope": "large", "review_loop": {"iteration": 8, "original_task_id": str(original_task.id)}},
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9103,
+                "branch": "b",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "large",
+            "review_loop": {"iteration": 8, "original_task_id": str(original_task.id)},
+        },
     )
     db_session.add(source_task)
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    mocker.patch.dict(runtime_config, {"review_lane_cap_non_review": 8, "review_lane_cap_ci": 6})
+    mocker.patch.dict(
+        runtime_config, {"review_lane_cap_non_review": 8, "review_lane_cap_ci": 6}
+    )
     result, created = await _spawn_pipeline_task(
         source_task,
         "fix",
@@ -11942,18 +12601,38 @@ async def test_global_cap_still_bounded_with_lane_churn(db_session, mocker):
     await db_session.refresh(original_task)
 
     for _ in range(16):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "review", "pr_number": 9104, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "review",
+                        "pr_number": 9104,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={"review_loop": {"original_task_id": str(original_task.id)}},
+            )
+        )
 
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "fix", "pr_number": 9104, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
-        context={"scope": "large", "review_loop": {"iteration": 16, "original_task_id": str(original_task.id)}},
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9104,
+                "branch": "b",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "large",
+            "review_loop": {"iteration": 16, "original_task_id": str(original_task.id)},
+        },
     )
     db_session.add(source_task)
     await db_session.commit()
@@ -11994,32 +12673,85 @@ async def test_terminal_outcome_detail_includes_lane_breakdown(db_session, mocke
 
     # 8 code-review fixes + 4 CI fixes + 4 conflict fixes = 16 total (global cap).
     for _ in range(8):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix", "pr_number": 9105, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"fix_reason": "code_review", "original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "fix",
+                        "pr_number": 9105,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "review_loop": {
+                        "fix_reason": "code_review",
+                        "original_task_id": str(original_task.id),
+                    }
+                },
+            )
+        )
     for _ in range(4):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix", "pr_number": 9105, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"fix_reason": "ci_failure", "original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "fix",
+                        "pr_number": 9105,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "review_loop": {
+                        "fix_reason": "ci_failure",
+                        "original_task_id": str(original_task.id),
+                    }
+                },
+            )
+        )
     for _ in range(4):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix", "pr_number": 9105, "branch": "b", "base_branch": "main"}],
-            context={"review_loop": {"fix_reason": "merge_conflict", "original_task_id": str(original_task.id)}},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "fix",
+                        "pr_number": 9105,
+                        "branch": "b",
+                        "base_branch": "main",
+                    }
+                ],
+                context={
+                    "review_loop": {
+                        "fix_reason": "merge_conflict",
+                        "original_task_id": str(original_task.id),
+                    }
+                },
+            )
+        )
 
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "fix", "pr_number": 9105, "branch": "b", "base_branch": "main", "original_task_id": str(original_task.id)}],
-        context={"scope": "large", "review_loop": {"iteration": 16, "original_task_id": str(original_task.id)}},
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 9105,
+                "branch": "b",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "large",
+            "review_loop": {"iteration": 16, "original_task_id": str(original_task.id)},
+        },
     )
     db_session.add(source_task)
     await db_session.commit()
@@ -12046,6 +12778,7 @@ async def test_terminal_outcome_detail_includes_lane_breakdown(db_session, mocke
     )
     assert lane_counts_stored.get("ci") == 4 or "ci=4" in detail
 
+
 # ── Issue ledger: contested-region injection ──────────────────────────────────
 
 
@@ -12055,7 +12788,12 @@ def _contest_issue(
     line: int = 42,
     severity: str = "CRITICAL",
 ) -> dict:
-    return {"description": description, "severity": severity, "file": file, "line": line}
+    return {
+        "description": description,
+        "severity": severity,
+        "file": file,
+        "line": line,
+    }
 
 
 @pytest.mark.asyncio
@@ -12325,7 +13063,10 @@ async def test_contested_ledger_serialized_into_review_loop(db_session, mocker):
     assert len(ledger["contested"]) >= 1
     c = ledger["contested"][0]
     assert c["file"] == "backend/app/task_evaluators.py"
-    assert "frozenset" in c["demanded_description"] or "frozenset" in c["reappeared_description"]
+    assert (
+        "frozenset" in c["demanded_description"]
+        or "frozenset" in c["reappeared_description"]
+    )
 
 
 @pytest.mark.asyncio
@@ -12794,7 +13535,8 @@ async def test_mid_retry_defer_defers_review_when_fix_infra_failed_in_grace_wind
     failed_fix = make_task(
         project_id=project.id,
         status=TaskStatus.FAILED,
-        updated_at=__import__('datetime').datetime.utcnow() - __import__('datetime').timedelta(minutes=5),
+        updated_at=__import__("datetime").datetime.utcnow()
+        - __import__("datetime").timedelta(minutes=5),
         payloads=[
             {
                 "type": "fix",
@@ -12843,7 +13585,9 @@ async def test_mid_retry_defer_defers_review_when_fix_infra_failed_in_grace_wind
         original_task_id=str(original_task.id),
     )
 
-    assert result is None, "Review spawn must be deferred during fix mid-retry grace window"
+    assert result is None, (
+        "Review spawn must be deferred during fix mid-retry grace window"
+    )
     assert created is False
     assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_DEFERRED
 
@@ -12870,7 +13614,8 @@ async def test_mid_retry_defer_allows_review_when_fix_outside_grace_window(
     old_failed_fix = make_task(
         project_id=project.id,
         status=TaskStatus.FAILED,
-        updated_at=__import__('datetime').datetime.utcnow() - __import__('datetime').timedelta(minutes=25),
+        updated_at=__import__("datetime").datetime.utcnow()
+        - __import__("datetime").timedelta(minutes=25),
         payloads=[
             {
                 "type": "fix",
@@ -12919,7 +13664,9 @@ async def test_mid_retry_defer_allows_review_when_fix_outside_grace_window(
         original_task_id=str(original_task.id),
     )
 
-    assert result is not None, "Review spawn must proceed when fix failure is outside grace window"
+    assert result is not None, (
+        "Review spawn must proceed when fix failure is outside grace window"
+    )
     assert created is True
 
 
@@ -12944,7 +13691,8 @@ async def test_mid_retry_defer_allows_review_when_budget_exhausted(db_session, m
     exhausted_fix = make_task(
         project_id=project.id,
         status=TaskStatus.FAILED,
-        updated_at=__import__('datetime').datetime.utcnow() - __import__('datetime').timedelta(minutes=5),
+        updated_at=__import__("datetime").datetime.utcnow()
+        - __import__("datetime").timedelta(minutes=5),
         payloads=[
             {
                 "type": "fix",
@@ -12993,7 +13741,9 @@ async def test_mid_retry_defer_allows_review_when_budget_exhausted(db_session, m
         original_task_id=str(original_task.id),
     )
 
-    assert result is not None, "Review spawn must proceed when fix resurrection budget is exhausted"
+    assert result is not None, (
+        "Review spawn must proceed when fix resurrection budget is exhausted"
+    )
     assert created is True
 
 
@@ -13010,6 +13760,15 @@ def _lane_pilot_on(mocker):
     mocker.patch.dict(
         "app.shared_state.runtime_config",
         {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": True},
+        clear=False,
+    )
+
+
+def _lane_shadow_on(mocker):
+    """Enable checkpoint-only shadow mode for improvement lanes."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"improvement_lanes_enabled": True, "review_fix_lane_pilot_enabled": False},
         clear=False,
     )
 
@@ -13062,10 +13821,6 @@ async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
 
     # The implement (create) phase just completed on a warm pool member.
     vm_id = "pool-vm-lane-1"
-    member = PoolVm(
-        vm_instance_id=vm_id, project_id=project.id, state=PoolVmState.LEASED
-    )
-    db_session.add(member)
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.EVALUATING,
@@ -13093,6 +13848,14 @@ async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
     db_session.add(source_task)
     await db_session.commit()
     await db_session.refresh(source_task)
+    member = PoolVm(
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        leased_task_id=source_task.id,
+    )
+    db_session.add(member)
+    await db_session.commit()
 
     # ── Implement completion → COLD review ──
     review, created = await _spawn_pipeline_task(
@@ -13198,6 +13961,304 @@ async def test_lane_pilot_fix_side_only_review_stays_cold(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_lane_checkpoint_missing_under_budget_spawns_recovery_instead_of_review(
+    db_session, mocker
+):
+    """Lane-arm review boundary with a missing/unverifiable checkpoint, under the
+    requeue budget: the cold review is SUPPRESSED and a lane-aware recovery of the
+    failed phase is requeued instead.
+
+    The recovery task carries ONLY durable chain metadata (lane chain id, arm,
+    review_loop, recovery reason) and NONE of the stale warm-resume directives
+    (no improvement_lane_id, no lane_checkpoint_sha, no warm-handoff pin). The
+    active lane is rebound to the recovery task, phase_requeues is incremented,
+    and a visible recovery reason is recorded on the lane manifest. No review task
+    is created. Exercises checkpoint_or_recover_phase ->
+    _handle_lane_checkpoint_recovery -> rebind_lane_to_recovery.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_pilot_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    # SHA NOT reachable on the lane branch → checkpoint degrades to missing.
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    from app.models import ImprovementLane, ImprovementLaneStatus
+    from app.review_pipeline import SPAWN_REASON_LANE_RECOVERY
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_RECOVERY_ATTEMPT_KEY,
+        LANE_RECOVERY_REASON_KEY,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id="vm-lane-recover-1",
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 510,
+                "branch": "feat/lane-recover",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "deadbeef12345678",
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Implement completion → review boundary, but the checkpoint is unverifiable.
+    recovery, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=510,
+        branch="feat/lane-recover",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    # A recovery task was created in place of the review.
+    assert created is True
+    assert recovery is not None
+    assert recovery.first_payload.get("type") == "fix"
+    assert recovery.id != source_task.id
+
+    rctx = recovery.context or {}
+    # Durable chain metadata rides forward.
+    assert rctx.get(LANE_PILOT_ASSIGNMENT_KEY) == "lane"
+    lane_id_raw = rctx.get(LANE_CHAIN_ID_KEY)
+    assert lane_id_raw
+    assert rctx.get(LANE_RECOVERY_REASON_KEY) == "checkpoint_missing"
+    assert rctx.get(LANE_RECOVERY_ATTEMPT_KEY) == 1
+    assert (rctx.get("review_loop") or {}).get("original_task_id") == str(
+        original_task.id
+    )
+    # No stale warm-resume / lane-reserved-VM directives on the recovery task.
+    assert "improvement_lane_id" not in rctx
+    assert "lane_checkpoint_sha" not in rctx
+    assert rctx.get("is_lane_phase") is None
+    assert "warm_target_vm_id" not in rctx
+    # Recovery runs cold (fresh clone) — not pinned to the implementer VM.
+    assert recovery.vm_instance_id is None
+
+    # The lane is rebound to the recovery task, still ACTIVE, miss counted.
+    lane_id = uuid.UUID(str(lane_id_raw))
+    lane = await db_session.get(ImprovementLane, lane_id)
+    assert lane is not None
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.current_task_id == recovery.id
+    assert lane.phase_requeues == 1
+    # Operator-visible recovery reason recorded on the manifest.
+    recovery_state = (lane.manifest or {}).get("recovery") or {}
+    assert recovery_state.get("reason") == "checkpoint_missing"
+    assert recovery_state.get("exhausted") is False
+    assert recovery_state.get("attempt") == 1
+
+    # No review task was created for this chain.
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    review_tasks = [t for t in all_tasks if t.first_payload.get("type") == "review"]
+    assert review_tasks == []
+
+    # Source carries the visible recovery spawn reason.
+    await db_session.refresh(source_task)
+    assert (source_task.context or {}).get(
+        SPAWN_REASON_KEY
+    ) == SPAWN_REASON_LANE_RECOVERY
+
+
+@pytest.mark.asyncio
+async def test_lane_checkpoint_missing_over_budget_kills_lane_and_falls_back(
+    db_session, mocker
+):
+    """Lane-arm review boundary with a checkpoint miss that EXHAUSTS the requeue
+    budget: the lane is closed (KILLED) inline, any lane-held reservation is
+    released, a visible exhaustion reason is recorded, and the pipeline falls back
+    to a classic cold review (the PR is not orphaned).
+
+    Exercises checkpoint_or_recover_phase -> close_lane_checkpoint_exhausted.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_pilot_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.models import (
+        ImprovementLaneStatus,
+        PoolVm,
+        PoolVmState,
+        _LANE_MAX_PHASE_REQUEUES,
+    )
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY, LANE_PILOT_ASSIGNMENT_KEY
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Pre-existing lane already AT the requeue budget — one more miss exhausts it.
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="lane-exhausted",
+        goal="exhaust requeues",
+        branch_name="feat/lane-exhaust",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    await db_session.flush()
+    await cas_transition(
+        db_session,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=None,
+    )
+    lane.phase_requeues = _LANE_MAX_PHASE_REQUEUES
+    # A warm-pool member reserved for the lane must be released on exhaustion.
+    member = PoolVm(
+        vm_instance_id="pool-vm-exhaust-1",
+        project_id=project.id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+    )
+    db_session.add(member)
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id="vm-lane-exhaust-src",
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 511,
+                "branch": "feat/lane-exhaust",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "feedface87654321",
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=511,
+        branch="feat/lane-exhaust",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    # Classic cold review fallback — the PR is still reviewed.
+    assert created is True
+    assert review is not None
+    assert review.first_payload.get("type") == "review"
+    rctx = review.context or {}
+    assert "improvement_lane_id" not in rctx
+    assert rctx.get("is_lane_phase") is None
+
+    # Lane closed (KILLED) with a visible exhaustion reason; reservation released.
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.KILLED.value
+    assert lane.phase_requeues == _LANE_MAX_PHASE_REQUEUES + 1
+    recovery_state = (lane.manifest or {}).get("recovery") or {}
+    assert recovery_state.get("exhausted") is True
+    await db_session.refresh(member)
+    assert member.reserved_lane_id is None
+
+    # The next fix spawn must stay classic: the exhausted lane is terminal and
+    # must not be re-wired into the fix task even though the durable chain id
+    # still exists on the cold review.
+    review.status = TaskStatus.COMPLETED
+    db_session.add(review)
+    await db_session.commit()
+    await db_session.refresh(review)
+
+    fix, fix_created = await _spawn_pipeline_task(
+        review,
+        "fix",
+        db_session,
+        pr_number=511,
+        branch="feat/lane-exhaust",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Resume after exhausted lane",
+    )
+    assert fix_created is True
+    assert fix is not None
+    fctx = fix.context or {}
+    assert "improvement_lane_id" not in fctx
+    assert fctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in fctx
+
+
+@pytest.mark.asyncio
 async def test_lane_pilot_flag_off_classic_spawn_unchanged(db_session, mocker):
     """Flag off: no intent-to-treat assignment, no lane context, no lane row,
     no reservation — the classic spawn path is unchanged."""
@@ -13259,11 +14320,572 @@ async def test_lane_pilot_flag_off_classic_spawn_unchanged(db_session, mocker):
     assert rctx.get("is_lane_phase") is None
     # No lane row created.
     lanes = (
-        await db_session.execute(
-            select(ImprovementLane).where(ImprovementLane.project_id == project.id)
+        (
+            await db_session.execute(
+                select(ImprovementLane).where(ImprovementLane.project_id == project.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert lanes == []
+
+
+@pytest.mark.asyncio
+async def test_lane_shadow_mode_creates_armless_lane_without_reservation(
+    db_session, mocker
+):
+    """Shadow mode writes real checkpoints on an armless lane without taking
+    warm-pool reservations or attaching full-pilot dispatch/prompt context."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_shadow_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    from app.models import (
+        ImprovementLane,
+        ImprovementLaneStatus,
+        PoolVm,
+        PoolVmState,
+    )
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_RESUME_CONTEXT_KEY,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    vm_id = "pool-vm-shadow-1"
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=vm_id,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 610,
+                "branch": "feat/shadow",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "abc1234def5678",
+            # Simulate a chain that was assigned before the operator switched
+            # from full pilot to shadow; shadow spawns must scrub this key.
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "_pr_changed_files": ["backend/app/shadow.py"],
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    member = PoolVm(
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        leased_task_id=source_task.id,
+    )
+    db_session.add_all([source_task, member])
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    existing_lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="shadow-old-lane",
+        goal="stale full-pilot lane",
+        branch_name="feat/shadow",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    await db_session.flush()
+    await cas_transition(
+        db_session,
+        existing_lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=source_task.id,
+    )
+    existing_lane.workspace_state = "WARM_RESERVED"
+    existing_lane.workspace_vm_instance_id = vm_id
+    db_session.add(existing_lane)
+    source_task.context = {
+        **(source_task.context or {}),
+        LANE_CHAIN_ID_KEY: str(existing_lane.id),
+    }
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=610,
+        branch="feat/shadow",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    assert review is not None
+    rctx = review.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in rctx
+    assert "improvement_lane_id" not in rctx
+    assert rctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in rctx
+    assert LANE_RESUME_CONTEXT_KEY not in rctx
+    assert rctx.get(LANE_CHAIN_ID_KEY) != str(existing_lane.id)
+    # Shadow does not force the reviewer cold: warm-continuity behaves like the
+    # classic path when the source VM is live.
+    assert rctx.get("warm_target_vm_id") == vm_id
+    assert review.vm_instance_id is None
+
+    lane_id = uuid.UUID(str(rctx[LANE_CHAIN_ID_KEY]))
+    lane = await db_session.get(ImprovementLane, lane_id)
+    assert lane is not None
+    assert lane.pilot_arm is None
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.last_checkpoint_sha == "abc1234def5678"
+    assert lane.checkpoint_seq == 1
+    assert lane.workspace_state == "COLD"
+    assert lane.workspace_vm_instance_id is None
+    assert lane.vm_cost_usd_total == 0
+    await db_session.refresh(existing_lane)
+    assert existing_lane.pilot_arm == "lane"
+    assert existing_lane.workspace_state == "WARM_RESERVED"
+    await db_session.refresh(member)
+    assert member.reserved_lane_id is None
+    assert member.state == PoolVmState.LEASED
+
+    review.status = TaskStatus.COMPLETED
+    review.vm_instance_id = "shadow-review-vm"
+    db_session.add(review)
+    await db_session.commit()
+    await db_session.refresh(review)
+    await db_session.refresh(source_task)
+    assert (source_task.context or {}).get(LANE_PILOT_ASSIGNMENT_KEY) is None
+    assert (source_task.context or {}).get(LANE_CHAIN_ID_KEY) == str(lane_id)
+
+    fix, fix_created = await _spawn_pipeline_task(
+        review,
+        "fix",
+        db_session,
+        pr_number=610,
+        branch="feat/shadow",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the review feedback",
+        current_feedback="Tighten the guard",
+        fix_reason="code_review",
+    )
+    assert fix_created is True
+    assert fix is not None
+    fctx = fix.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in fctx
+    assert fctx.get(LANE_CHAIN_ID_KEY) == str(lane_id)
+    assert "improvement_lane_id" not in fctx
+    assert fctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in fctx
+    assert LANE_RESUME_CONTEXT_KEY not in fctx
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.current_task_id == fix.id
+    assert lane.workspace_state == "COLD"
+
+    fix.status = TaskStatus.EVALUATING
+    fix.context = {
+        **fctx,
+        "head_sha": "def5678abc1234",
+        "_pr_changed_files": ["backend/app/shadow.py", "backend/app/next.py"],
+        "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+    }
+    db_session.add(fix)
+    await db_session.commit()
+    await db_session.refresh(fix)
+
+    rereview, rereview_created = await _spawn_pipeline_task(
+        fix,
+        "review",
+        db_session,
+        pr_number=610,
+        branch="feat/shadow",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert rereview_created is True
+    assert rereview is not None
+    rrctx = rereview.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in rrctx
+    assert "improvement_lane_id" not in rrctx
+    assert "lane_checkpoint_sha" not in rrctx
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.last_checkpoint_sha == "def5678abc1234"
+    assert lane.checkpoint_seq == 2
+    assert lane.pilot_arm is None
+    assert lane.workspace_state == "COLD"
+    phase_log = (lane.manifest or {}).get("phase_log") or []
+    assert len(phase_log) == 2
+    assert any("create PR#610" in entry for entry in phase_log)
+    assert any("fix PR#610" in entry for entry in phase_log)
+
+
+@pytest.mark.asyncio
+async def test_lane_fix_spawn_skips_lane_when_mode_switches_to_shadow(
+    db_session, mocker
+):
+    """A lane created while full pilot is on must not be reused if fix spawn
+    happens after the chain switches to shadow mode."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_pilot_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    from app.models import (
+        ImprovementLane,
+        ImprovementLaneStatus,
+        PoolVm,
+        PoolVmState,
+    )
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        LANE_PILOT_ASSIGNMENT_KEY,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    vm_id = "pool-vm-lane-switch-1"
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id=vm_id,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 611,
+                "branch": "feat/lane-switch",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "abc1234def5678",
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    member = PoolVm(
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        leased_task_id=source_task.id,
+    )
+    db_session.add_all([source_task, member])
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=611,
+        branch="feat/lane-switch",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    assert review is not None
+    rctx = review.context or {}
+    assert rctx.get(LANE_PILOT_ASSIGNMENT_KEY) == "lane"
+    lane_id = uuid.UUID(str(rctx[LANE_CHAIN_ID_KEY]))
+
+    lane = await db_session.get(ImprovementLane, lane_id)
+    assert lane is not None
+    assert lane.pilot_arm == "lane"
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.workspace_state == "WARM_RESERVED"
+
+    _lane_shadow_on(mocker)
+
+    review.status = TaskStatus.COMPLETED
+    review.vm_instance_id = "lane-review-vm"
+    db_session.add(review)
+    await db_session.commit()
+    await db_session.refresh(review)
+
+    fix, fix_created = await _spawn_pipeline_task(
+        review,
+        "fix",
+        db_session,
+        pr_number=611,
+        branch="feat/lane-switch",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the review feedback",
+        current_feedback="Tighten the guard",
+        fix_reason="code_review",
+    )
+    assert fix_created is True
+    assert fix is not None
+    fctx = fix.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in fctx
+    assert "improvement_lane_id" not in fctx
+    assert fctx.get("is_lane_phase") is None
+    assert "lane_checkpoint_sha" not in fctx
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.workspace_state == "WARM_RESERVED"
+
+
+@pytest.mark.asyncio
+async def test_lane_shadow_chains_do_not_contribute_to_pilot_aggregates(
+    db_session,
+):
+    """Armless shadow lanes and tasks without ITT assignment remain invisible
+    to compute_lane_pilot_aggregates."""
+    from app.improvement_lane_ops import create_lane
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        compute_lane_pilot_aggregates,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="shadow-lane",
+        goal="shadow aggregate exclusion",
+        branch_name="feat/shadow-agg",
+        base_branch="main",
+        pilot_arm=None,
+    )
+    lane.phase_requeues = 2
+    shadow_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={LANE_CHAIN_ID_KEY: str(lane.id), "pr_merged": True},
+        estimated_cost_usd=9.0,
+    )
+    db_session.add(shadow_task)
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+    assert agg["n_lane"] == 0
+    assert agg["n_control"] == 0
+    assert agg["lane_merge_rate"] is None
+    assert agg["control_merge_rate"] is None
+    assert agg["checkpoint_loss_rate"] is None
+    assert agg["lane_fix_tasks_sampled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lane_shadow_checkpoint_miss_records_reason_without_recovery_spawn(
+    db_session, mocker
+):
+    """Shadow checkpoint misses are visible but never redirect to recovery."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    _lane_shadow_on(mocker)
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    from app.models import ImprovementLane, ImprovementLaneStatus
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY, LANE_PILOT_ASSIGNMENT_KEY
+    from app.review_pipeline import SPAWN_REASON_LANE_RECOVERY
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id="vm-shadow-miss-1",
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 611,
+                "branch": "feat/shadow-miss",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "head_sha": "deadbeef12345678",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=611,
+        branch="feat/shadow-miss",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    assert review is not None
+    assert review.first_payload.get("type") == "review"
+    rctx = review.context or {}
+    assert LANE_PILOT_ASSIGNMENT_KEY not in rctx
+    assert "improvement_lane_id" not in rctx
+    lane_id = uuid.UUID(str(rctx[LANE_CHAIN_ID_KEY]))
+
+    lane = await db_session.get(ImprovementLane, lane_id)
+    assert lane is not None
+    assert lane.pilot_arm is None
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.phase_requeues == 1
+    assert lane.workspace_state == "COLD"
+    recovery_state = (lane.manifest or {}).get("recovery") or {}
+    assert recovery_state.get("reason") == "sha_not_reachable"
+    assert recovery_state.get("attempt") == 1
+    assert recovery_state.get("exhausted") is False
+
+    await db_session.refresh(source_task)
+    assert (source_task.context or {}).get(
+        SPAWN_REASON_KEY
+    ) != SPAWN_REASON_LANE_RECOVERY
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    recovery_tasks = [
+        t
+        for t in tasks
+        if (t.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_LANE_RECOVERY
+    ]
+    assert recovery_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_lane_shadow_checkpoint_owner_conflict_records_visible_reason(
+    db_session,
+):
+    """A shadow CAS owner conflict records an operator-visible marker without
+    consuming the checkpoint-miss requeue budget."""
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.models import ImprovementLaneStatus
+    from app.review_fix_lane_pilot import (
+        CHECKPOINT_PHASE_OK,
+        checkpoint_or_recover_phase,
+    )
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="shadow-owner-conflict",
+        goal="record visible CAS conflict",
+        branch_name="feat/shadow-owner",
+        base_branch="main",
+        pilot_arm=None,
+    )
+    await db_session.flush()
+    owner_task_id = uuid.uuid4()
+    await cas_transition(
+        db_session,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=owner_task_id,
+    )
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={"head_sha": "abc1234def5678"},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    await db_session.refresh(lane)
+
+    outcome = await checkpoint_or_recover_phase(
+        db_session,
+        source_task,
+        lane,
+        sha="abc1234def5678",
+        summary="shadow owner conflict",
+        reserve_workspace=False,
+        enable_recovery=False,
+        record_miss_marker=True,
+    )
+
+    assert outcome == CHECKPOINT_PHASE_OK
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.current_task_id == owner_task_id
+    assert lane.phase_requeues == 0
+    recovery_state = (lane.manifest or {}).get("recovery") or {}
+    assert recovery_state.get("reason") == "owner_mismatch"
+    assert recovery_state.get("attempt") == 0
+    assert recovery_state.get("exhausted") is False
 
 
 @pytest.mark.asyncio
@@ -13334,10 +14956,14 @@ async def test_lane_pilot_control_arm_runs_classic(db_session, mocker):
     assert rctx.get("is_lane_phase") is None
     # No lane row, and the pool member was NOT reserved.
     lanes = (
-        await db_session.execute(
-            select(ImprovementLane).where(ImprovementLane.project_id == project.id)
+        (
+            await db_session.execute(
+                select(ImprovementLane).where(ImprovementLane.project_id == project.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert lanes == []
     await db_session.refresh(member)
     assert member.reserved_lane_id is None
@@ -13473,10 +15099,14 @@ async def test_lane_pilot_gate_integrity_alert_raised_and_deduped(db_session):
     await db_session.commit()
 
     msgs = (
-        await db_session.execute(
-            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(msgs) == 1
     assert msgs[0].message_type == MessageType.BLOCKER
     assert (msgs[0].context or {}).get("event_type") == (
@@ -13522,10 +15152,14 @@ async def test_lane_pilot_aggregates_checkpoint_loss_rate(db_session):
     await db_session.commit()
 
     lanes = (
-        await db_session.execute(
-            select(ImprovementLane).where(ImprovementLane.project_id == project.id)
+        (
+            await db_session.execute(
+                select(ImprovementLane).where(ImprovementLane.project_id == project.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(lanes) == 1
 
     agg = await compute_lane_pilot_aggregates(db_session, project.id)
@@ -13533,6 +15167,296 @@ async def test_lane_pilot_aggregates_checkpoint_loss_rate(db_session):
     assert agg["n_control"] == 1
     # One lane row had a requeue → 1.0 checkpoint-loss rate.
     assert agg["checkpoint_loss_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_aggregates_count_original_chains_not_iterations(db_session):
+    """compute_lane_pilot_aggregates counts chains (original PRs), not tasks.
+
+    A 3-task chain (create + review + fix) sharing one original_task_id must
+    contribute exactly ONE lane sample, not three.  Merge outcome is True if ANY
+    task in the chain has pr_merged=True.  Cost is summed across all tasks.
+    Engagement receipts (warm_resume_fraction, checkpoint_fraction) are also
+    chain-level: a chain is considered engaged if any fix task in it had the
+    receipt stamped.
+    """
+    from app.capability_trial_verdict import (
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import compute_lane_pilot_aggregates
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+
+    # ── Chain A: lane arm, 3 tasks sharing same original_task_id ────────────
+    # The root create task (no original_task_id in payload).
+    root_task_id = uuid.uuid4()
+    root_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_task.id = root_task_id
+
+    # Review iteration task — not merged.
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "prompt": "review",
+                "base_branch": "main",
+                "original_task_id": str(root_task_id),
+            }
+        ],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane", "pr_merged": False},
+        estimated_cost_usd=1.0,
+    )
+
+    # Fix iteration task — merged, has warm-resume + checkpoint receipts.
+    fix_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_task_id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": True,
+            LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+            LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=2.0,
+    )
+
+    # ── Chain B: control arm, single task ───────────────────────────────────
+    control_root_id = uuid.uuid4()
+    control_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "control", "pr_merged": False},
+        estimated_cost_usd=1.5,
+    )
+    control_task.id = control_root_id
+
+    db_session.add_all([root_task, review_task, fix_task, control_task])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+
+    # Chain A contributes 1 lane sample (not 3 tasks), chain B contributes 1 control.
+    assert agg["n_lane"] == 1, f"expected 1 lane chain, got {agg['n_lane']}"
+    assert agg["n_control"] == 1, f"expected 1 control chain, got {agg['n_control']}"
+
+    # Merge outcome: chain A is merged (fix_task had pr_merged=True).
+    assert agg["lane_merge_rate"] == 1.0, (
+        f"expected lane merged, got {agg['lane_merge_rate']}"
+    )
+    assert agg["control_merge_rate"] == 0.0, (
+        f"expected control not merged, got {agg['control_merge_rate']}"
+    )
+
+    # Cost: chain A cost = review_task(1.0) + fix_task(2.0) = 3.0 for merged chain.
+    # root_task has no estimated_cost_usd set, defaults to 0.
+    assert agg["lane_cost_per_merged"] == pytest.approx(3.0, abs=0.01), (
+        f"expected chain-summed cost 3.0, got {agg['lane_cost_per_merged']}"
+    )
+
+    # Engagement: chain A fix task had both receipts → 1 warm chain / 1 fix chain.
+    assert agg["lane_fix_tasks_sampled"] == 1, (
+        f"expected 1 engagement chain (not task count), got {agg['lane_fix_tasks_sampled']}"
+    )
+    assert agg["warm_resume_fraction"] == 1.0, (
+        f"expected warm_resume_fraction=1.0, got {agg['warm_resume_fraction']}"
+    )
+    assert agg["checkpoint_fraction"] == 1.0, (
+        f"expected checkpoint_fraction=1.0, got {agg['checkpoint_fraction']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_aggregates_partial_warm_resume_fraction(db_session):
+    """compute_lane_pilot_aggregates returns fractional engagement at partial values.
+
+    Two lane-arm chains are created:
+    - Chain A fix task has LANE_PILOT_WARM_RESUME_RECEIPT_KEY=True and
+      LANE_PILOT_CHECKPOINT_RECEIPT_KEY=True.
+    - Chain B fix task has neither receipt key.
+
+    warm_resume_fraction and checkpoint_fraction must both be 0.5 (1 out of 2),
+    not 0.0 or 1.0.  A separate variant also verifies that the two fractions are
+    measured independently: chain A has checkpoint only, chain B has warm-resume
+    only, so both fractions are 0.5 but from different chains.
+    """
+    from app.capability_trial_verdict import (
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import compute_lane_pilot_aggregates
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+
+    # ── Chain A: fix task carries both warm-resume + checkpoint receipts ──────
+    root_a_id = uuid.uuid4()
+    root_a = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_a.id = root_a_id
+
+    fix_a = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_a_id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": True,
+            LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+            LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    # ── Chain B: fix task carries neither receipt ────────────────────────────
+    root_b_id = uuid.uuid4()
+    root_b = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_b.id = root_b_id
+
+    fix_b = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_b_id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": False,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    db_session.add_all([root_a, fix_a, root_b, fix_b])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+
+    assert agg["lane_fix_tasks_sampled"] == 2, (
+        f"expected 2 engagement chains, got {agg['lane_fix_tasks_sampled']}"
+    )
+    assert agg["warm_resume_fraction"] == pytest.approx(0.5), (
+        f"expected warm_resume_fraction=0.5 (1/2), got {agg['warm_resume_fraction']}"
+    )
+    assert agg["checkpoint_fraction"] == pytest.approx(0.5), (
+        f"expected checkpoint_fraction=0.5 (1/2), got {agg['checkpoint_fraction']}"
+    )
+
+    # ── Second scenario: fractions diverge because receipts are on different chains
+    # Create a fresh project so state is isolated.
+    project2 = await _make_db_project(db_session, is_self_repo=True)
+
+    # Chain C: checkpoint only (no warm-resume).
+    root_c_id = uuid.uuid4()
+    root_c = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_c.id = root_c_id
+
+    fix_c = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_c_id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": True,
+            LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    # Chain D: warm-resume only (no checkpoint).
+    root_d_id = uuid.uuid4()
+    root_d = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_d.id = root_d_id
+
+    fix_d = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_d_id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": False,
+            LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    db_session.add_all([root_c, fix_c, root_d, fix_d])
+    await db_session.commit()
+
+    agg2 = await compute_lane_pilot_aggregates(db_session, project2.id)
+
+    assert agg2["lane_fix_tasks_sampled"] == 2, (
+        f"expected 2 engagement chains in project2, got {agg2['lane_fix_tasks_sampled']}"
+    )
+    # Both fractions are 0.5 but from different chains — verifies they are
+    # measured independently and not conflated.
+    assert agg2["warm_resume_fraction"] == pytest.approx(0.5), (
+        f"expected warm_resume_fraction=0.5 (chain D only), got {agg2['warm_resume_fraction']}"
+    )
+    assert agg2["checkpoint_fraction"] == pytest.approx(0.5), (
+        f"expected checkpoint_fraction=0.5 (chain C only), got {agg2['checkpoint_fraction']}"
+    )
 
 
 @pytest.mark.asyncio
@@ -13582,7 +15506,10 @@ async def test_lane_pilot_aggregates_gate_integrity_violations(db_session):
     await _persist(db_session, control_task)
 
     agg_after_control = await compute_lane_pilot_aggregates(db_session, project.id)
-    assert agg_after_control["gate_integrity_violations"] == agg_with["gate_integrity_violations"]
+    assert (
+        agg_after_control["gate_integrity_violations"]
+        == agg_with["gate_integrity_violations"]
+    )
 
     # ── Different project's violation should NOT count ───────────────────────
     other_violation = make_task(
@@ -13597,7 +15524,10 @@ async def test_lane_pilot_aggregates_gate_integrity_violations(db_session):
     await _persist(db_session, other_violation)
 
     agg_isolated = await compute_lane_pilot_aggregates(db_session, project.id)
-    assert agg_isolated["gate_integrity_violations"] == agg_with["gate_integrity_violations"]
+    assert (
+        agg_isolated["gate_integrity_violations"]
+        == agg_with["gate_integrity_violations"]
+    )
 
     # ── Lane-arm fix task (not review/audit) should NOT count ────────────────
     fix_task = make_task(
@@ -13612,7 +15542,10 @@ async def test_lane_pilot_aggregates_gate_integrity_violations(db_session):
     await _persist(db_session, fix_task)
 
     agg_after_fix = await compute_lane_pilot_aggregates(db_session, project.id)
-    assert agg_after_fix["gate_integrity_violations"] == agg_with["gate_integrity_violations"]
+    assert (
+        agg_after_fix["gate_integrity_violations"]
+        == agg_with["gate_integrity_violations"]
+    )
 
 
 @pytest.mark.asyncio
@@ -13702,10 +15635,14 @@ async def test_lane_pilot_durable_kill_survives_enabled_flag_reload(db_session, 
     assert "lane_checkpoint_sha" not in rctx
     # No lane rows created.
     lanes = (
-        await db_session.execute(
-            select(ImprovementLane).where(ImprovementLane.project_id == project.id)
+        (
+            await db_session.execute(
+                select(ImprovementLane).where(ImprovementLane.project_id == project.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert lanes == []
 
 
@@ -13967,9 +15904,7 @@ class TestLaneCheckpointShaVerification:
         assert (lane.phase_requeues or 0) == initial_requeues + 1
 
     @pytest.mark.asyncio
-    async def test_lane_checkpoint_sha_token_error_degrades(
-        self, db_session, mocker
-    ):
+    async def test_lane_checkpoint_sha_token_error_degrades(self, db_session, mocker):
         """Token fetch failure (credentials missing, etc.) → degrade to
         mark_checkpoint_missing(reason='sha_verification_unavailable'), return False."""
         mocker.patch(
@@ -14000,9 +15935,7 @@ class TestLaneCheckpointShaVerification:
         assert (lane.phase_requeues or 0) == initial_requeues + 1
 
     @pytest.mark.asyncio
-    async def test_lane_checkpoint_sha_reachable_proceeds(
-        self, db_session, mocker
-    ):
+    async def test_lane_checkpoint_sha_reachable_proceeds(self, db_session, mocker):
         """SHA verified as reachable → checkpoint_lane is called and True is returned."""
         mocker.patch(
             "app.github_token_resolver.get_github_token_for_task",
@@ -14031,6 +15964,43 @@ class TestLaneCheckpointShaVerification:
         await db_session.refresh(lane)
         assert lane.last_checkpoint_sha == "abc1234def5678"
 
+    @pytest.mark.asyncio
+    async def test_lane_checkpoint_owner_mismatch_is_stale_noop(
+        self, db_session, mocker
+    ):
+        """A stale task that no longer owns the ACTIVE lane must not consume the
+        checkpoint-miss budget or trigger recovery, even on a short SHA."""
+        mock_mark_checkpoint_missing = mocker.patch(
+            "app.improvement_lane_ops.mark_checkpoint_missing",
+            new_callable=AsyncMock,
+        )
+
+        from app.models import ImprovementLaneStatus
+        from app.review_fix_lane_pilot import (
+            CHECKPOINT_PHASE_OK,
+            checkpoint_or_recover_phase,
+        )
+
+        lane, source_task = await self._setup_lane_and_task(db_session)
+        lane.current_task_id = uuid.uuid4()
+        await db_session.commit()
+        await db_session.refresh(lane)
+        initial_requeues = lane.phase_requeues or 0
+
+        result = await checkpoint_or_recover_phase(
+            db_session,
+            source_task,
+            lane,
+            sha="abc",
+            summary="phase complete",
+        )
+
+        assert result == CHECKPOINT_PHASE_OK
+        await db_session.refresh(lane)
+        assert lane.status == ImprovementLaneStatus.ACTIVE.value
+        assert (lane.phase_requeues or 0) == initial_requeues
+        mock_mark_checkpoint_missing.assert_not_called()
+
 
 @pytest.mark.asyncio
 async def test_lane_pilot_is_review_fix_lane_pilot_active_for_project():
@@ -14047,31 +16017,43 @@ async def test_lane_pilot_is_review_fix_lane_pilot_active_for_project():
         p.capability_adoption_verdicts = verdicts or {}
         return p
 
-    with patch(
-        "app.review_fix_lane_pilot.is_review_fix_lane_pilot_enabled", return_value=True
-    ), patch(
-        "app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True
+    with (
+        patch(
+            "app.review_fix_lane_pilot.is_review_fix_lane_pilot_enabled",
+            return_value=True,
+        ),
+        patch("app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True),
     ):
         # No verdict → active.
         assert is_review_fix_lane_pilot_active_for_project(_make_mock_project()) is True
 
         # KILL verdict → inactive.
-        assert is_review_fix_lane_pilot_active_for_project(
-            _make_mock_project({LANE_PILOT_CAP_NAME: {"verdict": "KILL"}})
-        ) is False
+        assert (
+            is_review_fix_lane_pilot_active_for_project(
+                _make_mock_project({LANE_PILOT_CAP_NAME: {"verdict": "KILL"}})
+            )
+            is False
+        )
 
         # ADOPT verdict → active (ADOPT does not suppress the gate).
-        assert is_review_fix_lane_pilot_active_for_project(
-            _make_mock_project({LANE_PILOT_CAP_NAME: {"verdict": "ADOPT"}})
-        ) is True
+        assert (
+            is_review_fix_lane_pilot_active_for_project(
+                _make_mock_project({LANE_PILOT_CAP_NAME: {"verdict": "ADOPT"}})
+            )
+            is True
+        )
 
     # Flag off → inactive regardless of project state.
-    with patch(
-        "app.review_fix_lane_pilot.is_review_fix_lane_pilot_enabled", return_value=False
-    ), patch(
-        "app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True
+    with (
+        patch(
+            "app.review_fix_lane_pilot.is_review_fix_lane_pilot_enabled",
+            return_value=False,
+        ),
+        patch("app.review_fix_lane_pilot.is_pilot_eligible_project", return_value=True),
     ):
-        assert is_review_fix_lane_pilot_active_for_project(_make_mock_project()) is False
+        assert (
+            is_review_fix_lane_pilot_active_for_project(_make_mock_project()) is False
+        )
 
 
 @pytest.mark.asyncio
@@ -14139,7 +16121,15 @@ async def test_lane_pilot_manifest_patch_and_fix_resume_context(db_session, mock
             "review_loop": {
                 "iteration": 2,
                 "review_history": [
-                    {"issues": [{"severity": "major", "description": "guard null", "file": "foo.py"}]},
+                    {
+                        "issues": [
+                            {
+                                "severity": "major",
+                                "description": "guard null",
+                                "file": "foo.py",
+                            }
+                        ]
+                    },
                 ],
             },
         },
@@ -14151,14 +16141,19 @@ async def test_lane_pilot_manifest_patch_and_fix_resume_context(db_session, mock
 
     # (1) Manifest accumulation: the checkpoint records a derived manifest patch.
     wrote = await checkpoint_and_reserve_on_phase_complete(
-        db_session, source_task, lane,
-        sha="cafe1234beef5678", summary="addressed null-guard review",
+        db_session,
+        source_task,
+        lane,
+        sha="cafe1234beef5678",
+        summary="addressed null-guard review",
     )
     assert wrote is True
     await db_session.refresh(lane)
     assert lane.status == ImprovementLaneStatus.PARKED.value
     manifest = lane.manifest or {}
-    assert manifest.get("phase_log") == ["fix PR#4242 iter2: addressed null-guard review"]
+    assert manifest.get("phase_log") == [
+        "fix PR#4242 iter2: addressed null-guard review"
+    ]
     assert "backend/app/foo.py" in manifest.get("critical_files", [])
     assert manifest.get("remaining") == ["[MAJOR] [foo.py] guard null"]
 
@@ -14187,3 +16182,267 @@ async def test_lane_pilot_manifest_patch_and_fix_resume_context(db_session, mock
     classic_ctx: dict = {"scope": "small"}
     wire_fix_lane_context(classic_ctx, None)
     assert classic_ctx == {"scope": "small"}
+
+
+# ── Persistent merge conflict escalation ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_persistent_merge_conflict_escalates_before_cap(db_session, mocker):
+    """When the conflict lane has accumulated >= PERSISTENT_CONFLICT_ESCALATION_THRESHOLD
+    completions and a new conflict fix would be spawned, _spawn_pipeline_task returns
+    (None, False), sets failure_detail='persistent_merge_conflict' on the orig task,
+    closes the PR, and the status message explicitly names 'merge conflict'.
+
+    This fires before LANE_CAP_CONFLICT_DEFAULT (4), so the escalation happens at
+    iteration 3 (after 2 completed conflict-fix tasks), well below the global cap.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    comment_mock = mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    # Source task simulating a third conflict-fix spawn attempt.
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 555,
+                "branch": "feat/conflict",
+                "base_branch": "main",
+                "original_task_id": str(orig.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(orig.id),
+                "fix_reason": "merge_conflict",
+            },
+        },
+    )
+    db_session.add(source_task)
+
+    # Two COMPLETED conflict-fix tasks for PR #555 — reaches the threshold (2).
+    for _ in range(PERSISTENT_CONFLICT_ESCALATION_THRESHOLD):
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "fix",
+                    "pr_number": 555,
+                    "branch": "feat/conflict",
+                    "base_branch": "main",
+                }
+            ],
+            context={
+                "review_loop": {
+                    "fix_reason": "merge_conflict",
+                    "original_task_id": str(orig.id),
+                }
+            },
+        )
+        db_session.add(t)
+
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=555,
+        branch="feat/conflict",
+        base_branch="main",
+        fix_reason="merge_conflict",
+        original_task_id=str(orig.id),
+    )
+
+    assert result is None, "Persistent conflict should block the spawn"
+    assert not created
+
+    await db_session.refresh(orig)
+    assert orig.status == TaskStatus.FAILED, (
+        f"orig must be FAILED on persistent conflict, got {orig.status}"
+    )
+    assert (orig.context or {}).get("failure_detail") == "persistent_merge_conflict", (
+        f"failure_detail must be 'persistent_merge_conflict', "
+        f"got {(orig.context or {}).get('failure_detail')!r}"
+    )
+
+    # Status message must name merge conflict explicitly.
+    status_msg = orig.latest_status_message or ""
+    assert "merge conflict" in status_msg.lower(), (
+        f"Status message must mention 'merge conflict': {status_msg!r}"
+    )
+
+    terminal_outcome = (orig.context or {}).get("review_loop_terminal_outcome") or {}
+    assert terminal_outcome.get("kind") == "persistent_conflict", (
+        f"Terminal outcome kind must be 'persistent_conflict': {terminal_outcome!r}"
+    )
+
+    close_mock.assert_awaited_once()
+    assert close_mock.call_args.args[3] == 555
+
+    # PR comment must mention merge conflict.
+    comment_mock.assert_awaited()
+    comment_text = comment_mock.call_args[0][4] if comment_mock.call_args else ""
+    assert "merge conflict" in comment_text.lower(), (
+        f"PR comment must mention 'merge conflict': {comment_text!r}"
+    )
+
+    # spawn_reason must be recorded.
+    await db_session.refresh(source_task)
+    assert (source_task.context or {}).get(
+        SPAWN_REASON_KEY
+    ) == SPAWN_REASON_PERSISTENT_CONFLICT
+
+
+@pytest.mark.asyncio
+async def test_conflict_resolved_on_first_attempt_no_escalation(db_session, mocker):
+    """When only one conflict-fix task exists (below threshold), the second conflict-
+    fix spawn proceeds normally — no early escalation."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 556,
+                "branch": "feat/conflict2",
+                "base_branch": "main",
+                "original_task_id": str(orig.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(orig.id),
+                "fix_reason": "merge_conflict",
+            },
+        },
+    )
+    db_session.add(source_task)
+
+    # Only ONE prior conflict-fix (below threshold of 2) → no escalation.
+    prior_conflict = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 556,
+                "branch": "feat/conflict2",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "fix_reason": "merge_conflict",
+                "original_task_id": str(orig.id),
+            }
+        },
+    )
+    db_session.add(prior_conflict)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=556,
+        branch="feat/conflict2",
+        base_branch="main",
+        fix_reason="merge_conflict",
+        fix_prompt="Resolve merge conflict on feat/conflict2",
+        original_task_id=str(orig.id),
+    )
+
+    # The orig must NOT have been marked with persistent_merge_conflict —
+    # that's the sole assertion: the escalation did not fire.
+    await db_session.refresh(orig)
+    assert (orig.context or {}).get("failure_detail") != "persistent_merge_conflict", (
+        "One conflict-fix attempt is below threshold — no escalation should fire"
+    )
+    spawn_reason = (source_task.context or {}).get(SPAWN_REASON_KEY)
+    assert spawn_reason != SPAWN_REASON_PERSISTENT_CONFLICT, (
+        f"spawn_reason must not be persistent_conflict with only 1 prior conflict attempt: {spawn_reason!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_persistent_conflict_escalation_below_global_cap(db_session, mocker):
+    """The persistent-conflict escalation fires well below LANE_CAP_CONFLICT_DEFAULT (4)
+    and the global cap, so iterations are not wasted on a hopeless conflict."""
+    from app.review_pipeline import LANE_CAP_CONFLICT_DEFAULT, MAX_REVIEW_FIX_ITERATIONS
+
+    assert PERSISTENT_CONFLICT_ESCALATION_THRESHOLD < LANE_CAP_CONFLICT_DEFAULT, (
+        f"Persistent-conflict threshold ({PERSISTENT_CONFLICT_ESCALATION_THRESHOLD}) "
+        f"must be below the lane sub-cap ({LANE_CAP_CONFLICT_DEFAULT}) — "
+        f"otherwise the lane cap fires first and the explicit conflict message is lost"
+    )
+    assert PERSISTENT_CONFLICT_ESCALATION_THRESHOLD < MAX_REVIEW_FIX_ITERATIONS, (
+        f"Persistent-conflict threshold ({PERSISTENT_CONFLICT_ESCALATION_THRESHOLD}) "
+        f"must be well below the global cap ({MAX_REVIEW_FIX_ITERATIONS})"
+    )

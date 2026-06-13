@@ -6,11 +6,19 @@ export function shortPromotedSha(sha?: string | null): string | null {
   return sha.slice(0, 8);
 }
 
-/** serving_confirmed → green, any other status → amber. */
+const SERVING_STATUS_CLASS: Record<string, string> = {
+  serving_confirmed: 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300',
+  deploy_failed: 'bg-red-500/10 border-red-500/20 text-red-300',
+  confirmation_timed_out: 'bg-amber-500/10 border-amber-500/20 text-amber-300',
+  unconfirmed: 'bg-amber-500/10 border-amber-500/20 text-amber-300',
+};
+
+/** Severity-truthful badge classes for each backend-emittable serving status. */
 export function servingStatusClass(status?: string | null): string {
-  return status === 'serving_confirmed'
-    ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
-    : 'bg-amber-500/10 border-amber-500/20 text-amber-300';
+  return (
+    (status != null && SERVING_STATUS_CLASS[status]) ||
+    'bg-neutral-500/10 border-neutral-500/20 text-neutral-400'
+  );
 }
 
 /**

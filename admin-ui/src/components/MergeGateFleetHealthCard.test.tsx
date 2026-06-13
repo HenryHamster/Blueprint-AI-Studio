@@ -28,8 +28,30 @@ describe('MergeGateFleetHealthCard', () => {
     expect(screen.getByText(/cheap acceptance probe/)).toBeInTheDocument();
   });
 
-  it('renders nothing when data is null', () => {
+  it('renders nothing when data is null and stale is false', () => {
     const { container } = render(<MergeGateFleetHealthCard data={null} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders a greyed placeholder when data is null and stale is true', () => {
+    render(<MergeGateFleetHealthCard data={null} stale={true} />);
+    expect(screen.getByText('Merge Gate Health')).toBeInTheDocument();
+    expect(screen.getByText('Data unavailable')).toBeInTheDocument();
+  });
+
+  it('renders the full card even when stale is true and data is present', () => {
+    render(<MergeGateFleetHealthCard data={makeData()} stale={true} />);
+    expect(screen.getByText('75%')).toBeInTheDocument();
+    expect(screen.getByText(/across 2 projects/)).toBeInTheDocument();
+  });
+
+  it('renders nothing when project_count is 0 even if stale is true', () => {
+    const { container } = render(
+      <MergeGateFleetHealthCard
+        data={makeData({ project_count: 0, verified_count: 0, fell_open_count: 0, verification_rate: null, most_common_reason: null, degraded_project_count: 0 })}
+        stale={true}
+      />,
+    );
     expect(container).toBeEmptyDOMElement();
   });
 

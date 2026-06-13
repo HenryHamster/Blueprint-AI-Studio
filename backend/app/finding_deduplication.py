@@ -13,7 +13,8 @@ Four strategies are applied, in order:
   3. File-overlap: skip findings whose ``related_files`` are fully covered by
      open PR artifacts.
   4. Evidence-overlap: skip findings whose source refs (≥80% Jaccard overlap)
-     and claims (at least one shared) match recent findings.
+     and claims (at least one shared) match recent findings. A bounded recent-
+     terminal history path is also consulted when callers provide it.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 CODE_ERROR_COOLDOWN = timedelta(hours=48)
+RECENT_TERMINAL_TASK_HISTORY_CAP = 50
+RECENT_TERMINAL_FINDING_HISTORY_CAP = 200
 
 _STOPWORDS = frozenset(
     {
@@ -443,6 +446,78 @@ def build_dedup_state(
     return recent_finding_hashes, failed_hashes, prior_failure_by_hash
 
 
+def extract_recent_terminal_finding_history(
+    recent_tasks: Iterable[Task],
+    failed_parent_ids: set,
+    now: Optional[datetime] = None,
+    *,
+    task_cap: int = RECENT_TERMINAL_TASK_HISTORY_CAP,
+    finding_cap: int = RECENT_TERMINAL_FINDING_HISTORY_CAP,
+) -> list[dict]:
+    """Return recent terminal findings suitable for cross-cycle dedup.
+
+    The history is bounded and conservative:
+      * only tasks with persisted ``plan_output`` findings are considered;
+      * completed tasks whose rollup parent was already marked stranded are
+        excluded as ghost merges;
+      * FAILED/CANCELLED tasks keep the existing retry semantics, so transient
+        infra failures and CODE_ERROR tasks beyond cooldown are not added; and
+      * the returned findings are capped so a busy project cannot balloon the
+        terminal-history seed.
+    """
+    now = now or _utcnow()
+    terminal_tasks = sorted(
+        recent_tasks,
+        key=lambda t: (getattr(t, "created_at", None) or datetime.min, str(t.id)),
+        reverse=True,
+    )
+    findings: list[dict] = []
+    task_count = 0
+    for t in terminal_tasks:
+        if task_count >= task_cap or len(findings) >= finding_cap:
+            break
+        if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            continue
+        ctx = _task_context(t)
+        if (
+            t.status == TaskStatus.COMPLETED
+            and ctx.get("pr_merged")
+            and t.parent_task_id in failed_parent_ids
+        ):
+            continue
+        if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            failure_class = classify_failure(
+                t, at_time=t.last_heartbeat or t.started_at
+            )
+            if failure_class in INFRA_CLASSES:
+                continue
+            if failure_class == "CODE_ERROR" and not _within_code_error_cooldown(
+                t, now
+            ):
+                continue
+        if not isinstance(t.plan_output, list) or not t.plan_output:
+            continue
+        task_count += 1
+        task_dir_id = _optional_str(ctx.get("direction_id"))
+        task_type = _normalize_task_type((t.first_payload or {}).get("type"))
+        for finding in t.plan_output:
+            if len(findings) >= finding_cap:
+                break
+            if not isinstance(finding, dict):
+                continue
+            title = finding.get("title")
+            if not title:
+                continue
+            enriched = dict(finding)
+            enriched["title"] = str(title)
+            if task_dir_id:
+                enriched.setdefault("direction_id", task_dir_id)
+            if task_type:
+                enriched.setdefault("type", task_type)
+            findings.append(enriched)
+    return findings
+
+
 def extract_retired_failed_approaches(retired_context: list[dict]) -> list[dict]:
     """Extract failed approach dicts from retired direction context dicts.
 
@@ -666,6 +741,7 @@ def deduplicate_findings(
     retired_failed_approaches: Optional[list[dict]] = None,
     archived_diagnoses: Optional[list[str]] = None,
     direction_categories: Optional[dict[str, str]] = None,
+    recent_terminal_findings: Optional[list[dict]] = None,
 ) -> DedupOutcome:
     """Apply hash, word-overlap, file-overlap, and evidence-overlap dedup to ``findings``.
 
@@ -682,6 +758,9 @@ def deduplicate_findings(
 
     outcome = DedupOutcome()
     parent_dir_id = (task_context or {}).get("direction_id")
+    recent_terminal_findings = [
+        f for f in (recent_terminal_findings or []) if isinstance(f, dict)
+    ]
     # Build evidence list from already-deduped findings for evidence-overlap check
     evidence_list: list[tuple[str, list, list]] = []
 
@@ -724,6 +803,25 @@ def deduplicate_findings(
                 }
             )
             continue
+
+        if recent_terminal_findings:
+            matched_title = _find_overlap_match(
+                title, finding_dir_id, recent_terminal_findings, finding_task_type
+            )
+            if matched_title is not None:
+                logger.warning(
+                    f"[RESEARCH] Skipping finding '{title}' — matches recent terminal task"
+                )
+                outcome.word_overlap_count += 1
+                reason = f"recent terminal word overlap with: {matched_title[:60]}"
+                outcome.filtered.append(
+                    {
+                        "title": title[:120],
+                        "direction_id": finding_dir_id,
+                        "reason": reason[:80],
+                    }
+                )
+                continue
 
         if retired_failed_approaches:
             _finding_category = (
@@ -803,6 +901,43 @@ def deduplicate_findings(
                 }
             )
             continue
+
+        if recent_terminal_findings:
+            recent_terminal_evidence = [
+                (
+                    f.get("title", ""),
+                    f.get("sources", []),
+                    f.get("claims", []),
+                )
+                for f in recent_terminal_findings
+                if not finding_dir_id
+                or not f.get("direction_id")
+                or f.get("direction_id") == finding_dir_id
+            ]
+            is_terminal_evidence_dup, matched_terminal_evidence_title = (
+                _check_evidence_overlap(
+                    finding.get("sources", []),
+                    finding.get("claims", []),
+                    recent_terminal_evidence,
+                )
+            )
+            if is_terminal_evidence_dup:
+                logger.info(
+                    f"[RESEARCH] Skipping finding '{title}' — evidence overlap with recent terminal '{matched_terminal_evidence_title}'"
+                )
+                outcome.evidence_overlap_count += 1
+                reason = (
+                    f"recent terminal evidence overlap with: "
+                    f"{matched_terminal_evidence_title[:60]}"
+                )
+                outcome.filtered.append(
+                    {
+                        "title": title[:120],
+                        "direction_id": finding_dir_id,
+                        "reason": reason[:80],
+                    }
+                )
+                continue
 
         outcome.deduplicated.append((orig_i, finding, fhash))
         # Add to evidence list for future comparisons in this cycle

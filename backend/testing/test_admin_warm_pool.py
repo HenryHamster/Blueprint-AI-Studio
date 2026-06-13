@@ -1,4 +1,5 @@
 """Integration tests for the admin warm-pool seed/drain control endpoints
+and the global-disable settings drain (test_global_disable_drains_all_live_pool_members).
 (``backend/app/routers/admin_warm_pool.py``, efficiency direction d-5fd69fe1).
 
 Covers the task's deliverables:
@@ -95,9 +96,7 @@ async def _register(db_session, project, vm_id, state, **kw):
 async def test_seed_denied_for_non_member_project(
     client: AsyncClient, db_session, foreign_project, warm_pool_enabled
 ):
-    resp = await client.post(
-        f"/api/admin/projects/{foreign_project.id}/warm-pool/seed"
-    )
+    resp = await client.post(f"/api/admin/projects/{foreign_project.id}/warm-pool/seed")
     assert resp.status_code == 404, resp.text
 
 
@@ -122,9 +121,7 @@ async def test_seed_returns_409_when_pool_disabled(
 ):
     """warm_pool_enabled off → clear 409 no-op, no PoolVm rows registered."""
     _runtime_config["warm_pool_enabled"] = False
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/seed"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/seed")
     assert resp.status_code == 409, resp.text
     rows = (await db_session.execute(select(PoolVm))).scalars().all()
     assert rows == []
@@ -162,18 +159,20 @@ async def test_seed_provisions_up_to_target(
         new=_registering_provision,
     )
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/seed"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/seed")
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["seeded"] == 2
     assert data["project_id"] == str(project_owner.id)
     rows = (
-        await db_session.execute(
-            select(PoolVm).where(PoolVm.project_id == project_owner.id)
+        (
+            await db_session.execute(
+                select(PoolVm).where(PoolVm.project_id == project_owner.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(rows) == 2
 
 
@@ -192,15 +191,17 @@ async def test_seed_returns_409_when_project_not_in_scope(
     # Scope the pool to some OTHER project so project_owner is out of scope.
     _runtime_config["warm_pool_project_allowlist"] = [str(uuid.uuid4())]
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/seed"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/seed")
     assert resp.status_code == 409, resp.text
     rows = (
-        await db_session.execute(
-            select(PoolVm).where(PoolVm.project_id == project_owner.id)
+        (
+            await db_session.execute(
+                select(PoolVm).where(PoolVm.project_id == project_owner.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert rows == []
 
 
@@ -233,9 +234,7 @@ async def test_seed_provisions_when_project_in_scope(
         new=_registering_provision,
     )
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/seed"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/seed")
     assert resp.status_code == 200, resp.text
     assert resp.json()["seeded"] == 1
 
@@ -271,9 +270,7 @@ async def test_seed_respects_pool_budget_ceiling(
         new=_registering_provision,
     )
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/seed"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/seed")
     assert resp.status_code == 200, resp.text
     # pool_budget_remaining = max_vms(1) - live(0) = 1 → exactly one provisioned.
     assert resp.json()["seeded"] == 1
@@ -299,16 +296,18 @@ async def test_seed_provisions_zero_when_breaker_tripped(
         new=_must_not_provision,
     )
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/seed"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/seed")
     assert resp.status_code == 200, resp.text
     assert resp.json()["seeded"] == 0
     rows = (
-        await db_session.execute(
-            select(PoolVm).where(PoolVm.project_id == project_owner.id)
+        (
+            await db_session.execute(
+                select(PoolVm).where(PoolVm.project_id == project_owner.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert rows == []
 
 
@@ -323,9 +322,7 @@ async def test_drain_retires_live_members_and_banks_idle_cost(
 ):
     """DRAIN retires every live member; rows removed and idle cost banked to the
     ledger via the existing retire_and_delete_pool_vm path."""
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.compute.get_stale_image_vms", return_value=[])
 
     idle = await _register(db_session, project_owner, "agent-vm-d1", PoolVmState.IDLE)
@@ -336,32 +333,38 @@ async def test_drain_retires_live_members_and_banks_idle_cost(
     # A RETIRING member is not "live" and must not be counted/double-torn-down.
     await _register(db_session, project_owner, "agent-vm-d3", PoolVmState.RETIRING)
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/drain"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/drain")
     assert resp.status_code == 200, resp.text
     assert resp.json()["drained"] == 2
 
     remaining = (
-        await db_session.execute(
-            select(PoolVm).where(
-                PoolVm.project_id == project_owner.id,
-                PoolVm.state.in_(
-                    (PoolVmState.IDLE, PoolVmState.PROVISIONING, PoolVmState.LEASED)
-                ),
+        (
+            await db_session.execute(
+                select(PoolVm).where(
+                    PoolVm.project_id == project_owner.id,
+                    PoolVm.state.in_(
+                        (PoolVmState.IDLE, PoolVmState.PROVISIONING, PoolVmState.LEASED)
+                    ),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert remaining == []
 
     # The idle member's accrued cost was carried into the durable ledger.
     ledger = (
-        await db_session.execute(
-            select(PoolIdleCostLedger).where(
-                PoolIdleCostLedger.project_id == project_owner.id
+        (
+            await db_session.execute(
+                select(PoolIdleCostLedger).where(
+                    PoolIdleCostLedger.project_id == project_owner.id
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert any(row.idle_cost_usd > 0 for row in ledger)
 
 
@@ -369,9 +372,7 @@ async def test_drain_retires_live_members_and_banks_idle_cost(
 async def test_drain_empty_pool_is_noop(
     client: AsyncClient, db_session, project_owner, warm_pool_enabled
 ):
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/drain"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/drain")
     assert resp.status_code == 200, resp.text
     assert resp.json()["drained"] == 0
 
@@ -429,9 +430,7 @@ async def test_enable_scopes_project_sets_master_and_seeds(
         new=_registering_provision_factory(),
     )
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/enable"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/enable")
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["enabled"] is True
@@ -442,10 +441,14 @@ async def test_enable_scopes_project_sets_master_and_seeds(
     assert _runtime_config["warm_pool_enabled"] is True
     assert str(project_owner.id) in warm_pool_project_scope()
     rows = (
-        await db_session.execute(
-            select(PoolVm).where(PoolVm.project_id == project_owner.id)
+        (
+            await db_session.execute(
+                select(PoolVm).where(PoolVm.project_id == project_owner.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(rows) == 2
 
 
@@ -465,9 +468,7 @@ async def test_enable_is_additive_to_existing_scope(
         new=_registering_provision_factory(),
     )
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/enable"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/enable")
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["project_allowlist"] == sorted([peer, str(project_owner.id)])
@@ -494,16 +495,14 @@ async def test_enable_establishes_default_target_when_unset(
         new=_registering_provision_factory(),
     )
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/enable"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/enable")
     assert resp.status_code == 200, resp.text
     # The GLOBAL target is left untouched (no fleet-wide resize)...
     assert _runtime_config["warm_pool_target_size"] == 0
     # ...the per-project target for THIS project is established at 2.
-    assert _runtime_config["warm_pool_target_size_by_project"][
-        str(project_owner.id)
-    ] == 2
+    assert (
+        _runtime_config["warm_pool_target_size_by_project"][str(project_owner.id)] == 2
+    )
     assert resp.json()["seeded"] == 2
 
 
@@ -525,14 +524,12 @@ async def test_enable_keeps_existing_global_target_without_pinning(
         new=_registering_provision_factory(),
     )
 
-    resp = await client.post(
-        f"/api/admin/projects/{project_owner.id}/warm-pool/enable"
-    )
+    resp = await client.post(f"/api/admin/projects/{project_owner.id}/warm-pool/enable")
     assert resp.status_code == 200, resp.text
     # No per-project entry pinned — the project resolves to the global target.
-    assert str(project_owner.id) not in _runtime_config[
-        "warm_pool_target_size_by_project"
-    ]
+    assert (
+        str(project_owner.id) not in _runtime_config["warm_pool_target_size_by_project"]
+    )
     assert resp.json()["seeded"] == 3
 
 
@@ -557,9 +554,7 @@ async def test_disable_drains_and_removes_from_scope_peers_stay_enabled(
 ):
     """DISABLE drains the project's members and removes it from scope WITHOUT
     turning the pool off for a peer that is still scoped (the key safety prop)."""
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.compute.get_stale_image_vms", return_value=[])
 
     peer = str(uuid.uuid4())
@@ -586,15 +581,19 @@ async def test_disable_drains_and_removes_from_scope_peers_stay_enabled(
     assert _runtime_config["warm_pool_enabled"] is True
 
     remaining = (
-        await db_session.execute(
-            select(PoolVm).where(
-                PoolVm.project_id == project_owner.id,
-                PoolVm.state.in_(
-                    (PoolVmState.IDLE, PoolVmState.PROVISIONING, PoolVmState.LEASED)
-                ),
+        (
+            await db_session.execute(
+                select(PoolVm).where(
+                    PoolVm.project_id == project_owner.id,
+                    PoolVm.state.in_(
+                        (PoolVmState.IDLE, PoolVmState.PROVISIONING, PoolVmState.LEASED)
+                    ),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert remaining == []
 
 
@@ -604,9 +603,7 @@ async def test_disable_last_scoped_project_flips_master_off(
 ):
     """Removing the LAST explicitly-scoped project flips the master switch off so
     the empty allowlist never silently reverts to fleet-wide."""
-    mocker.patch(
-        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
-    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.compute.get_stale_image_vms", return_value=[])
 
     _runtime_config["warm_pool_enabled"] = True
@@ -682,16 +679,14 @@ async def test_set_target_sets_per_project_value(
     assert data["cleared"] is False
     assert data["warm_pool_target_size_by_project"][str(project_owner.id)] == 5
     # Stored in runtime_config and the global is untouched.
-    assert _runtime_config["warm_pool_target_size_by_project"][
-        str(project_owner.id)
-    ] == 5
+    assert (
+        _runtime_config["warm_pool_target_size_by_project"][str(project_owner.id)] == 5
+    )
     assert _runtime_config["warm_pool_target_size"] == 2
 
 
 @pytest.mark.asyncio
-async def test_set_target_supports_zero(
-    client: AsyncClient, db_session, project_owner
-):
+async def test_set_target_supports_zero(client: AsyncClient, db_session, project_owner):
     """0 is a valid explicit target (keep this project's pool empty)."""
     _runtime_config["warm_pool_target_size"] = 3
     _runtime_config["warm_pool_target_size_by_project"] = {}
@@ -704,9 +699,9 @@ async def test_set_target_supports_zero(
     data = resp.json()
     assert data["target_size"] == 0
     assert data["effective_target"] == 0
-    assert _runtime_config["warm_pool_target_size_by_project"][
-        str(project_owner.id)
-    ] == 0
+    assert (
+        _runtime_config["warm_pool_target_size_by_project"][str(project_owner.id)] == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -728,9 +723,9 @@ async def test_set_target_clear_falls_back_to_global(
     assert data["target_size"] is None
     # Falls back to the global target.
     assert data["effective_target"] == 4
-    assert str(project_owner.id) not in _runtime_config[
-        "warm_pool_target_size_by_project"
-    ]
+    assert (
+        str(project_owner.id) not in _runtime_config["warm_pool_target_size_by_project"]
+    )
 
 
 @pytest.mark.asyncio
@@ -776,3 +771,95 @@ async def test_set_target_requires_target_size_key(
         json={},
     )
     assert resp.status_code == 400, resp.text
+
+
+# ---------------------------------------------------------------------------
+# GLOBAL DISABLE (PATCH /api/admin/settings warm_pool_enabled: False)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def second_project(db_session):
+    """A second project with its own live pool members for the global-disable test."""
+    project = Project(name="Second Pool Project", user_id="other-user-2")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_global_disable_drains_all_live_pool_members(
+    client: AsyncClient,
+    db_session,
+    project_owner,
+    second_project,
+    warm_pool_enabled,
+    mocker,
+):
+    """Flipping warm_pool_enabled False via PATCH /api/admin/settings drains every
+    live pool member fleet-wide: PoolVm rows in PROVISIONING/IDLE/LEASED across
+    all projects are retired and removed, leaving an empty registry.
+
+    Idempotency: a second disable (already False) must not call teardown again.
+    """
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+
+    # Register live members across two projects.
+    await _register(db_session, project_owner, "agent-vm-gd1", PoolVmState.IDLE)
+    await _register(db_session, project_owner, "agent-vm-gd2", PoolVmState.PROVISIONING)
+    await _register(db_session, second_project, "agent-vm-gd3", PoolVmState.IDLE)
+    # A RETIRING member is not live and must not be double-torn-down.
+    await _register(db_session, project_owner, "agent-vm-gd4", PoolVmState.RETIRING)
+
+    assert _runtime_config["warm_pool_enabled"] is True
+
+    resp = await client.patch("/api/admin/settings", json={"warm_pool_enabled": False})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["warm_pool_enabled"] is False
+
+    # All live members must have been retired and their rows removed.
+    live_rows = (
+        (
+            await db_session.execute(
+                select(PoolVm).where(
+                    PoolVm.state.in_(
+                        (PoolVmState.IDLE, PoolVmState.PROVISIONING, PoolVmState.LEASED)
+                    )
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert live_rows == [], f"Expected no live PoolVm rows, got {len(live_rows)}"
+
+    # Idempotency: applying the disable again (already False) drains nothing.
+    retire_spy = mocker.patch(
+        "app.warm_pool_maintainer.retire_and_delete_pool_vm",
+        new_callable=mocker.AsyncMock,
+    )
+    resp2 = await client.patch("/api/admin/settings", json={"warm_pool_enabled": False})
+    assert resp2.status_code == 200, resp2.text
+    retire_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_global_disable_noop_for_unrelated_key(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
+):
+    """Patching an unrelated settings key while the pool is already enabled must
+    not drain any pool members."""
+    await _register(db_session, project_owner, "agent-vm-noop1", PoolVmState.IDLE)
+
+    retire_spy = mocker.patch(
+        "app.warm_pool_maintainer.retire_and_delete_pool_vm",
+        new_callable=mocker.AsyncMock,
+    )
+
+    # Patch an unrelated key — warm_pool_enabled stays True.
+    resp = await client.patch("/api/admin/settings", json={"warm_pool_target_size": 3})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["warm_pool_enabled"] is True
+    retire_spy.assert_not_called()

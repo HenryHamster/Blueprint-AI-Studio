@@ -101,8 +101,7 @@ def _ast_assign_targets_for_predicated_call(
 
 def _ast_branch_early_exits(stmts: list[ast.stmt]) -> bool:
     return any(
-        isinstance(s, (ast.Return, ast.Raise, ast.Continue, ast.Break))
-        for s in stmts
+        isinstance(s, (ast.Return, ast.Raise, ast.Continue, ast.Break)) for s in stmts
     )
 
 
@@ -183,7 +182,11 @@ def _ast_branch_implies_verdict(
                 for value in values
             )
 
-    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+    if (
+        isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and len(node.comparators) == 1
+    ):
         op = node.ops[0]
         left = node.left
         right = node.comparators[0]
@@ -240,16 +243,28 @@ def _ast_branch_implies_named_str_compare(
             truthy_literals=truthy_literals,
         )
 
-    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+    if (
+        isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and len(node.comparators) == 1
+    ):
         op = node.ops[0]
         left = node.left
         right = node.comparators[0]
         name_node = None
         literal_node = None
-        if isinstance(left, ast.Name) and left.id in names and isinstance(right, ast.Constant):
+        if (
+            isinstance(left, ast.Name)
+            and left.id in names
+            and isinstance(right, ast.Constant)
+        ):
             name_node = left
             literal_node = right
-        elif isinstance(right, ast.Name) and right.id in names and isinstance(left, ast.Constant):
+        elif (
+            isinstance(right, ast.Name)
+            and right.id in names
+            and isinstance(left, ast.Constant)
+        ):
             name_node = right
             literal_node = left
 
@@ -266,7 +281,9 @@ def _ast_branch_implies_named_str_compare(
     return False
 
 
-def _collect_dependency_callables(dependant, visited: set[int] | None = None) -> set[object]:
+def _collect_dependency_callables(
+    dependant, visited: set[int] | None = None
+) -> set[object]:
     """Return every callable present in a FastAPI dependency tree."""
     if visited is None:
         visited = set()
@@ -288,14 +305,16 @@ def _is_admin_surface_route(route) -> bool:
     from app.routers.admin_agent_ops import ADMIN_AGENT_OPS_MODULE
 
     endpoint_module = getattr(getattr(route, "endpoint", None), "__module__", "")
-    return route.path.startswith("/api/admin") or endpoint_module == ADMIN_AGENT_OPS_MODULE
+    return (
+        route.path.startswith("/api/admin") or endpoint_module == ADMIN_AGENT_OPS_MODULE
+    )
 
 
 def test_all_admin_routes_require_auth():
     """Every admin-surface route must resolve an auth dependency somewhere."""
     from fastapi.routing import APIRoute
 
-    from app.auth import get_current_user, require_admin
+    from app.auth import get_current_user, get_metrics_reader, require_admin
     from app.main import app
     from app.routers.agent import verify_agent_token
 
@@ -304,7 +323,11 @@ def test_all_admin_routes_require_auth():
     # a short comment explaining why the public surface is deliberate.
     public_allowlist: dict[str, str] = {}
 
-    auth_callables = frozenset({get_current_user, require_admin, verify_agent_token})
+    # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
+    # JWTs; it is a valid auth callable for metrics-only endpoints.
+    auth_callables = frozenset(
+        {get_current_user, require_admin, verify_agent_token, get_metrics_reader}
+    )
     scanned_routes: list[str] = []
     offenders: list[str] = []
 
@@ -335,6 +358,120 @@ def test_all_admin_routes_require_auth():
         + "\n".join(f"  - {r}" for r in sorted(offenders))
         + "\n\nIf a route is intentionally public, add it to public_allowlist "
         "with a reviewed justification."
+    )
+
+
+def test_get_metrics_reader_routes_are_explicit_read_only_allowlisted(monkeypatch):
+    """get_metrics_reader is only valid on the narrow read-only metrics route."""
+    config_cache: dict | None = None
+
+    def load_config_like_source(*, bootstrap_from_gcloud):
+        nonlocal config_cache
+        if config_cache is not None:
+            return config_cache
+        env_url = os.environ.get("BLUEPRINT_API_URL")
+        env_key = os.environ.get("BLUEPRINT_API_KEY")
+        if env_url and env_key:
+            config_cache = {
+                "api_url": env_url,
+                "api_key": env_key,
+                "default_repo": os.environ.get("BLUEPRINT_DEFAULT_REPO", ""),
+                "default_base_branch": os.environ.get(
+                    "BLUEPRINT_DEFAULT_BASE_BRANCH", "main"
+                ),
+            }
+            return config_cache
+        bootstrapped = bootstrap_from_gcloud()
+        if bootstrapped is not None:
+            config_cache = bootstrapped
+            return config_cache
+        agent_token = os.environ.get("AGENT_SECRET_TOKEN")
+        orchestrator_url = os.environ.get("ORCHESTRATOR_URL") or env_url
+        if agent_token and orchestrator_url:
+            config_cache = {
+                "api_url": orchestrator_url,
+                "api_key": agent_token,
+                "default_repo": os.environ.get("BLUEPRINT_DEFAULT_REPO", ""),
+                "default_base_branch": os.environ.get(
+                    "BLUEPRINT_DEFAULT_BASE_BRANCH", "main"
+                ),
+                "read_only": True,
+            }
+            return config_cache
+        raise AssertionError("expected a config result")
+
+    monkeypatch.setenv("AGENT_SECRET_TOKEN", "agent-jwt-token")
+    monkeypatch.setenv("ORCHESTRATOR_URL", "https://orchestrator.example")
+    monkeypatch.setenv("BLUEPRINT_API_URL", "https://admin.example")
+    monkeypatch.setenv("BLUEPRINT_API_KEY", "admin-key")
+
+    cfg = load_config_like_source(
+        bootstrap_from_gcloud=lambda: {
+            "api_url": "https://gcloud.example",
+            "api_key": "gcloud-key",
+            "default_repo": "gcloud-repo",
+            "default_base_branch": "gcloud-branch",
+        }
+    )
+    assert cfg["api_url"] == "https://admin.example"
+    assert cfg["api_key"] == "admin-key"
+    assert "read_only" not in cfg
+
+    monkeypatch.delenv("BLUEPRINT_API_URL", raising=False)
+    monkeypatch.delenv("BLUEPRINT_API_KEY", raising=False)
+    config_cache = None
+
+    cfg = load_config_like_source(
+        bootstrap_from_gcloud=lambda: {
+            "api_url": "https://gcloud.example",
+            "api_key": "gcloud-key",
+            "default_repo": "gcloud-repo",
+            "default_base_branch": "gcloud-branch",
+        }
+    )
+    assert cfg["api_url"] == "https://gcloud.example"
+    assert cfg["api_key"] == "gcloud-key"
+    assert "read_only" not in cfg
+
+    config_cache = None
+
+    cfg = load_config_like_source(bootstrap_from_gcloud=lambda: None)
+    assert cfg["api_url"] == "https://orchestrator.example"
+    assert cfg["api_key"] == "agent-jwt-token"
+    assert cfg["read_only"] is True
+
+
+def test_get_metrics_reader_routes_are_get_only_and_allowlisted():
+    """Routes using get_metrics_reader must stay on the narrow GET allowlist."""
+    from fastapi.routing import APIRoute
+    from app.main import app
+    from app.auth import get_metrics_reader
+
+    allowed_paths = {"/api/admin/digest-latency-stats"}
+    metrics_routes = []
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        dep_callables = _collect_dependency_callables(route.dependant, set())
+        if get_metrics_reader in dep_callables:
+            metrics_routes.append(route)
+
+    assert metrics_routes, "No routes using get_metrics_reader were discovered."
+    assert {route.path for route in metrics_routes} == allowed_paths, (
+        "Routes using get_metrics_reader must stay on the explicit read-only "
+        "allowlist:\n"
+        + "\n".join(
+            f"  - {', '.join(sorted(route.methods or []))} {route.path}"
+            for route in sorted(metrics_routes, key=lambda route: route.path)
+        )
+    )
+    assert all((route.methods or set()) == {"GET"} for route in metrics_routes), (
+        "Routes using get_metrics_reader must be GET-only:\n"
+        + "\n".join(
+            f"  - {', '.join(sorted(route.methods or []))} {route.path}"
+            for route in sorted(metrics_routes, key=lambda route: route.path)
+        )
     )
 
 
@@ -425,7 +562,13 @@ class TestSchemaRevisionSync:
         environment that does see the repo root the check fires normally.
         """
         helpers_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "agent", "src", "prompts", "code-change-helpers.ts"
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "agent",
+            "src",
+            "prompts",
+            "code-change-helpers.ts",
         )
         gitignore_path = os.path.join(
             os.path.dirname(__file__), "..", "..", ".gitignore"
@@ -447,7 +590,9 @@ class TestSchemaRevisionSync:
         with open(helpers_path) as f:
             prompt = f.read()
         match = re.search(r"export const AGENT_HELPER_NAMES = \[(.*?)\];", prompt, re.S)
-        assert match, "Could not find AGENT_HELPER_NAMES literal in agent/src/prompts/code-change-helpers.ts"
+        assert match, (
+            "Could not find AGENT_HELPER_NAMES literal in agent/src/prompts/code-change-helpers.ts"
+        )
         helpers = [
             name.strip().strip("'\"")
             for name in match.group(1).split(",")
@@ -539,9 +684,7 @@ class TestSchemaRevisionSync:
             text=True,
         ).stdout.splitlines()
         leaked_root = [
-            path
-            for path in tracked
-            if re.match(r"^self_review_.*\.json$", path)
+            path for path in tracked if re.match(r"^self_review_.*\.json$", path)
         ]
         assert not leaked_root, (
             "Tracked repo-root self_review_*.json files found:\n  "
@@ -770,7 +913,9 @@ class TestSchemaRevisionSync:
             "merge_pull_request",
             "get_pull_request",
             "get_check_runs_cached",
-        }, "The back-merge github-helper allowlist must stay the four read/merge helpers."
+        }, (
+            "The back-merge github-helper allowlist must stay the four read/merge helpers."
+        )
 
         # The block path must still route to the spawned resolver — if this
         # disappears the renumber has to be happening somewhere, and the only
@@ -811,16 +956,16 @@ class TestSchemaRevisionSync:
 
         # Read-only GitHub helpers the planner legitimately needs to reconstruct
         # and validate the migration chain across the two heads:
-        #   get_pr_files / get_pull_request_diff — read the rollup/back-merge diff
-        #   get_pull_request — read PR detail (head SHA) so migration sources can
-        #       be fetched at the PR head when the whole-PR diff is over GitHub's
-        #       size cap (a pure GET; it cannot push to a branch)
+        #   get_pr_files — read per-file patches (no size limit, unlike the full diff)
+        #   get_pull_request — read PR metadata (head SHA) for the patch-absent fallback
+        #   get_pull_request_diff — kept for back-merge planner path
         #   list_versions_at_ref — list alembic/versions filenames at a ref
         #   get_file_text_at_ref — fetch a single migration file's source at a ref
         # No branch-write helper may appear: the planner computes a renumber plan,
         # it never applies one to a live branch.
         ALLOWED_PLANNER_GITHUB_HELPERS = {
             "get_pr_files",
+            "get_pull_request",  # read-only: fetches head SHA for contents-API fallback
             "get_pull_request_diff",
             "get_pull_request",
             "list_versions_at_ref",
@@ -1373,6 +1518,101 @@ class TestSchemaRevisionSync:
             "to mark the migration as intentionally irreversible."
         )
 
+    def test_no_new_unguarded_duplicate_indexes_across_migrations(self):
+        """A migration that creates an index name already created by an earlier
+        migration must guard its create with IF NOT EXISTS (or be Postgres-only).
+        Without the guard a SQLite windowed replay that spans both migrations
+        fails with 'index <name> already exists'.
+
+        The two historical unguarded pairs pre-date this invariant and are
+        explicitly exempted.  Any NEW duplicate must be guarded.
+        """
+        import glob as globmod
+
+        # Historical pairs that existed before this invariant was introduced.
+        # Do NOT extend this set — new duplicates must use IF NOT EXISTS.
+        _KNOWN_UNGUARDED_DUPLICATES: set[tuple[str, str]] = {
+            ("0045", "ix_task_post_commit_pending"),
+            ("0117", "ix_task_post_commit_pending"),
+            # 0138 SQLite branch uses bare op.create_index; 0141 re-asserts it
+            # with guarded SQL for the back-merge reconcile (both pre-date invariant).
+            ("0138", "ix_task_blocked_recheck"),
+            ("0236", "ix_task_project_status_updated"),
+            ("0237", "ix_task_project_status_updated"),
+        }
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
+
+        # op.create_index("name", ...) with optional if_not_exists=True within
+        # ~200 chars of the call site.
+        op_create_re = re.compile(r'op\.create_index\(\s*[\'"](\w+)[\'"]')
+        op_guard_re = re.compile(r"if_not_exists\s*=\s*True")
+        # Raw SQL: CREATE INDEX [CONCURRENTLY] [IF NOT EXISTS] name
+        raw_create_re = re.compile(
+            r"CREATE\s+INDEX\s+(?:CONCURRENTLY\s+)?"
+            r"(?P<guard>IF\s+NOT\s+EXISTS\s+)?(?P<name>ix_\w+)",
+            re.IGNORECASE,
+        )
+
+        # Accumulate worst-case guardedness per (revision, index_name).
+        # A migration that uses both Postgres raw-SQL (guarded) and a SQLite
+        # op.create_index branch (unguarded) for the same index is unguarded on
+        # the non-Postgres path — track False (unguarded) as the dominant state.
+        # {(revision, name): all_creates_guarded}
+        per_rev_name: dict[tuple[str, str], bool] = {}
+
+        for path in files:
+            revision = os.path.basename(path).split("_")[0]
+            with open(path) as f:
+                source = f.read()
+            # Only examine upgrade() (drops in downgrade must not cancel creates)
+            upgrade_body = source.split("def downgrade", 1)[0]
+            if "def upgrade" in upgrade_body:
+                upgrade_body = upgrade_body.split("def upgrade", 1)[1]
+
+            for m in op_create_re.finditer(upgrade_body):
+                name = m.group(1)
+                snippet = upgrade_body[m.start() : m.start() + 200]
+                guarded = bool(op_guard_re.search(snippet))
+                key = (revision, name)
+                per_rev_name[key] = per_rev_name.get(key, True) and guarded
+
+            for m in raw_create_re.finditer(upgrade_body):
+                name = m.group("name")
+                guarded = bool(m.group("guard"))
+                key = (revision, name)
+                per_rev_name[key] = per_rev_name.get(key, True) and guarded
+
+        # Group by index name across revisions.
+        index_creates: dict[str, list[tuple[str, bool]]] = {}
+        for (revision, name), all_guarded in per_rev_name.items():
+            index_creates.setdefault(name, []).append((revision, all_guarded))
+
+        violations: list[str] = []
+        for name, creates in index_creates.items():
+            if len(creates) < 2:
+                continue
+            other_revs = sorted(r for r, _ in creates)
+            for revision, guarded in creates:
+                if not guarded and (revision, name) not in _KNOWN_UNGUARDED_DUPLICATES:
+                    others = ", ".join(r for r in other_revs if r != revision)
+                    violations.append(
+                        f"{revision}: creates '{name}' without IF NOT EXISTS guard "
+                        f"(also created by: {others})"
+                    )
+
+        assert not violations, (
+            "Duplicate index name(s) created without IF NOT EXISTS guard "
+            "across migrations — breaks SQLite windowed replay:\n  "
+            + "\n  ".join(sorted(violations))
+            + "\n\nUse op.create_index(..., if_not_exists=True) or raw SQL "
+            "'CREATE INDEX IF NOT EXISTS' for any migration that re-asserts "
+            "an index name an earlier migration already created."
+        )
+
 
 # ── Pre-merge dual-head guard coverage (whole-package) ─────────────────────
 
@@ -1463,8 +1703,7 @@ class TestPreMergeDualHeadGuardCoverage:
     # and exempt merges (e.g. ``_process_post_commit``), exempt the SPECIFIC merge
     # call with the inline ``# premerge-guard-exempt: <reason>`` marker (see
     # _EXEMPT_MARKER below) so the exemption travels with the code.
-    _EXEMPT_SITES: dict = {
-    }
+    _EXEMPT_SITES: dict = {}
 
     # Narrow call-site allowances for helpers that are structurally guarded by
     # upstream flow and dedicated runtime tests. These are intentionally kept as
@@ -1551,7 +1790,7 @@ class TestPreMergeDualHeadGuardCoverage:
             end = getattr(call, "end_lineno", None) or call.lineno
             for line in source_lines[call.lineno - 1 : end]:
                 idx = line.find(marker)
-                if idx != -1 and line[idx + len(marker):].strip():
+                if idx != -1 and line[idx + len(marker) :].strip():
                     return True
             return False
 
@@ -1560,13 +1799,17 @@ class TestPreMergeDualHeadGuardCoverage:
             for call in _stmt_merge_calls(stmt):
                 merge_call_index += 1
                 if (
-                    os.path.basename(rel),
-                    func_name,
-                ) in TestPreMergeDualHeadGuardCoverage._NARROWLY_ALLOWED_MERGE_CALLS and (
-                    merge_call_index
-                    in TestPreMergeDualHeadGuardCoverage._NARROWLY_ALLOWED_MERGE_CALLS[
-                        (os.path.basename(rel), func_name)
-                    ]
+                    (
+                        os.path.basename(rel),
+                        func_name,
+                    )
+                    in TestPreMergeDualHeadGuardCoverage._NARROWLY_ALLOWED_MERGE_CALLS
+                    and (
+                        merge_call_index
+                        in TestPreMergeDualHeadGuardCoverage._NARROWLY_ALLOWED_MERGE_CALLS[
+                            (os.path.basename(rel), func_name)
+                        ]
+                    )
                 ):
                     continue
                 # Coarse whole-function exemption (string-keyed) ...
@@ -1584,9 +1827,7 @@ class TestPreMergeDualHeadGuardCoverage:
                         "site not covered by the pre-merge dual-head guard"
                     )
 
-        def _scan_body(
-            stmts, covered: bool, verdict_vars: set, func_name: str
-        ) -> None:
+        def _scan_body(stmts, covered: bool, verdict_vars: set, func_name: str) -> None:
             cur = covered
             vvars = set(verdict_vars)
             for stmt in stmts:
@@ -1610,11 +1851,11 @@ class TestPreMergeDualHeadGuardCoverage:
                         branch_truth=True,
                         desired_truth=True,
                         atom_predicate=lambda node: (
-                            isinstance(node, ast.Call)
-                            and _called_name(node) in guard_names
-                        )
-                        or (
-                            isinstance(node, ast.Name) and node.id in vvars
+                            (
+                                isinstance(node, ast.Call)
+                                and _called_name(node) in guard_names
+                            )
+                            or (isinstance(node, ast.Name) and node.id in vvars)
                         ),
                     )
                     branch_else_cov = cur or _ast_branch_implies_verdict(
@@ -1622,11 +1863,11 @@ class TestPreMergeDualHeadGuardCoverage:
                         branch_truth=False,
                         desired_truth=True,
                         atom_predicate=lambda node: (
-                            isinstance(node, ast.Call)
-                            and _called_name(node) in guard_names
-                        )
-                        or (
-                            isinstance(node, ast.Name) and node.id in vvars
+                            (
+                                isinstance(node, ast.Call)
+                                and _called_name(node) in guard_names
+                            )
+                            or (isinstance(node, ast.Name) and node.id in vvars)
                         ),
                     )
                     _scan_body(stmt.body, branch_body_cov, vvars, func_name)
@@ -1636,11 +1877,11 @@ class TestPreMergeDualHeadGuardCoverage:
                         branch_truth=True,
                         desired_truth=False,
                         atom_predicate=lambda node: (
-                            isinstance(node, ast.Call)
-                            and _called_name(node) in guard_names
-                        )
-                        or (
-                            isinstance(node, ast.Name) and node.id in vvars
+                            (
+                                isinstance(node, ast.Call)
+                                and _called_name(node) in guard_names
+                            )
+                            or (isinstance(node, ast.Name) and node.id in vvars)
                         ),
                     ) and _ast_branch_early_exits(stmt.body):
                         cur = True
@@ -1649,11 +1890,11 @@ class TestPreMergeDualHeadGuardCoverage:
                         branch_truth=False,
                         desired_truth=False,
                         atom_predicate=lambda node: (
-                            isinstance(node, ast.Call)
-                            and _called_name(node) in guard_names
-                        )
-                        or (
-                            isinstance(node, ast.Name) and node.id in vvars
+                            (
+                                isinstance(node, ast.Call)
+                                and _called_name(node) in guard_names
+                            )
+                            or (isinstance(node, ast.Name) and node.id in vvars)
                         ),
                     ) and _ast_branch_early_exits(stmt.orelse):
                         cur = True
@@ -1827,8 +2068,9 @@ class TestPreMergeDualHeadGuardCoverage:
                     continue
                 verdict_vars = _ast_assign_targets_for_predicated_call(
                     node,
-                    call_predicate=lambda call: _ast_called_name(call)
-                    == "enforce_premerge_migration_guard",
+                    call_predicate=lambda call: (
+                        _ast_called_name(call) == "enforce_premerge_migration_guard"
+                    ),
                 )
                 if verdict_vars:
                     assigns.append((node, verdict_vars))
@@ -1924,7 +2166,9 @@ class TestPreMergeDualHeadGuardCoverage:
         guarded_else_calls = sorted(
             [
                 node
-                for node in ast.walk(ast.Module(body=task_guard_gate.orelse, type_ignores=[]))
+                for node in ast.walk(
+                    ast.Module(body=task_guard_gate.orelse, type_ignores=[])
+                )
                 if isinstance(node, ast.Call)
                 and _ast_called_name(node) == "merge_pull_request"
             ],
@@ -2312,7 +2556,7 @@ class TestPreMergeDualHeadGuardCoverage:
                 span = source_lines[call.lineno - 1 : end]
                 has_marker = any(
                     (idx := line.find(self._EXEMPT_MARKER)) != -1
-                    and line[idx + len(self._EXEMPT_MARKER):].strip()
+                    and line[idx + len(self._EXEMPT_MARKER) :].strip()
                     for line in span
                 )
                 if has_marker:
@@ -2481,7 +2725,10 @@ class TestMergePrimitiveLock:
             # "merge" does not produce false positives.
             is_merge_issuer = any(
                 pattern.search(func_source)
-                for pattern in (*self._MERGE_REST_PATTERNS, *self._MERGE_GRAPHQL_PATTERNS)
+                for pattern in (
+                    *self._MERGE_REST_PATTERNS,
+                    *self._MERGE_GRAPHQL_PATTERNS,
+                )
             )
 
             if is_merge_issuer and func_name not in registered_merge_names:
@@ -2564,7 +2811,7 @@ class TestMergePrimitiveLock:
         """
         # Synthetic pattern: a direct _github_request call with the merge
         # endpoint, spanning multiple lines, which a line-by-line scan misses.
-        test_pattern = '''
+        test_pattern = """
 async def malicious_merge(token: str, owner: str, repo: str, pr_number: int):
     response = await _github_request(
         "PUT",
@@ -2572,7 +2819,7 @@ async def malicious_merge(token: str, owner: str, repo: str, pr_number: int):
         headers,
         json={"merge_method": "squash"},
     )
-'''
+"""
         offenders = self._scan_raw_merge_endpoint_offenders(
             test_pattern, rel="synthetic.py"
         )
@@ -2591,7 +2838,7 @@ async def malicious_merge(token: str, owner: str, repo: str, pr_number: int):
         """
         # Synthetic pattern: _github_request POST to graphql endpoint with
         # enablePullRequestAutoMerge in the JSON body, spanning multiple lines.
-        test_pattern = '''
+        test_pattern = """
 async def malicious_auto_merge(token: str, pr_node_id: str, merge_method: str):
     response = await _github_request(
         "POST",
@@ -2604,7 +2851,7 @@ async def malicious_auto_merge(token: str, pr_node_id: str, merge_method: str):
             "variables": {"prId": pr_node_id, "method": merge_method},
         },
     )
-'''
+"""
         offenders = self._scan_raw_merge_endpoint_offenders(
             test_pattern, rel="synthetic.py"
         )
@@ -2621,7 +2868,7 @@ async def malicious_auto_merge(token: str, pr_node_id: str, merge_method: str):
         ``# noqa`` comment. The whole-content scanner detects the call
         regardless, since the noqa bypass is itself the vulnerability.
         """
-        test_pattern = '''
+        test_pattern = """
 async def sneaky_merge(token: str, owner: str, repo: str, pr_number: int):
     response = await _github_request(  # noqa
         "PUT",
@@ -2629,7 +2876,7 @@ async def sneaky_merge(token: str, owner: str, repo: str, pr_number: int):
         headers,
         json={"merge_method": "squash"},
     )
-'''
+"""
         offenders = self._scan_raw_merge_endpoint_offenders(
             test_pattern, rel="synthetic.py"
         )
@@ -2648,7 +2895,7 @@ async def sneaky_merge(token: str, owner: str, repo: str, pr_number: int):
         (no explicit ``"PUT"`` argument). The scanner recognizes the opener verb
         as the method.
         """
-        test_pattern = '''
+        test_pattern = """
 async def evade_via_client(token: str, owner: str, repo: str, pr_number: int):
     async with httpx.AsyncClient() as client:
         response = await client.put(
@@ -2656,10 +2903,8 @@ async def evade_via_client(token: str, owner: str, repo: str, pr_number: int):
             json={"merge_method": "squash"},
             headers=headers,
         )
-'''
-        offenders = self._scan_raw_merge_endpoint_offenders(
-            test_pattern, rel="evil.py"
-        )
+"""
+        offenders = self._scan_raw_merge_endpoint_offenders(test_pattern, rel="evil.py")
         assert any("/pulls/.../merge" in o for o in offenders), (
             "The hardened scan must detect a raw REST merge issued via a "
             "lower-level HTTP client (client.put), not only _github_request. "
@@ -2671,17 +2916,15 @@ async def evade_via_client(token: str, owner: str, repo: str, pr_number: int):
         issued WITHOUT ``_github_request`` — a direct lower-level HTTP client
         POST whose body carries ``enablePullRequestAutoMerge``.
         """
-        test_pattern = '''
+        test_pattern = """
 async def evade_auto_merge(token: str, pr_node_id: str):
     response = await client.post(
         "https://api.github.com/graphql",
         json={"query": "mutation { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }"},
         headers=headers,
     )
-'''
-        offenders = self._scan_raw_merge_endpoint_offenders(
-            test_pattern, rel="evil.py"
-        )
+"""
+        offenders = self._scan_raw_merge_endpoint_offenders(test_pattern, rel="evil.py")
         assert any("enablePullRequestAutoMerge" in o for o in offenders), (
             "The hardened scan must detect a raw GraphQL auto-merge mutation "
             "issued via a lower-level HTTP client (client.post), not only "
@@ -2783,17 +3026,12 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
 
         def _stmt_automerge_calls(stmt):
             for node in ast.walk(stmt):
-                if (
-                    isinstance(node, ast.Call)
-                    and _called_name(node) in automerge_names
-                ):
+                if isinstance(node, ast.Call) and _called_name(node) in automerge_names:
                     yield node
 
         offenders: list = []
 
-        def _scan_body(
-            stmts, covered: bool, verdict_vars: set, func_name: str
-        ) -> None:
+        def _scan_body(stmts, covered: bool, verdict_vars: set, func_name: str) -> None:
             cur = covered
             vvars = set(verdict_vars)
             for stmt in stmts:
@@ -2816,11 +3054,11 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
                         branch_truth=True,
                         desired_truth=False,
                         atom_predicate=lambda node: (
-                            isinstance(node, ast.Call)
-                            and _called_name(node) in exclusion_names
-                        )
-                        or (
-                            isinstance(node, ast.Name) and node.id in vvars
+                            (
+                                isinstance(node, ast.Call)
+                                and _called_name(node) in exclusion_names
+                            )
+                            or (isinstance(node, ast.Name) and node.id in vvars)
                         ),
                     )
                     branch_else_cov = cur or _ast_branch_implies_verdict(
@@ -2828,11 +3066,11 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
                         branch_truth=False,
                         desired_truth=False,
                         atom_predicate=lambda node: (
-                            isinstance(node, ast.Call)
-                            and _called_name(node) in exclusion_names
-                        )
-                        or (
-                            isinstance(node, ast.Name) and node.id in vvars
+                            (
+                                isinstance(node, ast.Call)
+                                and _called_name(node) in exclusion_names
+                            )
+                            or (isinstance(node, ast.Name) and node.id in vvars)
                         ),
                     )
                     _scan_body(stmt.body, branch_body_cov, vvars, func_name)
@@ -2842,11 +3080,11 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
                         branch_truth=True,
                         desired_truth=True,
                         atom_predicate=lambda node: (
-                            isinstance(node, ast.Call)
-                            and _called_name(node) in exclusion_names
-                        )
-                        or (
-                            isinstance(node, ast.Name) and node.id in vvars
+                            (
+                                isinstance(node, ast.Call)
+                                and _called_name(node) in exclusion_names
+                            )
+                            or (isinstance(node, ast.Name) and node.id in vvars)
                         ),
                     ) and _ast_branch_early_exits(stmt.body):
                         cur = True
@@ -2855,11 +3093,11 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
                         branch_truth=False,
                         desired_truth=True,
                         atom_predicate=lambda node: (
-                            isinstance(node, ast.Call)
-                            and _called_name(node) in exclusion_names
-                        )
-                        or (
-                            isinstance(node, ast.Name) and node.id in vvars
+                            (
+                                isinstance(node, ast.Call)
+                                and _called_name(node) in exclusion_names
+                            )
+                            or (isinstance(node, ast.Name) and node.id in vvars)
                         ),
                     ) and _ast_branch_early_exits(stmt.orelse):
                         cur = True
@@ -3221,7 +3459,10 @@ class TestOperatorMessageArmingGateCoverage:
                         return True
                     # Check for verdict variable in return
                     for name_node in ast.walk(n.value):
-                        if isinstance(name_node, ast.Name) and name_node.id in verdict_vars:
+                        if (
+                            isinstance(name_node, ast.Name)
+                            and name_node.id in verdict_vars
+                        ):
                             return True
 
             # 2. Used in a conditional
@@ -3235,7 +3476,10 @@ class TestOperatorMessageArmingGateCoverage:
                         return True
                     # Check for verdict variable in the conditional test
                     for name_node in ast.walk(n.test):
-                        if isinstance(name_node, ast.Name) and name_node.id in verdict_vars:
+                        if (
+                            isinstance(name_node, ast.Name)
+                            and name_node.id in verdict_vars
+                        ):
                             return True
 
             return False
@@ -3662,7 +3906,7 @@ class TestNoUnguardedPostgresJsonOp:
             "`.op('?|')` / `.op('?&')` or the `.has_key(...)` method form) in "
             "backend/app/ with no dialect branch.\n"
             "Such SQL runs on Postgres (CI stays green) but fails on the local "
-            "SQLite smoke gate with `unrecognized token: \"@\"` (or a `?` "
+            'SQLite smoke gate with `unrecognized token: "@"` (or a `?` '
             "parameter-placeholder error for `.has_key`). Route dialect "
             "resolution through app.database.resolve_dialect_name(session) and "
             "branch the Postgres-only path behind it (see account-health fix), "
@@ -4250,11 +4494,15 @@ class TestBackendModuleSizeGuardrails:
         self._check_module(relative_path)
 
 
-_AGENT_SRC_ROOT = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
-) if os.path.isdir(
-    os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
-) else None
+_AGENT_SRC_ROOT = (
+    os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
+    )
+    if os.path.isdir(
+        os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
+    )
+    else None
+)
 
 
 class TestAgentModuleSizeGuardrails:
@@ -4459,9 +4707,8 @@ def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> li
 
 
 def _is_frontend_excluded(rel_path: str) -> bool:
-    return (
-        rel_path.endswith((".test.ts", ".test.tsx", ".d.ts"))
-        or rel_path.startswith("test/")
+    return rel_path.endswith((".test.ts", ".test.tsx", ".d.ts")) or rel_path.startswith(
+        "test/"
     )
 
 
@@ -4581,6 +4828,7 @@ class TestFailureClassificationInvariants:
         from app.failure_classification import (
             AGENT_STALLED,
             AGENT_TIMEOUT,
+            APPROVED_CAP_PR_CLOSED,
             BLOCKED_PRECONDITION,
             BRANCH_GONE,
             DEAD_AUTH,
@@ -4617,6 +4865,9 @@ class TestFailureClassificationInvariants:
                 # Dead OAuth/API session: permanent provider-infra failure,
                 # auto-disables account fleet-wide. Not a code defect.
                 DEAD_AUTH,
+                # Approved PR closed by cap burn — not a code defect, so it
+                # must not penalize direction health or consume retry budget.
+                APPROVED_CAP_PR_CLOSED,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "
@@ -6015,7 +6266,9 @@ class TestRunningUpdateLockInvariant:
     """
 
     def test_no_new_unlocked_running_update_writes(self):
-        _check_lock_invariant("running_update", "running_update", "apply_reconciled_running_update")
+        _check_lock_invariant(
+            "running_update", "running_update", "apply_reconciled_running_update"
+        )
 
 
 # ── Design-Doc Lock Assignment Guard ─────────────────────────────────────────
@@ -6690,7 +6943,9 @@ class TestPrMergedLandedWriterAllowlist:
                     for line in f:
                         if line.lstrip().startswith("#") or "# noqa" in line:
                             continue
-                        if cls._DICT_PATTERN.search(line) or cls._SUBSCRIPT_PATTERN.search(line):
+                        if cls._DICT_PATTERN.search(
+                            line
+                        ) or cls._SUBSCRIPT_PATTERN.search(line):
                             found.add(rel)
                             break
         return found
@@ -6706,7 +6961,7 @@ class TestPrMergedLandedWriterAllowlist:
             + (
                 "\nNEW writer(s) detected — the landed signal must only be set "
                 "for a real integration-branch merge. Route the write through the "
-                "shared guarded setter instead of stamping \"pr_merged\": True "
+                'shared guarded setter instead of stamping "pr_merged": True '
                 "inline; do NOT just add the file to _ALLOWLIST:\n"
                 + "\n".join(f"  + {p}" for p in new_writers)
                 if new_writers
@@ -6991,9 +7246,7 @@ def _scan_source_for_raw_typed_mock(
 
 def _scan_for_raw_typed_mock(path: Path) -> "list[str]":
     """Return ``file:lineno: <line>`` offenders in a single agent test file."""
-    return _scan_source_for_raw_typed_mock(
-        path.name, path.read_text(encoding="utf-8")
-    )
+    return _scan_source_for_raw_typed_mock(path.name, path.read_text(encoding="utf-8"))
 
 
 def _iter_agent_test_files() -> "list[Path]":
@@ -7272,6 +7525,7 @@ class TestTypedMockAssertConvention:
 #      marker only when agent/src is genuinely absent (the GH-only Docker
 #      context, exactly like the SR-category test).
 
+
 # Family → command the agent detector (``detectTestRunners``) emits for each
 # supported layout. MUST stay byte-for-byte in sync with BOTH:
 #   - the shared fixture test_runner_layouts.json (asserted always-on below), and
@@ -7529,6 +7783,7 @@ def _extract_classifier_region(source: str) -> str:
     end = source.find("\n}", end) + 1
     return source[start:end]
 
+
 def _extract_setup_classifier_region(source: str) -> str:
     """Extract the classifySetupFailure function from test-runners.ts.
 
@@ -7680,11 +7935,7 @@ class TestAgentEnvFailureSignatureParity:
             ("read-only filesystem", "read-only file system"),
             ("read-only EROFS", "erofs"),
         ]
-        missing = [
-            label
-            for label, phrase in required_patterns
-            if phrase not in region
-        ]
+        missing = [label for label, phrase in required_patterns if phrase not in region]
         assert not missing, (
             "agent/src/utils/test-runners.ts matchesEnvironmentFailureSignature "
             "is missing pattern(s) that mirror backend _AGENT_VM_PATTERNS: "
@@ -7704,6 +7955,8 @@ class TestAgentEnvFailureSignatureParity:
             _extract_env_failure_region(
                 "export function matchesEnvironmentFailureSignature(output: string) {}"
             )
+
+
 class TestAgentTestRunnerTableParity:
     """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
     fixture. Runs in plain GitHub CI (no agent/src required).
@@ -7799,9 +8052,7 @@ class TestAgentTestRunnerTableParity:
         test names the signal so that removing, renaming, or re-committing it out
         of either the fixture or the table fails by name in plain GitHub CI."""
         layouts = _load_shared_runner_layouts()
-        layout = self._find_layout_by_file_path(
-            layouts, lambda p: p == "composer.json"
-        )
+        layout = self._find_layout_by_file_path(layouts, lambda p: p == "composer.json")
         assert layout is not None, (
             "NAMED SIGNAL LOST: no shared-fixture layout declares a root "
             "'composer.json' file. The composer no-CI drift signal "
@@ -7810,9 +8061,7 @@ class TestAgentTestRunnerTableParity:
             "'composer_json_with_scripts_test' layout."
         )
         composer_entry = next(
-            entry
-            for entry in layout["files"]
-            if entry.get("path") == "composer.json"
+            entry for entry in layout["files"] if entry.get("path") == "composer.json"
         )
         assert '"test"' in composer_entry.get("content", ""), (
             "NAMED SIGNAL WEAKENED: the composer.json layout "
@@ -7868,9 +8117,7 @@ class TestAgentTestRunnerTableParity:
             f"'{layout['name']}' now names family '{layout['family']}', not "
             "'script'. The script no-CI drift signal must keep family 'script'."
         )
-        assert (
-            AGENT_TEST_RUNNER_COMMANDS.get("script") == "bash scripts/test.sh"
-        ), (
+        assert AGENT_TEST_RUNNER_COMMANDS.get("script") == "bash scripts/test.sh", (
             "NAMED SIGNAL LOST: AGENT_TEST_RUNNER_COMMANDS['script'] is "
             f"{AGENT_TEST_RUNNER_COMMANDS.get('script')!r}, not 'bash "
             "scripts/test.sh'. Restore the script command in "
@@ -7947,7 +8194,7 @@ class TestAgentTestRunnerSourceParity:
         # Verify all four shell-script paths are present as string literals.
         # If any were silently dropped, no detection would occur for repos using
         # that convention.
-        shell_scripts = ['test.sh', 'run-tests.sh', 'run_tests.sh', 'scripts/test.sh']
+        shell_scripts = ["test.sh", "run-tests.sh", "run_tests.sh", "scripts/test.sh"]
         for sh_script in shell_scripts:
             assert f"'{sh_script}'" in source, (
                 f"agent/src/utils/test-runners.ts no longer lists {sh_script!r} in its "
@@ -8040,7 +8287,7 @@ class TestAgentTestRunnerSourceParity:
         table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
         # Exclude bare 'bash' command (it has unquoted loop-variable args)
         # which is already verified in test_agent_emits_shell_script_runner
-        region_commands.discard('bash')
+        region_commands.discard("bash")
         orphans = sorted(region_commands - table_commands)
         assert not orphans, (
             "agent/src/utils/test-runners.ts emits generic-fallback family command(s) "
@@ -8065,7 +8312,11 @@ class TestAgentTestRunnerSourceParity:
         table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
         # Exclude commands with unquoted ternary args that are already in the table
         # (e.g., 'bash scripts/test-backend.sh' is a blueprint-internal case)
-        region_commands = {cmd for cmd in region_commands if cmd in table_commands or not cmd.startswith('bash')}
+        region_commands = {
+            cmd
+            for cmd in region_commands
+            if cmd in table_commands or not cmd.startswith("bash")
+        }
         orphans = sorted(region_commands - table_commands)
         assert not orphans, (
             "agent/src/utils/test-runners.ts emits root-level core family command(s) "
@@ -8211,7 +8462,10 @@ class TestAgentTestRunnerSourceParity:
             "agent/src/utils/test-runners.ts classifySetupFailure must define a "
             "missingToolPatterns set of line-anchored regexes."
         )
-        assert "trimmedLines.some(line => missingToolPatterns.some(pattern => pattern.test(line)))" in region, (
+        assert (
+            "trimmedLines.some(line => missingToolPatterns.some(pattern => pattern.test(line)))"
+            in region
+        ), (
             "agent/src/utils/test-runners.ts classifySetupFailure must test "
             "missingToolPatterns per line, not against the whole output."
         )
@@ -8270,7 +8524,10 @@ class TestAgentTestRunnerSourceParity:
         # least one must be present). The substrings are the line-anchored,
         # non-zero-guarded signatures the guard uses for that family.
         required_signatures = [
-            ("pytest collection/import/conftest `1 error` summary", [r"[1-9]\d*\s+errors?"]),
+            (
+                "pytest collection/import/conftest `1 error` summary",
+                [r"[1-9]\d*\s+errors?"],
+            ),
             ("Go verbose per-test failure (--- FAIL:)", [r"^--- FAIL:"]),
             ("Go tab-separated package FAIL summary", [r"^FAIL\t"]),
             (".NET `Failed: N` (non-zero)", [r"Failed:\s+[1-9]"]),
@@ -8360,14 +8617,23 @@ class TestAgentTestRunnerSourceParity:
         # Per-family all-skip signatures: at least one candidate per family must
         # be present, covering the SAME family set as the real-failure guard.
         required_skip_signatures = [
-            ("pytest all-skipped/deselected", [r"[1-9]\d*\s+skipped", r"[1-9]\d*\s+deselected"]),
+            (
+                "pytest all-skipped/deselected",
+                [r"[1-9]\d*\s+skipped", r"[1-9]\d*\s+deselected"],
+            ),
             ("vitest all-skipped", [r"[1-9]\d*\s+skipped"]),
-            ("Rust all-ignored/filtered", [r"[1-9]\d*\s+ignored", r"[1-9]\d*\s+filtered out"]),
+            (
+                "Rust all-ignored/filtered",
+                [r"[1-9]\d*\s+ignored", r"[1-9]\d*\s+filtered out"],
+            ),
             ("Go verbose --- SKIP:", [r"--- SKIP:"]),
             ("Ruby/RSpec all-pending", [r"(\d+)\s+pending"]),
             ("Ruby/Minitest all-skips", [r"(\d+)\s+skips"]),
             ("Elixir/ExUnit all-excluded", [r"skipped|excluded"]),
-            ("Gradle/Maven Surefire Tests-run/Skipped", [r"Tests run:\s*(\d+)", r"Skipped:\s*(\d+)"]),
+            (
+                "Gradle/Maven Surefire Tests-run/Skipped",
+                [r"Tests run:\s*(\d+)", r"Skipped:\s*(\d+)"],
+            ),
             (".NET Total:/Skipped:", [r"Total:\s*(\d+)"]),
             ("PHPUnit Tests:/Skipped:", [r"Tests:\s*(\d+)"]),
         ]
@@ -8501,7 +8767,11 @@ class TestAgentTestRunnerParseHelpers:
         )
         region = _extract_setup_classifier_region(synthetic)
         assert "missingToolPatterns" in region
-        assert ".some(line => missingToolPatterns.some(pattern => pattern.test(line)))" in region
+        assert (
+            ".some(line => missingToolPatterns.some(pattern => pattern.test(line)))"
+            in region
+        )
+
 
 # ── No-CI UNVERIFIED-merge reason-label parity ────────────────────────────────
 # The orchestrator writes a stable reason KEY into
@@ -8765,8 +9035,10 @@ class TestSpawnResumeNeedSignalParity:
             (
                 "capability-no-marker",
                 {"kind": "capability", "ref": "auth"},
-                lambda: self._task(title="Build the auth foundation",
-                                   context={"related_files": ["backend/app/auth.py"]}),
+                lambda: self._task(
+                    title="Build the auth foundation",
+                    context={"related_files": ["backend/app/auth.py"]},
+                ),
                 False,
             ),
         ]
@@ -8777,9 +9049,7 @@ class TestSpawnResumeNeedSignalParity:
             # A BLOCKED dependent distinct from the foundation candidate.
             blocked = self._task()
             spawn_hit = resolve_prerequisite_task(need, [spawn_task]) is not None
-            resume_hit = (
-                resolve_blocked_need(blocked, need, [resume_task]) is not None
-            )
+            resume_hit = resolve_blocked_need(blocked, need, [resume_task]) is not None
             assert spawn_hit == resume_hit, (
                 f"spawn/resume need-signal parity broken for case '{label}': "
                 f"spawn matched={spawn_hit}, resume matched={resume_hit}. Both "

@@ -247,9 +247,7 @@ async def test_guard_no_child_tasks(db_session: AsyncSession):
     assert entry["research_spawn_gate_fail_open_count"] == 0
     assert entry["research_spawn_gate_unresolved_count"] == 1
     assert entry["research_spawn_gate_wholesale_retry_exhausted"] is True
-    assert entry["research_spawn_gate_refuted_reasons"] == [
-        "fail-closed: no verdict"
-    ]
+    assert entry["research_spawn_gate_refuted_reasons"] == ["fail-closed: no verdict"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3042,8 +3040,12 @@ async def test_update_outcomes_cost_provider_switch_retry_no_chimera(
     assert isinstance(by_pm, dict) and by_pm, "cost_by_provider_model must be populated"
 
     # (a) No cross-provider chimera keys
-    assert "anthropic|gpt-5.4" not in by_pm, "chimera key anthropic|gpt-5.4 must not appear"
-    assert "openai|claude-opus-4-7" not in by_pm, "chimera key openai|claude-opus-4-7 must not appear"
+    assert "anthropic|gpt-5.4" not in by_pm, (
+        "chimera key anthropic|gpt-5.4 must not appear"
+    )
+    assert "openai|claude-opus-4-7" not in by_pm, (
+        "chimera key openai|claude-opus-4-7 must not appear"
+    )
 
     # (b) Each attempt's own pair present
     assert "anthropic|claude-opus-4-7" in by_pm, "attempt-1 pair must appear"
@@ -3054,7 +3056,9 @@ async def test_update_outcomes_cost_provider_switch_retry_no_chimera(
     assert by_pm["openai|gpt-5.4"] == pytest.approx(attempt2_cost, abs=1e-4)
 
     # (e) Unresolvable half degrades to unknown|unknown
-    assert "unknown|unknown" in by_pm, "partial provider/model must degrade to unknown|unknown"
+    assert "unknown|unknown" in by_pm, (
+        "partial provider/model must degrade to unknown|unknown"
+    )
     assert "anthropic|unknown" not in by_pm, "half-resolved key must not appear"
 
     # (d) Bucket sum == estimated_cost_usd
@@ -3200,16 +3204,20 @@ def test_non_genuine_cancelled_excludes_new_markers():
     assert not _counts_as_failure(
         _cancelled_task({"failure_detail": "cap_exhausted_after_approve"})
     )
+    # Supersession churn cancellations are non-genuine too, even though they
+    # keep failure_category=AGENT_TIMEOUT for the infra bucket.
+    assert _is_non_genuine_cancelled(
+        _cancelled_task({"failure_detail": "superseded_by_review_pipeline"})
+    )
+    assert not _counts_as_failure(
+        _cancelled_task({"failure_detail": "superseded_by_review_pipeline"})
+    )
     # FIX H: REASSIGNED handoff (and the SCOPE_EMPTY no-op) lands CANCELLED.
     assert _is_non_genuine_cancelled(
         _cancelled_task({"failure_category": "REASSIGNED"})
     )
-    assert not _counts_as_failure(
-        _cancelled_task({"failure_category": "REASSIGNED"})
-    )
-    assert not _counts_as_failure(
-        _cancelled_task({"failure_category": "SCOPE_EMPTY"})
-    )
+    assert not _counts_as_failure(_cancelled_task({"failure_category": "REASSIGNED"}))
+    assert not _counts_as_failure(_cancelled_task({"failure_category": "SCOPE_EMPTY"}))
 
 
 def test_genuine_cancelled_and_failed_still_count():
@@ -5142,7 +5150,15 @@ async def _run_mix(db_session: AsyncSession, direction_id: str, mix: list[str]) 
     "mix",
     [
         # All distinct scenario kinds together.
-        ["proven", "consumed", "soft", "declared_unsat", "undeclared", "degraded", "readonly"],
+        [
+            "proven",
+            "consumed",
+            "soft",
+            "declared_unsat",
+            "undeclared",
+            "degraded",
+            "readonly",
+        ],
         # Proven-heavy.
         ["proven", "consumed", "proven", "soft"],
         # No proven at all (soft + undeclared + degraded).
@@ -5152,8 +5168,17 @@ async def _run_mix(db_session: AsyncSession, direction_id: str, mix: list[str]) 
         # Only declared-unsatisfied write merges.
         ["declared_unsat", "declared_unsat"],
         # Duplicated full mix to exercise larger counts.
-        ["proven", "proven", "soft", "soft", "declared_unsat", "undeclared",
-         "degraded", "readonly", "readonly"],
+        [
+            "proven",
+            "proven",
+            "soft",
+            "soft",
+            "declared_unsat",
+            "undeclared",
+            "degraded",
+            "readonly",
+            "readonly",
+        ],
     ],
 )
 @pytest.mark.asyncio
@@ -5257,7 +5282,9 @@ def test_acceptance_metric_invariant_violations_detects_drift():
     assert acceptance_metrics_consistent(clean) is True
 
     # proven drifts above declared.
-    assert acceptance_metric_invariant_violations({**clean, "acceptance_proven_merged": 3})
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_proven_merged": 3}
+    )
     # consumed drifts above proven.
     assert acceptance_metric_invariant_violations(
         {**clean, "acceptance_consumed_merged": 2, "acceptance_proven_merged": 1}
@@ -5303,15 +5330,18 @@ def test_acceptance_metric_invariants_fail_safe_on_legacy_entries():
     assert acceptance_metric_invariant_violations({"prs_merged": 5}) == []
     # Pre-denominator entry: coverage present but no merged-write count → the
     # identity check is skipped; only the [0,1] sanity bound applies.
-    assert acceptance_metric_invariant_violations(
-        {
-            "acceptance_proven_merged": 1,
-            "acceptance_declared_merged": 2,
-            "verified_prs_merged": 3,
-            "prs_merged": 4,
-            "acceptance_declaration_coverage": 0.5,
-        }
-    ) == []
+    assert (
+        acceptance_metric_invariant_violations(
+            {
+                "acceptance_proven_merged": 1,
+                "acceptance_declared_merged": 2,
+                "verified_prs_merged": 3,
+                "prs_merged": 4,
+                "acceptance_declaration_coverage": 0.5,
+            }
+        )
+        == []
+    )
     # A pre-denominator entry with an out-of-range coverage is still caught.
     assert acceptance_metric_invariant_violations(
         {"prs_merged": 4, "acceptance_declaration_coverage": 1.5}
@@ -5346,9 +5376,7 @@ async def test_unproven_merge_surfaced_to_research_feedback(
     # The delivered-but-unproven merge: declared acceptance evidence, NOT
     # satisfied. Carries a verdict reason that should be surfaced verbatim
     # (truncated to 120 chars).
-    long_reason = "named_test did not pass under the real merge verdict; " + (
-        "x" * 200
-    )
+    long_reason = "named_test did not pass under the real merge verdict; " + ("x" * 200)
     await _create_child_task(
         db_session,
         research_task.id,
@@ -5568,7 +5596,9 @@ async def test_spawn_gate_counts_and_rates_are_recorded(db_session: AsyncSession
         "research_spawn_gate_survived_count": 1,
     }
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     await _create_child_task(
@@ -5658,7 +5688,9 @@ async def test_spawn_gate_breakdown_and_reasons_roll_up(db_session: AsyncSession
         ],
     }
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     await _create_child_task(
@@ -5748,11 +5780,16 @@ async def test_spawn_gate_cause_flows_from_research_ctx_to_history(
         "direction_id": direction_id,
         "research_spawn_gate_challenged_count": 2,
         "research_spawn_gate_unresolved_count": 2,
-        "research_spawn_gate_cause": {"category": "AGENT_TIMEOUT", "detail": "timed out"},
+        "research_spawn_gate_cause": {
+            "category": "AGENT_TIMEOUT",
+            "detail": "timed out",
+        },
         "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 2},
     }
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=0)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=0)
+    ]
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -5764,7 +5801,10 @@ async def test_spawn_gate_cause_flows_from_research_ctx_to_history(
 
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
-    assert entry["research_spawn_gate_cause"] == {"category": "AGENT_TIMEOUT", "detail": "timed out"}
+    assert entry["research_spawn_gate_cause"] == {
+        "category": "AGENT_TIMEOUT",
+        "detail": "timed out",
+    }
     assert entry["research_spawn_gate_cause_counts"] == {"AGENT_TIMEOUT": 2}
 
     # Verify that absent cause keys do not appear in the entry.
@@ -5789,9 +5829,7 @@ async def test_spawn_gate_cause_flows_from_research_ctx_to_history(
 
     await db_session.refresh(project)
     entry2 = next(
-        d["research_history"][0]
-        for d in project.directions
-        if d["id"] == direction_id2
+        d["research_history"][0] for d in project.directions if d["id"] == direction_id2
     )
     assert "research_spawn_gate_cause" not in entry2
     assert "research_spawn_gate_cause_counts" not in entry2
@@ -5849,7 +5887,9 @@ async def test_adversarial_give_up_count_rolls_up_to_spawn_gate_metrics(
         },
     }
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     await _create_child_task(
@@ -5886,3 +5926,637 @@ async def test_adversarial_give_up_count_rolls_up_to_spawn_gate_metrics(
     # Give-up count is a separate bucket — legacy refuted/survived counters unchanged.
     assert entry["research_spawn_gate_refuted_count"] == 0
     assert entry["research_spawn_gate_survived_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_scoped_to_owning_direction(db_session: AsyncSession):
+    """Per-direction gate data is not smeared across sibling directions.
+
+    When research_spawn_gate_by_direction is present, direction B's history entry
+    must only carry gate counters from B's own per-direction entry, not the totals
+    that belong to direction A.
+    """
+    direction_a = "d-sg-dir-a"
+    direction_b = "d-sg-dir-b"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    # Direction A had 3 challenges; direction B had none.
+    research_task.context = {
+        "direction_id": direction_a,
+        "research_spawn_gate_challenged_count": 3,
+        "research_spawn_gate_refuted_count": 2,
+        "research_spawn_gate_survived_count": 1,
+        "research_spawn_gate_wholesale_retry_exhausted": True,
+        "research_spawn_gate_by_direction": {
+            direction_a: {
+                "challenged_count": 3,
+                "refuted_count": 2,
+                "survived_count": 1,
+                "explicit_pass_count": 0,
+                "fail_open_count": 1,
+                "unresolved_count": 1,
+                "wholesale_retry_exhausted": True,
+            },
+            direction_b: {},
+        },
+    }
+    project.directions = [
+        _make_direction(direction_a, research_task_id, tasks_created=1),
+        _make_direction(direction_b, research_task_id, tasks_created=0),
+    ]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_b,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry_b = next(
+        d["research_history"][0] for d in project.directions if d["id"] == direction_b
+    )
+    # Direction B's entry must reflect B's own (zero) gate activity, not A's.
+    assert entry_b["research_spawn_gate_challenged_count"] == 0
+    assert entry_b["research_spawn_gate_refuted_count"] == 0
+    assert entry_b["research_spawn_gate_survived_count"] == 0
+    assert entry_b["research_spawn_gate_wholesale_retry_exhausted"] is False
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_missing_direction_entry_stays_zero(
+    db_session: AsyncSession,
+):
+    """A missing per-direction entry must not fall back to sibling globals."""
+    direction_a = "d-sg-dir-a"
+    direction_b = "d-sg-dir-b"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_a,
+        "research_spawn_gate_challenged_count": 3,
+        "research_spawn_gate_refuted_count": 2,
+        "research_spawn_gate_survived_count": 1,
+        "research_spawn_gate_wholesale_retry_exhausted": True,
+        "research_spawn_gate_by_direction": {
+            direction_a: {
+                "challenged_count": 3,
+                "refuted_count": 2,
+                "survived_count": 1,
+                "explicit_pass_count": 0,
+                "fail_open_count": 1,
+                "unresolved_count": 1,
+                "wholesale_retry_exhausted": True,
+            }
+        },
+    }
+    project.directions = [
+        _make_direction(direction_a, research_task_id, tasks_created=1),
+        _make_direction(direction_b, research_task_id, tasks_created=0),
+    ]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_b,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry_b = next(
+        d["research_history"][0] for d in project.directions if d["id"] == direction_b
+    )
+    assert entry_b["research_spawn_gate_challenged_count"] == 0
+    assert entry_b["research_spawn_gate_refuted_count"] == 0
+    assert entry_b["research_spawn_gate_survived_count"] == 0
+    assert entry_b["research_spawn_gate_explicit_pass_count"] == 0
+    assert entry_b["research_spawn_gate_fail_open_count"] == 0
+    assert entry_b["research_spawn_gate_unresolved_count"] == 0
+    assert entry_b["research_spawn_gate_wholesale_retry_exhausted"] is False
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_exhausted_flag_cleared_on_healthy_pass(
+    db_session: AsyncSession,
+):
+    """Per-direction wholesale_retry_exhausted overrides the sticky global flag.
+
+    The global context flag is set on exhaustion and never cleared, so a later
+    healthy-gate cycle still reports exhausted=True globally.  When the per-direction
+    entry says False, the direction's history entry must record False.
+    """
+    direction_id = "d-sg-exhausted-cleared"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    # Global flag is still True (from an earlier cycle), but this direction's
+    # per-direction entry reflects a healthy pass.
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_wholesale_retry_exhausted": True,
+        "research_spawn_gate_parse_outcome": "ok",
+        "research_spawn_gate_by_direction": {
+            direction_id: {
+                "challenged_count": 2,
+                "refuted_count": 0,
+                "survived_count": 2,
+                "explicit_pass_count": 2,
+                "fail_open_count": 0,
+                "unresolved_count": 0,
+                "wholesale_retry_exhausted": False,
+                "parse_outcome": "ok",
+            },
+        },
+    }
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=0)
+    ]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["research_spawn_gate_wholesale_retry_exhausted"] is False
+    assert entry["research_spawn_gate_challenged_count"] == 2
+    assert entry["research_spawn_gate_survived_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_challenged_spawned_filtered_by_direction(
+    db_session: AsyncSession,
+):
+    """challenged_spawned / unchallenged_spawned are scoped to the owning direction.
+
+    Two directions share a research task; each has child tasks tagged with their own
+    direction_id. The challenged_spawned and unchallenged_spawned counts for each
+    direction must only count that direction's children, not the combined total.
+    """
+    direction_a = "d-sg-spawn-a"
+    direction_b = "d-sg-spawn-b"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "direction_id": direction_a,
+        "research_spawn_gate_by_direction": {
+            direction_a: {
+                "challenged_count": 2,
+                "refuted_count": 0,
+                "survived_count": 2,
+                "explicit_pass_count": 2,
+                "fail_open_count": 0,
+                "unresolved_count": 0,
+                "wholesale_retry_exhausted": False,
+            },
+            direction_b: {
+                "challenged_count": 1,
+                "refuted_count": 1,
+                "survived_count": 0,
+                "explicit_pass_count": 0,
+                "fail_open_count": 0,
+                "unresolved_count": 1,
+                "wholesale_retry_exhausted": False,
+            },
+        },
+    }
+    project.directions = [
+        _make_direction(direction_a, research_task_id, tasks_created=3),
+        _make_direction(direction_b, research_task_id, tasks_created=2),
+    ]
+    await db_session.flush()
+
+    # Direction A: 2 challenged children, 1 unchallenged child.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="a-challenged-1",
+        context={
+            "direction_id": direction_a,
+            "research_spawn_gate_challenged": True,
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="a-challenged-2",
+        context={"direction_id": direction_a, "research_spawn_gate_challenged": True},
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="a-unchallenged",
+        context={"direction_id": direction_a, "research_spawn_gate_challenged": False},
+    )
+    # Direction B: 1 challenged child, 1 unchallenged child.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="b-challenged",
+        context={"direction_id": direction_b, "research_spawn_gate_challenged": True},
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="b-unchallenged",
+        context={"direction_id": direction_b, "research_spawn_gate_challenged": False},
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_a,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry_a = next(
+        d["research_history"][0] for d in project.directions if d["id"] == direction_a
+    )
+    # Direction A should only count its own children.
+    assert entry_a["research_spawn_gate_challenged_spawned"] == 2
+    assert entry_a["research_spawn_gate_unchallenged_spawned"] == 1
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_b,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry_b = next(
+        d["research_history"][0] for d in project.directions if d["id"] == direction_b
+    )
+    # Direction B should only count its own children.
+    assert entry_b["research_spawn_gate_challenged_spawned"] == 1
+    assert entry_b["research_spawn_gate_unchallenged_spawned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_fallback_when_no_by_direction_key(db_session: AsyncSession):
+    """Global spawn-gate counters are used when research_spawn_gate_by_direction is absent.
+
+    This covers pre-fix cycles (where the per-direction dict was never written) and
+    standalone research tasks that serve only one direction.  The global fallback must
+    preserve the existing behavior so these older history entries remain valid.
+    """
+    direction_id = "d-sg-fallback"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    # No research_spawn_gate_by_direction key — only the global counters.
+    research_task.context = {
+        "direction_id": direction_id,
+        "research_spawn_gate_challenged_count": 4,
+        "research_spawn_gate_refuted_count": 1,
+        "research_spawn_gate_survived_count": 3,
+        "research_spawn_gate_explicit_pass_count": 2,
+        "research_spawn_gate_fail_open_count": 1,
+        "research_spawn_gate_unresolved_count": 0,
+        "research_spawn_gate_wholesale_retry_exhausted": False,
+        "research_spawn_gate_refuted_reasons": ["plausible but unverified"],
+    }
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=0)
+    ]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Global counters must be forwarded unchanged via the fallback path.
+    assert entry["research_spawn_gate_challenged_count"] == 4
+    assert entry["research_spawn_gate_refuted_count"] == 1
+    assert entry["research_spawn_gate_survived_count"] == 3
+    assert entry["research_spawn_gate_explicit_pass_count"] == 2
+    assert entry["research_spawn_gate_fail_open_count"] == 1
+    assert entry["research_spawn_gate_unresolved_count"] == 0
+    assert entry["research_spawn_gate_wholesale_retry_exhausted"] is False
+    assert entry["research_spawn_gate_refuted_reasons"] == ["plausible but unverified"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-direction cycle outcome scoping
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_multi_direction_cycle_outcomes_scoped_to_own_direction(
+    db_session: AsyncSession,
+):
+    """Per-direction outcome stats must not smear across sibling directions.
+
+    Two directions share a single research task. Direction A has 2 merged children
+    and 1 failed child; direction B has 1 merged child and 1 cancelled child. After
+    running the updater for each direction, each entry must reflect only its own
+    children for prs_merged, tasks_completed, tasks_failed, tasks_cancelled,
+    type_breakdown, and scope_breakdown.
+    """
+    direction_a = "d-scope-a"
+    direction_b = "d-scope-b"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_a, research_task_id, tasks_created=3),
+        _make_direction(direction_b, research_task_id, tasks_created=2),
+    ]
+    await db_session.flush()
+
+    # Direction A children: 2 merged, 1 failed
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="a-merged-1",
+        context={
+            "direction_id": direction_a,
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "scope": "small",
+        },
+        payloads=[{"type": "fix", "scope": "small"}],
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="a-merged-2",
+        context={
+            "direction_id": direction_a,
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "scope": "medium",
+        },
+        payloads=[{"type": "create", "scope": "medium"}],
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        title="a-failed-1",
+        context={"direction_id": direction_a, "scope": "small"},
+        payloads=[{"type": "fix", "scope": "small"}],
+    )
+    # Direction B children: 1 merged, 1 cancelled
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="b-merged-1",
+        context={
+            "direction_id": direction_b,
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "scope": "large",
+        },
+        payloads=[{"type": "fix", "scope": "large"}],
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        title="b-cancelled-1",
+        context={"direction_id": direction_b, "scope": "large"},
+        payloads=[{"type": "fix", "scope": "large"}],
+    )
+    await db_session.flush()
+
+    # Run updater for direction A
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_a,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry_a = next(
+        d["research_history"][0] for d in project.directions if d["id"] == direction_a
+    )
+
+    # Direction A: 3 children (2 completed, 1 failed), 2 merged
+    assert entry_a["prs_merged"] == 2, (
+        f"direction A prs_merged: {entry_a['prs_merged']}"
+    )
+    assert entry_a["tasks_completed"] == 2
+    assert entry_a["tasks_failed"] == 1
+    assert entry_a["tasks_cancelled"] == 0
+
+    # type_breakdown must only reflect direction A task types (fix x2, create x1)
+    tb_a = entry_a.get("type_breakdown", {})
+    assert "fix" in tb_a
+    assert tb_a["fix"]["created"] == 2
+    assert "create" in tb_a
+    assert tb_a["create"]["created"] == 1
+    # Direction B's "large" scope children must NOT appear in direction A
+    sb_a = entry_a.get("scope_breakdown", {})
+    assert sb_a.get("large", {}).get("created", 0) == 0
+
+    # Run updater for direction B
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_b,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry_b = next(
+        d["research_history"][0] for d in project.directions if d["id"] == direction_b
+    )
+
+    # Direction B: 2 children (1 completed, 0 failed, 1 cancelled), 1 merged
+    assert entry_b["prs_merged"] == 1, (
+        f"direction B prs_merged: {entry_b['prs_merged']}"
+    )
+    assert entry_b["tasks_completed"] == 1
+    assert entry_b["tasks_failed"] == 0
+    assert entry_b["tasks_cancelled"] == 1
+
+    # Direction A's "small"/"medium" scope children must NOT appear in direction B
+    sb_b = entry_b.get("scope_breakdown", {})
+    assert sb_b.get("small", {}).get("created", 0) == 0
+    assert sb_b.get("medium", {}).get("created", 0) == 0
+    assert sb_b.get("large", {}).get("created", 0) == 2
+
+
+@pytest.mark.asyncio
+async def test_multi_direction_cycle_legacy_fallback(db_session: AsyncSession):
+    """When no child has direction_id set, all children are attributed to the direction.
+
+    This covers legacy single-direction cycles where children were spawned before
+    the direction_id context key was introduced. Both directions see the same combined
+    totals (the pre-fix behavior), ensuring existing history entries remain valid.
+    """
+    direction_id = "d-legacy"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # Children with NO direction_id in context (legacy)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="legacy-merged",
+        context={"pr_merged": True, "landed_on_integration": True},
+        payloads=[{"type": "fix", "scope": "small"}],
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="legacy-no-pr",
+        context={},
+        payloads=[{"type": "fix", "scope": "small"}],
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        title="legacy-failed",
+        context={},
+        payloads=[{"type": "fix", "scope": "small"}],
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # All 3 children must be counted (legacy fallback: no direction_id filtering)
+    assert entry["prs_merged"] == 1
+    assert entry["tasks_completed"] == 2
+    assert entry["tasks_failed"] == 1
+    assert entry["tasks_cancelled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_scope_breakdown_skips_ineligible_task_types(db_session: AsyncSession):
+    """scope_breakdown excludes web_research, design, and compute_experiment children.
+
+    These types can never open a PR, so they must not inflate the scope
+    conversion denominator.  type_breakdown (used by pr_ineligible_created_in_entry)
+    still records them correctly — only the scope buckets are excluded.
+    """
+    direction_id = "d-ineligible"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=5)
+    ]
+    await db_session.flush()
+
+    # One merged create task at scope=medium (PR-eligible)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "medium", "direction_id": direction_id},
+        payloads=[{"type": "create"}],
+        title="eligible-merged",
+    )
+    # One web_research child at scope=medium (never opens a PR)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"scope": "medium", "direction_id": direction_id},
+        payloads=[{"type": "web_research"}],
+        title="knowledge-web",
+    )
+    # One design child at scope=small (never opens a PR)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "small", "direction_id": direction_id},
+        payloads=[{"type": "design"}],
+        title="knowledge-design",
+    )
+    # One compute_experiment child at scope=medium (never opens a PR)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"scope": "medium", "direction_id": direction_id},
+        payloads=[{"type": "compute_experiment"}],
+        title="compute-exp",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    sb = entry["scope_breakdown"]
+    tb = entry["type_breakdown"]
+
+    # scope_breakdown must only reflect the PR-eligible create task
+    assert sb["medium"]["created"] == 1, (
+        "only the create task counts in scope_breakdown"
+    )
+    assert sb["medium"]["merged"] == 1
+    assert "small" not in sb, "design (ineligible) must not create a small bucket"
+
+    # type_breakdown still tracks all types (used by pr_ineligible_created_in_entry)
+    assert tb["create"]["created"] == 1
+    assert tb["web_research"]["created"] == 1
+    assert tb["design"]["created"] == 1
+    assert tb["compute_experiment"]["created"] == 1

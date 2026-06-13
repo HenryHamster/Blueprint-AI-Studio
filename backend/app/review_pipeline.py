@@ -8,9 +8,11 @@ or app.task_lifecycle.
 """
 
 import logging
+import os
 import re
 import uuid
 from datetime import timedelta
+from typing import Any, Callable, Iterable
 
 from sqlalchemy import func
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -59,6 +61,7 @@ from app.review_heuristics import (  # noqa: F401
     LANE_CI,
     LANE_CONFLICT,
     LANE_REVIEW_CONVERGENCE,
+    PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
@@ -103,6 +106,7 @@ from app.review_loop_convergence import (
     _CHURN_NARROW_FOCUS_PREFIX,
     _EARLY_REPEATING_ISSUES_PREFIX,
     _handle_cap_exhaustion,
+    _handle_persistent_conflict_escalation,
     _MID_BUDGET_NARROW_FOCUS_PREFIX,
     _SCOPE_PRESSURE_HARD_CAP_PREFIX,
     _is_pipeline_task_stale,
@@ -110,6 +114,13 @@ from app.review_loop_convergence import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_REVIEW_SUPERSEDE_CHURN_COUNT_KEY = "_review_supersede_churn_count"
+_REVIEW_SUPERSEDE_CHURN_LAST_KEY = "_review_supersede_churn_last"
+_REVIEW_SUPERSEDE_CHURN_LIMIT = max(
+    1, int(os.getenv("REVIEW_SUPERSEDE_CHURN_LIMIT", "3"))
+)
 
 
 # Goal framing for review-fix tasks: the cited issues are necessary
@@ -247,7 +258,18 @@ def _is_verification_only_rejection(
 # APPROVE." A blank/unknown severity is deliberately NOT in this set: an
 # unclassified issue cannot be PROVEN non-blocking, so it keeps blocking.
 _NON_BLOCKING_SEVERITIES = frozenset(
-    {"MINOR", "NIT", "NITPICK", "LOW", "INFO", "INFORMATIONAL", "TRIVIAL", "STYLE", "SUGGESTION", "NONE"}
+    {
+        "MINOR",
+        "NIT",
+        "NITPICK",
+        "LOW",
+        "INFO",
+        "INFORMATIONAL",
+        "TRIVIAL",
+        "STYLE",
+        "SUGGESTION",
+        "NONE",
+    }
 )
 
 
@@ -497,6 +519,7 @@ def _is_rollup_chain_source(source_task: "Task") -> bool:
             return True
     return False
 
+
 # Phase 2c (warm-VM continuity): how long after a source task's last heartbeat
 # (or its completion) the warm-VM pin is honored on the spawned task. After
 # this window the orchestrator's provisioning loop clears the pin and
@@ -504,7 +527,6 @@ def _is_rollup_chain_source(source_task: "Task") -> bool:
 # (agent finishing prior role + a few VM-heartbeat ticks during the next-role
 # poll) without keeping a stale pin alive long enough to mask a dead VM.
 WARM_HANDOFF_WINDOW_SECS = 240
-
 
 
 def _max_review_iterations(task: Task, direction_data: dict | None = None) -> int:
@@ -584,6 +606,9 @@ SPAWN_REASON_KEY = "_last_pipeline_spawn_reason"
 SPAWN_REASON_SPAWNED = "spawned"
 SPAWN_REASON_DEDUP = "dedup_same_type"
 SPAWN_REASON_ALREADY_MERGED = "already_merged"
+# PR was closed without merging — distinct from already_merged so callers can
+# log accurately (a closed-unmerged PR is NOT the same as a mid-flight merge).
+SPAWN_REASON_PR_CLOSED_UNMERGED = "pr_closed_unmerged"
 SPAWN_REASON_DEFERRED = "deferred_cross_type"
 SPAWN_REASON_CAP = "cap_exhausted"
 SPAWN_REASON_STUCK = "stuck_cycle"
@@ -592,12 +617,23 @@ SPAWN_REASON_STUCK = "stuck_cycle"
 # disclosure) and was escalated to the operator at iteration K rather than
 # grinding to the full cap. Distinct from stuck_cycle (same issue re-raised).
 SPAWN_REASON_NONCONVERGENCE = "early_nonconvergence"
+# Consecutive supersession cancellations on one PR chain crossed the churn
+# bound, so the pipeline stopped respawning and escalated the driver task.
+SPAWN_REASON_SUPERSEDE_CHURN = "supersession_churn_halt"
 # Two consecutive same-type pipeline tasks failed with an identical failure
 # fingerprint — the agent's code edits aren't moving the failure shape, which
 # is the signature of a precondition gap (missing system lib, baseline lint
 # debt, toolchain layer) rather than a code defect. Halt the chain and let
 # the strategic agent (or operator) decide whether to spawn an infra fix.
 SPAWN_REASON_BLOCKED_REPEAT = "blocked_repeat_fingerprint"
+# A lane-arm review boundary found the lane checkpoint missing/unverifiable and,
+# while still under the requeue budget, suppressed the cold review and requeued
+# the failed phase as a lane-aware recovery task (see _handle_lane_checkpoint_recovery).
+SPAWN_REASON_LANE_RECOVERY = "lane_checkpoint_recovery"
+# The conflict-fix lane accumulated enough consecutive completions without
+# resolving the merge conflict that further attempts are unlikely to succeed.
+# Escalated to the operator before the lane sub-cap fires.
+SPAWN_REASON_PERSISTENT_CONFLICT = "persistent_conflict"
 
 # Grace window for the mid-retry defer: when a same-PR fix is FAILED/CANCELLED
 # with an infra failure_category and the failure is younger than this many minutes,
@@ -1233,7 +1269,9 @@ async def _check_fix_mid_retry_defer(
             )
             type_match = func.json_extract(Task.payloads, "$[0].type") == "fix"
         else:
-            pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
+            pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(
+                pr_number
+            )
             type_match = Task.payloads[0]["type"].as_string() == "fix"
 
         candidates = (
@@ -1263,9 +1301,10 @@ async def _check_fix_mid_retry_defer(
         )
         for t in candidates:
             fp = t.first_payload
-            if not is_rollup_source and (
-                fp.get("original_task_id") or ""
-            ) != resolved_original_id:
+            if (
+                not is_rollup_source
+                and (fp.get("original_task_id") or "") != resolved_original_id
+            ):
                 continue
             ctx = t.context or {}
             fc = ctx.get("failure_category")
@@ -1280,7 +1319,10 @@ async def _check_fix_mid_retry_defer(
                 if int(ctx.get("_resurrection_count", 0)) >= 1:
                     continue
             else:
-                if int(ctx.get("_blocked_optimistic_retries", 0)) >= _BLOCKED_OPTIMISTIC_RETRY_CAP:
+                if (
+                    int(ctx.get("_blocked_optimistic_retries", 0))
+                    >= _BLOCKED_OPTIMISTIC_RETRY_CAP
+                ):
                     continue
             return True
     except Exception:
@@ -1333,6 +1375,211 @@ def task_counts_toward_review_cap(task: Task) -> bool:
     if (task.context or {}).get("_review_stale_head"):
         return False
     return True
+
+
+def _recent_consecutive_lane_count(
+    tasks: Iterable[Task],
+    target_lane: str,
+    counts_toward_cap: Callable[[Task], bool] = task_counts_toward_review_cap,
+) -> int:
+    """Count the newest uninterrupted segment of cap-counting tasks in one lane."""
+
+    count = 0
+    sorted_tasks = sorted(
+        tasks,
+        key=lambda task: (
+            task.created_at.timestamp() if task.created_at is not None else 0.0
+        ),
+        reverse=True,
+    )
+    for task in sorted_tasks:
+        if not counts_toward_cap(task):
+            continue
+        if classify_iteration_lane(task) != target_lane:
+            break
+        count += 1
+    return count
+
+
+def _review_supersede_churn_count(task: Task | None) -> int:
+    """Consecutive same-PR supersession cancellations carried on the chain root."""
+    try:
+        return int((task.context or {}).get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+def _review_supersede_churn_snapshot(
+    task: Task,
+    *,
+    task_type: str,
+    pr_number: int,
+    reason: str,
+) -> dict[str, object]:
+    """Capture the last superseded task's diagnostics for escalation context."""
+    snapshot: dict[str, object] = {
+        "task_id": str(task.id),
+        "task_type": task_type,
+        "reason": reason,
+        "status": task.status,
+    }
+    if task.latest_status_message:
+        snapshot["latest_status_message"] = task.latest_status_message
+    if task.started_at is not None:
+        snapshot["started_at"] = task.started_at.isoformat()
+    if task.last_heartbeat is not None:
+        snapshot["last_heartbeat"] = task.last_heartbeat.isoformat()
+    snapshot["pr_number"] = pr_number
+    return snapshot
+
+
+async def _handle_lane_checkpoint_recovery(
+    session: AsyncSession,
+    *,
+    source_task: Task,
+    lane: Any,
+    pr_number: int,
+    branch: str,
+    base_branch: str,
+    resolved_original_id: str,
+    propagated_ctx: dict,
+    parent_id: uuid.UUID | None,
+    inherited_priority: Any,
+) -> tuple[Task | None, bool]:
+    """Bounded recovery for a lane checkpoint that went missing at a review boundary.
+
+    Replaces the old silent "spawn the cold review anyway" behavior on a
+    checkpoint miss that is still under the requeue budget: suppress the review
+    and spawn a lane-aware retry of the failed phase carrying ONLY durable chain
+    metadata (lane chain id, arm assignment, PR/branch/review_loop state, and the
+    recovery reason). It deliberately carries NO stale warm-handoff pin, lane
+    checkpoint SHA, or lane-reserved VM directive — the warm workspace could not
+    be trusted, so the recovery runs cold from a fresh clone. The active lane is
+    rebound to the recovery task so chain continuity and the operator view follow
+    the retry. Returns ``(recovery_task, True)``; the caller treats a truthy task
+    as "the chain advanced" (not an iteration-cap escalation).
+
+    The exhausted-budget case is handled upstream by ``checkpoint_or_recover_phase``
+    (lane CAS to KILLED + reservation release) and is NOT routed here — an
+    exhausted lane falls back to a classic cold review.
+    """
+    from app.review_fix_lane_pilot import (
+        LANE_CHAIN_ID_KEY,
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_RECOVERY_ATTEMPT_KEY,
+        LANE_RECOVERY_REASON_KEY,
+        rebind_lane_to_recovery,
+        strip_transient_lane_context,
+    )
+
+    attempt = (lane.phase_requeues or 0) if lane is not None else 0
+
+    # Durable-only recovery context: carry the chain's review_loop (PR/branch/
+    # iteration/original_task_id), the intent-to-treat arm, and the chain lane id,
+    # then defensively strip any transient lane dispatch directive so no stale
+    # checkpoint SHA / lane-reserved VM directive can ride the recovery task.
+    recovery_ctx: dict[str, Any] = {}
+    for key in ("review_loop", LANE_PILOT_ASSIGNMENT_KEY, LANE_CHAIN_ID_KEY):
+        if propagated_ctx.get(key) is not None:
+            recovery_ctx[key] = propagated_ctx[key]
+    strip_transient_lane_context(recovery_ctx)
+    recovery_ctx[LANE_RECOVERY_REASON_KEY] = "checkpoint_missing"
+    recovery_ctx[LANE_RECOVERY_ATTEMPT_KEY] = attempt
+
+    recovery_prompt = (
+        f"Lane checkpoint recovery for PR #{pr_number}. The prior phase completed "
+        f"but its lane checkpoint could not be verified on branch {branch}, so the "
+        f"warm lane workspace cannot be trusted. Starting from a FRESH clone of "
+        f"{branch} (assume no local workspace state), re-verify the work on this "
+        f"PR, address any outstanding review feedback carried in context, and push "
+        f"your changes so the review re-runs against a verifiable head."
+    )
+    recovery_payload = validate_internal_payload(
+        {
+            "type": "fix",
+            "pr_number": pr_number,
+            "branch": branch,
+            "base_branch": base_branch,
+            "prompt": recovery_prompt,
+            "original_task_id": resolved_original_id,
+        },
+        "lane_checkpoint_recovery",
+    )
+    # Dedup per requeue attempt: a second review-boundary entry for the same
+    # missing checkpoint maps to the same key, so the active-idempotency index
+    # prevents a duplicate recovery for the same attempt.
+    idempotency_key = _pipeline_task_idempotency_key(
+        project_id=source_task.project_id,
+        task_type="lane_recovery",
+        pr_number=pr_number,
+        original_task_id=resolved_original_id,
+        iteration=attempt,
+        is_rollup=False,
+    )
+    recovery_task = Task(
+        project_id=source_task.project_id,
+        title=f"Lane checkpoint recovery PR #{pr_number}",
+        description=recovery_prompt,
+        parent_task_id=parent_id,
+        priority=inherited_priority,
+        payloads=[recovery_payload],
+        context=recovery_ctx,
+        idempotency_key=idempotency_key,
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(recovery_task)
+    await session.flush()  # assign recovery_task.id for the lane rebind
+    await rebind_lane_to_recovery(
+        session, lane, task_id=recovery_task.id, reason="checkpoint_missing"
+    )
+    source_task.latest_status_message = (
+        f"Lane checkpoint missing for PR #{pr_number} — review suppressed; "
+        f"requeued failed phase as recovery task {str(recovery_task.id)[:8]} "
+        f"(attempt {attempt})"
+    )
+    _set_spawn_reason(source_task, SPAWN_REASON_LANE_RECOVERY)
+    session.add(source_task)
+    session.add(
+        TaskHistory(
+            task_id=recovery_task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "REVIEW_PIPELINE",
+                "type": "lane_checkpoint_recovery",
+                "pr_number": pr_number,
+                "attempt": attempt,
+            },
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        # A concurrent recovery for the same attempt already exists (idempotency
+        # collision). Roll back and treat as a benign dedup — the sibling
+        # recovery drives the chain.
+        await session.rollback()
+        logger.warning(
+            "[PIPELINE] lane recovery for PR #%s hit idempotency key; "
+            "sibling recovery already active",
+            pr_number,
+        )
+        return (None, False)
+    await session.refresh(recovery_task)
+    await broadcast_to_project(
+        str(source_task.project_id),
+        "task_updated",
+        {"task_id": str(recovery_task.id), "status": TaskStatus.QUEUED},
+    )
+    logger.info(
+        "[PIPELINE] lane checkpoint recovery: requeued failed phase for PR #%s "
+        "as task %s (attempt %d); cold review suppressed",
+        pr_number,
+        recovery_task.id,
+        attempt,
+    )
+    return (recovery_task, True)
 
 
 async def _spawn_pipeline_task(
@@ -1415,6 +1662,7 @@ async def _spawn_pipeline_task(
     )
 
     # Guard: don't spawn if PR is already merged (check both original and source).
+    orig_task: Task | None = None
     try:
         orig_task = await session.get(Task, uuid.UUID(resolved_original_id))
         if orig_task and (orig_task.context or {}).get("pr_merged"):
@@ -1452,7 +1700,9 @@ async def _spawn_pipeline_task(
 
                 await _retire_lane(session, source_task.context or {})
             except Exception:  # noqa: BLE001
-                logger.debug("[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True)
+                logger.debug(
+                    "[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True
+                )
             return (None, False)
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -1470,7 +1720,31 @@ async def _spawn_pipeline_task(
 
             await _retire_lane(session, source_task.context or {})
         except Exception:  # noqa: BLE001
-            logger.debug("[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True)
+            logger.debug(
+                "[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True
+            )
+        return (None, False)
+
+    # Guard: don't spawn if PR was closed without merge.
+    _pr_closed = (orig_task is not None and (orig_task.context or {}).get("pr_closed_unmerged")) or (
+        (source_task.context or {}).get("pr_closed_unmerged")
+    )
+    if _pr_closed:
+        logger.info(
+            f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR closed without merge"
+        )
+        source_task.latest_status_message = (
+            f"PR #{pr_number} closed without merge — skipping {task_type}"
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_PR_CLOSED_UNMERGED)
+        session.add(source_task)
+        # Retire the chain's lane row so it reaches a terminal state promptly.
+        try:
+            from app.review_fix_lane_pilot import retire_chain_lane as _retire_lane
+
+            await _retire_lane(session, source_task.context or {})
+        except Exception:  # noqa: BLE001
+            logger.debug("[PIPELINE] retire_chain_lane (pr_closed_unmerged) failed (non-critical)", exc_info=True)
         return (None, False)
 
     # ── verify_tests fast-path ──────────────────────────────────────────────
@@ -1491,6 +1765,23 @@ async def _spawn_pipeline_task(
             original_task_id=resolved_original_id,
             attempt=attempt,
         )
+
+    supersede_churn_count = _review_supersede_churn_count(orig_task)
+    if source_task.status in (
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ) and task_counts_toward_review_cap(source_task):
+        supersede_churn_count = 0
+        if orig_task is not None:
+            from sqlalchemy.orm.attributes import flag_modified
+
+            orig_ctx = dict(orig_task.context or {})
+            orig_ctx.pop(_REVIEW_SUPERSEDE_CHURN_LAST_KEY, None)
+            orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = 0
+            orig_task.context = orig_ctx
+            flag_modified(orig_task, "context")
+            session.add(orig_task)
 
     # Dedup guard for active pipeline tasks on this PR/chain. The match axes are
     # (pr_number, chain, task_type, liveness):
@@ -1514,6 +1805,7 @@ async def _spawn_pipeline_task(
     # double-spawn review/fix for the shared PR.
     is_rollup_source = _is_rollup_chain_source(source_task)
     superseded_stale_task = False
+    supersede_churn_last_snapshot: dict[str, object] | None = None
     active_pipeline = (
         (
             await session.execute(
@@ -1551,15 +1843,39 @@ async def _spawn_pipeline_task(
                 AGENT_TIMEOUT,
                 persist_failure_category,
             )
+            from sqlalchemy.orm.attributes import flag_modified
 
+            t_ctx = dict(t.context or {})
+            t_ctx["failure_detail"] = "superseded_by_review_pipeline"
+            t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = {
+                **_review_supersede_churn_snapshot(
+                    t, task_type=t_type, pr_number=pr_number, reason="stale"
+                ),
+                "supersession_kind": "stale",
+            }
+            t.context = t_ctx
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
                 f"Superseded by new {task_type} for PR #{pr_number}: "
                 f"no heartbeat for >{PIPELINE_TASK_STALE_MINUTES}min"
             )
             persist_failure_category(t, AGENT_TIMEOUT)
+            flag_modified(t, "context")
             session.add(t)
             superseded_stale_task = True
+            supersede_churn_last_snapshot = t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY]
+            if orig_task is not None:
+                orig_ctx = dict(orig_task.context or {})
+                supersede_churn_count = (
+                    int(orig_ctx.get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0) + 1
+                )
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = supersede_churn_count
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = (
+                    supersede_churn_last_snapshot
+                )
+                orig_task.context = orig_ctx
+                flag_modified(orig_task, "context")
+                session.add(orig_task)
             logger.warning(
                 f"[PIPELINE] Superseding stale {t_type} task {t.id} "
                 f"(last_heartbeat={t.last_heartbeat}, started_at={t.started_at}) "
@@ -1585,15 +1901,39 @@ async def _spawn_pipeline_task(
                 AGENT_TIMEOUT,
                 persist_failure_category,
             )
+            from sqlalchemy.orm.attributes import flag_modified
 
+            t_ctx = dict(t.context or {})
+            t_ctx["failure_detail"] = "superseded_by_review_pipeline"
+            t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = {
+                **_review_supersede_churn_snapshot(
+                    t, task_type=t_type, pr_number=pr_number, reason="fix"
+                ),
+                "supersession_kind": "fix_supersedes_review",
+            }
+            t.context = t_ctx
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
                 f"Superseded by fix on PR #{pr_number}: review was scoped to "
                 f"a pre-conflict / pre-CI-failure snapshot"
             )
             persist_failure_category(t, AGENT_TIMEOUT)
+            flag_modified(t, "context")
             session.add(t)
             superseded_stale_task = True
+            supersede_churn_last_snapshot = t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY]
+            if orig_task is not None:
+                orig_ctx = dict(orig_task.context or {})
+                supersede_churn_count = (
+                    int(orig_ctx.get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0) + 1
+                )
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = supersede_churn_count
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = (
+                    supersede_churn_last_snapshot
+                )
+                orig_task.context = orig_ctx
+                flag_modified(orig_task, "context")
+                session.add(orig_task)
             logger.warning(
                 f"[PIPELINE] Cancelling in-flight review {t.id} on PR #{pr_number} "
                 f"so fix can proceed (review snapshot is stale)"
@@ -1616,6 +1956,91 @@ async def _spawn_pipeline_task(
         # Release the active-idempotency partial index before inserting the
         # replacement task in the same transaction.
         await session.flush()
+
+    churn_limit = int(
+        _runtime_config.get(
+            "review_supersede_churn_limit", _REVIEW_SUPERSEDE_CHURN_LIMIT
+        )
+        or _REVIEW_SUPERSEDE_CHURN_LIMIT
+    )
+    if (
+        superseded_stale_task
+        and orig_task is not None
+        and supersede_churn_count >= churn_limit
+    ):
+        from app.alert_dispatch import _maybe_create_escalation_alert
+        from sqlalchemy.orm.attributes import flag_modified
+
+        churn_last = supersede_churn_last_snapshot or (orig_task.context or {}).get(
+            _REVIEW_SUPERSEDE_CHURN_LAST_KEY
+        )
+        detail = (
+            "Supersession churn reached the bound after "
+            f"{supersede_churn_count} consecutive superseded task(s) with no "
+            "counted run in between."
+        )
+        if churn_last:
+            detail += f" Last superseded task: {churn_last}."
+        if _runtime_config.get("require_approval_gates", True):
+            orig_task.requires_approval = True
+        orig_task.latest_status_message = (
+            f"Review/fix supersession churn on PR #{pr_number}: "
+            f"{supersede_churn_count} consecutive superseded task(s); "
+            "manual review required."
+        )
+        _set_review_loop_terminal_outcome(
+            orig_task,
+            kind="supersession_churn_halt",
+            reason="supersession-churn",
+            pr_number=pr_number,
+            iterations=supersede_churn_count,
+            detail=detail,
+        )
+        orig_ctx = dict(orig_task.context or {})
+        orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = supersede_churn_count
+        if churn_last is not None:
+            orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = churn_last
+        orig_task.context = orig_ctx
+        flag_modified(orig_task, "context")
+        session.add(orig_task)
+        try:
+            await _maybe_create_escalation_alert(
+                orig_task,
+                session,
+                pr_number=pr_number,
+                reason="supersession-churn",
+                iteration=supersede_churn_count,
+            )
+        except Exception as _ae:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Failed to create supersession churn alert for "
+                f"PR #{pr_number}: {_ae}",
+                exc_info=True,
+            )
+        try:
+            import asyncio as _asyncio
+            from app.notification_dispatch import dispatch_external_notification
+
+            _asyncio.ensure_future(  # noqa: RUF006
+                dispatch_external_notification(
+                    orig_task.project_id,
+                    "APPROVAL_NEEDED",
+                    {
+                        "task_id": str(orig_task.id),
+                        "task_title": orig_task.title or str(orig_task.id)[:8],
+                        "pr_number": pr_number,
+                        "iteration": supersede_churn_count,
+                        "reason": "Review/fix supersession churn",
+                        "details": detail,
+                        "last_superseded_task": churn_last,
+                    },
+                )
+            )
+        except Exception as _ne:  # noqa: BLE001
+            logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
+        _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+        session.add(source_task)
+        return (None, False)
 
     # Mid-retry defer: when spawning a review, treat the chain as busy if a
     # same-PR fix is FAILED/CANCELLED with an infra failure_category within the
@@ -1680,8 +2105,8 @@ async def _spawn_pipeline_task(
         )
     else:
         pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
-        type_match = Task.payloads[0]["type"].as_string().in_(
-            ("review", "fix", "panel_review")
+        type_match = (
+            Task.payloads[0]["type"].as_string().in_(("review", "fix", "panel_review"))
         )
     pr_pipeline_tasks = (
         (
@@ -1899,6 +2324,11 @@ async def _spawn_pipeline_task(
         if _counts_toward_cap(_lt):
             _lane = classify_iteration_lane(_lt)
             lane_counts[_lane] = lane_counts.get(_lane, 0) + 1
+    recent_consecutive_conflict_count = _recent_consecutive_lane_count(
+        pr_pipeline_tasks,
+        LANE_CONFLICT,
+        _counts_toward_cap,
+    )
     non_review_total = (
         lane_counts[LANE_CONFLICT]
         + lane_counts[LANE_CI]
@@ -1976,6 +2406,38 @@ async def _spawn_pipeline_task(
         session.add(source_task)
         return (None, False)
 
+    # ── Persistent-conflict early escalation ───────────────────────────────
+    # When the conflict-fix lane has already accumulated >= threshold completions
+    # without resolving the conflict and this spawn would add another conflict
+    # attempt, stop early and close with a conflict-named terminal outcome. Fires
+    # BEFORE the lane sub-cap (LANE_CAP_CONFLICT_DEFAULT=4) so the PR closes at
+    # attempt 3 instead of grinding to cap or global exhaustion.
+    _persistent_conflict_threshold = _runtime_config.get(
+        "review_persistent_conflict_threshold",
+        PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
+    )
+    if (
+        _spawn_lane == LANE_CONFLICT
+        and recent_consecutive_conflict_count >= _persistent_conflict_threshold
+    ):
+        logger.warning(
+            f"[PIPELINE] PR #{pr_number} persistent merge conflict: "
+            f"{recent_consecutive_conflict_count} consecutive conflict-fix "
+            f"iterations completed without resolution "
+            f"(threshold={_persistent_conflict_threshold})"
+        )
+        await _handle_persistent_conflict_escalation(
+            source_task,
+            resolved_original_id,
+            pr_number,
+            pr_iterations,
+            recent_consecutive_conflict_count,
+            session,
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_PERSISTENT_CONFLICT)
+        session.add(source_task)
+        return (None, False)
+
     # ── Per-lane sub-cap checks ─────────────────────────────────────────────
     # Block a spawn when its lane's sub-cap is exhausted or non-review lanes
     # collectively hit the collective ceiling. These fire before the global cap
@@ -1984,13 +2446,22 @@ async def _spawn_pipeline_task(
     # path). Conflict/CI exhaustion routes to _handle_cap_exhaustion which
     # uses _pr_is_preservable_on_cap to preserve rollup work.
     _lane_exhausted: str | None = None
-    if _spawn_lane == LANE_ARBITRATION and lane_counts[LANE_ARBITRATION] >= _lane_cap_arbitration:
+    if (
+        _spawn_lane == LANE_ARBITRATION
+        and lane_counts[LANE_ARBITRATION] >= _lane_cap_arbitration
+    ):
         _lane_exhausted = LANE_ARBITRATION
-    elif _spawn_lane == LANE_CONFLICT and lane_counts[LANE_CONFLICT] >= _lane_cap_conflict:
+    elif (
+        _spawn_lane == LANE_CONFLICT
+        and lane_counts[LANE_CONFLICT] >= _lane_cap_conflict
+    ):
         _lane_exhausted = LANE_CONFLICT
     elif _spawn_lane == LANE_CI and lane_counts[LANE_CI] >= _lane_cap_ci:
         _lane_exhausted = LANE_CI
-    elif _spawn_lane != LANE_REVIEW_CONVERGENCE and non_review_total >= _lane_cap_non_review:
+    elif (
+        _spawn_lane != LANE_REVIEW_CONVERGENCE
+        and non_review_total >= _lane_cap_non_review
+    ):
         _lane_exhausted = "non_review_collective"
 
     if _lane_exhausted is not None:
@@ -2204,7 +2675,9 @@ async def _spawn_pipeline_task(
     # "pin_reviewer_model" runtime flag (default on). Carry-forward always happens
     # (fix spawns thread it through review_loop so the next review sees it).
     _pin_reviewer = bool(_runtime_config.get("pin_reviewer_model", True))
-    reviewer_model_for_chain = source_loop.get("reviewer_model") if _pin_reviewer else None
+    reviewer_model_for_chain = (
+        source_loop.get("reviewer_model") if _pin_reviewer else None
+    )
     if task_type == "review" and _pin_reviewer:
         if reviewer_model_for_chain:
             # Use the pinned model from a prior review in this chain.
@@ -2275,7 +2748,9 @@ async def _spawn_pipeline_task(
 
     churn_detections = int(source_loop.get("churn_detections", 0) or 0)
     # Carry forward any prior churn cap reduction so it survives across iterations.
-    churn_cap_reduction: int | None = (source_task.context or {}).get("_churn_cap_reduction")
+    churn_cap_reduction: int | None = (source_task.context or {}).get(
+        "_churn_cap_reduction"
+    )
     # Stuck-cycle detection: if the same CRITICAL/MAJOR issues repeat across consecutive
     # iterations, escalate for manual review instead of consuming the full iteration budget.
     if task_type == "fix" and iteration >= 2 and len(new_review_history) >= 2:
@@ -2484,10 +2959,7 @@ async def _spawn_pipeline_task(
         # escalate to the operator at iteration K instead of burning the full
         # budget. Only fires from iteration K onward so a normally-converging
         # loop (which lands APPROVE well before K) is never escalated early.
-        if (
-            task_type == "fix"
-            and iteration >= EARLY_NONCONVERGENCE_ESCALATE_AT
-        ):
+        if task_type == "fix" and iteration >= EARLY_NONCONVERGENCE_ESCALATE_AT:
             should_escalate, nonconvergence_reason = detect_early_nonconvergence(
                 new_review_history
             )
@@ -2499,9 +2971,7 @@ async def _spawn_pipeline_task(
                     f"grinding to cap."
                 )
                 try:
-                    nc_orig = await session.get(
-                        Task, uuid.UUID(resolved_original_id)
-                    )
+                    nc_orig = await session.get(Task, uuid.UUID(resolved_original_id))
                     if nc_orig:
                         # Discretionary gate, same as stuck-cycle: only
                         # approval-gate when require_approval_gates is on.
@@ -2540,8 +3010,7 @@ async def _spawn_pipeline_task(
                             )
                         except Exception as _ne:  # noqa: BLE001
                             logger.warning(
-                                f"[NOTIFY] APPROVAL_NEEDED dispatch setup "
-                                f"failed: {_ne}"
+                                f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}"
                             )
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
@@ -2968,11 +3437,7 @@ async def _spawn_pipeline_task(
         # Issue ledger: carries contested regions across iterations so each fix/review
         # agent sees the full oscillation history without re-deriving from history.
         # Only written when the ledger has at least one contested region.
-        **(
-            {"issue_ledger": _issue_ledger}
-            if _issue_ledger.get("contested")
-            else {}
-        ),
+        **({"issue_ledger": _issue_ledger} if _issue_ledger.get("contested") else {}),
         # Reviewer-model pin: first review stamps the resolved model; subsequent
         # reviews and fix tasks carry it forward so all reviews on the chain use
         # the same model (prevents reviewer personality drift mid-chain).
@@ -3002,46 +3467,64 @@ async def _spawn_pipeline_task(
 
     from app.models import Project as _Project
     from app.review_fix_lane_pilot import (
+        CHECKPOINT_PHASE_RECOVER,
         LANE_CHAIN_ID_KEY,
         LANE_PILOT_ASSIGNMENT_KEY,
         activate_lane_for_fix,
-        checkpoint_and_reserve_on_phase_complete,
+        checkpoint_or_recover_phase,
         ensure_chain_lane,
         get_chain_lane,
         is_review_fix_lane_pilot_active_for_project,
+        is_review_fix_lane_shadow_active_for_project,
         lane_arm_of,
         record_lane_arm_assignment,
         strip_transient_lane_context,
         wire_fix_lane_context,
     )
+    from app.models import ImprovementLaneStatus
 
     strip_transient_lane_context(propagated_ctx)
     lane_review_force_cold = False
     lane_fix_task_id: uuid.UUID | None = None
     lane_fix_to_activate = None
+    lane_fix_lease_workspace = True
     # Fetch the project for the project-aware pilot gate. The gate consults both
     # the runtime flag AND the durable persisted KILL/ADOPT verdict so a KILL
     # that survived a runtime_config reload is still honored.
     _pilot_project = await session.get(_Project, source_task.project_id)
-    if is_review_fix_lane_pilot_active_for_project(_pilot_project):
+    _lane_pilot_active = is_review_fix_lane_pilot_active_for_project(_pilot_project)
+    _lane_shadow_active = is_review_fix_lane_shadow_active_for_project(_pilot_project)
+    if _lane_pilot_active or _lane_shadow_active:
+        if _lane_shadow_active:
+            # Shadow chains must not write or forward the ITT assignment key:
+            # compute_lane_pilot_aggregates treats it as a trial sample.
+            propagated_ctx.pop(LANE_PILOT_ASSIGNMENT_KEY, None)
+            if LANE_PILOT_ASSIGNMENT_KEY in source_ctx:
+                source_ctx = dict(source_ctx)
+                source_ctx.pop(LANE_PILOT_ASSIGNMENT_KEY, None)
+                source_task.context = source_ctx
+                _flag_modified(source_task, "context")
         # Record the intent-to-treat arm ONCE for the chain (BOTH arms), keyed on
         # the immutable original create-task id, so arm membership is decided
         # before any fix-side treatment. Persisted on the source task (durable,
         # read by the measurement on terminal rows) AND propagated forward.
-        _seed = resolved_original_id or str(source_task.id)
-        record_lane_arm_assignment(source_ctx, _seed, _pilot_project)
-        _arm = lane_arm_of(source_ctx)
-        if _arm is not None:
-            propagated_ctx[LANE_PILOT_ASSIGNMENT_KEY] = _arm
-            if (source_task.context or {}).get(LANE_PILOT_ASSIGNMENT_KEY) != _arm:
-                source_task.context = source_ctx
-                _flag_modified(source_task, "context")
-        if _arm == "lane":
+        _arm = None
+        if _lane_pilot_active:
+            _seed = resolved_original_id or str(source_task.id)
+            record_lane_arm_assignment(source_ctx, _seed, _pilot_project)
+            _arm = lane_arm_of(source_ctx)
+            if _arm is not None:
+                propagated_ctx[LANE_PILOT_ASSIGNMENT_KEY] = _arm
+                if (source_task.context or {}).get(LANE_PILOT_ASSIGNMENT_KEY) != _arm:
+                    source_task.context = source_ctx
+                    _flag_modified(source_task, "context")
+        if _lane_shadow_active or _arm == "lane":
             if task_type == "review":
                 # Implement/fix phase just completed -> checkpoint the lane and
-                # move its workspace to WARM_RESERVED, then spawn the review COLD
-                # (lane ctx already stripped, warm handoff suppressed below).
-                lane_review_force_cold = True
+                # in full-pilot mode move its workspace to WARM_RESERVED, then
+                # spawn the review COLD. Shadow writes the same checkpoint/CAS
+                # evidence but leaves classic review spawning untouched.
+                lane_review_force_cold = _lane_pilot_active
                 _lane = await ensure_chain_lane(
                     session,
                     project_id=source_task.project_id,
@@ -3051,6 +3534,7 @@ async def _spawn_pipeline_task(
                     base_branch=base_branch,
                     direction_id=propagated_ctx.get("direction_id"),
                     current_task_id=source_task.id,
+                    pilot_arm="lane" if _lane_pilot_active else None,
                 )
                 _chain_lane_id = source_ctx.get(LANE_CHAIN_ID_KEY)
                 if _chain_lane_id:
@@ -3062,22 +3546,61 @@ async def _spawn_pipeline_task(
                 )
                 if not _phase_sha and orig is not None:
                     _phase_sha = (orig.context or {}).get("head_sha")
-                await checkpoint_and_reserve_on_phase_complete(
+                # Act on the checkpoint outcome instead of ignoring it. A
+                # missing/unverifiable checkpoint under budget deterministically
+                # suppresses this cold review and requeues the failed phase as a
+                # lane-aware recovery task; an exhausted budget closes the lane
+                # inline (KILLED + reservation released) and falls back to a
+                # classic cold review. A written checkpoint (or a benign no-op)
+                # proceeds to the cold review unchanged.
+                _ckpt_outcome = await checkpoint_or_recover_phase(
                     session,
                     source_task,
                     _lane,
                     sha=_phase_sha,
                     summary=f"lane phase complete PR #{pr_number}",
+                    reserve_workspace=_lane_pilot_active,
+                    enable_recovery=_lane_pilot_active,
+                    record_miss_marker=_lane_shadow_active,
                 )
+                if _ckpt_outcome == CHECKPOINT_PHASE_RECOVER:
+                    return await _handle_lane_checkpoint_recovery(
+                        session,
+                        source_task=source_task,
+                        lane=_lane,
+                        pr_number=pr_number,
+                        branch=branch,
+                        base_branch=base_branch,
+                        resolved_original_id=resolved_original_id,
+                        propagated_ctx=propagated_ctx,
+                        parent_id=parent_id,
+                        inherited_priority=inherited_priority,
+                    )
             elif task_type == "fix":
                 # Fix side resumes warm on the lane-reserved member: bind the
                 # lane ACTIVE for this phase and attach warm-resume directives +
                 # use receipts. The reviewer never reaches this branch.
                 _lane = await get_chain_lane(session, source_ctx)
-                if _lane is not None:
-                    lane_fix_task_id = uuid.uuid4()
+                _expected_pilot_arm = "lane" if _lane_pilot_active else None
+                if (
+                    _lane is not None
+                    and _lane.status == ImprovementLaneStatus.PARKED.value
+                    and _lane.pilot_arm == _expected_pilot_arm
+                ):
+                    if _lane_pilot_active:
+                        lane_fix_task_id = uuid.uuid4()
                     lane_fix_to_activate = _lane
-                    wire_fix_lane_context(propagated_ctx, _lane)
+                    lane_fix_lease_workspace = _lane_pilot_active
+                    if _lane_pilot_active:
+                        wire_fix_lane_context(propagated_ctx, _lane)
+                elif _lane is not None:
+                    logger.info(
+                        "[LANE-PILOT] chain lane %s has pilot_arm=%s but fix mode "
+                        "expects %s; skipping lane reuse for this spawn",
+                        _lane.id,
+                        _lane.pilot_arm,
+                        _expected_pilot_arm,
+                    )
 
     # Phase 2c: warm-VM continuity pin. When the runtime flag is on AND the
     # source task's VM is still alive (IN_PROGRESS or completed within the
@@ -3175,7 +3698,12 @@ async def _spawn_pipeline_task(
     )
     session.add(new_task)
     if lane_fix_to_activate is not None:
-        await activate_lane_for_fix(session, lane_fix_to_activate, task_id=new_task.id)
+        await activate_lane_for_fix(
+            session,
+            lane_fix_to_activate,
+            task_id=new_task.id,
+            lease_workspace=lane_fix_lease_workspace,
+        )
     try:
         await session.commit()
     except IntegrityError:

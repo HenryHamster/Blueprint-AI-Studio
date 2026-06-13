@@ -192,25 +192,27 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
   // Per-direction research pipeline: where is each active direction stuck/moving.
   const waiting = pipeline.filter(p => strVal(p.state as string) === 'research_waiting_on_action');
   const inProgress = pipeline.filter(p => strVal(p.state as string) === 'tasks_in_progress');
+  const held = pipeline.filter(p => strVal(p.state as string) === 'held_on_dependency');
+  const recent = pipeline.filter(p => strVal(p.state as string) === 'recently_converted');
   const idle = pipeline.filter(p => strVal(p.state as string) === 'idle');
   const waitingTotal = countOr(counts.pipeline_waiting_on_action, waiting.length);
   const inProgressTotal = countOr(counts.pipeline_tasks_in_progress, inProgress.length);
+  const heldTotal = countOr(counts.pipeline_held_on_dependency, held.length);
+  const recentTotal = countOr(counts.pipeline_recently_converted, recent.length);
   const idleTotal = countOr(counts.pipeline_idle, idle.length);
   const pipelineOverflow = countOr(counts.direction_pipeline_overflow, 0);
-  if (pipeline.length > 0 || waitingTotal > 0 || inProgressTotal > 0 || idleTotal > 0) {
+  if (
+    pipeline.length > 0 ||
+    waitingTotal > 0 ||
+    inProgressTotal > 0 ||
+    heldTotal > 0 ||
+    recentTotal > 0 ||
+    idleTotal > 0
+  ) {
     const deferredGaps = fmtScalar(counts.deferred_gaps, '0');
-    lines.push(`\n### Research pipeline by direction (${inProgressTotal} with tasks in progress, ${waitingTotal} waiting on action, ${idleTotal} idle; ${deferredGaps} gaps deferred)`);
+    lines.push(`\n### Research pipeline by direction (${inProgressTotal} with tasks in progress, ${heldTotal} live-held, ${recentTotal} recently converted, ${waitingTotal} waiting on action, ${idleTotal} idle; ${deferredGaps} gaps deferred)`);
     if (pipelineOverflow > 0) {
       lines.push(`Only the first ${pipeline.length} active directions are listed below (+${pipelineOverflow} more not shown).`);
-    }
-    if (waitingTotal > 0) {
-      lines.push('Research surfaced findings but NOTHING is acting on them — these are the directions most likely to need a plan/create task spawned:');
-      for (const p of waiting) {
-        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.findings, '0')} recent finding(s), 0 tasks in flight`);
-      }
-      if (waitingTotal > waiting.length) {
-        lines.push(`- +${waitingTotal - waiting.length} more waiting direction(s) not shown`);
-      }
     }
     if (inProgressTotal > 0) {
       lines.push('Already moving (tasks in flight — do not double-spawn):');
@@ -219,6 +221,33 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
       }
       if (inProgressTotal > inProgress.length) {
         lines.push(`- +${inProgressTotal - inProgress.length} more in-progress direction(s) not shown`);
+      }
+    }
+    if (heldTotal > 0) {
+      lines.push('Live-held on dependency (blocked or parked work is not waiting-on-action):');
+      for (const p of held) {
+        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.held, '0')} held task(s), ${fmtScalar(p.findings, '0')} recent finding(s)`);
+      }
+      if (heldTotal > held.length) {
+        lines.push(`- +${heldTotal - held.length} more held direction(s) not shown`);
+      }
+    }
+    if (recentTotal > 0) {
+      lines.push('Recently converted/completed (fresh work before the cycle start — not stalled):');
+      for (const p of recent) {
+        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.recently_completed, '0')} recently completed task(s), ${fmtScalar(p.findings, '0')} recent finding(s)`);
+      }
+      if (recentTotal > recent.length) {
+        lines.push(`- +${recentTotal - recent.length} more recently-converted direction(s) not shown`);
+      }
+    }
+    if (waitingTotal > 0) {
+      lines.push('Research surfaced findings but NOTHING is acting on them — these are the directions most likely to need a plan/create task spawned:');
+      for (const p of waiting) {
+        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.findings, '0')} recent finding(s), 0 tasks in flight`);
+      }
+      if (waitingTotal > waiting.length) {
+        lines.push(`- +${waitingTotal - waiting.length} more waiting direction(s) not shown`);
       }
     }
     if (idleTotal > 0) {

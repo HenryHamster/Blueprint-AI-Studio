@@ -17,14 +17,16 @@ the route paths stay byte-identical and the agent-side fetch script needs
 no change.
 """
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 
 from app.database import get_session
 from app.message_convergence import get_message_link, resolve_message_ref
-from app.models import Project, Task
+from app.models import Project, QualificationVerdict, ReleaseVersion, Task
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.source_ref_validation import (
@@ -33,6 +35,8 @@ from app.source_ref_validation import (
 )
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+logger = logging.getLogger(__name__)
 
 _RESEARCH_HISTORY_KEEP_ON_FETCH = 20
 
@@ -205,6 +209,125 @@ async def agent_fetch_message(
             "convergence_link": get_message_link(msg),
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
         },
+    }
+
+
+@router.get("/projects/{project_id}/qualification")
+@limiter.limit("60/minute")
+async def agent_fetch_qualification(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the latest qualification verdict context for the project's open version.
+
+    Read-only; agent-scoped. Prefers the durable per-attempt evidence on the
+    latest immutable QualificationVerdict row (its audit_findings column survives
+    re-qualification overwrites), falling back to the mutable
+    last_qualification blob for legacy rows. The source field reflects which
+    store was used. Returns {"source": "no_open_version"} when no open version
+    exists or no qualification has run yet.
+
+    Payload includes: candidate_sha, finalized_at, status, confidence,
+    sub_scores, findings, excluded_findings, challenger_refuted_findings.
+    """
+    from app.release_qualifier import (  # noqa: PLC0415
+        get_latest_qualification_audit_findings,
+    )
+
+    await _resolve_agent_project(project_id, token, session)
+
+    open_row = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if open_row is None:
+        return {"source": "no_open_version"}
+
+    # Re-qualification readiness signal + per-finding resolution view (ADDITIVE).
+    # The fix-first triage workflow needs to know, from the same read it already
+    # makes, whether every gating high+medium carried finding is resolved-or-stale
+    # (the pre-registered re-qualification trigger) and the per-finding ledger
+    # state for each. Best-effort: a failure to compute the ledger-backed signal
+    # must never break this read or change the existing response shape, so it
+    # degrades to ``requalification_ready: None`` + an empty resolution view.
+    requalification_extra: dict = {
+        "requalification_ready": None,
+        "finding_resolution": [],
+    }
+    try:
+        from app.release_readiness import (  # noqa: PLC0415
+            compute_requalification_readiness,
+        )
+
+        readiness = await compute_requalification_readiness(session, project_id)
+        requalification_extra = {
+            "requalification_ready": readiness["requalification_ready"],
+            # Per-finding resolution view: each gating carried finding's key,
+            # severity, summary, and resolution state (resolved|stale|unresolved).
+            "finding_resolution": readiness["findings"],
+        }
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] requalification readiness compute failed for project %s; "
+            "serving qualification without the readiness signal",
+            project_id,
+        )
+
+    verdict = (
+        (
+            await session.execute(
+                select(QualificationVerdict)
+                .where(
+                    QualificationVerdict.release_version_id == open_row.id,
+                    QualificationVerdict.audit_findings.is_not(None),
+                )
+                .order_by(QualificationVerdict.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    if verdict is not None:
+        return {
+            "candidate_sha": verdict.candidate_sha,
+            "finalized_at": verdict.finalized_at.isoformat() if verdict.finalized_at else None,
+            "status": verdict.terminal_status,
+            "confidence": verdict.confidence,
+            "sub_scores": verdict.sub_scores,
+            "findings": get_latest_qualification_audit_findings(open_row, verdict),
+            "excluded_findings": verdict.excluded_audit_findings or [],
+            "challenger_refuted_findings": verdict.challenger_refuted_audit_findings or [],
+            "source": "qualification_verdict",
+            **requalification_extra,
+        }
+
+    qual = open_row.last_qualification or {}
+    return {
+        "candidate_sha": qual.get("candidate_sha"),
+        "finalized_at": qual.get("finalized_at"),
+        "status": qual.get("status"),
+        "confidence": qual.get("confidence"),
+        "sub_scores": qual.get("sub_scores"),
+        "findings": get_latest_qualification_audit_findings(open_row),
+        "excluded_findings": qual.get("excluded_audit_findings") or [],
+        "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings") or [],
+        "source": "last_qualification",
+        **requalification_extra,
     }
 
 

@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 from sqlalchemy import select
 
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
@@ -507,12 +507,9 @@ async def test_drift_snapshot_failure_does_not_expire_caller_instances(
     # attribute read must return the in-memory value without IO. Under the old
     # bare-rollback this access raised MissingGreenlet.
     assert project.vision.get("purpose") == "test purpose"
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     assert any(
-        t.payloads[0].get("type") == "strategic_review"
-        for t in result.scalars().all()
+        t.payloads[0].get("type") == "strategic_review" for t in result.scalars().all()
     )
 
 
@@ -557,8 +554,7 @@ async def test_spawn_review_includes_model_health_signal(db_session):
     # 24 active gaps = 2x the healthy threshold (12) -> 'large'.
     problem_model = {
         "gaps": [
-            {"id": f"g-{i}", "name": f"gap {i}", "status": "active"}
-            for i in range(24)
+            {"id": f"g-{i}", "name": f"gap {i}", "status": "active"} for i in range(24)
         ],
     }
     project = _make_project(
@@ -946,9 +942,7 @@ async def test_recent_challenge_summary_present_in_direction_stats(db_session):
     assert spawned is True
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     payload = result.scalars().all()[0].payloads[0]
-    d_stat = next(
-        s for s in payload["directions_summary"] if s["id"] == "d-challenge"
-    )
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-challenge")
     assert d_stat["recent_findings_challenge_summary"] == {
         "challenged_findings": 3,
         "agreement_distribution": {
@@ -1115,9 +1109,7 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
 
-    proven = next(
-        s for s in payload["directions_summary"] if s["id"] == "d-proven01"
-    )
+    proven = next(s for s in payload["directions_summary"] if s["id"] == "d-proven01")
     assert proven["verified_prs_merged"] == 4
     assert proven["proven_prs_merged"] == 2
     assert proven["consumed_prs_merged"] == 1
@@ -1126,9 +1118,7 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
     assert proven["consumed_prs_merged"] <= proven["proven_prs_merged"]
     assert proven["acceptance_declaration_coverage"] == round(3 / 4, 3)
 
-    legacy = next(
-        s for s in payload["directions_summary"] if s["id"] == "d-legacy01"
-    )
+    legacy = next(s for s in payload["directions_summary"] if s["id"] == "d-legacy01")
     # Legacy fallback: nothing retroactively claimed proven, no coverage denom.
     assert legacy["proven_prs_merged"] == 0
     assert legacy["consumed_prs_merged"] == 0
@@ -1507,7 +1497,9 @@ async def test_cost_fields_use_recorded_spend_over_proxy(db_session):
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
-    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cost-recorded")
+    d_stat = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-cost-recorded"
+    )
 
     assert d_stat["estimated_cost_usd"] == 6.50
     assert d_stat["cost_per_merged_pr"] == round(6.50 / 2, 2)
@@ -1694,6 +1686,39 @@ async def test_spawn_strategic_review_aborts_when_peer_holds_spawn_lock_at_inser
     assert result.scalars().all() == []
 
 
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_bail_survives_rollback_expiry(db_session, mocker):
+    """Bail paths do not raise MissingGreenlet when the session rollback expires ORM instances.
+
+    SQLAlchemy expires every instance in the identity map on rollback (expire_on_commit=False
+    does not apply to rollback). Accessing project.id after rollback used to trigger a
+    synchronous lazy-load that raises MissingGreenlet in async context (BUG_REPORT e530efec).
+    The fix captures project.id before rolling back; this test confirms the bail path returns
+    False cleanly rather than propagating the greenlet exception.
+    """
+    mocker.patch(
+        "app.autonomous_research._try_research_spawn_advisory_lock",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    # Expire the project instance — simulates what SQLAlchemy does on rollback.
+    # After expire(), any attribute access on the instance without an active
+    # async IO context raises MissingGreenlet (the same failure mode as
+    # post-rollback access).  The bail path must not access ORM attributes
+    # after the rollback, so this expiry is functionally equivalent.
+    db_session.expire(project)
+
+    # Must return False without raising
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is False
+
+
 # ── Bootstrap-pending guard in _spawn_design_doc_update ───────────────────────
 
 
@@ -1724,6 +1749,38 @@ async def test_spawn_design_doc_update_defers_while_bootstrap_pending(db_session
         select(Task).where(
             Task.project_id == project.id,
             Task.payloads[0]["type"].as_string() == "design_doc_update",
+        )
+    )
+    assert result.scalars().first() is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_defers_while_bootstrap_pending(db_session):
+    """_spawn_strategic_review returns False while a repo_bootstrap task is in-flight."""
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        build_config={},  # bootstrap_completed_at not set
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a pending repo_bootstrap task for this project
+    bootstrap_task = Task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "repo_bootstrap"}],
+    )
+    db_session.add(bootstrap_task)
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is False
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "strategic_review",
         )
     )
     assert result.scalars().first() is None
@@ -2126,7 +2183,9 @@ async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-sg01")
 
-    assert "spawn_gate_metrics" in d_stat, "spawn_gate_metrics should be present for direction with spawn-gate activity"
+    assert "spawn_gate_metrics" in d_stat, (
+        "spawn_gate_metrics should be present for direction with spawn-gate activity"
+    )
     sgm = d_stat["spawn_gate_metrics"]
     assert sgm["challenged"] == 5
     assert sgm["refuted"] == 2
@@ -2177,7 +2236,9 @@ async def test_spawn_gate_metrics_absent_when_no_activity(db_session):
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-sg02")
 
-    assert "spawn_gate_metrics" not in d_stat, "spawn_gate_metrics should be absent when no spawn-gate activity"
+    assert "spawn_gate_metrics" not in d_stat, (
+        "spawn_gate_metrics should be absent when no spawn-gate activity"
+    )
 
 
 @pytest.mark.asyncio
@@ -2197,7 +2258,10 @@ async def test_spawn_gate_exhaustion_note_names_cause_distribution(db_session):
                         "research_spawn_gate_unresolved_count": 2,
                         "research_spawn_gate_challenged_spawned": 2,
                         "research_spawn_gate_wholesale_retry_exhausted": True,
-                        "research_spawn_gate_cause_counts": {"AGENT_TIMEOUT": 2, "RATE_LIMIT": 1},
+                        "research_spawn_gate_cause_counts": {
+                            "AGENT_TIMEOUT": 2,
+                            "RATE_LIMIT": 1,
+                        },
                     }
                 ],
             }
@@ -4621,9 +4685,7 @@ async def test_strategic_review_omits_parallelism_snapshot(db_session):
             _shared_state.runtime_config["max_concurrent_vms"] = prev_cap
 
     assert spawned is True
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     strategic_tasks = [
         t
         for t in result.scalars().all()
@@ -4706,9 +4768,7 @@ async def test_strategic_review_includes_held_directions_block(db_session):
         _shared_state.direction_failure_streaks.clear()
 
     assert spawned is True
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     strategic_tasks = [
         t
         for t in result.scalars().all()
@@ -4750,9 +4810,7 @@ async def test_strategic_review_omits_held_directions_when_none_held(db_session)
         _shared_state.direction_failure_streaks.clear()
 
     assert spawned is True
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     strategic_tasks = [
         t
         for t in result.scalars().all()
@@ -5060,7 +5118,9 @@ async def test_direction_counts_by_system_survives_directions_summary_trim(db_se
                     "prs_rejected": 0,
                     "tasks_failed": 0,
                     "tasks_created": 1,
-                    "key_finding_descriptions": [f"finding {j} " * 20 for j in range(5)],
+                    "key_finding_descriptions": [
+                        f"finding {j} " * 20 for j in range(5)
+                    ],
                     "failed_task_details": [],
                     "timestamp": "2026-04-01T00:00:00Z",
                 }
@@ -5870,8 +5930,16 @@ def _patch_candidate_currency(mocker, *, resolved, head_sha):
 
 def _make_stabilize_version_with_candidate(candidate_sha):
     from app.models import ReleaseVersion
+    from app.release_scoring import _audit_finding_key
 
     now = datetime.utcnow().replace(tzinfo=None)
+    # Carried findings stamped with the deterministic content key the resolution
+    # ledger joins against (release_scoring._audit_finding_key) so readiness can be
+    # computed exactly as it is for real carried findings.
+    _high = {"severity": "high", "summary": "Token baked into VM image."}
+    _high["key"] = _audit_finding_key(_high["summary"], None)
+    _low = {"severity": "low", "summary": "Private cross-module import."}
+    _low["key"] = _audit_finding_key(_low["summary"], None)
     return ReleaseVersion(
         version_number=4,
         phase="stabilize",
@@ -5884,12 +5952,36 @@ def _make_stabilize_version_with_candidate(candidate_sha):
             "blocker": None,
             "sub_scores": {"audit": 0.74, "test_erosion": 1.0},
             "candidate_sha": candidate_sha,
-            "audit_findings": [
-                {"severity": "high", "summary": "Token baked into VM image."},
-                {"severity": "low", "summary": "Private cross-module import."},
-            ],
+            "audit_findings": [_high, _low],
         },
     )
+
+
+async def _ensure_audit_finding_resolution_table(session):
+    """Create the AuditFindingResolution ledger table idempotently."""
+    from app.models import AuditFindingResolution as _AFR
+
+    conn = await session.connection()
+    await conn.run_sync(lambda c: _AFR.__table__.create(c, checkfirst=True))
+    await session.commit()
+
+
+async def _resolve_finding_in_ledger(
+    session, project_id, release_version_id, *, summary, severity, state="resolved"
+):
+    """Insert a resolution-ledger row for the carried finding keyed by summary."""
+    from app.models import AuditFindingResolution
+    from app.release_scoring import _audit_finding_key
+
+    row = AuditFindingResolution(
+        project_id=project_id,
+        release_version_id=release_version_id,
+        finding_key=_audit_finding_key(summary, None),
+        severity=severity,
+        state=state,
+    )
+    session.add(row)
+    await session.commit()
 
 
 @pytest.mark.asyncio
@@ -5897,10 +5989,12 @@ async def test_stabilize_carried_findings_marked_stale_when_candidate_behind_hea
     db_session, mocker, _lts_split_active
 ):
     """When the qualification's candidate commit is BEHIND the live integration
-    HEAD, the carried findings are framed POSSIBLY-STALE, the agent is steered
-    toward a fresh qualify_request, and they are NOT asserted as a current
+    HEAD AND the resolution ledger marks every gating finding resolved-or-stale,
+    the carried findings are framed POSSIBLY-STALE, the agent is steered toward a
+    fresh qualify_request (trigger MET), and they are NOT asserted as a current
     binding blocker nor escalated into a new audit direction."""
     await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
     project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
     db_session.add(project)
     await db_session.commit()
@@ -5911,6 +6005,18 @@ async def test_stabilize_carried_findings_marked_stale_when_candidate_behind_hea
     version.project_id = project.id
     db_session.add(version)
     await db_session.commit()
+    await db_session.refresh(version)
+
+    # Mark the single gating (high) carried finding resolved in the ledger so the
+    # pre-registered re-qualification trigger is MET and the re-qualify steer applies.
+    await _resolve_finding_in_ledger(
+        db_session,
+        project.id,
+        version.id,
+        summary="Token baked into VM image.",
+        severity="high",
+        state="resolved",
+    )
 
     _patch_spawning_deps(mocker)
     _patch_candidate_currency(
@@ -5920,11 +6026,85 @@ async def test_stabilize_carried_findings_marked_stale_when_candidate_behind_hea
 
     assert "POSSIBLY-STALE" in suffix
     assert "qualify_request" in suffix
+    assert "trigger is MET" in suffix
     assert candidate[:8] in suffix
     # Must NOT assert the stale findings are a current binding blocker, and must
     # NOT churn a fresh remediation direction at a superseded snapshot.
     assert "the audit sub-score is the binding constraint on promotion" not in suffix
     assert "MUST create a new direction" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_requalify_only_when_readiness_signaled(
+    db_session, mocker, _lts_split_active
+):
+    """Trigger-based stabilize steering (the pre-registered re-qualification trigger).
+
+    On the behind-head path the hint steers toward a fresh qualify_request ONLY
+    when the finding-resolution ledger marks every gating high/medium finding
+    resolved-or-stale. When a gating finding remains UNRESOLVED, the hint instead
+    steers toward the outstanding fix-first work (and escalates to create a
+    remediation direction) rather than a blanket re-qualification.
+    """
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha="b" * 40
+    )
+
+    # ---- Scenario A: gating finding RESOLVED in the ledger → trigger MET ----
+    ready_project = _make_project(is_self_repo=True, vision={"purpose": "p"})
+    db_session.add(ready_project)
+    await db_session.commit()
+    await db_session.refresh(ready_project)
+
+    ready_version = _make_stabilize_version_with_candidate("a" * 40)
+    ready_version.project_id = ready_project.id
+    db_session.add(ready_version)
+    await db_session.commit()
+    await db_session.refresh(ready_version)
+    await _resolve_finding_in_ledger(
+        db_session,
+        ready_project.id,
+        ready_version.id,
+        summary="Token baked into VM image.",
+        severity="high",
+        state="resolved",
+    )
+
+    ready_suffix = await _spawn_and_get_stabilize_suffix(ready_project, db_session)
+    # Re-qualify steer engaged; fix-first / escalation NOT engaged.
+    assert "trigger is MET" in ready_suffix
+    assert "PREFER emitting a fresh qualify_request" in ready_suffix
+    assert "UNRESOLVED" not in ready_suffix
+    assert "trigger is NOT met" not in ready_suffix
+    assert "MUST create a new direction" not in ready_suffix
+
+    # ---- Scenario B: gating finding UNRESOLVED (no ledger row) → trigger NOT met --
+    notready_project = _make_project(is_self_repo=True, vision={"purpose": "p"})
+    db_session.add(notready_project)
+    await db_session.commit()
+    await db_session.refresh(notready_project)
+
+    notready_version = _make_stabilize_version_with_candidate("c" * 40)
+    notready_version.project_id = notready_project.id
+    db_session.add(notready_version)
+    await db_session.commit()
+    await db_session.refresh(notready_version)
+    # No resolution-ledger row → the high gating finding reads as unresolved.
+
+    notready_suffix = await _spawn_and_get_stabilize_suffix(
+        notready_project, db_session
+    )
+    # Fix-first steer engaged; the blanket re-qualify trigger is explicitly NOT met.
+    assert "trigger is NOT met" in notready_suffix
+    assert "UNRESOLVED" in notready_suffix
+    assert "fix-first work" in notready_suffix
+    assert "trigger is MET" not in notready_suffix
+    # The carried finding still needs fixing, so the create-a-direction escalation
+    # fires (there is no active audit/fundamentals-mode direction on this project).
+    assert "MUST create a new direction" in notready_suffix
 
 
 @pytest.mark.asyncio
@@ -6577,7 +6757,10 @@ async def test_post_promote_handoff_unknown_serving_status_is_not_live(
     assert "Version handoff" in suffix
     assert "is now live" not in suffix
     assert "serving evidence is unknown or unreadable" in suffix
-    assert "Verify lifecycle/deploy state before treating the previous version as live" in suffix
+    assert (
+        "Verify lifecycle/deploy state before treating the previous version as live"
+        in suffix
+    )
     assert "serving_confirmed" in suffix
 
 
@@ -6730,7 +6913,9 @@ async def test_failed_deploy_directive_clears_when_newer_version_serving_confirm
     suffix = payload.get("prompt_suffix", "")
     # The failed-deploy directive must NOT be present because v2 is the latest
     # promoted version and it is serving_confirmed (not deploy_failed)
-    assert "deployment crisis" not in suffix.lower() and "deploy_failed" not in suffix, (
+    assert (
+        "deployment crisis" not in suffix.lower() and "deploy_failed" not in suffix
+    ), (
         f"Failed-deploy directive must clear when recovery is confirmed serving; got: {suffix}"
     )
 
@@ -6802,7 +6987,10 @@ async def test_failed_deploy_directive_text_states_same_sha_recovery_clears(
         f"directive must not imply only a subsequent version clears it; got: {suffix}"
     )
     # The misleading old phrasing must be gone.
-    assert "remains active until a subsequent version is promoted AND confirmed serving" not in suffix
+    assert (
+        "remains active until a subsequent version is promoted AND confirmed serving"
+        not in suffix
+    )
 
 
 @pytest.mark.asyncio
@@ -6863,9 +7051,9 @@ async def test_failed_deploy_directive_clears_on_same_sha_recovery(
     assert tasks
     suffix = tasks[0].payloads[0].get("prompt_suffix", "")
 
-    assert "deployment crisis" not in suffix.lower() and "deploy_failed" not in suffix, (
-        f"Crisis directive must clear on a same-SHA recovery; got: {suffix}"
-    )
+    assert (
+        "deployment crisis" not in suffix.lower() and "deploy_failed" not in suffix
+    ), f"Crisis directive must clear on a same-SHA recovery; got: {suffix}"
 
 
 @pytest.mark.asyncio
@@ -7353,6 +7541,133 @@ async def test_on_automain_false_when_rollup_not_merged(db_session):
     assert merges[0]["on_automain"] is False
 
 
+# ── landed_on_integration field in _build_recent_interventions ───────────────
+
+
+@pytest.mark.asyncio
+async def test_merges_out_landed_on_integration_false(db_session):
+    """merges[] entries expose landed_on_integration=False when the context key is
+    explicitly False (merged to rollup staging branch, not integration branch)."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Rollup-only fix",
+        description="merged to staging only",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "landed_on_integration": False},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["landed_on_integration"] is False
+
+
+@pytest.mark.asyncio
+async def test_merges_out_landed_on_integration_true(db_session):
+    """merges[] entries expose landed_on_integration=True when the context key is
+    explicitly True (confirmed merge to the integration branch)."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Integration fix",
+        description="landed on integration",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["landed_on_integration"] is True
+
+
+@pytest.mark.asyncio
+async def test_merges_out_landed_on_integration_legacy_none(db_session):
+    """merges[] entries expose landed_on_integration=None for legacy rows that
+    predate the landed_on_integration context key — backward compatible."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Legacy fix",
+        description="old row without landed_on_integration key",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["landed_on_integration"] is None
+
+
+@pytest.mark.asyncio
+async def test_recent_merged_titles_landed_on_integration(db_session):
+    """per_direction_delta recent_merged_titles entries expose landed_on_integration
+    alongside on_automain and merge_verdict."""
+    d_id = "d-test-loi"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[{"id": d_id, "text": "test direction", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task merged to rollup staging only (landed_on_integration=False)
+    task = Task(
+        project_id=project.id,
+        title="Staging-only fix",
+        description="merged to staging branch only",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "direction_id": d_id,
+            "landed_on_integration": False,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = {d["direction_id"]: d for d in result["per_direction_delta"]}
+    assert d_id in delta
+    titles = delta[d_id].get("recent_merged_titles", [])
+    assert len(titles) == 1
+    assert titles[0]["landed_on_integration"] is False
+    assert titles[0]["title"] == "Staging-only fix"
+
+
 # ── on_main / undeployed_directions + deployment_state block ──────────────────
 
 
@@ -7401,7 +7716,9 @@ async def test_on_main_mirrors_on_automain_without_lts_split(db_session):
     result = await _build_recent_interventions(project, db_session)
     by_title = {m["pr_title"]: m for m in result["merges"]}
     # on_main == on_automain when there is no split.
-    assert by_title["Child fix"]["on_main"] == by_title["Child fix"]["on_automain"] is True
+    assert (
+        by_title["Child fix"]["on_main"] == by_title["Child fix"]["on_automain"] is True
+    )
     # No split → nothing can be "landed but not deployed".
     assert result["undeployed_directions"] == []
 
@@ -7697,8 +8014,13 @@ async def test_deployment_state_absent_without_lts_split(db_session, mocker):
 
 
 async def _spawn_self_repo_with_deployment_state(
-    db_session, mocker, *, status, rolled_back_from_sha=None,
-    rollback_count=0, rollback_reason=None,
+    db_session,
+    mocker,
+    *,
+    status,
+    rolled_back_from_sha=None,
+    rollback_count=0,
+    rollback_reason=None,
 ):
     """Spawn a self-repo strategic review under an LTS split with a seeded
     DeploymentState row. Returns (deployment_state block, prompt_suffix)."""
@@ -7748,9 +8070,7 @@ async def _spawn_self_repo_with_deployment_state(
     await db_session.commit()
 
     assert await _spawn_strategic_review(project, db_session) is True
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     payload = next(
         t.payloads[0]
         for t in result.scalars().all()
@@ -7760,9 +8080,7 @@ async def _spawn_self_repo_with_deployment_state(
 
 
 @pytest.mark.asyncio
-async def test_deployment_state_block_carries_rollback_provenance(
-    db_session, mocker
-):
+async def test_deployment_state_block_carries_rollback_provenance(db_session, mocker):
     """The deployment_state block surfaces the rollback provenance the operator
     UI already shows: rolled-back-from SHA (12-char), count, and reason."""
     ds, _suffix = await _spawn_self_repo_with_deployment_state(
@@ -7821,7 +8139,9 @@ async def test_stabilization_directive_fires_on_halted(db_session, mocker):
 async def test_stabilization_directive_absent_when_stable(db_session, mocker):
     """A healthy (STABLE) deploy status emits no stabilization directive."""
     _ds, suffix = await _spawn_self_repo_with_deployment_state(
-        db_session, mocker, status="STABLE",
+        db_session,
+        mocker,
+        status="STABLE",
     )
     assert "STABILIZATION" not in suffix
     assert "ROLLED_BACK" not in suffix
@@ -7957,6 +8277,10 @@ async def test_on_automain_false_when_commit_not_ancestor(db_session, mocker):
     mocker.patch(
         "app.github.is_ancestor_of",
         new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
     )
 
     result = await _build_recent_interventions(project, db_session)
@@ -8191,6 +8515,10 @@ async def test_on_automain_child_false_when_parent_rollup_pr_not_ancestor(
         "app.github.is_ancestor_of",
         new=AsyncMock(return_value=False),
     )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
+    )
 
     result = await _build_recent_interventions(project, db_session)
     by_title = {m["pr_title"]: m for m in result["merges"]}
@@ -8353,16 +8681,174 @@ async def test_recent_merged_titles_carry_tristate_merge_verdict(db_session, moc
         "app.github.is_ancestor_of",
         new=AsyncMock(side_effect=_anc_side_effect),
     )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
+    )
 
     result = await _build_recent_interventions(project, db_session)
     delta = next(
         d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
     )
-    verdicts = {
-        t["title"]: t["merge_verdict"] for t in delta["recent_merged_titles"]
-    }
+    verdicts = {t["title"]: t["merge_verdict"] for t in delta["recent_merged_titles"]}
     assert verdicts["Landed on automain"] == "verified_landed"
     assert verdicts["Badge says merged but stranded"] == "verified_not_landed"
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_verdict", "expected_not_landed_titles"),
+    [
+        (
+            ["Rollup squash\n\nIncluded work:\n- Honor rollup squash bodies"],
+            "verified_landed",
+            None,
+        ),
+        (
+            ["Rollup squash\n\nIncluded PRs: #9635, #9639"],
+            "verified_landed",
+            None,
+        ),
+        (
+            ["Rollup squash\n\nIncluded PRs: #1111"],
+            "verified_not_landed",
+            ["Honor rollup squash bodies"],
+        ),
+        (None, "unverifiable", None),
+    ],
+    ids=["title-evidence", "pr-evidence", "absent", "scan-failure"],
+)
+@pytest.mark.asyncio
+async def test_rollup_squash_body_evidence_prevents_not_landed_verdict(
+    db_session, mocker, messages, expected_verdict, expected_not_landed_titles
+):
+    """Recent rollup squash bodies can upgrade false ancestry before accounting."""
+    direction_id = "dir-rollup-evidence"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "merge accounting dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Honor rollup squash bodies",
+        description="merge commit was rewritten by a rollup squash",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 9635, "direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merge_commit_sha": "rewritten-child-sha",
+                "head": {"sha": "head-sha"},
+            }
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    commit_messages_mock = mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=messages),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+
+    assert delta["recent_merged_titles"] == [
+        {
+            "title": "Honor rollup squash bodies",
+            "on_automain": expected_verdict == "verified_landed",
+            "merge_verdict": expected_verdict,
+            "landed_on_integration": None,
+        }
+    ]
+    if expected_not_landed_titles:
+        assert delta["recent_not_landed_titles"] == expected_not_landed_titles
+    else:
+        assert "recent_not_landed_titles" not in delta
+    assert delta["recent_merge_verdict_counts"][expected_verdict] == 1
+    assert sum(delta["recent_merge_verdict_counts"].values()) == 1
+    commit_messages_mock.assert_any_await(
+        "tok", "owner", "repo", "automain", project_id=str(project.id)
+    )
+    expected_scan_count = 2 if expected_verdict == "verified_landed" else 1
+    assert commit_messages_mock.await_count == expected_scan_count
+
+
+@pytest.mark.asyncio
+async def test_rollup_squash_body_evidence_applies_to_promotion_target(
+    db_session, mocker
+):
+    """Squash-body evidence on the promotion target marks rescued work deployed."""
+    direction_id = "dir-rollup-main-evidence"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "merge accounting dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Promoted rollup squash body",
+        description="merge commit was rewritten by a promoted rollup squash",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 9635, "direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"merge_commit_sha": "rewritten-child-sha"}),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    commit_messages_mock = mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(
+            side_effect=[
+                ["Rollup squash\n\nIncluded PRs: #9635"],
+                ["Promoted rollup\n\nIncluded work: Promoted rollup squash body"],
+            ]
+        ),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+
+    merge = result["merges"][0]
+    assert merge["on_automain"] is True
+    assert merge["on_main"] is True
+    assert result["undeployed_directions"] == []
+    assert commit_messages_mock.await_args_list == [
+        call("tok", "owner", "repo", "automain", project_id=str(project.id)),
+        call("tok", "owner", "repo", "main", project_id=str(project.id)),
+    ]
 
 
 @pytest.mark.asyncio
@@ -8434,21 +8920,29 @@ async def test_recent_merged_titles_cap_preserves_full_merge_accounting_counts(
         "app.github.is_ancestor_of",
         new=AsyncMock(side_effect=_anc_side_effect),
     )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
+    )
 
     result = await _build_recent_interventions(project, db_session)
     delta = next(
         d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
     )
     assert len(delta["recent_merged_titles"]) == _RECENT_MERGED_TITLES_CAP
-    assert {
-        t["merge_verdict"] for t in delta["recent_merged_titles"]
-    } == {"verified_landed"}
+    assert {t["merge_verdict"] for t in delta["recent_merged_titles"]} == {
+        "verified_landed"
+    }
     assert delta["recent_merge_verdict_counts"] == {
         "verified_landed": _RECENT_MERGED_TITLES_CAP,
         "verified_not_landed": 3,
         "unverifiable": 0,
     }
-    assert delta["recent_not_landed_titles"] == ["stranded 10", "stranded 11", "stranded 12"]
+    assert delta["recent_not_landed_titles"] == [
+        "stranded 10",
+        "stranded 11",
+        "stranded 12",
+    ]
     assert len(delta["recent_not_landed_titles"]) <= _RECON_LIST_CAP
 
 
@@ -8590,7 +9084,9 @@ class TestGetProjectIntegrationBranch:
         Refusing to land integration work on the promotion target is enforced at
         the merge/rollup boundary; the hot-path resolver must not raise.
         """
-        project = _make_project(integration_branch="release", promotion_target="release")
+        project = _make_project(
+            integration_branch="release", promotion_target="release"
+        )
         assert _shared_state.get_project_integration_branch(project) == "release"
 
 
@@ -8645,7 +9141,17 @@ class TestAnnotateCapabilityProofStatus:
         from app.strategic_spawning import _annotate_capability_proof_status
 
         original = [{"name": "cap-a", "status": "working"}]
-        proof_records = {"cap-a": [{"task_id": "t1", "proved_at": "", "proof_kind": "named_test", "proof_ref": "", "commit_sha": ""}]}
+        proof_records = {
+            "cap-a": [
+                {
+                    "task_id": "t1",
+                    "proved_at": "",
+                    "proof_kind": "named_test",
+                    "proof_ref": "",
+                    "commit_sha": "",
+                }
+            ]
+        }
         out = _annotate_capability_proof_status(original, proof_records)
         # Input dict must not have been mutated.
         assert "proof_status" not in original[0]
@@ -8667,7 +9173,15 @@ class TestAnnotateCapabilityProofStatus:
             {"name": "cap-claimed", "status": "partial"},
         ]
         proof_records = {
-            "cap-proven": [{"task_id": "t1", "proved_at": "", "proof_kind": "named_test", "proof_ref": "", "commit_sha": ""}]
+            "cap-proven": [
+                {
+                    "task_id": "t1",
+                    "proved_at": "",
+                    "proof_kind": "named_test",
+                    "proof_ref": "",
+                    "commit_sha": "",
+                }
+            ]
         }
         out = _annotate_capability_proof_status(vocab, proof_records)
         assert out[0]["proof_status"] == "proven"
@@ -8933,16 +9447,28 @@ class TestBuildCycleStartReconciliation:
         pm = {
             "gaps": [
                 # Orphan: active, no deferral, no live direction.
-                {"id": "g-orphan", "name": "drifted", "status": "active",
-                 "priority": "high"},
+                {
+                    "id": "g-orphan",
+                    "name": "drifted",
+                    "status": "active",
+                    "priority": "high",
+                },
                 # Stale active_moves alone do NOT prove staffing.
-                {"id": "g-moved", "name": "worked", "status": "active",
-                 "active_moves": ["d-9"]},
+                {
+                    "id": "g-moved",
+                    "name": "worked",
+                    "status": "active",
+                    "active_moves": ["d-9"],
+                },
                 # Staffed via a direction pointing back (gap_id) → not an orphan.
                 {"id": "g-linked", "name": "linked", "status": "active"},
                 # Intentionally deferred → counted separately, not an orphan.
-                {"id": "g-deferred", "name": "parked", "status": "active",
-                 "deferral": {"rationale": "next version", "created_at": "x"}},
+                {
+                    "id": "g-deferred",
+                    "name": "parked",
+                    "status": "active",
+                    "deferral": {"rationale": "next version", "created_at": "x"},
+                },
                 # Closed gaps never count.
                 {"id": "g-closed", "name": "done", "status": "closed"},
             ]
@@ -8965,13 +9491,21 @@ class TestBuildCycleStartReconciliation:
         pm = {
             "gaps": [
                 # Blocked + unstaffed → orphan, carries status="blocked".
-                {"id": "g-blocked", "name": "blocked orphan", "status": "blocked",
-                 "priority": "medium"},
+                {
+                    "id": "g-blocked",
+                    "name": "blocked orphan",
+                    "status": "blocked",
+                    "priority": "medium",
+                },
                 # Blocked but staffed by a live direction → not an orphan.
                 {"id": "g-blocked-linked", "name": "worked", "status": "blocked"},
                 # Blocked + deferred → counted as deferred, not orphaned.
-                {"id": "g-blocked-deferred", "name": "parked", "status": "blocked",
-                 "deferral": {"rationale": "later", "created_at": "x"}},
+                {
+                    "id": "g-blocked-deferred",
+                    "name": "parked",
+                    "status": "blocked",
+                    "deferral": {"rationale": "later", "created_at": "x"},
+                },
             ]
         }
         direction_stats = [
@@ -8988,8 +9522,12 @@ class TestBuildCycleStartReconciliation:
         pm = {"gaps": [{"id": "g-live", "name": "x", "status": "active"}]}
         direction_stats = [
             {"id": "d-nogap", "status": "active", "text": "no link"},
-            {"id": "d-dangling", "status": "active", "text": "stale",
-             "gap_id": "g-gone"},
+            {
+                "id": "d-dangling",
+                "status": "active",
+                "text": "stale",
+                "gap_id": "g-gone",
+            },
             {"id": "d-ok", "status": "active", "text": "fine", "gap_id": "g-live"},
             # Paused direction is ignored (only active directions reconcile).
             {"id": "d-paused", "status": "paused", "text": "n/a"},
@@ -9003,32 +9541,185 @@ class TestBuildCycleStartReconciliation:
 
         direction_stats = [
             # In flight → tasks_in_progress (regardless of findings).
-            {"id": "d-busy", "status": "active", "text": "busy",
-             "recent_findings": ["f1"]},
+            {
+                "id": "d-busy",
+                "status": "active",
+                "text": "busy",
+                "recent_findings": ["f1"],
+            },
             # No tasks but has findings → research_waiting_on_action.
-            {"id": "d-wait", "status": "active", "text": "wait",
-             "recent_findings": ["f1", "f2"]},
+            {
+                "id": "d-wait",
+                "status": "active",
+                "text": "wait",
+                "recent_findings": ["f1", "f2"],
+            },
+            # Live-held work is distinct from waiting-on-action.
+            {
+                "id": "d-held",
+                "status": "active",
+                "text": "held",
+                "recent_findings": ["f1"],
+            },
+            # Fresh completion before cycle start is also distinct.
+            {
+                "id": "d-recent",
+                "status": "active",
+                "text": "recent",
+                "recent_findings": ["f1"],
+            },
             # No tasks, no findings → idle.
             {"id": "d-idle", "status": "active", "text": "idle"},
         ]
         active_by_direction = {"d-busy": 2}
+        held_by_direction = {"d-held": 1}
+        per_direction_delta = [
+            {
+                "direction_id": "d-recent",
+                "direction_text": "recent",
+                "recent_merged_titles": [
+                    {"title": "fresh merge", "merge_verdict": "verified_landed"},
+                ],
+            },
+        ]
         out = _build_cycle_start_reconciliation(
-            direction_stats, {}, active_by_direction
+            direction_stats,
+            {},
+            active_by_direction,
+            held_by_direction,
+            per_direction_delta,
         )
         states = {p["direction_id"]: p["state"] for p in out["direction_pipeline"]}
         assert states == {
             "d-busy": "tasks_in_progress",
             "d-wait": "research_waiting_on_action",
+            "d-held": "held_on_dependency",
+            "d-recent": "recently_converted",
             "d-idle": "idle",
         }
-        busy = next(p for p in out["direction_pipeline"] if p["direction_id"] == "d-busy")
+        busy = next(
+            p for p in out["direction_pipeline"] if p["direction_id"] == "d-busy"
+        )
         assert busy["in_flight"] == 2
-        wait = next(p for p in out["direction_pipeline"] if p["direction_id"] == "d-wait")
+        wait = next(
+            p for p in out["direction_pipeline"] if p["direction_id"] == "d-wait"
+        )
         assert wait["findings"] == 2
-        assert out["counts"]["active_directions"] == 3
+        held = next(
+            p for p in out["direction_pipeline"] if p["direction_id"] == "d-held"
+        )
+        assert held["held"] == 1
+        assert held["state"] == "held_on_dependency"
+        recent = next(
+            p for p in out["direction_pipeline"] if p["direction_id"] == "d-recent"
+        )
+        assert recent["recently_completed"] == 1
+        assert recent["state"] == "recently_converted"
+        assert out["counts"]["active_directions"] == 5
+        assert out["counts"]["pipeline_waiting_on_action"] == 1
+        assert out["counts"]["pipeline_tasks_in_progress"] == 1
+        assert out["counts"]["pipeline_held_on_dependency"] == 1
+        assert out["counts"]["pipeline_recently_converted"] == 1
+        assert out["counts"]["pipeline_idle"] == 1
+
+    def test_cycle_start_reconciliation_distinguishes_held_and_recently_converted_work(
+        self,
+    ):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {
+                "id": "d-held",
+                "status": "active",
+                "text": "held lane",
+                "recent_findings": ["f1"],
+            },
+            {
+                "id": "d-recent",
+                "status": "active",
+                "text": "fresh lane",
+                "recent_findings": ["f1", "f2"],
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            {},
+            {},
+            {"d-held": 1},
+            [
+                {
+                    "direction_id": "d-recent",
+                    "direction_text": "fresh lane",
+                    "recent_merged_titles": [
+                        {"title": "fresh merge", "merge_verdict": "verified_landed"},
+                    ],
+                },
+            ],
+        )
+        assert out is not None
+        states = {p["direction_id"]: p["state"] for p in out["direction_pipeline"]}
+        assert states == {
+            "d-held": "held_on_dependency",
+            "d-recent": "recently_converted",
+        }
+        assert out["counts"]["pipeline_waiting_on_action"] == 0
+        assert out["counts"]["pipeline_held_on_dependency"] == 1
+        assert out["counts"]["pipeline_recently_converted"] == 1
+
+    def test_non_pr_completions_count_as_recently_converted(self):
+        # Directions that produce only design/web_research/compute_experiment
+        # findings never set pr_merged=True, so recent_merged_titles is empty.
+        # The reconciliation should still classify them as recently_converted when
+        # recent_non_pr_completed > 0.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {
+                "id": "d-design",
+                "status": "active",
+                "text": "design direction",
+                "recent_findings": ["f1"],
+            },
+            {
+                "id": "d-wait",
+                "status": "active",
+                "text": "waiting direction",
+                "recent_findings": ["f1"],
+            },
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-design",
+                "direction_text": "design direction",
+                # No recent_merged_titles — direction only produced design docs.
+                "recent_non_pr_completed": 2,
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            {},
+            {},
+            {},
+            per_direction_delta,
+        )
+        assert out is not None
+        states = {p["direction_id"]: p["state"] for p in out["direction_pipeline"]}
+        assert states["d-design"] == "recently_converted", (
+            "non-PR completions should yield recently_converted, not research_waiting_on_action"
+        )
+        assert states["d-wait"] == "research_waiting_on_action"
+        design_entry = next(
+            p for p in out["direction_pipeline"] if p["direction_id"] == "d-design"
+        )
+        assert design_entry["recently_completed"] == 2
+        assert out["counts"]["pipeline_recently_converted"] == 1
+        assert out["counts"]["pipeline_waiting_on_action"] == 1
 
     def test_lists_are_capped_but_counts_carry_true_total(self):
-        from app.strategic_spawning import _build_cycle_start_reconciliation, _RECON_LIST_CAP
+        from app.strategic_spawning import (
+            _build_cycle_start_reconciliation,
+            _RECON_LIST_CAP,
+        )
 
         gaps = [
             {"id": f"g-{i}", "name": f"orphan {i}", "status": "active"}
@@ -9040,7 +9731,10 @@ class TestBuildCycleStartReconciliation:
         assert out["counts"]["orphaned_gaps"] == _RECON_LIST_CAP + 5
 
     def test_pipeline_counts_survive_list_cap(self):
-        from app.strategic_spawning import _build_cycle_start_reconciliation, _RECON_LIST_CAP
+        from app.strategic_spawning import (
+            _build_cycle_start_reconciliation,
+            _RECON_LIST_CAP,
+        )
 
         direction_stats = []
         for i in range(_RECON_LIST_CAP + 3):
@@ -9062,7 +9756,9 @@ class TestBuildCycleStartReconciliation:
                 }
             )
         active_by_direction = {"d-p-0": 1, "d-p-1": 2}
-        out = _build_cycle_start_reconciliation(direction_stats, {}, active_by_direction)
+        out = _build_cycle_start_reconciliation(
+            direction_stats, {}, active_by_direction
+        )
         assert len(out["direction_pipeline"]) == _RECON_LIST_CAP
         assert out["counts"]["direction_pipeline"] == _RECON_LIST_CAP + 5
         assert out["counts"]["direction_pipeline_overflow"] == 5
@@ -9095,7 +9791,7 @@ class TestBuildCycleStartReconciliation:
             },
         ]
         out = _build_cycle_start_reconciliation(
-            direction_stats, pm, {}, per_direction_delta
+            direction_stats, pm, {}, None, per_direction_delta
         )
         assert out is not None
         acct = out["merge_accounting"]
@@ -9137,7 +9833,7 @@ class TestBuildCycleStartReconciliation:
             },
         ]
         out = _build_cycle_start_reconciliation(
-            direction_stats, {}, {}, per_direction_delta
+            direction_stats, {}, {}, None, per_direction_delta
         )
         assert out is not None
         assert out["merge_accounting"] == []
@@ -9177,7 +9873,7 @@ class TestBuildCycleStartReconciliation:
                 "recent_merged_titles": titles,
             },
         ]
-        out = _build_cycle_start_reconciliation([], {}, {}, per_direction_delta)
+        out = _build_cycle_start_reconciliation([], {}, {}, None, per_direction_delta)
         assert out is not None
         entry = out["merge_accounting"][0]
         assert entry["not_landed"] == _RECON_LIST_CAP + 4
@@ -9207,7 +9903,7 @@ class TestBuildCycleStartReconciliation:
                 "recent_not_landed_titles": ["ghost 10", "ghost 11", "ghost 12"],
             },
         ]
-        out = _build_cycle_start_reconciliation([], {}, {}, per_direction_delta)
+        out = _build_cycle_start_reconciliation([], {}, {}, None, per_direction_delta)
         assert out is not None
         entry = out["merge_accounting"][0]
         assert entry["landed"] == _RECENT_MERGED_TITLES_CAP
@@ -9233,14 +9929,27 @@ class TestBuildPruneCandidates:
 
         pm = {
             "gaps": [
-                {"id": "g1", "name": "x", "status": "active",
-                 "active_moves": ["d-retired"]},
+                {
+                    "id": "g1",
+                    "name": "x",
+                    "status": "active",
+                    "active_moves": ["d-retired"],
+                },
             ],
         }
         directions = [{"id": "d-retired", "status": "retired"}]
-        for status in (None, {}, {"model_size_status": "healthy"},
-                       {"model_size_status": "growing"}):
-            assert _build_prune_candidates(pm, directions, status, "2026-06-04T00:00:00+00:00") is None
+        for status in (
+            None,
+            {},
+            {"model_size_status": "healthy"},
+            {"model_size_status": "growing"},
+        ):
+            assert (
+                _build_prune_candidates(
+                    pm, directions, status, "2026-06-04T00:00:00+00:00"
+                )
+                is None
+            )
 
     def test_returns_none_when_no_candidates_even_if_heavy(self):
         from app.strategic_spawning import _build_prune_candidates
@@ -9248,31 +9957,47 @@ class TestBuildPruneCandidates:
         pm = {
             "gaps": [
                 # Active gap worked by a still-active, never-merged direction.
-                {"id": "g1", "name": "x", "status": "active",
-                 "active_moves": ["d-live"]},
+                {
+                    "id": "g1",
+                    "name": "x",
+                    "status": "active",
+                    "active_moves": ["d-live"],
+                },
             ],
             "capabilities": [
-                {"name": "ok", "status": "working",
-                 "verification": {"effective_status": "working"}},
+                {
+                    "name": "ok",
+                    "status": "working",
+                    "verification": {"effective_status": "working"},
+                },
             ],
         }
         directions = [{"id": "d-live", "status": "active", "research_history": []}]
-        assert _build_prune_candidates(
-            pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00"
-        ) is None
+        assert (
+            _build_prune_candidates(
+                pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00"
+            )
+            is None
+        )
 
     def test_surfaces_gap_linked_to_retired_direction(self):
         from app.strategic_spawning import _build_prune_candidates
 
         pm = {
             "gaps": [
-                {"id": "g-ret", "name": "retired work", "status": "active",
-                 "active_moves": ["d-ret"]},
+                {
+                    "id": "g-ret",
+                    "name": "retired work",
+                    "status": "active",
+                    "active_moves": ["d-ret"],
+                },
             ],
         }
         directions = [{"id": "d-ret", "status": "retired"}]
         out = _build_prune_candidates(
-            pm, directions, {"model_size_status": "oversized"},
+            pm,
+            directions,
+            {"model_size_status": "oversized"},
             "2026-06-04T00:00:00+00:00",
         )
         assert out is not None
@@ -9289,16 +10014,25 @@ class TestBuildPruneCandidates:
 
         pm = {
             "gaps": [
-                {"id": "g-ship", "name": "shipped work", "status": "active",
-                 "active_moves": ["d-ship"]},
+                {
+                    "id": "g-ship",
+                    "name": "shipped work",
+                    "status": "active",
+                    "active_moves": ["d-ship"],
+                },
             ],
         }
         # Still active, but has merged PRs in its history → shipped.
         directions = [
-            {"id": "d-ship", "status": "active",
-             "research_history": [{"prs_merged": 2}]},
+            {
+                "id": "d-ship",
+                "status": "active",
+                "research_history": [{"prs_merged": 2}],
+            },
         ]
-        out = _build_prune_candidates(pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00")
+        out = _build_prune_candidates(
+            pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00"
+        )
         assert len(out["resolved_gaps"]) == 1
         assert out["resolved_gaps"][0]["reason"] == "direction_shipped"
 
@@ -9310,19 +10044,33 @@ class TestBuildPruneCandidates:
 
         pm = {
             "gaps": [
-                {"id": "g-deg", "name": "degraded only", "status": "active",
-                 "active_moves": ["d-deg"]},
-                {"id": "g-ver", "name": "verified", "status": "active",
-                 "active_moves": ["d-ver"]},
+                {
+                    "id": "g-deg",
+                    "name": "degraded only",
+                    "status": "active",
+                    "active_moves": ["d-deg"],
+                },
+                {
+                    "id": "g-ver",
+                    "name": "verified",
+                    "status": "active",
+                    "active_moves": ["d-ver"],
+                },
             ],
         }
         directions = [
             # Raw prs_merged>0 but the verification-aware count is 0 → not shipped.
-            {"id": "d-deg", "status": "active",
-             "research_history": [{"prs_merged": 3, "verified_prs_merged": 0}]},
+            {
+                "id": "d-deg",
+                "status": "active",
+                "research_history": [{"prs_merged": 3, "verified_prs_merged": 0}],
+            },
             # A genuine verified merge → still ships the gap.
-            {"id": "d-ver", "status": "active",
-             "research_history": [{"prs_merged": 1, "verified_prs_merged": 1}]},
+            {
+                "id": "d-ver",
+                "status": "active",
+                "research_history": [{"prs_merged": 1, "verified_prs_merged": 1}],
+            },
         ]
         out = _build_prune_candidates(
             pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00"
@@ -9336,13 +10084,22 @@ class TestBuildPruneCandidates:
 
         pm = {
             "capabilities": [
-                {"name": "ghost", "status": "working",
-                 "verification": {"effective_status": "absent"}},
+                {
+                    "name": "ghost",
+                    "status": "working",
+                    "verification": {"effective_status": "absent"},
+                },
                 # partial is NOT absent → not a prune candidate here.
-                {"name": "partial-cap", "status": "working",
-                 "verification": {"effective_status": "partial"}},
-                {"name": "unverified-cap", "status": "working",
-                 "verification": {"effective_status": "unverified"}},
+                {
+                    "name": "partial-cap",
+                    "status": "working",
+                    "verification": {"effective_status": "partial"},
+                },
+                {
+                    "name": "unverified-cap",
+                    "status": "working",
+                    "verification": {"effective_status": "unverified"},
+                },
             ],
         }
         out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
@@ -9356,16 +10113,34 @@ class TestBuildPruneCandidates:
         pm = {
             "gaps": [
                 # Hold elapsed.
-                {"id": "g-exp", "name": "expired hold", "status": "active",
-                 "deferral": {"rationale": "later", "created_at": "x",
-                              "hold_until": "2026-01-01T00:00:00+00:00"}},
+                {
+                    "id": "g-exp",
+                    "name": "expired hold",
+                    "status": "active",
+                    "deferral": {
+                        "rationale": "later",
+                        "created_at": "x",
+                        "hold_until": "2026-01-01T00:00:00+00:00",
+                    },
+                },
                 # Hold still in the future → NOT a candidate.
-                {"id": "g-fut", "name": "future hold", "status": "active",
-                 "deferral": {"rationale": "later", "created_at": "x",
-                              "hold_until": "2027-01-01T00:00:00+00:00"}},
+                {
+                    "id": "g-fut",
+                    "name": "future hold",
+                    "status": "active",
+                    "deferral": {
+                        "rationale": "later",
+                        "created_at": "x",
+                        "hold_until": "2027-01-01T00:00:00+00:00",
+                    },
+                },
                 # Deferral with no hold_until → NOT a candidate.
-                {"id": "g-noh", "name": "no hold", "status": "active",
-                 "deferral": {"rationale": "later", "created_at": "x"}},
+                {
+                    "id": "g-noh",
+                    "name": "no hold",
+                    "status": "active",
+                    "deferral": {"rationale": "later", "created_at": "x"},
+                },
             ],
         }
         out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
@@ -9377,30 +10152,52 @@ class TestBuildPruneCandidates:
 
         pm = {
             "gaps": [
-                {"id": "g-bad", "name": "bad ts", "status": "active",
-                 "deferral": {"rationale": "x", "created_at": "x",
-                              "hold_until": "not-a-timestamp"}},
-                {"id": "g-num", "name": "num ts", "status": "active",
-                 "deferral": {"rationale": "x", "created_at": "x",
-                              "hold_until": 12345}},
+                {
+                    "id": "g-bad",
+                    "name": "bad ts",
+                    "status": "active",
+                    "deferral": {
+                        "rationale": "x",
+                        "created_at": "x",
+                        "hold_until": "not-a-timestamp",
+                    },
+                },
+                {
+                    "id": "g-num",
+                    "name": "num ts",
+                    "status": "active",
+                    "deferral": {
+                        "rationale": "x",
+                        "created_at": "x",
+                        "hold_until": 12345,
+                    },
+                },
             ],
         }
         # Malformed hold_until is ignored — no candidates, so None.
-        assert _build_prune_candidates(
-            pm, [], self._LARGE, "2026-06-04T00:00:00+00:00"
-        ) is None
+        assert (
+            _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+            is None
+        )
 
     def test_respects_cap_and_carries_true_totals(self):
         from app.strategic_spawning import _build_prune_candidates, _RECON_LIST_CAP
 
         gaps = [
-            {"id": f"g-{i}", "name": f"resolved {i}", "status": "active",
-             "active_moves": ["d-ret"]}
+            {
+                "id": f"g-{i}",
+                "name": f"resolved {i}",
+                "status": "active",
+                "active_moves": ["d-ret"],
+            }
             for i in range(_RECON_LIST_CAP + 4)
         ]
         directions = [{"id": "d-ret", "status": "retired"}]
         out = _build_prune_candidates(
-            {"gaps": gaps}, directions, self._LARGE, "2026-06-04T00:00:00+00:00",
+            {"gaps": gaps},
+            directions,
+            self._LARGE,
+            "2026-06-04T00:00:00+00:00",
         )
         assert len(out["resolved_gaps"]) == _RECON_LIST_CAP
         assert out["counts"]["resolved_gaps"] == _RECON_LIST_CAP + 4
@@ -9415,14 +10212,19 @@ class TestBuildPruneCandidates:
                 # No backing_paths, no source, no verification → ungroundable.
                 {"name": "ungrounded-cap", "status": "planned"},
                 # Has backing_paths → NOT ungroundable.
-                {"name": "grounded-cap", "status": "working",
-                 "backing_paths": ["backend/app/foo.py"]},
+                {
+                    "name": "grounded-cap",
+                    "status": "working",
+                    "backing_paths": ["backend/app/foo.py"],
+                },
                 # Has source → NOT ungroundable (even without backing_paths).
-                {"name": "sourced-cap", "status": "working",
-                 "source": "documentation"},
+                {"name": "sourced-cap", "status": "working", "source": "documentation"},
                 # Has verification → NOT ungroundable.
-                {"name": "verified-cap", "status": "working",
-                 "verification": {"effective_status": "working"}},
+                {
+                    "name": "verified-cap",
+                    "status": "working",
+                    "verification": {"effective_status": "working"},
+                },
             ],
         }
         out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
@@ -9440,8 +10242,11 @@ class TestBuildPruneCandidates:
                 {"name": "no-ground-cap", "status": "working"},
                 {"name": "another-no-ground", "status": "planned"},
                 # excluded
-                {"name": "grounded", "status": "working",
-                 "backing_paths": ["path/to/file.py"]},
+                {
+                    "name": "grounded",
+                    "status": "working",
+                    "backing_paths": ["path/to/file.py"],
+                },
             ],
         }
         out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
@@ -9459,15 +10264,19 @@ class TestBuildPruneCandidates:
 
         pm = {
             "capabilities": [
-                {"name": "cap-with-source", "status": "working",
-                 "source": "design_doc"},
+                {
+                    "name": "cap-with-source",
+                    "status": "working",
+                    "source": "design_doc",
+                },
             ],
         }
         # source is present → not in ungroundable_capabilities → only candidate class
         # available is none → returns None.
-        assert _build_prune_candidates(
-            pm, [], self._LARGE, "2026-06-04T00:00:00+00:00"
-        ) is None
+        assert (
+            _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+            is None
+        )
 
     def test_domain_merge_groups_keyword_bucketing(self):
         """Capabilities sharing a keyword bucket form a merge group."""
@@ -9513,19 +10322,37 @@ class TestBuildPruneCandidates:
         from app.strategic_spawning import _build_prune_candidates
 
         def _history(n: int) -> list:
-            return [{"event": f"entry-{i}", "ts": f"2026-0{i+1}-01"} for i in range(n)]
+            return [
+                {"event": f"entry-{i}", "ts": f"2026-0{i + 1}-01"} for i in range(n)
+            ]
 
         pm = {
             "gaps": [
-                {"id": "g-small", "name": "small gap", "status": "active",
-                 "history": _history(2)},
-                {"id": "g-large", "name": "large gap", "status": "active",
-                 "history": _history(10)},
-                {"id": "g-medium", "name": "medium gap", "status": "active",
-                 "history": _history(5)},
+                {
+                    "id": "g-small",
+                    "name": "small gap",
+                    "status": "active",
+                    "history": _history(2),
+                },
+                {
+                    "id": "g-large",
+                    "name": "large gap",
+                    "status": "active",
+                    "history": _history(10),
+                },
+                {
+                    "id": "g-medium",
+                    "name": "medium gap",
+                    "status": "active",
+                    "history": _history(5),
+                },
                 # archived gap — not included in heavy_gaps
-                {"id": "g-arch", "name": "archived gap", "status": "archived",
-                 "history": _history(20)},
+                {
+                    "id": "g-arch",
+                    "name": "archived gap",
+                    "status": "archived",
+                    "history": _history(20),
+                },
             ],
         }
         out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
@@ -9577,22 +10404,35 @@ class TestBuildPruneCandidates:
                 # ungroundable
                 {"name": "no-ground", "status": "planned"},
                 # absent
-                {"name": "ghost", "status": "working",
-                 "verification": {"effective_status": "absent"}},
+                {
+                    "name": "ghost",
+                    "status": "working",
+                    "verification": {"effective_status": "absent"},
+                },
             ],
             "gaps": [
                 # resolved
-                {"id": "g1", "name": "g1", "status": "active",
-                 "active_moves": ["d-ret"]},
+                {
+                    "id": "g1",
+                    "name": "g1",
+                    "status": "active",
+                    "active_moves": ["d-ret"],
+                },
             ],
         }
         directions = [{"id": "d-ret", "status": "retired"}]
-        out = _build_prune_candidates(pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00")
+        out = _build_prune_candidates(
+            pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00"
+        )
         assert out is not None
         for key in (
-            "resolved_gaps", "absent_capabilities", "expired_holds",
-            "ungroundable_capabilities", "domain_merge_groups",
-            "heavy_gaps", "long_names",
+            "resolved_gaps",
+            "absent_capabilities",
+            "expired_holds",
+            "ungroundable_capabilities",
+            "domain_merge_groups",
+            "heavy_gaps",
+            "long_names",
         ):
             assert key in out["counts"], f"counts missing key: {key}"
 
@@ -9641,9 +10481,7 @@ async def test_seeded_goal_reaches_strategic_review_payload(db_session):
     await db_session.commit()
     await db_session.refresh(project)
     db_session.add(
-        ProjectMessage(
-            project_id=project.id, from_type="user", content=_ONBOARD_GOAL
-        )
+        ProjectMessage(project_id=project.id, from_type="user", content=_ONBOARD_GOAL)
     )
     await db_session.commit()
 
@@ -9673,9 +10511,7 @@ async def test_seeded_goal_reaches_design_doc_update_payload(db_session):
     await db_session.commit()
     await db_session.refresh(project)
     db_session.add(
-        ProjectMessage(
-            project_id=project.id, from_type="user", content=_ONBOARD_GOAL
-        )
+        ProjectMessage(project_id=project.id, from_type="user", content=_ONBOARD_GOAL)
     )
     await db_session.commit()
 
@@ -9814,18 +10650,30 @@ def test_summarize_open_messages_preserves_critical_and_oldest():
     messages = []
     # One old critical BUG_REPORT (oldest) and one BLOCKER.
     messages.append(
-        {"id": "bug", "type": "BUG_REPORT", "content": "x" * 5000,
-         "created_at": "2026-05-01T00:00:00"}
+        {
+            "id": "bug",
+            "type": "BUG_REPORT",
+            "content": "x" * 5000,
+            "created_at": "2026-05-01T00:00:00",
+        }
     )
     messages.append(
-        {"id": "blk", "type": "BLOCKER", "content": "blocked",
-         "created_at": "2026-05-02T00:00:00"}
+        {
+            "id": "blk",
+            "type": "BLOCKER",
+            "content": "blocked",
+            "created_at": "2026-05-02T00:00:00",
+        }
     )
     # Many newer NOTEs that should be trimmed away first.
     for i in range(50):
         messages.append(
-            {"id": f"note{i}", "type": "NOTE", "content": f"note {i}",
-             "created_at": f"2026-06-01T00:00:{i:02d}"}
+            {
+                "id": f"note{i}",
+                "type": "NOTE",
+                "content": f"note {i}",
+                "created_at": f"2026-06-01T00:00:{i:02d}",
+            }
         )
 
     trimmed = _summarize_open_messages(messages)
@@ -9981,24 +10829,39 @@ class TestParallelismHint:
         from app.strategic_spawning import _build_parallelism_hint
 
         # At the target (min(max_active, vms)): no nag.
-        assert _build_parallelism_hint(8, max_concurrent_vms=8, max_active_directions=10) == ""
+        assert (
+            _build_parallelism_hint(8, max_concurrent_vms=8, max_active_directions=10)
+            == ""
+        )
         # max_active_directions is the target even when the fleet could run more VMs.
-        assert _build_parallelism_hint(10, max_concurrent_vms=15, max_active_directions=10) == ""
+        assert (
+            _build_parallelism_hint(10, max_concurrent_vms=15, max_active_directions=10)
+            == ""
+        )
         # Above the VM-clamped target also no nag.
-        assert _build_parallelism_hint(10, max_concurrent_vms=8, max_active_directions=10) == ""
+        assert (
+            _build_parallelism_hint(10, max_concurrent_vms=8, max_active_directions=10)
+            == ""
+        )
 
     def test_below_target_nags_above_the_old_floor(self):
         from app.strategic_spawning import _build_parallelism_hint
 
         # Core behavior change: the old gate went silent at 3 directions. Now 4 on
         # a 15-VM fleet (target 10) still nags, and 5 of 8 (target 8) still nags.
-        assert _build_parallelism_hint(4, max_concurrent_vms=15, max_active_directions=10)
-        assert _build_parallelism_hint(5, max_concurrent_vms=8, max_active_directions=10)
+        assert _build_parallelism_hint(
+            4, max_concurrent_vms=15, max_active_directions=10
+        )
+        assert _build_parallelism_hint(
+            5, max_concurrent_vms=8, max_active_directions=10
+        )
 
     def test_below_target_emits_independence_framed_hint(self):
         from app.strategic_spawning import _build_parallelism_hint
 
-        hint = _build_parallelism_hint(1, max_concurrent_vms=8, max_active_directions=10)
+        hint = _build_parallelism_hint(
+            1, max_concurrent_vms=8, max_active_directions=10
+        )
         assert hint  # non-empty
         assert "PARALLELISM" in hint
         assert "1 active direction" in hint
@@ -10012,19 +10875,29 @@ class TestParallelismHint:
         from app.strategic_spawning import _build_parallelism_hint
 
         # Fleet can only run 2 VMs, so 2 active directions is NOT underutilized.
-        assert _build_parallelism_hint(2, max_concurrent_vms=2, max_active_directions=10) == ""
+        assert (
+            _build_parallelism_hint(2, max_concurrent_vms=2, max_active_directions=10)
+            == ""
+        )
         # But 1 active on a 2-VM fleet still leaves a lane idle.
-        assert _build_parallelism_hint(1, max_concurrent_vms=2, max_active_directions=10)
+        assert _build_parallelism_hint(
+            1, max_concurrent_vms=2, max_active_directions=10
+        )
 
     def test_unknown_capacity_targets_max_active_and_omits_vm_clause(self):
         from app.strategic_spawning import _build_parallelism_hint
 
         # No capacity signal → target falls back to max_active_directions; no VM clause.
-        hint = _build_parallelism_hint(1, max_concurrent_vms=0, max_active_directions=10)
+        hint = _build_parallelism_hint(
+            1, max_concurrent_vms=0, max_active_directions=10
+        )
         assert hint
         assert "VMs at once" not in hint  # no concrete VM count when capacity unknown
         # At the max_active_directions target with unknown capacity: no nag.
-        assert _build_parallelism_hint(10, max_concurrent_vms=0, max_active_directions=10) == ""
+        assert (
+            _build_parallelism_hint(10, max_concurrent_vms=0, max_active_directions=10)
+            == ""
+        )
 
 
 # ── Deploy-model framing (integration-branch landing ≠ deployment) ────────────
@@ -10562,9 +11435,7 @@ async def test_design_doc_update_no_operator_steered_when_no_marker(db_session):
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     task = result.scalars().all()[0]
     assert "operator_steered" not in (task.context or {})
 
@@ -10587,13 +11458,16 @@ async def test_strategic_review_start_event_includes_cycle_and_steering(
     await db_session.commit()
     await db_session.refresh(project)
 
-    assert await _spawn_strategic_review(
-        project,
-        db_session,
-        cycle_id=cycle_id,
-        operator_steered=True,
-        steering_excerpt=steering_excerpt,
-    ) is True
+    assert (
+        await _spawn_strategic_review(
+            project,
+            db_session,
+            cycle_id=cycle_id,
+            operator_steered=True,
+            steering_excerpt=steering_excerpt,
+        )
+        is True
+    )
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     task = result.scalars().all()[0]
@@ -10621,12 +11495,8 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
 
     # Phase-1 → Phase-2 completion emits cycle events; stub them so the test
     # exercises only the steering-directive threading, not the SSE layer.
-    mocker.patch(
-        "app.strategic_events.emit_strategic_cycle_started", new=AsyncMock()
-    )
-    mocker.patch(
-        "app.strategic_events.emit_strategic_cycle_completed", new=AsyncMock()
-    )
+    mocker.patch("app.strategic_events.emit_strategic_cycle_started", new=AsyncMock())
+    mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=AsyncMock())
 
     project = _make_project(
         vision={
@@ -10672,7 +11542,9 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
     # mark Phase 1 complete so the Phase 2 active-task guard does not skip.
     from app.strategic_trigger import strategic_refresh_origin
 
-    project.vision = {k: v for k, v in project.vision.items() if k != "_strategic_refresh"}
+    project.vision = {
+        k: v for k, v in project.vision.items() if k != "_strategic_refresh"
+    }
     design_doc_task.status = TaskStatus.COMPLETED
     db_session.add(project)
     db_session.add(design_doc_task)
@@ -10931,7 +11803,9 @@ async def test_spawn_strategic_review_thread_aged_out_uses_steering_excerpt(
     assert steering_excerpt in suffix
     # Sanity: the operator message really did age out of the shipped snapshot,
     # so the directive came from the durable excerpt — not the live thread.
-    thread_contents = [m.get("content", "") for m in payload.get("conversation_thread", [])]
+    thread_contents = [
+        m.get("content", "") for m in payload.get("conversation_thread", [])
+    ]
     assert not any("aged out" in c for c in thread_contents)
 
 
@@ -11352,7 +12226,12 @@ def test_floor_leaves_caps_friction_untouched_when_gaps_are_the_bulk():
     pm = {
         "gaps": gaps,
         "capabilities": [
-            {"name": "keep me", "status": "working", "notes": "n", "backing_paths": ["a.py"]}
+            {
+                "name": "keep me",
+                "status": "working",
+                "notes": "n",
+                "backing_paths": ["a.py"],
+            }
         ],
         "friction": [
             {"id": "f-keep", "name": "keep", "status": "active", "description": "d"}
@@ -11473,7 +12352,10 @@ def _mature_agent_view_problem_model() -> dict:
             "status": "working" if i % 2 == 0 else "partial",
             "notes": cap_notes,
             "source": {"type": "shipped_change", "pr_number": 7000 + i},
-            "backing_paths": [f"backend/app/mod_{i}.py", f"backend/testing/test_mod_{i}.py"],
+            "backing_paths": [
+                f"backend/app/mod_{i}.py",
+                f"backend/testing/test_mod_{i}.py",
+            ],
         }
         for i in range(20)
     ]
@@ -11556,7 +12438,9 @@ def test_strategic_review_ships_whole_problem_model_under_contention():
     assert len(shipped["friction"]) == 8
     assert len(shipped["gaps"]) == 12
     assert shipped["capabilities"][0].get("notes"), "capability detail was collapsed"
-    assert shipped["capabilities"][0].get("backing_paths"), "capability detail collapsed"
+    assert shipped["capabilities"][0].get("backing_paths"), (
+        "capability detail collapsed"
+    )
     assert shipped["friction"][0].get("description"), "friction detail was collapsed"
 
 
@@ -11774,9 +12658,7 @@ async def test_strategic_review_ships_design_doc_index_not_full_prose(
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     dd = payload["design_doc"]
@@ -11819,9 +12701,7 @@ async def test_design_doc_update_ships_design_doc_index_not_full_prose(
 
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     payload = result.scalars().all()[0].payloads[0]
     assert payload["type"] == "design_doc_update"
 
@@ -11881,7 +12761,8 @@ async def test_strategic_review_includes_missing_capability_demand(db_session):
     assert spawned is True
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     payload = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if t.payloads[0].get("type") == "strategic_review"
     ][0].payloads[0]
 
@@ -11899,13 +12780,16 @@ async def test_strategic_review_omits_demand_when_none(db_session):
     await db_session.refresh(project)
     await _seed_legacy_cycles(db_session, project)
 
-    assert (await collect_missing_capability_demand(db_session, project.id))["total"] == 0
+    assert (await collect_missing_capability_demand(db_session, project.id))[
+        "total"
+    ] == 0
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     payload = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if t.payloads[0].get("type") == "strategic_review"
     ][0].payloads[0]
 
@@ -11933,7 +12817,8 @@ async def test_design_doc_update_includes_missing_capability_demand(db_session):
     assert spawned is True
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     payload = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if t.payloads[0].get("type") == "design_doc_update"
     ][0].payloads[0]
 
@@ -11950,13 +12835,16 @@ async def test_design_doc_update_omits_demand_when_none(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    assert (await collect_missing_capability_demand(db_session, project.id))["total"] == 0
+    assert (await collect_missing_capability_demand(db_session, project.id))[
+        "total"
+    ] == 0
 
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     payload = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if t.payloads[0].get("type") == "design_doc_update"
     ][0].payloads[0]
 
@@ -12013,7 +12901,9 @@ def _accept_cycle(*, proven, declared, merged=2, **extra):
         "acceptance_merged_write_total": merged,
         "acceptance_proven_merged": proven,
         "acceptance_declared_merged": declared,
-        "acceptance_declaration_coverage": round(declared / merged, 3) if merged else None,
+        "acceptance_declaration_coverage": round(declared / merged, 3)
+        if merged
+        else None,
     }
     entry.update(extra)
     return entry
@@ -12031,8 +12921,12 @@ def test_direction_health_reflects_declaration_coverage():
     from app.direction_outcomes import verified_merged_count
 
     # Equal MERGE VOLUME (3 cycles, 2 verified merges each); only proof differs.
-    proven_dir = {"research_history": [_accept_cycle(proven=2, declared=2) for _ in range(3)]}
-    undeclared_dir = {"research_history": [_accept_cycle(proven=0, declared=0) for _ in range(3)]}
+    proven_dir = {
+        "research_history": [_accept_cycle(proven=2, declared=2) for _ in range(3)]
+    }
+    undeclared_dir = {
+        "research_history": [_accept_cycle(proven=0, declared=0) for _ in range(3)]
+    }
 
     # 1. Quality/health: the undeclared pile no longer reads as fully healthy.
     q_proven = _compute_direction_quality_score(proven_dir)
@@ -12073,6 +12967,7 @@ def test_direction_health_reflects_declaration_coverage():
 
 
 # ── _summarize_memo_citations tests ──────────────────────────────────────────
+
 
 def test_summarize_memo_citations_legacy_shape_unchanged():
     """Legacy {task_id, summary_excerpt} entries pass through unchanged."""
@@ -12123,14 +13018,20 @@ def test_summarize_memo_citations_strips_heavy_fields():
     assert entry["success_evidence"] == "All tests passed."
     assert entry["retirement_condition"] == "KPIs met."
     assert entry["citation_refs"] == "task-cit-1, task-cit-2"
-    assert entry["final_metrics_excerpt"] == "final_prs_merged=10, final_cycles_active=4"
+    assert (
+        entry["final_metrics_excerpt"] == "final_prs_merged=10, final_cycles_active=4"
+    )
     assert entry["rationale_excerpt"] == "Long rationale text."
     assert entry["reasoning_excerpt"] == "Direction: retired because KPIs were met."
     # Heavy/verbose fields stripped
     assert "citations" not in entry, "_summarize_memo_citations must strip citations"
-    assert "final_metrics" not in entry, "_summarize_memo_citations must strip final_metrics"
+    assert "final_metrics" not in entry, (
+        "_summarize_memo_citations must strip final_metrics"
+    )
     assert "rationale" not in entry, "_summarize_memo_citations must strip rationale"
-    assert "reasoning" not in entry, "_summarize_memo_citations must strip full reasoning"
+    assert "reasoning" not in entry, (
+        "_summarize_memo_citations must strip full reasoning"
+    )
 
 
 def test_summarize_memo_citations_strips_full_reasoning_keeps_excerpt():
@@ -12150,7 +13051,9 @@ def test_summarize_memo_citations_strips_full_reasoning_keeps_excerpt():
     result = _summarize_memo_citations(memos)
     assert len(result) == 1
     entry = result[0]
-    assert "reasoning" not in entry, "full reasoning must be stripped to honour budget bounds"
+    assert "reasoning" not in entry, (
+        "full reasoning must be stripped to honour budget bounds"
+    )
     assert entry["reasoning_excerpt"] == "Compact excerpt that fits in budget."
     assert entry["task_id"] == "t-full"
 
@@ -12167,7 +13070,10 @@ def test_summarize_memo_citations_caps_entry_count():
 
 def test_summarize_memo_citations_caps_excerpt_length():
     """summary_excerpt is capped to _MEMO_EXCERPT_MAX_CHARS."""
-    from app.strategic_spawning import _summarize_memo_citations, _MEMO_EXCERPT_MAX_CHARS
+    from app.strategic_spawning import (
+        _summarize_memo_citations,
+        _MEMO_EXCERPT_MAX_CHARS,
+    )
 
     long_text = "x" * (_MEMO_EXCERPT_MAX_CHARS + 100)
     memos = [{"task_id": "t1", "summary_excerpt": long_text}]
@@ -12202,7 +13108,14 @@ def test_summarize_efficiency_snapshot_includes_format_compliance():
     from app.strategic_spawning import _summarize_efficiency_snapshot
 
     snapshot = {
-        "axes": {"cost_per_merged_pr": {"current": 1.5, "baseline": 2.0, "drift_pct": -25.0, "history": []}},
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            }
+        },
         "baseline_captured_at": "2026-04-05T00:00:00",
         "last_snapshot_at": "2026-05-01T00:00:00",
         "format_compliance": {
@@ -12224,7 +13137,11 @@ def test_summarize_efficiency_snapshot_includes_format_compliance():
     assert "format_compliance" in result
     fc = result["format_compliance"]
     assert "format_compliance_rate" in fc
-    assert fc["format_compliance_rate"] == {"current": 0.92, "baseline": 0.88, "drift_pct": 4.5}
+    assert fc["format_compliance_rate"] == {
+        "current": 0.92,
+        "baseline": 0.88,
+        "drift_pct": 4.5,
+    }
     assert "history" not in fc["format_compliance_rate"]
     assert "self_repair_success_rate" in fc
     assert fc["self_repair_success_rate"]["current"] == 0.75
@@ -12235,7 +13152,14 @@ def test_summarize_efficiency_snapshot_includes_agent_timeout_rate():
     from app.strategic_spawning import _summarize_efficiency_snapshot
 
     snapshot = {
-        "axes": {"cost_per_merged_pr": {"current": 1.5, "baseline": 2.0, "drift_pct": -25.0, "history": []}},
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            }
+        },
         "agent_timeout_rate": {
             "overall": {
                 "current": 0.08,
@@ -12287,7 +13211,14 @@ def test_summarize_efficiency_snapshot_omits_blocks_when_absent():
     from app.strategic_spawning import _summarize_efficiency_snapshot
 
     snapshot = {
-        "axes": {"cost_per_merged_pr": {"current": 1.5, "baseline": 2.0, "drift_pct": -25.0, "history": []}},
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            }
+        },
     }
     result = _summarize_efficiency_snapshot(snapshot)
     assert "format_compliance" not in result

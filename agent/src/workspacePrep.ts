@@ -23,6 +23,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { cloneWithRetry, log, GIT_REFERENCE_CACHE_ROOT, registerSizeCapMergeDriver } from './index.js';
 import { DEFAULT_CLONE_DEPTH } from './constants.js';
+import { sanitize } from './utils/sanitize.js';
 
 /**
  * Resolve the pre-baked git object mirror path for an authenticated clone URL,
@@ -82,6 +83,39 @@ export interface PrepareWorkspaceOptions {
   allowLaneResume?: boolean;
 }
 
+/** Structured outcome from a single `prepareWorkspaceForRole` call. */
+export interface WorkspacePrepOutcome {
+  /** Which path actually completed. */
+  path: 'warm' | 'cold';
+  /** True only when the warm reuse path completed without falling back to cold. */
+  warm_reuse_succeeded: boolean;
+  /** True only when lane-mode hard-reset to the checkpoint SHA actually executed. */
+  checkpoint_reset_applied: boolean;
+  /**
+   * Short bounded reason string when the cold path was taken AFTER a warm
+   * attempt failed. Null when no warm attempt was made (genuine cold start) or
+   * when warm succeeded.
+   */
+  cold_fallback_reason: string | null;
+  /** Whether lane mode was requested (BLUEPRINT_LANE_MODE=1 with allowLaneResume). */
+  lane_phase: boolean;
+}
+
+// Module-level recorder: written by prepareWorkspaceForRole, read by
+// enrichStatusPayload (via getLastWorkspacePrepOutcome). Reset between roles.
+let _lastWorkspacePrepOutcome: WorkspacePrepOutcome | null = null;
+
+/** Returns the outcome of the most recent prepareWorkspaceForRole call, or
+ *  null if the function has not been called since the last reset. */
+export function getLastWorkspacePrepOutcome(): WorkspacePrepOutcome | null {
+  return _lastWorkspacePrepOutcome;
+}
+
+/** Reset the recorded outcome (called between roles by resetPerRoleModuleState). */
+export function resetWorkspacePrepOutcome(): void {
+  _lastWorkspacePrepOutcome = null;
+}
+
 /**
  * Prepare the workspace for the next role. Either reuses the existing clone
  * (warm path) or wipes + re-clones (cold path).
@@ -93,8 +127,15 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
     ? opts.depth
     : DEFAULT_CLONE_DEPTH;
 
+  // lane_phase is meaningful for both warm and cold paths — computed upfront.
+  const allowLaneResume = opts.allowLaneResume !== false;
+  const lanePhase = allowLaneResume && process.env.BLUEPRINT_LANE_MODE === '1';
+
   const warmHandoff = process.env.BLUEPRINT_WARM_HANDOFF === '1';
   const gitDirExists = warmHandoff && fs.existsSync(path.join(workspace, '.git'));
+
+  // cold_fallback_reason is set in the warm-path catch when we fall through.
+  let coldFallbackReason: string | null = null;
 
   if (warmHandoff && gitDirExists) {
     try {
@@ -170,10 +211,10 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
       // allowLaneResume defaults true (env-driven). A reviewer/auditor passes
       // false so lane reset can never engage even if a lane env leaked onto a
       // cold claim — the cold, independent review path is non-negotiable.
-      const allowLaneResume = opts.allowLaneResume !== false;
-      const laneMode = allowLaneResume && process.env.BLUEPRINT_LANE_MODE === '1';
-      const laneCheckpointSha = laneMode ? (process.env.BLUEPRINT_LANE_CHECKPOINT_SHA ?? '') : '';
-      if (laneMode && laneCheckpointSha) {
+      // lanePhase is computed above (before the warm/cold branch).
+      const laneCheckpointSha = lanePhase ? (process.env.BLUEPRINT_LANE_CHECKPOINT_SHA ?? '') : '';
+      const checkpointResetApplied = lanePhase && !!laneCheckpointSha;
+      if (lanePhase && laneCheckpointSha) {
         execFileSync('git', ['-C', workspace, 'reset', '--hard', laneCheckpointSha], {
           encoding: 'utf-8', timeout: 30_000,
         });
@@ -200,9 +241,18 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
       // always assert it (a prior role on a different repo could have left it unset).
       registerSizeCapMergeDriver(workspace);
       log(`prepareWorkspaceForRole: warm-handoff reuse OK (branch=${branch})`);
+      _lastWorkspacePrepOutcome = {
+        path: 'warm',
+        warm_reuse_succeeded: true,
+        checkpoint_reset_applied: checkpointResetApplied,
+        cold_fallback_reason: null,
+        lane_phase: lanePhase,
+      };
       return;
     } catch (e) {
-      log(`prepareWorkspaceForRole: warm path failed (${String(e)}); falling back to cold clone`);
+      const sanitizedError = sanitize(String(e));
+      coldFallbackReason = `warm_path_error: ${sanitizedError.slice(0, 200)}`;
+      log(`prepareWorkspaceForRole: warm path failed (${sanitizedError}); falling back to cold clone`);
       // Fall through to cold path.
     }
   }
@@ -227,4 +277,11 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
   // A fresh clone does NOT carry .git/config, so the .gitattributes sizecap
   // mapping is inert until the driver command is registered here.
   registerSizeCapMergeDriver(workspace);
+  _lastWorkspacePrepOutcome = {
+    path: 'cold',
+    warm_reuse_succeeded: false,
+    checkpoint_reset_applied: false,
+    cold_fallback_reason: coldFallbackReason,
+    lane_phase: lanePhase,
+  };
 }

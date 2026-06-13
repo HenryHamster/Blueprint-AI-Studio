@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from app.models import Task, TaskStatus
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, clear_retry_after
 
 # Canonical failure class for precondition blockers (mirrors
 # app.failure_classification.BLOCKED_PRECONDITION; duplicated as a literal here
@@ -40,6 +40,46 @@ BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 
 # JSONB key under Task.context that holds the structured blocker metadata.
 BLOCKER_CONTEXT_KEY = "blocker"
+
+# Attempt-scoped context keys that must not survive any path returning a task
+# (or clone) to QUEUED. Retry-guidance history such as
+# ``_previous_failure_class`` / ``_failure_class_history`` is intentionally not
+# listed here: it describes prior attempts and is consumed by retry prompts.
+FRESH_ATTEMPT_CONTEXT_STRIP_KEYS: frozenset[str] = frozenset(
+    {
+        "failure_class",
+        "failure_category",
+        BLOCKER_CONTEXT_KEY,
+        "_blocked_escalated",
+        "_precondition_escalated_key",
+        "_blocked_optimistic_retries",
+        "_retry_after_resets",
+        "provision_failures",
+        "provision_failures_infra",
+        "retry_after",
+        "max_plan_account_id",
+        "llm_account_id",
+        "llm_provider",
+        "llm_auth_mode",
+        "llm_model",
+        "llm_execution_mode",
+        "_infra_wait",
+        "blacklisted_accounts",
+        "provision_failed_accounts",
+        "_slot_released",
+        "_api_failure_retries",
+        "_dispatch_prep_failures",
+        # Transient lane/warm routing is per-attempt and must be reattached by
+        # an explicit spawn path if still relevant.
+        "improvement_lane_id",
+        "is_lane_phase",
+        "lane_checkpoint_sha",
+        "lane_resume",
+        "warm_target_vm_id",
+        "warm_target_pr",
+        "warm_handoff_deadline",
+    }
+)
 
 # ── Canonical machine-resolvable NEED primitive ──────────────────────────────
 # A "need" names the specific precondition a piece of blocked work depends on,
@@ -384,6 +424,34 @@ def mark_blocker_escalated(
     return meta
 
 
+def strip_fresh_attempt_context(
+    context: object,
+    *,
+    preserve_blocked_optimistic_retries: bool = False,
+    preserve_non_blocked_failure_verdict: bool = False,
+) -> Dict[str, Any]:
+    """Return ``context`` with stale per-attempt state removed.
+
+    ``preserve_non_blocked_failure_verdict`` exists for
+    :func:`clear_blocker_metadata`: that unblock helper historically removes
+    only BLOCKED_PRECONDITION compatibility tags, preserving a later
+    authoritative verdict such as RATE_LIMIT. Fresh QUEUED resurrection paths
+    should use the default and strip all previous verdict keys.
+    """
+    ctx = dict(context) if isinstance(context, dict) else {}
+    for key in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS:
+        if key == "_blocked_optimistic_retries" and preserve_blocked_optimistic_retries:
+            continue
+        if key in ("failure_class", "failure_category"):
+            if (
+                preserve_non_blocked_failure_verdict
+                and ctx.get(key) != BLOCKED_PRECONDITION
+            ):
+                continue
+        ctx.pop(key, None)
+    return ctx
+
+
 def clear_blocker_metadata(task: Task) -> None:
     """Drop the structured blocker metadata from the task context.
 
@@ -405,6 +473,7 @@ def clear_blocker_metadata(task: Task) -> None:
     task.blocked_reason = None
     task.blocked_at = None
     task.recheck_after = None
+    clear_retry_after(task)
     ctx_src = task.context or {}
     has_blocker = BLOCKER_CONTEXT_KEY in ctx_src
     stale_class = ctx_src.get("failure_class") == BLOCKED_PRECONDITION
@@ -414,18 +483,11 @@ def clear_blocker_metadata(task: Task) -> None:
     )
     if not (has_blocker or stale_class or stale_category or has_escalation_markers):
         return
-    ctx = dict(ctx_src)
-    ctx.pop(BLOCKER_CONTEXT_KEY, None)
-    # Clear reaper escalation markers: a requeued task must not carry the prior
-    # episode's escalation state into the next attempt (whack-a-mole bug where
-    # operator requeues a file_conflict blocker and it re-parks within seconds).
-    ctx.pop("_blocked_escalated", None)
-    ctx.pop("_precondition_escalated_key", None)
-    if stale_class:
-        ctx.pop("failure_class", None)
-    if stale_category:
-        ctx.pop("failure_category", None)
-    task.context = ctx
+    task.context = strip_fresh_attempt_context(
+        ctx_src,
+        preserve_blocked_optimistic_retries=True,
+        preserve_non_blocked_failure_verdict=True,
+    )
 
 
 def unblock_to_queued(
@@ -440,6 +502,7 @@ def unblock_to_queued(
     decides *when* a precondition has resolved is owned by the auto-unblock work.
     """
     clear_blocker_metadata(task)
+    task.context = strip_fresh_attempt_context(task.context or {})
     task.status = TaskStatus.QUEUED
     task.latest_status_message = (
         message or "Unblocked — precondition resolved, requeued"

@@ -11,16 +11,19 @@ import base64
 import json
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 import os
 import shlex
 import signal
 import uuid
 
 import pytest
+import pytest_asyncio
 from google.api_core.exceptions import Aborted
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlmodel import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from sqlmodel import SQLModel, select
 
 from app import compute
 from app import compute_backends as compute_backends_module
@@ -128,6 +131,34 @@ def patched_client():
         yield client
 
 
+@pytest_asyncio.fixture()
+async def gcp_cleanup_db(mocker):
+    """Isolated DB for _cleanup_gcp revalidation tests."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    session_factory = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    mocker.patch("app.compute.AsyncSessionLocal", session_factory)
+
+    async with session_factory() as session:
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await engine.dispose()
+
+
 class TestStoreAgentSecretIamRetry:
     """Retry + idempotency tests for _store_agent_secret IAM policy handling."""
 
@@ -213,6 +244,146 @@ class TestStoreAgentSecretIamRetry:
 class _FleetSourceFakeSession:
     async def execute(self, _stmt):
         raise RuntimeError("db unavailable")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_gcp_skips_vm_that_becomes_active_mid_sweep(
+    gcp_cleanup_db, mocker
+):
+    """A VM that flips to IN_PROGRESS after inventory but before deletion must
+    be spared by the fresh revalidation step."""
+    project = Project(name="Cleanup Revalidate", user_id="user-1")
+    gcp_cleanup_db.add(project)
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(project)
+
+    target_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id="agent-vm-flip-1",
+    )
+    gcp_cleanup_db.add(target_task)
+    await gcp_cleanup_db.commit()
+
+    mocker.patch("app.compute.LOCAL_MODE", False)
+    mocker.patch("app.compute.FALLBACK_ZONES", [("us-central1-a", "subnet-a")])
+    mocker.patch("app.compute.GPU_FALLBACK_ZONES", {})
+    mocker.patch(
+        "app.compute._list_vms_in_zone",
+        return_value=[
+            ("agent-vm-flip-1", "us-central1-a", "RUNNING"),
+            ("agent-vm-orphan-1", "us-central1-a", "RUNNING"),
+        ],
+    )
+    delete_mock = mocker.patch("app.compute._delete_single_vm", return_value=True)
+
+    from app.services import _collect_gcp_cleanup_active_vm_ids as real_collect
+
+    flipped = {"done": False}
+
+    async def _flip_then_collect(session):
+        if not flipped["done"]:
+            target_task.status = TaskStatus.IN_PROGRESS
+            gcp_cleanup_db.add(target_task)
+            await gcp_cleanup_db.commit()
+            flipped["done"] = True
+        return await real_collect(session)
+
+    mocker.patch(
+        "app.services._collect_gcp_cleanup_active_vm_ids",
+        side_effect=_flip_then_collect,
+    )
+
+    result = await compute._cleanup_gcp([])
+
+    assert "agent-vm-orphan-1" in result.deleted
+    assert "agent-vm-flip-1" not in result.deleted
+    assert delete_mock.call_args_list == [call("agent-vm-orphan-1", "us-central1-a")]
+
+
+@pytest.mark.asyncio
+async def test_gpu_vm_lifecycle_searches_gpu_zone_ring_after_restart(monkeypatch):
+    """GPU-only zones (e.g. us-east1-d, us-east4-c) must be searched by
+    find_vm_zone, stop_vm, _delete_gcp, and _cleanup_gcp so compute-job VMs
+    provisioned in accelerator-specific zones survive process restarts and are
+    included in orphan cleanup."""
+    # us-east1-d and us-east4-c are in GPU_FALLBACK_ZONES but NOT in FALLBACK_ZONES.
+    cpu_only_zones = [
+        ("us-central1-f", "agent-sandbox-subnet"),
+        ("us-east1-b", "agent-sandbox-subnet-us-east1"),
+    ]
+    gpu_only_zones = {
+        "nvidia-tesla-t4": [
+            ("us-east1-d", "agent-sandbox-subnet-us-east1"),
+            ("us-east4-c", "agent-sandbox-subnet-us-east4"),
+        ]
+    }
+    monkeypatch.setattr(compute, "FALLBACK_ZONES", cpu_only_zones)
+    monkeypatch.setattr(compute, "GPU_FALLBACK_ZONES", gpu_only_zones)
+    monkeypatch.setattr(compute, "_vm_zones", {})
+
+    # --- find_vm_zone discovers a GPU-only zone after restart ---
+    probed: list[str] = []
+
+    def fake_get_vm_status(vm_name: str, zone: str) -> str | None:
+        probed.append(zone)
+        if zone == "us-east1-d" and vm_name == "compute-job-vm-gpu-1":
+            return "RUNNING"
+        return "DELETED"
+
+    monkeypatch.setattr(compute, "get_vm_status", fake_get_vm_status)
+    result_zone = compute.find_vm_zone("compute-job-vm-gpu-1")
+    assert result_zone == "us-east1-d", f"expected us-east1-d, got {result_zone}"
+    # CPU zones searched first, then GPU-only zones
+    assert "us-central1-f" in probed
+    assert "us-east1-d" in probed
+    # Zone repopulated in cache
+    assert compute._vm_zones.get("compute-job-vm-gpu-1") == "us-east1-d"
+
+    # --- _all_managed_zones includes GPU-only zones but not duplicates ---
+    all_zones = compute._all_managed_zones()
+    assert "us-east1-d" in all_zones
+    assert "us-east4-c" in all_zones
+    # CPU zones come first
+    assert all_zones.index("us-central1-f") < all_zones.index("us-east1-d")
+    # No duplicates
+    assert len(all_zones) == len(set(all_zones))
+
+    # --- _cleanup_gcp inventories GPU-only zones ---
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    listed_zones: list[str] = []
+
+    def fake_list_vms(zone: str):
+        listed_zones.append(zone)
+        if zone == "us-east4-c":
+            return [("compute-job-vm-orphan-gpu", zone, "RUNNING")]
+        return []
+
+    monkeypatch.setattr(compute, "_list_vms_in_zone", fake_list_vms)
+    deleted: list[str] = []
+
+    async def fake_refresh_active():
+        return set()
+
+    monkeypatch.setattr(
+        compute, "_refresh_gcp_cleanup_active_vm_ids", fake_refresh_active
+    )
+
+    def fake_delete_single_vm(name, zone):
+        deleted.append(name)
+        return True
+
+    def fake_delete_agent_secret_sync(name):
+        pass
+
+    monkeypatch.setattr(compute, "_delete_single_vm", fake_delete_single_vm)
+    monkeypatch.setattr(compute, "_delete_agent_secret", fake_delete_agent_secret_sync)
+
+    cleanup_result = await compute._cleanup_gcp([])
+    assert "us-east4-c" in listed_zones, "cleanup must scan GPU-only zone us-east4-c"
+    assert "compute-job-vm-orphan-gpu" in cleanup_result.deleted
 
 
 @pytest.mark.asyncio
@@ -518,6 +689,51 @@ async def test_local_compute_backend_idempotent_launch_preserves_started_at():
             ),
             reason="cleanup",
         )
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_env_does_not_inherit_orchestrator_secrets(
+    monkeypatch,
+):
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "DATABASE_URL",
+        "GITHUB_PRIVATE_KEY",
+        "AGENT_JWT_SECRET",
+        "WS_TICKET_SECRET",
+    ):
+        monkeypatch.setenv(key, f"sentinel-{key}")
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 12345
+    fake_proc.poll.return_value = None
+
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="env",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        env={"EXPLICIT_JOB_ENV": "present"},
+    )
+
+    with patch("app.compute_backends.subprocess.Popen", return_value=fake_proc) as popen:
+        result = await backend.launch(spec)
+
+    try:
+        child_env = popen.call_args.kwargs["env"]
+        assert child_env["EXPLICIT_JOB_ENV"] == "present"
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "DATABASE_URL",
+            "GITHUB_PRIVATE_KEY",
+            "AGENT_JWT_SECRET",
+            "WS_TICKET_SECRET",
+        ):
+            assert key not in child_env
+    finally:
+        backend._processes.pop(result.external_id, None)
 
 
 @pytest.mark.asyncio
@@ -8460,3 +8676,44 @@ def test_local_wrapper_command_writes_release_echo_to_terminal_file():
     assert "RELEASE_ECHO=$RELEASE_ECHO_B64" in wrapper
     assert "RELEASE_ECHO_B64" in wrapper
     assert "BLUEPRINT_RELEASE_SHA" in wrapper
+
+
+@pytest.mark.asyncio
+async def test_provision_local_does_not_inherit_orchestrator_secrets(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GITHUB_PRIVATE_KEY", "sentinel-private-key")
+    monkeypatch.setenv("AGENT_JWT_SECRET", "sentinel-jwt-secret")
+
+    captured_envs = []
+
+    def fake_popen(args, cwd=None, env=None, **kwargs):
+        captured_envs.append(dict(env) if env is not None else None)
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.returncode = None
+        mock_proc.wait = MagicMock(return_value=0)
+        return mock_proc
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(compute, "AGENT_DIR", str(tmp_path))
+
+    task_id = uuid.uuid4()
+    vm_instance_id = f"local-{uuid.uuid4()}"
+
+    await compute._provision_local(
+        vm_instance_id=vm_instance_id,
+        task_id=task_id,
+        payload_uri="payload://test",
+        oauth_token="test-oauth-token",
+        task_type="test",
+    )
+
+    assert len(captured_envs) == 1, "expected exactly one Popen call"
+    child_env = captured_envs[0]
+    assert child_env is not None
+    assert "GITHUB_PRIVATE_KEY" not in child_env
+    assert "AGENT_JWT_SECRET" not in child_env
+    assert child_env.get("PAYLOAD_URI") == "payload://test"
+    assert child_env.get("VM_INSTANCE_ID") == vm_instance_id

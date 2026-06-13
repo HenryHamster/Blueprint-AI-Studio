@@ -111,4 +111,11 @@ describe('CapabilityTrialsPanel', () => {
     render(<CapabilityTrialsPanel digest={{ capability_adoption_verdicts: {} } as never} />);
     expect(screen.getByText('No capability trials are currently running.')).toBeTruthy();
   });
+
+  it('renders nothing when digest is null', () => {
+    const { container } = render(<CapabilityTrialsPanel digest={null} />);
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByText('No capability trials are currently running.')).toBeNull();
+    expect(screen.queryByText('Capability Trials')).toBeNull();
+  });
 });

@@ -651,6 +651,9 @@ export interface ImprovementLaneRow {
   workspace_vm_instance_id: string | null;
   reservation_expires_at: string | null;
   reserved_vm_instance_id: string | null;
+  reservation_claimed_by_fix_count: number | null;
+  reservation_expired_before_fix_count: number | null;
+  reservation_force_expired_count: number | null;
   pilot_arm: string | null;
   phase_requeues: number;
   llm_input_tokens_total: number | null;
@@ -663,12 +666,21 @@ export interface ImprovementLaneRow {
   [key: string]: unknown;
 }
 
+export interface ShadowLaneHealth {
+  shadow_lane_count: number;
+  checkpoints_written: number;
+  checkpoint_miss_count: number;
+  exhausted_close_count: number;
+  miss_rate: number | null;
+}
+
 export interface ImprovementLanesResponse {
   lanes: ImprovementLaneRow[];
   total_returned: number;
   offset: number;
   limit: number;
   project_id: string;
+  shadow_health?: ShadowLaneHealth;
   [key: string]: unknown;
 }
 
@@ -691,6 +703,57 @@ export async function fetchImprovementLanes(
     signal,
   );
   if (!res.ok) throw new Error(`Failed to fetch improvement lanes: ${res.status}`);
+  return res.json();
+}
+
+export interface LanePilotDrainReport {
+  project_id: string;
+  flag_disabled: boolean;
+  reservations_cleared: number;
+  lanes_killed: number;
+  reason: string;
+}
+
+export async function drainLanePilot(projectId: string): Promise<LanePilotDrainReport> {
+  const res = await apiFetch(
+    `/api/admin/improvement-lanes/drain?project_id=${encodeURIComponent(projectId)}`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || data?.error?.message || `Failed to drain lane pilot: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to drain lane pilot: ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface LanePilotPreflightCheck {
+  name: string;
+  met: boolean;
+  blocking_value: string;
+  fix_hint: string | null;
+}
+
+export interface LanePilotPreflightResponse {
+  project_id: string;
+  ready: boolean;
+  checks: LanePilotPreflightCheck[];
+  durable_verdict: string | null;
+  pilot_mode?: string;
+}
+
+export async function fetchLanePilotPreflight(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<LanePilotPreflightResponse> {
+  const res = await apiFetch(
+    `/api/admin/improvement-lanes/preflight?project_id=${encodeURIComponent(projectId)}`,
+    undefined,
+    2,
+    15000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch lane pilot preflight: ${res.status}`);
   return res.json();
 }
 
@@ -1300,6 +1363,24 @@ export interface LlmCostTaskTypeRow {
   share_of_total_cost: number | null;
 }
 
+export interface ReworkPrEntry {
+  pr_number: number;
+  rework_llm_cost_usd: number;
+  rework_vm_cost_usd: number;
+}
+
+/** Per-window LLM-dollar rework attribution: first-pass vs rework split + top rework PRs. */
+export interface ReworkAttribution {
+  /** Fraction of total LLM spend attributable to rework review-fix chains (null when no priced chain data). */
+  rework_share: number | null;
+  /** LLM spend on first-pass attempts within the window. */
+  first_pass_llm_cost_usd: number;
+  /** LLM spend on rework (retry / review-fix chain) attempts within the window. */
+  rework_llm_cost_usd: number;
+  /** Top PRs ranked by rework LLM spend (descending). */
+  top_rework_prs: ReworkPrEntry[];
+}
+
 export interface LlmCostBreakdownResponse {
   window_days: number;
   generated_at: string;
@@ -1307,6 +1388,8 @@ export interface LlmCostBreakdownResponse {
   by_model: LlmCostModelRow[];
   /** Per-task-type cost attribution — same pricing table as by_model, bucketed by first_payload["type"]. */
   by_task_type: LlmCostTaskTypeRow[];
+  /** Rework attribution: first-pass vs rework LLM spend split and top rework PRs. Absent on older backends. */
+  rework_attribution?: ReworkAttribution;
   totals: {
     total_input_tokens: number;
     total_output_tokens: number;
@@ -1375,6 +1458,12 @@ export interface AuditReconciliation {
 export interface AuditFinding {
   severity: string;
   summary: string;
+  // File attribution carried when the raw finding named one (additive; older
+  // records predating stable-identity carry no file).
+  file?: string;
+  // Deterministic content-derived key (sha256→16-hex of normalized file|summary)
+  // stable across re-extractions, so findings can be keyed in a resolution ledger.
+  key?: string;
 }
 
 export interface ChallengerRefutedFinding {
@@ -1417,6 +1506,12 @@ export interface VersionQualification {
   // Audit findings carried from the qualification run (severity + summary per finding).
   audit_findings?: AuditFinding[] | null;
   excluded_audit_findings?: AuditFinding[] | null;
+  // Pre-cap totals + truncation flags so the UI can tell whether the carried
+  // findings lists were clipped at the carry cap (additive; absent on older records).
+  audit_findings_total?: number | null;
+  audit_findings_truncated?: boolean | null;
+  excluded_audit_findings_total?: number | null;
+  excluded_audit_findings_truncated?: boolean | null;
   // Challenger-confirmed false positives: findings refuted by an independent challenger (with reason).
   challenger_refuted_audit_findings?: ChallengerRefutedFinding[] | null;
   migration_safety?: string | null;
@@ -1444,6 +1539,23 @@ export interface ReleaseArtifactEvidence {
   reason_code?: string | null;
 }
 
+export interface ManagedCheckWaitSnapshotCheck {
+  name: string;
+  status?: string | null;
+  conclusion?: string | null;
+}
+
+export interface ManagedCheckWaitSnapshot {
+  state: string;
+  classified_at: string;
+  head_sha?: string | null;
+  total_checks?: number | null;
+  checks?: ManagedCheckWaitSnapshotCheck[];
+  truncated?: boolean | null;
+  reason?: string | null;
+  detail?: string | null;
+}
+
 export interface QualificationState {
   state: string;
   summary: string;
@@ -1466,7 +1578,7 @@ export interface QualificationState {
   // (distinct from native auto-merge 'promotion_in_flight'). These are additive
   // and absent for native auto-merge.
   migration_carrying?: boolean | null;
-  check_snapshot?: unknown;
+  check_snapshot?: ManagedCheckWaitSnapshot | null;
   ci_state?: string | null;
   blocker?: string | null;
   // Post-promotion serving confirmation. A 'promoted' state is provisional:
@@ -1476,6 +1588,13 @@ export interface QualificationState {
   // never stabilized. deploy_failure_reason carries the failure detail.
   serving_status?: string | null;
   deploy_failure_reason?: string | null;
+}
+
+export interface OutOfBandPromotion {
+  source: string;
+  recorded_at: string;
+  candidate_sha: string;
+  promoted_sha: string;
 }
 
 export interface CurrentVersion {
@@ -1534,6 +1653,9 @@ export interface CurrentVersion {
   // resolves serving_status to confirmed/failed when this elapses; the panel
   // computes remaining/overdue at render time.
   deploy_confirm_deadline?: string | null;
+  // Out-of-band promotion provenance. Non-null only when an operator force-merged
+  // this version outside the normal qualification flow.
+  out_of_band_promotion?: OutOfBandPromotion | null;
 }
 
 export interface RecentVersion {
@@ -1560,6 +1682,8 @@ export interface RecentVersion {
   // CurrentVersion. Present on the recently-promoted history row whose
   // serving_status is still 'unconfirmed'.
   deploy_confirm_deadline?: string | null;
+  // Out-of-band promotion provenance — see CurrentVersion.
+  out_of_band_promotion?: OutOfBandPromotion | null;
 }
 
 export interface PromotionReadinessConfidence {
@@ -1602,6 +1726,8 @@ export interface PromotionReadiness {
   deploy_failed_count?: number;
 }
 
+export type PromotionPolicySource = 'runtime_config' | 'yaml_file' | 'hardcoded_defaults';
+
 export interface StagedDirection {
   id: string | null;
   text: string | null;
@@ -1643,6 +1769,8 @@ export interface VersionLifecycleResponse {
   /** Which value is in effect: a per-project override or the fleet-wide default. */
   promotion_enabled_source?: 'project' | 'fleet';
   promotion_readiness?: PromotionReadiness | null;
+  promotion_policy_source?: PromotionPolicySource;
+  promotion_policy_error?: string | null;
   staged_directions?: StagedDirection[];
   /** Challenged-vs-unchallenged decision-quality cohort comparison. Advisory/display only. */
   challenged_vs_unchallenged?: ChallengedVsUnchallengedTelemetry | null;
@@ -2454,6 +2582,17 @@ export interface ComputeJob {
   } | null;
   accelerator_type: string | null;
   accelerator_count: number | null;
+  // Phase the VM reached before going terminal, promoted by the admin endpoint:
+  // 'provisioning' (never started — $0 cost, VM never reached RUNNING) vs
+  // 'runtime' (failed during execution). Absent on agent-facing / legacy rows.
+  vm_phase?: 'provisioning' | 'runtime' | null;
+  // Echo of the requested launch contract, surfaced for provisioning-context
+  // diagnostics (machine_type / accelerator_type are already top-level fields).
+  // Present only on the admin endpoint; absent on legacy rows.
+  launch_contract?: {
+    requested_deadline_seconds?: number | null;
+    provisioning_model?: string | null;
+  } | null;
   polling_metadata?: Record<string, unknown>;
   // Bounded RPC failure diagnostic; null/absent when no backend RPC has failed
   // (or once it resolves). Older responses may carry it under polling_metadata.
@@ -2501,9 +2640,31 @@ export interface BuildConfigCommandEntry {
   commands_stale: boolean;
 }
 
+/** Outcome of the repo_bootstrap command write-back, recorded independently of
+ *  the repo overview. `confirmed` = commands were written back and verified;
+ *  `missing_commands` = bootstrap produced an overview but no commands to confirm;
+ *  `writeback_failed` = commands existed but the write-back did not land;
+ *  `unknown` = a legacy agent omitted the status payload entirely. */
+export type BuildConfigCommandMemoryStatus =
+  | 'confirmed'
+  | 'missing_commands'
+  | 'writeback_failed'
+  | 'unknown';
+
+export interface BuildConfigCommandMemory {
+  status: BuildConfigCommandMemoryStatus | string;
+  complete?: boolean | null;
+  detail?: string | null;
+  paths?: string[] | null;
+  updated_at?: string | null;
+}
+
 export interface BuildConfigCommandsResponse {
   project_id: string;
   directories: BuildConfigCommandEntry[];
+  /** Bootstrap command-memory outcome. Null/absent on legacy projects that
+   *  predate the command-memory status contract. */
+  command_memory?: BuildConfigCommandMemory | null;
 }
 
 export async function fetchBuildConfigCommands(
@@ -2799,6 +2960,16 @@ export interface FleetUtilizationResponse {
   window_hours: number;
   /** Derived saturation label; null when no enabled accounts are configured. */
   saturation: 'healthy' | 'busy' | 'saturated' | null;
+  vm_cap: number | null;
+  active_task_vms: number | null;
+  managed_vm_count: number | null;
+  idle_pool_vms: number | null;
+  vm_slots_available: number | null;
+  vm_saturation: 'healthy' | 'busy' | 'saturated' | null;
+  precomputed?: boolean;
+  precomputed_at?: string | null;
+  precompute_age_seconds?: number | null;
+  served_stale?: boolean;
 }
 
 export async function fetchFleetUtilization(): Promise<FleetUtilizationResponse> {
@@ -2899,4 +3070,114 @@ export async function fetchLaneDiag(
   const res = await apiFetch(`/api/admin/lane-diag${query}`, undefined, 2, 30000, signal);
   if (!res.ok) throw new Error(`Failed to fetch lane diagnostics: ${res.status}`);
   return res.json();
+}
+
+// --- Evergreen fill observability + backlog ----------------------------------
+
+export interface EvergreenFillDecisionRecord {
+  action: string;
+  reason: string;
+  trigger: string | null;
+  project_id: string | null;
+}
+
+export interface EvergreenFillObservabilityResponse {
+  created_count: number;
+  reason_counts: Record<string, number>;
+  trigger_counts: Record<string, number>;
+  recent: EvergreenFillDecisionRecord[];
+}
+
+export interface EvergreenBacklogItem {
+  id: string;
+  project_id: string;
+  finding_key: string;
+  title: string;
+  detail: string | null;
+  status: string;
+  outcome: string | null;
+  provenance: string;
+  direction_id: string | null;
+  attempts: number;
+  spawned_task_id: string | null;
+  verified_against_sha: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface EvergreenBacklogResponse {
+  items: EvergreenBacklogItem[];
+}
+
+export type EvergreenBacklogSummaryResponse = Record<string, number>;
+
+interface EvergreenBacklogSummaryEnvelope {
+  project_id: string;
+  counts: EvergreenBacklogSummaryResponse;
+}
+
+export interface EvergreenFillSettings {
+  evergreen_fill_mode: string;
+  evergreen_fill_interval_minutes: number;
+  evergreen_fill_util_threshold: number;
+  evergreen_fill_min_free_slots: number;
+  evergreen_fill_max_active: number;
+  evergreen_fill_daily_cap: number;
+  evergreen_fill_deferred_memo_enrollment: boolean;
+}
+
+export async function fetchEvergreenFillObservability(
+  signal?: AbortSignal,
+): Promise<EvergreenFillObservabilityResponse> {
+  const res = await apiFetch('/api/admin/evergreen/fill-observability', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch evergreen fill observability: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEvergreenBacklog(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<EvergreenBacklogResponse> {
+  const params = new URLSearchParams({ project_id: projectId });
+  const res = await apiFetch(`/api/admin/evergreen/backlog?${params}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch evergreen backlog: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEvergreenBacklogSummary(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<EvergreenBacklogSummaryResponse> {
+  const params = new URLSearchParams({ project_id: projectId });
+  const res = await apiFetch(`/api/admin/evergreen/backlog-summary?${params}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch evergreen backlog summary: ${res.status}`);
+  const data = await res.json() as EvergreenBacklogSummaryEnvelope;
+  return data.counts ?? {};
+}
+
+export async function fetchEvergreenFillSettings(signal?: AbortSignal): Promise<EvergreenFillSettings> {
+  const res = await apiFetch('/api/admin/settings', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch settings: ${res.status}`);
+  const data = await res.json();
+  return {
+    evergreen_fill_mode: data?.evergreen_fill_mode ?? 'off',
+    evergreen_fill_interval_minutes: data?.evergreen_fill_interval_minutes ?? 15,
+    evergreen_fill_util_threshold: data?.evergreen_fill_util_threshold ?? 0.5,
+    evergreen_fill_min_free_slots: data?.evergreen_fill_min_free_slots ?? 2,
+    evergreen_fill_max_active: data?.evergreen_fill_max_active ?? 1,
+    evergreen_fill_daily_cap: data?.evergreen_fill_daily_cap ?? 3,
+    evergreen_fill_deferred_memo_enrollment: data?.evergreen_fill_deferred_memo_enrollment ?? false,
+  };
+}
+
+export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSettings>): Promise<void> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update evergreen fill settings: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update evergreen fill settings: ${res.status}`);
+  }
 }

@@ -82,6 +82,7 @@ from app.shared_state import (
 )
 from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
+from app.landed_signal import LANDED_ON_INTEGRATION_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -335,8 +336,13 @@ def _design_doc_index(doc: dict | None) -> dict:
             # fields inline so the first strategic cycle has actual repo context
             # without a fetch round-trip. Optional fields are included when present.
             for field in (
-                "tech_stack", "directory_layout", "first_steps_summary",
-                "entry_points", "test_layout", "key_conventions", "environment_requirements",
+                "tech_stack",
+                "directory_layout",
+                "first_steps_summary",
+                "entry_points",
+                "test_layout",
+                "key_conventions",
+                "environment_requirements",
             ):
                 raw = value.get(field)
                 if isinstance(raw, str) and raw.strip():
@@ -456,9 +462,7 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
                     shortened[key] = {"shown": keep, "total": len(arr)}
                     g2[key] = arr[-keep:]
             if shortened:
-                gap_memory_trimmed.append(
-                    {"gap_id": g2.get("id"), "fields": shortened}
-                )
+                gap_memory_trimmed.append({"gap_id": g2.get("id"), "fields": shortened})
             new_gaps.append(g2)
         trimmed["gaps"] = new_gaps
         # Surface the pre-trim so the strategic agent can tell a gap's
@@ -807,7 +811,6 @@ def _build_operator_overrides_summary(project: Project) -> list[dict]:
     return entries[:_OPERATOR_OVERRIDES_MAX]
 
 
-
 async def _verify_capability_backing_paths(
     pm: dict | None,
     *,
@@ -1037,6 +1040,24 @@ def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
     usable = fleet.get("usable_capacity")
     if cooled and usable is not None and usable != cap:
         line += f" — {cooled} acct cooled, {usable} usable"
+    vm_cap = fleet.get("vm_cap")
+    vm_slots_available = fleet.get("vm_slots_available")
+    active_task_vms = fleet.get("active_task_vms")
+    idle_pool_vms = fleet.get("idle_pool_vms")
+    managed_vm_count = fleet.get("managed_vm_count")
+    if vm_cap:
+        effective = None
+        if (
+            active_task_vms is not None
+            and managed_vm_count is not None
+            and idle_pool_vms is not None
+        ):
+            effective = max(active_task_vms, managed_vm_count - idle_pool_vms)
+        if effective is not None:
+            saturated_marker = " [SATURATED]" if vm_slots_available == 0 else ""
+            line += f" | vm {effective}/{vm_cap}, {vm_slots_available} free{saturated_marker}"
+        elif vm_cap:
+            line += f" | vm cap {vm_cap}"
     return line
 
 
@@ -1172,9 +1193,7 @@ def _direction_activity_score(stat: dict) -> int:
     """
     if not isinstance(stat, dict):
         return 0
-    merged = int(
-        stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0
-    )
+    merged = int(stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0)
     failed = int(stat.get("tasks_failed") or 0)
     cycles = int(stat.get("total_cycles") or 0)
     priority = stat.get("priority")
@@ -1329,6 +1348,7 @@ def _build_cycle_start_reconciliation(
     direction_stats: list[dict],
     problem_model: dict | None,
     active_by_direction: dict[str, int] | None,
+    held_by_direction: dict[str, int] | None = None,
     per_direction_delta: list[dict] | None = None,
 ) -> dict | None:
     """Compute one authoritative cycle-start reconciliation of the strategic surfaces.
@@ -1358,8 +1378,11 @@ def _build_cycle_start_reconciliation(
         longer resolves to an active gap (closed/archived/never-existed), or that
         carry no gap linkage at all. These advance no tracked gap.
       * ``direction_pipeline`` — per active direction, whether its research is
-        ``research_waiting_on_action`` (findings surfaced but no task in flight),
-        ``tasks_in_progress`` (work already moving), or ``idle``.
+        ``research_waiting_on_action`` (findings surfaced but no task in flight
+        and no fresher completion/held signal), ``tasks_in_progress`` (work
+        already moving), ``held_on_dependency`` (live BLOCKED/PARKED work),
+        ``recently_converted`` (freshly completed/merged work with no active
+        task), or ``idle``.
       * ``merge_accounting`` — per active direction, where the merge BADGE
         (which asserts a PR shipped) disagrees with ancestry verification over
         the same recent merged-title window used for recent-work. Built from the
@@ -1381,6 +1404,7 @@ def _build_cycle_start_reconciliation(
     """
     pm = problem_model if isinstance(problem_model, dict) else {}
     active_by_direction = active_by_direction or {}
+    held_by_direction = held_by_direction or {}
 
     def _label(text: Any) -> str:
         return str(text or "")[:_RECON_LABEL_MAXLEN]
@@ -1393,7 +1417,9 @@ def _build_cycle_start_reconciliation(
 
     # Active directions and the set of gap_ids they reference (forward linkage).
     active_dirs = [
-        d for d in direction_stats if isinstance(d, dict) and d.get("status") == "active"
+        d
+        for d in direction_stats
+        if isinstance(d, dict) and d.get("status") == "active"
     ]
     referenced_gap_ids: set[str] = {
         str(d["gap_id"]) for d in active_dirs if d.get("gap_id")
@@ -1483,14 +1509,38 @@ def _build_cycle_start_reconciliation(
     pipeline_counts = {
         "research_waiting_on_action": 0,
         "tasks_in_progress": 0,
+        "held_on_dependency": 0,
+        "recently_converted": 0,
         "idle": 0,
     }
+    recent_completed_by_direction: dict[str, int] = {}
+    for delta in per_direction_delta or []:
+        if not isinstance(delta, dict):
+            continue
+        did = str(delta.get("direction_id") or "")
+        if not did:
+            continue
+        recent_titles = delta.get("recent_merged_titles")
+        pr_count = (
+            sum(1 for entry in recent_titles if isinstance(entry, dict))
+            if isinstance(recent_titles, list)
+            else 0
+        )
+        non_pr_count = int(delta.get("recent_non_pr_completed") or 0)
+        if pr_count or non_pr_count:
+            recent_completed_by_direction[did] = pr_count + non_pr_count
     for d in active_dirs:
         did = str(d.get("id") or "")
         in_flight = int(active_by_direction.get(did, 0) or 0)
+        held = int(held_by_direction.get(did, 0) or 0)
+        recently_completed = int(recent_completed_by_direction.get(did, 0) or 0)
         findings = len(d.get("recent_findings") or [])
         if in_flight > 0:
             state = "tasks_in_progress"
+        elif held > 0:
+            state = "held_on_dependency"
+        elif recently_completed > 0:
+            state = "recently_converted"
         elif findings > 0:
             state = "research_waiting_on_action"
         else:
@@ -1502,15 +1552,23 @@ def _build_cycle_start_reconciliation(
                 "text": _label(d.get("text")),
                 "state": state,
                 "in_flight": in_flight,
+                "held": held,
+                "recently_completed": recently_completed,
                 "findings": findings,
             }
         )
     direction_pipeline.sort(
         key=lambda item: (
-            {"research_waiting_on_action": 0, "tasks_in_progress": 1, "idle": 2}.get(
-                str(item.get("state")), 3
-            ),
+            {
+                "tasks_in_progress": 0,
+                "held_on_dependency": 1,
+                "recently_converted": 2,
+                "research_waiting_on_action": 3,
+                "idle": 4,
+            }.get(str(item.get("state")), 5),
             -int(item.get("findings") or 0),
+            -int(item.get("recently_completed") or 0),
+            -int(item.get("held") or 0),
             -int(item.get("in_flight") or 0),
             str(item.get("text") or ""),
         )
@@ -1543,9 +1601,7 @@ def _build_cycle_start_reconciliation(
             if isinstance(sampled_titles, list)
             else []
         )
-        landed_n = (
-            _count_field(count_block, "verified_landed") if count_block else None
-        )
+        landed_n = _count_field(count_block, "verified_landed") if count_block else None
         not_landed_n = (
             _count_field(count_block, "verified_not_landed") if count_block else None
         )
@@ -1592,7 +1648,10 @@ def _build_cycle_start_reconciliation(
             }
         )
     merge_accounting.sort(
-        key=lambda m: (-int(m.get("not_landed") or 0), str(m.get("direction_text") or ""))
+        key=lambda m: (
+            -int(m.get("not_landed") or 0),
+            str(m.get("direction_text") or ""),
+        )
     )
 
     # Nothing to reconcile (e.g. a cold-start project): let the caller omit it.
@@ -1641,10 +1700,10 @@ def _build_cycle_start_reconciliation(
             "active_directions": len(active_dirs),
             "direction_pipeline": len(direction_pipeline),
             "direction_pipeline_overflow": pipeline_dropped,
-            "pipeline_waiting_on_action": pipeline_counts[
-                "research_waiting_on_action"
-            ],
+            "pipeline_waiting_on_action": pipeline_counts["research_waiting_on_action"],
             "pipeline_tasks_in_progress": pipeline_counts["tasks_in_progress"],
+            "pipeline_held_on_dependency": pipeline_counts["held_on_dependency"],
+            "pipeline_recently_converted": pipeline_counts["recently_converted"],
             "pipeline_idle": pipeline_counts["idle"],
             # Merge-accounting drift: true direction-with-conflict total (shown +
             # overflow) plus aggregate landed/not-landed/unverifiable tallies.
@@ -1742,9 +1801,7 @@ def _build_prune_candidates(
         # per entry (with its legacy prs_merged fallback) plus the verified
         # aggregate key (falling back to total_prs_merged for pre-attribution
         # folded history).
-        merged = sum(
-            verified_merged_count(h) for h in history if isinstance(h, dict)
-        )
+        merged = sum(verified_merged_count(h) for h in history if isinstance(h, dict))
         agg = d.get("history_aggregate") or {}
         merged += int(
             agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
@@ -1873,7 +1930,11 @@ def _build_prune_candidates(
         raw_name = str(cap.get("name") or "")
         if len(raw_name) > _CAPABILITY_LONG_NAME_THRESHOLD:
             long_names.append(
-                {"kind": "capability", "name": _label(raw_name), "length": len(raw_name)}
+                {
+                    "kind": "capability",
+                    "name": _label(raw_name),
+                    "length": len(raw_name),
+                }
             )
     for g in gaps:
         if not isinstance(g, dict):
@@ -2039,7 +2100,9 @@ def _strip_verbose_fields(m: dict) -> dict:
 
 def _cap_excerpt(m: dict) -> dict:
     result = dict(m)
-    result["summary_excerpt"] = (m.get("summary_excerpt") or "")[:_MEMO_EXCERPT_MAX_CHARS]
+    result["summary_excerpt"] = (m.get("summary_excerpt") or "")[
+        :_MEMO_EXCERPT_MAX_CHARS
+    ]
     return result
 
 
@@ -2078,8 +2141,8 @@ def _summarize_memo_citations(memos: list) -> list:
 # a per-message excerpt cap) and priority-ordered so unresolved
 # BUG_REPORT/BLOCKER items (then the oldest-open items) are the LAST to be
 # dropped under budget pressure, never the first.
-_OPEN_MESSAGES_FETCH_LIMIT = 200       # DB window over open-status rows
-_OPEN_MESSAGES_KEEP = 40               # count bound for the packed feed
+_OPEN_MESSAGES_FETCH_LIMIT = 200  # DB window over open-status rows
+_OPEN_MESSAGES_KEEP = 40  # count bound for the packed feed
 _OPEN_MESSAGES_KEEP_WHEN_TRIMMED = 20  # tighter bound for the summarize fallback
 _OPEN_MESSAGE_EXCERPT_MAX_CHARS = 800  # per-message content excerpt cap
 _CRITICAL_OPEN_MESSAGE_TYPES = (
@@ -2587,6 +2650,29 @@ def _rollup_body_is_trivial(body: str | None) -> bool:
     return bool(re.match(r"^\s*Rollup of \d+ subtasks?\b", body))
 
 
+def _recent_commit_messages_match_task(
+    messages: list[str],
+    *,
+    title: str,
+    pr_numbers: set[int],
+) -> bool:
+    """Return True when a bounded commit-message sample names this task."""
+    import re
+
+    normalized_messages = [" ".join(m.casefold().split()) for m in messages]
+    normalized_title = " ".join((title or "").casefold().split())
+    if len(normalized_title) >= 8 and any(
+        normalized_title in message for message in normalized_messages
+    ):
+        return True
+
+    for pr_number in pr_numbers:
+        pr_ref_re = re.compile(rf"(?<![\w#])#{pr_number}(?!\d)")
+        if any(pr_ref_re.search(message) for message in messages):
+            return True
+    return False
+
+
 async def _build_recent_interventions(
     project: Project,
     session: AsyncSession,
@@ -2670,6 +2756,15 @@ async def _build_recent_interventions(
         .options(load_only(Task.id, Task.status, Task.context, Task.payloads))
     )
     active_tasks = list(active_tasks_result.scalars().all())
+    held_tasks_result = await session.execute(
+        select(Task)
+        .where(
+            Task.project_id == project.id,
+            Task.status.in_((TaskStatus.BLOCKED, TaskStatus.PARKED)),
+        )
+        .options(load_only(Task.id, Task.status, Task.context))
+    )
+    held_tasks = list(held_tasks_result.scalars().all())
 
     # Build direction lookup for text enrichment
     directions_by_id: dict[str, str] = {
@@ -2853,8 +2948,24 @@ async def _build_recent_interventions(
         # (multiple children share one parent rollup PR) and lets us fan the
         # per-PR ancestry checks out concurrently without redundant fetches.
         _tasks_by_pr: dict[int, list[uuid.UUID]] = {}
+        _rollup_message_evidence_by_task: dict[uuid.UUID, tuple[str, set[int]]] = {}
         for _t in (t for t in merged_tasks if t.id in _to_verify_ids):
             _ctx_t = _t.context or {}
+            _task_pr_numbers: set[int] = set()
+            for _raw_task_pr in (
+                _ctx_t.get("pr_number"),
+                _ctx_t.get("original_pr_number"),
+            ):
+                if not _raw_task_pr:
+                    continue
+                try:
+                    _task_pr_numbers.add(int(_raw_task_pr))
+                except (TypeError, ValueError):
+                    continue
+            _rollup_message_evidence_by_task[_t.id] = (
+                _t.title or "",
+                _task_pr_numbers,
+            )
             if _t.parent_task_id is not None:
                 _pr_num_raw = _parent_rollup_pr.get(_t.parent_task_id)
             else:
@@ -2968,6 +3079,87 @@ async def _build_recent_interventions(
                     if _on_main_landed is not None:
                         _on_main_verified[_tid] = _on_main_landed
 
+        # One bounded squash-body scan can rescue rollup-rewritten work from a
+        # false NOT-landed verdict. Scan failure degrades those negatives to
+        # unverifiable so merge accounting does not manufacture a conflict.
+        _ancestry_false_task_ids = [
+            _tid for _tid, _landed in _automain_verified.items() if _landed is False
+        ]
+        if _ancestry_false_task_ids:
+            try:
+                _recent_commit_messages = await asyncio.wait_for(
+                    _github_ss.list_recent_commit_messages(
+                        _gh_token_ss,
+                        _gh_owner_ss,
+                        _gh_repo_ss,
+                        _integration_branch_ss,
+                        project_id=str(project.id),
+                    ),
+                    timeout=_ANCESTRY_CALL_TIMEOUT_S,
+                )
+            except Exception as _exc_rollup:  # noqa: BLE001 — degrade to unverifiable
+                logger.debug(
+                    "[STRATEGIC] rollup squash message scan failed: %s",
+                    _exc_rollup,
+                )
+                _recent_commit_messages = None
+
+            if _recent_commit_messages is None:
+                for _tid in _ancestry_false_task_ids:
+                    _automain_verified.pop(_tid, None)
+            else:
+                _message_rescued_task_ids: list[uuid.UUID] = []
+                for _tid in _ancestry_false_task_ids:
+                    _title, _task_pr_numbers = _rollup_message_evidence_by_task.get(
+                        _tid, ("", set())
+                    )
+                    if _recent_commit_messages_match_task(
+                        _recent_commit_messages,
+                        title=_title,
+                        pr_numbers=_task_pr_numbers,
+                    ):
+                        _automain_verified[_tid] = True
+                        _message_rescued_task_ids.append(_tid)
+
+                # If the project uses an LTS split, exact-SHA ancestry can be
+                # equally false on the promotion target after a rollup squash.
+                # Apply the same commit-message evidence there before calling
+                # the merge integration-only; otherwise promoted rollup squash
+                # work is incorrectly reported as undeployed.
+                if (
+                    _message_rescued_task_ids
+                    and _promotion_target_ss != _integration_branch_ss
+                ):
+                    try:
+                        _recent_promotion_messages = await asyncio.wait_for(
+                            _github_ss.list_recent_commit_messages(
+                                _gh_token_ss,
+                                _gh_owner_ss,
+                                _gh_repo_ss,
+                                _promotion_target_ss,
+                                project_id=str(project.id),
+                            ),
+                            timeout=_ANCESTRY_CALL_TIMEOUT_S,
+                        )
+                    except Exception as _exc_rollup_main:  # noqa: BLE001
+                        logger.debug(
+                            "[STRATEGIC] promotion-target squash message scan failed: %s",
+                            _exc_rollup_main,
+                        )
+                        _recent_promotion_messages = None
+
+                    if _recent_promotion_messages is not None:
+                        for _tid in _message_rescued_task_ids:
+                            _title, _task_pr_numbers = (
+                                _rollup_message_evidence_by_task.get(_tid, ("", set()))
+                            )
+                            if _recent_commit_messages_match_task(
+                                _recent_promotion_messages,
+                                title=_title,
+                                pr_numbers=_task_pr_numbers,
+                            ):
+                                _on_main_verified[_tid] = True
+
     def _on_automain(task: Task) -> bool:
         # Prefer the GitHub-verified result when available.
         if task.id in _automain_verified:
@@ -3004,7 +3196,11 @@ async def _build_recent_interventions(
         no second GitHub/ancestry pass.
         """
         if task.id in _automain_verified:
-            return "verified_landed" if _automain_verified[task.id] else "verified_not_landed"
+            return (
+                "verified_landed"
+                if _automain_verified[task.id]
+                else "verified_not_landed"
+            )
         return "unverifiable"
 
     # For rollups: look up child titles so the agent sees what actually
@@ -3061,6 +3257,7 @@ async def _build_recent_interventions(
                 "body": body,
                 "on_automain": _on_automain(t),
                 "on_main": _on_main(t),
+                "landed_on_integration": ctx.get(LANDED_ON_INTEGRATION_KEY),
             }
         )
 
@@ -3113,6 +3310,9 @@ async def _build_recent_interventions(
                     "title": title,
                     "on_automain": _on_automain(t),
                     "merge_verdict": merge_verdict,
+                    "landed_on_integration": (t.context or {}).get(
+                        LANDED_ON_INTEGRATION_KEY
+                    ),
                 }
             )
             if merge_verdict not in recent_merge_verdict_counts:
@@ -3130,6 +3330,22 @@ async def _build_recent_interventions(
             entry["recent_merge_verdict_counts"] = recent_merge_verdict_counts
             if recent_not_landed_titles:
                 entry["recent_not_landed_titles"] = recent_not_landed_titles
+        # Count recently-completed tasks that produced no PR (design, web_research,
+        # compute_experiment, etc.).  These represent real pipeline progress even
+        # though they never set pr_merged=True.
+        recent_non_pr_completed = 0
+        for t in d_tasks:
+            if t.status != TaskStatus.COMPLETED or (t.context or {}).get("pr_merged"):
+                continue
+            t_updated = (
+                t.updated_at
+                or t.created_at
+                or datetime.min.replace(tzinfo=timezone.utc)
+            )
+            if t_updated >= recent_cutoff:
+                recent_non_pr_completed += 1
+        if recent_non_pr_completed:
+            entry["recent_non_pr_completed"] = recent_non_pr_completed
         per_direction_delta.append(entry)
 
     # Active-by-scope: tasks currently in flight per scope. Surfaced so the
@@ -3163,6 +3379,12 @@ async def _build_recent_interventions(
         if scope not in active_by_scope:
             active_by_scope[scope] = 0
         active_by_scope[scope] += 1
+
+    held_by_direction: dict[str, int] = {}
+    for t in held_tasks:
+        did = (t.context or {}).get("direction_id")
+        if did:
+            held_by_direction[did] = held_by_direction.get(did, 0) + 1
 
     # Directions whose shipped work has landed on the integration branch but is
     # NOT yet on the promotion target (promoted) — the capabilities whose
@@ -3199,6 +3421,7 @@ async def _build_recent_interventions(
         "per_direction_delta": per_direction_delta,
         "active_by_scope": active_by_scope,
         "active_by_direction": active_by_direction,
+        "held_by_direction": held_by_direction,
         "lookback_days": lookback_days,
         "undeployed_directions": undeployed_directions,
     }
@@ -3569,13 +3792,16 @@ async def _find_last_strategic_cycle_time(
 
 
 async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
-    """Return True if a repo_bootstrap task is still in-flight for this project.
+    """Return True if a repo_bootstrap task is still in-flight for this project,
+    or if an automatic recovery attempt is scheduled but not yet due.
 
     False for self-repo projects and for projects whose bootstrap has already
     completed (``bootstrap_completed_at`` is set).  A terminal bootstrap
-    (FAILED / COMPLETED / …) also returns False so a permanently degraded
-    bootstrap never deadlocks autonomous spawning.
+    (FAILED / COMPLETED / …) with no pending recovery also returns False so a
+    permanently degraded bootstrap never deadlocks autonomous spawning.
     """
+    from app.repo_bootstrap import _parse_recovery_at
+
     _build_cfg = project.build_config or {}
     if _build_cfg.get("bootstrap_completed_at") or project.is_self_repo:
         return False
@@ -3585,16 +3811,35 @@ async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
             .where(
                 Task.project_id == project.id,
                 Task.payloads[0]["type"].as_string() == "repo_bootstrap",
-                Task.status.in_([
-                    TaskStatus.QUEUED,
-                    TaskStatus.PROVISIONING,
-                    TaskStatus.IN_PROGRESS,
-                ]),
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                    ]
+                ),
             )
             .limit(1)
         )
     ).first()
-    return pending is not None
+    if pending is not None:
+        return True
+    # Also defer during a scheduled recovery backoff window so that the recovery
+    # attempt gets a chance to produce repo memory before implementation cycles start.
+    if _build_cfg.get("bootstrap_recovery_state") == "backoff":
+        next_at = _parse_recovery_at(_build_cfg.get("bootstrap_recovery_next_at"))
+        if next_at is not None and next_at > _utcnow():
+            return True
+    return False
+
+
+async def _maybe_notify_operator_bootstrap_deferred(
+    project: Project, session: AsyncSession, reason: str
+) -> None:
+    """Reuse the one-time operator deferral notice for bootstrap-pending gates."""
+    from app.autonomous_research import _maybe_notify_operator_refresh_deferred
+
+    await _maybe_notify_operator_refresh_deferred(project, session, reason)
 
 
 async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
@@ -3615,6 +3860,11 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
 
     # Guard: defer architecture cycles until repo_bootstrap completes.
     if await _bootstrap_pending(project, session):
+        await _maybe_notify_operator_bootstrap_deferred(
+            project,
+            session,
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+        )
         logger.info(
             "[STRATEGIC] Deferring design doc update for project %s — "
             "repo_bootstrap task is pending (bootstrap_completed_at not set)",
@@ -3876,6 +4126,11 @@ async def _spawn_strategic_review(
     # this project is still being onboarded — skip this cycle. If bootstrap has
     # FAILED or is otherwise terminal, proceed gracefully (degraded path).
     if await _bootstrap_pending(project, session):
+        await _maybe_notify_operator_bootstrap_deferred(
+            project,
+            session,
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+        )
         logger.info(
             "[STRATEGIC] Deferring strategic review for project %s — "
             "repo_bootstrap task is pending (bootstrap_completed_at not set)",
@@ -3905,9 +4160,7 @@ async def _spawn_strategic_review(
         # The displayed prs_merged and operator_rejection_rate below stay RAW
         # (operator-judgment metrics); only the activity-score selection input
         # reads this verified field.
-        total_verified_merged = sum(
-            verified_merged_count(h) for h in history
-        ) + (
+        total_verified_merged = sum(verified_merged_count(h) for h in history) + (
             agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
         )
         # Proven lifetime merge total — STRICTER than verified: only merges with
@@ -3915,17 +4168,17 @@ async def _spawn_strategic_review(
         # consumption (proven_merged_count); legacy entries degrade to 0. Always
         # <= total_verified_merged for the same window, so a direction that
         # shipped many merges but proved few is visibly distinct.
-        total_proven_merged = sum(
-            proven_merged_count(h) for h in history
-        ) + (agg.get("total_acceptance_proven_merged", 0) or 0)
+        total_proven_merged = sum(proven_merged_count(h) for h in history) + (
+            agg.get("total_acceptance_proven_merged", 0) or 0
+        )
         total_consumed_merged = sum(
             h.get("acceptance_consumed_merged", 0) for h in history
         ) + (agg.get("total_acceptance_consumed_merged", 0) or 0)
         # Declaration coverage = declared / merged-write, recomputed from summed
         # counts (not averaged per-cycle fractions) so it survives eviction.
-        total_declared_merged = sum(
-            declared_merged_count(h) for h in history
-        ) + (agg.get("total_acceptance_declared_merged", 0) or 0)
+        total_declared_merged = sum(declared_merged_count(h) for h in history) + (
+            agg.get("total_acceptance_declared_merged", 0) or 0
+        )
         total_merged_write = sum(
             h.get("acceptance_merged_write_total", 0) for h in history
         ) + (agg.get("total_acceptance_merged_write_total", 0) or 0)
@@ -4135,12 +4388,13 @@ async def _spawn_strategic_review(
         exhaustion_count = int(spawn_gate_metrics.get("exhaustion_count") or 0)
         if exhaustion_count <= 0:
             continue
-        direction_label = f"{stat_entry.get('id')}: {(stat_entry.get('text') or '')[:120]}".strip()
+        direction_label = (
+            f"{stat_entry.get('id')}: {(stat_entry.get('text') or '')[:120]}".strip()
+        )
         cause_distribution = spawn_gate_metrics.get("cause_distribution") or {}
         if cause_distribution:
             cause_parts = ", ".join(
-                f"{cat} x{cnt}"
-                for cat, cnt in sorted(cause_distribution.items())
+                f"{cat} x{cnt}" for cat, cnt in sorted(cause_distribution.items())
             )
             cause_note = f"observed causes: {cause_parts}"
         else:
@@ -4193,9 +4447,7 @@ async def _spawn_strategic_review(
     running_update_superseded = (
         {
             "count": len(_superseded_entries),
-            "most_recent_at": max(
-                (e.get("at") or "") for e in _superseded_entries
-            ),
+            "most_recent_at": max((e.get("at") or "") for e in _superseded_entries),
         }
         if _superseded_entries
         else None
@@ -4356,9 +4608,7 @@ async def _spawn_strategic_review(
             "measurable, promote it first."
         )
         prompt_suffix = (
-            f"{_deploy_framing}\n{prompt_suffix}"
-            if prompt_suffix
-            else _deploy_framing
+            f"{_deploy_framing}\n{prompt_suffix}" if prompt_suffix else _deploy_framing
         )
         try:
             from app.release_version import (
@@ -4500,9 +4750,9 @@ async def _spawn_strategic_review(
                 recent_closed_versions as _recent_closed_for_deploy,
             )
 
-            _tasks_merged_unpromoted = (
-                (_version_phase_block or {}).get("tasks_merged_this_version") or 0
-            )
+            _tasks_merged_unpromoted = (_version_phase_block or {}).get(
+                "tasks_merged_this_version"
+            ) or 0
             # Latest promoted version (rows are newest-first; the first promoted
             # one is the most recent promotion = highest version_number).
             _promoted_v = None
@@ -4572,9 +4822,9 @@ async def _spawn_strategic_review(
                 and _promoted_aggregate["serving_status"] == "serving_confirmed"
             ):
                 _deployed_sha = _promoted_v.served_sha
-            _undeployed_dirs = (
-                (recent_interventions or {}).get("undeployed_directions") or []
-            )
+            _undeployed_dirs = (recent_interventions or {}).get(
+                "undeployed_directions"
+            ) or []
             # automain_ahead_of_main: reliable from DB alone (open, un-promoted
             # version carrying merged work), refined by the GitHub-verified
             # per-direction list when available.
@@ -4592,8 +4842,7 @@ async def _spawn_strategic_review(
                 "deploy_status": _deploy_status,
                 # Rollback provenance (self-repo only; None/0 otherwise) — the
                 # same truth operators already see in the deploy panel.
-                "rolled_back_from_sha": (_rolled_back_from_sha or "")[:12]
-                or None,
+                "rolled_back_from_sha": (_rolled_back_from_sha or "")[:12] or None,
                 "rollback_count": _rollback_count,
                 "rollback_reason": _rollback_reason,
                 "promoted_version": (
@@ -4613,9 +4862,7 @@ async def _spawn_strategic_review(
                     else None
                 ),
                 "promoted_deploy_failure_reason": (
-                    _promoted_aggregate["reason_code"]
-                    if _promoted_aggregate
-                    else None
+                    _promoted_aggregate["reason_code"] if _promoted_aggregate else None
                 ),
                 "promoted_artifacts": _promoted_artifacts,
                 "promoted_artifact_gap": _promoted_gap,
@@ -4680,9 +4927,7 @@ async def _spawn_strategic_review(
                     else ""
                 )
                 _reason_txt = (
-                    f" Rollback reason: {_rollback_reason}."
-                    if _rollback_reason
-                    else ""
+                    f" Rollback reason: {_rollback_reason}." if _rollback_reason else ""
                 )
                 _count_txt = (
                     f" Consecutive rollbacks: {_rollback_count}."
@@ -4787,9 +5032,7 @@ async def _spawn_strategic_review(
 
             _project_id_str = str(project.id)
             _dir_text_map = {
-                d.get("id"): d
-                for d in (project.directions or [])
-                if d.get("id")
+                d.get("id"): d for d in (project.directions or []) if d.get("id")
             }
             # One bounded query for the project's recent FAILED tasks, then
             # partition by direction_id in memory (mirrors the gathering logic
@@ -4832,9 +5075,7 @@ async def _spawn_strategic_review(
                     {
                         "direction_id": _did,
                         "direction_text": (_direction.get("text") or "?")[:300],
-                        "consecutive_failures": _hold_info.get(
-                            "consecutive_failures"
-                        ),
+                        "consecutive_failures": _hold_info.get("consecutive_failures"),
                         "last_failure_class": _hold_info.get("last_failure_class"),
                         "dominant_error_fingerprint": _dominant_fp,
                         "recent_failure_messages": _failure_messages,
@@ -4936,9 +5177,7 @@ async def _spawn_strategic_review(
                 f" (reason={_prior_deploy_reason})" if _prior_deploy_reason else ""
             )
             _artifact_txt = (
-                f" Evidence: {_prior_artifact_gap}."
-                if _prior_artifact_gap
-                else ""
+                f" Evidence: {_prior_artifact_gap}." if _prior_artifact_gap else ""
             )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} MERGED to "
@@ -4963,9 +5202,7 @@ async def _spawn_strategic_review(
                 f" (reason={_prior_deploy_reason})" if _prior_deploy_reason else ""
             )
             _artifact_txt = (
-                f" Evidence: {_prior_artifact_gap}."
-                if _prior_artifact_gap
-                else ""
+                f" Evidence: {_prior_artifact_gap}." if _prior_artifact_gap else ""
             )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} MERGED to "
@@ -4985,9 +5222,7 @@ async def _spawn_strategic_review(
             )
         elif _prior_serving_status == "unconfirmed":
             _artifact_txt = (
-                f" Evidence: {_prior_artifact_gap}."
-                if _prior_artifact_gap
-                else ""
+                f" Evidence: {_prior_artifact_gap}." if _prior_artifact_gap else ""
             )
             _post_promote_hint = (
                 f"Version handoff — READ THIS FIRST. v{_prior_n} was promoted "
@@ -5041,17 +5276,12 @@ async def _spawn_strategic_review(
     # independently of the post-promotion handoff (which self-clears once the fresh
     # version starts qualifying) so failed deploys continue to drive strategic
     # attention until actually recovered.
-    if (
-        _open_version is not None
-        and _integration_branch != _promotion_target
-    ):
+    if _open_version is not None and _integration_branch != _promotion_target:
         _latest_promoted_version: Any | None = None
         try:
             from app.release_version import recent_closed_versions as _rcv
 
-            for _v in await _rcv(
-                session, project.id, limit=1, include_artifacts=True
-            ):
+            for _v in await _rcv(session, project.id, limit=1, include_artifacts=True):
                 if _v.status == "promoted":
                     _latest_promoted_version = _v
                     break
@@ -5080,9 +5310,7 @@ async def _spawn_strategic_review(
                 else ""
             )
             _artifact_txt = (
-                f" Evidence: {_latest_artifact_gap}."
-                if _latest_artifact_gap
-                else ""
+                f" Evidence: {_latest_artifact_gap}." if _latest_artifact_gap else ""
             )
             _failed_deploy_directive = (
                 f"Active deployment crisis — v{_latest_promoted_version.version_number} "
@@ -5191,8 +5419,7 @@ async def _spawn_strategic_review(
                     _binding_key = min(_active, key=lambda _k: _active[_k])
                     if _binding_key == "audit":
                         _binding_desc = (
-                            "the audit sub-score is the binding constraint on "
-                            "promotion"
+                            "the audit sub-score is the binding constraint on promotion"
                         )
                     else:
                         _binding_desc = (
@@ -5218,10 +5445,43 @@ async def _spawn_strategic_review(
                 _version_phase_block["last_qualification_candidate_currency"] = (
                     _currency
                 )
+            # Trigger-based re-qualification steering.  The candidate-behind heuristic
+            # alone is not enough to recommend a blanket re-qualification: the
+            # pre-registered trigger is "every gating high+medium carried finding
+            # resolved-or-stale".  Consult the per-finding resolution ledger so the
+            # steer matches what was actually resolved — re-qualify ONLY when the
+            # signal is met; otherwise drive the outstanding fix-first work.  This is
+            # only relevant on the behind-head path; on the live/indeterminate path
+            # the findings may genuinely still block, handled by the else branch.
+            # Best-effort: a failure to compute the ledger signal degrades to the
+            # prior blanket re-qualify steer so the strategic spawn never breaks.
+            _readiness: dict | None = None
+            _requal_ready = True
+            if _candidate_behind:
+                try:
+                    from app.release_readiness import (  # noqa: PLC0415
+                        compute_requalification_readiness,
+                    )
+
+                    _readiness = await compute_requalification_readiness(
+                        session, project.id
+                    )
+                    _requal_ready = bool(_readiness.get("requalification_ready"))
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] requalification readiness compute failed; "
+                        "defaulting to blanket re-qualify steer"
+                    )
+                    _readiness = None
+                    _requal_ready = True
+            # Re-qualification is the highest-leverage steer ONLY on the behind-head
+            # path with the readiness trigger met; everywhere else there is fix work
+            # to dispatch (so the create-a-direction escalation below should fire).
+            _prefer_requalify = _candidate_behind and _requal_ready
             if _candidate_behind:
                 _cand_short = _currency["candidate_sha"][:8]
                 _head_short = _currency["head_sha"][:8]
-                _stabilize_hint += (
+                _stale_preamble = (
                     f" The last qualification flagged {len(_carried_findings)} "
                     f"audit finding(s), but it scored them against candidate "
                     f"commit {_cand_short}, which is now BEHIND the live "
@@ -5229,14 +5489,52 @@ async def _spawn_strategic_review(
                     f"are POSSIBLY-STALE: they were scored against a superseded "
                     f"snapshot and may already be resolved by commits that landed "
                     f"afterward — do NOT treat them as confirmed current promotion "
-                    f"blockers. Before scoping brand-new hardening work directly at "
-                    f"them, PREFER emitting a fresh qualify_request to re-qualify "
-                    f"the current HEAD; a new audit against the current snapshot "
-                    f"will report which finding(s), if any, genuinely remain. Prior "
-                    f"list (against {_cand_short}) in "
-                    f"version_phase.last_qualification.audit_findings. Top prior "
-                    f"findings: {_top}."
+                    f"blockers."
                 )
+                if _readiness is None:
+                    # Graceful degradation: ledger signal unavailable → preserve the
+                    # prior blanket steer toward a fresh re-qualification.
+                    _stabilize_hint += _stale_preamble + (
+                        f" Before scoping brand-new hardening work directly at them, "
+                        f"PREFER emitting a fresh qualify_request to re-qualify the "
+                        f"current HEAD; a new audit against the current snapshot will "
+                        f"report which finding(s), if any, genuinely remain. Prior "
+                        f"list (against {_cand_short}) in "
+                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"findings: {_top}."
+                    )
+                elif _requal_ready:
+                    _stabilize_hint += _stale_preamble + (
+                        f" The finding-resolution ledger shows every gating "
+                        f"high/medium finding is resolved-or-stale "
+                        f"({_readiness.get('gating_resolved', 0)}/"
+                        f"{_readiness.get('gating_total', 0)}), so the pre-registered "
+                        f"re-qualification trigger is MET. PREFER emitting a fresh "
+                        f"qualify_request to re-qualify the current HEAD; a new audit "
+                        f"against the current snapshot will confirm the findings are "
+                        f"cleared. Prior list (against {_cand_short}) in "
+                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"findings: {_top}."
+                    )
+                else:
+                    _gating_total = _readiness.get("gating_total", 0)
+                    _gating_resolved = _readiness.get("gating_resolved", 0)
+                    _outstanding = max(_gating_total - _gating_resolved, 0)
+                    _stabilize_hint += _stale_preamble + (
+                        f" The finding-resolution ledger shows {_outstanding} of "
+                        f"{_gating_total} gating high/medium finding(s) still "
+                        f"UNRESOLVED, so the re-qualification trigger is NOT met. Do "
+                        f"NOT emit a blanket qualify_request yet — it would just "
+                        f"re-flag the unresolved finding(s). Instead, prioritize the "
+                        f"outstanding fix-first work: scope audit/fundamentals-mode "
+                        f"remediation at the unresolved finding(s) and record each as "
+                        f"resolved or code-verified stale in the resolution ledger. "
+                        f"Once every gating finding is resolved-or-stale the readiness "
+                        f"signal flips and a fresh qualify_request becomes the right "
+                        f"move. Prior list (against {_cand_short}) in "
+                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"findings: {_top}."
+                    )
             else:
                 _stabilize_hint += (
                     f" The last qualification's audit flagged "
@@ -5252,13 +5550,14 @@ async def _spawn_strategic_review(
                         "already landed, a fresh qualify_request will confirm what "
                         "genuinely remains.)"
                     )
-            # When the carried findings are POSSIBLY-STALE, the highest-leverage
-            # action is a fresh re-qualification, NOT scoping new remediation
-            # directly at a superseded snapshot — so skip the create-a-direction
-            # escalation below (which would churn fix work at already-resolved
-            # findings).  The escalation only applies on the live/indeterminate
-            # path where the findings may genuinely still block promotion.
-            if not _candidate_behind:
+            # The create-a-direction escalation dispatches fix-first remediation, so
+            # it fires on every path EXCEPT behind-head + readiness-met (where a fresh
+            # re-qualification — not new remediation at a superseded snapshot — is the
+            # highest-leverage move).  That deliberately INCLUDES the behind-head +
+            # NOT-ready path: gating findings are still unresolved there, so the agent
+            # must dispatch the fix work — and the live/indeterminate path where the
+            # findings may genuinely still block promotion.
+            if not _prefer_requalify:
                 # Only audit/fundamentals-mode directions do remediation work; a
                 # ship/pause direction that merely mentions the audit topic does
                 # not dispatch fixes.  When no remediation-mode direction is
@@ -5531,6 +5830,7 @@ async def _spawn_strategic_review(
         direction_stats,
         _verified_problem_model,
         (recent_interventions or {}).get("active_by_direction"),
+        (recent_interventions or {}).get("held_by_direction"),
         (recent_interventions or {}).get("per_direction_delta"),
     )
     # Soft size/health signal from the DURABLE pre-trim model so counts are honest
@@ -5727,20 +6027,26 @@ async def _spawn_strategic_review(
     # recomputed by the surviving spawner's cycle.
     from app.autonomous_research import _try_research_spawn_advisory_lock
 
-    if not await _try_research_spawn_advisory_lock(session, project.id):
+    # Capture before any rollback: rollback expires all ORM instances in the
+    # identity map (expire_on_commit=False does not apply to rollback), so
+    # accessing project.id after rollback triggers a synchronous lazy-load
+    # that raises MissingGreenlet in async context (BUG_REPORT e530efec).
+    _project_id = project.id
+
+    if not await _try_research_spawn_advisory_lock(session, _project_id):
         await session.rollback()
         logger.warning(
             "[STRATEGIC] Aborting strategic review spawn for project %s — a peer "
             "instance took the research-spawn lock during the payload build",
-            project.id,
+            _project_id,
         )
         return False
-    if await _has_active_strategic_task(project.id, session):
+    if await _has_active_strategic_task(_project_id, session):
         await session.rollback()
         logger.warning(
             "[STRATEGIC] Aborting strategic review spawn for project %s — a "
             "strategic task appeared during the payload build",
-            project.id,
+            _project_id,
         )
         return False
 

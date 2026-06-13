@@ -56,7 +56,7 @@ describePosix('writePrHelper', () => {
     script: string,
     args: string[],
     setup: (dir: string, realFs: typeof import('node:fs')) => void,
-  ): Promise<{ status: number; stdout: string; checkArgs?: string }> => {
+  ): Promise<{ status: number; stdout: string; stderr: string; checkArgs?: string }> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
@@ -87,10 +87,10 @@ describePosix('writePrHelper', () => {
         } catch {
           // File may not exist
         }
-        return { status: 0, stdout, checkArgs };
+        return { status: 0, stdout, stderr: '', checkArgs };
       } catch (err: unknown) {
-        const e = err as { status?: number; stdout?: string };
-        return { status: e.status ?? -1, stdout: e.stdout ?? '' };
+        const e = err as { status?: number; stdout?: string; stderr?: string };
+        return { status: e.status ?? -1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' };
       }
     } finally {
       realFs.rmSync(dir, { recursive: true, force: true });
@@ -160,7 +160,7 @@ case "$*" in
   *"diff --name-only origin/production...HEAD"*) printf '%s\n' 'backend/app/main.py'; exit 0 ;;
   *"diff --name-only HEAD"*) exit 0 ;;
   *"ls-files --others --exclude-standard"*) exit 0 ;;
-  *"status --porcelain"*) exit 0 ;;
+  *"status --porcelain"*) printf '%s\n' '?? src/normal.txt'; exit 0 ;;
   *"rev-list --count origin/production..HEAD"*) printf '1\n'; exit 0 ;;
   *"remote set-url origin"*) exit 0 ;;
   *"push --force-with-lease origin blueprint/task-lts-1"*) exit 0 ;;
@@ -188,6 +188,121 @@ esac
 
     expect(result.status).toBe(0);
     expect(result.checkArgs).toBe('test');
+  });
+
+  it('fails fast before push when workflow files are present in the base-relative diff', async () => {
+    const script = writeScript({
+      taskId: 'task-workflow-1',
+      workBranch: 'blueprint/task-workflow-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      const bin = `${dir}/bin`;
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\n' '.github/workflows/ci.yml'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease"*) printf 'push should not run\n' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+exit 0
+`, { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/jq`, '#!/bin/sh\nprintf \'{}\\n\'\n', { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('workflow files changed');
+    expect(result.stderr).toContain('.github/workflows/ci.yml');
+    expect(result.stderr).not.toContain('push attempt 1');
+    expect(result.stderr).not.toContain('push failed after 3 attempts');
+  });
+
+  it('fails fast before staging when pending changes include a shell-artifact filename', async () => {
+    const script = writeScript({
+      taskId: 'task-shell-artifact-1',
+      workBranch: 'blueprint/task-shell-artifact-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      const bin = `${dir}/bin`;
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"status --porcelain"*) printf '%s\n' '?? =' '?? src/normal.txt'; exit 0 ;;
+  *"add -A"*) printf 'git add should not run\n' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Suspicious shell-artifact file(s)');
+    expect(result.stderr).toContain('[pr]   =');
+    expect(result.stderr).not.toContain('git add should not run');
+  });
+
+  it('classifies deterministic workflow-permission push rejections without retrying', async () => {
+    const script = writeScript({
+      taskId: 'task-workflow-2',
+      workBranch: 'blueprint/task-workflow-2',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      const bin = `${dir}/bin`;
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-workflow-2"*)
+    printf '%s\n' 'remote: refusing to allow a GitHub App to create or update workflow ./.github/workflows/ci.yml without workflows permission.' >&2
+    exit 1
+    ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+exit 0
+`, { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/jq`, '#!/bin/sh\nprintf \'{}\\n\'\n', { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('cannot create or update workflow files without the workflows permission');
+    expect(result.stderr).toContain('Revert the workflow file(s) below before pushing');
+    expect(result.stderr).not.toContain('push attempt 1');
+    expect(result.stderr).not.toContain('push failed after 3 attempts');
   });
 
   it('surfaces the GATE-ENVIRONMENT marker after a passing ./check test', async () => {
@@ -269,7 +384,7 @@ esac
       realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
 case "$*" in
-  *"status --porcelain"*) exit 0 ;;
+  *"status --porcelain"*) printf '%s\n' '?? src/normal.txt'; exit 0 ;;
   *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
   *"remote set-url origin"*) exit 0 ;;
   *"push --force-with-lease origin blueprint/task-dirty-1"*) exit 0 ;;
@@ -307,6 +422,7 @@ esac
     });
 
     expect(result.status).toBe(4);
+    expect(result.stderr).not.toContain('Suspicious shell-artifact file(s)');
     expect(result.stdout).toContain('mergeable=false, mergeable_state=dirty');
   });
 });
@@ -342,5 +458,7 @@ describe('writePrHelper — generated script content', () => {
     expect(script).toContain('[pr] NOTE: the test gate ran in GATE-ENVIRONMENT mode on this VM:');
     expect(script).toContain("sed 's/^/[pr]   /' /tmp/check_gate_env_task-static-1.txt");
     expect(script).toContain('Record your faithful test evidence');
+    expect(script).toContain('classify_push_error()');
+    expect(script).toContain('workflow files changed, and this token cannot create or update them without workflows permission');
   });
 });

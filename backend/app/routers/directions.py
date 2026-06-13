@@ -176,9 +176,7 @@ async def get_directions(
     knowledge_counts: dict[str, int] = {}
     count_rows = (
         await session.execute(
-            select(
-                KnowledgeDocument.direction_id, _sa_func.count()
-            )
+            select(KnowledgeDocument.direction_id, _sa_func.count())
             .where(
                 KnowledgeDocument.project_id == project_id,
                 KnowledgeDocument.direction_id.is_not(None),
@@ -237,12 +235,8 @@ async def get_directions(
                 "merges_per_cycle": _compute_direction_merges_per_cycle(d),
                 "quality_score": round(_compute_direction_quality_score(d), 3),
                 "generalized_successes": generalized_state["generalized_successes"],
-                "generalized_health_rate": generalized_state[
-                    "generalized_health_rate"
-                ],
-                "outcome_kind_breakdown": generalized_state[
-                    "outcome_kind_breakdown"
-                ],
+                "generalized_health_rate": generalized_state["generalized_health_rate"],
+                "outcome_kind_breakdown": generalized_state["outcome_kind_breakdown"],
                 "held": bool(hold_info["held"]),
                 "held_reason": hold_info["reason"] if hold_info["held"] else None,
                 "held_at": held_at.isoformat()
@@ -727,13 +721,15 @@ async def update_direction(
     if "refractory_until" in payload and payload["refractory_until"] is not None:
         if not isinstance(payload["refractory_until"], str):
             raise HTTPException(
-                status_code=400, detail="refractory_until must be an ISO timestamp or null"
+                status_code=400,
+                detail="refractory_until must be an ISO timestamp or null",
             )
         try:
             datetime.fromisoformat(payload["refractory_until"])
         except (TypeError, ValueError):
             raise HTTPException(
-                status_code=400, detail="refractory_until must be an ISO timestamp or null"
+                status_code=400,
+                detail="refractory_until must be an ISO timestamp or null",
             ) from None
     if (
         "success_evidence" in payload
@@ -778,8 +774,7 @@ async def update_direction(
         "system_id" in payload
         and payload["system_id"] is not None
         and (
-            not isinstance(payload["system_id"], str)
-            or len(payload["system_id"]) > 100
+            not isinstance(payload["system_id"], str) or len(payload["system_id"]) > 100
         )
     ):
         raise HTTPException(
@@ -794,7 +789,9 @@ async def update_direction(
     # version and must be >= it: a version that has already promoted/closed would
     # auto-activate the direction on the next sweep, which is nonsensical.
     staged_for_version: int | None = None
-    _wants_staging = payload.get("status") == "staged" or "staged_for_version" in payload
+    _wants_staging = (
+        payload.get("status") == "staged" or "staged_for_version" in payload
+    )
     if _wants_staging:
         from app.release_version import current_open_version
 
@@ -883,7 +880,10 @@ async def update_direction(
                 # staged direction can be retargeted; the resolved/validated
                 # target replaces its marker so the strategist + activation sweep
                 # bind it to the new version.
-                if "staged_for_version" in payload and payload.get("status") != "staged":
+                if (
+                    "staged_for_version" in payload
+                    and payload.get("status") != "staged"
+                ):
                     if d.get("status") != "staged":
                         raise HTTPException(
                             status_code=409,
@@ -1055,6 +1055,7 @@ async def create_direction_research_task(
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
         TaskStatus.BLOCKED,
+        TaskStatus.PARKED,
     ]
 
     # Fast path: modern research tasks all carry the direction claim key, so a
@@ -1183,21 +1184,26 @@ async def create_direction_research_task(
         # a second VM-backed cycle or erroring — mirrors trigger_self_audit.
         await session.rollback()
         existing = (
-            await session.execute(
-                select(Task).where(
-                    Task.idempotency_key == idempotency_key,
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                            TaskStatus.BLOCKED,
-                        ]
-                    ),
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.idempotency_key == idempotency_key,
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                                TaskStatus.BLOCKED,
+                                TaskStatus.PARKED,
+                            ]
+                        ),
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         detail = (
             f"Research is already in progress on this direction "
             f"(task {str(existing.id)[:8]}, status {existing.status}). "
@@ -1392,7 +1398,11 @@ async def create_message(
             )
         ).scalar_one_or_none()
         if existing is not None:
-            return {"id": str(existing.id), "status": "duplicate", "arming": "duplicate"}
+            return {
+                "id": str(existing.id),
+                "status": "duplicate",
+                "arming": "duplicate",
+            }
 
     # Reproduce-on-HEAD citation grounding for free-text bug reports: validate
     # any file/symbol the report cites against the project's real integration

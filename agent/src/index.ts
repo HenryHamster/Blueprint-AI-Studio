@@ -3,6 +3,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
+import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { handlers, resolveHandler } from './handlers/index.js';
 import {
   loadTaskCapabilityContract,
@@ -1083,6 +1084,7 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
     const report = getLastProviderRunErrorReport();
     if (report && report.task_id === taskId) errorReport = report;
   }
+  const workspacePrepOutcome = getLastWorkspacePrepOutcome();
   return {
     provider: PROVIDER,
     auth_mode: AUTH_MODE,
@@ -1093,6 +1095,7 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
     ...(errorReport ? { error_report: errorReport } : {}),
     ...payload,
     ...statusFlagsForTask(taskId),
+    ...(workspacePrepOutcome !== null ? { workspace_prep: workspacePrepOutcome } : {}),
     ...(mergedFixLoopEvents !== undefined ? { fix_loop_events: mergedFixLoopEvents } : {}),
   };
 }
@@ -1817,6 +1820,20 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // attachment by task_id, but clear between roles anyway so a warm role can
   // never observe the prior role's run report through the getter.
   clearLastProviderRunErrorReport();
+  // Workspace-prep outcome recorded by prepareWorkspaceForRole. Reset so a
+  // stale outcome from the prior role never rides the next role's payload.
+  resetWorkspacePrepOutcome();
+  // Log ring buffer — without clearing, prior-role lines replay on the next
+  // task's websocket connect and can trip the backend's 20 msg/s close-threshold.
+  clearLogBuffer();
+  // Heartbeat mutex — reset so a stale in-flight flag from the prior role
+  // doesn't silence the new role's first periodic tick. stopHeartbeat() clears
+  // these too, but resetting here makes resetPerRoleModuleState self-contained
+  // regardless of call ordering.
+  // (heartbeatGeneration is intentionally left monotonic — it only needs to be
+  // unique per tick, never reset between roles.)
+  heartbeatInFlight = false;
+  heartbeatInFlightSince = 0;
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────
@@ -2169,11 +2186,35 @@ export function snapshotLogBuffer(): LogEntry[] {
   return logBuffer.slice();
 }
 
+export function clearLogBuffer(): void {
+  logBuffer.splice(0);
+}
+
 export function flushLogBuffer(ws: WebSocket) {
   while (logBuffer.length > 0) {
     const entry = logBuffer[0];
     try { ws.send(JSON.stringify({ type: 'log', content: entry.content })); } catch { break; }
     logBuffer.shift();
+  }
+}
+
+// Replay the log buffer at a rate ≤15 msgs/s to stay safely under the
+// backend's 20 msg/s close-threshold (routers/projects.py).
+export async function replayLogBufferRateLimited(ws: WebSocket): Promise<void> {
+  const BATCH = 15;
+  while (logBuffer.length > 0) {
+    const batchStart = Date.now();
+    let sent = 0;
+    while (logBuffer.length > 0 && sent < BATCH) {
+      const entry = logBuffer[0];
+      try { ws.send(JSON.stringify({ type: 'log', content: entry.content })); } catch { return; }
+      logBuffer.shift();
+      sent++;
+    }
+    if (logBuffer.length > 0) {
+      const elapsed = Date.now() - batchStart;
+      if (elapsed < 1000) await new Promise(r => setTimeout(r, 1000 - elapsed));
+    }
   }
 }
 
@@ -2209,7 +2250,7 @@ async function connectLogStream(taskId: string): Promise<WebSocket | null> {
         });
       });
       if (ws) {
-        flushLogBuffer(ws);
+        await replayLogBufferRateLimited(ws);
         return ws;
       }
     } catch (err) {

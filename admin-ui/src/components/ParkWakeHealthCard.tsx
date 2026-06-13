@@ -6,7 +6,18 @@ function ageLabel(seconds: number | null): string {
   return seconds == null ? '—' : formatDurationSec(seconds);
 }
 
-export function ParkWakeHealthCard({ data }: { data?: ParkWakeHealth | null }) {
+export function ParkWakeHealthCard({ data, stale }: { data?: ParkWakeHealth | null; stale?: boolean }) {
+  if (!data && stale) {
+    return (
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 opacity-50">
+        <div className="flex items-center gap-2 mb-2">
+          <CircleParking className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+          <h3 className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest">Park/Wake Health</h3>
+        </div>
+        <div className="text-[10px] text-neutral-600">Data unavailable</div>
+      </div>
+    );
+  }
   if (!data) return null;
 
   const stalled = data.delivery_stalled;

@@ -18,6 +18,7 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import BackgroundTasks
 from httpx import AsyncClient
 
 from app.models import (
@@ -62,12 +63,20 @@ async def _make_project_with_member(db_session, owner_id=TEST_USER_ID):
     return project
 
 
-async def _make_task(db_session, project, *, status=TaskStatus.FAILED, task_type="fix"):
+async def _make_task(
+    db_session,
+    project,
+    *,
+    status=TaskStatus.FAILED,
+    task_type="fix",
+    context=None,
+):
     task = Task(
         project_id=project.id,
         title="C2 task",
         status=status,
         payloads=[{"type": task_type, "prompt": "do something"}],
+        context=dict(context or {}),
     )
     db_session.add(task)
     await db_session.commit()
@@ -76,6 +85,93 @@ async def _make_task(db_session, project, *, status=TaskStatus.FAILED, task_type
 
 
 # ── H-C3 — bulk retry doesn't hold the request session during _requeue ──────
+
+
+@pytest.mark.asyncio
+async def test_single_admin_requeue_strips_blocked_escalation_context(db_session):
+    from app.admin_task_mutations import modify_task_apply
+    from app.task_blocked import enter_blocked_state, mark_blocker_escalated
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_task(db_session, project, status=TaskStatus.IN_PROGRESS)
+    enter_blocked_state(task, waiting_on="dep", reason="blocked")
+    mark_blocker_escalated(task, detail="deadline elapsed")
+    task.context = {
+        **(task.context or {}),
+        "_blocked_escalated": True,
+        "_precondition_escalated_key": "dep",
+        "_dispatch_prep_failures": 3,
+        "_previous_failure_class": "SCOPE_OVERFLOW",
+        "_failure_class_history": ["SCOPE_OVERFLOW"],
+    }
+    task.status = TaskStatus.BLOCKED
+    db_session.add(task)
+    await db_session.commit()
+
+    await modify_task_apply(
+        task,
+        {"status": TaskStatus.QUEUED.value},
+        BackgroundTasks(),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    ctx = task.context or {}
+    assert "blocker" not in ctx
+    assert "failure_class" not in ctx
+    assert "failure_category" not in ctx
+    assert "_blocked_escalated" not in ctx
+    assert "_precondition_escalated_key" not in ctx
+    assert "_dispatch_prep_failures" not in ctx
+    assert ctx["_previous_failure_class"] == "SCOPE_OVERFLOW"
+    assert ctx["_failure_class_history"] == ["SCOPE_OVERFLOW"]
+
+    enter_blocked_state(task, waiting_on="dep", reason="blocked again")
+    mark_blocker_escalated(task, detail="second deadline")
+    assert (task.context or {})["blocker"]["escalation_detail"] == "second deadline"
+
+
+@pytest.mark.asyncio
+async def test_bulk_retry_strips_fresh_attempt_context(db_session):
+    from app.admin import _bulk_retry_one_task
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.FAILED,
+        context={
+            "failure_class": "CODE_ERROR",
+            "failure_category": "CODE_ERROR",
+            "blocker": {"source": "agent"},
+            "_blocked_escalated": True,
+            "_precondition_escalated_key": "dep",
+            "_blocked_optimistic_retries": 2,
+            "_dispatch_prep_failures": 3,
+            "provision_failures": 1,
+            "llm_account_id": "acct-1",
+            "_previous_failure_class": "SCOPE_OVERFLOW",
+            "_failure_class_history": ["SCOPE_OVERFLOW"],
+        },
+    )
+
+    await _bulk_retry_one_task(task.id, db_session, preloaded_has_children=False)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    ctx = task.context or {}
+    assert "failure_class" not in ctx
+    assert "failure_category" not in ctx
+    assert "blocker" not in ctx
+    assert "_blocked_escalated" not in ctx
+    assert "_precondition_escalated_key" not in ctx
+    assert "_blocked_optimistic_retries" not in ctx
+    assert "_dispatch_prep_failures" not in ctx
+    assert "provision_failures" not in ctx
+    assert "llm_account_id" not in ctx
+    assert ctx["_previous_failure_class"] == "SCOPE_OVERFLOW"
+    assert ctx["_failure_class_history"] == ["SCOPE_OVERFLOW"]
 
 
 @pytest.mark.asyncio
@@ -97,7 +193,7 @@ async def test_bulk_retry_uses_scoped_session_per_task(
 
     invoked_with: list[uuid.UUID] = []
 
-    async def _fake_retry(task_id: uuid.UUID, request_session):
+    async def _fake_retry(task_id: uuid.UUID, request_session, preloaded_has_children=None):
         invoked_with.append(task_id)
         return None  # no old VM to delete
 
@@ -143,7 +239,7 @@ async def test_bulk_retry_does_not_block_concurrent_session_during_requeue(
     sleep_started = asyncio.Event()
     second_op_done = asyncio.Event()
 
-    async def _slow_retry(task_id: uuid.UUID, request_session):
+    async def _slow_retry(task_id: uuid.UUID, request_session, preloaded_has_children=None):
         sleep_started.set()
         # Wait for the concurrent fresh-session read to complete.
         # If the request session holds a blocking transaction, the
@@ -368,7 +464,11 @@ async def test_bulk_approve_critical_merge_blocks_on_dual_head_collision(
     mocker.patch(
         "app.github.get_pr_files",
         new_callable=AsyncMock,
-        return_value=[{"filename": "backend/alembic/versions/0002_dupe.py"}],
+        return_value=[{
+            "filename": "backend/alembic/versions/0002_dupe.py",
+            "status": "added",
+            "patch": '+revision = "0002"\n+down_revision = "0001"',
+        }],
     )
     mocker.patch(
         "app.github.get_pull_request_diff",

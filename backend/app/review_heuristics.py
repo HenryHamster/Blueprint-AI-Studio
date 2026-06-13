@@ -213,7 +213,7 @@ def detect_early_nonconvergence(history: list) -> tuple[bool, str]:
             return out
 
         recent = rejection_entries[-EARLY_NONCONVERGENCE_VERIFY_DRIFT_ROUNDS:]
-        earlier = rejection_entries[: -EARLY_NONCONVERGENCE_VERIFY_DRIFT_ROUNDS]
+        earlier = rejection_entries[:-EARLY_NONCONVERGENCE_VERIFY_DRIFT_ROUNDS]
         seen_before: set[str] = set()
         for e in earlier:
             seen_before |= _norm_descs(e)
@@ -664,6 +664,15 @@ LANE_CAP_CI_DEFAULT = 6
 LANE_CAP_ARBITRATION_DEFAULT = 2
 LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci + arbitration collectively
 
+# Number of consecutive conflict-lane fix completions that trigger persistent-
+# conflict escalation BEFORE the lane sub-cap fires. The loop closes the PR and
+# records failure_detail="persistent_merge_conflict" on the orig task so the
+# operator can see the conflict, not a generic cap-exhaustion message.
+# Fires at lane_count >= threshold (default 2) so the first conflict attempt
+# is preserved (keeps hardened prompt behavior for attempt 1), and a second
+# failure without resolution confirms the conflict is not auto-resolvable.
+PERSISTENT_CONFLICT_ESCALATION_THRESHOLD = 2
+
 
 def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined]  # noqa: F821
     """Classify a completed/failed pipeline task into its review-fix lane.
@@ -676,7 +685,9 @@ def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined] 
     payload_type = payload.get("type", "")
     if payload_type == "panel_review":
         return LANE_ARBITRATION
-    fix_reason = (task.context or {}).get("review_loop", {}).get("fix_reason", "code_review")
+    fix_reason = (
+        (task.context or {}).get("review_loop", {}).get("fix_reason", "code_review")
+    )
     if fix_reason in ("merge_conflict", "update_branch_failed"):
         return LANE_CONFLICT
     if fix_reason == "ci_failure":

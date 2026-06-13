@@ -5,12 +5,13 @@ import { DashboardHome } from './DashboardHome';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
-const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, fetchFleetUtilizationMock, fetchAgentServingShasMock, capturedProps } = vi.hoisted(() => ({
+const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, fetchFleetUtilizationMock, fetchAgentServingShasMock, setVersionPhaseMock, capturedProps } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
   fetchQualificationVerdictsMock: vi.fn().mockResolvedValue({ verdicts: [], total: 0 }),
   fetchTaskMock: vi.fn(),
   fetchFleetUtilizationMock: vi.fn(),
   fetchAgentServingShasMock: vi.fn(),
+  setVersionPhaseMock: vi.fn(),
   capturedProps: {
     prMonitor: null as Record<string, unknown> | null,
     remediationFunnel: null as Record<string, unknown> | null,
@@ -41,7 +42,7 @@ vi.mock('../api', () => ({
     signal_age_hours: null,
     data_sufficient: true,
   }),
-  setVersionPhase: vi.fn(),
+  setVersionPhase: (projectId: string, phase: string, reasoning?: string) => setVersionPhaseMock(projectId, phase, reasoning),
   setVersionGoal: vi.fn(),
   triggerQualify: vi.fn(),
 }));
@@ -177,6 +178,14 @@ function notFoundResponse(): Response {
   } as Response;
 }
 
+function errorResponse(status: number): Response {
+  return {
+    ok: false,
+    status,
+    json: async () => ({}),
+  } as Response;
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   const promise = new Promise<T>(r => {
@@ -260,7 +269,14 @@ describe('DashboardHome', () => {
     fetchTaskMock.mockReset();
     fetchFleetUtilizationMock.mockReset();
     fetchAgentServingShasMock.mockReset();
+    setVersionPhaseMock.mockReset();
     fetchQualificationVerdictsMock.mockResolvedValue({ verdicts: [], total: 0 });
+    setVersionPhaseMock.mockResolvedValue({
+      version_number: 42,
+      phase: 'build',
+      phase_changed_at: '2026-05-20T12:05:00Z',
+      phase_reasoning: 'operator advance',
+    });
     fetchFleetUtilizationMock.mockResolvedValue({
       active_now: 0,
       nominal_capacity: null,
@@ -331,6 +347,76 @@ describe('DashboardHome', () => {
     expect(screen.getByText('No recent activity')).toBeInTheDocument();
     expect(screen.getByText('Completed')).toBeInTheDocument();
     expect(screen.getAllByText('0').length).toBeGreaterThan(2);
+  });
+
+  it('Active/Queued cards reflect aggregate counts, not the current task page slice', async () => {
+    // The `tasks` prop is the current paginated page — here a single IN_PROGRESS
+    // task. The membership-scoped aggregate props report the true fleet totals.
+    // The headline cards must render the aggregate so a one-task page can't make
+    // other projects' active/queued work disappear.
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(
+      <DashboardHome
+        tasks={[makeTask({ id: 'one-active', status: 'IN_PROGRESS' })]}
+        selectedProjectId={null}
+        globalActiveCount={12}
+        globalQueuedCount={7}
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    const section = (await screen.findByText('Task Status')).closest('section') as HTMLElement;
+    const activeCard = within(section).getByText('Active').closest('div') as HTMLElement;
+    expect(within(activeCard).getByText('12')).toBeInTheDocument();
+    // Not the page-slice value of 1.
+    expect(within(activeCard).queryByText('1')).not.toBeInTheDocument();
+
+    const queuedCard = within(section).getByText('Queued').closest('div') as HTMLElement;
+    expect(within(queuedCard).getByText('7')).toBeInTheDocument();
+  });
+
+  it('Active/Queued cards prefer the project-scoped aggregate when a project is selected', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(
+      <DashboardHome
+        tasks={[]}
+        selectedProjectId="proj1"
+        globalActiveCount={12}
+        globalQueuedCount={7}
+        scopedActiveCount={3}
+        scopedQueuedCount={2}
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    const section = (await screen.findByText('Task Status')).closest('section') as HTMLElement;
+    const activeCard = within(section).getByText('Active').closest('div') as HTMLElement;
+    // Project-scoped (3), not fleet (12).
+    expect(within(activeCard).getByText('3')).toBeInTheDocument();
+    const queuedCard = within(section).getByText('Queued').closest('div') as HTMLElement;
+    expect(within(queuedCard).getByText('2')).toBeInTheDocument();
   });
 
   it('fetches project-scoped agent serving SHA data', async () => {
@@ -628,6 +714,36 @@ describe('DashboardHome', () => {
     expect(screen.getByText('healthy')).toBeInTheDocument();
     expect(screen.getByText('92%')).toBeInTheDocument();
     expect(screen.getByText('120c 2rl')).toBeInTheDocument();
+  });
+
+  it('threads response-level served_stale from the health endpoint into the pool panel', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+      accountHealth: {
+        served_stale: true,
+        generated_at: '2026-06-13T00:00:00Z',
+        accounts: [
+          {
+            account_id: 'acct-1',
+            label: 'Main Anthropic',
+            provider: 'anthropic',
+            state: 'healthy',
+            health_score: 0.92,
+            completions_24h: 120,
+            rl_events_24h: 2,
+            rate_limited_models: [],
+            failure_class_counts: {},
+          },
+        ],
+      },
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    expect(await screen.findByText('Provider Account Health')).toBeInTheDocument();
+    // The response-level stale chip is present because served_stale flowed through.
+    expect(screen.getByTitle(/whole panel is a cached fallback/i)).toBeInTheDocument();
   });
 
   it('shows disabled state with reason and expands to reveal quota-vs-cooldown badges', async () => {
@@ -2072,6 +2188,53 @@ describe('DashboardHome', () => {
     expect(panel).toHaveTextContent('promoted');
   });
 
+  it('marks version lifecycle data stale when refresh fails after prior success', async () => {
+    const user = userEvent.setup();
+    let lifecycleCalls = 0;
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({ failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] }));
+      if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+      if (url.includes('/api/admin/open-prs')) return Promise.resolve(jsonResponse({ open_prs: [] }));
+      if (url.includes('/version-lifecycle')) {
+        lifecycleCalls += 1;
+        if (lifecycleCalls === 1) {
+          return Promise.resolve(jsonResponse({
+            current_version: {
+              version_number: 42,
+              phase: 'stabilize',
+              phase_changed_at: '2026-05-20T12:00:00Z',
+              goal: 'Ship mobile-responsive admin UI',
+              opened_at: '2026-05-15T00:00:00Z',
+              qualification_attempts: 2,
+              merged_task_count: 15,
+              last_qualification: { status: 'dry_run', confidence: 0.78, threshold: 0.80, sub_scores: null, blocker: null, finalized_at: null },
+            },
+            recent_versions: [],
+          }));
+        }
+        return Promise.resolve(errorResponse(503));
+      }
+      if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+      return Promise.resolve(notFoundResponse());
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    const panel = await screen.findByTestId('version-lifecycle-panel');
+    expect(panel).toHaveTextContent('v42');
+    expect(panel).not.toHaveTextContent('Version lifecycle data may be stale');
+
+    await user.click(within(panel).getByRole('button', { name: /build/i }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('version-lifecycle-stale')).toHaveTextContent('Version lifecycle data may be stale');
+    });
+    expect(setVersionPhaseMock).toHaveBeenCalledWith('proj1', 'build', 'operator advance');
+    expect(screen.getByTestId('version-lifecycle-panel')).toHaveTextContent('v42');
+    expect(screen.getByTestId('version-lifecycle-stale')).toHaveTextContent('Version lifecycle unavailable (503)');
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+  });
+
   it('shows green CI badge and resolved SHA in verdict history', async () => {
     apiFetchMock.mockImplementation((url: string) => {
       if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({ failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] }));
@@ -2216,7 +2379,7 @@ describe('DashboardHome', () => {
     expect(panel).not.toHaveTextContent('ci:pending @');
   });
 
-  it('does not render version lifecycle panel when project has no lifecycle data', async () => {
+  it('renders version lifecycle unavailable state when project lifecycle data is missing', async () => {
     setupApiMocks({
       digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
       diagnostics: makeDiagnostics(),
@@ -2226,7 +2389,8 @@ describe('DashboardHome', () => {
     render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
 
     await screen.findByText('All systems healthy');
-    expect(screen.queryByTestId('version-lifecycle-panel')).not.toBeInTheDocument();
+    expect(screen.getByTestId('version-lifecycle-unavailable')).toHaveTextContent('Version lifecycle unavailable (404)');
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
   });
 
   it('renders SR Blind Spots section with expandable pills and examples', async () => {
@@ -2538,6 +2702,141 @@ describe('DashboardHome', () => {
 
       await screen.findByText('All systems healthy');
       expect(screen.queryByText('Effort & Model Efficiency')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('digest staleness banner', () => {
+    it('shows the stale banner when the backend returns served_stale=true', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 2,
+          pending_approval_count: 0,
+          completed_count: 5,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+          served_stale: true,
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByTestId('digest-stale-banner')).toBeInTheDocument();
+      // Should NOT show the "Backend unreachable" banner — we have data
+      expect(screen.queryByText(/Backend unreachable/)).not.toBeInTheDocument();
+    });
+
+    it('shows the stale banner when digest fetch fails but previous data exists', async () => {
+      const validDigest = {
+        failed_count: 1,
+        pending_approval_count: 0,
+        completed_count: 3,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      };
+
+      // First call: returns valid digest
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(validDigest));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/api/admin/open-prs')) return Promise.resolve(jsonResponse({ open_prs: [] }));
+        if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+        return Promise.resolve(notFoundResponse());
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      // Wait for initial successful load
+      await screen.findByText('All systems healthy');
+      expect(screen.queryByTestId('digest-stale-banner')).not.toBeInTheDocument();
+
+      // Second call: digest fails
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/api/admin/digest')) return Promise.resolve(errorResponse(503));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/api/admin/open-prs')) return Promise.resolve(jsonResponse({ open_prs: [] }));
+        if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+        return Promise.resolve(notFoundResponse());
+      });
+
+      // Trigger a manual re-render cycle via window change (simulates poller tick)
+      const { rerender } = render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      rerender(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      // After fetch failure with prior data, stale banner should appear
+      await waitFor(() => {
+        expect(screen.queryByTestId('digest-stale-banner')).not.toBeNull();
+      });
+      // "Backend unreachable" banner should NOT appear since we have previous data
+      expect(screen.queryByText(/Backend unreachable/)).not.toBeInTheDocument();
+    });
+
+    it('passes degraded=true to PRMonitorSection when open-prs payload is degraded', async () => {
+      const validDigest = {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      };
+
+      setupApiMocks({
+        digest: validDigest,
+        diagnostics: makeDiagnostics(),
+        openPRs: {
+          open_prs: [],
+          project_integration_branch: 'main',
+          project_promotion_target: 'main',
+          degraded: true,
+          degraded_reason: 'github_token_error',
+        },
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      await screen.findByText('All systems healthy');
+
+      expect(capturedProps.prMonitor?.stale).toBeFalsy();
+      expect(capturedProps.prMonitor?.degraded).toBe(true);
+    });
+
+    it('passes stale=true to PRMonitorSection when open-prs fetch fails after prior success', async () => {
+      const validDigest = {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      };
+
+      setupApiMocks({ digest: validDigest, diagnostics: makeDiagnostics() });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      await screen.findByText('All systems healthy');
+
+      // PRMonitorSection should receive stale=false initially
+      expect(capturedProps.prMonitor?.stale).toBeFalsy();
+
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(validDigest));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/api/admin/open-prs')) return Promise.resolve(errorResponse(503));
+        if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+        return Promise.resolve(notFoundResponse());
+      });
+
+      const refresh = capturedProps.prMonitor?.onRefresh as (() => Promise<void>) | undefined;
+      expect(refresh).toBeDefined();
+      if (refresh) {
+        await refresh();
+      }
+
+      await waitFor(() => {
+        expect(capturedProps.prMonitor?.stale).toBe(true);
+      });
+      expect(capturedProps.prMonitor?.degraded).toBeFalsy();
     });
   });
 });

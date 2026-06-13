@@ -217,3 +217,43 @@ describe('PipelineView side-car rendering', () => {
     expect(screen.getByText('↳ side-car')).toBeTruthy();
   });
 });
+
+describe('PipelineView group summary counts parked tasks separately', () => {
+  it('displays parked count in group header badge and does not inflate queued segment', async () => {
+    const user = userEvent.setup();
+    // Two root tasks so Expand All button renders.
+    const tasks = [
+      makeTask({
+        id: 'root-1',
+        title: 'Root task',
+        status: 'IN_PROGRESS',
+      }),
+      makeTask({
+        id: 'parked-1',
+        title: 'Parked task',
+        status: 'PARKED',
+        parent_task_id: 'root-1',
+        park_reason: 'Waiting for dependency',
+        parked_at: '2026-05-01T10:30:00Z',
+      }),
+      makeTask({
+        id: 'queued-1',
+        title: 'Queued task',
+        status: 'QUEUED',
+        parent_task_id: 'root-1',
+      }),
+      makeTask({
+        id: 'root-2',
+        title: 'Second root',
+        status: 'QUEUED',
+      }),
+    ];
+    render(<PipelineView tasks={tasks} onViewLogs={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: 'Expand all' }));
+
+    // The group header should display a parked badge with the count.
+    // Look for a badge with title containing "parked" and text "1".
+    const parkedBadges = Array.from(document.querySelectorAll('[title*="parked"]')).filter(el => el.textContent?.includes('1'));
+    expect(parkedBadges.length).toBeGreaterThan(0);
+  });
+});

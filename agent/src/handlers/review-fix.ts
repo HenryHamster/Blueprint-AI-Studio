@@ -78,6 +78,56 @@ export type { MigrationConflict } from './review-fix-migration.js';
  * a brief delay between successive retries to reduce contention. Any non-
  * stale push failure and any rebase conflict surface immediately.
  */
+export type PushRejectionCategory =
+  | 'workflow-permission'
+  | 'push-protection'
+  | 'protected-branch';
+
+export function classifyDeterministicPushRejection(errMsg: string): {
+  category: PushRejectionCategory;
+  message: string;
+} | null {
+  const msg = errMsg.toLowerCase();
+  if (
+    msg.includes('refusing to allow a github app to create or update workflow')
+    || msg.includes('workflow permission')
+    || msg.includes('workflows permission')
+  ) {
+    return {
+      category: 'workflow-permission',
+      message:
+        'GitHub rejected the push because this GitHub App cannot create or update workflow files without the workflows permission. Revert the workflow file(s) before pushing, or use a token with workflows permission.',
+    };
+  }
+  if (
+    msg.includes('gh013')
+    || msg.includes('secret scanning')
+    || msg.includes('push protection')
+    || msg.includes('blocked by secret scanning')
+    || msg.includes('contains secrets')
+  ) {
+    return {
+      category: 'push-protection',
+      message:
+        'GitHub rejected the push because push protection or secret scanning blocked it. Remove the secret or revert the offending file(s) before pushing.',
+    };
+  }
+  if (
+    msg.includes('protected branch')
+    || msg.includes('branch protection')
+    || msg.includes('gh006')
+    || msg.includes('required status check')
+    || msg.includes('admin rights required')
+  ) {
+    return {
+      category: 'protected-branch',
+      message:
+        'GitHub rejected the push because the branch is protected. This push cannot succeed with force-with-lease; push to an unprotected branch or update branch protection.',
+    };
+  }
+  return null;
+}
+
 export async function pushForceWithLeaseRetrying(
   branch: string,
   ws: WebSocket | null,
@@ -89,7 +139,14 @@ export async function pushForceWithLeaseRetrying(
     return;
   } catch (e) {
     const errMsg = e instanceof Error ? e.message : String(e);
-    if (!errMsg.includes('stale info')) throw e;
+    if (!errMsg.includes('stale info')) {
+      const classified = classifyDeterministicPushRejection(errMsg);
+      if (classified) {
+        sendLog(ws, `${classified.message}\n`);
+        throw new Error(classified.message);
+      }
+      throw e;
+    }
     lastErr = e;
     sendLog(ws, `Push rejected (stale info) — concurrent push detected, will retry up to ${maxRetries} time(s).\n`);
   }
@@ -111,7 +168,14 @@ export async function pushForceWithLeaseRetrying(
       return;
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
-      if (!errMsg.includes('stale info')) throw e;
+      if (!errMsg.includes('stale info')) {
+        const classified = classifyDeterministicPushRejection(errMsg);
+        if (classified) {
+          sendLog(ws, `${classified.message}\n`);
+          throw new Error(classified.message);
+        }
+        throw e;
+      }
       lastErr = e;
       if (attempt < maxRetries) {
         sendLog(ws, `Retry ${attempt}/${maxRetries} also rejected (stale info) — another concurrent push, will retry.\n`);

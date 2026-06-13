@@ -404,6 +404,12 @@ export interface MissingCapabilityDemand {
 }
 
 export interface DigestData<DP = unknown> {
+  // ----- staleness signal -----
+  // Set by the backend when the L3 (on-demand) cache serves a last-good
+  // fallback because the live compute failed. Absent on L1/L2 (precomputed)
+  // responses. The dashboard renders a per-source staleness banner when true.
+  served_stale?: boolean;
+
   // ----- core contract (validated by assertDigestContract) -----
   failed_count: number;
   pending_approval_count: number;
@@ -422,6 +428,11 @@ export interface DigestData<DP = unknown> {
   active_count: number;
   running_count: number;
   queued_count: number;
+  // Fleet- or project-scoped count of IN_PROGRESS tasks whose last heartbeat is
+  // older than 5 minutes. Covers the whole fleet (or the selected project), not
+  // the current task page, so the health bar's "N stale" warning reflects real
+  // scope. Additive — absent on legacy payloads, so reads must guard.
+  stale_heartbeat_count?: number;
   research_cycles: number;
   prs_opened: number;
   active_tasks?: ActiveTask[];

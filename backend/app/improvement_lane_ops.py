@@ -39,6 +39,10 @@ class LaneCheckpointError(Exception):
     """Raised when a checkpoint cannot be appended (bad sha, budget, etc.)."""
 
 
+class LaneOwnerMismatchError(LaneCheckpointError):
+    """Raised when the completing task does not own the active lane."""
+
+
 _TERMINAL_STATUSES = frozenset(
     {ImprovementLaneStatus.RETIRED.value, ImprovementLaneStatus.KILLED.value}
 )
@@ -105,9 +109,7 @@ async def cas_transition(
         )
 
     result = await session.execute(
-        select(ImprovementLane)
-        .where(ImprovementLane.id == lane_id)
-        .with_for_update()
+        select(ImprovementLane).where(ImprovementLane.id == lane_id).with_for_update()
     )
     lane = result.scalar_one_or_none()
     if lane is None:
@@ -150,9 +152,19 @@ def _merge_manifest_patch(
     phase_log) are appended and trimmed to keep the total manifest under
     _LANE_MANIFEST_MAX_BYTES.  Other fields are overwritten by patch.
     """
-    _LIST_FIELDS = frozenset(
-        {"progress", "remaining", "critical_files", "failing_tests", "risks", "phase_log"}
-    )
+    # Eviction-priority order: fields listed first are trimmed first when the
+    # manifest is over budget.  phase_log and failing_tests grow fastest and have
+    # the lowest per-entry value; critical_files and risks are small and high-value
+    # so they survive longest.  Tie-breaking uses the first match in this sequence
+    # (the > guard in the loop keeps the earliest-seen winner on equal lengths).
+    _LIST_FIELDS = [
+        "phase_log",
+        "failing_tests",
+        "progress",
+        "remaining",
+        "critical_files",
+        "risks",
+    ]
     merged = dict(existing)
     for key, value in patch.items():
         if key in _LIST_FIELDS and isinstance(value, list):
@@ -193,9 +205,7 @@ async def checkpoint_lane(
     BEFORE calling this function (via GitHub API or equivalent).
     """
     result = await session.execute(
-        select(ImprovementLane)
-        .where(ImprovementLane.id == lane_id)
-        .with_for_update()
+        select(ImprovementLane).where(ImprovementLane.id == lane_id).with_for_update()
     )
     lane = result.scalar_one_or_none()
     if lane is None:
@@ -203,6 +213,11 @@ async def checkpoint_lane(
     if lane.status != ImprovementLaneStatus.ACTIVE.value:
         raise LaneCheckpointError(
             f"Lane {lane_id} must be ACTIVE to checkpoint, got {lane.status}"
+        )
+    if lane.current_task_id is not None and lane.current_task_id != task_id:
+        raise LaneOwnerMismatchError(
+            f"Lane {lane_id} is owned by task {lane.current_task_id}, "
+            f"but checkpoint was attempted by task {task_id}"
         )
 
     now = _utcnow()
@@ -246,8 +261,12 @@ async def checkpoint_lane(
     lane.checkpoint_seq = seq
 
     # Accumulate accounting.
-    lane.llm_input_tokens_total = (lane.llm_input_tokens_total or 0) + checkpoint.tokens_in
-    lane.llm_output_tokens_total = (lane.llm_output_tokens_total or 0) + checkpoint.tokens_out
+    lane.llm_input_tokens_total = (
+        lane.llm_input_tokens_total or 0
+    ) + checkpoint.tokens_in
+    lane.llm_output_tokens_total = (
+        lane.llm_output_tokens_total or 0
+    ) + checkpoint.tokens_out
     lane.vm_cost_usd_total = (lane.vm_cost_usd_total or 0.0) + checkpoint.vm_cost_usd
 
     # CAS ACTIVE -> PARKED.
@@ -269,12 +288,13 @@ async def mark_checkpoint_missing(
     Returns ``(lane, should_requeue)``.  ``should_requeue=True`` when
     ``phase_requeues`` is still under the budget; the caller is responsible
     for actually creating the requeue task.  When the budget is exhausted
-    the lane is left ACTIVE so the sweep can surface it to the strategist.
+    the lane is left ACTIVE here — the live review-spawn path
+    (``review_fix_lane_pilot.checkpoint_or_recover_phase``) closes it inline
+    (KILLED + reservation released), with ``sweep_exhausted_lane_budgets`` as a
+    backstop for any over-budget lane that escaped inline handling.
     """
     result = await session.execute(
-        select(ImprovementLane)
-        .where(ImprovementLane.id == lane_id)
-        .with_for_update()
+        select(ImprovementLane).where(ImprovementLane.id == lane_id).with_for_update()
     )
     lane = result.scalar_one_or_none()
     if lane is None:

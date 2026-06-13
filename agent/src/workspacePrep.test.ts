@@ -36,7 +36,10 @@ vi.mock('./index.js', () => ({
 }));
 
 // ── Imports (after mocks) ────────────────────────────────────────────────────
-import { prepareWorkspaceForRole, resolveReferenceRepo } from './workspacePrep.js';
+import {
+  prepareWorkspaceForRole, resolveReferenceRepo,
+  getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome,
+} from './workspacePrep.js';
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 describe('prepareWorkspaceForRole', () => {
@@ -50,6 +53,7 @@ describe('prepareWorkspaceForRole', () => {
     logMock.mockReset();
     registerSizeCapMergeDriverMock.mockReset();
     delete process.env.BLUEPRINT_WARM_HANDOFF;
+    resetWorkspacePrepOutcome();
   });
 
   afterEach(() => {
@@ -733,6 +737,251 @@ describe('prepareWorkspaceForRole', () => {
         a.includes('reset --hard origin/feat/lane-no-sha'),
       )).toBe(true);
       expect(cloneWithRetryMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── WorkspacePrepOutcome: module-level recorder ─────────────────────────────
+  //
+  // After prepareWorkspaceForRole returns, getLastWorkspacePrepOutcome() holds a
+  // structured record of what actually happened. This is what enrichStatusPayload
+  // reads and emits under the key `workspace_prep`.
+  describe('WorkspacePrepOutcome recorder', () => {
+    afterEach(() => {
+      delete process.env.BLUEPRINT_LANE_MODE;
+      delete process.env.BLUEPRINT_LANE_CHECKPOINT_SHA;
+    });
+
+    it('genuine cold start (no warm handoff) → path=cold, cold_fallback_reason=null, lane_phase=false', async () => {
+      // BLUEPRINT_WARM_HANDOFF unset → pure cold path, no warm attempt.
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+      });
+
+      const outcome = getLastWorkspacePrepOutcome();
+      expect(outcome).not.toBeNull();
+      expect(outcome?.path).toBe('cold');
+      expect(outcome?.warm_reuse_succeeded).toBe(false);
+      expect(outcome?.checkpoint_reset_applied).toBe(false);
+      expect(outcome?.cold_fallback_reason).toBeNull();
+      expect(outcome?.lane_phase).toBe(false);
+    });
+
+    it('warm success (non-lane) → path=warm, warm_reuse_succeeded=true, checkpoint_reset_applied=false', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+      });
+
+      const outcome = getLastWorkspacePrepOutcome();
+      expect(outcome).not.toBeNull();
+      expect(outcome?.path).toBe('warm');
+      expect(outcome?.warm_reuse_succeeded).toBe(true);
+      expect(outcome?.checkpoint_reset_applied).toBe(false);
+      expect(outcome?.cold_fallback_reason).toBeNull();
+      expect(outcome?.lane_phase).toBe(false);
+    });
+
+    it('lane warm success with checkpoint reset → path=warm, warm_reuse_succeeded=true, checkpoint_reset_applied=true', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'abc1234def5678901234567890123456789012ab';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feat/lane',
+      });
+
+      const outcome = getLastWorkspacePrepOutcome();
+      expect(outcome).not.toBeNull();
+      expect(outcome?.path).toBe('warm');
+      expect(outcome?.warm_reuse_succeeded).toBe(true);
+      expect(outcome?.checkpoint_reset_applied).toBe(true);
+      expect(outcome?.cold_fallback_reason).toBeNull();
+      expect(outcome?.lane_phase).toBe(true);
+    });
+
+    it('lane warm mode but no checkpoint SHA → path=warm, checkpoint_reset_applied=false', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      // BLUEPRINT_LANE_CHECKPOINT_SHA intentionally not set.
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feat/lane-no-sha',
+      });
+
+      const outcome = getLastWorkspacePrepOutcome();
+      expect(outcome?.path).toBe('warm');
+      expect(outcome?.warm_reuse_succeeded).toBe(true);
+      expect(outcome?.checkpoint_reset_applied).toBe(false);
+      expect(outcome?.lane_phase).toBe(true);
+    });
+
+    it('warm failure → cold fallback: path=cold, warm_reuse_succeeded=false, non-null cold_fallback_reason', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === 'git') {
+          const arg0 = args.includes('-C') ? args[2] : args[0];
+          if (arg0 === 'fetch') throw new Error('network unreachable');
+        }
+        return '';
+      });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+      });
+
+      const outcome = getLastWorkspacePrepOutcome();
+      expect(outcome).not.toBeNull();
+      expect(outcome?.path).toBe('cold');
+      expect(outcome?.warm_reuse_succeeded).toBe(false);
+      expect(outcome?.checkpoint_reset_applied).toBe(false);
+      expect(outcome?.cold_fallback_reason).not.toBeNull();
+      expect(outcome?.cold_fallback_reason).toMatch(/^warm_path_error:/);
+      expect(outcome?.cold_fallback_reason).toMatch(/network unreachable/);
+      // Reason is bounded (≤ 220 chars including prefix).
+      expect((outcome?.cold_fallback_reason ?? '').length).toBeLessThanOrEqual(220);
+      expect(outcome?.lane_phase).toBe(false);
+    });
+
+    it('warm failure redacts tokenized repo URLs from the fallback reason and log output', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === 'git' && Array.isArray(args) && args.includes('remote')) {
+          throw new Error(
+            'Command failed: git -C /ws remote set-url origin https://x-access-token:tok@github.com/o/r.git\n'
+              + 'fatal: authentication failed',
+          );
+        }
+        return '';
+      });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+      });
+
+      const outcome = getLastWorkspacePrepOutcome();
+      expect(outcome?.path).toBe('cold');
+      expect(outcome?.cold_fallback_reason).toContain('https://x-access-token:***@github.com/o/r.git');
+      expect(outcome?.cold_fallback_reason).not.toContain('https://x-access-token:tok@github.com/o/r.git');
+      expect(logMock.mock.calls.some(call =>
+        String(call[0]).includes('https://x-access-token:***@github.com/o/r.git'),
+      )).toBe(true);
+      expect(logMock.mock.calls.some(call =>
+        String(call[0]).includes('https://x-access-token:tok@github.com/o/r.git'),
+      )).toBe(false);
+    });
+
+    it('lane warm failure → cold fallback: lane_phase=true even on cold path', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'deadbeef00000000000000000000000000000000';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === 'git' && Array.isArray(args) && args.includes('reset')
+            && args.includes('deadbeef00000000000000000000000000000000')) {
+          throw new Error('fatal: unknown revision or path not in the working tree');
+        }
+        return '';
+      });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feat/lane',
+      });
+
+      const outcome = getLastWorkspacePrepOutcome();
+      expect(outcome?.path).toBe('cold');
+      expect(outcome?.warm_reuse_succeeded).toBe(false);
+      expect(outcome?.checkpoint_reset_applied).toBe(false);
+      expect(outcome?.cold_fallback_reason).toMatch(/^warm_path_error:/);
+      expect(outcome?.lane_phase).toBe(true);
+    });
+
+    it('review side (allowLaneResume=false): lane_phase=false even when BLUEPRINT_LANE_MODE=1', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'deadbeefcafe1234';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+        allowLaneResume: false,
+      });
+
+      const outcome = getLastWorkspacePrepOutcome();
+      expect(outcome?.path).toBe('warm');
+      expect(outcome?.warm_reuse_succeeded).toBe(true);
+      expect(outcome?.checkpoint_reset_applied).toBe(false);
+      // allowLaneResume=false → lane_phase is false (gate disabled).
+      expect(outcome?.lane_phase).toBe(false);
+    });
+
+    it('resetWorkspacePrepOutcome clears the recorded outcome', async () => {
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+      });
+      expect(getLastWorkspacePrepOutcome()).not.toBeNull();
+      resetWorkspacePrepOutcome();
+      expect(getLastWorkspacePrepOutcome()).toBeNull();
+    });
+
+    it('enrichStatusPayload integration: getLastWorkspacePrepOutcome returns what workspace_prep would carry', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      process.env.BLUEPRINT_LANE_MODE = '1';
+      process.env.BLUEPRINT_LANE_CHECKPOINT_SHA = 'abc1234def5678901234567890123456789012ab';
+      fsMocks.existsSync.mockReturnValue(true);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feat/lane',
+      });
+
+      // The value getLastWorkspacePrepOutcome() returns is exactly what
+      // index.ts's enrichStatusPayload embeds under the key `workspace_prep`.
+      const outcome = getLastWorkspacePrepOutcome();
+      expect(outcome).toEqual({
+        path: 'warm',
+        warm_reuse_succeeded: true,
+        checkpoint_reset_applied: true,
+        cold_fallback_reason: null,
+        lane_phase: true,
+      });
     });
   });
 

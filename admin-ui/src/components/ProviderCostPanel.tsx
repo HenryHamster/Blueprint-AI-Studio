@@ -29,6 +29,7 @@ export function ProviderCostPanel({
   windowHours: number;
 }) {
   const [data, setData] = useState<ProviderCostSummary | null>(null);
+  const [pollError, setPollError] = useState(false);
   const efficiency = useEfficiencySnapshot(selectedProjectId);
 
   usePoller(async (signal) => {
@@ -36,11 +37,30 @@ export function ProviderCostPanel({
       const params = new URLSearchParams({ hours: String(windowHours) });
       if (selectedProjectId) params.set('project_id', selectedProjectId);
       const res = await apiFetch(`/api/admin/provider-cost-summary?${params}`);
-      if (!signal.aborted && res.ok) setData(await res.json());
-    } catch { /* silent */ }
+      if (!signal.aborted) {
+        if (res.ok) {
+          setData(await res.json());
+          setPollError(false);
+        } else {
+          setPollError(true);
+        }
+      }
+    } catch {
+      if (!signal.aborted) setPollError(true);
+    }
   }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId, windowHours] });
 
-  if (!data || data.rows.length === 0) return null;
+  if (!data || data.rows.length === 0) {
+    if (pollError) {
+      return (
+        <section>
+          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Cost &amp; Success</h2>
+          <div className="text-xs text-red-400 px-1">Cost data unavailable — fetch failed.</div>
+        </section>
+      );
+    }
+    return null;
+  }
 
   const w24 = efficiency?.window_24h;
   const w7 = efficiency?.window_7d;
@@ -48,6 +68,11 @@ export function ProviderCostPanel({
   return (
     <section>
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Cost &amp; Success</h2>
+      {pollError && (
+        <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+          Data may be stale — last poll failed.
+        </div>
+      )}
       {efficiency && (
         <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 px-1">
           <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">Pipeline Efficiency</span>

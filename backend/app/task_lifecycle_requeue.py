@@ -26,6 +26,7 @@ from app.retry_budget import (
     compute_effective_max_requeues,
 )
 from app.retry_prompt import _build_retry_prompt_suffix, merge_retry_prompt_suffix
+from app.task_blocked import strip_fresh_attempt_context
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +104,7 @@ async def _resolve_terminal_parent_verdict(
     blocked_children = [c for c in children if c.status == TaskStatus.BLOCKED]
     cancelled_children = [c for c in children if c.status == TaskStatus.CANCELLED]
     genuine_cancelled_children = [
-        c
-        for c in cancelled_children
-        if not _is_non_genuine_cancelled(c)
+        c for c in cancelled_children if not _is_non_genuine_cancelled(c)
     ]
     non_genuine_cancelled_children = [
         c for c in cancelled_children if _is_non_genuine_cancelled(c)
@@ -191,13 +190,10 @@ async def _terminate_all_non_genuine_cancelled(
     """
     from app.failure_classification import SCOPE_EMPTY, persist_failure_category
 
-    cancelled_count = len(
-        [c for c in children if c.status == TaskStatus.CANCELLED]
-    )
+    cancelled_count = len([c for c in children if c.status == TaskStatus.CANCELLED])
     parent.status = TaskStatus.FAILED
     parent.latest_status_message = (
-        f"All {cancelled_count} subtask(s) superseded/cancelled — "
-        f"nothing to roll up"
+        f"All {cancelled_count} subtask(s) superseded/cancelled — nothing to roll up"
     )
     persist_failure_category(parent, SCOPE_EMPTY)
     session.add(parent)
@@ -263,6 +259,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     Leaves COMPLETED, CANCELLED, and active (QUEUED/IN_PROGRESS) children untouched.
     Sets parent back to EVALUATING — no VM needed."""
     from app.alert_dispatch import _maybe_create_failure_alert
+
     # Deferred imports so test patches on app.task_lifecycle.* apply
     from app.task_lifecycle import broadcast_to_project, classify_failure
 
@@ -289,7 +286,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # visible to the blocked-vs-failed verdict — the old FAILED-only query made
         # them invisible and force-failed parents that were merely blocked.
         children = (
-            (await session.execute(select(Task).where(Task.parent_task_id == parent.id)))
+            (
+                await session.execute(
+                    select(Task).where(Task.parent_task_id == parent.id)
+                )
+            )
             .scalars()
             .all()
         )
@@ -573,21 +574,14 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         child_ctx = child.context or {}
         task_scope = child_ctx.get("scope", DEFAULT_TASK_SCOPE)
         attempt = child_ctx.get("_attempt_number", 1)
-        _ctx_keys_to_strip = {
-            "max_plan_account_id",
-            "llm_account_id",
-            "llm_provider",
-            "llm_auth_mode",
-            "llm_model",
-            "llm_execution_mode",
-            "provision_failures",
-            "provision_failures_infra",
-            "_infra_wait",
-            "blacklisted_accounts",
-            "provision_failed_accounts",
-            "_slot_released",
-        }
-        clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
+        # Normalize raw lowercase 'scope_overflow' — defensive path where classify_failure
+        # returned CODE_ERROR but the agent's raw failure_category indicates scope overflow.
+        # failure_category is stripped from clone_ctx before _build_retry_prompt_suffix
+        # runs, so normalize failure_class here to ensure scope escalation fires correctly.
+        _raw_agent_cat = (child_ctx.get("failure_category") or "").lower()
+        if failure_class == "CODE_ERROR" and _raw_agent_cat == "scope_overflow":
+            failure_class = "SCOPE_OVERFLOW"
+        clone_ctx = strip_fresh_attempt_context(child_ctx)
 
         # Preserve the prior attempt's provider/model under a non-stripped key
         # so retry guidance can branch on what actually failed (e.g. emit
@@ -648,6 +642,28 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 "[REQUEUE] Failed to accumulate prior attempt cost for task %s",
                 child.id,
             )
+
+        # Accumulate LLM cost of prior failed attempts (symmetric to VM cost above).
+        # Uses _task_llm_cost from efficiency_snapshot which prices per-attempt tokens
+        # against the attempt's provider/model so multi-model chains are correct.
+        # Unpriced combos contribute $0 rather than blocking the requeue.
+        try:
+            from app.efficiency_snapshot import _task_llm_cost
+
+            _attempt_llm_cost, _ = _task_llm_cost(child)
+            if _attempt_llm_cost > 0.0:
+                _prior_llm_cost = float(
+                    clone_ctx.get("_prior_attempts_llm_cost") or 0.0
+                )
+                clone_ctx["_prior_attempts_llm_cost"] = round(
+                    _prior_llm_cost + _attempt_llm_cost, 6
+                )
+        except Exception:
+            logger.exception(
+                "[REQUEUE] Failed to accumulate prior attempt LLM cost for task %s",
+                child.id,
+            )
+
         clone_ctx["_previous_error"] = (original_status_message or "")[:5000]
         clone_ctx["_previous_failure_class"] = failure_class
         clone_ctx["_failure_class_history"] = append_failure_class_history(

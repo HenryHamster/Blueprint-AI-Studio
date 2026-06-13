@@ -32,6 +32,11 @@ import {
 } from './strategic-helpers.js';
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
+
+export const PR_INELIGIBLE_TASK_TYPES = [
+  'research', 'investigate', 'audit', 'memo',
+  'web_research', 'design', 'compute_experiment',
+] as const;
 export {
   formatCochangeHints,
   formatDecompositionOutcomes,
@@ -88,14 +93,28 @@ export function aggregateDirectionStats(
   if (totalMerged > 0) parts.push(`${totalMerged} merged`);
   if (totalFailed > 0) parts.push(`${totalFailed} failed`);
 
-  // Conversion rate from last 3 cycles: findings that became merged PRs
+  // Conversion rate from last 3 cycles: findings that became merged PRs.
+  // Exclude task types that can never open a PR (knowledge/compute outputs)
+  // from the denominator so the rate reflects PR-eligible tasks only.
+  // Older entries without type_breakdown contribute 0 ineligible (safe default).
+  const prIneligibleTypes: ReadonlySet<string> = new Set(PR_INELIGIBLE_TASK_TYPES);
   const recent = history.slice(-3);
   const recentTasksCreated = recent.reduce((s, h) => s + ((h.tasks_created as number) || 0), 0);
-  if (recentTasksCreated > 0) {
+  const recentIneligible = recent.reduce((s, h) => {
+    const tb = h.type_breakdown as Record<string, {created?: number} | undefined> | undefined;
+    if (!tb || typeof tb !== 'object') return s;
+    let n = 0;
+    for (const [k, v] of Object.entries(tb)) {
+      if (prIneligibleTypes.has(k) && v && typeof v.created === 'number') n += v.created;
+    }
+    return s + n;
+  }, 0);
+  const recentEligible = recentTasksCreated - recentIneligible;
+  if (recentEligible > 0) {
     const recentMerged = recent.reduce((s, h) => s + ((h.prs_merged as number) || 0), 0);
-    const pct = Math.round((recentMerged / recentTasksCreated) * 100);
+    const pct = Math.round((recentMerged / recentEligible) * 100);
     const cycleLabel = recent.length === 1 ? '1 cycle' : `${recent.length} cycles`;
-    parts.push(`conversion: ${pct}% (${recentMerged}/${recentTasksCreated} findings merged last ${cycleLabel})`);
+    parts.push(`conversion: ${pct}% (${recentMerged}/${recentEligible} findings merged last ${cycleLabel})`);
   }
 
   // Dedup/filter losses across last 3 cycles — lets the agent see how many

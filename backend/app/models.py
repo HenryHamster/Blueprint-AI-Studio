@@ -1247,6 +1247,10 @@ class Task(SQLModel, table=True):
         # narrower prefix.
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
+        Index("ix_task_project_status_updated", "project_id", "status", "updated_at"),
+        Index(
+            "ix_task_project_status_completed", "project_id", "status", "completed_at"
+        ),
         # BLOCKED joins the active-status set here (alembic 0138): a blocked
         # task is non-terminal and still owns its idempotency slot, so a
         # duplicate insert with the same key while the original is parked must
@@ -1318,6 +1322,20 @@ class Task(SQLModel, table=True):
             "last_heartbeat",
             postgresql_where=text("status IN ('IN_PROGRESS', 'PROVISIONING')"),
         ),
+        # Partial index for the admin health-overview query that selects
+        # COMPLETED/FAILED tasks with vm_instance_id IS NOT NULL ordered by
+        # last_heartbeat desc. The existing ix_task_status_last_heartbeat is
+        # partial on IN_PROGRESS/PROVISIONING so it actively excludes these rows.
+        Index(
+            "ix_task_terminal_last_heartbeat",
+            "last_heartbeat",
+            postgresql_where=text(
+                "status IN ('COMPLETED', 'FAILED') AND vm_instance_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "status IN ('COMPLETED', 'FAILED') AND vm_instance_id IS NOT NULL"
+            ),
+        ),
         Index(
             "ix_task_parent_task_id_status",
             "parent_task_id",
@@ -1337,6 +1355,10 @@ class Task(SQLModel, table=True):
             "payloads",
             postgresql_where=text("status IN ('PROVISIONING', 'IN_PROGRESS')"),
         ),
+        # Expression index on payloads[0]->>'type' covering all statuses so
+        # get_project_tasks task-type filters avoid a full table scan.
+        # Added via alembic 0238 CONCURRENTLY DDL.
+        Index("ix_task_payloads_type_all", "payloads"),
         # Partial index on retry_after_until so the reaper's stale
         # retry_after sweep (reaper.py: status=QUEUED AND
         # retry_after_until IS NOT NULL) doesn't degrade to linear scan
@@ -1990,7 +2012,18 @@ class PoolVm(SQLModel, table=True):
     reserved_lane_id: uuid.UUID | None = Field(
         default=None, sa_column=Column(GUID(), nullable=True)
     )
+    # SOFT reservation expiry. The maintainer's liveness-aware sweep may RE-STAMP
+    # this forward (extend) while the owning lane is still awaiting its fix, so it
+    # is NOT a reliable anchor for the absolute lifetime cap.
     reservation_expires_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    # HARD absolute ceiling on a reservation's total lifetime. Stamped ONCE at
+    # reservation creation (release_pool_vm) and never re-stamped, so liveness
+    # extension of reservation_expires_at can never exceed it. The sweep ALWAYS
+    # frees the member once this elapses, so a stuck/zombie lane can never pin a
+    # warm VM indefinitely (pool-capacity protection).
+    reservation_hard_expires_at: datetime | None = Field(
         default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
     )
 
@@ -4069,6 +4102,99 @@ class QualificationVerdict(SQLModel, table=True):
     )
 
 
+class AuditFindingResolution(SQLModel, table=True):
+    """Durable per-finding resolution ledger for carried qualification audit findings.
+
+    The re-qualification trigger ("all high+medium carried audit findings
+    merged-fixed or code-verified stale") needs per-finding resolution state that
+    SURVIVES qualification finalize.  Today nothing tracks it: every finalize
+    overwrites ``ReleaseVersion.last_qualification`` wholesale, and each immutable
+    ``QualificationVerdict`` row is a point-in-time snapshot, not a mutable
+    resolution record.  This table records ONE row per
+    ``(release_version, finding_key)`` resolution, keyed on the deterministic
+    content key ``release_scoring._audit_finding_key`` attaches to every carried
+    finding.  It lives in its OWN table — never inside ``last_qualification`` —
+    so it is never clobbered by a subsequent finalize overwrite.
+
+    A unique constraint on ``(release_version_id, finding_key)`` makes a repeat
+    write an UPSERT (latest write wins) rather than a duplicate; the write helper
+    ``release_readiness.apply_finding_resolution`` performs that upsert.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # Deterministic content key (release_scoring._audit_finding_key — sha256 of
+    # normalized file|summary, 16 hex) of the carried finding this row resolves.
+    finding_key: str = Field(
+        sa_column=Column(String(64), nullable=False, index=True),
+    )
+
+    # The carried finding's severity at resolution time (low/medium/high/critical/...).
+    severity: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+
+    # Resolution state: "resolved" (a merged fix addressed it) or "stale" (it was
+    # code-verified to no longer apply on the candidate).
+    state: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+
+    # Optional human/agent note explaining the resolution.
+    note: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    # Optional resolving reference — e.g. the merged PR number or URL that fixed it.
+    resolving_ref: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True),
+    )
+
+    # The candidate SHA the resolution/staleness verification was performed against.
+    verified_against_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "release_version_id",
+            "finding_key",
+            name="uq_auditfindingresolution_version_key",
+        ),
+    )
+
+
 class MigrationReservation(SQLModel, table=True):
     """A provisional Alembic revision id reserved for a migration-producing task.
 
@@ -4159,6 +4285,10 @@ class ImprovementLaneStatus(str, Enum):
     PARKED -> ACTIVE (next phase dispatched; current_task_id bound)
     ACTIVE | PARKED -> RETIRED (goal met / version closed; terminal)
     ACTIVE | PARKED -> KILLED (pilot kill or operator action; terminal)
+    PROPOSED -> KILLED (failed/abandoned activation aged out by the
+        reconciliation sweep; terminal)
+    PROPOSED -> RETIRED (chain merged/closed before the lane ever activated;
+        terminal)
     """
 
     PROPOSED = "PROPOSED"
@@ -4177,6 +4307,15 @@ _IMPROVEMENT_LANE_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
         ("PARKED", "RETIRED"),
         ("ACTIVE", "KILLED"),
         ("PARKED", "KILLED"),
+        # A PROPOSED lane whose activation never completed (failed/abandoned
+        # dispatch, or an operator/admin close before the first phase ran) had
+        # no permitted terminal exit, so it could strand forever holding its
+        # direction scope. These two edges let the reconciliation sweep and the
+        # pilot closers age such a lane to a terminal state. KILLED carries the
+        # abandoned/failed-activation semantics the sweep uses; RETIRED covers a
+        # chain that merged/closed before the lane ever activated.
+        ("PROPOSED", "KILLED"),
+        ("PROPOSED", "RETIRED"),
     }
 )
 
@@ -4281,6 +4420,30 @@ class ImprovementLane(SQLModel, table=True):
     reserved_idle_cost_usd_total: float = Field(
         default=0.0,
         sa_column=Column(Float, nullable=False, server_default=text("0.0")),
+    )
+
+    # Reservation expiry-cause telemetry (warm-resume diagnosability). Each warm
+    # reservation this lane held ends exactly one way; these counters make a low
+    # warm_resume_fraction explainable on the lanes analytics surface:
+    #   * claimed_by_fix       — the fix phase actually leased the reserved member
+    #                            (the GOOD outcome that lifts warm_resume_fraction).
+    #   * expired_before_fix   — the soft TTL lapsed and the sweep reclaimed the
+    #                            member because the chain stopped awaiting its fix
+    #                            (lane no longer PARKED) before the hard ceiling.
+    #   * force_expired        — released by the hard absolute ceiling, a pilot
+    #                            KILL, a chain RETIRE, a checkpoint-exhausted close,
+    #                            or a reaped member.
+    reservation_claimed_by_fix_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    reservation_expired_before_fix_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    reservation_force_expired_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
 
     # Pilot arm: "lane" | "control" | None (intent-to-treat assignment)
@@ -4438,5 +4601,122 @@ class TaskWakeRegistration(SQLModel, table=True):
             "ix_taskwakeregistration_state_deadline",
             "delivery_state",
             "deadline_at",
+        ),
+    )
+
+
+class EvergreenBacklogItem(SQLModel, table=True):
+    """Durable ledger of curated "evergreen" backlog candidates.
+
+    The utilization-triggered evergreen auto-fill mechanism (direction
+    d-2877ddc7) spawns LOW-priority research probes from this ledger when the
+    fleet is idle (low utilization) or all active directions are parked /
+    proof-waiting — additive parallelism that never competes with the
+    release-critical path. Each row is one candidate, project-scoped and keyed
+    by a stable ``finding_key`` so the same latent gap is never enrolled twice.
+
+    Lifecycle (``status`` — closed vocabulary, see
+    ``app.evergreen_backlog.BACKLOG_STATUSES``):
+
+    * ``enrolled``  — eligible for selection, never spawned.
+    * ``spawned``   — a research probe is live (``spawned_task_id`` set).
+    * ``advanced``  — the probe's surviving findings spawned implementation
+                      children through the existing research_completion gates.
+    * ``verified_stale`` — the probe's findings were rejected / non-actionable
+                      by the reproduce-on-HEAD / actionability gates; the gap no
+                      longer reproduces, so the item retires.
+    * ``retired``   — exhausted attempts or operator-retired; no longer eligible.
+
+    NO direct fix/create spawn path touches this table — implementation children
+    come only from research_completion's surviving-finding gates.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # Stable per-project dedup key for the latent gap this item represents.
+    finding_key: str = Field(
+        sa_column=Column(String(128), nullable=False, index=True),
+    )
+
+    title: str = Field(sa_column=Column(String(512), nullable=False))
+    detail: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+
+    # Lifecycle status (closed vocabulary — validated in app.evergreen_backlog).
+    status: str = Field(
+        sa_column=Column(String(32), nullable=False, server_default="enrolled"),
+    )
+    # Terminal/interim outcome reason (closed vocabulary), nullable until set.
+    outcome: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    # How the item was enrolled: e.g. "manual", "deferred_memo".
+    provenance: str = Field(
+        sa_column=Column(String(64), nullable=False, server_default="manual"),
+    )
+
+    # Optional direction this candidate belongs to (free-form id; conflict checks
+    # use it to skip enrolling against a direction that already has live work).
+    direction_id: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True, index=True)
+    )
+
+    attempts: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
+    # The research probe currently representing this item (nullable; SET NULL so
+    # the ledger row outlives the task row for durable provenance).
+    spawned_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    # SHA the most recent probe verified its finding against (reproduce-on-HEAD).
+    verified_against_sha: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        # Project-scoped finding-key uniqueness: the same latent gap can never be
+        # enrolled twice within a project.
+        UniqueConstraint(
+            "project_id",
+            "finding_key",
+            name="uq_evergreenbacklogitem_project_finding",
+        ),
+        # Selection hot path: scan a project's enrolled candidates by status.
+        Index(
+            "ix_evergreenbacklogitem_project_status",
+            "project_id",
+            "status",
         ),
     )

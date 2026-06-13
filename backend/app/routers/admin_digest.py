@@ -46,8 +46,7 @@ from app.capability_trial_verdict import (
     evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
     get_trial_definitions,
-    get_trial_verdicts,
-    record_trial_verdict,
+    persist_trial_verdicts_in_transaction,
 )
 from app.digest_metrics import (
     _compute_edges_considered_metrics,  # noqa: F401  re-exported for external importers
@@ -82,6 +81,7 @@ from app.digest_metrics import (
     compute_remediation_and_patterns,  # noqa: F401  re-exported for external importers
     compute_remediation_funnel,  # noqa: F401  re-exported for external importers
     compute_resurrection_outcome_summary,  # noqa: F401  re-exported for external importers
+    compute_llm_rework_cost,
     compute_retry_analytics,  # noqa: F401  re-exported for external importers
     compute_retry_pattern_summary,  # noqa: F401  re-exported for external importers
     compute_review_cap_exhaustion_summary,  # noqa: F401  re-exported for external importers
@@ -257,7 +257,7 @@ async def get_digest(
         )
 
     cache_key = ("digest", hours, str(project_id) if project_id else None)
-    result = await cache.get_or_compute(
+    result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_digest(hours=hours, project_id=project_id, session=session),
         ttl=60.0,
@@ -268,12 +268,14 @@ async def get_digest(
     # payload as fresh-for-PRECOMPUTE_STALE_FALLBACK_SECONDS, regressing
     # non-leader digest freshness from 15s to 5 minutes.
     record_digest_request(time.monotonic() - _t0, "l3_on_demand")
-    return annotate_precompute_metadata(
+    annotated = annotate_precompute_metadata(
         result,
         precomputed=False,
         precomputed_at=result.get("generated_at") or None,
         precompute_age_seconds=0.0,
     )
+    annotated["served_stale"] = served_stale
+    return annotated
 
 
 async def _compute_digest(
@@ -488,14 +490,26 @@ async def _compute_digest(
     if project_id:
         active_filters.append(Task.project_id == project_id)
     active_counts_result = await session.execute(
-        select(Task.status, func.count())
-        .where(*active_filters)
-        .group_by(Task.status)
+        select(Task.status, func.count()).where(*active_filters).group_by(Task.status)
     )
     active_count_by_status = {
         row_status: int(row_count or 0)
         for row_status, row_count in active_counts_result.all()
     }
+
+    # Stale-heartbeat count: IN_PROGRESS tasks whose last_heartbeat is >5 min old.
+    # Scoped to project_id when provided (same pattern as active_filters above).
+    _stale_threshold = _utcnow() - timedelta(minutes=5)
+    stale_filters = [
+        Task.status == TaskStatus.IN_PROGRESS,
+        Task.last_heartbeat < _stale_threshold,
+    ]
+    if project_id:
+        stale_filters.append(Task.project_id == project_id)
+    stale_count_result = await session.execute(
+        select(func.count()).where(*stale_filters)
+    )
+    stale_heartbeat_count = int(stale_count_result.scalar() or 0)
     if _use_projection:
         active_result = await session.execute(
             select(
@@ -622,9 +636,13 @@ async def _compute_digest(
             .order_by(Artifact.created_at.asc())
             .limit(500)
         )
-        for task_id, artifact_type, pr_url, error_log_snippet, created_at in (
-            artifacts_result.all()
-        ):
+        for (
+            task_id,
+            artifact_type,
+            pr_url,
+            error_log_snippet,
+            created_at,
+        ) in artifacts_result.all():
             tid = str(task_id)
             if artifact_type == ArtifactType.PULL_REQUEST:
                 if created_at >= window_start:
@@ -788,6 +806,13 @@ async def _compute_digest(
     avg_retries_before_failure = _retry_analytics["avg_retries_before_failure"]
     retry_success_rate_by_class = _retry_analytics["retry_success_rate_by_class"]
     retry_wasted_rate = _retry_analytics["retry_wasted_rate"]
+
+    _llm_rework = compute_llm_rework_cost(
+        failed_tasks=failed_tasks,
+        cancelled_tasks=cancelled_tasks,
+        completed_tasks=completed_tasks,
+        window_start=window_start,
+    )
 
     # Taxonomy distribution (4-category: scope/review/infra/code_defect)
     _tax_keys = (
@@ -1055,6 +1080,9 @@ async def _compute_digest(
     # operator_action_count fields (already surfaced in DirectionCard).
     overall_type_distribution = _cost_econ["overall_type_distribution"]
     pipeline_filter_funnel = _cost_econ["pipeline_filter_funnel"]
+    total_llm_cost_usd = _cost_econ["total_llm_cost_usd"]
+    llm_share_of_combined_cost = _cost_econ["llm_share_of_combined_cost"]
+    median_llm_cost_per_merged_pr = _cost_econ["median_llm_cost_per_merged_pr"]
 
     # Per-effort-tier / per-actual-model LLM efficiency rollup over the window's
     # finished (terminal) tasks. Additive — answers whether effort-tier scaling
@@ -1267,22 +1295,16 @@ async def _compute_digest(
                 latest_cycle[CYCLE_META_MEMOS_AVAILABLE] = _ms[
                     CYCLE_META_MEMOS_AVAILABLE
                 ]
-                latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[
-                    CYCLE_META_MEMOS_CITED
-                ]
+                latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[CYCLE_META_MEMOS_CITED]
                 # Compact strategic-judgment-challenge summary when this
                 # cycle carried a challenge record; omit entirely for
                 # legacy cycles so absence never reads as a failure.
                 _challenge_record = (_sc_row.cycle_metadata or {}).get(
                     "strategic_judgment_challenge"
                 )
-                _challenge_summary = strategic_challenge_summary(
-                    _challenge_record
-                )
+                _challenge_summary = strategic_challenge_summary(_challenge_record)
                 if _challenge_summary is not None:
-                    latest_cycle["strategic_judgment_challenge"] = (
-                        _challenge_summary
-                    )
+                    latest_cycle["strategic_judgment_challenge"] = _challenge_summary
             _sc_history = await _strategic_cycle.recent_for_agent_context(
                 session,
                 project_id,
@@ -1429,7 +1451,13 @@ async def _compute_digest(
     _augmented_verdicts: dict = {}
     if _digest_project is not None:
         from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
+
         _verdict_evaluated_at = _tv_utcnow().isoformat()
+        _pending_trial_verdicts: list[tuple[str, dict[str, Any]]] = []
+        # Collected gate-integrity alert detail (if any) — persisted durably in
+        # the write-owned helper alongside the verdicts, NOT on the request
+        # session, which the caller may roll back.
+        _gate_alert_detail: str | None = None
         for _td in get_trial_definitions():
             _cap = _td["cap_name"]
             # Lane pilot uses its own multi-axis evaluator (KILL/ADOPT thresholds
@@ -1454,7 +1482,7 @@ async def _compute_digest(
                 arm_composition=_accum.get("arm_composition"),
                 receipt_only_trial=(_td.get("assignment_key") is None),
             )
-            record_trial_verdict(_digest_project, _cap, _verdict_entry)
+            _pending_trial_verdicts.append((_cap, _verdict_entry))
 
         # ── Lane pilot: dedicated multi-axis verdict path ─────────────────────
         # Uses compute_lane_pilot_aggregates -> evaluate_lane_pilot_verdict which
@@ -1463,54 +1491,123 @@ async def _compute_digest(
         # A KILL verdict degrades spawning + force-expires reservations; an
         # immediate_alert verdict posts a BLOCKER ProjectMessage.
         from app.review_fix_lane_pilot import (  # noqa: PLC0415
-            apply_lane_pilot_kill,
+            apply_lane_pilot_kill_in_transaction,
             compute_lane_pilot_aggregates,
-            raise_gate_integrity_alert,
+            compute_lane_arm_time_medians,
         )
+
         if project_id is not None:
             _lane_aggs = await compute_lane_pilot_aggregates(session, project_id)
             _lane_verdict = evaluate_lane_pilot_verdict(_lane_aggs)
             _lane_verdict["evaluated_at"] = _verdict_evaluated_at
-            # Annotate with the most recent closed version's relay baseline so the
-            # lane-vs-relay comparison is recorded alongside the verdict for auditing.
+            # Materialize a compact lane-vs-relay comparison: relay medians from
+            # the most recent closed version's persisted baseline plus lane-arm
+            # medians computed live, plus deltas.  Only bounded scalars are
+            # stored — no per-PR row arrays or per-task chains.
             try:
                 from app.lane_baseline_snapshot import read_version_lane_baseline  # noqa: PLC0415
                 from app.models import ReleaseVersion as _ReleaseVersion  # noqa: PLC0415
-                _latest_rv = (
-                    await session.execute(
-                        select(_ReleaseVersion)
-                        .where(
-                            _ReleaseVersion.project_id == project_id,
-                            _ReleaseVersion.status.in_(["promoted", "abandoned"]),
-                        )
-                        .order_by(desc(_ReleaseVersion.version_number))
-                        .limit(1)
-                    )
-                ).scalars().first()
-                if _latest_rv is not None and _digest_project is not None:
-                    _rb = read_version_lane_baseline(_digest_project, _latest_rv.version_number)
-                    if _rb is not None:
-                        _lane_verdict["relay_baseline"] = _rb
-            except Exception:
-                logger.warning("[LANE_PILOT] failed to annotate relay_baseline", exc_info=True)
-            record_trial_verdict(_digest_project, LANE_PILOT_CAP_NAME, _lane_verdict)
-            if _lane_verdict.get("verdict") == "KILL":
-                await apply_lane_pilot_kill(
-                    session,
-                    project_id,
-                    reason=_lane_verdict.get("verdict_reason", "digest_eval"),
-                )
-            if _lane_verdict.get("immediate_alert"):
-                await raise_gate_integrity_alert(
-                    session,
-                    project_id,
-                    detail=str(_lane_verdict.get("verdict_reason", "")),
-                )
 
+                _latest_rv = (
+                    (
+                        await session.execute(
+                            select(_ReleaseVersion)
+                            .where(
+                                _ReleaseVersion.project_id == project_id,
+                                _ReleaseVersion.status.in_(["promoted", "abandoned"]),
+                            )
+                            .order_by(desc(_ReleaseVersion.version_number))
+                            .limit(1)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if _latest_rv is not None and _digest_project is not None:
+                    _rb = read_version_lane_baseline(
+                        _digest_project, _latest_rv.version_number
+                    )
+                    if _rb is not None:
+                        _relay_m = _rb.get("relay_medians") or {}
+                        _relay_fields = {
+                            "wall_clock_seconds": _relay_m.get("wall_clock_seconds"),
+                            "active_seconds": _relay_m.get("active_seconds"),
+                            "gap_seconds": _relay_m.get("gap_seconds"),
+                            "task_count": _relay_m.get("task_count"),
+                            "pr_count": _relay_m.get("pr_count", 0),
+                        }
+                        _lane_m = await compute_lane_arm_time_medians(
+                            session, project_id
+                        )
+                        _deltas: dict[str, Any] = {}
+                        for _mf in (
+                            "wall_clock_seconds",
+                            "active_seconds",
+                            "gap_seconds",
+                            "task_count",
+                        ):
+                            _rv, _lv = _relay_fields.get(_mf), _lane_m.get(_mf)
+                            _deltas[_mf] = (
+                                (_lv - _rv)
+                                if (_rv is not None and _lv is not None)
+                                else None
+                            )
+                        _lane_verdict["lane_relay_comparison"] = {
+                            "source_version": {
+                                "version_number": _latest_rv.version_number,
+                                "captured_at": _rb.get("captured_at"),
+                                "terminal_status": _rb.get("terminal_status"),
+                            },
+                            "relay": _relay_fields,
+                            "lane": _lane_m,
+                            "deltas": _deltas,
+                        }
+            except Exception:
+                logger.warning(
+                    "[LANE_PILOT] failed to compute lane_relay_comparison",
+                    exc_info=True,
+                )
+            if _lane_verdict.get("verdict") == "KILL":
+                await apply_lane_pilot_kill_in_transaction(
+                    session,
+                    project_id,
+                    verdict_entry=_lane_verdict,
+                    reason=_lane_verdict.get("verdict_reason", "digest_eval"),
+                    alert_detail=(
+                        str(_lane_verdict.get("verdict_reason", ""))
+                        if _lane_verdict.get("immediate_alert")
+                        else None
+                    ),
+                )
+            elif _lane_verdict.get("immediate_alert"):
+                # Route the alert through the durable write-owned helper below
+                # instead of the request session, which the caller may roll back.
+                _gate_alert_detail = str(_lane_verdict.get("verdict_reason", ""))
+            _pending_trial_verdicts.append((LANE_PILOT_CAP_NAME, _lane_verdict))
+
+        # Persist ALL collected trial verdicts AND any gate-integrity alert in an
+        # explicit write-owned transaction whose commit is INDEPENDENT of the
+        # request session. On the request path the caller's session is closed
+        # without committing; on the precompute path the request session's commit
+        # is contingent on the L2 cache write (write_shared) succeeding. The
+        # helper re-fetches the project fresh inside its own session so
+        # record_trial_verdict's KILL-survival / self-revert guards see current
+        # committed state — and so a lane-pilot KILL already committed by
+        # apply_lane_pilot_kill_in_transaction is never clobbered by a stale
+        # re-record of the early-fetched _digest_project row.
+        _persisted_verdicts: dict = {}
         try:
-            await session.flush()
+            _persisted_verdicts = await persist_trial_verdicts_in_transaction(
+                session,
+                project_id,
+                pending_verdicts=_pending_trial_verdicts,
+                gate_alert_detail=_gate_alert_detail,
+            )
         except Exception:
-            logger.warning("[CAPABILITY_TRIAL] failed to flush verdicts", exc_info=True)
+            logger.warning(
+                "[CAPABILITY_TRIAL] failed to durably persist verdicts", exc_info=True
+            )
+            _persisted_verdicts = {}
 
         # --- Per-trial accrual projection (ephemeral, NOT persisted) ---
         # Augment the verdict entries returned in the response with a recent
@@ -1519,13 +1616,17 @@ async def _compute_digest(
         # the current rate. Only assignment-based trials (an ``assignment_key``) have
         # a randomized holdback arm to project; receipt-only trials get no projection.
         #
-        # This is read-only display compute. We deliberately do NOT mutate the live
-        # ``project.capability_adoption_verdicts`` entries (which ``get_trial_verdicts``
-        # returns by reference) — mutating them would risk a later autoflush
-        # persisting ``accrual_projection`` to the JSONB column. Instead we build a
-        # response-only copy with the projection grafted on.
+        # This is read-only display compute. We build the response payload from
+        # ``_persisted_verdicts`` — the snapshot returned by the durable helper,
+        # which mirrors EXACTLY what was committed (after record_trial_verdict's
+        # KILL-survival / self-revert guards ran against fresh committed state).
+        # We deliberately do NOT read off the early-fetched ``_digest_project``
+        # row: it is stale relative to the helper's commit, and mutating it would
+        # risk a later autoflush persisting ``accrual_projection`` to the JSONB
+        # column. Instead we build a response-only copy with the projection
+        # grafted on.
         _accrual_window_days = 7
-        _stored_verdicts = get_trial_verdicts(_digest_project)
+        _stored_verdicts = _persisted_verdicts
         _augmented_verdicts = {
             _k: (dict(_v) if isinstance(_v, dict) else _v)
             for _k, _v in _stored_verdicts.items()
@@ -1691,6 +1792,9 @@ async def _compute_digest(
         "daily_vm_cost_usd": _cost_econ["daily_vm_cost_usd"],
         "daily_compute_cost_usd": _cost_econ["daily_compute_cost_usd"],
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
+        "total_llm_cost_usd": total_llm_cost_usd,
+        "llm_share_of_combined_cost": llm_share_of_combined_cost,
+        "median_llm_cost_per_merged_pr": median_llm_cost_per_merged_pr,
         "narrative_summary": narrative_summary,
         "prev_completed_count": prev_completed_count,
         "prev_failed_count": prev_failed_count,
@@ -1746,4 +1850,6 @@ async def _compute_digest(
         else {},
         "research_output_quality": _research_output_quality,
         "problem_model_gc_health": problem_model_gc_health,
+        "stale_heartbeat_count": stale_heartbeat_count,
+        "llm_rework_cost": _llm_rework,
     }

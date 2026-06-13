@@ -94,7 +94,11 @@ from app.payload_schemas import read_acceptance_evidence, validate_internal_payl
 from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
 from app.time_utils import _utcnow
-from app.task_locking import project_lock, with_design_doc_locked, with_directions_locked
+from app.task_locking import (
+    project_lock,
+    with_design_doc_locked,
+    with_directions_locked,
+)
 from app.vm_cost_rates import get_vm_rate_per_second
 
 logger = logging.getLogger(__name__)
@@ -149,6 +153,7 @@ class _ComputeKnowledgeOutcome(NamedTuple):
 
     deterministic_ok: bool
     analysis_retry_pending: bool
+
 
 # Shared marker used by both the TypeScript agent handler (review-fix.ts
 # buildBlueprintPrFooter) and this Python helper so either side can update
@@ -328,9 +333,8 @@ def _derive_artifact_delivery_record(resource: dict) -> dict:
     # Both storage_uri and result_reference must be validated against the durable-URI
     # predicate: Artifact.storage_uri can be https:// (agent-supplied signed URLs) and
     # is not guaranteed durable.
-    if (
-        (storage_uri and _is_durable_artifact_uri(storage_uri))
-        or (result_reference and _is_durable_artifact_uri(result_reference))
+    if (storage_uri and _is_durable_artifact_uri(storage_uri)) or (
+        result_reference and _is_durable_artifact_uri(result_reference)
     ):
         durability = "durable"
         delivered = True
@@ -1057,13 +1061,13 @@ async def _release_pool_member_if_terminal(
     # Only reclaim the member actually bound to THIS task: a vm_instance_id
     # reused across tasks must not let one task's terminal state pull back a
     # member leased to a different task.
-    if member.leased_task_id is not None and member.leased_task_id != task.id:
+    if member.leased_task_id != task.id:
         return None
     if status == TaskStatus.COMPLETED:
-        await release_pool_vm(session, vm_id)
+        await release_pool_vm(session, vm_id, owning_task_id=task.id)
         outcome = "idle"
     else:
-        await mark_pool_vm_retiring(session, vm_id)
+        await mark_pool_vm_retiring(session, vm_id, source_states=(PoolVmState.LEASED,))
         outcome = "retiring"
     logger.info(
         "[WARM-POOL] task %s terminal (%s) — pool member %s -> %s",
@@ -1560,7 +1564,9 @@ async def _maybe_release_safeguard_gate(
     ).lower()
 
     if has_blocker:
-        _challenge_verdict = (safeguard_task.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
+        _challenge_verdict = (safeguard_task.context or {}).get(
+            SAFEGUARD_CHALLENGE_VERDICT_KEY
+        )
 
         if _gate_mode == "observe":
             if _challenge_verdict is not None:
@@ -1781,31 +1787,75 @@ async def _maybe_release_safeguard_gate(
 # references fails here.
 # ---------------------------------------------------------------------------
 
-_FINDINGS_STOPWORDS = frozenset({
-    "about", "code", "does", "from", "function", "have", "into", "make",
-    "made", "method", "over", "prompt", "report", "should", "state", "such",
-    "than", "that", "their", "them", "then", "there", "these", "they", "this",
-    "those", "topic", "under", "used", "using", "what", "when", "where",
-    "which", "while", "will", "with", "would", "your",
-})
+_FINDINGS_STOPWORDS = frozenset(
+    {
+        "about",
+        "code",
+        "does",
+        "from",
+        "function",
+        "have",
+        "into",
+        "make",
+        "made",
+        "method",
+        "over",
+        "prompt",
+        "report",
+        "should",
+        "state",
+        "such",
+        "than",
+        "that",
+        "their",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "topic",
+        "under",
+        "used",
+        "using",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "will",
+        "with",
+        "would",
+        "your",
+    }
+)
 _FINDINGS_MIN_KWS = 3
 _FINDINGS_MIN_OVERLAP = 0.1
 
 
 def _findings_kws(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
-            if len(w) >= 4 and w not in _FINDINGS_STOPWORDS}
+    return {
+        w
+        for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(w) >= 4 and w not in _FINDINGS_STOPWORDS
+    }
 
 
 def _findings_responsiveness_miss(task: Task, findings: list) -> str | None:
     """Return a reason when findings clearly don't match the requested target, else None."""
     payload = task.first_payload or {}
-    req = _findings_kws(" ".join(str(payload.get(k) or "") for k in ("prompt", "topic", "target")))
+    req = _findings_kws(
+        " ".join(str(payload.get(k) or "") for k in ("prompt", "topic", "target"))
+    )
     if len(req) < _FINDINGS_MIN_KWS:
         return None
-    doc = _findings_kws(" ".join(
-        " ".join(str(f.get(k) or "") for k in ("title", "description", "area")) for f in findings
-    ))
+    doc = _findings_kws(
+        " ".join(
+            " ".join(str(f.get(k) or "") for k in ("title", "description", "area"))
+            for f in findings
+        )
+    )
     overlap = req & doc
     if len(overlap) / len(req) >= _FINDINGS_MIN_OVERLAP:
         return None
@@ -1822,19 +1872,26 @@ def _findings_grounding_miss(findings: list) -> str | None:
 def _findings_probe_detail(task: Task, findings: list) -> dict:
     """Structured probe detail persisted in plan_output for operator visibility."""
     payload = task.first_payload or {}
-    req = _findings_kws(" ".join(str(payload.get(k) or "") for k in ("prompt", "topic", "target")))
-    doc = _findings_kws(" ".join(
-        " ".join(str(f.get(k) or "") for k in ("title", "description", "area")) for f in findings
-    ))
+    req = _findings_kws(
+        " ".join(str(payload.get(k) or "") for k in ("prompt", "topic", "target"))
+    )
+    doc = _findings_kws(
+        " ".join(
+            " ".join(str(f.get(k) or "") for k in ("title", "description", "area"))
+            for f in findings
+        )
+    )
     grounded = sum(1 for f in findings if str(f.get("file_path") or "").strip())
     return {
         "topic_responsiveness": {
             "passed": _findings_responsiveness_miss(task, findings) is None,
-            "overlap": len(req & doc), "total": len(req),
+            "overlap": len(req & doc),
+            "total": len(req),
         },
         "grounding": {
             "passed": _findings_grounding_miss(findings) is None,
-            "grounded": grounded, "total": len(findings),
+            "grounded": grounded,
+            "total": len(findings),
         },
     }
 
@@ -1916,7 +1973,10 @@ async def _handle_security_audit_completion(
     # Store all findings + acceptance-probe detail for operator visibility.
     # Wrapped in a dict so query_findings_index (which only processes list
     # plan_output) does not treat security audit findings as research findings.
-    task.plan_output = {"findings": findings, "acceptance_probe": _findings_probe_detail(task, findings)}
+    task.plan_output = {
+        "findings": findings,
+        "acceptance_probe": _findings_probe_detail(task, findings),
+    }
     session.add(task)
     await session.commit()
 
@@ -1925,14 +1985,27 @@ async def _handle_security_audit_completion(
     # always, regardless of whether the optional quality grader is enabled.
     # Errs toward acceptance — only a CLEAR miss fails here, preventing an
     # obviously off-objective or ungrounded audit from spawning fix PRs.
-    _probe_miss = _findings_responsiveness_miss(task, findings) or _findings_grounding_miss(findings)
+    _probe_miss = _findings_responsiveness_miss(
+        task, findings
+    ) or _findings_grounding_miss(findings)
     if _probe_miss is not None:
-        record_failed_gate(task, EvaluationVerdict(False, f"security_audit {_probe_miss}", "forward-quality"))
+        record_failed_gate(
+            task,
+            EvaluationVerdict(
+                False, f"security_audit {_probe_miss}", "forward-quality"
+            ),
+        )
         session.add(task)
         await session.commit()
         await _maybe_release_safeguard_gate(task, None, session)
-        await broadcast_to_project(str(task.project_id), "task_updated", {"task_id": str(task.id), "status": TaskStatus.FAILED})
-        logger.info("[SECURITY AUDIT] Task %s failed acceptance probe: %s", task.id, _probe_miss)
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[SECURITY AUDIT] Task %s failed acceptance probe: %s", task.id, _probe_miss
+        )
         return
 
     project = await session.get(Project, task.project_id)
@@ -1961,9 +2034,7 @@ async def _handle_security_audit_completion(
     if _grader_verdict is None and _runtime_config.get(
         "security_audit_quality_grader_enabled", False
     ):
-        grader = await spawn_forward_quality_grader(
-            task, json.dumps(findings), session
-        )
+        grader = await spawn_forward_quality_grader(task, json.dumps(findings), session)
         if grader is not None:
             logger.info(
                 "[SECURITY AUDIT] Task %s parked awaiting forward-quality grade "
@@ -1977,12 +2048,13 @@ async def _handle_security_audit_completion(
     # flipping the parent to EVALUATING, a replay would re-parse the same findings
     # and spawn duplicates. Detect that case and skip spawning.
     existing_children = (
-        await session.execute(
-            select(Task).where(Task.parent_task_id == task.id)
-        )
-    ).scalars().all()
+        (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
     already_spawned = [
-        ct for ct in existing_children
+        ct
+        for ct in existing_children
         if (ct.context or {}).get("security_audit_task_id") == str(task.id)
     ]
 
@@ -2016,7 +2088,11 @@ async def _handle_security_audit_completion(
                             "type": "create",
                             "prompt": fix_prompt,
                             "base_branch": base_branch,
-                            **({"prompt_suffix": create_suffix} if create_suffix else {}),
+                            **(
+                                {"prompt_suffix": create_suffix}
+                                if create_suffix
+                                else {}
+                            ),
                         },
                         "task_completion:security_finding",
                     )
@@ -2042,17 +2118,22 @@ async def _handle_security_audit_completion(
             history = TaskHistory(
                 task_id=ct.id,
                 action="SPAWNED",
-                details={"spawned_by": "SECURITY_AUDIT", "parent_audit_id": str(task.id)},
+                details={
+                    "spawned_by": "SECURITY_AUDIT",
+                    "parent_audit_id": str(task.id),
+                },
             )
             session.add(history)
 
     pending_broadcasts: list[tuple[str, str, dict]] = []
     for ct in child_tasks:
-        pending_broadcasts.append((
-            str(task.project_id),
-            "task_updated",
-            {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
-        ))
+        pending_broadcasts.append(
+            (
+                str(task.project_id),
+                "task_updated",
+                {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
+            )
+        )
 
     # Post PR comment for medium/low findings that don't get auto-fixed
     informational = [f for f in findings if f.get("severity") in ("medium", "low")]
@@ -2184,7 +2265,10 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     # Store all findings + acceptance-probe detail for operator visibility.
     # Wrapped in a dict so query_findings_index (which only processes list
     # plan_output) does not treat perf audit findings as research findings.
-    task.plan_output = {"findings": findings, "acceptance_probe": _findings_probe_detail(task, findings)}
+    task.plan_output = {
+        "findings": findings,
+        "acceptance_probe": _findings_probe_detail(task, findings),
+    }
     session.add(task)
     await session.commit()
 
@@ -2195,10 +2279,16 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     # applied here: perf findings are legitimately area-based without file refs.
     _probe_miss = _findings_responsiveness_miss(task, findings)
     if _probe_miss is not None:
-        record_failed_gate(task, EvaluationVerdict(False, f"perf {_probe_miss}", "forward-quality"))
+        record_failed_gate(
+            task, EvaluationVerdict(False, f"perf {_probe_miss}", "forward-quality")
+        )
         session.add(task)
         await session.commit()
-        await broadcast_to_project(str(task.project_id), "task_updated", {"task_id": str(task.id), "status": TaskStatus.FAILED})
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
         logger.info("[PERF] Task %s failed acceptance probe: %s", task.id, _probe_miss)
         return
 
@@ -2408,7 +2498,9 @@ async def _route_compute_analysis_to_vm(
             .first()
         )
         if existing is not None:
-            mode = str((existing.forward_quality_verdict or {}).get("analysis_mode") or "")
+            mode = str(
+                (existing.forward_quality_verdict or {}).get("analysis_mode") or ""
+            )
             if mode == "llm":
                 # Already upgraded by a prior VM submission — nothing to route.
                 return False
@@ -2884,10 +2976,9 @@ async def _handle_compute_experiment_completion(
         and acceptance_evidence.kind == "downstream_artifact"
     )
 
-    prerequisite_mode = (
-        (task.context or {}).get(COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY)
-        == COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
-    )
+    prerequisite_mode = (task.context or {}).get(
+        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY
+    ) == COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
 
     if prerequisite_mode:
         measurement = _extract_compute_measurement(logs)
@@ -3038,9 +3129,7 @@ async def _handle_compute_experiment_completion(
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
     task.status = TaskStatus.COMPLETED
-    logger.info(
-        "[COMPUTE] Task %s delivered a compute artifact and completed", task.id
-    )
+    logger.info("[COMPUTE] Task %s delivered a compute artifact and completed", task.id)
     # Persist the measured verdict as durable, queryable knowledge so future
     # research/strategist cycles can discover that this experiment already ran
     # and what it found, the same way web_research/design results survive.
@@ -3164,9 +3253,7 @@ def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, A
     investigated_files = raw.get("investigated_files")
     if isinstance(investigated_files, list):
         normalized["investigated_files"] = [
-            str(path).strip()
-            for path in investigated_files
-            if str(path).strip()
+            str(path).strip() for path in investigated_files if str(path).strip()
         ]
     return normalized
 
@@ -3252,7 +3339,9 @@ def reconcile_review_second_opinion(
     agreed issue set downstream consumers act on.
     """
     primary_verdict = (
-        primary_verdict if primary_verdict in ("APPROVE", "REQUEST_CHANGES") else "REQUEST_CHANGES"
+        primary_verdict
+        if primary_verdict in ("APPROVE", "REQUEST_CHANGES")
+        else "REQUEST_CHANGES"
     )
     challenge_verdict = panel.get("overall_verdict")
     if challenge_verdict not in ("APPROVE", "REQUEST_CHANGES"):
@@ -3302,9 +3391,7 @@ def reconcile_review_second_opinion(
     }
 
 
-async def _handle_panel_review_completion(
-    task: Task, logs: str, session: AsyncSession
-):
+async def _handle_panel_review_completion(task: Task, logs: str, session: AsyncSession):
     """Persist a terminal structured verdict for ``panel_review`` tasks."""
     from app.models import Artifact  # noqa: PLC0415
 
@@ -3365,9 +3452,7 @@ async def _handle_panel_review_completion(
         "task_updated",
         {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
     )
-    logger.info(
-        "[PANEL_REVIEW] Persisted verdict artifact for task %s", task.id
-    )
+    logger.info("[PANEL_REVIEW] Persisted verdict artifact for task %s", task.id)
 
     # Surface the verdict on the PR (and raise an operator signal for
     # REQUEST_CHANGES). Best-effort — the durable artifact and COMPLETED
@@ -3479,9 +3564,7 @@ async def _post_panel_review_to_pr(
             all_issues.extend(
                 i for i in (lens_data.get("issues") or []) if isinstance(i, dict)
             )
-    all_issues.extend(
-        i for i in (parsed.get("issues") or []) if isinstance(i, dict)
-    )
+    all_issues.extend(i for i in (parsed.get("issues") or []) if isinstance(i, dict))
     inline_comments: List[Dict[str, Any]] = []
     for issue in all_issues:
         if issue.get("file") and issue.get("line"):
@@ -4062,7 +4145,9 @@ async def _handle_design_doc_completion(
             logger.warning(
                 f"[DESIGN DOC] Phase 2 spawn skipped for task {task_id_str} (active strategic task exists)"
             )
-            task.latest_status_message = status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review deferred (active task exists)"
+            task.latest_status_message = status_message = (
+                f"Design doc: {page_count} pages, rev {rev} — strategic review deferred (active task exists)"
+            )
             project.vision = {
                 **base_vision,
                 "_pending_strategic_review": {
@@ -4082,9 +4167,11 @@ async def _handle_design_doc_completion(
             f"[DESIGN DOC] Failed to chain Phase 2 for task {task_id_str}: {chain_exc}",
             exc_info=True,
         )
-        task.latest_status_message = status_message = f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[
-            :500
-        ]
+        task.latest_status_message = status_message = (
+            f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[
+                :500
+            ]
+        )
         await _create_strategic_alert(
             task_project_id,
             session,
@@ -4142,6 +4229,187 @@ async def _handle_design_doc_completion(
         )
 
 
+# Confirmed-command field names written back by the agent build-config endpoint.
+_CONFIRMED_COMMAND_KEYS = (
+    "confirmed_lint_cmd",
+    "confirmed_test_cmd",
+    "confirmed_build_cmd",
+    "confirmed_install_cmd",
+)
+# Command-memory statuses that mean "overview may be fine but command write-back
+# is NOT complete" — i.e. a partial / degraded command-memory state.
+_PARTIAL_COMMAND_MEMORY_STATUSES = frozenset(
+    {"missing_commands", "writeback_failed", "unknown"}
+)
+
+
+def _has_command_writeback_evidence(build_config: Dict[str, Any], task_id: str) -> bool:
+    """Return True when *this* task durably persisted ≥1 confirmed command.
+
+    Primary evidence is the top-level write-back marker stamped by
+    ``agent_write_back_build_config_commands``; the per-directory
+    ``confirming_task_id`` stamps are a robustness fallback (e.g. a marker
+    written by an older endpoint build that predates the top-level field).
+    """
+    if build_config.get(
+        "last_command_writeback_task_id"
+    ) == task_id and build_config.get("last_command_writeback_paths"):
+        return True
+    for entry in build_config.get("directories") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("confirming_task_id")) != task_id:
+            continue
+        if any(
+            isinstance(entry.get(k), str) and entry.get(k).strip()
+            for k in _CONFIRMED_COMMAND_KEYS
+        ):
+            return True
+    return False
+
+
+async def _seed_bootstrap_playbook_commands(
+    project: Any,
+    build_config: Dict[str, Any],
+    task: Task,
+    session: AsyncSession,
+    now_iso: str,
+) -> None:
+    """Seed confirmed build/test/lint commands into project playbook after bootstrap.
+
+    Called from within a project_lock block; uses with_design_doc_locked for the
+    write so the invariant guard stays satisfied. Idempotent: skips keys that
+    already exist. Only runs for non-self-repo projects with confirmed command memory.
+    """
+    if getattr(project, "is_self_repo", False):
+        return
+    if not build_config.get("bootstrap_command_memory_complete"):
+        return
+
+    _CMD_PLAYBOOK_KEYS = {
+        "test-detected": "confirmed_test_cmd",
+        "build-detected": "confirmed_build_cmd",
+        "lint-detected": "confirmed_lint_cmd",
+    }
+
+    cmds_by_key: Dict[str, list] = {k: [] for k in _CMD_PLAYBOOK_KEYS}
+    for entry in build_config.get("directories") or []:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path") or "."
+        for playbook_key, field in _CMD_PLAYBOOK_KEYS.items():
+            cmd = entry.get(field)
+            if isinstance(cmd, str) and cmd.strip():
+                cmds_by_key[playbook_key].append((path, cmd.strip()))
+
+    to_seed: Dict[str, str] = {}
+    for playbook_key, cmds in cmds_by_key.items():
+        if not cmds:
+            continue
+        parts = []
+        for path, cmd in cmds:
+            if path and path not in (".", ""):
+                parts.append(f"`cd {path} && {cmd}`")
+            else:
+                parts.append(f"`{cmd}`")
+        to_seed[playbook_key] = " | ".join(parts)
+
+    if not to_seed:
+        return
+
+    task_id_str = str(task.id)
+    project_id = project.id
+    added_count: Dict[str, int] = {"v": 0}
+
+    def _mutate(doc: Dict[str, Any]) -> None:
+        for key, content in to_seed.items():
+            full_key = f"playbook/{key}"
+            if full_key in doc:
+                continue
+            doc[full_key] = {
+                "content": content,
+                "source_task_id": task_id_str,
+                "updated_at": now_iso,
+                "confirmed_count": 0,
+            }
+            added_count["v"] += 1
+        if added_count["v"]:
+            meta = dict(doc.get("_meta") or {"revision": 0})
+            meta["revision"] = meta.get("revision", 0) + 1
+            meta["last_updated"] = now_iso
+            doc["_meta"] = meta
+
+    await with_design_doc_locked(session, project_id, _mutate)
+    if added_count["v"]:
+        logger.info(
+            "[BOOTSTRAP] Seeded %d playbook command entries for project %s (task %s)",
+            added_count["v"],
+            project_id,
+            task.id,
+        )
+
+
+def _stamp_command_memory_status(build_config: Dict[str, Any], task: Task) -> None:
+    """Record a truthful, distinguishable command-memory marker on build_config.
+
+    Reconciles the agent's self-reported ``command_memory`` outcome (persisted
+    into ``task.context``) against durable write-back evidence so a valid
+    repo_overview can no longer mask incomplete command memory. Mutates
+    ``build_config`` in place; never raises on malformed input.
+    """
+    task_id = str(task.id)
+    reported = (task.context or {}).get("command_memory")
+    reported_status: str | None = None
+    reported_detail: str | None = None
+    reported_paths: list[str] | None = None
+    if isinstance(reported, dict):
+        rs = reported.get("status")
+        if isinstance(rs, str):
+            reported_status = rs
+        rd = reported.get("detail")
+        if isinstance(rd, str) and rd.strip():
+            reported_detail = rd
+        rp = reported.get("updated_paths")
+        if isinstance(rp, list):
+            reported_paths = [p for p in rp if isinstance(p, str) and p.strip()]
+
+    evidence = _has_command_writeback_evidence(build_config, task_id)
+
+    detail = reported_detail
+    if evidence:
+        status = "confirmed"
+    elif reported_status == "missing_commands":
+        status = "missing_commands"
+    elif reported_status == "writeback_failed":
+        status = "writeback_failed"
+    elif reported_status == "success":
+        # Agent claimed success but nothing landed — degrade truthfully so the
+        # marker reflects reality, not the unverified claim.
+        status = "writeback_failed"
+        detail = detail or "reported success without write-back evidence"
+    else:
+        # Older agent omitted the payload entirely.
+        status = "unknown"
+
+    build_config["bootstrap_command_memory_status"] = status
+    build_config["bootstrap_command_memory_complete"] = status == "confirmed"
+    build_config["bootstrap_command_memory_updated_at"] = _utcnow().isoformat()
+    if detail:
+        build_config["bootstrap_command_memory_detail"] = detail
+    else:
+        build_config.pop("bootstrap_command_memory_detail", None)
+
+    paths = reported_paths or (
+        list(build_config.get("last_command_writeback_paths") or [])
+        if build_config.get("last_command_writeback_task_id") == task_id
+        else []
+    )
+    if paths:
+        build_config["bootstrap_command_memory_paths"] = paths
+    else:
+        build_config.pop("bootstrap_command_memory_paths", None)
+
+
 async def _handle_repo_bootstrap_completion(
     task: Task, logs: str, session: AsyncSession
 ) -> None:
@@ -4163,7 +4431,10 @@ async def _handle_repo_bootstrap_completion(
     """
     _OVERVIEW_KEYS = ("tech_stack", "directory_layout", "first_steps_summary")
     _OVERVIEW_OPTIONAL_KEYS = (
-        "entry_points", "test_layout", "key_conventions", "environment_requirements"
+        "entry_points",
+        "test_layout",
+        "key_conventions",
+        "environment_requirements",
     )
     _REVISION_KEYS = ("source_revision", "revision", "commit", "commit_sha")
     overview: dict[str, str] | None = None
@@ -4220,9 +4491,10 @@ async def _handle_repo_bootstrap_completion(
             return
 
         build_config = dict(project.build_config or {})
+        now = _utcnow()
+        now_iso = now.isoformat()
 
         if overview:
-            now_iso = _utcnow().isoformat()
             # Provenance carried alongside the overview so downstream agents see
             # freshness (refreshed time + the branch/revision the overview
             # describes). Nested under the repo_overview block so a refresh
@@ -4267,7 +4539,6 @@ async def _handle_repo_bootstrap_completion(
             )
         else:
             if not build_config.get("bootstrap_completed_at"):
-                now = _utcnow()
                 attempts = (
                     coerce_recovery_attempts(
                         build_config.get("bootstrap_recovery_attempts")
@@ -4293,6 +4564,24 @@ async def _handle_repo_bootstrap_completion(
                     task.project_id,
                     task.id,
                 )
+
+        # ── Command-memory status (independent of overview persistence) ──────
+        # A valid overview no longer implies complete command memory. The agent
+        # reports the write-back outcome separately (success / missing_commands
+        # / writeback_failed), and the write-back endpoint stamps top-level
+        # evidence (last_command_writeback_task_id) plus per-directory
+        # confirming_task_id. Completion reconciles the two so build_config
+        # exposes a truthful, distinguishable command-memory marker:
+        #   confirmed       — this task persisted ≥1 confirmed command
+        #   missing_commands— agent found nothing runnable to confirm
+        #   writeback_failed— agent's write-back failed (or it claimed success
+        #                     without leaving any evidence)
+        #   unknown         — older agent omitted the payload entirely; degrade
+        #                     truthfully rather than falsely claim success
+        _stamp_command_memory_status(build_config, task)
+        await _seed_bootstrap_playbook_commands(
+            project, build_config, task, session, now_iso
+        )
 
         project.build_config = build_config
         flag_modified(project, "build_config")

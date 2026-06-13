@@ -15,11 +15,13 @@ import {
   type CiResolution,
   type CurrentVersion,
   type LatestAudit,
+  type OutOfBandPromotion,
   type QualificationVerdictRecord,
   type ReleaseArtifactEvidence,
   type StagedDirection,
   type VersionLifecycleResponse,
   type VersionQualification,
+  type PromotionPolicySource,
   type PromotionReadiness,
   type QualificationState,
   type ChallengedVsUnchallengedTelemetry,
@@ -92,6 +94,58 @@ function PostPromotionOutcomeBadge({
   );
 }
 
+function OutOfBandPromotionBadge({ oob }: { oob: OutOfBandPromotion }) {
+  return (
+    <span
+      data-testid="out-of-band-promotion-badge"
+      className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-violet-500/10 border-violet-500/30 text-violet-400"
+      title={`Promoted out-of-band (operator override) recorded ${oob.recorded_at}`}
+    >
+      ⚑ promoted out-of-band (operator override)
+      <span className="font-mono text-violet-500/90">{oob.candidate_sha.slice(0, 7)}→{oob.promoted_sha.slice(0, 7)}</span>
+      <span className="text-violet-600/90">{timeAgo(oob.recorded_at)}</span>
+    </span>
+  );
+}
+
+const POLICY_SOURCE_STYLE: Record<PromotionPolicySource, string> = {
+  runtime_config: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
+  yaml_file: 'bg-sky-500/10 border-sky-500/30 text-sky-400',
+  hardcoded_defaults: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+};
+
+function PromotionPolicyBadge({
+  source,
+  error,
+}: {
+  source?: PromotionPolicySource | null;
+  error?: string | null;
+}) {
+  if (!source) return null;
+  const style = POLICY_SOURCE_STYLE[source] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700';
+  return (
+    <div className="flex flex-wrap items-start gap-x-2 gap-y-0.5 text-[10px]">
+      <span className="text-neutral-500 uppercase tracking-wide">Policy source</span>
+      <span
+        data-testid="promotion-policy-source"
+        className={`px-1.5 py-0.5 rounded border font-semibold ${style}`}
+        title={`Promotion policy loaded from ${source}`}
+      >
+        {source}
+      </span>
+      {error && (
+        <span
+          data-testid="promotion-policy-source-error"
+          className="text-amber-400"
+          title={error}
+        >
+          fallback: {error}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function QualSummary({ q }: { q: VersionQualification | null }) {
   if (!q || q.confidence == null) return <span className="text-neutral-500 text-[10px]">—</span>;
   const conf = `${Math.round(q.confidence * 100)}%`;
@@ -117,6 +171,61 @@ function CiBadge({ ci }: { ci: CiResolution }) {
     <span className={`font-mono text-[9px] ${color}`} title={ci.detail}>
       ci:{ci.state}{ci.resolved_sha ? ` @${ci.resolved_sha.slice(0, 7)}` : ''}
     </span>
+  );
+}
+
+function ManagedCheckWaitSnapshotDetails({
+  state,
+}: {
+  state: QualificationState | null | undefined;
+}) {
+  const snapshot = state?.check_snapshot;
+  if (!snapshot) return null;
+  const color = CI_STATE_STYLE[snapshot.state] ?? 'text-neutral-400';
+  const checks = Array.isArray(snapshot.checks) ? snapshot.checks : [];
+  const totalChecks =
+    typeof snapshot.total_checks === 'number' && Number.isFinite(snapshot.total_checks)
+      ? snapshot.total_checks
+      : checks.length;
+  return (
+    <div
+      data-testid="promotion-check-wait-snapshot"
+      className="text-[10px] text-neutral-400 border border-neutral-800 bg-neutral-950/40 rounded px-2 py-1 space-y-1"
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className={`font-mono ${color}`}>ci:{snapshot.state}</span>
+        <span title={snapshot.classified_at}>classified {timeAgo(snapshot.classified_at)}</span>
+        {snapshot.head_sha && (
+          <span className="font-mono text-neutral-500">head {snapshot.head_sha.slice(0, 7)}</span>
+        )}
+        <span>{totalChecks} check{totalChecks === 1 ? '' : 's'}</span>
+        {snapshot.reason && <span className="text-amber-400">{snapshot.reason.replace(/_/g, ' ')}</span>}
+      </div>
+      {snapshot.detail && <p className="text-neutral-500">{snapshot.detail}</p>}
+      {checks.length > 0 ? (
+        <div className="flex flex-wrap gap-1">
+          {checks.map((check, index) => {
+            const status = check.conclusion ?? check.status ?? 'unknown';
+            return (
+              <span
+                key={`${check.name}-${index}`}
+                className="font-mono text-[9px] px-1 py-0.5 rounded border border-neutral-800 bg-neutral-900 text-neutral-300"
+                title={`${check.name}: ${status}`}
+              >
+                {check.name}: {status}
+              </span>
+            );
+          })}
+          {snapshot.truncated && (
+            <span className="font-mono text-[9px] px-1 py-0.5 rounded border border-neutral-800 text-neutral-500">
+              +{Math.max(0, totalChecks - checks.length)} more
+            </span>
+          )}
+        </div>
+      ) : (
+        <p className="text-neutral-500">No check runs reported yet.</p>
+      )}
+    </div>
   );
 }
 
@@ -465,7 +574,7 @@ function AuditFindingsList({ audit }: { audit: LatestAudit }) {
       {sorted.map((f, i) => (
         <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
           <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
-          <span>{f.summary}</span>
+          <span className="min-w-0 break-words">{f.summary}</span>
         </div>
       ))}
     </div>
@@ -634,7 +743,7 @@ function DurableQualificationEvidenceRow({ q }: { q: DurableQualificationEvidenc
     chips.push(
       <span
         key="test-erosion-detail"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
         title={formatCompactDetail(q.test_erosion_detail)}
       >
         erosion {formatCompactDetail(q.test_erosion_detail)}
@@ -645,7 +754,7 @@ function DurableQualificationEvidenceRow({ q }: { q: DurableQualificationEvidenc
     chips.push(
       <span
         key="smoketest-detail"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
         title={formatCompactDetail(q.smoketest_detail)}
       >
         smoke {formatCompactDetail(q.smoketest_detail)}
@@ -888,7 +997,65 @@ function ChallengedVsUnchallengedSummary({ telemetry }: { telemetry: ChallengedV
   );
 }
 
-export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void; userRole?: 'admin' | 'user' | null }) {
+interface VersionLifecyclePanelProps {
+  data: VersionLifecycleResponse | null;
+  loading: boolean;
+  projectId: string | null;
+  onRefresh: () => void;
+  userRole?: 'admin' | 'user' | null;
+  refreshError?: string | null;
+  lastSuccessfulRefreshAt?: string | null;
+  refreshing?: boolean;
+}
+
+function VersionLifecycleRefreshBanner({
+  kind,
+  message,
+  lastSuccessfulRefreshAt,
+  refreshing,
+  canRetry,
+  onRefresh,
+}: {
+  kind: 'stale' | 'unavailable';
+  message: string;
+  lastSuccessfulRefreshAt?: string | null;
+  refreshing: boolean;
+  canRetry: boolean;
+  onRefresh: () => void;
+}) {
+  const stale = kind === 'stale';
+  const toneClass = stale
+    ? 'mb-2 border-amber-500/30 bg-amber-500/10 text-amber-200'
+    : 'border-red-500/30 bg-red-500/10 text-red-300';
+  const detailClass = stale ? 'text-amber-200/90' : 'text-red-300/90';
+  const buttonClass = stale
+    ? 'border-amber-400/40 text-amber-100 hover:bg-amber-500/10'
+    : 'border-red-400/40 text-red-200 hover:bg-red-500/10';
+  return (
+    <div role="alert" data-testid={stale ? 'version-lifecycle-stale' : 'version-lifecycle-unavailable'} className={`${toneClass} rounded-lg border px-3 py-2 text-xs`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className={`font-semibold ${stale ? '' : 'text-red-200'}`}>
+            {stale ? 'Version lifecycle data may be stale' : 'Version lifecycle unavailable'}
+          </p>
+          <p className={`text-[11px] ${detailClass}`}>
+            {message}{stale && lastSuccessfulRefreshAt ? `; last successful refresh ${timeAgo(lastSuccessfulRefreshAt)}` : ''}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={refreshing || !canRetry}
+          className={`min-h-[44px] rounded border px-2 py-1 text-[11px] disabled:cursor-not-allowed disabled:opacity-50 ${buttonClass}`}
+        >
+          {refreshing ? 'Retrying...' : 'Retry'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole, refreshError, lastSuccessfulRefreshAt, refreshing = false }: VersionLifecyclePanelProps) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
@@ -917,12 +1084,23 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     setPromotionEnabledOverride(null);
   }, [data?.promotion_enabled]);
 
-  if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
+  if (loading) return null;
+  if (!data || (!data.current_version && data.recent_versions.length === 0)) {
+    if (!refreshError) return null;
+    return (
+      <section data-testid="version-lifecycle-panel">
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
+        <VersionLifecycleRefreshBanner kind="unavailable" message={refreshError} refreshing={refreshing} canRetry={!!projectId} onRefresh={onRefresh} />
+      </section>
+    );
+  }
   const cv = data.current_version ? (optimisticOverrides ? { ...data.current_version, ...optimisticOverrides } : data.current_version) : null;
   const recent = data.recent_versions;
   const promotionEnabled = data.promotion_enabled ?? false;
   const optimisticPromotionEnabled = promotionEnabledOverride ?? promotionEnabled;
   const readiness = data.promotion_readiness;
+  const policySource = data.promotion_policy_source ?? null;
+  const policyError = data.promotion_policy_error ?? null;
   // A promotion in flight (audit passed, promotion PR open and auto-merging)
   // makes the qualify + phase-flip levers unsafe: re-qualifying clobbers the
   // promotion-pending record and a phase flip clears the in-flight indication
@@ -1143,6 +1321,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
+      {refreshError && (
+        <VersionLifecycleRefreshBanner kind="stale" message={refreshError} lastSuccessfulRefreshAt={lastSuccessfulRefreshAt} refreshing={refreshing} canRetry={!!projectId} onRefresh={onRefresh} />
+      )}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
         <div className="flex flex-wrap items-center gap-2">
           {data.promotion_enabled !== undefined && (
@@ -1153,12 +1334,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     {optimisticPromotionEnabled ? 'LIVE' : 'DRY-RUN'}
                   </span>
                   {projectId && userRole === 'admin' && (
-                    // eslint-disable-next-line viewport/min-touch-target
                     <button
                       onClick={handleTogglePromotionEnabled}
                       disabled={actionLoading !== null}
                       className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                       title="Changes promotion mode for all projects"
+                      data-viewport-allow-small-target
                     >
                       {actionLoading === 'promotion' ? '…' : optimisticPromotionEnabled ? 'Disable' : 'Enable'}
                     </button>
@@ -1174,31 +1355,31 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     </span>
                     {projectId && userRole === 'admin' && (
                       <>
-                        {/* eslint-disable-next-line viewport/min-touch-target */}
                         <button
                           onClick={() => handleSetProjectPromotion(true)}
                           disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === true)}
                           className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                           title="Arm live promotion for this project only"
+                          data-viewport-allow-small-target
                         >
                           {actionLoading === 'project-promotion' ? '…' : 'Arm'}
                         </button>
-                        {/* eslint-disable-next-line viewport/min-touch-target */}
                         <button
                           onClick={() => handleSetProjectPromotion(false)}
                           disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === false)}
                           className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                           title="Hold live promotion for this project only"
+                          data-viewport-allow-small-target
                         >
                           Hold
                         </button>
                         {data.promotion_enabled_source === 'project' && (
-                          // eslint-disable-next-line viewport/min-touch-target
                           <button
                             onClick={() => handleSetProjectPromotion(null)}
                             disabled={actionLoading !== null}
                             className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                             title="Clear this project's override and follow the fleet default"
+                            data-viewport-allow-small-target
                           >
                             Use fleet default
                           </button>
@@ -1214,6 +1395,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             </>
           )}
         </div>
+        {policySource && (
+          <PromotionPolicyBadge source={policySource} error={policyError} />
+        )}
         {cv && (
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
@@ -1244,15 +1428,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   rows={2}
                 />
                 <div className="flex gap-1">
-                  {/* eslint-disable-next-line viewport/min-touch-target */}
                   <button
                     onClick={handleSetGoal}
                     disabled={actionLoading !== null}
                     className="text-[10px] px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    data-viewport-allow-small-target
                   >
                     {actionLoading === 'goal' ? '…' : 'Save'}
                   </button>
-                  {/* eslint-disable-next-line viewport/min-touch-target */}
                   <button
                     onClick={() => {
                       setEditingGoal(false);
@@ -1260,6 +1443,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     }}
                     disabled={actionLoading !== null}
                     className="text-[10px] px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    data-viewport-allow-small-target
                   >
                     Cancel
                   </button>
@@ -1285,7 +1469,6 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       <span className="text-neutral-600">Live focus: </span>{cv.live_current_focus}
                     </p>
                     {projectId && (
-                      // eslint-disable-next-line viewport/min-touch-target
                       <button
                         onClick={() => {
                           setGoalInput(cv.live_current_focus || '');
@@ -1293,6 +1476,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                         }}
                         disabled={actionLoading !== null}
                         className="text-[10px] px-1.5 py-0.5 w-fit rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        data-viewport-allow-small-target
                       >
                         Resync to focus
                       </button>
@@ -1300,26 +1484,29 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </div>
                 )}
                 {projectId && (
-                  // eslint-disable-next-line viewport/min-touch-target
                   <button
                     onClick={() => setEditingGoal(true)}
                     disabled={actionLoading !== null}
                     className="text-[10px] px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    data-viewport-allow-small-target
                   >
                     Edit
                   </button>
                 )}
               </div>
             ) : projectId ? (
-              // eslint-disable-next-line viewport/min-touch-target
               <button
                 onClick={() => setEditingGoal(true)}
                 disabled={actionLoading !== null}
                 className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                data-viewport-allow-small-target
               >
                 Set goal
               </button>
             ) : null}
+            {cv.out_of_band_promotion && (
+              <OutOfBandPromotionBadge oob={cv.out_of_band_promotion} />
+            )}
             {cv.phase_reasoning && (
               <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
             )}
@@ -1352,6 +1539,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   >
                     Migration-carrying promotion PR{cv.qualification_state.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} waiting for required checks{promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — Blueprint retries the merge automatically
                   </p>
+                )}
+                {cv.qualification_state.state === 'promotion_check_wait' && (
+                  <ManagedCheckWaitSnapshotDetails state={cv.qualification_state} />
                 )}
                 {(cv.qualification_state.state === 'required_check_failed' || cv.qualification_state.state === 'protection_blocked_review') && cv.qualification_state.detail && (
                   <p
@@ -1507,15 +1697,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                         maxLength={200}
                         className="text-[10px] flex-1 bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-0.5 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
                       />
-                      {/* eslint-disable-next-line viewport/min-touch-target */}
                       <button
                         onClick={handleCutVersion}
                         disabled={actionLoading !== null}
                         className="text-[10px] px-2 py-0.5 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        data-viewport-allow-small-target
                       >
                         {actionLoading === 'cut' ? '…' : 'Cut'}
                       </button>
-                      {/* eslint-disable-next-line viewport/min-touch-target */}
                       <button
                         onClick={() => {
                           setCuttingVersion(false);
@@ -1523,6 +1712,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                         }}
                         disabled={actionLoading !== null}
                         className="text-[10px] px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        data-viewport-allow-small-target
                       >
                         Cancel
                       </button>
@@ -1612,6 +1802,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       </span>
                     )}
                   </div>
+                  {v.out_of_band_promotion && (
+                    <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
+                  )}
                   <ArtifactEvidenceList artifacts={v.artifacts} />
                 </div>
               ))}

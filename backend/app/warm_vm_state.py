@@ -133,6 +133,36 @@ def is_vm_alive(vm_instance_id: str, max_age_seconds: int = 90) -> bool:
     return (_utcnow() - last).total_seconds() <= max_age_seconds
 
 
+def is_pool_vm_alive(
+    vm_instance_id: str,
+    last_heartbeat_at: "datetime | None",
+    max_age_seconds: int = 90,
+) -> bool:
+    """True iff a pool VM is live per in-memory cache OR durable heartbeat.
+
+    Extends :func:`is_vm_alive` with a durable fallback: the caller passes
+    the ``PoolVm.last_heartbeat_at`` column value (stamped by the heartbeat
+    endpoint on every clean pool-VM beat) so established members survive a
+    process restart whose in-memory ``vm_last_heartbeat`` map starts empty.
+
+    Used by :func:`sweep_idle_pool_vms` for zombie teardown and LEASED-member
+    reclaim decisions, replacing the in-memory-only :func:`is_vm_alive` call
+    for pool-member liveness checks.
+    """
+    if not vm_instance_id:
+        return False
+    now = _utcnow()
+    # In-memory map first (hot path — stamped by /vm-heartbeat on this instance).
+    last = vm_last_heartbeat.get(vm_instance_id)
+    if last is not None and (now - last).total_seconds() <= max_age_seconds:
+        return True
+    # Durable fallback: PoolVm.last_heartbeat_at is stamped by the heartbeat
+    # endpoint on every clean pool-VM beat and survives process restarts.
+    if last_heartbeat_at is not None and (now - last_heartbeat_at).total_seconds() <= max_age_seconds:
+        return True
+    return False
+
+
 # --- SR catch-rate refresh debounce (scale: every-claim recompute) ---
 # Maps project_id (str) -> last datetime this instance recomputed the SR
 # catch-rate trend. The recompute is a ~2000-row JSONB context scan plus a

@@ -269,6 +269,52 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                   )}
                 </div>
               </div>
+              {(() => {
+                // Provisioning-death evidence: for a job that went terminal
+                // before the VM ever reached RUNNING ($0 cost), surface the VM
+                // phase, the sanitized launch-RPC cause, and the requested
+                // launch contract so an operator can see WHY it died (deadline
+                // too tight for GPU cold start, quota/capacity, launch error).
+                // When none of the new fields are present we render nothing
+                // extra and the terminal_reason above stands on its own.
+                if (active || job.vm_phase !== 'provisioning') return null;
+                const cause = computeJobRpcDiagnostic(job);
+                const deadlineSec = job.launch_contract?.requested_deadline_seconds;
+                const provModel = job.launch_contract?.provisioning_model;
+                const hasContract =
+                  typeof deadlineSec === 'number' || (typeof provModel === 'string' && !!provModel);
+                if (!cause && !hasContract) return null;
+                return (
+                  <div
+                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-200"
+                    data-testid="compute-provisioning-cause"
+                  >
+                    <div className="flex items-start gap-1.5">
+                      <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                      <div className="min-w-0">
+                        <div className="font-semibold break-words">
+                          Died during provisioning — VM never reached RUNNING
+                        </div>
+                        {cause && (
+                          <div className="mt-0.5 font-mono text-amber-300/90 break-words">
+                            {cause.operation}: {cause.error_type}
+                            {cause.error_message ? ` — ${cause.error_message}` : ''}
+                          </div>
+                        )}
+                        {hasContract && (
+                          <div className="mt-0.5 font-mono text-amber-300/80 break-words">
+                            {typeof deadlineSec === 'number'
+                              ? `requested deadline ${deadlineSec}s`
+                              : ''}
+                            {typeof deadlineSec === 'number' && provModel ? ' · ' : ''}
+                            {provModel ? `provisioning model ${provModel}` : ''}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
               {analysisFeedback[job.id] && (
                 <div
                   className={`mt-1.5 rounded border px-2 py-1 text-[10px] ${
@@ -336,6 +382,10 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
               {(() => {
                 const diag = computeJobRpcDiagnostic(job);
                 if (!diag) return null;
+                // Provisioning-phase terminal failures get the dedicated
+                // provisioning-cause block above (with the launch contract);
+                // don't also render the generic retry-oriented RPC warning.
+                if (!active && job.vm_phase === 'provisioning') return null;
                 // Retry context: prefer a live countdown to next_retry_at, fall
                 // back to the bounded retry_after_seconds the backend recorded.
                 let retryText: string | null = null;

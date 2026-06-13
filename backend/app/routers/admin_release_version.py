@@ -1,6 +1,7 @@
 """Release version lifecycle endpoints."""
 
 import asyncio
+import logging
 import uuid
 from typing import Any, Dict, Optional
 
@@ -30,6 +31,8 @@ from app import compute as _compute
 from app.digest_cache import DigestCache
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 # Short-window caches for dashboard-polled endpoints.
 # Keyed by project_id (not user) — access check runs before every cache lookup.
@@ -191,6 +194,10 @@ def _serialize_version_history_entry(version: ReleaseVersion) -> dict[str, Any]:
             if version.status == "abandoned"
             else None
         ),
+        # Out-of-band promotion provenance: non-null when an operator force-merged
+        # this version outside the normal qualification flow. Degrades gracefully
+        # when the model column is absent (sibling PR not yet on this branch).
+        "out_of_band_promotion": getattr(version, "out_of_band_promotion", None),
     }
 
 
@@ -350,6 +357,7 @@ async def get_version_lifecycle(
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
         resolve_lifecycle_audit_evidence,
+        _resolve_policy_with_provenance,
     )
     from app.models import Project  # noqa: PLC0415
     from app.strategic_spawning import (  # noqa: PLC0415
@@ -364,6 +372,7 @@ async def get_version_lifecycle(
         project_row = (
             await session.execute(select(Project).where(Project.id == project_id))
         ).scalar_one_or_none()
+        _, promotion_policy_source, promotion_policy_error = _resolve_policy_with_provenance()
 
         open_row = (
             (
@@ -381,6 +390,29 @@ async def get_version_lifecycle(
             .scalars()
             .first()
         )
+
+        # Re-qualification readiness signal (ledger-backed) for the open version.
+        # Surfaced ADDITIVELY on current_version_out so the version-lifecycle UI can
+        # show whether the pre-registered re-qualification trigger (every gating
+        # high+medium carried finding resolved-or-stale) is met, plus the per-finding
+        # resolution state. Best-effort: a failure computing it must never break the
+        # lifecycle read — it degrades to ``requalification_ready: None``.
+        requalification_readiness: Optional[Dict[str, Any]] = None
+        if open_row is not None:
+            try:
+                from app.release_readiness import (  # noqa: PLC0415
+                    compute_requalification_readiness,
+                )
+
+                requalification_readiness = await compute_requalification_readiness(
+                    session, project_id
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] requalification readiness compute failed "
+                    "for project %s; serving lifecycle without the signal",
+                    project_id,
+                )
 
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
@@ -473,6 +505,18 @@ async def get_version_lifecycle(
                 "in_flight_task_count": in_flight_count,
                 "qualification_state": qual_state,
                 "last_qualification": _format_qualification(qual) if qual else None,
+                # Ledger-backed re-qualification readiness (ADDITIVE; nullable when
+                # the signal could not be computed). ``requalification_ready`` is the
+                # top-level boolean trigger; ``requalification_readiness`` carries the
+                # full per-finding resolution view (each gating finding's key,
+                # severity, summary, and resolved|stale|unresolved state) plus the
+                # gating counts and human-readable reason.
+                "requalification_ready": (
+                    requalification_readiness.get("requalification_ready")
+                    if requalification_readiness is not None
+                    else None
+                ),
+                "requalification_readiness": requalification_readiness,
                 # The candidate commit currently under evaluation for this open
                 # version, surfaced as a first-class field (not buried in
                 # last_qualification) so the UI can show what is being qualified and,
@@ -502,6 +546,10 @@ async def get_version_lifecycle(
                 "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
                 if open_row.deploy_confirm_deadline
                 else None,
+                # Out-of-band promotion provenance (nullable). Non-null only when an
+                # operator force-merged this version outside normal qualification flow.
+                # Degrades gracefully when the model column is absent on this branch.
+                "out_of_band_promotion": getattr(open_row, "out_of_band_promotion", None),
             }
 
         history_rows = (
@@ -553,6 +601,8 @@ async def get_version_lifecycle(
                 else "fleet"
             ),
             "promotion_readiness": promotion_readiness,
+            "promotion_policy_source": promotion_policy_source,
+            "promotion_policy_error": promotion_policy_error,
             # Directions deliberately queued (status=staged) to begin only after the
             # current version promotes. Surfaced read-only so an operator can confirm
             # staged work is queued and spot items rotting past their target version.

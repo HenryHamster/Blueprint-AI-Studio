@@ -23,7 +23,7 @@ import uuid
 from datetime import timedelta
 from typing import Optional
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import PoolVm, PoolVmState, Task, TaskStatus
@@ -342,6 +342,34 @@ async def count_live_pool_vms(
     return int((await session.execute(stmt)).scalar() or 0)
 
 
+async def count_pending_pool_leases(
+    session, *, project_id: Optional[uuid.UUID] = None
+) -> int:
+    """Count LEASED pool members whose pinned task is still QUEUED.
+
+    These are pool VMs in the dispatch-to-claim handoff window: the dispatch
+    hook has leased the VM and pinned the task to it, but the task is still
+    QUEUED (the agent has not yet claimed it via /next-role). They occupy a
+    real GCP slot but are invisible to the normal headroom calculation because
+    neither ``active_tasks`` (PROVISIONING/IN_PROGRESS only) nor ``idle_pool``
+    (PROVISIONING/IDLE only) captures them. Subtracting this count from the
+    headroom prevents the maintainer from provisioning into slots already
+    consumed by in-flight warm-pool handoffs.
+    """
+    stmt = (
+        select(func.count())
+        .select_from(PoolVm)
+        .join(Task, PoolVm.leased_task_id == Task.id)
+        .where(
+            PoolVm.state == PoolVmState.LEASED,
+            Task.status == TaskStatus.QUEUED,
+        )
+    )
+    if project_id is not None:
+        stmt = stmt.where(PoolVm.project_id == project_id)
+    return int((await session.execute(stmt)).scalar() or 0)
+
+
 # Terminal task statuses for orphaned-lease detection. A LEASED pool member whose
 # backing task is in one of these (or whose task row has vanished) is an ORPHANED
 # lease: the agent run is over, so the VM no longer backs active dispatch work.
@@ -539,10 +567,25 @@ async def lease_idle_pool_vm(
             )
         )
 
+    # When a lane_id is given, sort own-reserved members FIRST (CASE sort key 0)
+    # before falling back to oldest-idle ordering. This ensures a lane's own
+    # reserved member is always preferred over an older-idle generic member so
+    # the warm workspace it checkpointed into is actually reused. The single
+    # SELECT + FOR UPDATE SKIP LOCKED atomicity is fully preserved.
+    if lane_id is not None:
+        _lane_uuid = uuid.UUID(str(lane_id))
+        _order_exprs = [
+            case((PoolVm.reserved_lane_id == _lane_uuid, 0), else_=1).asc(),
+            PoolVm.idle_since.asc().nullsfirst(),
+            PoolVm.created_at.asc(),
+        ]
+    else:
+        _order_exprs = [PoolVm.idle_since.asc().nullsfirst(), PoolVm.created_at.asc()]
+
     stmt = (
         select(PoolVm)
         .where(*filters)
-        .order_by(PoolVm.idle_since.asc().nullsfirst(), PoolVm.created_at.asc())
+        .order_by(*_order_exprs)
         .with_for_update(skip_locked=True)
         .limit(1)
     )
@@ -560,6 +603,25 @@ async def lease_idle_pool_vm(
         return None
 
     ttl = lease_ttl_secs if lease_ttl_secs is not None else _DEFAULT_LEASE_TTL_SECS
+    expired_reservation_lane_id = (
+        member.reserved_lane_id
+        if member.reserved_lane_id is not None
+        and member.reservation_expires_at is not None
+        and member.reservation_expires_at <= now
+        else None
+    )
+    # Claimed-by-fix: the lane is leasing a member STILL actively reserved to it
+    # (reservation not expired) — the warm-resume success path. Captured before the
+    # reservation fields are cleared so the expiry-cause telemetry can attribute it.
+    claimed_own_reservation_lane_id = (
+        member.reserved_lane_id
+        if lane_id is not None
+        and member.reserved_lane_id is not None
+        and member.reserved_lane_id == uuid.UUID(str(lane_id))
+        and member.reservation_expires_at is not None
+        and member.reservation_expires_at > now
+        else None
+    )
     member.state = PoolVmState.LEASED
     member.leased_task_id = leased_task_id
     member.lease_expires_at = now + timedelta(seconds=ttl)
@@ -575,7 +637,29 @@ async def lease_idle_pool_vm(
     # Clear any reservation — a leased member holds no reservation.
     member.reserved_lane_id = None
     member.reservation_expires_at = None
+    member.reservation_hard_expires_at = None
+    object.__setattr__(
+        member, "_expired_reservation_lane_id", expired_reservation_lane_id
+    )
     session.add(member)
+    if claimed_own_reservation_lane_id is not None:
+        from app.runtime_config_state import is_improvement_lanes_enabled
+
+        if is_improvement_lanes_enabled():
+            await record_lane_reservation_cause(
+                session,
+                claimed_own_reservation_lane_id,
+                "claimed_by_fix",
+            )
+    if expired_reservation_lane_id is not None:
+        from app.runtime_config_state import is_improvement_lanes_enabled
+
+        if is_improvement_lanes_enabled():
+            await clear_lane_warm_workspace_if_matching_member(
+                session,
+                expired_reservation_lane_id,
+                member.vm_instance_id,
+            )
     logger.info(
         "[WARM-POOL] leased pool VM vm_instance_id=%s project=%s task=%s "
         "lease_expires_at=%s",
@@ -624,28 +708,11 @@ async def promote_pool_vm_to_idle(session, vm_instance_id: str) -> bool:
     return bool(result.rowcount)
 
 
-async def mark_pool_vm_idle(session, vm_instance_id: str) -> Optional[PoolVm]:
-    """Transition a member to IDLE (booted-ready, or returned from a lease).
-
-    Clears any lease binding and stamps ``idle_since`` so the idle reaper /
-    maintainer can age the member out. No-op (returns None) when the member is
-    unknown. The caller owns the transaction (commit).
-    """
-    member = await get_pool_vm(session, vm_instance_id)
-    if member is None:
-        return None
-    member.state = PoolVmState.IDLE
-    member.leased_task_id = None
-    member.lease_expires_at = None
-    member.idle_since = _utcnow()
-    session.add(member)
-    return member
-
-
 async def release_pool_vm(
     session,
     vm_instance_id: str,
     *,
+    owning_task_id: uuid.UUID | str,
     lane_id: Optional[str] = None,
 ) -> Optional[PoolVm]:
     """Atomically return a LEASED member to the IDLE pool so it can be re-leased.
@@ -658,30 +725,33 @@ async def release_pool_vm(
     (blocking replenishment) until the reaper's orphan-lease sweep eventually
     retires and DELETEs it, making every member single-use.
 
-    Unlike :func:`mark_pool_vm_idle` (which flips ANY state to IDLE — the
-    booted-ready PROVISIONING->IDLE signal), this return is GUARDED to a
-    ``state == LEASED`` row locked ``FOR UPDATE SKIP LOCKED`` before it is
-    flipped to IDLE, so a member a concurrent reaper/maintainer already moved to
-    RETIRING (mid-teardown) is NEVER resurrected onto the leasable set, and a
-    duplicate completion signal is a race-safe no-op. Returns the now-IDLE
-    member, or None when no LEASED row matches (unknown / already reconciled /
-    retiring). The caller owns the transaction (commit).
+    This return is GUARDED to a ``state == LEASED`` row owned by
+    ``owning_task_id`` and locked
+    ``FOR UPDATE SKIP LOCKED`` before it is flipped to IDLE, so a member a
+    concurrent reaper/maintainer already moved to RETIRING (mid-teardown) is
+    NEVER resurrected onto the leasable set, a duplicate completion signal is a
+    race-safe no-op, and a stale/non-owner task cannot return or reserve another
+    task's lease. Returns the now-IDLE member, or None when no owned LEASED row
+    matches (unknown / already reconciled / retiring / leased to another task).
+    The caller owns the transaction (commit).
 
     Idle-cost banking is preserved trivially: a LEASED member's ``idle_since`` is
     already None (cleared at lease time, with its accrued span banked then), so
     the fresh IDLE window simply restarts from now with nothing to erase.
 
     ``lane_id``: when supplied (improvement lanes enabled, caller passes the lane's
-    id), the member is returned IDLE stamped with ``reserved_lane_id`` /
+    id), the owned member is returned IDLE stamped with ``reserved_lane_id`` /
     ``reservation_expires_at`` so the lane's next phase can reclaim its warm
     workspace. A normal (no-lane) release stamps no reservation and clears any
     prior reservation fields.
     """
+    owner_id = uuid.UUID(str(owning_task_id))
     stmt = (
         select(PoolVm)
         .where(
             PoolVm.vm_instance_id == vm_instance_id,
             PoolVm.state == PoolVmState.LEASED,
+            PoolVm.leased_task_id == owner_id,
         )
         .with_for_update(skip_locked=True)
         .limit(1)
@@ -696,37 +766,144 @@ async def release_pool_vm(
     member.idle_since = now
     if lane_id is not None:
         ttl = int(
-            _runtime_config.get("warm_pool_lane_reservation_ttl_seconds", 900) or 900
+            _runtime_config.get("warm_pool_lane_reservation_ttl_seconds", 1800) or 1800
+        )
+        hard_cap = int(
+            _runtime_config.get("warm_pool_lane_reservation_hard_cap_seconds", 5400)
+            or 5400
         )
         member.reserved_lane_id = uuid.UUID(str(lane_id))
         member.reservation_expires_at = now + timedelta(seconds=ttl)
+        # Stamp the HARD absolute ceiling ONCE, here at reservation creation, with
+        # its own anchor that survives the soft TTL being re-stamped by the
+        # liveness sweep. The cap can never be exceeded, so a stuck lane cannot
+        # pin a warm VM forever.
+        member.reservation_hard_expires_at = now + timedelta(seconds=max(hard_cap, ttl))
     else:
         member.reserved_lane_id = None
         member.reservation_expires_at = None
+        member.reservation_hard_expires_at = None
     session.add(member)
     logger.info(
-        "[WARM-POOL] released pool VM vm_instance_id=%s -> IDLE (re-leasable) lane=%s",
+        "[WARM-POOL] released pool VM vm_instance_id=%s task=%s -> IDLE "
+        "(re-leasable) lane=%s",
         vm_instance_id,
+        owner_id,
         lane_id,
     )
     return member
 
 
-async def mark_pool_vm_retiring(session, vm_instance_id: str) -> Optional[PoolVm]:
-    """Mark a member RETIRING so it is never leased again (pending teardown).
+# Expiry-cause -> ImprovementLane counter column. Each warm reservation ends
+# exactly one way; these counters make a low warm_resume_fraction diagnosable on
+# the lanes analytics surface.
+_LANE_RESERVATION_CAUSE_COLUMNS = {
+    "claimed_by_fix": "reservation_claimed_by_fix_count",
+    "expired_before_fix": "reservation_expired_before_fix_count",
+    "force_expired": "reservation_force_expired_count",
+}
 
-    No-op (returns None) when the member is unknown. The caller owns the
+
+async def record_lane_reservation_cause(
+    session, lane_id: uuid.UUID | str, cause: str
+) -> bool:
+    """Increment the lane's expiry-cause counter for how a reservation ended.
+
+    ``cause`` is one of ``claimed_by_fix`` / ``expired_before_fix`` /
+    ``force_expired``. Implemented as a single atomic ``col = col + 1`` UPDATE so
+    concurrent reservation lifecycle events never lose a count to a read-modify-
+    write race. A no-op (returns False) for an unknown cause or a missing lane.
+    The caller owns the transaction (commit).
+    """
+    column = _LANE_RESERVATION_CAUSE_COLUMNS.get(cause)
+    if column is None:
+        return False
+    from app.models import ImprovementLane
+
+    col = getattr(ImprovementLane, column)
+    result = await session.execute(
+        update(ImprovementLane)
+        .where(ImprovementLane.id == uuid.UUID(str(lane_id)))
+        .values({column: col + 1})
+    )
+    return bool(result.rowcount)
+
+
+async def clear_lane_warm_workspace(session, lane_id: uuid.UUID | str) -> bool:
+    """Force a lane workspace back to COLD and clear its warm-resume VM pointer."""
+    from app.models import ImprovementLane
+
+    result = await session.execute(
+        update(ImprovementLane)
+        .where(ImprovementLane.id == uuid.UUID(str(lane_id)))
+        .values(workspace_state="COLD", workspace_vm_instance_id=None)
+    )
+    return bool(result.rowcount)
+
+
+async def clear_lane_warm_workspace_if_matching_member(
+    session,
+    lane_id: uuid.UUID | str,
+    workspace_vm_instance_id: str | None,
+) -> bool:
+    """Clear a lane workspace only while it still advertises a warm reservation."""
+    from app.models import ImprovementLane
+
+    result = await session.execute(
+        update(ImprovementLane)
+        .where(
+            ImprovementLane.id == uuid.UUID(str(lane_id)),
+            ImprovementLane.workspace_state == "WARM_RESERVED",
+            ImprovementLane.workspace_vm_instance_id == workspace_vm_instance_id,
+        )
+        .values(workspace_state="COLD", workspace_vm_instance_id=None)
+    )
+    return bool(result.rowcount)
+
+
+async def mark_pool_vm_retiring(
+    session,
+    vm_instance_id: str,
+    *,
+    source_states: tuple[PoolVmState, ...] = (
+        PoolVmState.PROVISIONING,
+        PoolVmState.IDLE,
+    ),
+) -> Optional[PoolVm]:
+    """Atomically mark a member RETIRING so it is never leased again.
+
+    Uses ``SELECT … FOR UPDATE SKIP LOCKED`` restricted to ``source_states`` so a
+    concurrent lease commit (IDLE → LEASED) causes this call to see no matching
+    unlocked row and return None without clobbering the lease binding.
+
+    Default ``source_states`` covers the vm-heartbeat pre-claim-failure path
+    (member failed before its first lease — PROVISIONING or IDLE). Callers that
+    need to retire an already-LEASED member (orchestrator pool-pin timeout,
+    task-completion FAILED/CANCELLED, doomed-VM guard in try_pool_dispatch) must
+    pass ``source_states=(PoolVmState.LEASED,)`` explicitly.
+
+    Returns None when the member is unknown, not in a qualifying state, or the
+    row is locked by a concurrent transaction (SKIP LOCKED). The caller owns the
     transaction (commit).
     """
-    member = await get_pool_vm(session, vm_instance_id)
+    stmt = (
+        select(PoolVm)
+        .where(
+            PoolVm.vm_instance_id == vm_instance_id,
+            PoolVm.state.in_(source_states),
+        )
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    member = (await session.execute(stmt)).scalars().first()
     if member is None:
         return None
     member.state = PoolVmState.RETIRING
     member.leased_task_id = None
     member.lease_expires_at = None
     # Bank accrued idle cost before clearing idle_since (IDLE->RETIRING is a
-    # settle call site; a no-op when the member was LEASED, whose idle_since is
-    # already None — teardown must never erase measured idle spend).
+    # settle call site; a no-op for LEASED members whose idle_since is already
+    # None — teardown must never erase measured idle spend).
     from app.efficiency_snapshot import settle_pool_vm_idle_cost
 
     settle_pool_vm_idle_cost(member, session=session)
@@ -809,11 +986,11 @@ async def try_pool_dispatch(
     # allowlist ⇒ fleet-wide (is_project_warm_pool_scoped returns True for all),
     # so legacy behavior is byte-identical.
     if not is_project_warm_pool_scoped(task.project_id):
-        record_pool_lease_miss("out_of_scope", account=required_account)
+        record_pool_lease_miss("out_of_scope", account=required_account, project_id=task.project_id)
         return None
 
     if is_warm_pool_suppressed():
-        record_pool_lease_miss("suppressed")
+        record_pool_lease_miss("suppressed", project_id=task.project_id)
         return None
 
     # Cost-aware auto-drain: pause leasing while the pool's idle spend is not
@@ -822,7 +999,7 @@ async def try_pool_dispatch(
     # guard reverses on its own (here and in the maintainer) once the hit rate
     # recovers above the configured floor.
     if await is_pool_cost_guard_engaged(session):
-        record_pool_lease_miss("cost_guard")
+        record_pool_lease_miss("cost_guard", project_id=task.project_id)
         return None
 
     # The required identity is the caller's RESOLVED LLM selection (provider /
@@ -874,7 +1051,7 @@ async def try_pool_dispatch(
     except Exception:
         logger.exception("[WARM-POOL] lease error during dispatch for task %s", task.id)
         record_pool_claim_failure("lease_error")
-        record_pool_lease_miss("lease_error")
+        record_pool_lease_miss("lease_error", project_id=task.project_id)
         return None
 
     if member is None:
@@ -888,7 +1065,50 @@ async def try_pool_dispatch(
             session, project_id=task.project_id
         )
         reason = "no_compatible_member" if idle_present else "no_idle_member"
-        record_pool_lease_miss(reason, account=required_account)
+        record_pool_lease_miss(reason, account=required_account, project_id=task.project_id)
+        # Best-effort workspace-state correction: the lane cannot stay
+        # WARM_RESERVED when no compatible member is available — its reservation
+        # is stale or already gone. Degrade to COLD so the lane's next phase
+        # cold-preps instead of waiting on a VM that is no longer there. Mirrors
+        # the degradation pattern in sweep_idle_pool_vms Pass 2.
+        if lane_id is not None and is_improvement_lanes_enabled():
+            try:
+                from app.models import ImprovementLane as _ImprovementLane
+
+                _lane_vm_instance_id = (
+                    (
+                        await session.execute(
+                            select(_ImprovementLane.workspace_vm_instance_id).where(
+                                _ImprovementLane.id == uuid.UUID(lane_id),
+                                _ImprovementLane.project_id == task.project_id,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if await clear_lane_warm_workspace_if_matching_member(
+                    session,
+                    lane_id,
+                    _lane_vm_instance_id,
+                ):
+                    # Commit here: this is the miss path — we return None below
+                    # so the caller never commits. The caller's only pending
+                    # mutation on this path is task.context (blacklist update in
+                    # orchestrator.py:3243-3249); that field is idempotent and
+                    # expire_on_commit=False avoids the MissingGreenlet hazard,
+                    # so committing ahead of the caller is safe on this branch.
+                    await session.commit()
+                    logger.debug(
+                        "[WARM-POOL] lane %s has no compatible member — degraded to COLD",
+                        lane_id,
+                    )
+            except Exception:
+                logger.debug(
+                    "[WARM-POOL] lane workspace-state correction failed lane=%s",
+                    lane_id,
+                    exc_info=True,
+                )
         return None
 
     # In-flight-delete guard: never land a lease on a VM the orchestrator already
@@ -905,9 +1125,13 @@ async def try_pool_dispatch(
             delete_reason,
             task.id,
         )
-        await mark_pool_vm_retiring(session, member.vm_instance_id)
+        await mark_pool_vm_retiring(
+            session,
+            member.vm_instance_id,
+            source_states=(PoolVmState.LEASED,),
+        )
         record_pool_claim_failure("doomed_vm")
-        record_pool_lease_miss("doomed_vm")
+        record_pool_lease_miss("doomed_vm", project_id=task.project_id)
         return None
 
     _pin_task_to_pool_vm(
@@ -918,6 +1142,57 @@ async def try_pool_dispatch(
         resolved_auth_mode=required_auth_mode,
         resolved_model=required_model,
     )
+    # Best-effort: if the lane dispatched to a VM other than its reserved one,
+    # update workspace_vm_instance_id so the lane row reflects the actual VM
+    # the task is running on (the caller's commit will persist this).
+    if lane_id is not None and is_improvement_lanes_enabled():
+        try:
+            from app.models import ImprovementLane as _ImprovementLane
+
+            expired_reservation_lane_id = getattr(
+                member, "_expired_reservation_lane_id", None
+            )
+            _lane_uuid = uuid.UUID(lane_id)
+            _lane_obj = (
+                (
+                    await session.execute(
+                        select(_ImprovementLane).where(
+                            _ImprovementLane.id == _lane_uuid,
+                            _ImprovementLane.project_id == task.project_id,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if (
+                expired_reservation_lane_id is not None
+                and _lane_uuid == expired_reservation_lane_id
+            ):
+                logger.debug(
+                    "[WARM-POOL] lane %s claimed expired reservation on vm=%s — left workspace COLD",
+                    lane_id,
+                    member.vm_instance_id,
+                )
+            elif (
+                _lane_obj is not None
+                and _lane_obj.workspace_vm_instance_id != member.vm_instance_id
+            ):
+                _prior_vm = _lane_obj.workspace_vm_instance_id
+                _lane_obj.workspace_vm_instance_id = member.vm_instance_id
+                session.add(_lane_obj)
+                logger.debug(
+                    "[WARM-POOL] lane %s dispatched to vm=%s (was %s) — updated workspace_vm_instance_id",
+                    lane_id,
+                    member.vm_instance_id,
+                    _prior_vm,
+                )
+        except Exception:
+            logger.debug(
+                "[WARM-POOL] lane workspace-vm correction failed lane=%s",
+                lane_id,
+                exc_info=True,
+            )
     logger.info(
         "[WARM-POOL] dispatch hook leased member %s for task %s (project %s) — "
         "skipping cold provision",

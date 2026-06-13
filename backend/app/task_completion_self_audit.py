@@ -355,6 +355,20 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
 
     upserted = 0
     project = await session.get(Project, task.project_id)
+
+    # Batch-fetch all existing SystemMaturity rows for this project in one query
+    # to avoid an N+1 SELECT (one per finding) in the loop below.
+    system_ids = {finding["system_id"] for finding in normalized}
+    existing_rows_result = await session.execute(
+        select(SystemMaturity).where(
+            SystemMaturity.project_id == task.project_id,
+            SystemMaturity.system_id.in_(system_ids),
+        )
+    )
+    by_system_id: Dict[str, SystemMaturity] = {
+        row.system_id: row for row in existing_rows_result.scalars().all()
+    }
+
     # Collect (mode, system_id, consecutive_ship_count) for findings that may
     # propagate to directions; the actual directions read-modify-write is
     # serialized once, after the loop, through the canonical row lock so a
@@ -363,18 +377,7 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
     for finding in normalized:
         system_id = finding["system_id"]
         mode = finding["recommended_mode"]
-        existing = (
-            (
-                await session.execute(
-                    select(SystemMaturity).where(
-                        SystemMaturity.project_id == task.project_id,
-                        SystemMaturity.system_id == system_id,
-                    )
-                )
-            )
-            .scalars()
-            .first()
-        )
+        existing = by_system_id.get(system_id)
         now = _utcnow()
         # Track consecutive ship assessments so we can auto-clear recovered directions.
         if existing is not None:
@@ -404,19 +407,19 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
             flag_modified(existing, "evidence")
             session.add(existing)
         else:
-            session.add(
-                SystemMaturity(
-                    project_id=task.project_id,
-                    system_id=system_id,
-                    score=finding["score"],
-                    components=new_components,
-                    recommended_mode=finding["recommended_mode"],
-                    top_issues=finding["top_issues"],
-                    evidence=finding["evidence"],
-                    last_audited_at=now,
-                    source_task_id=task.id,
-                )
+            new_row = SystemMaturity(
+                project_id=task.project_id,
+                system_id=system_id,
+                score=finding["score"],
+                components=new_components,
+                recommended_mode=finding["recommended_mode"],
+                top_issues=finding["top_issues"],
+                evidence=finding["evidence"],
+                last_audited_at=now,
+                source_task_id=task.id,
             )
+            session.add(new_row)
+            by_system_id[system_id] = new_row
         upserted += 1
         if mode in _SELF_AUDIT_PROPAGATED_MODES or mode == "ship":
             propagation_inputs.append((mode, system_id, consecutive_ship_count))
@@ -534,7 +537,9 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
 
         # Store a bounded propagation record in task.context for operator/debug visibility.
         ctx = dict(task.context or {})
-        ctx[SELF_AUDIT_PROPAGATION_RECORD_KEY] = effect_entries[:_PROPAGATION_RECORD_MAX_ENTRIES]
+        ctx[SELF_AUDIT_PROPAGATION_RECORD_KEY] = effect_entries[
+            :_PROPAGATION_RECORD_MAX_ENTRIES
+        ]
         task.context = ctx
         flag_modified(task, "context")
 

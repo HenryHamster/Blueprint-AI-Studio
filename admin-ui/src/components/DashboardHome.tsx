@@ -87,6 +87,15 @@ export interface DashboardHomeProps {
   tasks: Task[];
   selectedProjectId: string | null;
   projects?: Project[];
+  // Membership-scoped aggregate task counts from the tasks hook (/api/admin/tasks).
+  // These cover the whole accessible fleet (global*) or the selected project
+  // (scoped*), NOT the current paginated task page, so the Active/Queued cards
+  // can render true counts instead of a slice. All optional/additive: when
+  // undefined the cards fall back to deriving from the `tasks` page.
+  globalActiveCount?: number;
+  globalQueuedCount?: number;
+  scopedActiveCount?: number | null;
+  scopedQueuedCount?: number | null;
   onViewTask: (task: Task) => void;
   onDirectionClick?: (directionId: string) => void;
   onCategoryClick?: (category: string) => void;
@@ -95,6 +104,14 @@ export interface DashboardHomeProps {
   onSpawnOrphanFix?: (pr: OpenPR) => void;
   onPanelReviewPr?: (pr: OpenPR) => void;
   userRole?: 'admin' | 'user' | null;
+}
+
+interface OpenPrsResponse {
+  open_prs?: OpenPR[];
+  project_integration_branch?: string | null;
+  project_promotion_target?: string | null;
+  degraded?: boolean;
+  degraded_reason?: string | null;
 }
 
 // ---------- component ----------
@@ -107,18 +124,26 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, userRole }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, userRole }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
+  const [digestStale, setDigestStale] = useState(false);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
+  const [openPRsStale, setOpenPRsStale] = useState(false);
+  const [openPRsDegraded, setOpenPRsDegraded] = useState(false);
   const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
   const [openPRsPromotionTarget, setOpenPRsPromotionTarget] = useState<string | null>(null);
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
   const [scopeBaselines, setScopeBaselines] = useState<ScopeBaselinesResponse | null>(null);
   const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
   const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
+  const [accountHealthServedStale, setAccountHealthServedStale] = useState(false);
+  const [accountHealthGeneratedAt, setAccountHealthGeneratedAt] = useState<string | null>(null);
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [versionLifecycle, setVersionLifecycle] = useState<VersionLifecycleResponse | null>(null);
+  const [versionLifecycleError, setVersionLifecycleError] = useState<string | null>(null);
+  const [versionLifecycleLastSuccessAt, setVersionLifecycleLastSuccessAt] = useState<string | null>(null);
+  const [versionLifecycleRefreshing, setVersionLifecycleRefreshing] = useState(false);
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [expandedBlindSpotThemes, setExpandedBlindSpotThemes] = useState<Set<string>>(new Set());
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
@@ -138,6 +163,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [srDrillThroughError, setSrDrillThroughError] = useState<{ taskId: string; message: string } | null>(null);
   const sparkRef = useRef<SparkPoint[]>([]);
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
+  // Tracks whether any successful digest fetch has run in the current project
+  // context. Used in the allFailed check to avoid reading stale `digest` state
+  // inside the fetchData useCallback closure.
+  const digestHasDataRef = useRef(false);
   const reviewQualitySectionRef = useRef<HTMLElement>(null);
   const dashboardRequestIdRef = useRef(0);
   const openPRsRequestIdRef = useRef(0);
@@ -148,15 +177,23 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
   const resetProjectScopedState = useCallback(() => {
     setDigest(null);
+    setDigestStale(false);
     setOpenPRs([]);
+    setOpenPRsStale(false);
+    setOpenPRsDegraded(false);
     setOpenPRsIntegrationBranch(null);
     setOpenPRsPromotionTarget(null);
     setMeasurementData(null);
     setScopeBaselines(null);
     setAccountHealth(null);
+    setAccountHealthServedStale(false);
+    setAccountHealthGeneratedAt(null);
     setSystemMaturity(null);
     setTaskDurationStats(null);
     setVersionLifecycle(null);
+    setVersionLifecycleError(null);
+    setVersionLifecycleLastSuccessAt(null);
+    setVersionLifecycleRefreshing(false);
     setBlindSpots(null);
     setExpandedBlindSpotThemes(new Set());
     setSrRecentMisses(null);
@@ -169,6 +206,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     setAgentServingShas(null);
     setSparkData([]);
     sparkRef.current = [];
+    digestHasDataRef.current = false;
     setOpenPRsRefreshing(false);
     setLoading(true);
     setLastFetchError(false);
@@ -182,10 +220,15 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     try {
       const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
       if (res.ok && requestId === openPRsRequestIdRef.current) {
-        const data = await res.json();
+        const data = await res.json() as OpenPrsResponse;
         setOpenPRs(data.open_prs ?? []);
         setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
         setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
+        setOpenPRsDegraded(Boolean(data.degraded));
+        setOpenPRsStale(false);
+      } else if (requestId === openPRsRequestIdRef.current) {
+        setOpenPRsStale(true);
+        setOpenPRsDegraded(false);
       }
     } catch { /* silent */ }
     finally {
@@ -257,16 +300,20 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             const data = await res.json();
             if (requestId === dashboardRequestIdRef.current && assertDigestContract<DirectionProgress>(data)) {
               setDigest(data);
+              setDigestStale(false);
+              digestHasDataRef.current = true;
               digestOk = true;
             } else if (requestId === dashboardRequestIdRef.current) {
-              setDigest(null);
+              // Contract failed — preserve previous digest, mark stale
+              setDigestStale(true);
             }
           } else if (requestId === dashboardRequestIdRef.current) {
-            setDigest(null);
+            // HTTP error — preserve previous digest, mark stale
+            setDigestStale(true);
           }
         } catch {
           if (requestId === dashboardRequestIdRef.current) {
-            setDigest(null);
+            setDigestStale(true);
           }
           /* silent */
         }
@@ -288,13 +335,23 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           try {
             const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
             if (res.ok && requestId === dashboardRequestIdRef.current) {
-              const data = await res.json();
+              const data = await res.json() as OpenPrsResponse;
               setOpenPRs(data.open_prs ?? []);
               setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
               setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
+              setOpenPRsDegraded(Boolean(data.degraded));
+              setOpenPRsStale(false);
               openPRsOk = true;
+            } else if (requestId === dashboardRequestIdRef.current) {
+              setOpenPRsStale(true);
+              setOpenPRsDegraded(false);
             }
-          } catch { /* silent */ }
+          } catch {
+            if (requestId === dashboardRequestIdRef.current) {
+              setOpenPRsStale(true);
+              setOpenPRsDegraded(false);
+            }
+          }
         })(),
         (async () => {
           try {
@@ -314,6 +371,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             if (res.ok && requestId === dashboardRequestIdRef.current) {
               const data = await res.json();
               setAccountHealth(data.accounts ?? []);
+              setAccountHealthServedStale(data.served_stale === true);
+              setAccountHealthGeneratedAt(
+                typeof data.generated_at === 'string' ? data.generated_at : null,
+              );
             }
           } catch { /* silent */ }
         })(),
@@ -367,8 +428,19 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) setVersionLifecycle(await res.json());
-          } catch { /* silent */ }
+            if (requestId !== dashboardRequestIdRef.current) return;
+            if (res.ok) {
+              setVersionLifecycle(await res.json());
+              setVersionLifecycleError(null);
+              setVersionLifecycleLastSuccessAt(new Date().toISOString());
+            } else {
+              setVersionLifecycleError(`Version lifecycle unavailable (${res.status})`);
+            }
+          } catch {
+            if (requestId === dashboardRequestIdRef.current) {
+              setVersionLifecycleError('Version lifecycle refresh failed');
+            }
+          }
         })(),
         (async () => {
           try {
@@ -419,20 +491,39 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     if (requestId !== dashboardRequestIdRef.current) return;
     setLoading(false);
 
-    // Show error banner only when all primary fetches fail (backend unreachable)
+    // Show error banner only when all primary fetches fail AND we have no
+    // previously-loaded digest to show. digestHasDataRef tracks whether any
+    // successful digest fetch has run (avoids the stale-closure problem with
+    // reading `digest` state directly inside this callback).
     const allFailed = selectedProjectId
-      ? !digestOk && !diagnosticsOk && !openPRsOk
-      : !digestOk;
+      ? !digestOk && !diagnosticsOk && !openPRsOk && !digestHasDataRef.current
+      : !digestOk && !digestHasDataRef.current;
     setLastFetchError(allFailed);
   }, [selectedProjectId, windowHours, selectedSrCategory]);
 
   const refreshVersionLifecycle = useCallback(async () => {
     if (!selectedProjectId) return;
     const requestId = ++versionLifecycleRequestIdRef.current;
+    setVersionLifecycleRefreshing(true);
     try {
       const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
-      if (res.ok && requestId === versionLifecycleRequestIdRef.current) setVersionLifecycle(await res.json());
-    } catch { /* silent */ }
+      if (requestId !== versionLifecycleRequestIdRef.current) return;
+      if (res.ok) {
+        setVersionLifecycle(await res.json());
+        setVersionLifecycleError(null);
+        setVersionLifecycleLastSuccessAt(new Date().toISOString());
+      } else {
+        setVersionLifecycleError(`Version lifecycle unavailable (${res.status})`);
+      }
+    } catch {
+      if (requestId === versionLifecycleRequestIdRef.current) {
+        setVersionLifecycleError('Version lifecycle refresh failed');
+      }
+    } finally {
+      if (requestId === versionLifecycleRequestIdRef.current) {
+        setVersionLifecycleRefreshing(false);
+      }
+    }
   }, [selectedProjectId]);
 
   // Reset project-scoped state synchronously on a project/window/category
@@ -466,10 +557,21 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     void fetchData(++dashboardRequestIdRef.current);
   }, [fetchData]);
 
-  const { activeCount, queuedCount } = useMemo(() => ({
-    activeCount: tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
-    queuedCount: tasks.filter(t => t.status === 'QUEUED').length,
+  // Active/Queued headline cards read the membership-scoped aggregate counts
+  // (project-scoped when a project is selected, else fleet-wide) so a paginated
+  // task page can never hide active/queued work from other projects. Fall back
+  // to deriving from the current `tasks` page only when the aggregate props are
+  // absent (e.g. legacy callers / tests that don't thread them through).
+  const { pageActiveCount, pageQueuedCount } = useMemo(() => ({
+    pageActiveCount: tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
+    pageQueuedCount: tasks.filter(t => t.status === 'QUEUED').length,
   }), [tasks]);
+  const activeCount = selectedProjectId && scopedActiveCount != null
+    ? scopedActiveCount
+    : (globalActiveCount ?? pageActiveCount);
+  const queuedCount = selectedProjectId && scopedQueuedCount != null
+    ? scopedQueuedCount
+    : (globalQueuedCount ?? pageQueuedCount);
 
   // Sparkline sampling
   useEffect(() => {
@@ -478,6 +580,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     sparkRef.current = next;
     setSparkData(next);
   }, [activeCount, queuedCount, digest?.failed_count]);
+  const digestIsStale = digestStale || Boolean(digest?.served_stale);
   const failedCount = digest?.failed_count ?? 0;
   const successRate = digest?.success_rate;
 
@@ -531,6 +634,19 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           <span>Backend unreachable — showing stale data</span>
         </div>
       )}
+      {/* Digest staleness banner — shown when the backend served a stale
+          fallback (served_stale) OR when the client-side fetch failed but
+          prior digest data is preserved (digestStale). Distinct from the
+          "Backend unreachable" banner, which only fires when no data exists. */}
+      {(digestStale || digest?.served_stale) && !loading && (
+        <div
+          data-testid="digest-stale-banner"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs"
+        >
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+          <span>Digest data may be stale — last fetch failed, showing cached values</span>
+        </div>
+      )}
       {/* Header row with time window selector */}
       <div className="flex items-center justify-end px-1">
         <select
@@ -563,7 +679,18 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
 
       {/* Version Lifecycle */}
-      {selectedProjectId && <VersionLifecyclePanel data={versionLifecycle} loading={loading} projectId={selectedProjectId} onRefresh={refreshVersionLifecycle} userRole={userRole} />}
+      {selectedProjectId && (
+        <VersionLifecyclePanel
+          data={versionLifecycle}
+          loading={loading}
+          projectId={selectedProjectId}
+          onRefresh={refreshVersionLifecycle}
+          userRole={userRole}
+          refreshError={versionLifecycleError}
+          lastSuccessfulRefreshAt={versionLifecycleLastSuccessAt}
+          refreshing={versionLifecycleRefreshing}
+        />
+      )}
 
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />
@@ -777,7 +904,12 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
           {/* Section 2d: Provider Account Health */}
           {!!selectedProjectId && (
-            <PoolAccountHealthPanel accounts={accountHealth} loading={loading} />
+            <PoolAccountHealthPanel
+              accounts={accountHealth}
+              loading={loading}
+              servedStale={accountHealthServedStale}
+              generatedAt={accountHealthGeneratedAt}
+            />
           )}
 
           {/* Section 2e: Provider / Model Breakdown */}
@@ -808,16 +940,16 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           <RecentMergesTimeline mergeEvents={mergeEvents} loading={loading} />
 
           {/* Fleet-wide no-CI merge-gate verification health (read-only) */}
-          {digest?.merge_gate_fleet_health && digest.merge_gate_fleet_health.project_count > 0 && (
+          {(digest?.merge_gate_fleet_health || digestIsStale) && (
             <div className="mt-4">
-              <MergeGateFleetHealthCard data={digest.merge_gate_fleet_health} />
+              <MergeGateFleetHealthCard data={digest?.merge_gate_fleet_health} stale={digestIsStale} />
             </div>
           )}
 
           {/* Park/wake delivery health (read-only) */}
-          {digest?.park_wake_health && (
+          {(digest?.park_wake_health || digestIsStale) && (
             <div className="mt-4">
-              <ParkWakeHealthCard data={digest.park_wake_health} />
+              <ParkWakeHealthCard data={digest?.park_wake_health} stale={digestIsStale} />
             </div>
           )}
 
@@ -851,6 +983,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             promotionTarget={openPRsPromotionTarget}
             onSpawnFixTask={onSpawnOrphanFix}
             onPanelReviewPr={onPanelReviewPr}
+            stale={openPRsStale}
+            degraded={openPRsDegraded}
           />
         </div>
       </div>

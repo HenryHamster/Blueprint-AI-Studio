@@ -83,6 +83,11 @@ async def test_warm_vm_state_exposes_per_project_pool_guard_and_caches(
     from datetime import timedelta
 
     from app.models import PoolVm, PoolVmState, Project, Task, TaskStatus, _utcnow
+    from app.warm_backlog_reuse import (
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        record_pool_lease_miss,
+    )
 
     fresh_cache = DigestCache(default_ttl=60.0)
     app.dependency_overrides[get_digest_cache] = lambda: fresh_cache
@@ -133,6 +138,10 @@ async def test_warm_vm_state_exposes_per_project_pool_guard_and_caches(
         ]
     )
     await db_session.commit()
+    _pool_lease_hit_events.clear()
+    _pool_lease_miss_events.clear()
+    record_pool_lease_miss("no_idle_member", project_id=bad.id)
+    record_pool_lease_miss("no_idle_member", project_id=bad.id)
 
     old_guard_config = {
         key: _runtime_config.get(key)
@@ -159,8 +168,18 @@ async def test_warm_vm_state_exposes_per_project_pool_guard_and_caches(
 
     assert r1.status_code == 200
     assert r2.status_code == 200
-    assert r1.json() == r2.json()
-    pool = r1.json()["pool_metrics"]
+    body1 = r1.json()
+    body2 = r2.json()
+    assert body1["active_vms"] == body2["active_vms"]
+    assert body1["warm_pin_metrics"] == body2["warm_pin_metrics"]
+    assert body1["generated_at"] == body2["generated_at"]
+    assert body1["served_stale"] is False
+    assert body2["served_stale"] is False
+    assert body1["precomputed"] is False
+    assert body2["precomputed"] is False
+    assert body1["precompute_age_seconds"] is not None
+    assert body1["precompute_age_seconds"] < 60
+    pool = body1["pool_metrics"]
     assert "cost_guard" in pool
     assert "cost_guard_by_project" in pool
     guard_by_project = pool["cost_guard_by_project"]
@@ -382,6 +401,119 @@ async def test_health_overview_serve_stale_marks_verdict_not_live(
     assert spy.call_count == 2
 
 
+@pytest.mark.asyncio
+async def test_warm_vm_state_serve_stale_is_annotated(
+    client: AsyncClient, db_session, mocker
+):
+    """warm-vm-state must expose the DigestCache stale-fallback signal."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    short_cache = DigestCache(default_ttl=0.05, stale_retry_ttl=60)
+    app.dependency_overrides[get_digest_cache] = lambda: short_cache
+
+    old_iso = (_utcnow() - timedelta(hours=2)).isoformat()
+    good: Dict[str, Any] = {
+        "active_vms": [],
+        "warm_pin_metrics": {"active_warm_chains": 0},
+        "generated_at": old_iso,
+    }
+    spy = AsyncMock(side_effect=[good, RuntimeError("warm-vm scan timed out")])
+    mocker.patch.object(_admin_health, "_compute_warm_vm_state", spy)
+
+    try:
+        r1 = await client.get("/api/admin/warm-vm-state")
+        await asyncio.sleep(0.1)
+        r2 = await client.get("/api/admin/warm-vm-state")
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    assert r1.status_code == 200
+    assert r1.json()["served_stale"] is False
+
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["active_vms"] == []
+    assert b2["served_stale"] is True
+    assert b2["precomputed"] is False
+    assert b2["precomputed_at"] == old_iso
+    assert b2["precompute_age_seconds"] > 120
+    assert spy.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fleet_utilization_on_demand_stamps_live_freshness(
+    client: AsyncClient, db_session, mocker
+):
+    """fleet-utilization fresh compute emits generated_at and live metadata."""
+    fresh_cache = DigestCache(default_ttl=60.0)
+    app.dependency_overrides[get_digest_cache] = lambda: fresh_cache
+
+    spy = AsyncMock(return_value={"util_avg": 0.5, "util_now": 0.25})
+    mocker.patch.object(_admin_health, "get_fleet_utilization_snapshot", spy)
+
+    try:
+        resp = await client.get("/api/admin/fleet-utilization")
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["util_avg"] == 0.5
+    assert body["util_now"] == 0.25
+    assert body["saturation"] == "healthy"
+    assert body["generated_at"]
+    assert body["served_stale"] is False
+    assert body["precomputed"] is False
+    assert body["precomputed_at"] == body["generated_at"]
+    assert body["precompute_age_seconds"] is not None
+    assert body["precompute_age_seconds"] < 60
+    assert spy.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fleet_utilization_serve_stale_is_annotated(
+    client: AsyncClient, db_session, mocker
+):
+    """fleet-utilization must expose the DigestCache stale-fallback signal."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    short_cache = DigestCache(default_ttl=0.05, stale_retry_ttl=60)
+    app.dependency_overrides[get_digest_cache] = lambda: short_cache
+
+    old_iso = (_utcnow() - timedelta(hours=2)).isoformat()
+    good: Dict[str, Any] = {
+        "util_avg": 0.95,
+        "util_now": 1.0,
+        "saturation": "saturated",
+        "generated_at": old_iso,
+    }
+    spy = AsyncMock(side_effect=[good, RuntimeError("fleet scan timed out")])
+    mocker.patch.object(_admin_health, "_compute_fleet_utilization", spy)
+
+    try:
+        r1 = await client.get("/api/admin/fleet-utilization")
+        await asyncio.sleep(0.1)
+        r2 = await client.get("/api/admin/fleet-utilization")
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    assert r1.status_code == 200
+    assert r1.json()["served_stale"] is False
+
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["saturation"] == "saturated"
+    assert b2["served_stale"] is True
+    assert b2["precomputed"] is False
+    assert b2["precomputed_at"] == old_iso
+    assert b2["precompute_age_seconds"] > 120
+    assert spy.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # /api/admin/max-plan-accounts/health cache
 # ---------------------------------------------------------------------------
@@ -407,7 +539,10 @@ async def test_pool_accounts_health_caches_repeated_calls_within_ttl(
 
     assert r1.status_code == 200
     assert r2.status_code == 200
-    assert r1.json() == r2.json() == expected
+    # The payload now carries additive freshness keys; the cached body is still
+    # identical across the two polls and the underlying compute runs once.
+    assert r1.json() == r2.json()
+    assert r1.json()["accounts"] == expected["accounts"]
     assert spy.call_count == 1
 
 
@@ -449,7 +584,7 @@ async def test_pool_accounts_health_dedups_concurrent_polls(
         app.dependency_overrides.pop(get_digest_cache, None)
 
     assert all(r.status_code == 200 for r in responses)
-    assert all(r.json() == {"accounts": []} for r in responses)
+    assert all(r.json()["accounts"] == [] for r in responses)
     assert call_count == 1
 
 

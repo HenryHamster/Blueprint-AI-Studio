@@ -80,7 +80,12 @@ class DigestCache:
         """Result-only wrapper around :meth:`get_or_compute_meta`.
 
         Preserved byte-compatible for the callers that don't need the
-        served-stale signal (admin_digest, admin_pool_accounts).
+        served-stale signal. The freshness-annotated endpoints
+        (admin_digest, admin_health, admin_pool_accounts, and
+        admin_release_version's version-lifecycle cache) use
+        :meth:`get_or_compute_meta` directly; this wrapper remains for the
+        remaining result-only callers (e.g. admin_release_version's
+        agent-serving-SHAs cache).
         """
         result, _served_stale = await self.get_or_compute_meta(
             key, compute_fn, ttl=ttl

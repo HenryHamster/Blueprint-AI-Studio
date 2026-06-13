@@ -489,6 +489,38 @@ async def test_cap_preserves_rollup_pr_unchanged(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_supersession_churn_hold_is_clearable(db_session):
+    """The churn-halt breadcrumb must remain a clearable escalation hold."""
+    from app.review_loop_convergence import clear_review_escalation_approval_gate
+
+    task = make_task(
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "review_loop_terminal_outcome": {
+                "kind": "supersession_churn_halt",
+                "reason": "supersession-churn",
+                "pr_number": 9179,
+                "iterations": 3,
+                "detail": "bound hit",
+                "recorded_at": "2026-06-09T23:29:15",
+            },
+            "_approval_set_at": "2026-06-09T23:29:15.375394",
+        },
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+    )
+
+    assert clear_review_escalation_approval_gate(
+        task, resolved_by="review_approve_pr_9179"
+    )
+    assert task.requires_approval is False
+    outcome = task.context["review_loop_terminal_outcome"]
+    assert outcome["kind"] == "supersession_churn_halt"
+    assert outcome["resolved"] is True
+    assert outcome["resolved_by"] == "review_approve_pr_9179"
+
+
+@pytest.mark.asyncio
 async def test_is_backmerge_resolver_helper(db_session):
     """The _is_backmerge_resolver predicate is True only for
     context.backmerge_conflict == True."""

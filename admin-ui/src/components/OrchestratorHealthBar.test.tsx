@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, act } from '@testing-library/react';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
 
@@ -26,6 +26,10 @@ function makeCostResponse(daily_cost_usd: number, daily_cost_ceiling_usd: number
     json: async () => ({ daily_cost_usd, daily_cost_ceiling_usd }),
   } as Response;
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('OrchestratorHealthBar cost pill', () => {
   beforeEach(() => {
@@ -97,6 +101,57 @@ describe('OrchestratorHealthBar cost pill', () => {
 
     const pill = screen.getByTitle(/\$12\.43 \/ \$50\.00/);
     expect(pill.textContent).toContain('$12.43 / $50.00');
+  });
+
+  it('marks the cost pill stale after a failed digest poll and clears it on recovery', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-13T12:00:00Z'));
+    apiFetchMock
+      .mockResolvedValueOnce(makeCostResponse(12.43, 50))
+      .mockResolvedValueOnce({ ok: false, json: async () => ({}) } as Response)
+      .mockResolvedValueOnce(makeCostResponse(15, 50));
+
+    render(<OrchestratorHealthBar {...baseProps} />);
+    await act(async () => {});
+
+    expect(screen.getByTitle(/Daily cost: \$12\.43 \/ \$50\.00/).textContent).not.toContain('as of');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+
+    const stalePill = screen.getByTitle(/Last digest poll failed; showing values as of 1m ago/);
+    expect(stalePill).toHaveTextContent('$12.43 / $50.00');
+    expect(stalePill).toHaveTextContent('as of 1m ago');
+    expect(stalePill.className).toContain('opacity-75');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+
+    const recoveredPill = screen.getByTitle(/Daily cost: \$15\.00 \/ \$50\.00/);
+    expect(recoveredPill).toHaveTextContent('$15.00 / $50.00');
+    expect(recoveredPill).not.toHaveTextContent('as of');
+    expect(recoveredPill.className).not.toContain('opacity-75');
+  });
+
+  it('dims cost pill when 200 response contains served_stale:true', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-13T12:00:00Z'));
+    apiFetchMock
+      .mockResolvedValueOnce(makeCostResponse(12.43, 50))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ daily_cost_usd: 12.43, daily_cost_ceiling_usd: 50, served_stale: true }),
+      } as Response);
+
+    render(<OrchestratorHealthBar {...baseProps} />);
+    await act(async () => {});
+
+    expect(screen.getByTitle(/Daily cost: \$12\.43 \/ \$50\.00/).textContent).not.toContain('as of');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+
+    const stalePill = screen.getByTitle(/Last digest poll failed; showing values as of 1m ago/);
+    expect(stalePill).toHaveTextContent('$12.43 / $50.00');
+    expect(stalePill).toHaveTextContent('as of 1m ago');
+    expect(stalePill.className).toContain('opacity-75');
   });
 });
 
@@ -256,5 +311,92 @@ describe('OrchestratorHealthBar deploy state', () => {
     expect(deployIndicator.innerHTML).toContain('bg-amber-400');
     expect(deployIndicator.textContent).toContain('Paused');
     expect(deployIndicator.textContent).toContain('External dependency down');
+  });
+});
+
+describe('OrchestratorHealthBar stale heartbeat warning', () => {
+  beforeEach(() => {
+    apiFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0 }),
+    } as Response);
+  });
+
+  function tasksWithStaleHeartbeats(count: number) {
+    return Array.from({ length: count }, (_, idx) => ({
+      id: `task-${idx + 1}`,
+      status: 'IN_PROGRESS',
+      last_heartbeat: '2026-05-06T22:30:00Z',
+    }));
+  }
+
+  it('uses the fleet digest stale-heartbeat count instead of the page slice', async () => {
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0, stale_heartbeat_count: 7 }),
+    } as Response);
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} tasks={tasksWithStaleHeartbeats(2)} />); });
+
+    const warning = screen.getByTitle(/7 IN_PROGRESS tasks with no heartbeat in the last 5 minutes \(fleet-wide\)/);
+    expect(warning.textContent).toContain('7 stale');
+    expect(warning.textContent).not.toContain('2 stale');
+  });
+
+  it('hides the warning when the fleet digest reports zero stale heartbeats', async () => {
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0, stale_heartbeat_count: 0 }),
+    } as Response);
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} tasks={tasksWithStaleHeartbeats(2)} />); });
+
+    expect(screen.queryByText(/stale$/)).toBeNull();
+  });
+
+  it('falls back to the current page slice when the digest omits stale_heartbeat_count', async () => {
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0 }),
+    } as Response);
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} tasks={tasksWithStaleHeartbeats(2)} />); });
+
+    const warning = screen.getByTitle(/2 IN_PROGRESS tasks with no heartbeat in the last 5 minutes \(current page only — fleet count unavailable\)/);
+    expect(warning.textContent).toContain('2 stale');
+  });
+
+  it('marks the fleet stale-heartbeat count stale after a failed digest poll and clears it on recovery', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-13T12:00:00Z'));
+    apiFetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0, stale_heartbeat_count: 7 }),
+      } as Response)
+      .mockRejectedValueOnce(new Error('digest unavailable'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0, stale_heartbeat_count: 3 }),
+      } as Response);
+
+    render(<OrchestratorHealthBar {...baseProps} tasks={tasksWithStaleHeartbeats(2)} />);
+    await act(async () => {});
+
+    expect(screen.getByTitle(/7 IN_PROGRESS tasks .* \(fleet-wide\)/)).toHaveTextContent('7 stale');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+
+    const staleWarning = screen.getByTitle(/7 IN_PROGRESS tasks .* Last digest poll failed; showing values as of 1m ago/);
+    expect(staleWarning).toHaveTextContent('7 stale');
+    expect(staleWarning).toHaveTextContent('as of 1m ago');
+    expect(staleWarning.className).toContain('opacity-75');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+
+    const recoveredWarning = screen.getByTitle(/3 IN_PROGRESS tasks .* \(fleet-wide\)/);
+    expect(recoveredWarning).toHaveTextContent('3 stale');
+    expect(recoveredWarning).not.toHaveTextContent('as of');
+    expect(recoveredWarning.className).not.toContain('opacity-75');
   });
 });

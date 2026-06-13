@@ -36,13 +36,27 @@ export function DiagnosticsPanel({ diagnostics, onViewTask, handleRetry, handleC
     return localStorage.getItem('blueprint-admin:diagnosticsPanelCollapsed') === 'true';
   });
   const [failingTypes, setFailingTypes] = useState<FailingTaskTypes | null>(null);
+  const [gatePollFailed, setGatePollFailed] = useState(false);
+  const [gatePollEverSucceeded, setGatePollEverSucceeded] = useState(false);
 
   usePoller(async (signal) => {
     try {
       const res = await authGet(`${API_BASE_URL}/api/admin/failing-task-types`);
-      if (!signal.aborted && res.ok) setFailingTypes(await res.json());
-    } catch { /* leave previous value */ }
+      if (!signal.aborted) {
+        if (res.ok) {
+          setFailingTypes(await res.json());
+          setGatePollFailed(false);
+          setGatePollEverSucceeded(true);
+        } else {
+          setGatePollFailed(true);
+        }
+      }
+    } catch {
+      if (!signal.aborted) setGatePollFailed(true);
+    }
   }, { intervalMs: DEFAULT_POLL_MS });
+
+  const gateDegraded = gatePollFailed || !gatePollEverSucceeded;
 
   const toggle = () => {
     const next = !collapsed;
@@ -77,6 +91,15 @@ export function DiagnosticsPanel({ diagnostics, onViewTask, handleRetry, handleC
           {failingTypes && failingTypes.gated_types.length > 0 && (
             <span className="ml-1 bg-amber-500/20 border border-amber-500/40 text-amber-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none">
               {failingTypes.gated_types.length} type{failingTypes.gated_types.length !== 1 ? 's' : ''} gated
+            </span>
+          )}
+          {gateDegraded && (
+            <span
+              className="ml-1 text-[9px] font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/15 text-amber-300"
+              title="Gate status unavailable — the failing-task-types poll failed or has not yet completed"
+            >
+              <AlertTriangle className="inline w-2.5 h-2.5 mr-0.5" />
+              gate unknown
             </span>
           )}
           {collapsed && diagnostics && (
@@ -176,6 +199,17 @@ export function DiagnosticsPanel({ diagnostics, onViewTask, handleRetry, handleC
           </div>
 
           {/* Per-type failure gate */}
+          {gateDegraded && !(failingTypes && failingTypes.gated_types.length > 0) && (
+            <div className="flex items-center gap-1.5">
+              <AlertTriangle className="w-3 h-3 text-amber-400" />
+              <span
+                className="text-[9px] font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/15 text-amber-300"
+                title="The failing-task-types poll has not yet completed or its last attempt failed"
+              >
+                gate status unknown
+              </span>
+            </div>
+          )}
           {failingTypes && failingTypes.gated_types.length > 0 && (
             <div>
               <div className="flex items-center gap-1.5 mb-1.5">

@@ -533,6 +533,71 @@ describe('ResearchBrowser spawn-gate provenance', () => {
   });
 });
 
+describe('ResearchBrowser BLOCKED/PARKED outcome styling', () => {
+  it('renders BLOCKED implementation with amber color and Blocked label', async () => {
+    const user = userEvent.setup();
+    const blockedImpl = makeImplementationTask({ status: 'BLOCKED' });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Blocked Finding' })]), blockedImpl]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    await user.click(screen.getByText('Blocked Finding'));
+    const label = screen.getByText('Blocked');
+    expect(label).toBeInTheDocument();
+    expect(label.className).toContain('amber');
+  });
+
+  it('renders PARKED implementation with purple color and Parked label', async () => {
+    const user = userEvent.setup();
+    const parkedImpl = makeImplementationTask({ id: 'impl-2', status: 'PARKED' });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Parked Finding' })]), parkedImpl]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    await user.click(screen.getByText('Parked Finding'));
+    const label = screen.getByText('Parked');
+    expect(label).toBeInTheDocument();
+    expect(label.className).toContain('purple');
+  });
+
+  it('BLOCKED and PARKED implementations appear under In Progress filter', async () => {
+    const user = userEvent.setup();
+    const blockedImpl = makeImplementationTask({
+      id: 'blocked-1',
+      status: 'BLOCKED',
+      context: { research_task_id: 'research-1', finding_index: 0 },
+    });
+    const parkedImpl = makeImplementationTask({
+      id: 'parked-1',
+      status: 'PARKED',
+      context: { research_task_id: 'research-1', finding_index: 1 },
+    });
+    const research = {
+      ...makeResearchTask([
+        makeFinding({ title: 'Finding Blocked' }),
+        makeFinding({ title: 'Finding Parked' }),
+      ]),
+    };
+    render(
+      <ResearchBrowser
+        tasks={[research, blockedImpl, parkedImpl]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'In Progress' }));
+    expect(screen.getByText('Finding Blocked')).toBeInTheDocument();
+    expect(screen.getByText('Finding Parked')).toBeInTheDocument();
+  });
+});
+
 describe('ResearchBrowser researchFeed prop', () => {
   it('uses researchFeed findings instead of tasks prop when provided', () => {
     const taskFinding = makeFinding({ title: 'From tasks prop' });

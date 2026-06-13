@@ -19,6 +19,7 @@ from app.finding_deduplication import (
     build_dedup_state,
     deduplicate_findings,
     extract_archived_diagnoses,
+    extract_recent_terminal_finding_history,
     extract_retired_failed_approaches,
     finding_hash,
     is_duplicate,
@@ -252,6 +253,30 @@ def test_build_dedup_state_ancestry_indeterminate_trusts_pr_merged_flag():
     assert "indet2" in hashes, "indeterminate ancestry must fall back to flag-trust"
 
 
+def test_extract_recent_terminal_finding_history_uses_plan_output_without_hash():
+    """Terminal history must keep persisted findings even when context lacks a hash."""
+    t = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={},
+        created_at=datetime.utcnow(),
+    )
+    t.plan_output = [
+        {
+            "title": "Persisted finding",
+            "description": "kept in plan_output",
+        }
+    ]
+
+    findings = extract_recent_terminal_finding_history([t], failed_parent_ids=set())
+
+    assert findings == [
+        {
+            "title": "Persisted finding",
+            "description": "kept in plan_output",
+        }
+    ]
+
+
 def test_build_dedup_state_excludes_infra_failures():
     # A task whose agent-reported failure_category is in INFRA_CLASSES should
     # NOT block respawn (the code never really ran).
@@ -468,6 +493,92 @@ def test_deduplicate_findings_parent_direction_inherited_from_context():
         open_pr_files=set(),
     )
     assert outcome.word_overlap_count == 1
+
+
+def test_reworded_same_direction_duplicate_of_recent_terminal_task_suppressed():
+    recent_terminal_findings = [
+        {
+            "title": "duplicate recent terminal finding chain",
+            "description": "desc",
+            "direction_id": "dir-1",
+            "type": "research",
+            "sources": [{"type": "file", "ref": "backend/app/alpha.py"}],
+            "claims": ["terminal chain already explored"],
+        }
+    ]
+    findings = [
+        {
+            "title": "duplicate recent terminal finding chain again",
+            "description": "different desc",
+            "priority": "medium",
+            "direction_id": "dir-1",
+        },
+        {
+            "title": "duplicate recent terminal finding chain elsewhere",
+            "description": "different desc",
+            "priority": "medium",
+            "direction_id": "dir-2",
+        },
+    ]
+    outcome = deduplicate_findings(
+        findings,
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        recent_terminal_findings=recent_terminal_findings,
+    )
+    assert outcome.word_overlap_count == 1
+    assert len(outcome.deduplicated) == 1
+    assert outcome.deduplicated[0][1]["direction_id"] == "dir-2"
+    assert len(outcome.filtered) == 1
+    rec = outcome.filtered[0]
+    assert rec["direction_id"] == "dir-1"
+    assert rec["reason"].startswith("recent terminal word overlap with: ")
+
+
+def test_deduplicate_findings_recent_terminal_evidence_overlap_rejects_reworded_duplicate():
+    recent_terminal_findings = [
+        {
+            "title": "measure duplicate retry inflation drivers",
+            "description": "desc",
+            "direction_id": "dir-1",
+            "type": "research",
+            "sources": [
+                {"type": "file", "ref": "backend/app/cache.py:42"},
+                {"type": "file", "ref": "backend/app/models.py#L100-L200"},
+            ],
+            "claims": ["retry inflation is caused by duplicate spawning"],
+        }
+    ]
+    outcome = deduplicate_findings(
+        [
+            {
+                "title": "track duplicate retry inflation causes",
+                "description": "reworded desc",
+                "priority": "high",
+                "direction_id": "dir-1",
+                "sources": [
+                    {"type": "file", "ref": "backend/app/cache.py"},
+                    {"type": "file", "ref": "backend/app/models.py:200"},
+                ],
+                "claims": ["retry inflation is caused by duplicate spawning"],
+            }
+        ],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        recent_terminal_findings=recent_terminal_findings,
+    )
+    assert outcome.word_overlap_count == 0
+    assert outcome.evidence_overlap_count == 1
+    assert outcome.deduplicated == []
+    assert len(outcome.filtered) == 1
+    rec = outcome.filtered[0]
+    assert rec["reason"].startswith("recent terminal evidence overlap with: ")
 
 
 def test_dedup_outcome_default_empty():

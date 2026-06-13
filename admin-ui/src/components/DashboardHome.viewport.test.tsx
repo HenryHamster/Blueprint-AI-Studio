@@ -224,6 +224,7 @@ vi.mock('../api', () => ({
     limit: 10,
     evicted_findings: [],
   })),
+  drainLanePilot: vi.fn(),
   fetchDirectionSrBreakdown: vi.fn(async () => ({ directions: [] })),
   fetchEfficiencyAxes: vi.fn(async () => ({
     axes: {
@@ -375,6 +376,7 @@ vi.mock('../api', () => ({
     promotion_head_sha: null,
   })),
   fetchImprovementLanes: vi.fn(async () => ({ total: 0, lanes: [] })),
+  fetchLanePilotPreflight: vi.fn(async () => null),
 }));
 
 describe('DashboardHome — viewport regression', () => {

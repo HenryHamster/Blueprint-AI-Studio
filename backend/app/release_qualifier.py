@@ -162,6 +162,8 @@ from app.release_scoring import (
     _MIN_TELEMETRY_SAMPLE,  # noqa: F401 — re-exported for callers/tests
     _SEVERITY_RANK,  # noqa: F401
     _SEVERITIES_REQUIRING_VERIFICATION,
+    _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
+    _audit_findings_carry_meta,
     _audit_missing_reason,
     _clamp01,  # noqa: F401
     _classify_check_runs,
@@ -302,31 +304,18 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
         return None
 
 
-def _load_policy() -> dict[str, Any]:
-    """Resolve the promotion rubric: live runtime_config → YAML file → defaults.
+def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
+    """Resolve the promotion rubric and return its active source + fallback reason.
 
-    Resolution order:
-      1. ``runtime_config['promotion_threshold'/'promotion_weights']`` — the
-         live, admin-tunable rubric (seeded from the YAML at startup, then
-         operator-overridable via PATCH /api/admin/settings with no redeploy).
-      2. ``backend/promotion_policy.yaml`` — the on-disk file, when the
-         runtime_config values are absent/unusable (e.g. a unit test importing
-         the module without seeding).
-      3. The hardcoded ``_DEFAULT_POLICY`` rubric.
-
-    On ANY read or parse failure at the YAML tier — missing file, unreadable,
-    malformed YAML, missing/non-numeric keys, PyYAML import failure — log a
-    warning and return a copy of ``_DEFAULT_POLICY``.  Never raises: a broken
-    policy source must not take down the qualifier (it would only fail-open the
-    gate; the caller still decides whether to act on the composite).
-
-    The returned dict always has the shape
-    ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
-       "threshold": float}`` with every value coerced to float.
+    The policy payload itself keeps the legacy ``{"weights": ..., "threshold": ...}``
+    shape. This helper layers operator-visible provenance on top so callers can tell
+    whether the active rubric came from runtime config, the YAML file, or the
+    hardcoded defaults after a YAML failure.
     """
     from_config = _policy_from_runtime_config()
     if from_config is not None:
-        return from_config
+        return from_config, "runtime_config", None
+
     try:
         import yaml
 
@@ -362,18 +351,49 @@ def _load_policy() -> dict[str, Any]:
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
 
-        return {"weights": weights, "threshold": threshold}
+        return {"weights": weights, "threshold": threshold}, "yaml_file", None
     except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
+        error = f"{exc.__class__.__name__}: {exc}"
         logger.warning(
             "[RELEASE_QUALIFIER] failed to load promotion_policy.yaml (%s); "
             "falling back to hardcoded defaults",
             exc,
         )
         # Return a deep-ish copy so callers can't mutate the module constant.
-        return {
-            "weights": dict(_DEFAULT_POLICY["weights"]),
-            "threshold": _DEFAULT_POLICY["threshold"],
-        }
+        return (
+            {
+                "weights": dict(_DEFAULT_POLICY["weights"]),
+                "threshold": _DEFAULT_POLICY["threshold"],
+            },
+            "hardcoded_defaults",
+            error,
+        )
+
+
+def _load_policy() -> dict[str, Any]:
+    """Resolve the promotion rubric: live runtime_config → YAML file → defaults.
+
+    Resolution order:
+      1. ``runtime_config['promotion_threshold'/'promotion_weights']`` — the
+         live, admin-tunable rubric (seeded from the YAML at startup, then
+         operator-overridable via PATCH /api/admin/settings with no redeploy).
+      2. ``backend/promotion_policy.yaml`` — the on-disk file, when the
+         runtime_config values are absent/unusable (e.g. a unit test importing
+         the module without seeding).
+      3. The hardcoded ``_DEFAULT_POLICY`` rubric.
+
+    On ANY read or parse failure at the YAML tier — missing file, unreadable,
+    malformed YAML, missing/non-numeric keys, PyYAML import failure — log a
+    warning and return a copy of ``_DEFAULT_POLICY``.  Never raises: a broken
+    policy source must not take down the qualifier (it would only fail-open the
+    gate; the caller still decides whether to act on the composite).
+
+    The returned dict always has the shape
+    ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
+       "threshold": float}`` with every value coerced to float.
+    """
+    policy, _, _ = _resolve_policy_with_provenance()
+    return policy
 
 
 # Terminal task statuses — a qualifier child in any of these has finished
@@ -2772,6 +2792,13 @@ async def _finalize_qualification(
     # strategic agent can target them.  Use reconciled report when available so
     # refuted findings are not surfaced as actionable blockers.
     audit_findings = _extract_audit_findings(_audit_report_scored)
+    # Pre-cap totals + truncation flags for both carried lists. Verified meta is
+    # computed on the reconciled report (matches audit_findings just above);
+    # excluded meta on the original report (matches excluded_audit_findings,
+    # which is derived from audit_report — the unverified-primary gap is
+    # independent of challenge reconciliation).
+    _verified_findings_meta = _audit_findings_carry_meta(_audit_report_scored)
+    _excluded_findings_meta = _audit_findings_carry_meta(audit_report)
     # Build the reconciliation record on the RECONCILED report so
     # findings_derived_score agrees with the applied audit_score.  The challenge
     # synthesis is derived from the binding verdict artifact (new gate) — kept
@@ -2933,6 +2960,18 @@ async def _finalize_qualification(
         "smoketest_task_id": smoketest_task_id,
         "audit_findings": audit_findings,
         "excluded_audit_findings": excluded_audit_findings,
+        # Pre-cap totals + truncation flags so consumers can tell whether the
+        # carried lists above are complete or were clipped at _MAX_CARRIED_FINDINGS.
+        # Verified-list meta tracks the reconciled report (matches audit_findings);
+        # excluded-list meta tracks the original report (matches excluded_audit_findings).
+        "audit_findings_total": _verified_findings_meta["audit_findings_total"],
+        "audit_findings_truncated": _verified_findings_meta["audit_findings_truncated"],
+        "excluded_audit_findings_total": _excluded_findings_meta[
+            "excluded_audit_findings_total"
+        ],
+        "excluded_audit_findings_truncated": _excluded_findings_meta[
+            "excluded_audit_findings_truncated"
+        ],
         # Challenger-confirmed false positives: findings the challenge marked
         # refuted_false_positive with an auditable reason — DISTINCT from
         # excluded_audit_findings (which tracks the unverified-primary gap).

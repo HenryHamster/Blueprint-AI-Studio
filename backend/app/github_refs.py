@@ -5,6 +5,7 @@ existing imports keep working.
 """
 
 from datetime import datetime
+from urllib.parse import quote
 
 from fastapi import HTTPException, status
 
@@ -13,6 +14,9 @@ from app.github import logger
 # Keep `datetime` referenced so linters don't strip it; it is only used as a
 # forward reference in `get_commit_date(...) -> "datetime | None"`.
 _DATETIME = datetime
+
+_RECENT_COMMIT_MESSAGES_DEFAULT_LIMIT = 30
+_RECENT_COMMIT_MESSAGES_MAX_LIMIT = 50
 
 
 def _github_request(*args, **kwargs):
@@ -521,9 +525,7 @@ async def list_pull_requests_for_commit(
     if len(_list_prs_for_commit_cache) > _LIST_PRS_FOR_COMMIT_CACHE_MAX:
         cutoff = now - (_LIST_PRS_FOR_COMMIT_CACHE_TTL_S * 2)
         for k in [
-            k
-            for k, (_, ts) in _list_prs_for_commit_cache.items()
-            if ts < cutoff
+            k for k, (_, ts) in _list_prs_for_commit_cache.items() if ts < cutoff
         ]:
             _list_prs_for_commit_cache.pop(k, None)
     return all_prs
@@ -566,9 +568,7 @@ async def agent_image_rebake_expected(
     )
     if files is None:
         return None
-    return any(
-        f.startswith(prefix) for f in files for prefix in AGENT_IMAGE_BAKE_PATHS
-    )
+    return any(f.startswith(prefix) for f in files for prefix in AGENT_IMAGE_BAKE_PATHS)
 
 
 async def is_ancestor_of(
@@ -643,6 +643,107 @@ async def is_ancestor_of(
     return compare_status in ("identical", "ahead")
 
 
+async def list_recent_commit_messages(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    limit: int = _RECENT_COMMIT_MESSAGES_DEFAULT_LIMIT,
+    project_id: str | None = None,
+) -> list[str] | None:
+    """Return recent commit messages from ``branch`` using one bounded API call."""
+    try:
+        per_page = max(1, min(int(limit), _RECENT_COMMIT_MESSAGES_MAX_LIMIT))
+    except (TypeError, ValueError):
+        per_page = _RECENT_COMMIT_MESSAGES_DEFAULT_LIMIT
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_branch = quote(branch, safe="")
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/commits"
+        f"?sha={encoded_branch}&per_page={per_page}",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] list_recent_commit_messages: %s/%s@%s returned %s",
+            owner,
+            repo,
+            branch,
+            response.status_code,
+        )
+        return None
+    try:
+        commits = response.json()
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "[GITHUB] list_recent_commit_messages: unparseable response for "
+            "%s/%s@%s: %s",
+            owner,
+            repo,
+            branch,
+            exc,
+        )
+        return None
+    if not isinstance(commits, list):
+        logger.warning(
+            "[GITHUB] list_recent_commit_messages: expected list for %s/%s@%s, got %s",
+            owner,
+            repo,
+            branch,
+            type(commits).__name__,
+        )
+        return None
+
+    messages: list[str] = []
+    for entry in commits:
+        commit = entry.get("commit") if isinstance(entry, dict) else None
+        message = commit.get("message") if isinstance(commit, dict) else None
+        if isinstance(message, str):
+            messages.append(message)
+    return messages
+
+
+async def check_squash_referenced(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    pr_number: int,
+    commit_shas: list[str] | None = None,
+    project_id: str | None = None,
+) -> bool | None:
+    """Return True if recent commits on ``branch`` reference ``pr_number`` or any
+    of ``commit_shas``, False if no reference was found, or None on API error.
+
+    Used as a fallback after ``is_ancestor_of`` returns False to detect squash-
+    merged PRs: the pre-squash ``merge_commit_sha`` stored on the PR object is
+    not an ancestor of the integration branch after a squash merge, but the
+    squash commit message typically contains ``#<pr_number>`` or includes the
+    original commit SHAs in its body.
+    """
+    messages = await list_recent_commit_messages(
+        token, owner, repo, branch, limit=50, project_id=project_id
+    )
+    if messages is None:
+        return None
+    pr_ref = f"#{pr_number}"
+    short_shas = {sha[:8] for sha in (commit_shas or []) if sha and len(sha) >= 8}
+    for msg in messages:
+        if pr_ref in msg:
+            return True
+        for short in short_shas:
+            if short in msg:
+                return True
+    return False
+
+
 async def get_files_changed_between_refs(
     token: str,
     owner: str,
@@ -698,5 +799,3 @@ async def get_files_changed_between_refs(
             exc,
         )
         return None
-
-

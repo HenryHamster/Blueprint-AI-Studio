@@ -23,7 +23,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import or_
+from sqlalchemy import or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -212,6 +212,29 @@ async def vm_heartbeat(
                     await persist_pool_vm_image_state(
                         session, req.vm_instance_id, **_img_kwargs
                     )
+                # Stamp a durable heartbeat on the PoolVm row so the reaper can
+                # distinguish a live member from a zombie even after a process
+                # restart (whose in-memory vm_last_heartbeat map starts empty).
+                # Targets only non-RETIRING states — idempotent, no-op for non-
+                # pool VMs (no matching row). The same UPDATE runs for PROVISIONING,
+                # IDLE, and LEASED members so a pool VM heartbeating while serving
+                # a task also refreshes the durable stamp.
+                from app.models import PoolVm, PoolVmState
+
+                await session.execute(
+                    update(PoolVm)
+                    .where(
+                        PoolVm.vm_instance_id == req.vm_instance_id,
+                        PoolVm.state.in_(
+                            (
+                                PoolVmState.PROVISIONING,
+                                PoolVmState.IDLE,
+                                PoolVmState.LEASED,
+                            )
+                        ),
+                    )
+                    .values(last_heartbeat_at=_utcnow())
+                )
                 await session.commit()
         except Exception:  # noqa: BLE001 — liveness must never 500 on a DB hiccup
             logger.warning(
@@ -352,12 +375,15 @@ async def _resolve_retarget(
     # ``provision_failed_accounts`` (accounts that died pre-claim).
     _blacklist = ctx.get("blacklisted_accounts") or []
     _sticky = ctx.get("provision_failed_accounts") or []
-    blacklist = list(
-        {
-            *(_blacklist if isinstance(_blacklist, list) else []),
-            *(_sticky if isinstance(_sticky, list) else []),
-        }
-    ) or None
+    blacklist = (
+        list(
+            {
+                *(_blacklist if isinstance(_blacklist, list) else []),
+                *(_sticky if isinstance(_sticky, list) else []),
+            }
+        )
+        or None
+    )
     selection = await select_llm_runtime_for_task(
         user_id=user_id,
         task=task,
@@ -578,6 +604,7 @@ async def _finalize_warm_claim(
     ttl_hours = (
         AGENT_TOKEN_TTL_HOURS if refresh_capable else AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
     )
+    _warm_task_id_str = str(task.id)
     try:
         if vm_boot is not None and _shared_state.runtime_config.get(
             "warm_retarget_enabled", False
@@ -591,7 +618,7 @@ async def _finalize_warm_claim(
                 logger.info(
                     "[NEXT-ROLE] Parked retarget claim for task %s on vm %s "
                     "deferred: no alternate account is claimable yet",
-                    task.id,
+                    _warm_task_id_str,
                     vm_instance_id,
                 )
                 return Response(status_code=204)

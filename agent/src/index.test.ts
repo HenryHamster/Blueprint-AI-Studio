@@ -69,7 +69,8 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import {
   __resetTaskCapabilityContractForTesting,
   isReadOnlyTaskType,
@@ -292,6 +293,48 @@ describe('sanitize', () => {
 
   it('redacts sk-ant- Anthropic API keys', () => {
     expect(sanitize('key: sk-ant-api03-someverylongkey-abc')).toBe('key: sk-ant-***');
+  });
+
+  it('redacts OpenAI sk- API keys with a conservative minimum length', () => {
+    const stderr = 'openai stderr: invalid key sk-abcdefghijklmnopqrstuvwxyz123456';
+    expect(sanitize(stderr)).toBe('openai stderr: invalid key sk-***');
+    expect(sanitize('short marker sk-not-a-real-key')).toBe('short marker sk-not-a-real-key');
+  });
+
+  it('redacts OpenAI sk-proj- API keys', () => {
+    expect(
+      sanitize('codex failed with OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456'),
+    ).toBe('codex failed with OPENAI_API_KEY=sk-proj-***');
+  });
+
+  it('redacts Google API keys', () => {
+    expect(
+      sanitize('gemini stderr: api key AIzaSyabcdefghijklmnopqrstuvwxyz123456789'),
+    ).toBe('gemini stderr: api key AIza***');
+  });
+
+  it('redacts bare ya29 OAuth tokens and unquoted key=value dumps', () => {
+    const token = 'ya29.a0AfH6SMBx_AbCdEfGhIjKlMnOpQrStUvWx';
+    expect(sanitize(token)).toBe('ya29***');
+    const kv = sanitize(`GOOGLE_oauth_token=${token}`);
+    expect(kv).toContain('GOOGLE_oauth_token=');
+    expect(kv).toContain('***');
+    expect(kv).not.toContain(token);
+  });
+
+  it('redacts quoted credential fields while preserving field names and quote style', () => {
+    const json = '{"access_token":"ya29.secret","refresh_token":"1//refresh","id_token":"header.payload.sig","api_key":"AIzaSyabcdefghijklmnopqrstuvwxyz123456789","client_secret":"client-secret","private_key":"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----","token":"opaque"}';
+    expect(sanitize(json)).toBe('{"access_token":"***","refresh_token":"***","id_token":"***","api_key":"***","client_secret":"***","private_key":"***","token":"***"}');
+  });
+
+  it('redacts quoted key-value credential fields in stderr-like text', () => {
+    const stderr = "stderr: access_token='ya29.secret' client_secret=\"secret\" token='opaque'";
+    expect(sanitize(stderr)).toBe("stderr: access_token='***' client_secret=\"***\" token='***'");
+  });
+
+  it('does not mangle ordinary prose mentioning token or api_key without credential-looking values', () => {
+    const text = 'The token field and api_key setting are missing; no secret value was provided.';
+    expect(sanitize(text)).toBe(text);
   });
 
   it('redacts JWT tokens matching eyJ…eyJ…sig pattern', () => {
@@ -676,6 +719,14 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
     _setWarmStartForTesting(true);
     resetPerRoleModuleState();
     expect(_getWarmStartForTesting()).toBe(false);
+  });
+
+  it('clears the log buffer so prior-role lines do not appear in the next task\'s stream', () => {
+    appendToLogBuffer('prior-role-line-1');
+    appendToLogBuffer('prior-role-line-2');
+    expect(snapshotLogBuffer().length).toBe(2);
+    resetPerRoleModuleState();
+    expect(snapshotLogBuffer().length).toBe(0);
   });
 });
 
@@ -2749,6 +2800,55 @@ describe('flushLogBuffer', () => {
   });
 });
 
+// ── replayLogBufferRateLimited ────────────────────────────────────────────────
+describe('replayLogBufferRateLimited', () => {
+  beforeEach(() => {
+    clearLogBuffer();
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    clearLogBuffer();
+  });
+
+  it('sends all buffered entries and empties the buffer for a small batch', async () => {
+    appendToLogBuffer('msg-1');
+    appendToLogBuffer('msg-2');
+    const ws = { send: vi.fn() } as unknown as WebSocket;
+    const replay = replayLogBufferRateLimited(ws);
+    await vi.runAllTimersAsync();
+    await replay;
+    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(2);
+    expect(snapshotLogBuffer().length).toBe(0);
+  });
+
+  it('does not exceed 15 sends before the 1-second throttle window elapses', async () => {
+    for (let i = 0; i < 16; i++) appendToLogBuffer(`msg-${i}`);
+    const ws = { send: vi.fn() } as unknown as WebSocket;
+    const replay = replayLogBufferRateLimited(ws);
+    // After minimal time: first batch of 15 sent, the 16th is still waiting.
+    await vi.advanceTimersByTimeAsync(50);
+    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(15);
+    expect(snapshotLogBuffer().length).toBe(1);
+    // Advance past the throttle window so the second batch fires.
+    await vi.advanceTimersByTimeAsync(1000);
+    await replay;
+    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(16);
+    expect(snapshotLogBuffer().length).toBe(0);
+  });
+
+  it('drains a full 1000-entry buffer fully across multiple batches', async () => {
+    for (let i = 0; i < 1000; i++) appendToLogBuffer(`msg-${i}`);
+    expect(snapshotLogBuffer().length).toBe(1000);
+    const ws = { send: vi.fn() } as unknown as WebSocket;
+    const replay = replayLogBufferRateLimited(ws);
+    await vi.advanceTimersByTimeAsync(100_000);
+    await replay;
+    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1000);
+    expect(snapshotLogBuffer().length).toBe(0);
+  });
+});
+
 // ── Phase 0 telemetry — setup_secs / warm_start / prior_role_vm_id ───────────
 describe('persistAndPostStatus telemetry enrichment', () => {
   let fetchMock: FetchMock;
@@ -2851,6 +2951,86 @@ describe('persistAndPostStatus telemetry enrichment', () => {
       (fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}',
     ) as { handler_duration_secs?: number };
     expect(body.handler_duration_secs).toBeUndefined();
+  });
+});
+
+describe('persistAndPostStatus workspace_prep shipping', () => {
+  let fetchMock: FetchMock;
+
+  beforeEach(() => {
+    resetWorkspacePrepOutcome();
+    fetchMock = makeFetchMock().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true }),
+      text: () => Promise.resolve(''),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    resetWorkspacePrepOutcome();
+    delete process.env.BLUEPRINT_WARM_HANDOFF;
+    delete process.env.BLUEPRINT_LANE_MODE;
+  });
+
+  it('includes the recorded workspace prep outcome in /api/agent/status', async () => {
+    const existsSpy = vi.mocked(fs.existsSync);
+    existsSpy.mockImplementation(path => path === '/ws/.git');
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    process.env.BLUEPRINT_LANE_MODE = '1';
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'feature/warm',
+    });
+
+    await persistAndPostStatus('task-wp', { task_id: 'task-wp', status: 'COMPLETED' });
+
+    const body = JSON.parse(
+      (fetchMock.mock.calls.at(-1)?.[1] as { body?: string }).body ?? '{}',
+    ) as {
+      workspace_prep?: {
+        path?: string;
+        warm_reuse_succeeded?: boolean;
+        checkpoint_reset_applied?: boolean;
+        lane_phase?: boolean;
+      };
+    };
+    expect(body.workspace_prep).toMatchObject({
+      path: 'warm',
+      warm_reuse_succeeded: true,
+      checkpoint_reset_applied: false,
+      lane_phase: true,
+    });
+  });
+
+  it('resetPerRoleModuleState clears stale workspace_prep before the next role ships', async () => {
+    const existsSpy = vi.mocked(fs.existsSync);
+    existsSpy.mockImplementation(path => path === '/ws/.git');
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    process.env.BLUEPRINT_LANE_MODE = '1';
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'feature/warm',
+    });
+    resetPerRoleModuleState({ warmStart: false });
+
+    await persistAndPostStatus('task-wp-reset', {
+      task_id: 'task-wp-reset',
+      status: 'COMPLETED',
+    });
+
+    const body = JSON.parse(
+      (fetchMock.mock.calls.at(-1)?.[1] as { body?: string }).body ?? '{}',
+    ) as { workspace_prep?: unknown };
+    expect(body.workspace_prep).toBeUndefined();
   });
 });
 
@@ -6102,6 +6282,42 @@ describe('cross-language classification contracts', () => {
   it('_VIEWPORT_PATTERNS still matches expectMinTouchTargetAt function name', () => {
     // viewport.ts throws errors containing 'expectMinTouchTargetAt(...)'.
     expect(classifierSrc).toContain('"expectmintouchtargetat("');
+  });
+});
+
+// ── Cross-language credential redaction corpus ───────────────────────────────
+// Keep the shared corpus file in backend/testing/__fixtures__ so both the
+// backend pytest suite and this agent vitest suite can read the exact same
+// fixtures. If this fails, update the corpus or the sanitizer pattern set.
+describe('cross-language credential redaction corpus', () => {
+  let corpus: Array<{ family: string; secret: string; raw: string }> = [];
+
+  beforeAll(async () => {
+    const realFs = await vi.importActual<typeof import('fs')>('fs');
+    const nodePath = await import('node:path');
+    const nodeUrl = await import('node:url');
+    const dir = nodePath.dirname(nodeUrl.fileURLToPath(import.meta.url));
+    corpus = JSON.parse(
+      realFs.readFileSync(
+        nodePath.join(
+          dir,
+          '..',
+          '..',
+          'backend',
+          'testing',
+          '__fixtures__',
+          'credential_redaction_corpus.json',
+        ),
+        'utf-8',
+      ),
+    ) as Array<{ family: string; secret: string; raw: string }>;
+  });
+
+  it('masks every shared corpus entry', () => {
+    for (const entry of corpus) {
+      const out = sanitize(entry.secret);
+      expect(out).not.toContain(entry.raw);
+    }
   });
 });
 

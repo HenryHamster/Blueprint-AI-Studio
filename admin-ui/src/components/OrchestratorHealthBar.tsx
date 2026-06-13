@@ -84,6 +84,12 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
   const [localQuota, setLocalQuota] = useState<GithubQuota | null>(null);
   const [dailyCostUsd, setDailyCostUsd] = useState<number | null>(null);
   const [dailyCostCeilingUsd, setDailyCostCeilingUsd] = useState<number>(0);
+  const [digestPollFailed, setDigestPollFailed] = useState(false);
+  const [digestLastSuccessAt, setDigestLastSuccessAt] = useState<number | null>(null);
+  // Fleet-scoped stale-heartbeat count from the same digest fetch as the cost
+  // pill. `null` until the digest has returned the field; until then the warning
+  // falls back to the current `tasks` page (clearly labelled as page-only).
+  const [fleetStaleHeartbeatCount, setFleetStaleHeartbeatCount] = useState<number | null>(null);
   const costFetchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -108,8 +114,20 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         const data = await res.json();
         if (data?.daily_cost_usd != null) setDailyCostUsd(data.daily_cost_usd);
         if (data?.daily_cost_ceiling_usd != null) setDailyCostCeilingUsd(data.daily_cost_ceiling_usd);
+        if (typeof data?.stale_heartbeat_count === 'number') setFleetStaleHeartbeatCount(data.stale_heartbeat_count);
+        // Treat served_stale as equivalent to a failed poll for display purposes
+        if (data?.served_stale === true) {
+          setDigestPollFailed(true);
+        } else {
+          setDigestLastSuccessAt(Date.now());
+          setDigestPollFailed(false);
+        }
+      } else {
+        setDigestPollFailed(true);
       }
-    } catch { /* silent */ }
+    } catch {
+      setDigestPollFailed(true);
+    }
   }, []);
 
   useEffect(() => {
@@ -135,7 +153,9 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
     }
   };
 
-  const staleHeartbeatCount = useMemo(() => {
+  // Page-derived stale-heartbeat count over the current `tasks` slice. Used only
+  // as a fallback until the fleet-scoped digest count is available.
+  const pageStaleHeartbeatCount = useMemo(() => {
     const fiveMinutesAgo = now - 5 * 60 * 1000;
     return tasks.filter(t =>
       t.status === 'IN_PROGRESS' &&
@@ -143,6 +163,20 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
       parseTimestamp(t.last_heartbeat).getTime() < fiveMinutesAgo
     ).length;
   }, [tasks, now]);
+
+  // Prefer the fleet-wide digest count so the warning reflects every stuck task,
+  // not just those on the current paginated page. Fall back to the page count
+  // (labelled page-only in the tooltip) until the digest field has loaded.
+  const staleIsPageOnly = fleetStaleHeartbeatCount == null;
+  const staleHeartbeatIsDigestStale = digestPollFailed && fleetStaleHeartbeatCount != null;
+  const staleHeartbeatCount = fleetStaleHeartbeatCount ?? pageStaleHeartbeatCount;
+  const digestAsOfLabel =
+    digestPollFailed && digestLastSuccessAt != null
+      ? timeAgo(digestLastSuccessAt)
+      : null;
+  const digestStaleSuffix = digestAsOfLabel
+    ? `Last digest poll failed; showing values as of ${digestAsOfLabel}.`
+    : null;
 
   // Cycle-COMPLETION age is now only a secondary, informational slow-cycle
   // signal. The PRIMARY health verdict comes from the backend's progress-based
@@ -504,12 +538,15 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
               return (
                 <button
                   type="button"
-                  className={`inline-flex items-center gap-1 min-h-[44px] sm:min-h-0 px-1.5 py-0.5 text-xs rounded cursor-pointer ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''}`}
-                  title={titleText}
+                  className={`inline-flex items-center gap-1 min-h-[44px] sm:min-h-0 px-1.5 py-0.5 text-xs rounded cursor-pointer ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''} ${digestPollFailed ? 'border border-amber-500/30 opacity-75' : ''}`}
+                  title={digestStaleSuffix ? `${titleText} ${digestStaleSuffix}` : titleText}
                   onClick={() => { document.getElementById('cost-section')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
                   <span className={textColor}>{label}{isRed && ratio >= 1 ? ' ⚠' : ''}</span>
+                  {digestStaleSuffix && (
+                    <span className="text-[10px] text-amber-300">as of {digestAsOfLabel}</span>
+                  )}
                 </button>
               );
             })()}
@@ -520,8 +557,14 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
       {/* Right: stale heartbeats + last update */}
       <div className="flex items-center gap-3">
         {staleHeartbeatCount > 0 && (
-          <span className="text-amber-400" title={`${staleHeartbeatCount} IN_PROGRESS task${staleHeartbeatCount !== 1 ? 's' : ''} with no heartbeat in the last 5 minutes`}>
+          <span
+            className={`text-amber-400 ${staleHeartbeatIsDigestStale ? 'opacity-75' : ''}`}
+            title={`${staleHeartbeatCount} IN_PROGRESS task${staleHeartbeatCount !== 1 ? 's' : ''} with no heartbeat in the last 5 minutes${staleIsPageOnly ? ' (current page only — fleet count unavailable)' : ' (fleet-wide)'}${digestStaleSuffix ? ` — ${digestStaleSuffix}` : ''}`}
+          >
             ⚠ {staleHeartbeatCount} stale
+            {staleHeartbeatIsDigestStale && digestAsOfLabel && (
+              <span className="ml-1 text-[10px] text-amber-300">as of {digestAsOfLabel}</span>
+            )}
           </span>
         )}
         <span className="text-neutral-500">Updated {lastFetchTime ? timeAgo(lastFetchTime) : '—'}</span>

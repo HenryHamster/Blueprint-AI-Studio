@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DiagnosticsPanel } from './DiagnosticsPanel';
+import { authGet } from '../api';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
 vi.mock('../api', () => ({
@@ -86,5 +87,44 @@ describe('DiagnosticsPanel', () => {
     dialog.onConfirm();
     expect(handleCancel).toHaveBeenCalledWith('task-active');
     expect(setConfirmDialog).toHaveBeenLastCalledWith(null);
+  });
+
+  test('renders a degraded affordance when the gate poll fails, distinct from confirmed-zero', async () => {
+    // Part 1: poll returns a non-ok response → degraded affordance must appear.
+    vi.mocked(authGet).mockResolvedValueOnce(new Response('', { status: 500 }));
+
+    const { unmount } = render(
+      <DiagnosticsPanel
+        diagnostics={null}
+        onViewTask={vi.fn()}
+        handleRetry={vi.fn()}
+        handleCancel={vi.fn()}
+        setConfirmDialog={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTitle(/gate status unavailable/i)).toBeInTheDocument();
+    });
+    expect(screen.getAllByText(/gate unknown/i).length).toBeGreaterThan(0);
+
+    unmount();
+    vi.clearAllMocks();
+
+    // Part 2: poll succeeds with empty gated_types (confirmed-zero) → no degraded affordance.
+    render(
+      <DiagnosticsPanel
+        diagnostics={null}
+        onViewTask={vi.fn()}
+        handleRetry={vi.fn()}
+        handleCancel={vi.fn()}
+        setConfirmDialog={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByTitle(/gate status unavailable/i)).not.toBeInTheDocument();
+    });
+    expect(screen.queryByText(/gate unknown/i)).not.toBeInTheDocument();
   });
 });

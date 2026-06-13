@@ -836,6 +836,23 @@ def _migration_diff(path: str, revision: str, down_revision: str) -> str:
     )
 
 
+def _migration_patch(revision: str, down_revision: str) -> str:
+    """Per-file patch for get_pr_files mocks — mirrors _migration_diff content.
+
+    GitHub's per-file patch omits the diff header; only hunk content with
+    ``+``/``-``/context lines. _collect_added_migration_sources extracts the
+    ``+`` lines via _extract_source_from_patch, so the patch only needs the
+    added lines for parse_revision_identifiers to find revision/down_revision.
+    """
+    return (
+        '+"""hotfix migration"""\n'
+        f"+revision = '{revision}'\n"
+        f"+down_revision = '{down_revision}'\n"
+        "+def upgrade():\n"
+        "+    pass"
+    )
+
+
 async def test_backmerge_blocked_on_same_revision_dual_head(db_session, mocker):
     """A back-merge whose promotion-target diff adds a migration whose revision id
     already exists on the integration branch is BLOCKED before merge: the merge
@@ -851,7 +868,7 @@ async def test_backmerge_blocked_on_same_revision_dual_head(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     # main adds 0002_hotfix while automain already has its own 0002_feature.
@@ -927,7 +944,7 @@ async def test_backmerge_blocked_on_stale_anchor_dual_head(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0003_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0003_hotfix.py", "status": "added", "patch": _migration_patch("0003", "0001")}]
         ),
     )
     # 0003 anchors to 0001, but automain's head is 0002 — a stale anchor.
@@ -969,7 +986,7 @@ async def test_backmerge_clean_migration_still_merges(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0003_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0003_hotfix.py", "status": "added", "patch": _migration_patch("0003", "0002")}]
         ),
     )
     # 0003 chains cleanly onto the current head 0002 — valid.
@@ -1041,7 +1058,7 @@ async def test_backmerge_migration_block_dedupes_resolver(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1142,7 +1159,7 @@ async def test_backmerge_block_routes_to_resolver_single_collision(db_session, m
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1206,7 +1223,7 @@ async def test_backmerge_block_never_pushes_to_integration_branch(db_session, mo
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1264,7 +1281,7 @@ async def test_backmerge_block_defers_with_open_resolver_no_new_alert(db_session
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1339,7 +1356,7 @@ async def test_backmerge_block_dedup_prevents_spurious_resolver_on_periodic(
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1412,7 +1429,7 @@ async def test_backmerge_deduped_periodic_reentry_skips_planner(db_session, mock
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1503,7 +1520,7 @@ async def test_backmerge_ambiguous_dual_head_falls_back_to_resolver(db_session, 
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1550,7 +1567,7 @@ async def test_backmerge_block_fallback_on_planner_error(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1610,7 +1627,7 @@ async def test_backmerge_block_fallback_on_missing_schema_literal(
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1676,7 +1693,7 @@ async def test_backmerge_single_collision_embeds_renumber_plan(db_session, mocke
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1777,7 +1794,7 @@ async def test_backmerge_collision_with_linear_descendant_embeds_full_plan(
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1919,7 +1936,7 @@ async def test_backmerge_nonmechanical_block_falls_back_to_prose(db_session, moc
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -1988,7 +2005,7 @@ async def test_backmerge_planner_exception_still_spawns_resolver(db_session, moc
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -2533,7 +2550,7 @@ async def test_backmerge_after_successful_merge_has_single_head(db_session, mock
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0003_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0003_hotfix.py", "status": "added", "patch": _migration_patch("0003", "0002")}]
         ),
     )
     mocker.patch(
@@ -2617,7 +2634,7 @@ async def test_backmerge_migration_fanout_tail_refuses_falls_back(db_session, mo
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(
@@ -2716,8 +2733,8 @@ async def test_backmerge_migration_multiple_collisions_refuses_falls_back(
         "app.github.get_pr_files",
         new=AsyncMock(
             return_value=[
-                {"filename": "backend/alembic/versions/0002_hotfix_a.py"},
-                {"filename": "backend/alembic/versions/0003_hotfix_b.py"},
+                {"filename": "backend/alembic/versions/0002_hotfix_a.py", "status": "added", "patch": _migration_patch("0002", "0001")},
+                {"filename": "backend/alembic/versions/0003_hotfix_b.py", "status": "added", "patch": _migration_patch("0003", "0002")},
             ]
         ),
     )
@@ -2809,7 +2826,7 @@ async def test_backmerge_migration_stale_anchor_non_shared_refuses_falls_back(
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py", "status": "added", "patch": _migration_patch("0002", "0001")}]
         ),
     )
     mocker.patch(

@@ -901,6 +901,113 @@ async def test_gcp_cleanup_passes_active_vm_ids_to_cleanup(gcp_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_gcp_cleanup_spares_live_warm_handoff_target_vm(gcp_db, mocker):
+    """A QUEUED warm-handoff successor should keep its source VM active until
+    the deadline, so the generic orphan sweep must not pass that VM to cleanup."""
+    project = await _make_project(gcp_db)
+    live_deadline = (datetime.utcnow() + timedelta(minutes=10)).isoformat()
+    handoff_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "warm_target_vm_id": "agent-vm-warm-1",
+            "warm_handoff_deadline": live_deadline,
+        },
+    )
+    gcp_db.add(handoff_task)
+    await gcp_db.commit()
+
+    mock_cleanup = AsyncMock(
+        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=1)
+    )
+    mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+
+    await gcp_cleanup_service()
+
+    mock_cleanup.assert_called_once()
+    called_vm_ids = mock_cleanup.call_args[0][0]
+    assert "agent-vm-warm-1" in called_vm_ids
+
+
+@pytest.mark.asyncio
+async def test_gcp_cleanup_reclaims_expired_warm_handoff_target_vm(gcp_db, mocker):
+    """Once a warm-handoff deadline expires, the source VM should be reclaimable
+    again if no task has claimed it."""
+    project = await _make_project(gcp_db)
+    expired_deadline = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+    handoff_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "warm_target_vm_id": "agent-vm-expired-1",
+            "warm_handoff_deadline": expired_deadline,
+        },
+    )
+    gcp_db.add(handoff_task)
+    await gcp_db.commit()
+
+    mock_cleanup = AsyncMock(
+        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=1)
+    )
+    mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+
+    await gcp_cleanup_service()
+
+    mock_cleanup.assert_called_once()
+    called_vm_ids = mock_cleanup.call_args[0][0]
+    assert "agent-vm-expired-1" not in called_vm_ids
+
+
+@pytest.mark.asyncio
+async def test_gcp_cleanup_does_not_exempt_pool_vm_when_pool_disabled(gcp_db, mocker):
+    """Pool members stay reclaimable when warm_pool_enabled is off."""
+    project = await _make_project(gcp_db)
+    gcp_db.add(
+        PoolVm(
+            project_id=project.id,
+            vm_instance_id="agent-vm-pool-disabled",
+            state=PoolVmState.IDLE,
+            account_id="acct-1",
+            provider="anthropic",
+        )
+    )
+    await _make_task_with_vm(
+        gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-active-1"
+    )
+    await gcp_db.commit()
+
+    prev = _shared_state.runtime_config.get("warm_pool_enabled", False)
+    try:
+        _shared_state.runtime_config["warm_pool_enabled"] = False
+        mock_cleanup = AsyncMock(
+            return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=2)
+        )
+        mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
+        mocker.patch(
+            "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+        )
+
+        await gcp_cleanup_service()
+
+        mock_cleanup.assert_called_once()
+        called_vm_ids = mock_cleanup.call_args[0][0]
+        assert "agent-vm-active-1" in called_vm_ids
+        assert "agent-vm-pool-disabled" not in called_vm_ids
+    finally:
+        _shared_state.runtime_config["warm_pool_enabled"] = prev
+
+
+@pytest.mark.asyncio
 async def test_gcp_cleanup_handles_api_failure_gracefully(gcp_db, mocker):
     """If cleanup_orphaned_vms raises an exception, gcp_cleanup_service should log and continue."""
     project = await _make_project(gcp_db)
@@ -961,6 +1068,42 @@ async def test_gcp_cleanup_updates_vm_count_cache(gcp_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_gcp_cleanup_caches_post_delete_agent_vm_count(gcp_db, mocker):
+    """After orphan deletion, _last_gcp_vm_count must reflect the remaining inventory
+    (pre-deletion count minus deleted agent VMs), not the pre-deletion total."""
+    project = await _make_project(gcp_db)
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-1")
+
+    # GCP inventory: 2 agent VMs — 1 active (agent-vm-1) + 1 orphan (agent-vm-orphan)
+    mocker.patch("app.compute.LOCAL_MODE", False)
+    mocker.patch("app.compute.FALLBACK_ZONES", [("us-central1-a", "subnet-a")])
+    mocker.patch("app.compute.GPU_FALLBACK_ZONES", {})
+    mocker.patch(
+        "app.compute._list_vms_in_zone",
+        return_value=[
+            ("agent-vm-1", "us-central1-a", "RUNNING"),
+            ("agent-vm-orphan", "us-central1-a", "RUNNING"),
+        ],
+    )
+    mocker.patch("app.compute._delete_single_vm", return_value=True)
+    mocker.patch("app.compute._delete_agent_secret", return_value=None)
+    mocker.patch(
+        "app.compute._refresh_gcp_cleanup_active_vm_ids",
+        AsyncMock(return_value={"agent-vm-1"}),
+    )
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+
+    import app.vm_lifecycle as _vm_lifecycle
+
+    await gcp_cleanup_service()
+
+    # Pre-deletion: 2 agent VMs. Deleted: 1 orphan. Expected cache: 1 (not 2).
+    assert _vm_lifecycle._last_gcp_vm_count == 1
+
+
+@pytest.mark.asyncio
 async def test_gcp_cleanup_logs_partial_failures(gcp_db, mocker):
     """If cleanup_result.failed is non-empty, the service should still run without crashing."""
     project = await _make_project(gcp_db)
@@ -1013,7 +1156,9 @@ async def test_gcp_cleanup_does_not_reap_parked_task_vm(gcp_db, mocker):
     gcp_db.add(plain_queued)
 
     # Active IN_PROGRESS task — must always be exempted
-    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-active-1")
+    await _make_task_with_vm(
+        gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-active-1"
+    )
 
     await gcp_db.commit()
 
@@ -1061,9 +1206,7 @@ async def cost_db(mocker):
     )
 
     # Suppress broadcasts (patched at cost_ceiling where the call actually happens)
-    mocker.patch(
-        "app.cost_ceiling.broadcast_to_project", new_callable=AsyncMock
-    )
+    mocker.patch("app.cost_ceiling.broadcast_to_project", new_callable=AsyncMock)
     # Suppress external notification dispatch (patching where defined so ensure_future gets a real coroutine)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -1452,19 +1595,20 @@ async def test_cost_ceiling_alert_when_pool_idle_pushes_over(cost_db, mocker):
         dispatch_mock,
     )
 
-    # VM cost only: 5 minutes on-demand ≈ $0.006 — under a $0.10 ceiling.
+    # VM cost only: 5 minutes on-demand ≈ $0.006 — under a $0.05 ceiling.
     task = _make_cost_task(project.id, vm_secs=300, is_spot=False)
     cost_db.add(task)
 
-    # Pool VM that has been IDLE since midnight today (1 hour = 3600s idle).
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Fix the clock to noon of the current UTC day so the test is not sensitive
+    # to time-of-day. Running near midnight would clamp idle_since to today_start
+    # and shrink idle_seconds to near-zero, making expected_idle < $0.05 ceiling.
+    real_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    fixed_noon = real_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    mocker.patch("app.efficiency_snapshot._utcnow", return_value=fixed_noon)
+
+    # Pool VM that has been IDLE for 1 hour before our fixed noon.
     idle_seconds = 3600.0
-    idle_since = now - timedelta(seconds=idle_seconds)
-    # Ensure idle_since is within today (not before midnight).
-    if idle_since < today_start:
-        idle_since = today_start + timedelta(seconds=1)
-        idle_seconds = (now - idle_since).total_seconds()
+    idle_since = fixed_noon - timedelta(seconds=idle_seconds)
 
     pool_vm = PoolVm(
         project_id=project.id,
@@ -1477,7 +1621,7 @@ async def test_cost_ceiling_alert_when_pool_idle_pushes_over(cost_db, mocker):
     await cost_db.commit()
     await cost_db.refresh(task)
 
-    # idle_cost_usd for idle_seconds (1h ≈ $0.067) must exceed our chosen ceiling.
+    # idle_cost_usd for 1h ≈ $0.067 must exceed our chosen ceiling.
     expected_idle = idle_cost_usd(idle_seconds)
     assert expected_idle > 0.05, f"Expected pool idle cost > $0.05, got {expected_idle}"
 
@@ -2674,9 +2818,7 @@ async def test_post_commit_sweep_transient_failure_does_not_bump_attempts(
     await _sweep_post_commit_pending()
 
     await svc_db.refresh(task)
-    attempts = (
-        (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
-    )
+    attempts = (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
     assert attempts == 1, (
         f"transient failure must NOT increment the attempt cap; got {attempts}"
     )
@@ -2710,16 +2852,12 @@ async def test_post_commit_sweep_postcommitlocked_does_not_bump_attempts(
     async def locked(task_id, _payload):
         raise PostCommitLocked(f"task {task_id} row held by peer after 3 retries")
 
-    mocker.patch(
-        "app.routers.agent_status._process_post_commit", side_effect=locked
-    )
+    mocker.patch("app.routers.agent_status._process_post_commit", side_effect=locked)
 
     await _sweep_post_commit_pending()
 
     await svc_db.refresh(task)
-    attempts = (
-        (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
-    )
+    attempts = (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
     assert attempts == 3, (
         f"PostCommitLocked must NOT increment the attempt cap; got {attempts}"
     )
@@ -2751,9 +2889,7 @@ async def test_post_commit_sweep_persistent_failure_still_bumps_attempts(
     await _sweep_post_commit_pending()
 
     await svc_db.refresh(task)
-    attempts = (
-        (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
-    )
+    attempts = (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
     assert attempts == 2, (
         f"persistent failure must still advance the attempt cap; got {attempts}"
     )

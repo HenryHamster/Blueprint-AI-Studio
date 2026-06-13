@@ -1,6 +1,31 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { SettingsOrchestratorSection } from './SettingsOrchestratorSection';
+
+vi.mock('../api', () => ({
+  fetchEvergreenFillSettings: vi.fn().mockResolvedValue({
+    evergreen_fill_mode: 'off',
+    evergreen_fill_interval_minutes: 15,
+    evergreen_fill_util_threshold: 0.5,
+    evergreen_fill_min_free_slots: 2,
+    evergreen_fill_max_active: 1,
+    evergreen_fill_daily_cap: 3,
+    evergreen_fill_deferred_memo_enrollment: false,
+  }),
+  patchEvergreenFillSettings: vi.fn().mockResolvedValue(undefined),
+  fetchEvergreenFillObservability: vi.fn().mockResolvedValue({
+    created_count: 0,
+    reason_counts: {},
+    trigger_counts: {},
+    recent: [],
+  }),
+  fetchEvergreenBacklog: vi.fn().mockResolvedValue({ items: [] }),
+  fetchEvergreenBacklogSummary: vi.fn().mockResolvedValue({}),
+}));
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
 
 const baseProps = {
   maxConcurrentVMs: 4,

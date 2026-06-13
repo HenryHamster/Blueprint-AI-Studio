@@ -3,7 +3,10 @@
  * Removes or masks:
  * - GitHub personal access tokens (ghp_, ghs_, github_pat_)
  * - Anthropic API keys (sk-ant-...)
+ * - OpenAI API keys (sk-..., sk-proj-...)
+ * - Google API keys (AIza...)
  * - Bearer tokens and OAuth tokens
+ * - JSON/key-value credential fields
  * - JWT tokens
  * - Private SSH keys
  * - Git URLs with embedded credentials
@@ -16,8 +19,24 @@ export function sanitize(text: string): string {
     .replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:***@')
     .replace(/ghp_[A-Za-z0-9_]+/g, 'ghp_***')
     .replace(/ghs_[A-Za-z0-9_]+/g, 'ghs_***')
+    .replace(/ghu_[A-Za-z0-9_]+/g, 'ghu_***')
+    .replace(/gho_[A-Za-z0-9_]+/g, 'gho_***')
+    .replace(/ghr_[A-Za-z0-9_]+/g, 'ghr_***')
     .replace(/github_pat_[A-Za-z0-9_]+/g, 'github_pat_***')
     .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-***')
+    .replace(/sk-proj-[A-Za-z0-9_-]{20,}/g, 'sk-proj-***')
+    .replace(/sk-(?!ant-|proj-)[A-Za-z0-9_-]{20,}/g, 'sk-***')
+    .replace(/AIza[A-Za-z0-9_-]{20,}/g, 'AIza***')
+    .replace(/ya29\.[A-Za-z0-9_.-]+/g, 'ya29***')
+    .replace(
+      // keep in sync with backend/app/broadcast.py and backend/app/failure_classification.py
+      // Value group uses [^'"\\]|\\. (unambiguous alternation — avoids ReDoS on backslash-heavy inputs)
+      // Alternation handles quoted values (ReDoS-safe inner group) and unquoted values (8+ char floor)
+      // \b guards prevent matching 'api_key' inside compound names like OPENAI_API_KEY
+      /(['"]?\b(?:access_token|refresh_token|id_token|api_key|client_secret|private_key|token)\b['"]?\s*[:=]\s*)(?:(['"])((?:[^'"\\]|\\.)+)\2|([A-Za-z0-9_.+=\-/@]{8,}))/gi,
+      (_match, prefix: string, quote: string | undefined) =>
+        quote ? `${prefix}${quote}***${quote}` : `${prefix}***`,
+    )
     .replace(/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, 'eyJ***')
     .replace(/Bearer\s+[^\s,'"]+/gi, 'Bearer ***')
     .replace(/oauth_token[=:]\s*[^\s&'"]+/gi, 'oauth_token=***')

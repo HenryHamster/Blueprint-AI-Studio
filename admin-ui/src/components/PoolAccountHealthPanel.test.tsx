@@ -178,4 +178,48 @@ describe('PoolAccountHealthPanel', () => {
     );
     expect(document.querySelector('.opacity-50')).toBeNull();
   });
+
+  it('stale usage snapshot renders dimmed with explicit stale label', () => {
+    const account = makeAccount({
+      usage_snapshot: {
+        known: true,
+        five_hour_utilization: 42,
+        seven_day_utilization: 88,
+        resets_at: { five_hour: '2026-06-06T18:00:00Z', seven_day: '2026-06-12T00:00:00Z' },
+        probed_at: '2026-06-06T12:00:00Z',
+        stale: true,
+      },
+    });
+    render(<PoolAccountHealthPanel accounts={[account]} loading={false} />);
+
+    const badge = screen.getByTitle(/Usage headroom — 5h \/ 7d window utilization/);
+    expect(badge).toHaveClass('opacity-60');
+    expect(badge).toHaveTextContent('stale');
+    expect(badge).toHaveTextContent('@12:00');
+  });
+
+  it('renders a response-level stale chip when servedStale is true', () => {
+    const account = makeAccount();
+    render(
+      <PoolAccountHealthPanel
+        accounts={[account]}
+        loading={false}
+        servedStale
+        generatedAt="2026-06-13T00:00:00Z"
+      />,
+    );
+
+    // The response-level chip is distinct from the per-account usage_snapshot.stale
+    // indicator (which this account does not carry).
+    const chip = screen.getByTitle(/whole panel is a cached fallback/i);
+    expect(chip).toBeInTheDocument();
+    expect(chip).toHaveTextContent(/stale/i);
+  });
+
+  it('renders no response-level stale chip when servedStale is absent/false', () => {
+    const account = makeAccount();
+    render(<PoolAccountHealthPanel accounts={[account]} loading={false} />);
+
+    expect(screen.queryByTitle(/whole panel is a cached fallback/i)).not.toBeInTheDocument();
+  });
 });

@@ -332,12 +332,9 @@ async def _load_project_lanes(
     project_id: uuid.UUID,
 ) -> list[ImprovementLane]:
     """Load all non-KILLED ImprovementLane rows for the project."""
-    stmt = (
-        select(ImprovementLane)
-        .where(
-            ImprovementLane.project_id == project_id,
-            ImprovementLane.status != ImprovementLaneStatus.KILLED.value,
-        )
+    stmt = select(ImprovementLane).where(
+        ImprovementLane.project_id == project_id,
+        ImprovementLane.status != ImprovementLaneStatus.KILLED.value,
     )
     return list((await session.execute(stmt)).scalars().all())
 
@@ -382,7 +379,7 @@ def _compute_lane_warm_resume_rate(lanes: list[ImprovementLane]) -> float | None
     total_checkpoints = 0
     warm_checkpoints = 0
     for lane in lanes:
-        for checkpoint in (lane.checkpoints or []):
+        for checkpoint in lane.checkpoints or []:
             total_checkpoints += 1
             if checkpoint.get("warm_resume") is True:
                 warm_checkpoints += 1
@@ -564,13 +561,9 @@ async def compute_pool_idle_cost(
         )
 
     # Carry-forward: durable idle spend of members already reaped (rows deleted).
-    ledger_stmt = select(
-        func.coalesce(func.sum(PoolIdleCostLedger.idle_cost_usd), 0.0)
-    )
+    ledger_stmt = select(func.coalesce(func.sum(PoolIdleCostLedger.idle_cost_usd), 0.0))
     if project_id is not None:
-        ledger_stmt = ledger_stmt.where(
-            PoolIdleCostLedger.project_id == project_id
-        )
+        ledger_stmt = ledger_stmt.where(PoolIdleCostLedger.project_id == project_id)
     retired_idle = float((await session.execute(ledger_stmt)).scalar() or 0.0)
     settled += retired_idle
 
@@ -615,14 +608,12 @@ async def _compute_windowed_idle_cost(
     now = _utcnow()
 
     # Settled spans: only rows whose settlement timestamp falls within the window.
-    span_stmt = select(
-        func.coalesce(func.sum(PoolIdleSpan.cost_usd), 0.0)
-    ).where(PoolIdleSpan.settled_at >= cutoff)
+    span_stmt = select(func.coalesce(func.sum(PoolIdleSpan.cost_usd), 0.0)).where(
+        PoolIdleSpan.settled_at >= cutoff
+    )
     if project_id is not None:
         span_stmt = span_stmt.where(PoolIdleSpan.project_id == project_id)
-    windowed_retired = float(
-        (await session.execute(span_stmt)).scalar() or 0.0
-    )
+    windowed_retired = float((await session.execute(span_stmt)).scalar() or 0.0)
 
     # Live IDLE members: current idle period clamped to the window start.
     member_stmt = select(PoolVm).where(
@@ -644,7 +635,10 @@ async def _compute_windowed_idle_cost(
             acc = by_account.setdefault(label, {"total_idle_cost_usd": 0.0})
             acc["total_idle_cost_usd"] = round(acc["total_idle_cost_usd"] + cost, 6)
 
-    return {"total": round(windowed_retired + windowed_live, 6), "by_account": by_account}
+    return {
+        "total": round(windowed_retired + windowed_live, 6),
+        "by_account": by_account,
+    }
 
 
 def compute_pool_cost_amortization(
@@ -959,9 +953,7 @@ def _estimate_pool_hit_rate(
             rem = target_size % n
             for i, a in enumerate(accounts):
                 alloc[a] = base + (1 if i < rem else 0)
-        slots: Dict[str | None, list[float]] = {
-            a: [0.0] * alloc[a] for a in accounts
-        }
+        slots: Dict[str | None, list[float]] = {a: [0.0] * alloc[a] for a in accounts}
 
     def _serve(slot_list: list[float], t: float) -> bool:
         """Lease the first compatible idle member at time ``t``; True iff warm."""
@@ -1068,7 +1060,9 @@ async def estimate_pool_hit_rate(
     for t in tasks:
         if t.vm_dispatched_at is None:
             continue
-        dispatches.append((_account_label(get_task_llm_account_id(t)), t.vm_dispatched_at))
+        dispatches.append(
+            (_account_label(get_task_llm_account_id(t)), t.vm_dispatched_at)
+        )
 
     pinned = _estimate_pool_hit_rate(
         dispatches,
@@ -1118,7 +1112,9 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> float | None:
                 pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
                 if pricing:
                     input_rate, output_rate = pricing
-                    total_cost += input_tokens * input_rate + output_tokens * output_rate
+                    total_cost += (
+                        input_tokens * input_rate + output_tokens * output_rate
+                    )
         if is_merged_completion(t):
             merged += 1
     if not merged:
@@ -1149,7 +1145,9 @@ def _llm_attempt_nonnegative_int(value: Any) -> int:
     return int(value) if isinstance(value, (int, float)) and value >= 0 else 0
 
 
-def _task_llm_attempts(task: Task) -> list[tuple[str | None, str | None, int, int, int]]:
+def _task_llm_attempts(
+    task: Task,
+) -> list[tuple[str | None, str | None, int, int, int]]:
     history = task.attempt_history or []
     if not history:
         input_tokens, output_tokens, call_count = get_task_total_llm_totals(task)
@@ -1158,6 +1156,7 @@ def _task_llm_attempts(task: Task) -> list[tuple[str | None, str | None, int, in
             if input_tokens > 0 or output_tokens > 0
             else []
         )
+
     def _resolve_pair(attempt: dict) -> tuple[str | None, str | None]:
         ap = attempt.get("provider")
         am = attempt.get("model")
@@ -1182,7 +1181,9 @@ def _task_llm_attempts(task: Task) -> list[tuple[str | None, str | None, int, in
         task
     )
     if current_input > 0 or current_output > 0:
-        attempts.append((task.provider, task.model, current_input, current_output, current_calls))
+        attempts.append(
+            (task.provider, task.model, current_input, current_output, current_calls)
+        )
     return attempts
 
 
@@ -1269,7 +1270,13 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
         task_model_keys: set[tuple[str, str]] = set()
         task_provider_keys: set[str] = set()
         task_contributed = False
-        for provider, model, input_tokens, output_tokens, call_count in _task_llm_attempts(t):
+        for (
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            call_count,
+        ) in _task_llm_attempts(t):
             if input_tokens <= 0 and output_tokens <= 0:
                 continue
             if not provider or not model:
@@ -1466,6 +1473,200 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     }
 
 
+def _task_llm_cost(task: Task) -> tuple[float, bool]:
+    """Return (total_llm_usd, any_unpriced) for a single task."""
+    cost = 0.0
+    any_unpriced = False
+    for provider, model, input_tokens, output_tokens, _call_count in _task_llm_attempts(
+        task
+    ):
+        if input_tokens <= 0 and output_tokens <= 0:
+            continue
+        if not provider or not model:
+            any_unpriced = True
+            continue
+        key = (provider.lower(), model.lower())
+        pricing = LLM_TOKEN_PRICING.get(key)
+        if pricing:
+            input_rate, output_rate = pricing
+            cost += input_tokens * input_rate + output_tokens * output_rate
+        else:
+            any_unpriced = True
+    return cost, any_unpriced
+
+
+def _pr_number_for_task(task: Task) -> int | None:
+    """Extract PR number from first payload or review_loop context."""
+    pr = (task.first_payload or {}).get("pr_number")
+    if pr is not None:
+        try:
+            return int(pr)
+        except (TypeError, ValueError):
+            pass
+    loop_pr = (task.context or {}).get("review_loop", {}).get("pr_number")
+    if loop_pr is not None:
+        try:
+            return int(loop_pr)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _is_rework_task(task: Task) -> bool:
+    """True when a task is rework: a fix task, or a review with iteration > 1."""
+    task_type = (task.first_payload or {}).get("type") or ""
+    if task_type == "fix":
+        return True
+    iteration = (task.context or {}).get("review_loop", {}).get("iteration")
+    if isinstance(iteration, int) and iteration > 1:
+        return True
+    return False
+
+
+def compute_pr_rework_chain_breakdown(
+    tasks: list[Task], *, top_n: int = 10
+) -> Dict[str, Any]:
+    """Per-PR chain LLM cost split into first-pass vs rework over the given tasks.
+
+    Groups recently-terminal tasks by their PR number (``first_payload.pr_number``
+    or ``context.review_loop.pr_number`` as fallback) and prices each task in LLM
+    dollars using the shared :data:`LLM_TOKEN_PRICING` table + per-attempt history
+    (same helpers as :func:`compute_llm_cost_breakdown` for consistency).  VM
+    dollars are included via :func:`get_task_total_vm_cost_usd` alongside LLM
+    dollars. Tasks with no resolvable PR number are excluded without error.
+
+    **First-pass** vs **rework** classification:
+      - A task is *first-pass* when its type is not ``"fix"`` AND its
+        ``context.review_loop.iteration`` is ≤ 1 (or absent). This captures the
+        originating implementation task and its first review round.
+      - A task is *rework* when its type is ``"fix"`` OR its review loop
+        iteration is > 1 (subsequent re-reviews). Fix tasks and re-reviews
+        accumulate rework spend.
+
+    Unpriced (provider, model) combos contribute zero LLM cost but are counted;
+    chains containing any unpriced task are flagged in ``unpriced_chain_count``.
+    Pure DB-free and unit-testable over synthetic task lists.
+
+    Returns::
+
+        {
+          "total_pr_chains": int,
+          "total_llm_usd": float,
+          "total_vm_usd": float,
+          "rework_llm_usd": float,
+          "rework_vm_usd": float,
+          "first_pass_llm_usd": float,
+          "first_pass_vm_usd": float,
+          "rework_share_of_total_llm_cost": float | None,
+          "rework_share_of_total_vm_cost": float | None,
+          "unpriced_chain_count": int,
+          "top_rework_prs": [
+            {
+              "pr_number": int,
+              "total_llm_usd": float,
+              "total_vm_usd": float,
+              "rework_llm_usd": float,
+              "rework_vm_usd": float,
+              "first_pass_llm_usd": float,
+              "rework_share": float | None,
+              "task_count": int,
+              "rework_task_count": int,
+              "has_unpriced": bool
+            }, ...  (capped at top_n, sorted by rework_llm_usd descending)
+          ]
+        }
+    """
+    from collections import defaultdict
+
+    # pr_number -> accumulated per-chain stats
+    chains: Dict[int, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "total_llm_usd": 0.0,
+            "total_vm_usd": 0.0,
+            "rework_llm_usd": 0.0,
+            "rework_vm_usd": 0.0,
+            "first_pass_llm_usd": 0.0,
+            "first_pass_vm_usd": 0.0,
+            "task_count": 0,
+            "rework_task_count": 0,
+            "has_unpriced": False,
+        }
+    )
+
+    for t in tasks:
+        pr_num = _pr_number_for_task(t)
+        if pr_num is None:
+            continue
+        llm_cost, any_unpriced = _task_llm_cost(t)
+        vm_cost = get_task_total_vm_cost_usd(t)
+        is_rework = _is_rework_task(t)
+        c = chains[pr_num]
+        c["task_count"] += 1
+        c["total_llm_usd"] += llm_cost
+        c["total_vm_usd"] += vm_cost
+        if is_rework:
+            c["rework_task_count"] += 1
+            c["rework_llm_usd"] += llm_cost
+            c["rework_vm_usd"] += vm_cost
+        else:
+            c["first_pass_llm_usd"] += llm_cost
+            c["first_pass_vm_usd"] += vm_cost
+        if any_unpriced:
+            c["has_unpriced"] = True
+
+    total_llm = sum(c["total_llm_usd"] for c in chains.values())
+    total_vm = sum(c["total_vm_usd"] for c in chains.values())
+    rework_llm = sum(c["rework_llm_usd"] for c in chains.values())
+    rework_vm = sum(c["rework_vm_usd"] for c in chains.values())
+    first_pass_llm = sum(c["first_pass_llm_usd"] for c in chains.values())
+    first_pass_vm = sum(c["first_pass_vm_usd"] for c in chains.values())
+    unpriced_chain_count = sum(1 for c in chains.values() if c["has_unpriced"])
+
+    rework_share_llm: float | None = (
+        round(rework_llm / total_llm, 4) if total_llm > 0 else None
+    )
+    rework_share_vm: float | None = (
+        round(rework_vm / total_vm, 4) if total_vm > 0 else None
+    )
+
+    sorted_chains = sorted(
+        chains.items(), key=lambda kv: kv[1]["rework_llm_usd"], reverse=True
+    )
+    top_rework_prs = [
+        {
+            "pr_number": pr_num,
+            "total_llm_usd": round(c["total_llm_usd"], 6),
+            "total_vm_usd": round(c["total_vm_usd"], 6),
+            "rework_llm_usd": round(c["rework_llm_usd"], 6),
+            "rework_vm_usd": round(c["rework_vm_usd"], 6),
+            "first_pass_llm_usd": round(c["first_pass_llm_usd"], 6),
+            "rework_share": (
+                round(c["rework_llm_usd"] / c["total_llm_usd"], 4)
+                if c["total_llm_usd"] > 0
+                else None
+            ),
+            "task_count": c["task_count"],
+            "rework_task_count": c["rework_task_count"],
+            "has_unpriced": c["has_unpriced"],
+        }
+        for pr_num, c in sorted_chains[:top_n]
+    ]
+
+    return {
+        "total_pr_chains": len(chains),
+        "total_llm_usd": round(total_llm, 6),
+        "total_vm_usd": round(total_vm, 6),
+        "rework_llm_usd": round(rework_llm, 6),
+        "rework_vm_usd": round(rework_vm, 6),
+        "first_pass_llm_usd": round(first_pass_llm, 6),
+        "first_pass_vm_usd": round(first_pass_vm, 6),
+        "rework_share_of_total_llm_cost": rework_share_llm,
+        "rework_share_of_total_vm_cost": rework_share_vm,
+        "unpriced_chain_count": unpriced_chain_count,
+        "top_rework_prs": top_rework_prs,
+    }
+
+
 def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
     """Per-task-type LLM cost/token rollup over the given tasks.
 
@@ -1514,7 +1715,13 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
             bucket["verified_merged_count"] += 1
 
         task_cost = 0.0
-        for provider, model, input_tokens, output_tokens, call_count in _task_llm_attempts(t):
+        for (
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            call_count,
+        ) in _task_llm_attempts(t):
             if input_tokens <= 0 and output_tokens <= 0:
                 continue
             if not provider or not model:
@@ -1563,8 +1770,12 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
             "merged_count": int(b["merged_count"]),
             "merge_rate": _merge_rate(b["merged_count"], b["task_count"]),
             "verified_merged_count": int(b["verified_merged_count"]),
-            "verified_merge_rate": _merge_rate(b["verified_merged_count"], b["task_count"]),
-            "cost_per_merge": _cost_per_merge(b["cost_usd"], b["verified_merged_count"]),
+            "verified_merge_rate": _merge_rate(
+                b["verified_merged_count"], b["task_count"]
+            ),
+            "cost_per_merge": _cost_per_merge(
+                b["cost_usd"], b["verified_merged_count"]
+            ),
             "share_of_total_cost": _share(b["cost_usd"]),
         }
         for task_type, b in sorted(
@@ -1834,9 +2045,13 @@ def compute_effort_model_efficiency(
         # never per attempt-row.
         task_model_keys: set[tuple[str, str]] = set()
 
-        for provider, model, input_tokens, output_tokens, call_count in (
-            _task_llm_attempts(t)
-        ):
+        for (
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            call_count,
+        ) in _task_llm_attempts(t):
             if input_tokens <= 0 and output_tokens <= 0:
                 continue
             if not provider or not model:
@@ -1864,7 +2079,12 @@ def compute_effort_model_efficiency(
                 eff_bucket, input_tokens, output_tokens, call_count, cost, priced
             )
             _accumulate_attempt(
-                model_buckets[key], input_tokens, output_tokens, call_count, cost, priced
+                model_buckets[key],
+                input_tokens,
+                output_tokens,
+                call_count,
+                cost,
+                priced,
             )
             _accumulate_attempt(
                 totals, input_tokens, output_tokens, call_count, cost, priced
@@ -1933,7 +2153,9 @@ def compute_effort_model_efficiency(
 
     by_effort = [
         _finalize_efficiency_bucket(
-            effort_buckets[effort], effort=effort, resolved_models=_resolved_models(effort)
+            effort_buckets[effort],
+            effort=effort,
+            resolved_models=_resolved_models(effort),
         )
         for effort in sorted(
             effort_buckets, key=lambda e: (_EFFORT_TIER_ORDER.get(e, 99), e)
@@ -2144,7 +2366,10 @@ async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
     """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
-    from app.digest_metrics import compute_format_compliance_metrics, compute_timeout_rate
+    from app.digest_metrics import (
+        compute_format_compliance_metrics,
+        compute_timeout_rate,
+    )
     from app.warm_backlog_reuse import (
         compute_dominant_pool_miss,
         compute_dominant_reuse_dropout,
@@ -2168,9 +2393,7 @@ async def compute_current_axes(
     windowed_idle = await _compute_windowed_idle_cost(session, project_id, axis_cutoff)
     total_vm_cost, merged = _cost_and_merges(tasks)
     cost_incl_pool_idle: float | None = (
-        round((total_vm_cost + windowed_idle["total"]) / merged, 4)
-        if merged
-        else None
+        round((total_vm_cost + windowed_idle["total"]) / merged, 4) if merged else None
     )
 
     return {
@@ -2227,7 +2450,9 @@ async def compute_current_axes(
         # by task type. The by_type block lets read-only research agents
         # (authenticated with the agent token) obtain the durable per-type
         # breakdown for a snapshot day without hitting admin-auth endpoints.
-        FORMAT_COMPLIANCE_KEY: (_fc := compute_format_compliance_metrics(tasks))["overall"],
+        FORMAT_COMPLIANCE_KEY: (_fc := compute_format_compliance_metrics(tasks))[
+            "overall"
+        ],
         "format_compliance_by_type": _fc["by_type"],
     }
 
@@ -2292,9 +2517,7 @@ async def write_snapshot(
             # (or re-seeded after a migration) and from which snapshot's data it
             # came.  Missing on pre-provenance baselines — see retroactive
             # inference below.
-            provenance: Dict[str, Any] = dict(
-                baseline.get("_member_provenance") or {}
-            )
+            provenance: Dict[str, Any] = dict(baseline.get("_member_provenance") or {})
             # Retroactive annotation: if provenance is empty and snapshots already
             # exist, scan the snapshot history to find the earliest snapshot whose
             # value matches each current baseline member.  This annotates patchwork
@@ -2700,9 +2923,7 @@ async def read_baseline_with_drift(
         # blocks), each value carries seeded_at / snapshot_captured_at so every
         # consumer can see which reference date each drift figure is measured from.
         "baseline_provenance": {
-            k: v
-            for k, v in member_provenance.items()
-            if not str(k).startswith("_")
+            k: v for k, v in member_provenance.items() if not str(k).startswith("_")
         },
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
@@ -3146,6 +3367,7 @@ async def get_llm_cost_breakdown(
         "generated_at": _utcnow().isoformat(),
         **breakdown,
         "by_task_type": compute_llm_cost_by_task_type(tasks),
+        "pr_chain_rework": compute_pr_rework_chain_breakdown(tasks),
     }
 
 
@@ -3234,10 +3456,7 @@ async def compute_project_window_spend_usd(
                 # VM span overlaps the window: has a VM and either still running
                 # or stopped after the window cutoff.
                 Task.vm_provisioned_at.isnot(None)
-                & (
-                    Task.vm_stopped_at.is_(None)
-                    | (Task.vm_stopped_at >= cutoff)
-                ),
+                & (Task.vm_stopped_at.is_(None) | (Task.vm_stopped_at >= cutoff)),
                 # LLM-only tasks (no VM span): fall back to created_at so token
                 # cost is still captured for tasks that never provisioned a VM.
                 Task.vm_provisioned_at.is_(None) & (Task.created_at >= cutoff),
@@ -3323,7 +3542,9 @@ async def agent_get_efficiency_snapshot_format_compliance(
         try:
             task_uuid = uuid.UUID(task_id_str)
         except ValueError:
-            raise HTTPException(status_code=401, detail="token_invalid_subject") from None
+            raise HTTPException(
+                status_code=401, detail="token_invalid_subject"
+            ) from None
         task = await session.get(Task, task_uuid)
         if task is None:
             raise HTTPException(status_code=404, detail="task_not_found")
@@ -3332,7 +3553,9 @@ async def agent_get_efficiency_snapshot_format_compliance(
         try:
             project_id = uuid.UUID(project_id_str)
         except (ValueError, TypeError):
-            raise HTTPException(status_code=401, detail="token_invalid_project_id") from None
+            raise HTTPException(
+                status_code=401, detail="token_invalid_project_id"
+            ) from None
 
     project = await session.get(Project, project_id)
     if project is None:

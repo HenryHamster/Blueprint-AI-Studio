@@ -49,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
+from app.schemas import sanitize_rpc_diagnostic
 from app.knowledge_query import (
     KnowledgeSubstance,
     classify_knowledge_acceptance,
@@ -1223,9 +1224,31 @@ def _build_compute_experiment_document(
     if terminal_diagnostics:
         td_reason = terminal_diagnostics.get("terminal_reason")
         td_phase = terminal_diagnostics.get("vm_phase")
+        td_cause = terminal_diagnostics.get("provisioning_cause")
+        td_contract = terminal_diagnostics.get("launch_contract")
         if td_reason:
             phase_clause = f"; VM phase: {td_phase}" if td_phase else ""
             summary_parts.append(f"Terminal diagnostics: {td_reason}{phase_clause}.")
+        if td_cause:
+            cause_parts = []
+            if td_cause.get("error_type"):
+                cause_parts.append(f"type={td_cause['error_type']}")
+            if td_cause.get("error_message"):
+                cause_parts.append(f"message={td_cause['error_message'][:200]}")
+            if td_cause.get("reason"):
+                cause_parts.append(f"reason={td_cause['reason']}")
+            if cause_parts:
+                summary_parts.append(f"Provisioning failure: {'; '.join(cause_parts)}.")
+        if td_contract:
+            contract_parts = []
+            if td_contract.get("requested_deadline_seconds") is not None:
+                contract_parts.append(
+                    f"deadline={td_contract['requested_deadline_seconds']}s"
+                )
+            if td_contract.get("provisioning_model"):
+                contract_parts.append(f"model={td_contract['provisioning_model']}")
+            if contract_parts:
+                summary_parts.append(f"Launch contract: {', '.join(contract_parts)}.")
     summary = " ".join(summary_parts)
 
     body_lines = [
@@ -1252,6 +1275,8 @@ def _build_compute_experiment_document(
         td_phase = terminal_diagnostics.get("vm_phase")
         td_accel = terminal_diagnostics.get("accelerator_type")
         td_machine = terminal_diagnostics.get("machine_type")
+        td_cause = terminal_diagnostics.get("provisioning_cause")
+        td_contract = terminal_diagnostics.get("launch_contract")
         if td_reason:
             body_lines.append(f"- **Terminal reason:** {td_reason}")
         if td_phase:
@@ -1260,6 +1285,28 @@ def _build_compute_experiment_document(
             body_lines.append(f"- **Accelerator type:** {td_accel}")
         if td_machine:
             body_lines.append(f"- **Machine type:** {td_machine}")
+        if td_cause:
+            if td_cause.get("error_type"):
+                body_lines.append(
+                    f"- **Provisioning failure type:** {td_cause['error_type']}"
+                )
+            if td_cause.get("error_message"):
+                body_lines.append(
+                    f"- **Provisioning failure message:** {td_cause['error_message'][:300]}"
+                )
+            if td_cause.get("reason"):
+                body_lines.append(
+                    f"- **Provisioning failure reason:** {td_cause['reason']}"
+                )
+        if td_contract:
+            if td_contract.get("requested_deadline_seconds") is not None:
+                body_lines.append(
+                    f"- **Requested deadline (s):** {td_contract['requested_deadline_seconds']}"
+                )
+            if td_contract.get("provisioning_model"):
+                body_lines.append(
+                    f"- **Provisioning model:** {td_contract['provisioning_model']}"
+                )
     body = "\n".join(body_lines)
 
     raw_tags = payload.get("tags")
@@ -2003,8 +2050,10 @@ def _extract_job_terminal_diagnostics(job: Any) -> dict[str, Any] | None:
 
     Returns a dict with ``terminal_reason``, ``vm_phase`` (``provisioning`` when
     the VM never started, ``runtime`` otherwise), plus ``accelerator_type`` and
-    ``machine_type`` when known.  Returns ``None`` when the job has no
-    terminal_reason (i.e. no diagnostic information to add).
+    ``machine_type`` when known.  For provisioning-phase failures also adds a
+    sanitized ``provisioning_cause`` (from ``polling_metadata["compute_rpc_diagnostic"]``)
+    and a ``launch_contract`` echo (``requested_deadline_seconds``,
+    ``provisioning_model``).  Returns ``None`` when the job has no terminal_reason.
     """
     if job is None:
         return None
@@ -2023,6 +2072,24 @@ def _extract_job_terminal_diagnostics(job: Any) -> dict[str, Any] | None:
     machine = getattr(job, "machine_type", None)
     if machine:
         diag["machine_type"] = machine
+    if vm_phase == "provisioning":
+        try:
+            meta = getattr(job, "polling_metadata", None) or {}
+            raw_diag = meta.get("compute_rpc_diagnostic")
+            cause = sanitize_rpc_diagnostic(raw_diag)
+            if cause:
+                diag["provisioning_cause"] = cause
+            deadline = meta.get("requested_deadline_seconds")
+            prov_model = meta.get("provisioning_model")
+            contract: dict[str, Any] = {}
+            if deadline is not None:
+                contract["requested_deadline_seconds"] = deadline
+            if prov_model is not None:
+                contract["provisioning_model"] = prov_model
+            if contract:
+                diag["launch_contract"] = contract
+        except Exception:
+            pass
     return diag
 
 

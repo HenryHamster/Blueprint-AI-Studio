@@ -76,6 +76,7 @@ def _reject_unknown_task_types(
             ),
         )
 
+
 # Every runtime-config key the PATCH /api/admin/settings handler (_apply_settings)
 # knows how to validate + apply. A payload key NOT in this set is a typo or a
 # stale field name — _apply_settings logs it as a WARNING and rejects the whole
@@ -95,6 +96,13 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "autonomous_direction_cooldown_minutes",
         "autonomous_periodic_tasks",
         "autonomous_research_interval_minutes",
+        "evergreen_fill_mode",
+        "evergreen_fill_interval_minutes",
+        "evergreen_fill_util_threshold",
+        "evergreen_fill_min_free_slots",
+        "evergreen_fill_max_active",
+        "evergreen_fill_daily_cap",
+        "evergreen_fill_deferred_memo_enrollment",
         "category_routing",
         "ci_backstop_timeout_minutes",
         "cochange_decomposition_enabled",
@@ -317,6 +325,25 @@ async def get_settings(
         "autonomous_research_interval_minutes": _runtime_config.get(
             "autonomous_research_interval_minutes", 30
         ),
+        "evergreen_fill_mode": str(_runtime_config.get("evergreen_fill_mode", "off")),
+        "evergreen_fill_interval_minutes": int(
+            _runtime_config.get("evergreen_fill_interval_minutes", 15)
+        ),
+        "evergreen_fill_util_threshold": float(
+            _runtime_config.get("evergreen_fill_util_threshold", 0.5)
+        ),
+        "evergreen_fill_min_free_slots": int(
+            _runtime_config.get("evergreen_fill_min_free_slots", 2)
+        ),
+        "evergreen_fill_max_active": int(
+            _runtime_config.get("evergreen_fill_max_active", 1)
+        ),
+        "evergreen_fill_daily_cap": int(
+            _runtime_config.get("evergreen_fill_daily_cap", 3)
+        ),
+        "evergreen_fill_deferred_memo_enrollment": bool(
+            _runtime_config.get("evergreen_fill_deferred_memo_enrollment", False)
+        ),
         "max_concurrent_auto_remediations": _runtime_config.get(
             "max_concurrent_auto_remediations", 2
         ),
@@ -467,9 +494,7 @@ async def get_settings(
                 _runtime_config.get("warm_pool_project_allowlist") or []
             )
         ),
-        "warm_pool_target_size": int(
-            _runtime_config.get("warm_pool_target_size", 2)
-        ),
+        "warm_pool_target_size": int(_runtime_config.get("warm_pool_target_size", 2)),
         "warm_pool_target_size_by_project": _normalize_warm_pool_target_map(
             _runtime_config.get("warm_pool_target_size_by_project") or {}
         ),
@@ -765,6 +790,92 @@ async def _apply_settings(
                 detail="autonomous_research_interval_minutes must be between 1 and 1440",
             )
         _runtime_config["autonomous_research_interval_minutes"] = val
+    if "evergreen_fill_mode" in payload:
+        val = str(payload["evergreen_fill_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["evergreen_fill_mode"] = val
+    if "evergreen_fill_interval_minutes" in payload:
+        try:
+            val = int(payload["evergreen_fill_interval_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_interval_minutes must be a number",
+            )
+        if not (1 <= val <= 1440):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_interval_minutes must be between 1 and 1440",
+            )
+        _runtime_config["evergreen_fill_interval_minutes"] = val
+    if "evergreen_fill_util_threshold" in payload:
+        try:
+            fval = float(payload["evergreen_fill_util_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_util_threshold must be a number",
+            )
+        if not (0.0 <= fval <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_util_threshold must be between 0.0 and 1.0",
+            )
+        _runtime_config["evergreen_fill_util_threshold"] = fval
+    if "evergreen_fill_min_free_slots" in payload:
+        try:
+            val = int(payload["evergreen_fill_min_free_slots"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_min_free_slots must be a number",
+            )
+        if not (0 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_min_free_slots must be between 0 and 100",
+            )
+        _runtime_config["evergreen_fill_min_free_slots"] = val
+    if "evergreen_fill_max_active" in payload:
+        try:
+            val = int(payload["evergreen_fill_max_active"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_max_active must be a number",
+            )
+        if not (0 <= val <= 50):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_max_active must be between 0 and 50",
+            )
+        _runtime_config["evergreen_fill_max_active"] = val
+    if "evergreen_fill_daily_cap" in payload:
+        try:
+            val = int(payload["evergreen_fill_daily_cap"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_daily_cap must be a number",
+            )
+        if not (0 <= val <= 200):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_daily_cap must be between 0 and 200",
+            )
+        _runtime_config["evergreen_fill_daily_cap"] = val
+    if "evergreen_fill_deferred_memo_enrollment" in payload:
+        raw = payload["evergreen_fill_deferred_memo_enrollment"]
+        if not isinstance(raw, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="evergreen_fill_deferred_memo_enrollment must be a boolean",
+            )
+        _runtime_config["evergreen_fill_deferred_memo_enrollment"] = raw
     if "evaluating_pipeline_timeout_minutes" in payload:
         try:
             val = int(payload["evaluating_pipeline_timeout_minutes"])
@@ -915,9 +1026,7 @@ async def _apply_settings(
         if abs(weight_sum - 1.0) > 0.01:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"promotion_weights must sum to ~1.0 (got {weight_sum:.4f})"
-                ),
+                detail=(f"promotion_weights must sum to ~1.0 (got {weight_sum:.4f})"),
             )
         _runtime_config["promotion_weights"] = {
             wk: round(cleaned_weights[wk], 4) for wk in _PROMOTION_WEIGHT_KEYS
@@ -1042,7 +1151,11 @@ async def _apply_settings(
             )
         _runtime_config["review_second_opinion_gate_enabled"] = val
     if "strategic_retirement_challenge_gate_mode" in payload:
-        val = str(payload["strategic_retirement_challenge_gate_mode"] or "").strip().lower()
+        val = (
+            str(payload["strategic_retirement_challenge_gate_mode"] or "")
+            .strip()
+            .lower()
+        )
         if val not in ("observe", "advisory", "enforce"):
             raise HTTPException(
                 status_code=400,
@@ -1739,9 +1852,7 @@ async def _apply_settings(
                     status_code=400,
                     detail="deploy_repo_identity must be 'owner/repo'",
                 )
-            _runtime_config["deploy_repo_identity"] = (
-                f"{owner.strip()}/{repo.strip()}"
-            )
+            _runtime_config["deploy_repo_identity"] = f"{owner.strip()}/{repo.strip()}"
         else:
             raise HTTPException(
                 status_code=400,
@@ -2358,6 +2469,14 @@ async def _apply_settings(
             raise HTTPException(status_code=502, detail=f"Webhook request failed: {e}")
         return {"ok": True, "test_notification_sent": True}
 
+    # Detect a genuine warm_pool_enabled True→False transition. Computed here —
+    # after all config changes but before the DB persist block — so the flag is
+    # available in both the early-return (no DeploymentState row) and normal
+    # (post-commit) code paths.
+    _pool_disable_transition = bool(
+        _config_snapshot.get("warm_pool_enabled", False)
+    ) and not bool(_runtime_config.get("warm_pool_enabled", False))
+
     # Persist to DB so values survive Cloud Run restarts
     # Always persist all runtime config values (not just changed ones) to ensure consistency
     try:
@@ -2378,6 +2497,18 @@ async def _apply_settings(
                 if exists is None:
                     # No DeploymentState row yet — runtime config is in-memory only.
                     # Skip the persist; the next admin/deploy bootstrap will create the row.
+                    # Still drain the pool if the global disable transition fired.
+                    if _pool_disable_transition:
+                        from app.warm_pool_maintainer import drain_global_warm_pool
+
+                        try:
+                            await drain_global_warm_pool()
+                        except Exception:
+                            logger.warning(
+                                "[SETTINGS] global warm-pool drain failed after disable; "
+                                "idle reaper will reclaim any remaining live members",
+                                exc_info=True,
+                            )
                     return _runtime_config
                 raise HTTPException(
                     status_code=409,
@@ -2434,9 +2565,7 @@ async def _apply_settings(
                     # survives a Cloud Run restart (config-sync reads it back on
                     # boot; otherwise the in-memory value reverts to the env
                     # default).
-                    "deploy_repo_identity": _runtime_config.get(
-                        "deploy_repo_identity"
-                    ),
+                    "deploy_repo_identity": _runtime_config.get("deploy_repo_identity"),
                     "provider_settings_defaults": _runtime_config.get(
                         "provider_settings_defaults", {}
                     ),
@@ -2558,9 +2687,7 @@ async def _apply_settings(
                     # back on boot; otherwise the in-memory value reverts to the
                     # True default).
                     "review_second_opinion_gate_enabled": bool(
-                        _runtime_config.get(
-                            "review_second_opinion_gate_enabled", True
-                        )
+                        _runtime_config.get("review_second_opinion_gate_enabled", True)
                     ),
                     "strategic_retirement_challenge_gate_mode": str(
                         _runtime_config.get(
@@ -2581,9 +2708,7 @@ async def _apply_settings(
                         _runtime_config.get("warm_pool_enabled", False)
                     ),
                     "warm_pool_account_retarget_enabled": bool(
-                        _runtime_config.get(
-                            "warm_pool_account_retarget_enabled", False
-                        )
+                        _runtime_config.get("warm_pool_account_retarget_enabled", False)
                     ),
                     "warm_pool_cross_provider_retarget_enabled": bool(
                         _runtime_config.get(
@@ -2624,7 +2749,8 @@ async def _apply_settings(
                         for k, v in (
                             _runtime_config.get(
                                 "max_concurrent_compute_jobs_by_project"
-                            ) or {}
+                            )
+                            or {}
                         ).items()
                         if v and int(v) > 0
                     },
@@ -2717,7 +2843,9 @@ async def _apply_settings(
                     "promotion_threshold": _runtime_config.get("promotion_threshold"),
                     "promotion_weights": _runtime_config.get("promotion_weights"),
                     "diagnostics_after_edit_holdback_fraction": float(
-                        _runtime_config.get("diagnostics_after_edit_holdback_fraction", 0.1)
+                        _runtime_config.get(
+                            "diagnostics_after_edit_holdback_fraction", 0.1
+                        )
                     ),
                     "diagnostics_after_edit_enabled": bool(
                         _runtime_config.get("diagnostics_after_edit_enabled", True)
@@ -2747,6 +2875,21 @@ async def _apply_settings(
         logger.exception("[SETTINGS] DB persist failed, rolling back in-memory config")
         await session.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to persist settings: {e}")
+
+    # If warm_pool_enabled transitioned True→False and the DB commit succeeded,
+    # drain all live pool members fleet-wide. Errors are best-effort — a
+    # partial drain is recoverable by the idle reaper.
+    if _pool_disable_transition:
+        from app.warm_pool_maintainer import drain_global_warm_pool
+
+        try:
+            await drain_global_warm_pool()
+        except Exception:
+            logger.warning(
+                "[SETTINGS] global warm-pool drain failed after disable; "
+                "idle reaper will reclaim any remaining live members",
+                exc_info=True,
+            )
 
     return _runtime_config
 
@@ -3198,17 +3341,39 @@ async def repair_state(
     from app.alert_dispatch import _maybe_create_circuit_breaker_alert
     from app.time_utils import _utcnow as _main_utcnow
 
-    for proj_id, breaker in list(_circuit_breakers.items()):
-        if breaker.get("state") != "HALF_OPEN":
-            continue
+    # Batch-load all test tasks for HALF_OPEN breakers in one query
+    half_open_items = [
+        (proj_id, breaker)
+        for proj_id, breaker in list(_circuit_breakers.items())
+        if breaker.get("state") == "HALF_OPEN" and breaker.get("half_open_task_id")
+    ]
+    if half_open_items:
+        test_ids = []
+        for _, breaker in half_open_items:
+            try:
+                test_ids.append(uuid.UUID(breaker["half_open_task_id"]))
+            except Exception:
+                pass
+        found_ids: set = set()
+        if test_ids:
+            try:
+                rows = (
+                    (await session.execute(select(Task).where(Task.id.in_(test_ids))))
+                    .scalars()
+                    .all()
+                )
+                found_ids = {r.id for r in rows}
+            except Exception:
+                pass
+
+    for proj_id, breaker in half_open_items:
         test_id = breaker.get("half_open_task_id")
-        if not test_id:
-            continue
         try:
-            test_task = await session.get(Task, uuid.UUID(test_id))
+            task_uuid = uuid.UUID(test_id)
         except Exception:
-            test_task = None
-        if test_task is None:
+            continue
+        test_task_exists = task_uuid in found_ids
+        if not test_task_exists:
             breaker["state"] = "OPEN"
             breaker["opened_at"] = _main_utcnow()
             breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
