@@ -2811,6 +2811,167 @@ class TestDeadAuthClassification:
         t.api_call_summary = None
         assert normalize_agent_failure_category("claude_code_failed", t) == DEAD_AUTH
 
+    # ── refresh_token_reused (new pattern, incident 2026-06-13) ────────────
+
+    def test_refresh_token_reused_classifies_dead_auth(self):
+        # Real stderr from Codex CLI when a cached refresh token has been consumed.
+        # Incident: account SavarinCodex stayed healthy (2.9% success rate) because
+        # this phrasing wasn't in _OAUTH_DEAD_AUTH_PATTERNS → bucketed PROVISION_FAILURE
+        # → never auto-disabled → every new task coin-flipped into the dead account.
+        real_stderr = (
+            "ERROR codex_login::auth::manager: Failed to refresh token: "
+            '401 Unauthorized: {"error": {"message": "Your refresh token has '
+            "already been used to generate a new access token. Please log out and "
+            'sign in again."}}'
+        )
+        report = self._openai_oauth_report(stderr_tail=real_stderr)
+        t = self._dead_auth_task(report)
+        from app.failure_classification import DEAD_AUTH
+
+        assert classify_failure(t) == DEAD_AUTH
+        assert (
+            t.context.get("dead_auth_matched_pattern")
+            == "refresh token has already been used"
+        )
+
+    def test_refresh_token_reused_not_classified_when_model_output_seen(self):
+        # If the CLI produced model output before dying, auth was successful —
+        # dead-auth must not fire even if the pattern somehow appears in stderr.
+        real_stderr = "WARNING: refresh token was already used (late error)\n"
+        report = self._openai_oauth_report(
+            stderr_tail=real_stderr,
+            model_output_seen=True,
+        )
+        t = self._dead_auth_task(report)
+        from app.failure_classification import DEAD_AUTH
+
+        assert classify_failure(t) != DEAD_AUTH
+
+    # ── panel_review_lens_failed + dead-auth path (incident 2026-06-13) ────
+
+    def test_panel_review_lens_failed_with_dead_auth_in_logs(self):
+        # panel_review_lens_failed: when the Codex lens dies with a consumed
+        # refresh token, failPanelClosed stores the full error message in
+        # task.latest_status_message (via _sanitize_log_tail(payload.logs, 8000)).
+        # For a startup-death the total output is short (< 4096 chars), so the
+        # dead-auth guard fires and classification returns DEAD_AUTH, not
+        # PROVISION_FAILURE.
+        full_status = (
+            "Panel review fan-out failed: lens 'correctness' agent pass exited 1.\n"
+            "Reading prompt from stdin...\n"
+            "2026-06-13T20:48:11.576087Z ERROR codex_login::auth::manager: "
+            "Failed to refresh token: 401 Unauthorized: "
+            '{"error": {"message": "Your refresh token has already been used '
+            'to generate a new access token."}}\n'
+        )
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+        from app.failure_classification import DEAD_AUTH
+
+        result = classify_failure(t)
+        assert result == DEAD_AUTH
+        assert (
+            t.context.get("dead_auth_matched_pattern")
+            == "refresh token has already been used"
+        )
+
+    def test_panel_review_lens_failed_dead_auth_not_fired_on_long_output(self):
+        # If the lens ran successfully and produced kilobytes of model output
+        # before failing closed (e.g. no usable verdict), latest_status_message
+        # holds the last 8000 chars of that output — which may mention dead-auth
+        # literals if the diff being reviewed touches oauth / test files.
+        # The length guard (>= 4096 chars) must suppress the dead-auth scan
+        # so a healthy account is never falsely disabled.
+        model_output_with_dead_auth_phrase = (
+            # Simulate a lens reviewing a diff that adds the dead-auth pattern
+            # as a test string — the model quotes it in its analysis.
+            "The test file adds 'refresh token has already been used' as a "
+            "fixture string to cover the OAuth error case.  This looks correct "
+            "and necessary for coverage. " * 200  # ~8000 chars of model output
+        )
+        # In production this is _sanitize_log_tail(failLogs, 8000) — the last
+        # 8000 chars of "Panel review fan-out failed: ...\n<model output>".
+        full_status = (
+            "Panel review fan-out failed: lens 'correctness' produced no usable verdict.\n"
+            + model_output_with_dead_auth_phrase
+        )
+        assert len(full_status) >= 4096, "test precondition: status must be long"
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+        from app.failure_classification import DEAD_AUTH
+
+        result = classify_failure(t)
+        assert result != DEAD_AUTH, (
+            "dead-auth must not fire when lens output is long (model output path)"
+        )
+        assert "dead_auth_matched_pattern" not in t.context
+
+    def test_panel_review_lens_failed_rate_limited_classifies_rate_limit(self):
+        # When the lens subprocess is rate-limited (429), the error appears in
+        # latest_status_message.  Classification must return RATE_LIMIT (no-burn
+        # requeue) not PROVISION_FAILURE (which burns attempt_count).
+        # Uses "rate limit reached for" which is in _API_KEY_RATE_LIMIT_PATTERNS.
+        full_status = (
+            "Panel review fan-out failed: lens 'security' agent pass exited 1.\n"
+            "Error: 429 Too Many Requests\nrate limit reached for model gpt-4o\n"
+        )
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+        from app.failure_classification import RATE_LIMIT, normalize_agent_failure_category
+
+        # Drive via the production write-boundary path: normalize_agent_failure_category
+        # persists failure_class to context (agent_status.py:1085-1096), then
+        # classify_failure short-circuits on that persisted value.
+        normalized = normalize_agent_failure_category("panel_review_lens_failed", t)
+        assert normalized == RATE_LIMIT, (
+            f"normalize should return RATE_LIMIT for rate-limited panel_review_lens_failed, got {normalized}"
+        )
+        # Simulate the agent_status.py write boundary persistence
+        new_ctx = dict(t.context or {})
+        new_ctx["failure_category"] = normalized
+        new_ctx["failure_class"] = normalized
+        t.context = new_ctx
+        # classify_failure must short-circuit to the persisted RATE_LIMIT verdict
+        result = classify_failure(t)
+        assert result == RATE_LIMIT, (
+            f"rate-limited panel_review_lens_failed should be RATE_LIMIT after normalize+persist, got {result}"
+        )
+
+    def test_panel_review_lens_failed_without_dead_auth_stays_provision_failure(self):
+        # panel_review_lens_failed without a dead-auth or rate-limit pattern
+        # should stay PROVISION_FAILURE (lens subprocess crashed for a generic
+        # infra reason — no retry budget should be burned).
+        full_status = (
+            "Panel review fan-out failed: lens 'correctness' agent pass exited 1.\n"
+            "Error: ENOENT: no such file or directory, open '/tmp/foo'\n"
+        )
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+
+        result = classify_failure(t)
+        assert result == PROVISION_FAILURE
+        assert "dead_auth_matched_pattern" not in t.context
+
 
 class TestRedactCredentials:
     """Unit tests for the _redact_credentials helper.

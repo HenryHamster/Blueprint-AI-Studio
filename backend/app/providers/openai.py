@@ -90,6 +90,16 @@ _OAUTH_DEAD_AUTH_PATTERNS: tuple[str, ...] = (
     "app_session_terminated",
     "token_invalidated",
     "your session has ended. please log in again",
+    # A consumed/rotated refresh token never self-recovers: the Codex CLI exits
+    # with a 401 whose body says the refresh token was already used. Two phrasings
+    # observed across Codex CLI versions (the JSON body varies by endpoint):
+    #   "your refresh token was already used"  (CLI ≤ v0.x SDK error string)
+    #   "your refresh token has already been used"  (API JSON body, incident 2026-06-13)
+    # Incident: account SavarinCodex stayed healthy (success rate 2.9%) because
+    # neither phrasing was matched → never auto-disabled → fleet kept routing into
+    # the dead account. Never appears on transient 401s.
+    "refresh token was already used",
+    "refresh token has already been used",
 )
 
 _DEFAULT_TIER_MODELS = {
