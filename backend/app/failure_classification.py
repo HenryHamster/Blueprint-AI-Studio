@@ -1162,6 +1162,9 @@ _CRED_REDACT_SUBS: tuple[tuple[re.Pattern, str], ...] = (
     # GitHub tokens
     (re.compile(r"ghp_[A-Za-z0-9_]+"), "ghp_***"),
     (re.compile(r"ghs_[A-Za-z0-9_]+"), "ghs_***"),
+    (re.compile(r"ghu_[A-Za-z0-9_]+"), "ghu_***"),
+    (re.compile(r"gho_[A-Za-z0-9_]+"), "gho_***"),
+    (re.compile(r"ghr_[A-Za-z0-9_]+"), "ghr_***"),
     (re.compile(r"github_pat_[A-Za-z0-9_]+"), "github_pat_***"),
     # Anthropic API keys (sk-ant-…)
     (re.compile(r"sk-ant-[A-Za-z0-9_-]+"), "sk-ant-***"),
