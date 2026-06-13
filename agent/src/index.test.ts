@@ -313,6 +313,15 @@ describe('sanitize', () => {
     ).toBe('gemini stderr: api key AIza***');
   });
 
+  it('redacts bare ya29 OAuth tokens and unquoted key=value dumps', () => {
+    const token = 'ya29.a0AfH6SMBx_AbCdEfGhIjKlMnOpQrStUvWx';
+    expect(sanitize(token)).toBe('ya29***');
+    const kv = sanitize(`GOOGLE_oauth_token=${token}`);
+    expect(kv).toContain('GOOGLE_oauth_token=');
+    expect(kv).toContain('***');
+    expect(kv).not.toContain(token);
+  });
+
   it('redacts quoted credential fields while preserving field names and quote style', () => {
     const json = '{"access_token":"ya29.secret","refresh_token":"1//refresh","id_token":"header.payload.sig","api_key":"AIzaSyabcdefghijklmnopqrstuvwxyz123456789","client_secret":"client-secret","private_key":"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----","token":"opaque"}';
     expect(sanitize(json)).toBe('{"access_token":"***","refresh_token":"***","id_token":"***","api_key":"***","client_secret":"***","private_key":"***","token":"***"}');
@@ -6273,6 +6282,42 @@ describe('cross-language classification contracts', () => {
   it('_VIEWPORT_PATTERNS still matches expectMinTouchTargetAt function name', () => {
     // viewport.ts throws errors containing 'expectMinTouchTargetAt(...)'.
     expect(classifierSrc).toContain('"expectmintouchtargetat("');
+  });
+});
+
+// ── Cross-language credential redaction corpus ───────────────────────────────
+// Keep the shared corpus file in backend/testing/__fixtures__ so both the
+// backend pytest suite and this agent vitest suite can read the exact same
+// fixtures. If this fails, update the corpus or the sanitizer pattern set.
+describe('cross-language credential redaction corpus', () => {
+  let corpus: Array<{ family: string; secret: string; raw: string }> = [];
+
+  beforeAll(async () => {
+    const realFs = await vi.importActual<typeof import('fs')>('fs');
+    const nodePath = await import('node:path');
+    const nodeUrl = await import('node:url');
+    const dir = nodePath.dirname(nodeUrl.fileURLToPath(import.meta.url));
+    corpus = JSON.parse(
+      realFs.readFileSync(
+        nodePath.join(
+          dir,
+          '..',
+          '..',
+          'backend',
+          'testing',
+          '__fixtures__',
+          'credential_redaction_corpus.json',
+        ),
+        'utf-8',
+      ),
+    ) as Array<{ family: string; secret: string; raw: string }>;
+  });
+
+  it('masks every shared corpus entry', () => {
+    for (const entry of corpus) {
+      const out = sanitize(entry.secret);
+      expect(out).not.toContain(entry.raw);
+    }
   });
 });
 

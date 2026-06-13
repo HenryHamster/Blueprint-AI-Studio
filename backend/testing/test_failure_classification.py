@@ -1,5 +1,6 @@
 """Tests for failure_classification subtype helpers and classify_failure()."""
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -156,6 +157,11 @@ def _task(msg: str = "", ctx: dict | None = None) -> Task:
     t.latest_status_message = msg
     t.context = ctx or {}
     return t
+
+
+CORPUS_PATH = (
+    Path(__file__).resolve().parent / "__fixtures__" / "credential_redaction_corpus.json"
+)
 
 
 class TestPersistFailureCategoryTimeoutSubtype:
@@ -2850,6 +2856,18 @@ class TestRedactCredentials:
         assert "ya29.a0AfH6SMBx_longtoken" not in out
         assert "Bearer ***" in out
 
+    def test_ya29_bare_token_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        token = "ya29.a0AfH6SMBx_AbCdEfGhIjKlMnOpQrStUvWx"
+        bare = _redact_credentials(token)
+        kv = _redact_credentials(f"GOOGLE_oauth_token={token}")
+        assert token not in bare
+        assert token not in kv
+        assert "ya29***" in bare
+        assert "GOOGLE_oauth_token=" in kv
+        assert "***" in kv
+
     def test_bearer_case_insensitive(self):
         from app.failure_classification import _redact_credentials
 
@@ -2953,6 +2971,21 @@ class TestRedactCredentials:
         assert "sk-proj-abcdefghijklmnopqrst" not in out
         assert "AIza" + "B" * 35 not in out
         assert "mytoken123" not in out
+
+
+def _load_redaction_corpus() -> list[dict[str, str]]:
+    return json.loads(CORPUS_PATH.read_text())
+
+
+def test_redaction_corpus_parity():
+    from app.broadcast import _sanitize_log
+    from app.failure_classification import _redact_credentials
+
+    for entry in _load_redaction_corpus():
+        broadcast_out = _sanitize_log(entry["secret"])
+        failure_out = _redact_credentials(entry["secret"])
+        assert entry["raw"] not in broadcast_out, entry["family"]
+        assert entry["raw"] not in failure_out, entry["family"]
 
 
 class TestSanitizeReportAppliesRedaction:

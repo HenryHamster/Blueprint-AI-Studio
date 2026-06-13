@@ -24,6 +24,7 @@ export function sanitize(text: string): string {
     .replace(/sk-proj-[A-Za-z0-9_-]{20,}/g, 'sk-proj-***')
     .replace(/sk-(?!ant-|proj-)[A-Za-z0-9_-]{20,}/g, 'sk-***')
     .replace(/AIza[A-Za-z0-9_-]{20,}/g, 'AIza***')
+    .replace(/ya29\.[A-Za-z0-9_.-]+/g, 'ya29***')
     .replace(
       // keep in sync with backend/app/broadcast.py and backend/app/failure_classification.py
       // Value group uses [^'"\\]|\\. (unambiguous alternation — avoids ReDoS on backslash-heavy inputs)

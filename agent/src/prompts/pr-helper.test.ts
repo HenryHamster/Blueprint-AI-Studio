@@ -160,7 +160,7 @@ case "$*" in
   *"diff --name-only origin/production...HEAD"*) printf '%s\n' 'backend/app/main.py'; exit 0 ;;
   *"diff --name-only HEAD"*) exit 0 ;;
   *"ls-files --others --exclude-standard"*) exit 0 ;;
-  *"status --porcelain"*) exit 0 ;;
+  *"status --porcelain"*) printf '%s\n' '?? src/normal.txt'; exit 0 ;;
   *"rev-list --count origin/production..HEAD"*) printf '1\n'; exit 0 ;;
   *"remote set-url origin"*) exit 0 ;;
   *"push --force-with-lease origin blueprint/task-lts-1"*) exit 0 ;;
@@ -229,6 +229,36 @@ exit 0
     expect(result.stderr).toContain('.github/workflows/ci.yml');
     expect(result.stderr).not.toContain('push attempt 1');
     expect(result.stderr).not.toContain('push failed after 3 attempts');
+  });
+
+  it('fails fast before staging when pending changes include a shell-artifact filename', async () => {
+    const script = writeScript({
+      taskId: 'task-shell-artifact-1',
+      workBranch: 'blueprint/task-shell-artifact-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      const bin = `${dir}/bin`;
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"status --porcelain"*) printf '%s\n' '?? =' '?? src/normal.txt'; exit 0 ;;
+  *"add -A"*) printf 'git add should not run\n' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Suspicious shell-artifact file(s)');
+    expect(result.stderr).toContain('[pr]   =');
+    expect(result.stderr).not.toContain('git add should not run');
   });
 
   it('classifies deterministic workflow-permission push rejections without retrying', async () => {
@@ -354,7 +384,7 @@ esac
       realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
 case "$*" in
-  *"status --porcelain"*) exit 0 ;;
+  *"status --porcelain"*) printf '%s\n' '?? src/normal.txt'; exit 0 ;;
   *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
   *"remote set-url origin"*) exit 0 ;;
   *"push --force-with-lease origin blueprint/task-dirty-1"*) exit 0 ;;
@@ -392,6 +422,7 @@ esac
     });
 
     expect(result.status).toBe(4);
+    expect(result.stderr).not.toContain('Suspicious shell-artifact file(s)');
     expect(result.stdout).toContain('mergeable=false, mergeable_state=dirty');
   });
 });

@@ -1155,6 +1155,8 @@ _CRED_REDACT_SUBS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-***"),
     # Google AIza API keys (39 chars total: "AIza" + 35 alphanumeric)
     (re.compile(r"AIza[A-Za-z0-9_-]{35}"), "AIza***"),
+    # Google OAuth access tokens (ya29.…)
+    (re.compile(r"ya29\.[A-Za-z0-9_.\-]+"), "ya29***"),
     # JWT tokens: three base64url-encoded parts separated by dots
     (
         re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),

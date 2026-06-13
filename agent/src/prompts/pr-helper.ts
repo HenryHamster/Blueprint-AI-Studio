@@ -254,6 +254,22 @@ if [ -n "$_WORKFLOW_CHANGES" ]; then
   exit 1
 fi
 
+# Fail fast on obvious shell-accident junk files before git add -A.
+_SHELL_ARTIFACT_CHANGES=$(
+  git -c core.quotepath=false status --porcelain 2>/dev/null | while IFS= read -r _line; do
+    _path="\${_line:3}"
+    case "$_path" in *" -> "*) _path="\${_path##* -> }" ;; esac
+    _base="\${_path##*/}"
+    case "$_base" in *[A-Za-z0-9._]*|"") ;; *) printf '%s\n' "$_path" ;; esac
+  done | sort -u
+)
+if [ -n "$_SHELL_ARTIFACT_CHANGES" ]; then
+  echo "[pr] Suspicious shell-artifact file(s) found in pending changes." >&2
+  echo "[pr] Remove these files, or rename them to an intentional non-punctuation name, then re-run ./pr open:" >&2
+  printf '%s\n' "$_SHELL_ARTIFACT_CHANGES" | sed 's/^/[pr]   /' >&2
+  exit 1
+fi
+
 # 2. Stage and commit any pending changes
 if [ -n "$(git status --porcelain)" ]; then
   git add -A

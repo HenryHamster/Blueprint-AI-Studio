@@ -229,6 +229,7 @@ _SANITIZE_PATTERNS = [
     (re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}"), "sk-proj-***"),
     (re.compile(r"sk-(?!ant-|proj-)[A-Za-z0-9_\-]{20,}"), "sk-***"),
     (re.compile(r"AIza[A-Za-z0-9_\-]{20,}"), "AIza***"),
+    (re.compile(r"ya29\.[A-Za-z0-9_.\-]+"), "ya29***"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"), "eyJ***"),
     (re.compile(r'Bearer\s+[^\s,\'"]+', re.IGNORECASE), "Bearer ***"),
     (re.compile(r'oauth_token[=:]\s*[^\s&\'"]+', re.IGNORECASE), "oauth_token=***"),
