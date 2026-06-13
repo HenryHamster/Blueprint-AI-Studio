@@ -722,6 +722,21 @@ async def persist_trial_verdicts_in_transaction(
                         actual_verdict,
                         entry,
                     )
+                    try:
+                        from app.strategic_trigger import request_strategic_refresh
+
+                        await request_strategic_refresh(
+                            session,
+                            project_id,
+                            f"capability_verdict:{cap_name}:{actual_verdict}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[CAPABILITY_TRIAL] strategic refresh arm failed for "
+                            "%s verdict transition on project %s (non-fatal)",
+                            cap_name,
+                            project_id,
+                        )
             if gate_alert_detail is not None:
                 # Lazy import to avoid an import cycle: review_fix_lane_pilot
                 # imports record_trial_verdict from this module.

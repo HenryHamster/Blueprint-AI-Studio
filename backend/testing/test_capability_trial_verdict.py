@@ -1844,6 +1844,107 @@ class TestDiagnosticsAfterEditTrialDefinition:
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
 
+    def test_continue_trial_when_n_insufficient(self):
+        """diagnostics_after_edit: total n below min_n → continue-trial/insufficient_data."""
+        from app.capability_trial_verdict import _DEFAULT_ADOPT_LIFT
+
+        defs = get_trial_definitions()
+        td = next(d for d in defs if d["cap_name"] == "diagnostics_after_edit")
+        arm_composition = {
+            "with_assigned": 5,
+            "with_receipt": 0,
+            "without_assigned": 5,
+            "without_receipt": 0,
+        }
+        entry = evaluate_trial_verdict(
+            lift=_DEFAULT_ADOPT_LIFT,
+            n_with=5,
+            n_without=5,
+            config=td["thresholds"],
+            arm_composition=arm_composition,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] in (
+            "insufficient_data",
+            "insufficient_assigned_arm_data",
+        )
+
+    def test_reject_verdict_with_sufficient_assigned_arm_data(self):
+        """diagnostics_after_edit: lift below reject threshold + sufficient arms → reject."""
+        from app.capability_trial_verdict import (
+            _DEFAULT_MIN_N_PER_ARM,
+            _DEFAULT_REJECT_LIFT,
+        )
+
+        defs = get_trial_definitions()
+        td = next(d for d in defs if d["cap_name"] == "diagnostics_after_edit")
+        arm_composition = {
+            "with_assigned": _DEFAULT_MIN_N_PER_ARM,
+            "with_receipt": 0,
+            "without_assigned": _DEFAULT_MIN_N_PER_ARM,
+            "without_receipt": 0,
+        }
+        entry = evaluate_trial_verdict(
+            lift=_DEFAULT_REJECT_LIFT,
+            n_with=_DEFAULT_MIN_N_PER_ARM,
+            n_without=_DEFAULT_MIN_N_PER_ARM,
+            config=td["thresholds"],
+            arm_composition=arm_composition,
+        )
+        assert entry["verdict"] == "reject"
+
+    def test_full_merge_test_verdict_cycle(self):
+        """End-to-end: diagnostics_after_edit evaluate → record → persist on project.
+
+        Simulates a real merge-test scenario: sufficient assigned-arm tasks,
+        positive lift → adopt verdict persisted on project object.
+        """
+        from app.capability_trial_verdict import (
+            _DEFAULT_ADOPT_LIFT,
+            _DEFAULT_MIN_N_PER_ARM,
+        )
+
+        project = _make_project()
+        defs = get_trial_definitions()
+        td = next(d for d in defs if d["cap_name"] == "diagnostics_after_edit")
+
+        arm_composition = {
+            "with_assigned": _DEFAULT_MIN_N_PER_ARM + 5,
+            "with_receipt": 3,
+            "without_assigned": _DEFAULT_MIN_N_PER_ARM + 3,
+            "without_receipt": 2,
+        }
+        n_with = arm_composition["with_assigned"] + arm_composition["with_receipt"]
+        n_without = (
+            arm_composition["without_assigned"] + arm_composition["without_receipt"]
+        )
+        entry = evaluate_trial_verdict(
+            lift=_DEFAULT_ADOPT_LIFT,
+            n_with=n_with,
+            n_without=n_without,
+            config=td["thresholds"],
+            arm_composition=arm_composition,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+            evaluated_at="2026-06-13T00:00:00",
+        )
+        assert entry["verdict"] == "adopt"
+        assert entry["verdict_reason"] == "sufficient_data"
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "diagnostics_after_edit", entry)
+
+        assert (
+            project.capability_adoption_verdicts["diagnostics_after_edit"]["verdict"]
+            == "adopt"
+        )
+        assert (
+            project.capability_adoption_verdicts["diagnostics_after_edit"][
+                "accumulation_basis"
+            ]
+            == "cumulative_terminal_arm_tasks"
+        )
+        mock_flag.assert_called_once()
+
 
 # ── review_fix_lane TrialDefinition registration ──────────────────────────────
 
@@ -2764,3 +2865,81 @@ class TestPersistTrialVerdictsNoticeEmission:
 
         # same prior and actual verdict → no transition → no notice
         mock_notice.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_persist_trial_verdicts_triggers_strategic_refresh_on_decided_transition(
+        self,
+    ):
+        """Decided verdict transitions arm refresh; continue-trial and repeats do not."""
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
+
+        def _make_record_side_effect():
+            def _write_verdict(project, cap_name, entry):
+                project.capability_adoption_verdicts[cap_name] = entry
+
+            return _write_verdict
+
+        async def _run_case(prior_verdicts: dict, entry: dict):
+            project_id = uuid.uuid4()
+            _, _, mock_cm = self._build_mock_db(prior_verdicts=prior_verdicts)
+            mock_factory = MagicMock(return_value=mock_cm)
+
+            with (
+                patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+                patch("app.database.resolve_async_engine", return_value=MagicMock()),
+                patch(
+                    "app.capability_trial_verdict.raise_capability_verdict_notice",
+                    new_callable=AsyncMock,
+                ) as mock_notice,
+                patch(
+                    "app.strategic_trigger.request_strategic_refresh",
+                    new_callable=AsyncMock,
+                ) as mock_refresh,
+                patch("app.capability_trial_verdict.record_trial_verdict") as mock_record,
+            ):
+                mock_record.side_effect = _make_record_side_effect()
+                await persist_trial_verdicts_in_transaction(
+                    MagicMock(),
+                    project_id,
+                    pending_verdicts=[("repo_map", entry)],
+                )
+
+            return mock_notice, mock_refresh
+
+        decided_entry = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.07,
+            "n_with": 40,
+            "n_without": 40,
+        }
+        mock_notice, mock_refresh = await _run_case({}, decided_entry)
+        mock_notice.assert_called_once()
+        mock_refresh.assert_called_once()
+        refresh_args = mock_refresh.call_args[0]
+        assert refresh_args[2] == "capability_verdict:repo_map:adopt"
+
+        continue_entry = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "lift": None,
+            "n_with": 5,
+            "n_without": 0,
+        }
+        mock_notice, mock_refresh = await _run_case({"repo_map": decided_entry}, continue_entry)
+        mock_notice.assert_not_called()
+        mock_refresh.assert_not_called()
+
+        repeated_entry = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.09,
+            "n_with": 50,
+            "n_without": 50,
+        }
+        mock_notice, mock_refresh = await _run_case({"repo_map": decided_entry}, repeated_entry)
+        mock_notice.assert_not_called()
+        mock_refresh.assert_not_called()
