@@ -42,6 +42,7 @@ from app.release_artifacts import (
     get_or_create_release_deploy_artifact,
 )
 from app.notification_dispatch import post_event_message
+from app.release_scoring import _DEFAULT_POLICY, compute_composite
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     get_project_promotion_target as _get_project_promotion_target,
@@ -230,6 +231,78 @@ def _parse_iso_dt(raw: Any) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _recover_confidence_from_ci_unresolved(
+    base_record: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return base_record with confidence recovered from a ci_unresolved blocker.
+
+    When ci_unresolved forces confidence to 0.0, sub_scores still carry the real
+    per-dimension values (always computed before the early return in
+    compute_composite). This re-runs compute_composite with ci_green=True so
+    durable promotion records carry the real qualified confidence, not 0.00.
+
+    Returns base_record unchanged when the blocker is not ci_unresolved.
+    Adds confidence_recovery_failed=True when sub_scores are absent/malformed.
+    """
+    if base_record.get("blocker") != "ci_unresolved":
+        return base_record
+
+    sub_scores = base_record.get("sub_scores")
+    if not isinstance(sub_scores, dict):
+        if float(base_record.get("confidence") or 0.0) == 0.0:
+            return {
+                **base_record,
+                "confidence_recovery_failed": True,
+                "confidence_recovery_failure_reason": "sub_scores absent or not a dict",
+            }
+        return base_record
+
+    audit_raw = sub_scores.get("audit")
+    test_erosion_raw = sub_scores.get("test_erosion")
+    smoketest_raw = sub_scores.get("smoketest")
+    smoketest_enabled = bool(base_record.get("smoketest_enabled", True))
+
+    if not isinstance(audit_raw, (int, float)) or isinstance(audit_raw, bool):
+        return {
+            **base_record,
+            "confidence_recovery_failed": True,
+            "confidence_recovery_failure_reason": "sub_scores.audit not numeric",
+        }
+    if not isinstance(test_erosion_raw, (int, float)) or isinstance(
+        test_erosion_raw, bool
+    ):
+        return {
+            **base_record,
+            "confidence_recovery_failed": True,
+            "confidence_recovery_failure_reason": "sub_scores.test_erosion not numeric",
+        }
+
+    _policy = policy or _DEFAULT_POLICY
+    smoketest_score = (
+        float(smoketest_raw)
+        if isinstance(smoketest_raw, (int, float))
+        and not isinstance(smoketest_raw, bool)
+        else None
+    )
+
+    recovered = compute_composite(
+        ci_green=True,
+        audit_score=float(audit_raw),
+        test_erosion=float(test_erosion_raw),
+        smoketest_score=smoketest_score,
+        policy=_policy,
+        smoketest_enabled=smoketest_enabled,
+    )
+
+    return {
+        **base_record,
+        "confidence": recovered["confidence"],
+        "blocker": recovered.get("blocker"),
+        "confidence_recovered_from_ci_unresolved": True,
+    }
 
 
 async def _record_qualification_verdict(

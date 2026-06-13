@@ -2866,14 +2866,39 @@ async def _make_lane(
     return lane
 
 
+async def _make_task_with_pr(db_session, project, status, *, pr_number=42):
+    """Create a terminal task carrying PR dispatch context (pr_number, branch,
+    base_branch) so sweep_stranded_lanes can spawn a recovery task for it."""
+    task = Task(
+        project_id=project.id,
+        title="pr fix",
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": pr_number,
+                "branch": f"feature/pr-{pr_number}",
+                "base_branch": "automain",
+                "prompt": "fix it",
+                "original_task_id": "orig-task-id",
+            }
+        ],
+        context={"_review_fix_lane_id": "some-lane-id"},
+        status=status,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
 @pytest.mark.asyncio
 async def test_sweep_reconciles_stranded_active_lane_and_ages_stale_proposed(
     db_session, lanes_on
 ):
     """Acceptance seam: the sweep reconciles an ACTIVE lane whose bound task was
-    cancelled externally (requeue-from-checkpoint -> PARKED, stale binding
-    cleared) AND ages a stale PROPOSED lane to KILLED, while leaving a fresh
-    PROPOSED lane untouched — and a re-run (concurrent tick) is a safe no-op."""
+    cancelled externally (no PR context -> KILLED deterministically) AND ages a
+    stale PROPOSED lane to KILLED, while leaving a fresh PROPOSED lane untouched
+    — and a re-run (concurrent tick) is a safe no-op."""
     project = await _make_project(db_session, name="Strand Recon")
 
     cancelled = await _make_task(db_session, project, TaskStatus.CANCELLED)
@@ -2906,10 +2931,10 @@ async def test_sweep_reconciles_stranded_active_lane_and_ages_stale_proposed(
     assert transitioned == 2, "one stranded ACTIVE + one stale PROPOSED"
 
     await db_session.refresh(active_lane)
-    assert active_lane.status == ImprovementLaneStatus.PARKED.value, (
-        "under-budget stranded lane requeues-from-checkpoint (PARKED)"
+    assert active_lane.status == ImprovementLaneStatus.KILLED.value, (
+        "stranded lane with no PR context is killed deterministically (not parked inert)"
     )
-    assert active_lane.current_task_id is None, "stale task binding must be cleared"
+    assert active_lane.retired_at is not None
     assert active_lane.phase_requeues == 1, "mark_checkpoint_missing bumped the counter"
 
     await db_session.refresh(stale_proposed)
@@ -2958,7 +2983,8 @@ async def test_sweep_kills_stranded_active_lane_when_budget_exhausted(
 @pytest.mark.asyncio
 async def test_sweep_reconciles_vanished_and_unbound_active_lanes(db_session, lanes_on):
     """An ACTIVE lane whose current_task_id points at a deleted Task (vanished),
-    and one with no bound task at all, are both reconciled (PARKED under budget)."""
+    and one with no bound task at all, are both killed deterministically —
+    no dispatch context means no recovery task can be created."""
     project = await _make_project(db_session, name="Strand Vanished")
 
     vanished_lane = await _make_lane(
@@ -2983,7 +3009,7 @@ async def test_sweep_reconciles_vanished_and_unbound_active_lanes(db_session, la
 
     for lane in (vanished_lane, unbound_lane):
         await db_session.refresh(lane)
-        assert lane.status == ImprovementLaneStatus.PARKED.value
+        assert lane.status == ImprovementLaneStatus.KILLED.value
         assert lane.current_task_id is None
 
 
@@ -3111,8 +3137,8 @@ async def test_sweep_idle_pool_vms_invokes_stranded_lane_sweep(
 
     assert spy.call_count == 1, "sweep_idle_pool_vms must invoke sweep_stranded_lanes"
     await db_session.refresh(lane)
-    assert lane.status == ImprovementLaneStatus.PARKED.value, (
-        "the wired sweep actually reconciled the stranded lane"
+    assert lane.status == ImprovementLaneStatus.KILLED.value, (
+        "the wired sweep killed the stranded lane (no PR context for recovery)"
     )
 
 
@@ -3187,12 +3213,13 @@ async def test_sweep_stranded_lane_kill_clears_pool_vm_reservation(
 
 
 @pytest.mark.asyncio
-async def test_sweep_stranded_lane_park_does_not_clear_reservation(
+async def test_sweep_stranded_lane_no_context_kills_and_clears_reservation(
     db_session, lanes_on
 ):
-    """sweep_stranded_lanes does NOT clear PoolVm reservation fields when it
-    PARKs an under-budget stranded lane — the lane is still active/requeuing."""
-    project = await _make_project(db_session, name="Stranded Park Res")
+    """sweep_stranded_lanes kills an under-budget stranded lane that has no PR
+    dispatch context and clears the PoolVm reservation — the lane cannot be
+    recovered without a pr_number so it is terminated deterministically."""
+    project = await _make_project(db_session, name="Stranded No-ctx Res")
     cancelled = await _make_task(db_session, project, TaskStatus.CANCELLED)
     lane = await _make_lane(
         db_session,
@@ -3200,9 +3227,11 @@ async def test_sweep_stranded_lane_park_does_not_clear_reservation(
         status=ImprovementLaneStatus.ACTIVE,
         current_task_id=cancelled.id,
         phase_requeues=0,
-        name="stranded-under-budget",
+        name="stranded-no-context",
     )
-    member = await _register(db_session, project, "agent-vm-park-res", PoolVmState.IDLE)
+    member = await _register(
+        db_session, project, "agent-vm-nokill-res", PoolVmState.IDLE
+    )
     member.reserved_lane_id = lane.id
     member.reservation_expires_at = _utcnow() + timedelta(hours=1)
     member.reservation_hard_expires_at = _utcnow() + timedelta(hours=2)
@@ -3215,14 +3244,71 @@ async def test_sweep_stranded_lane_park_does_not_clear_reservation(
     assert transitioned == 1
 
     await db_session.refresh(lane)
-    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.status == ImprovementLaneStatus.KILLED.value, (
+        "no-context stranded lane must be killed, not parked into a dead state"
+    )
 
     await db_session.refresh(member)
-    assert member.reserved_lane_id == lane.id, (
-        "reservation must NOT be cleared when lane is only PARKed (still requeuing)"
+    assert member.reserved_lane_id is None, (
+        "reservation must be cleared after deterministic kill"
     )
-    assert member.reservation_expires_at is not None
-    assert member.reservation_hard_expires_at is not None
+    assert member.reservation_expires_at is None
+    assert member.reservation_hard_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_creates_recovery_task_when_context_available(
+    db_session, lanes_on
+):
+    """Acceptance proof: a stranded ACTIVE lane whose terminal task carries PR
+    dispatch context (pr_number / branch / base_branch) is re-dispatched with a
+    live QUEUED recovery task rather than parked inert until retirement.
+
+    The lane stays ACTIVE and current_task_id is rebound to the new recovery
+    task, so chain continuity is maintained and the 'requeue-from-checkpoint'
+    promise is real (selector: backend/testing/test_warm_pool_maintainer.py)."""
+    from app.models import Task as _Task
+
+    project = await _make_project(db_session, name="Strand Recovery")
+    cancelled = await _make_task_with_pr(
+        db_session, project, TaskStatus.CANCELLED, pr_number=99
+    )
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=cancelled.id,
+        phase_requeues=0,
+        name="stranded-with-context",
+    )
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 1
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value, (
+        "lane with PR context stays ACTIVE — bound to the recovery task"
+    )
+    assert lane.phase_requeues == 1, "mark_checkpoint_missing bumped the counter"
+    assert lane.current_task_id is not None, "lane must be bound to recovery task"
+    assert lane.current_task_id != cancelled.id, "old stale binding must be replaced"
+
+    # The recovery task must exist and be QUEUED.
+    recovery = await db_session.get(_Task, lane.current_task_id)
+    assert recovery is not None, "recovery task must exist in the DB"
+    assert recovery.status == TaskStatus.QUEUED, "recovery task must be QUEUED"
+    assert recovery.project_id == project.id
+    payload = recovery.first_payload or {}
+    assert payload.get("pr_number") == 99, "recovery payload carries the PR number"
+    assert payload.get("type") == "fix"
+
+    # A second sweep tick must not re-process the lane (now ACTIVE with a live task).
+    second = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert second == 0, "live-task lane is not stranded — re-run is a no-op"
 
 
 @pytest.mark.asyncio

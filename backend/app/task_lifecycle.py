@@ -393,7 +393,10 @@ def _resolve_adversarial_challenged_hashes(source: Task, grader: Task) -> list[s
     grader-side copy (for crash/recovery gaps), then the legacy plan_output
     fallback for parked sources that predate the persistence fix.
     """
-    from app.finding_deduplication import finding_hash as _fh
+    from app.finding_deduplication import (
+        canonical_finding_body as _canonical_body,
+        finding_hash as _fh,
+    )
 
     _stored_hashes = (source.context or {}).get("_adversarial_challenged_hashes")
     if isinstance(_stored_hashes, list) and _stored_hashes:
@@ -409,7 +412,7 @@ def _resolve_adversarial_challenged_hashes(source: Task, grader: Task) -> list[s
     return [
         _fh(
             str(f.get("title", "")),
-            str(f.get("description", "") or f.get("prompt", "")),
+            _canonical_body(f),
         )
         for f in stored_findings
         if isinstance(f, dict)
@@ -3208,11 +3211,16 @@ async def _process_post_commit(
                     # will be spawned, so the lane must reach a terminal state here
                     # rather than staying PARKED until the warm-pool hard ceiling.
                     try:
-                        from app.review_fix_lane_pilot import retire_chain_lane as _retire_lane_approve
+                        from app.review_fix_lane_pilot import (
+                            retire_chain_lane as _retire_lane_approve,
+                        )
 
                         await _retire_lane_approve(session, task.context or {})
                     except Exception:  # noqa: BLE001
-                        logger.debug("[PIPELINE] retire_chain_lane (APPROVE) failed (non-critical)", exc_info=True)
+                        logger.debug(
+                            "[PIPELINE] retire_chain_lane (APPROVE) failed (non-critical)",
+                            exc_info=True,
+                        )
                     # Rollup gate handoff: when the original task is parking in CI wait
                     # (rollup-to-main / large rollup path in rollup_management), the parent
                     # owns the merge gate. The review task must NOT merge directly — it

@@ -2229,7 +2229,7 @@ async def test_sweep_stranded_lanes_class1_active_no_task_id_is_stranded(
 
     assert count == 1
     refreshed = await db.get(ImprovementLane, lane.id)
-    assert refreshed.status == ImprovementLaneStatus.PARKED.value
+    assert refreshed.status == ImprovementLaneStatus.KILLED.value
     assert refreshed.current_task_id is None
 
 
@@ -2258,8 +2258,8 @@ async def test_sweep_stranded_lanes_class1_terminal_task_statuses_are_stranded(
 
         assert count == 1, f"expected 1 transition for status={status}"
         refreshed = await db.get(ImprovementLane, lane.id)
-        assert refreshed.status == ImprovementLaneStatus.PARKED.value, (
-            f"expected PARKED for status={status}"
+        assert refreshed.status == ImprovementLaneStatus.KILLED.value, (
+            f"expected KILLED for status={status} (no PR dispatch context)"
         )
 
 
@@ -2292,15 +2292,16 @@ async def test_sweep_stranded_lanes_class1_live_task_not_stranded(
 async def test_sweep_stranded_lanes_class1_under_budget_parks_with_clear_task(
     db: AsyncSession,
 ):
-    """Stranded ACTIVE lane under the requeue budget must transition ACTIVE→PARKED
-    with the task binding cleared (clear_task=True path)."""
+    """Stranded ACTIVE lane under the requeue budget with no PR dispatch context
+    must transition ACTIVE→KILLED (deterministic kill path clears task binding)."""
     from app.models import TaskStatus
     from app.warm_pool_maintainer import sweep_stranded_lanes
     from datetime import datetime
 
     project_id = await _make_project(db)
     task = await _make_task(db, project_id, TaskStatus.COMPLETED)
-    # phase_requeues=0 → after mark_checkpoint_missing increments → 1 ≤ 3 → PARKED
+    # phase_requeues=0 → after mark_checkpoint_missing increments → 1 ≤ 3
+    # but task payload has no pr_number → killed deterministically
     lane = await _make_active_lane(
         db, project_id, current_task_id=task.id, phase_requeues=0
     )
@@ -2313,7 +2314,7 @@ async def test_sweep_stranded_lanes_class1_under_budget_parks_with_clear_task(
 
     assert count == 1
     refreshed = await db.get(ImprovementLane, lane.id)
-    assert refreshed.status == ImprovementLaneStatus.PARKED.value
+    assert refreshed.status == ImprovementLaneStatus.KILLED.value
     assert refreshed.current_task_id is None
 
 

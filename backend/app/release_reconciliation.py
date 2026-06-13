@@ -47,6 +47,7 @@ from app.release_promotion import (
     _promotion_pr_landed,
     _record_promotion_failure,
     _record_promotion_success,
+    _recover_confidence_from_ci_unresolved,
     _resolve_github_with_session,
 )
 from app.rollup_migration_validation import _validate_migration_chain_post_merge
@@ -771,7 +772,7 @@ async def _reconcile_if_not_promoted_but_pr_merged(
             if not candidate_sha:
                 return False
 
-            base_record = dict(qual)
+            base_record = _recover_confidence_from_ci_unresolved(dict(qual))
             project = await session.get(Project, version.project_id)
             if project is None:
                 return False

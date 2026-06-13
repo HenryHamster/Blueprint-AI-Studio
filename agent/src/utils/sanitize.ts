@@ -42,3 +42,14 @@ export function sanitize(text: string): string {
     .replace(/oauth_token[=:]\s*[^\s&'"]+/gi, 'oauth_token=***')
     .replace(/-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----/g, '***PRIVATE KEY***');
 }
+
+/**
+ * Extract the message from a caught unknown value and sanitize it.
+ * Use this at the error-extraction site so every downstream consumer
+ * (sendLog, persistAndPostStatus, string interpolation) receives
+ * an already-redacted value rather than relying on each call site
+ * to remember the outer sanitize() wrap.
+ */
+export function sanitizeError(e: unknown): string {
+  return sanitize(e instanceof Error ? e.message : String(e));
+}

@@ -5613,11 +5613,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 continue
             missing_hash = _finding_hash(
                 str(missing_title),
-                str(
-                    missing_finding.get("description")
-                    or missing_finding.get("prompt", "")
-                    or ""
-                ),
+                _canonical_finding_body(missing_finding),
             )
             lineage_need = {"kind": "task", "ref": missing_hash}
             same_batch_foundation = next(

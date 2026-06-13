@@ -1377,6 +1377,7 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
     )
 
     for lane in active_lanes:
+        task = None
         stranded = False
         if lane.current_task_id is None:
             stranded = True
@@ -1388,26 +1389,154 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
             continue
 
         # Bounded recovery: increment the requeue counter via the shared
-        # primitive, then either requeue-from-checkpoint (park, clearing the
-        # stale binding) while under budget or terminate once exhausted.
+        # primitive, then either create a checkpoint-recovery task (rebinding
+        # the lane while it stays ACTIVE) while under budget, or terminate
+        # once the budget is exhausted.  A lane with no usable dispatch context
+        # (task vanished, or payload carries no pr_number) is killed
+        # deterministically rather than parked into a dead state with no
+        # resume path.
         try:
-            _, should_requeue = await mark_checkpoint_missing(
+            lane_locked, should_requeue = await mark_checkpoint_missing(
                 session, lane.id, reason="stranded_terminal_task"
             )
             if should_requeue:
-                await cas_transition(
-                    session,
-                    lane.id,
-                    ImprovementLaneStatus.ACTIVE,
-                    ImprovementLaneStatus.PARKED,
-                    clear_task=True,
+                payload = (task.first_payload or {}) if task is not None else {}
+                task_ctx = dict((task.context if task is not None else None) or {})
+                pr_number = payload.get("pr_number")
+                branch = payload.get("branch")
+                base_branch = payload.get("base_branch")
+                original_task_id = payload.get("original_task_id") or (
+                    str(task.id) if task is not None else None
                 )
-                logger.info(
-                    "[WARM-POOL] reconciled stranded ACTIVE lane %s -> PARKED "
-                    "(requeue-from-checkpoint; phase_requeues=%d)",
-                    lane.id,
-                    lane.phase_requeues,
-                )
+
+                if task is not None and pr_number is not None:
+                    # Dispatch context available: create a recovery task and
+                    # rebind the lane to it (stays ACTIVE), mirroring the
+                    # in-pipeline _handle_lane_checkpoint_recovery path.
+                    from app.models import TaskHistory
+                    from app.payload_schemas import validate_internal_payload
+                    from app.review_fix_lane_pilot import (
+                        LANE_CHAIN_ID_KEY,
+                        LANE_PILOT_ASSIGNMENT_KEY,
+                        LANE_RECOVERY_ATTEMPT_KEY,
+                        LANE_RECOVERY_REASON_KEY,
+                        rebind_lane_to_recovery,
+                        strip_transient_lane_context,
+                    )
+                    from app.review_pipeline import _pipeline_task_idempotency_key
+
+                    attempt = lane_locked.phase_requeues or 0
+                    recovery_ctx: dict = {}
+                    for key in (
+                        "review_loop",
+                        LANE_PILOT_ASSIGNMENT_KEY,
+                        LANE_CHAIN_ID_KEY,
+                    ):
+                        if task_ctx.get(key) is not None:
+                            recovery_ctx[key] = task_ctx[key]
+                    strip_transient_lane_context(recovery_ctx)
+                    recovery_ctx[LANE_RECOVERY_REASON_KEY] = "stranded_terminal_task"
+                    recovery_ctx[LANE_RECOVERY_ATTEMPT_KEY] = attempt
+
+                    recovery_prompt = (
+                        f"Lane checkpoint recovery for PR #{pr_number}. The prior "
+                        f"phase task was cancelled or killed before writing a "
+                        f"checkpoint. Starting from a FRESH clone of {branch}, "
+                        f"re-verify the work on this PR and push any needed changes."
+                    )
+                    recovery_payload = validate_internal_payload(
+                        {
+                            "type": "fix",
+                            "pr_number": pr_number,
+                            "branch": branch,
+                            "base_branch": base_branch,
+                            "prompt": recovery_prompt,
+                            "original_task_id": original_task_id,
+                        },
+                        "lane_checkpoint_recovery",
+                    )
+                    idempotency_key = _pipeline_task_idempotency_key(
+                        project_id=task.project_id,
+                        task_type="lane_recovery",
+                        pr_number=pr_number,
+                        original_task_id=original_task_id,
+                        iteration=attempt,
+                        is_rollup=False,
+                    )
+                    recovery_task = Task(
+                        project_id=task.project_id,
+                        title=f"Lane checkpoint recovery PR #{pr_number}",
+                        description=recovery_prompt,
+                        parent_task_id=task.parent_task_id,
+                        priority=task.priority,
+                        payloads=[recovery_payload],
+                        context=recovery_ctx,
+                        idempotency_key=idempotency_key,
+                        vm_instance_id=None,
+                        status=TaskStatus.QUEUED,
+                        created_by="ORCHESTRATOR",
+                    )
+                    session.add(recovery_task)
+                    await session.flush()
+                    await rebind_lane_to_recovery(
+                        session,
+                        lane_locked,
+                        task_id=recovery_task.id,
+                        reason="stranded_terminal_task",
+                    )
+                    session.add(
+                        TaskHistory(
+                            task_id=recovery_task.id,
+                            action="SPAWNED",
+                            details={
+                                "spawned_by": "WARM_POOL_MAINTAINER",
+                                "type": "lane_checkpoint_recovery",
+                                "pr_number": pr_number,
+                                "attempt": attempt,
+                            },
+                        )
+                    )
+                    logger.info(
+                        "[WARM-POOL] stranded ACTIVE lane %s -> recovery task %s "
+                        "(phase_requeues=%d; pr=%s)",
+                        lane.id,
+                        str(recovery_task.id)[:8],
+                        lane_locked.phase_requeues,
+                        pr_number,
+                    )
+                else:
+                    # No dispatch context (task vanished or payload has no
+                    # pr_number) — kill deterministically so the lane does not
+                    # sit inert until stale retirement.
+                    await cas_transition(
+                        session,
+                        lane.id,
+                        ImprovementLaneStatus.ACTIVE,
+                        ImprovementLaneStatus.KILLED,
+                    )
+                    logger.info(
+                        "[WARM-POOL] stranded ACTIVE lane %s -> KILLED "
+                        "(no dispatch context for recovery; phase_requeues=%d)",
+                        lane.id,
+                        lane_locked.phase_requeues,
+                    )
+                    reserved = (
+                        (
+                            await session.execute(
+                                select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    for member in reserved:
+                        member.reserved_lane_id = None
+                        member.reservation_expires_at = None
+                        member.reservation_hard_expires_at = None
+                        session.add(member)
+                        await record_lane_reservation_cause(
+                            session, lane.id, "force_expired"
+                        )
             else:
                 await cas_transition(
                     session,
@@ -1419,7 +1548,7 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                     "[WARM-POOL] reconciled stranded ACTIVE lane %s -> KILLED "
                     "(requeue budget exhausted; phase_requeues=%d)",
                     lane.id,
-                    lane.phase_requeues,
+                    lane_locked.phase_requeues,
                 )
                 reserved = (
                     (

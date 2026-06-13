@@ -37,7 +37,7 @@ import {
   scheduleProactiveTokenRefresh, stopProactiveTokenRefresh,
   computeRefreshDelayMs, isBootstrapToken,
 } from './utils/agent-token.js';
-import { sanitize } from './utils/sanitize.js';
+import { sanitize, sanitizeError } from './utils/sanitize.js';
 import {
   type StaleResultEnvelope,
   createStaleResultEnvelope, parseStaleResultFile,
@@ -2271,7 +2271,7 @@ async function connectLogStream(taskId: string): Promise<WebSocket | null> {
   return null;
 }
 
-export { sanitize };
+export { sanitize, sanitizeError };
 
 export function readHandlerOutput(
   taskId: string,

@@ -112,6 +112,7 @@ from app.release_promotion import (
     _record_promotion_failure,  # noqa: F401 — tests access via rq.*
     _record_promotion_success,
     _record_qualification_verdict,
+    _recover_confidence_from_ci_unresolved,
     _relock_version_for_promotion_write,  # noqa: F401 — tests access via rq.*
     _resolve_github_with_session,
     promote,
@@ -506,7 +507,10 @@ def _promotion_in_flight_result(
     qual_state = release_version.summarize_qualification_state(
         version.last_qualification
     )
-    if qual_state and qual_state.get("state") in release_version.PROMOTION_BLOCKING_STATES:
+    if (
+        qual_state
+        and qual_state.get("state") in release_version.PROMOTION_BLOCKING_STATES
+    ):
         result = {
             # Echo the specific blocking sub-state (``promotion_in_flight`` for
             # native auto-merge, ``promotion_check_wait`` for the managed
@@ -1882,7 +1886,7 @@ async def _guard_ci_unresolved_promotion_in_flight(
             session,
             version,
             candidate_sha,
-            base_record,
+            _recover_confidence_from_ci_unresolved(base_record),
             pr_url=_idempotent_pr_url(base_record),
             token=token,
             owner=owner,
@@ -1932,7 +1936,7 @@ async def _guard_ci_unresolved_promotion_in_flight(
         auto_merge_enabled,
     )
     q = dict(version.last_qualification or {})
-    q.update(base_record)
+    q.update(_recover_confidence_from_ci_unresolved(base_record))
     q["status"] = "pending"
     q["promotion_pending"] = {
         "pr_number": pr_number,
@@ -2084,10 +2088,9 @@ async def _finalize_qualification(
                 # on tasks with empty status messages that were never explicitly
                 # classified by the reaper or agent_status.
                 infra_respawn_count = qual.get("audit_infra_respawn_count", 0)
-                _audit_explicit_cat = (
-                    (_audit_task_obj.context or {}).get("failure_category", "")
-                    or (_audit_task_obj.context or {}).get("failure_class", "")
-                )
+                _audit_explicit_cat = (_audit_task_obj.context or {}).get(
+                    "failure_category", ""
+                ) or (_audit_task_obj.context or {}).get("failure_class", "")
                 if (
                     _audit_task_obj.status == TaskStatus.FAILED
                     and _audit_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
@@ -2318,9 +2321,7 @@ async def _finalize_qualification(
         _integration_branch, promotion_target = (
             _lts_branch_names(project) if project is not None else ("", "main")
         )
-        challenge_base_branch = (
-            audit_payload.get("base_branch") or promotion_target
-        )
+        challenge_base_branch = audit_payload.get("base_branch") or promotion_target
         challenge_diff_range = (
             audit_payload.get("diff_range")
             or f"{challenge_base_branch}...{candidate_sha}"
@@ -2415,10 +2416,9 @@ async def _finalize_qualification(
                     challenge_infra_respawn_count = qual.get(
                         "challenge_infra_respawn_count", 0
                     )
-                    _chal_explicit_cat = (
-                        (_challenge_task_obj.context or {}).get("failure_category", "")
-                        or (_challenge_task_obj.context or {}).get("failure_class", "")
-                    )
+                    _chal_explicit_cat = (_challenge_task_obj.context or {}).get(
+                        "failure_category", ""
+                    ) or (_challenge_task_obj.context or {}).get("failure_class", "")
                     if (
                         _challenge_task_obj.status == TaskStatus.FAILED
                         and _chal_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
@@ -2446,8 +2446,8 @@ async def _finalize_qualification(
                             or _audit_payload.get("diff_range")
                             or f"{_chal_base_branch}...{candidate_sha}"
                         )
-                        _chal_primary_findings = (
-                            _primary_findings_for_challenge_retry(audit_report)
+                        _chal_primary_findings = _primary_findings_for_challenge_retry(
+                            audit_report
                         )
                         if _chal_primary_findings:
                             from app.payload_schemas import PayloadTooLargeError
@@ -2658,7 +2658,9 @@ async def _finalize_qualification(
             _audit_report_scored,
             challenger_refuted_audit_findings,
             _challenge_binding_record,
-        ) = _reconcile_audit_with_challenge(audit_report, challenge_verdicts, candidate_sha)
+        ) = _reconcile_audit_with_challenge(
+            audit_report, challenge_verdicts, candidate_sha
+        )
         if _challenge_hold:
             logger.warning(
                 "[RELEASE_QUALIFIER] v%d challenge reconciliation HOLD: %s — "
@@ -2672,8 +2674,7 @@ async def _finalize_qualification(
             primary_findings = _primary_findings_for_challenge_retry(audit_report)
             if (
                 _challenge_hold in _AUDIT_CHALLENGE_BINDING_HOLDS
-                and challenge_respawn_count
-                < _MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
+                and challenge_respawn_count < _MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
                 and _audit_task_matches_candidate(_audit_task_obj, candidate_sha)
                 and primary_findings
             ):
@@ -2685,9 +2686,7 @@ async def _finalize_qualification(
                     else {}
                 )
                 audit_payload = (
-                    _audit_task_obj.first_payload
-                    if _audit_task_obj is not None
-                    else {}
+                    _audit_task_obj.first_payload if _audit_task_obj is not None else {}
                 )
                 project = await session.get(Project, version.project_id)
                 _integration_branch, promotion_target = (
@@ -2733,10 +2732,7 @@ async def _finalize_qualification(
                 # vs what this qualification expected.
                 _sha_mismatch_observed = (
                     str(
-                        (challenge_verdicts or {}).get(
-                            "challenged_candidate_sha"
-                        )
-                        or ""
+                        (challenge_verdicts or {}).get("challenged_candidate_sha") or ""
                     )
                     or None
                     if _challenge_hold == "audit_challenge_sha_mismatch"
@@ -2818,11 +2814,14 @@ async def _finalize_qualification(
     audit_challenge = audit_reconciliation.get("audit_challenge")
     audit_task_candidate_sha = None
     if _audit_task_obj is not None:
-        audit_task_candidate_sha = str(
-            (_audit_task_obj.context or {}).get("candidate_sha")
-            or (_audit_task_obj.first_payload or {}).get("candidate_sha")
-            or ""
-        ).strip() or None
+        audit_task_candidate_sha = (
+            str(
+                (_audit_task_obj.context or {}).get("candidate_sha")
+                or (_audit_task_obj.first_payload or {}).get("candidate_sha")
+                or ""
+            ).strip()
+            or None
+        )
     audit_reconciliation["audit_leg_proof"] = _build_audit_leg_proof(
         candidate_sha=candidate_sha,
         audit_task_id=str(audit_task_id) if audit_task_id else None,
@@ -2845,7 +2844,8 @@ async def _finalize_qualification(
             if isinstance(audit_challenge, dict)
             else None
         ),
-        legacy_advisory_only=bool(audit_challenge_task_id) and not bool(challenge_task_id),
+        legacy_advisory_only=bool(audit_challenge_task_id)
+        and not bool(challenge_task_id),
     )
 
     # --- Deterministic Alembic revision-identity safety gate ----------------
@@ -3237,9 +3237,7 @@ async def _required_children_terminal(
             else None
         )
         challenge_task_id = (
-            uuid.UUID(str(challenge_task_id_raw))
-            if challenge_required
-            else None
+            uuid.UUID(str(challenge_task_id_raw)) if challenge_required else None
         )
     except (ValueError, TypeError, AttributeError):
         logger.warning(

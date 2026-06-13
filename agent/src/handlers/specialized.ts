@@ -1,7 +1,7 @@
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
-  WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
+  WORKSPACE, strVal, sanitize, sanitizeError, sendLog, validateBranchName, readHandlerOutput,
   persistAndPostStatus, git, runClaudeCode, sendHeartbeatSync,
   setCurrentPromptFingerprint, listOpenPullRequestsForBranch, deriveTaskBranch, matchesRateLimit,
   resolveBaseBranch, resolveTaskBranchNamespace,
@@ -375,7 +375,7 @@ export async function handleSmoketest(
       execFileSync('git', ['checkout', '--detach', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
       sendLog(ws, `Checked out candidate commit ${candidateSha.slice(0, 12)} (detached HEAD).\n`);
     } catch (e) {
-      const detail = e instanceof Error ? e.message : String(e);
+      const detail = sanitizeError(e);
       sendLog(ws, `[ERROR] Could not check out candidate commit ${candidateSha}: ${detail}\n`);
       await persistAndPostStatus(taskId, {
         task_id: taskId,
@@ -1016,7 +1016,7 @@ Return ONLY the JSON object for /tmp/investigation_report_${taskId}.json with to
         task_id: taskId,
         status: 'FAILED',
         artifact_type: 'ERROR_LOG',
-        logs: logsBlob,
+        logs: sanitize(logsBlob),
         failure_category: rateLimitDetected ? 'rate_limited' : 'parse_failed',
       });
       return;

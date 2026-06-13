@@ -5060,6 +5060,77 @@ async def test_task_prerequisite_rebinds_to_same_batch_design_lineage(
 
 
 @_pytest.mark.asyncio
+async def test_depends_on_indices_wires_edge_when_foundation_description_has_trailing_whitespace(
+    db_session, mocker
+):
+    """depends_on edge must resolve when the foundation finding's description has
+    trailing whitespace (e.g. a trailing newline, common in LLM-emitted findings).
+
+    The bug: missing_hash was computed from the raw unstripped description, but
+    finding_lineage on the spawned foundation task is built from the canonical
+    stripped body. For a description like "Some body\\n" the two hashes diverge,
+    the lineage match fails, no edge is wired, and the dependent enters BLOCKED.
+    The fix: use _canonical_finding_body (which strips) for the missing_hash so
+    both sides agree.
+
+    Also covers the empty-string description case: when description is "" and
+    prompt is non-empty, the canonical body uses prompt (stripped), matching what
+    the lineage stores.
+    """
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-trailing-ws"
+    )
+
+    # Foundation finding whose description has a trailing newline.
+    foundation = _make_finding(
+        title="Build shared event infrastructure",
+        direction_id=direction["id"],
+    )
+    foundation["description"] = "Core pub/sub infrastructure\n"
+
+    dependent = _make_finding(
+        title="Wire domain event handlers",
+        direction_id=direction["id"],
+    )
+    dependent["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[foundation, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    by_title = {c.title: c for c in children}
+    foundation_child = by_title[foundation["title"]]
+    dependent_child = by_title[dependent["title"]]
+
+    assert dependent_child.status != TaskStatus.BLOCKED, (
+        "dependent must not be BLOCKED when foundation description has trailing whitespace"
+    )
+    assert str(foundation_child.id) in (dependent_child.depends_on or []), (
+        "depends_on edge must wire to the foundation task despite trailing newline in description"
+    )
+    assert get_blocker_needs(dependent_child) == [], (
+        "no unresolved need must be persisted when the edge was wired"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_observation_dependency_escalates_instead_of_blocking(db_session, mocker):
     """Observation/non-spawning findings cannot provide a task, so a dependent
     whose only need is that finding escalates instead of entering BLOCKED."""
