@@ -915,6 +915,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       && child.pid === originalPid
       && child.exitCode === null
       && child.signalCode === null;
+    const setForceKillTimer = (callback: () => void): void => {
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      forceKillTimer = setTimeout(callback, PROCESS_KILL_GRACE_MS);
+    };
     const resetStallWatchdog = () => {
       if (stallWatchdog) clearTimeout(stallWatchdog);
       stallWatchdog = setTimeout(() => {
@@ -923,10 +927,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         const pid = originalPid;
         if (pid !== undefined) {
           try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-          forceKillTimer = setTimeout(() => {
+          setForceKillTimer(() => {
             if (!processGroupStillOwned()) return;
             try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-          }, PROCESS_KILL_GRACE_MS);
+          });
         }
       }, CLAUDE_STREAM_STALL_MS);
     };
@@ -938,10 +942,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       const pid = originalPid;
       if (pid !== undefined && processGroupStillOwned()) {
         try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-        forceKillTimer = setTimeout(() => {
+        setForceKillTimer(() => {
           if (!processGroupStillOwned()) return;
           try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-        }, PROCESS_KILL_GRACE_MS);
+        });
       }
     }, timeoutMs);
 
@@ -970,10 +974,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         const pid = originalPid;
         if (pid !== undefined) {
           try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-          forceKillTimer = setTimeout(() => {
+          setForceKillTimer(() => {
             if (!processGroupStillOwned()) return;
             try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-          }, PROCESS_KILL_GRACE_MS);
+          });
         }
       }
     }, 60_000);
@@ -1033,10 +1037,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         const pid = originalPid;
         if (pid !== undefined) {
           try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-          forceKillTimer = setTimeout(() => {
+          setForceKillTimer(() => {
             if (!processGroupStillOwned()) return;
             try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-          }, PROCESS_KILL_GRACE_MS);
+          });
         }
       }
     }, 60_000);
@@ -1063,10 +1067,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         const pid = originalPid;
         if (pid !== undefined) {
           try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-          forceKillTimer = setTimeout(() => {
+          setForceKillTimer(() => {
             if (!processGroupStillOwned()) return;
             try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-          }, PROCESS_KILL_GRACE_MS);
+          });
         }
       }, 60_000);
     }
@@ -1214,10 +1218,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                   const pid = originalPid;
                   if (pid !== undefined) {
                     try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-                    forceKillTimer = setTimeout(() => {
+                    setForceKillTimer(() => {
                       if (!processGroupStillOwned()) return;
                       try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-                    }, PROCESS_KILL_GRACE_MS);
+                    });
                   }
                 }, CLAUDE_RESULT_GRACE_MS);
               }

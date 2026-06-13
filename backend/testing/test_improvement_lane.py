@@ -2512,3 +2512,94 @@ async def test_sweep_stranded_lanes_class2_inert_when_disabled(db: AsyncSession)
     assert count == 0
     refreshed = await db.get(ImprovementLane, lane.id)
     assert refreshed.status == ImprovementLaneStatus.PROPOSED.value
+
+
+# ---------------------------------------------------------------------------
+# checkpoint_and_reserve_on_phase_complete — cost/token accumulation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_accumulates_phase_cost_and_tokens(db: AsyncSession):
+    """checkpoint_and_reserve_on_phase_complete must forward the completing
+    phase task's banked tokens and VM cost into the LaneCheckpointPayload so
+    that checkpoint_lane accumulates them onto the lane row totals.
+
+    Before this fix the payload was built with tokens_in=0/tokens_out=0/
+    vm_cost_usd=0.0, leaving llm_input_tokens_total, llm_output_tokens_total,
+    and vm_cost_usd_total permanently zero for every lane.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from app.improvement_lane_ops import cas_transition
+    from app.models import ImprovementLaneStatus, Task, TaskStatus
+    from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+    project_id = await _make_project(db)
+
+    # Create an ACTIVE lane.
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="cost-accounting lane",
+        goal="verify cost accumulation",
+        branch_name="lane/cost-acct",
+        base_branch="main",
+    )
+
+    # Create a task with known banked accounting values.
+    task = Task(
+        project_id=project_id,
+        title="phase task",
+        payloads=[{"type": "fix", "prompt": "fix it", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        llm_input_tokens_banked_db=1200,
+        llm_output_tokens_banked_db=400,
+        vm_runtime_cost_banked_db=0.08,
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+
+    # Transition lane to ACTIVE, bound to our task.
+    await cas_transition(
+        db,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=task.id,
+    )
+    await db.commit()
+    await db.refresh(lane)
+    await db.refresh(task)
+
+    # Mock GitHub SHA verification to return reachable=True (happy path).
+    with (
+        patch(
+            "app.github_token_resolver.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("gh-token", "owner", "repo"),
+        ),
+        patch(
+            "app.github_refs.is_ancestor_of",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+    ):
+        result = await checkpoint_and_reserve_on_phase_complete(
+            db,
+            task,
+            lane,
+            sha="abc1234def5678",
+            summary="phase complete",
+            reserve_workspace=False,
+        )
+
+    assert result is True
+
+    await db.commit()
+    await db.refresh(lane)
+    assert lane.llm_input_tokens_total == 1200
+    assert lane.llm_output_tokens_total == 400
+    assert abs(lane.vm_cost_usd_total - 0.08) < 1e-6

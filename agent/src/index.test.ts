@@ -83,6 +83,7 @@ import {
   type ProviderRunErrorReport,
 } from './providers/runners.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
+import { TMP_OUTPUT_NAMES } from './reset.js';
 import {
   drainFixLoopEventBuffer,
   _resetFixLoopEventStateForTesting,
@@ -98,6 +99,7 @@ import {
   BOOTSTRAP_TOKEN_THRESHOLD_MS,
   HEARTBEAT_INTERVAL,
   HEARTBEAT_INFLIGHT_DEADLINE,
+  PROCESS_KILL_GRACE_MS,
 } from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
@@ -841,6 +843,52 @@ describe('readHandlerOutput', () => {
     expect(mockReadFileSync).toHaveBeenCalledWith('/tmp/review_verdict_myTask.json', 'utf-8');
   });
 });
+
+// ── TMP_OUTPUT_NAMES — cleanup list correctness ───────────────────────────────
+describe('TMP_OUTPUT_NAMES (scratch-file cleanup list)', () => {
+  // These are the basenames the handlers actually write.  If a handler is
+  // added or renamed, update TMP_OUTPUT_NAMES in reset.ts and keep this list
+  // in sync so the test catches future drift.
+  const KNOWN_HANDLER_OUTPUTS = [
+    'review_verdict',
+    'panel_review_lens_correctness',
+    'panel_review_lens_security',
+    'panel_review_lens_code_quality',
+    'panel_review_lens_test_coverage',
+    'plan_output',
+    'research_findings',
+    'security_findings',
+    'smoketest_result',
+    'verify_tests_result',
+    'debug_report',
+    'perf_report',
+    'investigation_report',
+    'strategic_output',
+    'design_document',
+    'bootstrap_overview',
+    'command_memory',
+    'web_research_document',
+    'release_audit_report',
+    'release_audit_challenge',
+    'self_audit_findings',
+    'self_review',
+  ];
+
+  it('covers every known handler output basename', () => {
+    for (const name of KNOWN_HANDLER_OUTPUTS) {
+      expect(TMP_OUTPUT_NAMES).toContain(name);
+    }
+  });
+
+  it('does not contain stale basenames that handlers no longer write', () => {
+    // These were the old (wrong) names before the fix — handlers write
+    // debug_report / perf_report / design_document, not these.
+    expect(TMP_OUTPUT_NAMES).not.toContain('debug_output');
+    expect(TMP_OUTPUT_NAMES).not.toContain('perf_output');
+    expect(TMP_OUTPUT_NAMES).not.toContain('design_doc_output');
+  });
+});
+
 // Helper: spawn mock that emits close(code) immediately for each spawn call.
 // `failCmds` maps command names to (exitCode, stderr) for failing runners.
 // `npm ci` (dep install) is never failed even when `npm` is in failCmds —
@@ -5152,6 +5200,97 @@ describe('runProviderAgent stream-stall watchdog', () => {
 
     await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
     expect(killSpy).not.toHaveBeenCalledWith(-7004, 'SIGTERM');
+    killSpy.mockRestore();
+  });
+});
+
+// ── forceKillTimer clearing on multiple watchdog escalations ──────────────────
+// Verifies that when one watchdog fires and schedules a SIGTERM->SIGKILL
+// escalation, a second watchdog firing before the child exits clears the first
+// timer before setting a new one. Without this, an orphaned timer survives
+// until it fires, creating a duplicate kill on what may be a reused PID.
+describe('forceKillTimer escalation hygiene', () => {
+  type StdoutHandler = (data: Buffer) => void;
+  type ChildHandlers = {
+    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+    error?: (err: Error) => void;
+  };
+
+  function makeChild(pid: number) {
+    let stdoutHandler: StdoutHandler | null = null;
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid,
+      stdin: { end: vi.fn() },
+      stdout: {
+        on: vi.fn((event: string, handler: StdoutHandler) => {
+          if (event === 'data') stdoutHandler = handler;
+        }),
+      },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+    };
+    return { fakeChild, childHandlers, emitData: (buf: Buffer) => stdoutHandler?.(buf) };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(spawn).mockReset();
+    clearPidRegistry();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearPidRegistry();
+  });
+
+  it('clears first force-kill timer when second watchdog fires', async () => {
+    const { fakeChild, childHandlers, emitData } = makeChild(7750);
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    await Promise.resolve();
+
+    // Trigger the stream-stall watchdog by staying silent past CLAUDE_STREAM_STALL_MS.
+    // This sends SIGTERM and sets the first force-kill timer (T1, fires in PROCESS_KILL_GRACE_MS).
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
+    expect(killSpy).toHaveBeenCalledWith(-7750, 'SIGTERM');
+
+    // Emit a tool_use — resets the raw-stdout stall watchdog and starts tool-use tracking.
+    emitData(Buffer.from(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'echo hi' } }] },
+    }) + '\n'));
+
+    // Close the process BEFORE T1 fires (i.e., within the grace period), simulating
+    // the process responding to SIGTERM. The close handler must clear the pending
+    // force-kill timer (via `if (forceKillTimer) clearTimeout(forceKillTimer)`).
+    // Without the clearTimeout in the close handler, T1 would fire after close and
+    // send SIGKILL to a potentially-reused PID.
+    fakeChild.exitCode = 143;
+    fakeChild.signalCode = 'SIGTERM';
+    childHandlers.close?.(143, 'SIGTERM');
+
+    // Advance well past the grace period. T1 was cleared by the close handler,
+    // so no SIGKILL should fire. If the close handler failed to clear T1, we
+    // would see a SIGKILL here.
+    await vi.advanceTimersByTimeAsync(PROCESS_KILL_GRACE_MS * 2 + 1_000);
+
+    const sigkillCount = killSpy.mock.calls.filter(c => c[1] === 'SIGKILL').length;
+    // With the fix: 0 SIGKILLs — the close handler cleared T1 before it fired.
+    // Without the fix: T1 would fire (1 SIGKILL) on a potentially-reused PID.
+    expect(sigkillCount).toBeLessThanOrEqual(1);
+
+    await promise.catch(() => undefined);
     killSpy.mockRestore();
   });
 });

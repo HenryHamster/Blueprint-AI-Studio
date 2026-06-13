@@ -522,7 +522,11 @@ async def checkpoint_and_reserve_on_phase_complete(
         checkpoint_lane,
         mark_checkpoint_missing,
     )
-    from app.models import ImprovementLaneStatus
+    from app.models import (
+        ImprovementLaneStatus,
+        get_task_total_llm_totals,
+        get_task_total_vm_cost_usd,
+    )
     from app.payload_schemas import LaneCheckpointPayload
 
     if lane is None:
@@ -643,6 +647,8 @@ async def checkpoint_and_reserve_on_phase_complete(
                 )
         return False
 
+    _tokens_in, _tokens_out, _ = get_task_total_llm_totals(source_task)
+    _vm_cost_usd = get_task_total_vm_cost_usd(source_task)
     payload = LaneCheckpointPayload(
         sha=str(sha),
         summary=summary[:1024],
@@ -655,6 +661,9 @@ async def checkpoint_and_reserve_on_phase_complete(
         # state so ImprovementLane.manifest accumulates chain knowledge across
         # phases via the existing bounded merge (never exceeding the 8KB cap).
         manifest_patch=build_lane_manifest_patch(source_task, summary=summary),
+        tokens_in=_tokens_in,
+        tokens_out=_tokens_out,
+        vm_cost_usd=_vm_cost_usd,
     )
     try:
         await checkpoint_lane(

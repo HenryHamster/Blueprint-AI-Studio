@@ -820,7 +820,9 @@ class TestRecordTrialVerdict:
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", incoming)
 
-        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "no_effect"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict"] == "no_effect"
+        )
         assert (
             project.capability_adoption_verdicts["repo_map"]["verdict_reason"]
             == "futility_bound_reached"
@@ -974,6 +976,56 @@ class TestRecordTrialVerdict:
             == strategic_reopen
         )
         mock_flag.assert_called_once()
+
+    def test_contaminated_continue_does_not_overwrite_adopt(self):
+        """Broken/contaminated measurements must not overturn a standing decided verdict.
+
+        When a capability is adopted, holdback goes to 0.0 and no without-arm tasks accrue.
+        A subsequent measurement showing treatment_not_engaging (with-arm delivery below
+        threshold) or holdback_contaminated (without-arm received capability despite holdback)
+        indicates a broken measurement, not a genuine inconclusive result. These contaminated
+        verdicts must emit an alert but must NOT revert the standing adopted verdict.
+        """
+        project = _make_project()
+        adopted = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
+        project.capability_adoption_verdicts = {"repo_map": adopted}
+
+        # Attempt 1: continue-trial with treatment_not_engaging (broken with-arm delivery)
+        contaminated_delivery = {
+            "verdict": "continue-trial",
+            "verdict_reason": "treatment_not_engaging",
+            "immediate_alert": True,
+            "lift": None,
+            "n_with": 40,
+            "n_without": 40,
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", contaminated_delivery)
+
+        # Adopt must be preserved; flag_modified not called (no write happened).
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.09
+        mock_flag.assert_not_called()
+
+        # Attempt 2: continue-trial with holdback_contaminated (broken without-arm)
+        contaminated_holdback = {
+            "verdict": "continue-trial",
+            "verdict_reason": "holdback_contaminated",
+            "immediate_alert": True,
+            "contamination_rate": 0.35,
+            "lift": None,
+            "n_with": 45,
+            "n_without": 45,
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", contaminated_holdback)
+
+        # Adopt must still be preserved despite the contaminated signal.
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.09
+        mock_flag.assert_not_called()
 
 
 # ── get_trial_verdicts ────────────────────────────────────────────────────────
@@ -2911,7 +2963,9 @@ class TestPersistTrialVerdictsNoticeEmission:
                     "app.strategic_trigger.request_strategic_refresh",
                     new_callable=AsyncMock,
                 ) as mock_refresh,
-                patch("app.capability_trial_verdict.record_trial_verdict") as mock_record,
+                patch(
+                    "app.capability_trial_verdict.record_trial_verdict"
+                ) as mock_record,
             ):
                 mock_record.side_effect = _make_record_side_effect()
                 await persist_trial_verdicts_in_transaction(
@@ -2942,7 +2996,9 @@ class TestPersistTrialVerdictsNoticeEmission:
             "n_with": 5,
             "n_without": 0,
         }
-        mock_notice, mock_refresh = await _run_case({"repo_map": decided_entry}, continue_entry)
+        mock_notice, mock_refresh = await _run_case(
+            {"repo_map": decided_entry}, continue_entry
+        )
         mock_notice.assert_not_called()
         mock_refresh.assert_not_called()
 
@@ -2953,7 +3009,9 @@ class TestPersistTrialVerdictsNoticeEmission:
             "n_with": 50,
             "n_without": 50,
         }
-        mock_notice, mock_refresh = await _run_case({"repo_map": decided_entry}, repeated_entry)
+        mock_notice, mock_refresh = await _run_case(
+            {"repo_map": decided_entry}, repeated_entry
+        )
         mock_notice.assert_not_called()
         mock_refresh.assert_not_called()
 
@@ -3131,8 +3189,13 @@ class TestEngagementGuard:
         assert entry["delivery_rate"] == pytest.approx(0.20, abs=0.01)
         assert entry["immediate_alert"] is True
 
-    def test_treatment_not_engaging_supersedes_prior_futility_no_effect(self):
-        """treatment_not_engaging in _SUFFICIENT_DATA_CONTINUE_REASONS allows overwrite."""
+    def test_treatment_not_engaging_does_not_overwrite_decided_no_effect(self):
+        """treatment_not_engaging is NOT in _SUFFICIENT_DATA_CONTINUE_REASONS and cannot overwrite.
+
+        treatment_not_engaging describes a broken/contaminated measurement (with-arm
+        delivery was never truly delivered), not a genuine inconclusive result.
+        It must emit an alert but NOT revert a standing decided verdict.
+        """
         from unittest.mock import patch
 
         project = MagicMock()
@@ -3153,14 +3216,18 @@ class TestEngagementGuard:
             "n_with": 90,
             "n_without": 90,
         }
-        with patch("app.capability_trial_verdict.flag_modified"):
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", newer)
 
-        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
+        # no_effect must be preserved; flag_modified not called (no write happened).
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict"] == "no_effect"
+        )
         assert (
             project.capability_adoption_verdicts["repo_map"]["verdict_reason"]
-            == "treatment_not_engaging"
+            == "futility_bound_reached"
         )
+        mock_flag.assert_not_called()
 
     def test_engagement_guard_does_not_fire_below_futility_n(self):
         # Arms not yet at futility_n → ordinary ambiguous_lift, guard never checked
@@ -3359,12 +3426,12 @@ class TestHoldbackContaminationGuard:
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] != "holdback_contaminated"
 
-    def test_holdback_contaminated_supersedes_prior_decided_verdict(self):
-        """holdback_contaminated is in _SUFFICIENT_DATA_CONTINUE_REASONS and can supersede adopt.
+    def test_holdback_contaminated_does_not_overwrite_decided_adopt(self):
+        """holdback_contaminated is NOT in _SUFFICIENT_DATA_CONTINUE_REASONS and cannot overwrite.
 
-        Because holdback_contaminated is in _SUFFICIENT_DATA_CONTINUE_REASONS,
-        record_trial_verdict allows it to overwrite a prior decided verdict — the
-        operator must fix the suppression leak before re-deciding.
+        holdback_contaminated describes a broken/contaminated measurement (without-arm
+        received capability despite holdback), not a genuine inconclusive result.
+        It must emit an alert but NOT revert a standing decided verdict.
         """
         project = _make_project()
         prior = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
@@ -3391,12 +3458,10 @@ class TestHoldbackContaminationGuard:
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", new_entry)
 
-        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
-        assert (
-            project.capability_adoption_verdicts["repo_map"]["verdict_reason"]
-            == "holdback_contaminated"
-        )
-        mock_flag.assert_called_once()
+        # adopt must be preserved; flag_modified not called (no write happened).
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "adopt"
+        assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.09
+        mock_flag.assert_not_called()
 
     def test_configurable_contamination_threshold_respected(self):
         """Custom futility_max_holdback_contamination_rate threshold is applied."""

@@ -14,7 +14,7 @@ import {
   startEventLoopLagMonitor, traceHeartbeat, installExitMarkers, recordFinalState,
 } from './diagnostics.js';
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
-import { resetForNextRole, clearStaleProviderCredentials } from './reset.js';
+import { resetForNextRole, clearStaleProviderCredentials, TMP_OUTPUT_NAMES } from './reset.js';
 import { isHeartbeatTransient } from './heartbeat-classify.js';
 import {
   type FixLoopEvent,
@@ -3557,7 +3557,7 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // Per-role /tmp scratch cleanup. Workspace teardown happens at process
     // exit (in main()'s outer finally) so warm continuity preserves it.
     try { fs.unlinkSync(`/tmp/agent_prompt_${taskId}.txt`); } catch { /* ignore */ }
-    for (const name of ['review_verdict', 'panel_review_lens_correctness', 'panel_review_lens_security', 'panel_review_lens_code_quality', 'panel_review_lens_test_coverage', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'verify_tests_result', 'debug_output', 'perf_output', 'investigation_report', 'strategic_output', 'design_doc_output']) {
+    for (const name of TMP_OUTPUT_NAMES) {
       try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch { /* ignore */ }
     }
   }

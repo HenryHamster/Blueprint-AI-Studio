@@ -95,9 +95,7 @@ LANE_PILOT_CHECKPOINT_RECEIPT_KEY = "_review_fix_checkpoint"
 
 _DECIDED_VERDICTS = frozenset({"adopt", "reject", "no_effect", "ADOPT", "KILL"})
 _CONTINUE_VERDICTS = frozenset({"continue-trial", "CONTINUE"})
-_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset(
-    {"ambiguous_lift", "receipt_only_trial", "treatment_not_engaging", "holdback_contaminated"}
-)
+_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset({"ambiguous_lift", "receipt_only_trial"})
 
 
 class LanePilotAggregates(TypedDict, total=False):

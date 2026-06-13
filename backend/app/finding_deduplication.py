@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
-from app.capability_registry import compose_capability_markers
+from app.capability_registry import compose_capability_markers, normalize_capability_name
 from app.failure_classification import INFRA_CLASSES, classify_failure
 from app.landed_signal import suppresses_redispatch
 from app.models import Task, TaskStatus
@@ -272,7 +272,13 @@ def prerequisite_matches_task(normalized: dict, task: Optional[Task]) -> bool:
             or need_matches_task_lineage({"kind": "task", "ref": canonical_ref}, task)
         )
     if kind == "capability":
-        return ref.lower() in _task_capability_markers(task)
+        markers = _task_capability_markers(task)
+        # Floor markers (task-provider:<uuid>) contain a colon that normalize_capability_name
+        # collapses to a hyphen, so also try a direct lowercase match before normalizing.
+        if ref.strip().lower() in markers:
+            return True
+        normalized_ref = normalize_capability_name(ref)
+        return normalized_ref is not None and normalized_ref in markers
     return False
 
 

@@ -647,3 +647,35 @@ async def test_fetch_wrapper_fails_open(mocker):
     )
     out = await fetch_missing_demand_for_spawn(object(), "p-1")
     assert out == {"total": 0, "demands": []}
+
+
+@pytest.mark.asyncio
+async def test_free_prose_demand_retires_when_kebab_foundation_lands(db_session):
+    """A BLOCKED dependent needing a free-prose capability ref ('Seeded Eval Harness')
+    yields ZERO demand when a shipped COMPLETED task advertises its kebab equivalent
+    ('seeded-eval-harness'). The demand identity and matcher must use the same
+    normalize_capability_name normalization so free-prose demand retires correctly."""
+    project = await _make_project(db_session)
+
+    # Dependent declares its need in free prose (spaces, mixed case).
+    free_prose_need = {
+        "kind": "capability",
+        "ref": "Seeded Eval Harness",
+        "label": "Seeded evaluation harness",
+    }
+    dependent = _blocked(project.id, free_prose_need, direction_id="d-eval")
+
+    # Foundation advertises the canonical kebab name the hint/strategist uses.
+    foundation = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"provides_capability": "seeded-eval-harness", "pr_merged": True},
+    )
+    db_session.add_all([dependent, foundation])
+    await db_session.commit()
+
+    result = await collect_missing_capability_demand(db_session, project.id)
+
+    # The kebab foundation satisfies the free-prose demand → zero remaining demand.
+    assert result["total"] == 0
+    assert result["demands"] == []

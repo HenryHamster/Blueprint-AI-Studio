@@ -270,12 +270,16 @@ def compose_capability_markers(task: Task | object) -> set[str]:
     ctx = context if isinstance(context, Mapping) else {}
     for key in ("provides_capability", "capability"):
         value = ctx.get(key)
-        if isinstance(value, str) and value.strip():
-            markers.add(value.strip().lower())
+        if isinstance(value, str):
+            normalized = normalize_capability_name(value)
+            if normalized:
+                markers.add(normalized)
         elif isinstance(value, (list, tuple, set)):
             for item in value:
-                if isinstance(item, str) and item.strip():
-                    markers.add(item.strip().lower())
+                if isinstance(item, str):
+                    normalized = normalize_capability_name(item)
+                    if normalized:
+                        markers.add(normalized)
     derived = derive_provider_marker(task)
     if derived:
         markers.add(derived.lower())

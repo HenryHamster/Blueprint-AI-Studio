@@ -88,7 +88,12 @@ def _demand_identity(need: Dict[str, Any]) -> Optional[tuple]:
         return None
     kind = norm["kind"]
     ref = norm["ref"]
-    identity_ref = ref.lower() if kind == "capability" else ref
+    if kind == "capability":
+        identity_ref = normalize_capability_name(ref)
+        if identity_ref is None:
+            return None
+    else:
+        identity_ref = ref
     return (kind, identity_ref)
 
 

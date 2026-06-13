@@ -196,11 +196,23 @@ describe('resetForNextRole', () => {
     expect(unlinkPaths).toContain('/tmp/research_findings_X.json');
     expect(unlinkPaths).toContain('/tmp/security_findings_X.json');
     expect(unlinkPaths).toContain('/tmp/smoketest_result_X.json');
-    expect(unlinkPaths).toContain('/tmp/debug_output_X.json');
-    expect(unlinkPaths).toContain('/tmp/perf_output_X.json');
+    expect(unlinkPaths).toContain('/tmp/verify_tests_result_X.json');
+    expect(unlinkPaths).toContain('/tmp/debug_report_X.json');
+    expect(unlinkPaths).toContain('/tmp/perf_report_X.json');
     expect(unlinkPaths).toContain('/tmp/investigation_report_X.json');
     expect(unlinkPaths).toContain('/tmp/strategic_output_X.json');
-    expect(unlinkPaths).toContain('/tmp/design_doc_output_X.json');
+    expect(unlinkPaths).toContain('/tmp/design_document_X.json');
+    expect(unlinkPaths).toContain('/tmp/bootstrap_overview_X.json');
+    expect(unlinkPaths).toContain('/tmp/command_memory_X.json');
+    expect(unlinkPaths).toContain('/tmp/web_research_document_X.json');
+    expect(unlinkPaths).toContain('/tmp/release_audit_report_X.json');
+    expect(unlinkPaths).toContain('/tmp/release_audit_challenge_X.json');
+    expect(unlinkPaths).toContain('/tmp/self_audit_findings_X.json');
+    expect(unlinkPaths).toContain('/tmp/self_review_X.json');
+    // Stale basenames that were incorrectly in the old list must be absent.
+    expect(unlinkPaths).not.toContain('/tmp/debug_output_X.json');
+    expect(unlinkPaths).not.toContain('/tmp/perf_output_X.json');
+    expect(unlinkPaths).not.toContain('/tmp/design_doc_output_X.json');
   });
 
   it('survives ENOENT on /tmp unlink and continues to subsequent steps', async () => {
