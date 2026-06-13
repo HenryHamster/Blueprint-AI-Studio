@@ -424,6 +424,10 @@ async def compute_trial_arm_accumulation(
             if _has_assignment
             else None
         )
+        # Receipt truthy: receipt key is explicitly true (SQLite json_extract returns 1 for JSON true).
+        _receipt_truthy_flag_expr = (
+            case((_receipt_expr_for_delivery == 1, 1), else_=0) if _has_assignment else None
+        )
     else:
         _primary_expr = Task.context[_assign_key].astext
         _fallback_expr = Task.context[context_key].astext
@@ -452,6 +456,12 @@ async def compute_trial_arm_accumulation(
             if _has_assignment
             else None
         )
+        # Receipt truthy: receipt key is explicitly "true" (PG astext returns string).
+        _receipt_truthy_flag_expr = (
+            case((_receipt_expr_for_delivery == "true", 1), else_=0)
+            if _has_assignment
+            else None
+        )
 
     filters = [
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
@@ -464,14 +474,27 @@ async def compute_trial_arm_accumulation(
     with_n = with_succ = without_n = without_succ = 0
     if _has_assignment:
         stmt = (
-            select(arm_expr, succ_expr, _assign_flag_expr, _delivered_flag_expr, func.count())
+            select(
+                arm_expr,
+                succ_expr,
+                _assign_flag_expr,
+                _delivered_flag_expr,
+                _receipt_truthy_flag_expr,
+                func.count(),
+            )
             .where(*filters)
-            .group_by(arm_expr, succ_expr, _assign_flag_expr, _delivered_flag_expr)
+            .group_by(
+                arm_expr,
+                succ_expr,
+                _assign_flag_expr,
+                _delivered_flag_expr,
+                _receipt_truthy_flag_expr,
+            )
         )
         rows = (await session.execute(stmt)).all()
         with_assigned = with_receipt = without_assigned = without_receipt = 0
-        with_assigned_delivered = 0
-        for arm_val, succ_val, is_assigned_val, is_delivered_val, cnt in rows:
+        with_assigned_delivered = without_contaminated = 0
+        for arm_val, succ_val, is_assigned_val, is_delivered_val, receipt_truthy_val, cnt in rows:
             cnt = int(cnt)
             is_assigned = bool(is_assigned_val)
             if _json_truthy(arm_val):
@@ -490,6 +513,8 @@ async def compute_trial_arm_accumulation(
                     without_succ += cnt
                 if is_assigned:
                     without_assigned += cnt
+                    if bool(receipt_truthy_val):
+                        without_contaminated += cnt
                 else:
                     without_receipt += cnt
     else:
@@ -533,6 +558,7 @@ async def compute_trial_arm_accumulation(
             "with_receipt": with_receipt,
             "without_assigned": without_assigned,
             "without_receipt": without_receipt,
+            "without_contaminated": without_contaminated,
         }
     return result
 

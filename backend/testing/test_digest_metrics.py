@@ -6408,6 +6408,129 @@ async def test_trial_accumulation_no_composition_without_assignment_key(db_sessi
     assert "arm_composition" not in accum
 
 
+@pytest.mark.asyncio
+async def test_trial_accumulation_counts_without_contaminated(db_session):
+    """Without-arm tasks that carry a positive receipt despite holdback assignment are counted.
+
+    A task assigned to the WITHOUT arm (_repo_map_arm=False) but with a truthy
+    receipt (_had_repo_map=True) represents a contaminated holdback task — the
+    suppression path was bypassed and the capability was delivered.  The
+    accumulator must surface this as without_contaminated in arm_composition.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = _utcnow() - timedelta(days=1)
+
+    def _task(context):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=created,
+            context=context,
+        )
+
+    tasks = [
+        # WITH arm — 2 assigned tasks
+        _task({"_repo_map_arm": True, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        _task({"_repo_map_arm": True, "_had_repo_map": False, "_first_attempt_succeeded": False}),
+        # WITHOUT arm, clean — holdback was respected (receipt=False)
+        _task({"_repo_map_arm": False, "_had_repo_map": False, "_first_attempt_succeeded": True}),
+        # WITHOUT arm, contaminated — holdback was NOT respected (receipt=True)
+        _task({"_repo_map_arm": False, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        _task({"_repo_map_arm": False, "_had_repo_map": True, "_first_attempt_succeeded": False}),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        assignment_key="_repo_map_arm",
+    )
+
+    comp = accum["arm_composition"]
+    # 2 contaminated holdback tasks (receipt=True in without arm)
+    assert comp["without_contaminated"] == 2
+    # 3 without-arm tasks total (1 clean + 2 contaminated)
+    assert comp["without_assigned"] == 3
+    # 0 clean without-receipt fallbacks in this scenario
+    assert comp["without_receipt"] == 0
+
+
+@pytest.mark.asyncio
+async def test_trial_accumulation_no_contamination_when_receipt_false(db_session):
+    """Without-arm tasks with receipt=False are NOT counted as contaminated."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = _utcnow() - timedelta(days=1)
+
+    def _task(context):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=created,
+            context=context,
+        )
+
+    tasks = [
+        _task({"_repo_map_arm": True, "_had_repo_map": True, "_first_attempt_succeeded": True}),
+        # WITHOUT arm, receipt explicitly False — clean holdback
+        _task({"_repo_map_arm": False, "_had_repo_map": False, "_first_attempt_succeeded": True}),
+        _task({"_repo_map_arm": False, "_had_repo_map": False, "_first_attempt_succeeded": False}),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        assignment_key="_repo_map_arm",
+    )
+
+    comp = accum["arm_composition"]
+    assert comp["without_contaminated"] == 0
+    assert comp["without_assigned"] == 2
+
+
+@pytest.mark.asyncio
+async def test_trial_accumulation_without_contaminated_absent_when_no_assignment_key(db_session):
+    """When no assignment_key is provided, without_contaminated is absent (receipt-only path)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=_utcnow() - timedelta(days=1),
+            context={"_had_repo_map": True, "_first_attempt_succeeded": True},
+        )
+    )
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        # no assignment_key — receipt-only trial path
+    )
+    # arm_composition is absent entirely when no assignment_key
+    assert "arm_composition" not in accum
+
+
 # ── compute_problem_model_gc_health ──────────────────────────────────────────
 
 

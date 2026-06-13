@@ -99,7 +99,7 @@ describe('per-handler prompt/helper provisioning parity', () => {
   // (provisionAmbientHelpers, called from runProviderAgent). The test exercises
   // that EXACT function, so a regression in the runtime's ambient provisioning
   // is caught here rather than silently exempted.
-  const AMBIENT = new Set(['note', 'playbook', 'messages']);
+  const AMBIENT = new Set(['note', 'playbook', 'messages', 'symbols']);
 
   // LIFECYCLE helpers are provisioned by the code-change wrapper
   // (writeCodeChangeHelpers) for code-change tasks — neither ambient nor written
@@ -189,7 +189,7 @@ describe('per-handler prompt/helper provisioning parity', () => {
   // Pin the ambient provisioner's own contract: exercising the EXACT function the
   // runtime calls must yield ./note, ./playbook, ./messages as real executables.
   // If this regresses, every handler that relies on ambient helpers is broken.
-  it('provisionAmbientHelpers writes ./note, ./playbook, ./messages as executables', () => {
+  it('provisionAmbientHelpers writes ./note, ./playbook, ./messages, ./symbols as executables', () => {
     provisionAmbientHelpers('t-helpertest', ws);
     const provided = executablesIn(ws);
     for (const name of AMBIENT) {

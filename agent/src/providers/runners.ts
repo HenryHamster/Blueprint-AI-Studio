@@ -15,7 +15,7 @@ import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
   recordLlmTokens, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
-import { writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
+import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper } from '../prompt.js';
 
 export type ProviderName = 'anthropic' | 'openai' | 'gemini';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
@@ -749,6 +749,7 @@ echo ""
   if (taskId) {
     try { writePlaybookHelper(taskId, workspace); } catch { /* best effort */ }
     try { writeMessagesHelper(taskId, workspace); } catch { /* best effort */ }
+    try { writeSymbolsHelper(taskId, workspace); } catch { /* best effort */ }
   }
 }
 

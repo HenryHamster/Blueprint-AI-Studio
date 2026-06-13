@@ -247,7 +247,7 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
   return hints;
 }
 
-export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
+export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. Use ./symbols <name> to find where a function or class is defined (returns file path, line, and kind). If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
 
 // Adaptive parallel-subagent guidance for rollup PRs touching multiple
 // modules. Only inject when shouldFanOutReview() AND the per-project
@@ -683,6 +683,42 @@ fi
 echo ""
 `;
   fs.writeFileSync(`${workspace}/messages`, helperScript, { mode: 0o755 });
+  excludeAgentHelpers();
+}
+
+// ── Symbol navigation helper ──────────────────────────────────────────────────
+// Reads the ctags JSON index built at workspace-setup time (standard handler).
+// Gracefully handles missing index — falls back with an informational message.
+export function writeSymbolsHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
+  const taskId = shellEscapeDoubleQuoted(taskIdRaw);
+  const helperScript = `#!/bin/bash
+# Symbol navigation — look up function/class/variable definitions via ctags index.
+# Usage: ./symbols <name>         — find all definitions matching the given name
+#        ./symbols <name> <kind>  — filter by kind (function, class, variable, etc.)
+# Returns: file path, line number, and symbol kind (up to 10 results).
+# Falls back gracefully when no ctags index is available for this task.
+
+NAME="\${1:?Usage: ./symbols <name> [kind]}"
+KIND="\${2:-}"
+INDEX="/tmp/symbols_${taskId}.json"
+
+if [ ! -f "$INDEX" ]; then
+  echo "[symbols] No symbol index available (ctags index not found at $INDEX)."
+  echo "[symbols] Use Grep/Glob to locate symbols manually."
+  exit 0
+fi
+
+if [ -n "$KIND" ]; then
+  jq -r --arg n "$NAME" --arg k "$KIND" \\
+    'select(.name == $n and .kind == $k) | "\\(.path):\\(.line)  \\(.kind)  \\(.name)"' \\
+    "$INDEX" | head -10
+else
+  jq -r --arg n "$NAME" \\
+    'select(.name == $n) | "\\(.path):\\(.line)  \\(.kind)  \\(.name)"' \\
+    "$INDEX" | head -10
+fi
+`;
+  fs.writeFileSync(`${workspace}/symbols`, helperScript, { mode: 0o755 });
   excludeAgentHelpers();
 }
 

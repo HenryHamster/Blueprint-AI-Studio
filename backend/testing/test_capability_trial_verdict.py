@@ -260,7 +260,7 @@ class TestEvaluateTrialVerdict:
     # ── futility bound tests ──────────────────────────────────────────────────
 
     def test_futility_bound_terminates_ambiguous_trial(self):
-        # Acceptance test: both arms at futility_n with ambiguous lift → reject/futility_bound_reached
+        # Acceptance test: both arms at futility_n with ambiguous lift → no_effect/futility_bound_reached
         # Default futility_n = 30 * 3 = 90
         entry = evaluate_trial_verdict(
             lift=0.02,
@@ -268,17 +268,30 @@ class TestEvaluateTrialVerdict:
             n_without=90,
             config=self._cfg(),
         )
-        assert entry["verdict"] == "reject"
+        assert entry["verdict"] == "no_effect"
         assert entry["verdict_reason"] == "futility_bound_reached"
 
-    def test_futility_bound_reached_emits_reject(self):
+    def test_futility_ambiguous_lift_is_no_effect_not_reject(self):
+        # Acceptance test (named): ambiguous lift at futility bound → no_effect, NOT reject.
+        # Negative lift crossing the reject threshold is a different outcome (reject/sufficient_data).
         entry = evaluate_trial_verdict(
             lift=0.01,
             n_with=100,
             n_without=100,
             config=self._cfg(),
         )
-        assert entry["verdict"] == "reject"
+        assert entry["verdict"] == "no_effect"
+        assert entry["verdict_reason"] == "futility_bound_reached"
+        assert entry["verdict"] != "reject"
+
+    def test_futility_bound_reached_emits_no_effect(self):
+        entry = evaluate_trial_verdict(
+            lift=0.01,
+            n_with=100,
+            n_without=100,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "no_effect"
         assert entry["verdict_reason"] == "futility_bound_reached"
 
     def test_below_futility_bound_stays_ambiguous(self):
@@ -345,11 +358,11 @@ class TestEvaluateTrialVerdict:
             n_without=50,
             config=cfg,
         )
-        assert entry["verdict"] == "reject"
+        assert entry["verdict"] == "no_effect"
         assert entry["verdict_reason"] == "futility_bound_reached"
 
     def test_futility_bound_holdback_is_one(self):
-        # futility_bound_reached reuses reject verdict — holdback must be 1.0
+        # futility_bound_reached emits no_effect — holdback must be 1.0 (stop delivering)
         entry = evaluate_trial_verdict(
             lift=0.01,
             n_with=90,
@@ -786,10 +799,10 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts["repo_map"]["lift"] == -0.07
 
     def test_futility_bound_verdict_protected_from_insufficient_data_revert(self):
-        # A reject/futility_bound_reached must not be overwritten by continue-trial/insufficient_data
+        # A no_effect/futility_bound_reached must not be overwritten by continue-trial/insufficient_data
         project = _make_project()
         prior = {
-            "verdict": "reject",
+            "verdict": "no_effect",
             "verdict_reason": "futility_bound_reached",
             "lift": 0.01,
             "n_with": 90,
@@ -807,7 +820,7 @@ class TestRecordTrialVerdict:
         with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
             record_trial_verdict(project, "repo_map", incoming)
 
-        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "reject"
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "no_effect"
         assert (
             project.capability_adoption_verdicts["repo_map"]["verdict_reason"]
             == "futility_bound_reached"
@@ -818,7 +831,7 @@ class TestRecordTrialVerdict:
         # Explicit strategist re-declaration must still override futility verdict
         project = _make_project()
         prior = {
-            "verdict": "reject",
+            "verdict": "no_effect",
             "verdict_reason": "futility_bound_reached",
             "lift": 0.01,
             "n_with": 90,
@@ -3008,8 +3021,8 @@ class TestEngagementGuard:
         assert entry["verdict_reason"] == "treatment_not_engaging"
         assert entry.get("immediate_alert") is True
 
-    def test_futility_bound_high_delivery_still_rejects(self):
-        # 50/90 = 0.556 >= 0.50 → guard does not fire, futility REJECT stands
+    def test_futility_bound_high_delivery_still_no_effect(self):
+        # 50/90 = 0.556 >= 0.50 → guard does not fire, futility no_effect stands
         comp = {
             "with_assigned": 90,
             "with_assigned_delivered": 50,
@@ -3024,19 +3037,19 @@ class TestEngagementGuard:
             config=self._cfg(),
             arm_composition=comp,
         )
-        assert entry["verdict"] == "reject"
+        assert entry["verdict"] == "no_effect"
         assert entry["verdict_reason"] == "futility_bound_reached"
         assert not entry.get("immediate_alert")
 
     def test_engagement_guard_absent_when_arm_composition_none(self):
-        # No arm_composition → guard skipped, reject stands
+        # No arm_composition → guard skipped, no_effect stands
         entry = evaluate_trial_verdict(
             lift=0.01,
             n_with=90,
             n_without=90,
             config=self._cfg(),
         )
-        assert entry["verdict"] == "reject"
+        assert entry["verdict"] == "no_effect"
         assert entry["verdict_reason"] == "futility_bound_reached"
 
     def test_engagement_guard_absent_when_with_assigned_delivered_missing(self):
@@ -3054,7 +3067,7 @@ class TestEngagementGuard:
             config=self._cfg(),
             arm_composition=comp,
         )
-        assert entry["verdict"] == "reject"
+        assert entry["verdict"] == "no_effect"
         assert entry["verdict_reason"] == "futility_bound_reached"
 
     def test_engagement_guard_skipped_when_with_assigned_zero(self):
@@ -3118,13 +3131,13 @@ class TestEngagementGuard:
         assert entry["delivery_rate"] == pytest.approx(0.20, abs=0.01)
         assert entry["immediate_alert"] is True
 
-    def test_treatment_not_engaging_supersedes_prior_futility_reject(self):
+    def test_treatment_not_engaging_supersedes_prior_futility_no_effect(self):
         """treatment_not_engaging in _SUFFICIENT_DATA_CONTINUE_REASONS allows overwrite."""
         from unittest.mock import patch
 
         project = MagicMock()
         prior = {
-            "verdict": "reject",
+            "verdict": "no_effect",
             "verdict_reason": "futility_bound_reached",
             "lift": 0.01,
             "n_with": 90,
@@ -3167,3 +3180,243 @@ class TestEngagementGuard:
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "ambiguous_lift"
+
+
+# ── holdback contamination guard ──────────────────────────────────────────────
+
+
+class TestHoldbackContaminationGuard:
+    """Tests for the contamination guard in evaluate_trial_verdict.
+
+    The guard fires when a decided/terminal verdict would otherwise be emitted but
+    the holdback-arm contamination rate (without_contaminated / without_assigned)
+    exceeds futility_max_holdback_contamination_rate (default 0.20).
+    """
+
+    def _cfg(self, **overrides):
+        base = {"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03}
+        base.update(overrides)
+        return base
+
+    def test_holdback_contamination_suppresses_decided_verdict(self):
+        """Acceptance test: high contamination rate suppresses adopt → holdback_contaminated.
+
+        This is the named acceptance requirement: a positive delivery receipt on
+        holdback-assigned tasks above the 20% threshold must suppress a decided
+        verdict with reason 'holdback_contaminated' and immediate_alert=True.
+        """
+        # without_contaminated=15 / without_assigned=50 = 0.30 > 0.20 threshold
+        comp = {
+            "with_assigned": 35,
+            "with_assigned_delivered": 35,
+            "with_receipt": 5,
+            "without_assigned": 50,
+            "without_receipt": 3,
+            "without_contaminated": 15,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.08,
+            n_with=40,
+            n_without=53,
+            config=self._cfg(),
+            arm_composition=comp,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+            evaluated_at="2026-06-13T00:00:00",
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "holdback_contaminated"
+        assert entry["immediate_alert"] is True
+        assert "contamination_rate" in entry
+        assert entry["contamination_rate"] == round(15 / 50, 4)
+
+    def test_high_contamination_suppresses_reject(self):
+        """High contamination rate suppresses reject verdict."""
+        comp = {
+            "with_assigned": 35,
+            "with_assigned_delivered": 35,
+            "with_receipt": 5,
+            "without_assigned": 50,
+            "without_receipt": 3,
+            "without_contaminated": 15,
+        }
+        entry = evaluate_trial_verdict(
+            lift=-0.05,
+            n_with=40,
+            n_without=53,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "holdback_contaminated"
+        assert entry["immediate_alert"] is True
+
+    def test_high_contamination_suppresses_no_effect(self):
+        """High contamination rate suppresses no_effect (futility-bound) verdict."""
+        # n_with, n_without both >= futility_n=90 with ambiguous lift → normally no_effect
+        comp = {
+            "with_assigned": 95,
+            "with_assigned_delivered": 95,
+            "with_receipt": 5,
+            "without_assigned": 95,
+            "without_receipt": 5,
+            "without_contaminated": 25,  # 25/95 ≈ 0.263 > 0.20
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.02,
+            n_with=100,
+            n_without=100,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "holdback_contaminated"
+        assert entry["immediate_alert"] is True
+
+    def test_contamination_at_threshold_does_not_block(self):
+        """Contamination rate exactly at threshold (not exceeding) must NOT trigger guard."""
+        # Rate = 10/50 = 0.20 exactly — check is strictly >, so 0.20 should not fire
+        comp = {
+            "with_assigned": 35,
+            "with_assigned_delivered": 35,
+            "with_receipt": 5,
+            "without_assigned": 50,
+            "without_receipt": 3,
+            "without_contaminated": 10,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.08,
+            n_with=40,
+            n_without=53,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "adopt"
+
+    def test_contamination_below_threshold_does_not_block(self):
+        """Contamination rate below threshold must not block a clean verdict."""
+        comp = {
+            "with_assigned": 35,
+            "with_assigned_delivered": 35,
+            "with_receipt": 5,
+            "without_assigned": 50,
+            "without_receipt": 3,
+            "without_contaminated": 5,  # 5/50 = 0.10 < 0.20
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.08,
+            n_with=40,
+            n_without=53,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "adopt"
+
+    def test_contamination_guard_skipped_when_arm_composition_absent(self):
+        """Guard must not fire when arm_composition is not provided."""
+        entry = evaluate_trial_verdict(
+            lift=0.08,
+            n_with=40,
+            n_without=33,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "adopt"
+
+    def test_contamination_guard_skipped_when_without_contaminated_absent(self):
+        """Guard must not fire when arm_composition lacks without_contaminated key."""
+        comp = {
+            "with_assigned": 35,
+            "with_receipt": 5,
+            "without_assigned": 50,
+            "without_receipt": 3,
+            # without_contaminated intentionally absent
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.08,
+            n_with=40,
+            n_without=53,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "adopt"
+
+    def test_contamination_guard_skipped_when_without_assigned_zero(self):
+        """Guard must not fire when without_assigned is zero (division guard)."""
+        comp = {
+            "with_assigned": 35,
+            "with_receipt": 5,
+            "without_assigned": 0,
+            "without_receipt": 53,
+            "without_contaminated": 5,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.08,
+            n_with=40,
+            n_without=53,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        # Purity gate fires first (without_assigned=0 < min_n=30) → insufficient_assigned_arm_data
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] != "holdback_contaminated"
+
+    def test_holdback_contaminated_supersedes_prior_decided_verdict(self):
+        """holdback_contaminated is in _SUFFICIENT_DATA_CONTINUE_REASONS and can supersede adopt.
+
+        Because holdback_contaminated is in _SUFFICIENT_DATA_CONTINUE_REASONS,
+        record_trial_verdict allows it to overwrite a prior decided verdict — the
+        operator must fix the suppression leak before re-deciding.
+        """
+        project = _make_project()
+        prior = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
+        project.capability_adoption_verdicts = {"repo_map": prior}
+
+        comp = {
+            "with_assigned": 35,
+            "with_assigned_delivered": 35,
+            "with_receipt": 5,
+            "without_assigned": 50,
+            "without_receipt": 3,
+            "without_contaminated": 15,
+        }
+        new_entry = evaluate_trial_verdict(
+            lift=0.08,
+            n_with=40,
+            n_without=53,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert new_entry["verdict"] == "continue-trial"
+        assert new_entry["verdict_reason"] == "holdback_contaminated"
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", new_entry)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict_reason"]
+            == "holdback_contaminated"
+        )
+        mock_flag.assert_called_once()
+
+    def test_configurable_contamination_threshold_respected(self):
+        """Custom futility_max_holdback_contamination_rate threshold is applied."""
+        # With a stricter threshold (0.10), rate=0.15 should trigger
+        comp = {
+            "with_assigned": 35,
+            "with_assigned_delivered": 35,
+            "with_receipt": 5,
+            "without_assigned": 100,
+            "without_receipt": 3,
+            "without_contaminated": 15,  # 15/100 = 0.15 > 0.10
+        }
+        cfg = self._cfg()
+        cfg["futility_max_holdback_contamination_rate"] = 0.10
+        entry = evaluate_trial_verdict(
+            lift=0.08,
+            n_with=40,
+            n_without=103,
+            config=cfg,
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "holdback_contaminated"

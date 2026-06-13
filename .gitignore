@@ -37,6 +37,7 @@ backend/.testmondata*
 /done
 /fail
 /fetch
+/symbols
 research-*.md
 *.bak
 # Repo-root self-review JSON output (agents write to /tmp; strays at the root

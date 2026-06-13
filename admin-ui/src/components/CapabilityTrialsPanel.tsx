@@ -24,6 +24,7 @@ function hasLaneMetrics(v: CapabilityVerdict): boolean {
 function verdictClass(verdict: CapabilityVerdict['verdict']): string {
   if (verdict === 'adopt' || verdict === 'ADOPT') return 'text-emerald-400';
   if (verdict === 'reject' || verdict === 'KILL') return 'text-red-400';
+  if (verdict === 'no_effect') return 'text-yellow-400';
   return 'text-amber-400';
 }
 
@@ -117,6 +118,7 @@ export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null })
                 {v.arm_composition && (
                   <div className="mt-0.5 text-neutral-500">
                     Arm: <span className="text-neutral-400">{v.arm_composition.with_assigned ?? 0}+{v.arm_composition.with_receipt ?? 0}w / {v.arm_composition.without_assigned ?? 0}+{v.arm_composition.without_receipt ?? 0}wo</span>
+                    {(v.arm_composition.without_contaminated ?? 0) > 0 && <span className="text-amber-400 ml-1">· {v.arm_composition.without_contaminated} holdback contaminated</span>}
                   </div>
                 )}
                 {v.accrual_projection && (
@@ -142,7 +144,7 @@ export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null })
                   <span className={`font-medium ${verdictClass(v.verdict)}`}>{v.verdict}</span>
                   {v.verdict_reason && <div className="text-[10px] text-neutral-500">{v.verdict_reason}</div>}
                   {v.immediate_alert && <div className="text-[10px] text-red-300">Immediate alert</div>}
-                  {v.arm_composition && <div className="text-[10px] text-neutral-500">{v.arm_composition.with_assigned ?? 0}+{v.arm_composition.with_receipt ?? 0}w / {v.arm_composition.without_assigned ?? 0}+{v.arm_composition.without_receipt ?? 0}wo</div>}
+                  {v.arm_composition && <div className="text-[10px] text-neutral-500">{v.arm_composition.with_assigned ?? 0}+{v.arm_composition.with_receipt ?? 0}w / {v.arm_composition.without_assigned ?? 0}+{v.arm_composition.without_receipt ?? 0}wo{(v.arm_composition.without_contaminated ?? 0) > 0 ? <span className="text-amber-400 ml-1">· {v.arm_composition.without_contaminated} contaminated</span> : null}</div>}
                 </td>
                 <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">{isLane ? <>{fmtRate(v.lane_merge_rate)} / {fmtRate(v.control_merge_rate)}</> : fmtLift(v.lift ?? null)}</td>
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{v.n_lane ?? 0} lane / {v.n_control ?? 0} control</> : <>{v.n_with}/{minN}</>}</td>

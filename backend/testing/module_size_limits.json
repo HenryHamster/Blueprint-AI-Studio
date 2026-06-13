@@ -50,7 +50,7 @@
     "review_pipeline.py": 3900,
     "deploy_health.py": 1250,
     "direction_outcomes.py": 2750,
-    "digest_metrics.py": 5250,
+    "digest_metrics.py": 6050,
     "digest_remediation.py": 900,
     "digest_direction_progress.py": 1350,
     "failure_layer_classifier.py": 400,

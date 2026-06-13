@@ -618,11 +618,16 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
  * other tracked files import them), lists each hub's exported symbols, and
  * returns a compact markdown section capped at 3 000 chars.
  *
+ * When opts.relatedFiles is provided, modules directly adjacent (imported by
+ * or importing from) those files are surfaced before global hubs. When
+ * opts.taskPrompt is provided, a keyword-match tiebreaker boosts modules
+ * whose basename appears in the prompt.
+ *
  * Fail-soft: returns '' on any error so the caller never blocks on missing
  * tooling. The natural stdlib/third-party filter comes for free — only modules
  * whose basename matches a tracked file appear in the output.
  */
-export function buildRepoMap(ws: WebSocket | null): string {
+export function buildRepoMap(ws: WebSocket | null, opts?: { taskPrompt?: string; relatedFiles?: string[] }): string {
   const CAP = 3000;
   try {
     const allFiles = execFileSync('git', ['ls-files'], { cwd: WORKSPACE, encoding: 'utf-8' })
@@ -644,6 +649,8 @@ export function buildRepoMap(ws: WebSocket | null): string {
 
     // inDegree is keyed on full file paths to avoid cross-package basename collisions
     const inDegree = new Map<string, number>();
+    // fileImports tracks each file's resolved imports for task-adjacency computation
+    const fileImports = new Map<string, string[]>();
 
     for (const file of allFiles) {
       let lines: string[];
@@ -653,6 +660,7 @@ export function buildRepoMap(ws: WebSocket | null): string {
 
       const isPython = file.endsWith('.py');
       const fileDir = file.split('/').slice(0, -1).join('/');
+      const importsForFile: string[] = [];
       for (const line of lines) {
         let resolved: string | null = null;
 
@@ -688,14 +696,65 @@ export function buildRepoMap(ws: WebSocket | null): string {
           }
         }
 
-        if (resolved) inDegree.set(resolved, (inDegree.get(resolved) ?? 0) + 1);
+        if (resolved) {
+          inDegree.set(resolved, (inDegree.get(resolved) ?? 0) + 1);
+          importsForFile.push(resolved);
+        }
       }
+      fileImports.set(file, importsForFile);
     }
 
     if (inDegree.size === 0) return '';
 
-    const hubs = [...inDegree.entries()]
-      .sort((a, b) => b[1] - a[1])
+    // ── Task-scoped ranking ──────────────────────────────────────────────────
+    // When relatedFiles are provided, modules that share a direct import edge
+    // with those files (either as dependencies or consumers) are promoted to
+    // appear before global hubs so the map is relevant to the current task.
+    const taskRelatedSet = new Set(
+      (opts?.relatedFiles ?? []).filter(f => fileSet.has(f))
+    );
+    const taskAdjacent = new Set<string>();
+    if (taskRelatedSet.size > 0) {
+      // What relatedFiles import → their direct dependencies
+      for (const relFile of taskRelatedSet) {
+        for (const imported of fileImports.get(relFile) ?? []) {
+          if (!taskRelatedSet.has(imported)) taskAdjacent.add(imported);
+        }
+      }
+      // Files that import from relatedFiles → their direct consumers
+      for (const [file, imports] of fileImports) {
+        if (taskRelatedSet.has(file)) continue;
+        if (imports.some(imp => taskRelatedSet.has(imp))) {
+          taskAdjacent.add(file);
+        }
+      }
+    }
+
+    // Keyword tiebreaker: files whose basename matches a word in the task prompt
+    const promptKeywords = new Set(
+      (opts?.taskPrompt ?? '').toLowerCase().match(/\b[a-z]\w{3,}\b/g) ?? []
+    );
+    const keywordScore = (file: string): number => {
+      if (promptKeywords.size === 0) return 0;
+      const base = file.split('/').pop()?.replace(/\.(py|ts|tsx|js|jsx|mjs)$/, '').toLowerCase() ?? '';
+      return promptKeywords.has(base) ? 0.5 : 0;
+    };
+
+    // Merge task-adjacent files into candidates even when their in-degree is 0,
+    // so direct consumers of relatedFiles appear in the map regardless of
+    // how many other modules import them.
+    const candidates = new Map<string, number>(inDegree);
+    for (const f of taskAdjacent) {
+      if (!candidates.has(f)) candidates.set(f, 0);
+    }
+
+    const hubs = [...candidates.entries()]
+      .sort((a, b) => {
+        const aAdj = taskAdjacent.has(a[0]) ? 1 : 0;
+        const bAdj = taskAdjacent.has(b[0]) ? 1 : 0;
+        if (aAdj !== bAdj) return bAdj - aAdj;
+        return (b[1] + keywordScore(b[0])) - (a[1] + keywordScore(a[0]));
+      })
       .slice(0, 20)
       .map(([file]) => file);
 

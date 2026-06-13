@@ -34,6 +34,12 @@ _DEFAULT_FUTILITY_N_MULTIPLIER = 3  # futility_n = min_n_per_arm * this
 # valid futility verdict — the measured (near-zero) lift is an artifact of
 # non-delivery, not a genuine null effect.
 _DEFAULT_FUTILITY_MIN_DELIVERY_RATE = 0.50
+# Contamination guard: suppress a decided verdict when the fraction of holdback
+# (without-arm-assigned) tasks that nonetheless received the capability exceeds
+# this threshold.  Contaminated holdback tasks inflate without-arm success and
+# can manufacture a false null/negative verdict for a capability that was never
+# cleanly suppressed.
+_DEFAULT_FUTILITY_MAX_HOLDBACK_CONTAMINATION_RATE = 0.20
 
 
 def _default_config() -> dict[str, Any]:
@@ -43,6 +49,7 @@ def _default_config() -> dict[str, Any]:
         "reject_lift": _DEFAULT_REJECT_LIFT,
         "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
         "futility_min_delivery_rate": _DEFAULT_FUTILITY_MIN_DELIVERY_RATE,
+        "futility_max_holdback_contamination_rate": _DEFAULT_FUTILITY_MAX_HOLDBACK_CONTAMINATION_RATE,
     }
 
 
@@ -86,10 +93,10 @@ LANE_PILOT_ASSIGNMENT_KEY = "_review_fix_lane_arm"  # intent-to-treat arm key
 LANE_PILOT_WARM_RESUME_RECEIPT_KEY = "_review_fix_warm_resume"
 LANE_PILOT_CHECKPOINT_RECEIPT_KEY = "_review_fix_checkpoint"
 
-_DECIDED_VERDICTS = frozenset({"adopt", "reject", "ADOPT", "KILL"})
+_DECIDED_VERDICTS = frozenset({"adopt", "reject", "no_effect", "ADOPT", "KILL"})
 _CONTINUE_VERDICTS = frozenset({"continue-trial", "CONTINUE"})
 _SUFFICIENT_DATA_CONTINUE_REASONS = frozenset(
-    {"ambiguous_lift", "receipt_only_trial", "treatment_not_engaging"}
+    {"ambiguous_lift", "receipt_only_trial", "treatment_not_engaging", "holdback_contaminated"}
 )
 
 
@@ -457,6 +464,9 @@ def evaluate_trial_verdict(
     reject_threshold = float(cfg["reject_lift"])
     futility_n = int(cfg["futility_n"])
     futility_min_delivery_rate = float(cfg["futility_min_delivery_rate"])
+    futility_max_holdback_contamination_rate = float(
+        cfg["futility_max_holdback_contamination_rate"]
+    )
 
     entry: dict[str, Any] = {
         "lift": lift,
@@ -508,7 +518,7 @@ def evaluate_trial_verdict(
                         entry["verdict"] = "continue-trial"
                         entry["verdict_reason"] = "treatment_not_engaging"
                         return entry
-            verdict = "reject"
+            verdict = "no_effect"
             verdict_reason = "futility_bound_reached"
         else:
             verdict = "continue-trial"
@@ -517,15 +527,32 @@ def evaluate_trial_verdict(
     # Receipt-only guard: trials with no assignment key accumulate only receipt
     # context — the arms are structurally confounded and must never produce a
     # decided verdict regardless of sample size.
-    if verdict in ("adopt", "reject") and receipt_only_trial:
+    if verdict in ("adopt", "reject", "no_effect") and receipt_only_trial:
         verdict = "continue-trial"
         verdict_reason = "receipt_only_trial"
+
+    # Contamination guard: suppress a decided verdict when the holdback arm has an
+    # abnormally high fraction of tasks that received the capability despite being
+    # assigned to holdback.  These contaminated tasks inflate without-arm success
+    # and can manufacture a false null/negative verdict.  Requires the accumulator
+    # to have populated ``without_contaminated`` in arm_composition.
+    if verdict in ("adopt", "reject", "no_effect") and arm_composition is not None:
+        _without_assigned = int(arm_composition.get("without_assigned") or 0)
+        _without_contaminated = arm_composition.get("without_contaminated")
+        if _without_contaminated is not None and _without_assigned > 0:
+            _contamination_rate = int(_without_contaminated) / _without_assigned
+            if _contamination_rate > futility_max_holdback_contamination_rate:
+                entry["contamination_rate"] = round(_contamination_rate, 4)
+                entry["immediate_alert"] = True
+                entry["verdict"] = "continue-trial"
+                entry["verdict_reason"] = "holdback_contaminated"
+                return entry
 
     # Purity gate: a decided verdict requires the assignment-based subpopulation
     # alone to satisfy min_n per arm. Receipt-fallback tasks (legacy tasks that
     # pre-date intent-to-treat assignment) are confounded and must not tip the
     # decision. Only applies when arm_composition is provided.
-    if verdict in ("adopt", "reject") and arm_composition is not None:
+    if verdict in ("adopt", "reject", "no_effect") and arm_composition is not None:
         with_assigned = int(arm_composition.get("with_assigned") or 0)
         without_assigned = int(arm_composition.get("without_assigned") or 0)
         if with_assigned < min_n or without_assigned < min_n:
@@ -666,10 +693,17 @@ async def raise_capability_verdict_notice(
         if prior_verdict
         else f"undecided → {new_verdict}"
     )
-    content = (
-        f"[CAPABILITY-TRIAL] {cap_name} decided: {new_verdict} ({transition_desc}) "
-        f"reason={verdict_reason} lift={lift} n_with={n_with} n_without={n_without}"
-    )
+    if new_verdict == "no_effect":
+        content = (
+            f"[CAPABILITY-TRIAL] {cap_name} no measurable effect: {new_verdict} ({transition_desc}) "
+            f"reason={verdict_reason} lift={lift} n_with={n_with} n_without={n_without} "
+            f"— capability neither helped nor harmed; consider simplification rather than removal"
+        )
+    else:
+        content = (
+            f"[CAPABILITY-TRIAL] {cap_name} decided: {new_verdict} ({transition_desc}) "
+            f"reason={verdict_reason} lift={lift} n_with={n_with} n_without={n_without}"
+        )
     session.add(
         ProjectMessage(
             project_id=project_id,
@@ -819,7 +853,7 @@ def carry_adoption_verdicts_for_consolidation(
         if not isinstance(entry, dict):
             return -1
         verdict = entry.get("verdict")
-        if verdict in ("adopt", "reject"):
+        if verdict in ("adopt", "reject", "no_effect"):
             return 2
         if entry.get("evidence_source") == "strategic_review":
             return 1
@@ -859,7 +893,7 @@ def carry_adoption_verdicts_for_consolidation(
         if isinstance(survivor_entry, dict):
             sv = survivor_entry.get("verdict")
             ss = survivor_entry.get("evidence_source")
-            if sv in ("adopt", "reject") or ss == "strategic_review":
+            if sv in ("adopt", "reject", "no_effect") or ss == "strategic_review":
                 logger.info(
                     "[CAPABILITY_TRIAL] consolidation carry-through skipped: "
                     "survivor=%s already has decided verdict %r",
@@ -902,6 +936,6 @@ def get_effective_holdback_fraction(
     verdict = entry.get("verdict")
     if verdict == "adopt":
         return 0.0
-    if verdict == "reject":
+    if verdict in ("reject", "no_effect"):
         return 1.0
     return default_fraction
