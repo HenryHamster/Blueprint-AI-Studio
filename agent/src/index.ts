@@ -1963,6 +1963,10 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         log(`WARNING: Memory at ${(memPct * 100).toFixed(0)}% of cgroup limit (${metrics.cgroup_mb}MB / ${metrics.cgroup_limit_mb}MB) — OOM kill imminent`);
       }
     }
+    // Low disk warning — git/npm operations fail silently when /tmp is full
+    if (metrics.disk_free_mb !== undefined && metrics.disk_free_mb < 512) {
+      log(`WARNING: Low disk space: ${metrics.disk_free_mb}MB free on /tmp`);
+    }
     const fix_loop_events = collectFixLoopEventsForFlush();
     const statusMessage = getMessage();
     const tool_trace = snapshotToolTrace({ refreshLastEntry: statusMessage.startsWith('Using tool:') });
