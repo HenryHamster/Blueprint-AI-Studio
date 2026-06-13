@@ -6462,6 +6462,273 @@ class TestCompletedFoundationSatisfiesPrereqAtSpawn:
                 "ghost-merge escalation must set no_live_or_deferred_provider reason"
             )
 
+    async def test_ghost_merge_squash_landed_not_stranded(self, mocker, db_session):
+        """A non-terminal parent whose merge commit is not an ancestor of the
+        integration branch (ancestry=False) but whose PR number IS referenced in
+        a recent squash commit message must NOT be marked stranded."""
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _make_research_task,
+            _patch_research_externals,
+        )
+        import app.research_completion as _rc_mod
+
+        direction = _active_direction("d-squash-land1", "Squash landed test")
+        project = _Project(
+            name="Squash Landed Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        # Non-terminal parent with a rollup PR number — simulates an IN_PROGRESS
+        # rollup whose commit was squash-merged onto integration.
+        rollup_parent = _Task(
+            project_id=project.id,
+            title="Rollup parent (in-progress)",
+            payloads=[{"type": "rollup", "prompt": "rollup"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            context={"rollup_pr_number": 101},
+        )
+        db_session.add(rollup_parent)
+        await db_session.commit()
+        await db_session.refresh(rollup_parent)
+
+        # COMPLETED+pr_merged child of the rollup — this populates
+        # potential_ghost_parent_ids so the ancestry check is triggered.
+        ghost_foundation = _Task(
+            project_id=project.id,
+            title="Foundation (pr_merged)",
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True},
+            parent_task_id=rollup_parent.id,
+        )
+        db_session.add(ghost_foundation)
+        await db_session.commit()
+        await db_session.refresh(ghost_foundation)
+
+        finding = {
+            **_make_finding(title="Finding: from squash PR"),
+            "actionability_grade": "HIGH",
+        }
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.release_qualifier._resolve_github_with_session",
+            new=AsyncMock(return_value=("tok", "owner", "repo")),
+        )
+        mocker.patch(
+            "app.github.get_pull_request",
+            new=AsyncMock(return_value={"merge_commit_sha": "deadbeef1234"}),
+        )
+        # ancestry returns False — the pre-squash SHA is not on integration
+        mocker.patch(
+            "app.github.is_ancestor_of",
+            new=AsyncMock(return_value=False),
+        )
+        mocker.patch(
+            "app.github.get_pull_request_commits",
+            new=AsyncMock(return_value=[]),
+        )
+        # squash reference found — PR #101 appears in a recent commit message
+        squash_ref_mock = mocker.patch(
+            "app.github.check_squash_referenced",
+            new=AsyncMock(return_value=True),
+        )
+        # Clear the idempotency cache before this test
+        _rc_mod._SQUASH_LANDED_CONFIRMED_PARENT_IDS.discard(str(rollup_parent.id))
+
+        await _handle_research_completion(task, "", db_session)
+
+        # Squash-reference check must have been called
+        squash_ref_mock.assert_awaited_once()
+        # Parent must have been added to the confirmed cache
+        assert str(rollup_parent.id) in _rc_mod._SQUASH_LANDED_CONFIRMED_PARENT_IDS
+
+    async def test_ghost_merge_squash_not_referenced_is_stranded(
+        self, mocker, db_session
+    ):
+        """A non-terminal parent with ancestry=False and no squash reference
+        found must be marked stranded (treated as a true ghost merge)."""
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _make_research_task,
+            _patch_research_externals,
+        )
+        import app.research_completion as _rc_mod
+
+        direction = _active_direction("d-squash-strand1", "Squash strand test")
+        project = _Project(
+            name="Squash Strand Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        rollup_parent = _Task(
+            project_id=project.id,
+            title="Rollup parent (in-progress, unmerged)",
+            payloads=[{"type": "rollup", "prompt": "rollup"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            context={"rollup_pr_number": 202},
+        )
+        db_session.add(rollup_parent)
+        await db_session.commit()
+        await db_session.refresh(rollup_parent)
+
+        ghost_foundation = _Task(
+            project_id=project.id,
+            title="Foundation (pr_merged, unmerged rollup)",
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True},
+            parent_task_id=rollup_parent.id,
+        )
+        db_session.add(ghost_foundation)
+        await db_session.commit()
+        await db_session.refresh(ghost_foundation)
+
+        finding = {
+            **_make_finding(title="Finding: from unmerged PR"),
+            "actionability_grade": "HIGH",
+        }
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.release_qualifier._resolve_github_with_session",
+            new=AsyncMock(return_value=("tok", "owner", "repo")),
+        )
+        mocker.patch(
+            "app.github.get_pull_request",
+            new=AsyncMock(return_value={"merge_commit_sha": "cafebabe5678"}),
+        )
+        mocker.patch(
+            "app.github.is_ancestor_of",
+            new=AsyncMock(return_value=False),
+        )
+        mocker.patch(
+            "app.github.get_pull_request_commits",
+            new=AsyncMock(return_value=[]),
+        )
+        # squash reference not found — PR #202 is not on integration branch
+        squash_ref_mock = mocker.patch(
+            "app.github.check_squash_referenced",
+            new=AsyncMock(return_value=False),
+        )
+        _rc_mod._SQUASH_LANDED_CONFIRMED_PARENT_IDS.discard(str(rollup_parent.id))
+
+        await _handle_research_completion(task, "", db_session)
+
+        squash_ref_mock.assert_awaited_once()
+        # Parent must NOT have been added to the squash-confirmed cache
+        assert str(rollup_parent.id) not in _rc_mod._SQUASH_LANDED_CONFIRMED_PARENT_IDS
+
+    async def test_ghost_merge_squash_idempotency_guard(self, mocker, db_session):
+        """A parent already in _SQUASH_LANDED_CONFIRMED_PARENT_IDS must not
+        trigger a re-check of the squash reference on a second cycle."""
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _make_research_task,
+            _patch_research_externals,
+        )
+        import app.research_completion as _rc_mod
+
+        direction = _active_direction("d-squash-idem1", "Squash idempotency test")
+        project = _Project(
+            name="Squash Idempotency Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        rollup_parent = _Task(
+            project_id=project.id,
+            title="Rollup parent (cached)",
+            payloads=[{"type": "rollup", "prompt": "rollup"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            context={"rollup_pr_number": 303},
+        )
+        db_session.add(rollup_parent)
+        await db_session.commit()
+        await db_session.refresh(rollup_parent)
+
+        ghost_foundation = _Task(
+            project_id=project.id,
+            title="Foundation (pr_merged, cached rollup)",
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True},
+            parent_task_id=rollup_parent.id,
+        )
+        db_session.add(ghost_foundation)
+        await db_session.commit()
+        await db_session.refresh(ghost_foundation)
+
+        # Pre-seed the idempotency cache
+        _rc_mod._SQUASH_LANDED_CONFIRMED_PARENT_IDS.add(str(rollup_parent.id))
+
+        finding = {
+            **_make_finding(title="Finding: idempotency guard"),
+            "actionability_grade": "HIGH",
+        }
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.release_qualifier._resolve_github_with_session",
+            new=AsyncMock(return_value=("tok", "owner", "repo")),
+        )
+        mocker.patch(
+            "app.github.get_pull_request",
+            new=AsyncMock(return_value={"merge_commit_sha": "11223344aabb"}),
+        )
+        mocker.patch(
+            "app.github.is_ancestor_of",
+            new=AsyncMock(return_value=False),
+        )
+        # check_squash_referenced must NOT be called for a cached parent
+        squash_ref_mock = mocker.patch(
+            "app.github.check_squash_referenced",
+            new=AsyncMock(return_value=True),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        squash_ref_mock.assert_not_awaited()
+
     async def test_recent_terminal_duplicate_finding_is_suppressed_by_history(
         self, mocker, db_session
     ):
@@ -12538,9 +12805,7 @@ async def test_deferred_memo_enrollment_flag_off_no_op(db_session, mocker):
         "app.research_completion.cited_paths_changed_since",
         new=AsyncMock(return_value=None),
     )
-    mocker.patch(
-        "app.research_completion._has_validation_backend", return_value=False
-    )
+    mocker.patch("app.research_completion._has_validation_backend", return_value=False)
     mocker.patch(
         "app.research_completion._summarize_ungrounded_claims_grounded",
         new=AsyncMock(return_value=None),
@@ -12604,9 +12869,7 @@ async def test_deferred_memo_enrollment_flag_on_enrolls(db_session, mocker):
         "app.research_completion.cited_paths_changed_since",
         new=AsyncMock(return_value=None),
     )
-    mocker.patch(
-        "app.research_completion._has_validation_backend", return_value=False
-    )
+    mocker.patch("app.research_completion._has_validation_backend", return_value=False)
     mocker.patch(
         "app.research_completion._summarize_ungrounded_claims_grounded",
         new=AsyncMock(return_value=None),
@@ -12675,9 +12938,7 @@ async def test_deferred_memo_enrollment_dedup_on_repeat_drop(db_session, mocker)
         "app.research_completion.cited_paths_changed_since",
         new=AsyncMock(return_value=None),
     )
-    mocker.patch(
-        "app.research_completion._has_validation_backend", return_value=False
-    )
+    mocker.patch("app.research_completion._has_validation_backend", return_value=False)
     mocker.patch(
         "app.research_completion._summarize_ungrounded_claims_grounded",
         new=AsyncMock(return_value=None),

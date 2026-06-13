@@ -187,6 +187,11 @@ _SCOPE_AWARE_EFFORT_TYPES = frozenset(
 # permanently shut down medium exploration and prevent data collection.
 MEDIUM_EXPLORATION_FLOOR = 0.05
 
+# Idempotency guard for squash-merge ancestry fallback: once a parent task's
+# PR is confirmed as squash-landed (commit message reference found), skip
+# re-checking on subsequent cycles — the landing is permanent.
+_SQUASH_LANDED_CONFIRMED_PARENT_IDS: set[str] = set()
+
 # Max memo tasks spawned per research cycle for dropped findings. Independent
 # of the implementation-task spawn cap (_DEGRADED_SPAWN_CAP / batch cap): memos
 # are read-only and cheap, so a flood of dropped findings is bounded here rather
@@ -3247,14 +3252,60 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             project_id=str(task.project_id),
                         )
                         if _is_anc is False:
-                            failed_parent_ids.add(_p.id)
-                            logger.info(
-                                "[RESEARCH] Parent task %s is non-terminal but ancestry "
-                                "check confirms merge commit %s not on %s — marking stranded",
-                                _p.id,
-                                _merge_sha[:8],
-                                _integration_branch_rc,
-                            )
+                            # Squash-merge fallback: the stored merge_commit_sha is the
+                            # pre-squash commit, not the squash commit on main.  Check
+                            # whether recent integration-branch commits reference this
+                            # PR number or any of its original commit SHAs before
+                            # declaring the parent stranded.
+                            if str(_p.id) in _SQUASH_LANDED_CONFIRMED_PARENT_IDS:
+                                # Already confirmed as squash-landed on a prior cycle.
+                                continue
+                            try:
+                                _pr_commits = await _rc_github.get_pull_request_commits(
+                                    _rc_token, _rc_owner, _rc_repo, _pr_num
+                                )
+                                _pr_commit_shas = [
+                                    c.get("sha")
+                                    for c in (_pr_commits or [])
+                                    if isinstance(c, dict) and c.get("sha")
+                                ]
+                                _is_sq_ref = await _rc_github.check_squash_referenced(
+                                    _rc_token,
+                                    _rc_owner,
+                                    _rc_repo,
+                                    _integration_branch_rc,
+                                    _pr_num,
+                                    commit_shas=_pr_commit_shas,
+                                    project_id=str(task.project_id),
+                                )
+                            except Exception as _exc_sq:  # noqa: BLE001
+                                logger.debug(
+                                    "[RESEARCH] squash-reference check failed for "
+                                    "parent task %s: %s",
+                                    _p.id,
+                                    _exc_sq,
+                                )
+                                _is_sq_ref = None
+                            if _is_sq_ref is True:
+                                _SQUASH_LANDED_CONFIRMED_PARENT_IDS.add(str(_p.id))
+                                logger.info(
+                                    "[RESEARCH] Parent task %s: ancestry False but "
+                                    "squash reference found on %s — not stranded",
+                                    _p.id,
+                                    _integration_branch_rc,
+                                )
+                                continue
+                            if _is_sq_ref is False:
+                                failed_parent_ids.add(_p.id)
+                                logger.info(
+                                    "[RESEARCH] Parent task %s: ancestry+squash check "
+                                    "confirms merge commit %s not on %s — marking stranded",
+                                    _p.id,
+                                    _merge_sha[:8],
+                                    _integration_branch_rc,
+                                )
+                            # _is_sq_ref is None (API error) — indeterminate; fall
+                            # through without stranding (flag-trust).
                     except Exception as _exc_p:  # noqa: BLE001 — API error → skip
                         logger.debug(
                             "[RESEARCH] ancestry check failed for parent task %s: %s",
@@ -4616,11 +4667,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 # description is an empty string and prompt is non-empty.
                 _finding_hash(
                     str(finding.get("title", title) or ""),
-                    str(
-                        finding.get("description")
-                        or finding.get("prompt", "")
-                        or ""
-                    ),
+                    str(finding.get("description") or finding.get("prompt", "") or ""),
                 ),
             )
             if isinstance(v, str) and v.strip()

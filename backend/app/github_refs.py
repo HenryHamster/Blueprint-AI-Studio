@@ -525,9 +525,7 @@ async def list_pull_requests_for_commit(
     if len(_list_prs_for_commit_cache) > _LIST_PRS_FOR_COMMIT_CACHE_MAX:
         cutoff = now - (_LIST_PRS_FOR_COMMIT_CACHE_TTL_S * 2)
         for k in [
-            k
-            for k, (_, ts) in _list_prs_for_commit_cache.items()
-            if ts < cutoff
+            k for k, (_, ts) in _list_prs_for_commit_cache.items() if ts < cutoff
         ]:
             _list_prs_for_commit_cache.pop(k, None)
     return all_prs
@@ -570,9 +568,7 @@ async def agent_image_rebake_expected(
     )
     if files is None:
         return None
-    return any(
-        f.startswith(prefix) for f in files for prefix in AGENT_IMAGE_BAKE_PATHS
-    )
+    return any(f.startswith(prefix) for f in files for prefix in AGENT_IMAGE_BAKE_PATHS)
 
 
 async def is_ancestor_of(
@@ -712,6 +708,40 @@ async def list_recent_commit_messages(
         if isinstance(message, str):
             messages.append(message)
     return messages
+
+
+async def check_squash_referenced(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    pr_number: int,
+    commit_shas: list[str] | None = None,
+    project_id: str | None = None,
+) -> bool | None:
+    """Return True if recent commits on ``branch`` reference ``pr_number`` or any
+    of ``commit_shas``, False if no reference was found, or None on API error.
+
+    Used as a fallback after ``is_ancestor_of`` returns False to detect squash-
+    merged PRs: the pre-squash ``merge_commit_sha`` stored on the PR object is
+    not an ancestor of the integration branch after a squash merge, but the
+    squash commit message typically contains ``#<pr_number>`` or includes the
+    original commit SHAs in its body.
+    """
+    messages = await list_recent_commit_messages(
+        token, owner, repo, branch, limit=50, project_id=project_id
+    )
+    if messages is None:
+        return None
+    pr_ref = f"#{pr_number}"
+    short_shas = {sha[:8] for sha in (commit_shas or []) if sha and len(sha) >= 8}
+    for msg in messages:
+        if pr_ref in msg:
+            return True
+        for short in short_shas:
+            if short in msg:
+                return True
+    return False
 
 
 async def get_files_changed_between_refs(

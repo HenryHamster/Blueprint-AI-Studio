@@ -82,6 +82,7 @@ from app.shared_state import (
 )
 from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
+from app.landed_signal import LANDED_ON_INTEGRATION_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -1520,10 +1521,14 @@ def _build_cycle_start_reconciliation(
         if not did:
             continue
         recent_titles = delta.get("recent_merged_titles")
-        if isinstance(recent_titles, list):
-            recent_completed_by_direction[did] = sum(
-                1 for entry in recent_titles if isinstance(entry, dict)
-            )
+        pr_count = (
+            sum(1 for entry in recent_titles if isinstance(entry, dict))
+            if isinstance(recent_titles, list)
+            else 0
+        )
+        non_pr_count = int(delta.get("recent_non_pr_completed") or 0)
+        if pr_count or non_pr_count:
+            recent_completed_by_direction[did] = pr_count + non_pr_count
     for d in active_dirs:
         did = str(d.get("id") or "")
         in_flight = int(active_by_direction.get(did, 0) or 0)
@@ -1560,9 +1565,7 @@ def _build_cycle_start_reconciliation(
                 "recently_converted": 2,
                 "research_waiting_on_action": 3,
                 "idle": 4,
-            }.get(
-                str(item.get("state")), 5
-            ),
+            }.get(str(item.get("state")), 5),
             -int(item.get("findings") or 0),
             -int(item.get("recently_completed") or 0),
             -int(item.get("held") or 0),
@@ -3254,6 +3257,7 @@ async def _build_recent_interventions(
                 "body": body,
                 "on_automain": _on_automain(t),
                 "on_main": _on_main(t),
+                "landed_on_integration": ctx.get(LANDED_ON_INTEGRATION_KEY),
             }
         )
 
@@ -3306,6 +3310,9 @@ async def _build_recent_interventions(
                     "title": title,
                     "on_automain": _on_automain(t),
                     "merge_verdict": merge_verdict,
+                    "landed_on_integration": (t.context or {}).get(
+                        LANDED_ON_INTEGRATION_KEY
+                    ),
                 }
             )
             if merge_verdict not in recent_merge_verdict_counts:
@@ -3323,6 +3330,22 @@ async def _build_recent_interventions(
             entry["recent_merge_verdict_counts"] = recent_merge_verdict_counts
             if recent_not_landed_titles:
                 entry["recent_not_landed_titles"] = recent_not_landed_titles
+        # Count recently-completed tasks that produced no PR (design, web_research,
+        # compute_experiment, etc.).  These represent real pipeline progress even
+        # though they never set pr_merged=True.
+        recent_non_pr_completed = 0
+        for t in d_tasks:
+            if t.status != TaskStatus.COMPLETED or (t.context or {}).get("pr_merged"):
+                continue
+            t_updated = (
+                t.updated_at
+                or t.created_at
+                or datetime.min.replace(tzinfo=timezone.utc)
+            )
+            if t_updated >= recent_cutoff:
+                recent_non_pr_completed += 1
+        if recent_non_pr_completed:
+            entry["recent_non_pr_completed"] = recent_non_pr_completed
         per_direction_delta.append(entry)
 
     # Active-by-scope: tasks currently in flight per scope. Surfaced so the

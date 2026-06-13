@@ -7541,6 +7541,133 @@ async def test_on_automain_false_when_rollup_not_merged(db_session):
     assert merges[0]["on_automain"] is False
 
 
+# ── landed_on_integration field in _build_recent_interventions ───────────────
+
+
+@pytest.mark.asyncio
+async def test_merges_out_landed_on_integration_false(db_session):
+    """merges[] entries expose landed_on_integration=False when the context key is
+    explicitly False (merged to rollup staging branch, not integration branch)."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Rollup-only fix",
+        description="merged to staging only",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "landed_on_integration": False},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["landed_on_integration"] is False
+
+
+@pytest.mark.asyncio
+async def test_merges_out_landed_on_integration_true(db_session):
+    """merges[] entries expose landed_on_integration=True when the context key is
+    explicitly True (confirmed merge to the integration branch)."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Integration fix",
+        description="landed on integration",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["landed_on_integration"] is True
+
+
+@pytest.mark.asyncio
+async def test_merges_out_landed_on_integration_legacy_none(db_session):
+    """merges[] entries expose landed_on_integration=None for legacy rows that
+    predate the landed_on_integration context key — backward compatible."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Legacy fix",
+        description="old row without landed_on_integration key",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["landed_on_integration"] is None
+
+
+@pytest.mark.asyncio
+async def test_recent_merged_titles_landed_on_integration(db_session):
+    """per_direction_delta recent_merged_titles entries expose landed_on_integration
+    alongside on_automain and merge_verdict."""
+    d_id = "d-test-loi"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[{"id": d_id, "text": "test direction", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task merged to rollup staging only (landed_on_integration=False)
+    task = Task(
+        project_id=project.id,
+        title="Staging-only fix",
+        description="merged to staging branch only",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "direction_id": d_id,
+            "landed_on_integration": False,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = {d["direction_id"]: d for d in result["per_direction_delta"]}
+    assert d_id in delta
+    titles = delta[d_id].get("recent_merged_titles", [])
+    assert len(titles) == 1
+    assert titles[0]["landed_on_integration"] is False
+    assert titles[0]["title"] == "Staging-only fix"
+
+
 # ── on_main / undeployed_directions + deployment_state block ──────────────────
 
 
@@ -8648,6 +8775,7 @@ async def test_rollup_squash_body_evidence_prevents_not_landed_verdict(
             "title": "Honor rollup squash bodies",
             "on_automain": expected_verdict == "verified_landed",
             "merge_verdict": expected_verdict,
+            "landed_on_integration": None,
         }
     ]
     if expected_not_landed_titles:
@@ -9537,6 +9665,55 @@ class TestBuildCycleStartReconciliation:
         assert out["counts"]["pipeline_waiting_on_action"] == 0
         assert out["counts"]["pipeline_held_on_dependency"] == 1
         assert out["counts"]["pipeline_recently_converted"] == 1
+
+    def test_non_pr_completions_count_as_recently_converted(self):
+        # Directions that produce only design/web_research/compute_experiment
+        # findings never set pr_merged=True, so recent_merged_titles is empty.
+        # The reconciliation should still classify them as recently_converted when
+        # recent_non_pr_completed > 0.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {
+                "id": "d-design",
+                "status": "active",
+                "text": "design direction",
+                "recent_findings": ["f1"],
+            },
+            {
+                "id": "d-wait",
+                "status": "active",
+                "text": "waiting direction",
+                "recent_findings": ["f1"],
+            },
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-design",
+                "direction_text": "design direction",
+                # No recent_merged_titles — direction only produced design docs.
+                "recent_non_pr_completed": 2,
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            {},
+            {},
+            {},
+            per_direction_delta,
+        )
+        assert out is not None
+        states = {p["direction_id"]: p["state"] for p in out["direction_pipeline"]}
+        assert states["d-design"] == "recently_converted", (
+            "non-PR completions should yield recently_converted, not research_waiting_on_action"
+        )
+        assert states["d-wait"] == "research_waiting_on_action"
+        design_entry = next(
+            p for p in out["direction_pipeline"] if p["direction_id"] == "d-design"
+        )
+        assert design_entry["recently_completed"] == 2
+        assert out["counts"]["pipeline_recently_converted"] == 1
+        assert out["counts"]["pipeline_waiting_on_action"] == 1
 
     def test_lists_are_capped_but_counts_carry_true_total(self):
         from app.strategic_spawning import (

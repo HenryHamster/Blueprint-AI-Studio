@@ -1666,9 +1666,7 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
     await db_session.refresh(task)
     assert task.context.get("pr_merged") is True
     alerts = (
-        (
-            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
-        )
+        (await db_session.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1840,9 +1838,7 @@ async def test_pr_merged_to_distinct_promotion_target_alerts_without_pr_merged(
     rollup_mock.assert_not_called()
 
     alerts = (
-        (
-            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
-        )
+        (await db_session.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -3492,6 +3488,104 @@ async def test_list_recent_commit_messages_returns_none_on_failure(
 
 
 # ---------------------------------------------------------------------------
+# check_squash_referenced — PR-number / commit-SHA scan over integration branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_squash_referenced_finds_pr_number(mocker):
+    """Returns True when a recent commit message on the branch contains #{pr_number}."""
+    from app.github import check_squash_referenced
+
+    commits = [
+        {"commit": {"message": "Squash-merged PR #42 into automain\n\nfixes thing"}},
+        {"commit": {"message": "Another commit"}},
+    ]
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, commits),
+    )
+    result = await check_squash_referenced("tok", "owner", "repo", "automain", 42)
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_check_squash_referenced_finds_commit_sha(mocker):
+    """Returns True when a recent commit message contains a short SHA from commit_shas."""
+    from app.github import check_squash_referenced
+
+    commits = [
+        {"commit": {"message": "Rollup squash\n\nco-authored: deadbeef1234abcd"}},
+    ]
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, commits),
+    )
+    result = await check_squash_referenced(
+        "tok",
+        "owner",
+        "repo",
+        "automain",
+        99,
+        commit_shas=["deadbeef1234abcdef"],
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_check_squash_referenced_returns_false_when_not_found(mocker):
+    """Returns False when no commit message references the PR number or SHAs."""
+    from app.github import check_squash_referenced
+
+    commits = [
+        {"commit": {"message": "Unrelated change to the codebase"}},
+        {"commit": {"message": "Fix typo in README"}},
+    ]
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, commits),
+    )
+    result = await check_squash_referenced(
+        "tok",
+        "owner",
+        "repo",
+        "automain",
+        42,
+        commit_shas=["aabbccdd"],
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_check_squash_referenced_returns_none_on_api_error(mocker):
+    """Returns None (indeterminate) when the API call fails."""
+    from app.github import check_squash_referenced
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(500, {}),
+    )
+    result = await check_squash_referenced("tok", "owner", "repo", "automain", 42)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_check_squash_referenced_no_commit_shas(mocker):
+    """Works correctly with no commit_shas provided (only PR number lookup)."""
+    from app.github import check_squash_referenced
+
+    commits = [
+        {"commit": {"message": "Merge pull request #7 from feature/foo"}},
+    ]
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, commits),
+    )
+    result = await check_squash_referenced("tok", "owner", "repo", "automain", 7)
+    assert result is True
+
+
+# ---------------------------------------------------------------------------
 # pr_is_not_behind — GitHub-clean / ancestor-of-base detector
 # ---------------------------------------------------------------------------
 
@@ -3737,16 +3831,12 @@ async def test_submit_pr_review_self_authored_approve_downgrades_to_comment(mock
         "app.github._github_request",
         new_callable=AsyncMock,
         side_effect=[
-            MockResponse(
-                422, {}, text="Can not approve your own pull request"
-            ),
+            MockResponse(422, {}, text="Can not approve your own pull request"),
             MockResponse(200, {"id": 1}),
         ],
     )
 
-    result = await submit_pr_review(
-        "tok", "owner", "repo", 7, "APPROVE", "LGTM", []
-    )
+    result = await submit_pr_review("tok", "owner", "repo", 7, "APPROVE", "LGTM", [])
 
     assert result == {"id": 1}
     assert req.await_count == 2
@@ -3830,9 +3920,7 @@ async def test_submit_pr_review_self_authored_then_bad_comments(mocker):
         new_callable=AsyncMock,
         side_effect=[
             MockResponse(422, {}, text="Can not approve your own pull request"),
-            MockResponse(
-                422, {}, text="line must be part of the diff"
-            ),
+            MockResponse(422, {}, text="line must be part of the diff"),
             MockResponse(201, {"id": 3, "state": "COMMENTED"}),
         ],
     )
@@ -4086,7 +4174,7 @@ async def test_get_file_text_at_ref_decodes_200(mocker):
     import base64
     from app.github import get_file_text_at_ref
 
-    body = "EXPECTED_SCHEMA_REVISION = \"0137\"\n"
+    body = 'EXPECTED_SCHEMA_REVISION = "0137"\n'
     encoded = base64.b64encode(body.encode()).decode()
     mocker.patch(
         "app.github._github_request",
@@ -4137,16 +4225,19 @@ async def test_commit_file_changes_happy_path(mocker):
         "app.github._github_request",
         new_callable=AsyncMock,
         side_effect=[
-            MockResponse(200, {"object": {"sha": "tip"}}),       # get-ref
-            MockResponse(200, {"tree": {"sha": "basetree"}}),     # get-commit
-            MockResponse(201, {"sha": "blob1"}),                  # create-blob
-            MockResponse(201, {"sha": "newtree"}),                # create-tree
-            MockResponse(201, {"sha": "newcommit"}),              # create-commit
-            MockResponse(200, {}),                                # update-ref
+            MockResponse(200, {"object": {"sha": "tip"}}),  # get-ref
+            MockResponse(200, {"tree": {"sha": "basetree"}}),  # get-commit
+            MockResponse(201, {"sha": "blob1"}),  # create-blob
+            MockResponse(201, {"sha": "newtree"}),  # create-tree
+            MockResponse(201, {"sha": "newcommit"}),  # create-commit
+            MockResponse(200, {}),  # update-ref
         ],
     )
     sha = await commit_file_changes(
-        "t", "o", "r", "staging",
+        "t",
+        "o",
+        "r",
+        "staging",
         upserts={"backend/app/main.py": "X = 1\n"},
         deletes=[],
         message="msg",
@@ -4176,7 +4267,10 @@ async def test_commit_file_changes_delete_uses_sha_null(mocker):
         ],
     )
     await commit_file_changes(
-        "t", "o", "r", "staging",
+        "t",
+        "o",
+        "r",
+        "staging",
         upserts={"backend/alembic/versions/0138_new.py": "src"},
         deletes=["backend/alembic/versions/0137_new.py"],
         message="rename",
@@ -4203,8 +4297,13 @@ async def test_commit_file_changes_raises_on_bad_status(mocker):
     )
     with pytest.raises(RuntimeError):
         await commit_file_changes(
-            "t", "o", "r", "staging",
-            upserts={"f.py": "x"}, deletes=[], message="m",
+            "t",
+            "o",
+            "r",
+            "staging",
+            upserts={"f.py": "x"},
+            deletes=[],
+            message="m",
         )
 
 
