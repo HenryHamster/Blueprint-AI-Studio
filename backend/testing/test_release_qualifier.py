@@ -8715,8 +8715,8 @@ async def test_promote_guard_block_skips_auto_merge(db_session, mocker):
         new=AsyncMock(return_value={"enabled": True}),
     )
     mocker.patch(
-        "app.rollup_migration_validation.enforce_premerge_migration_guard",
-        new=AsyncMock(return_value=(False, "dual-head: duplicate revision")),
+        "app.rollup_migration_validation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("block", "dual-head: duplicate revision")),
     )
 
     result = await rq.promote(
@@ -8741,10 +8741,18 @@ async def test_promote_guard_block_skips_auto_merge(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_promote_defers_on_migration_metadata_unfetchable(db_session, mocker):
+async def test_promote_defers_to_managed_check_wait_on_migration_metadata_unfetchable(
+    db_session, mocker
+):
     """A transient inability to fetch the migration metadata HOLDS the promotion
-    (retryable) rather than merging blind — fail-safe, mirroring the other
-    pre-merge guard paths."""
+    in ``managed_check_wait`` (retryable) rather than merging blind OR recording
+    a terminal failure.
+
+    The bool wrapper used to collapse ``defer`` → ``migration_guard_blocked``,
+    which for a release rollup means a spurious terminal failure that bounces
+    the version to stabilize and never lands. With the 3-way verdict, ``defer``
+    enters managed_check_wait: the release branch is KEPT and the reconciler
+    re-runs the guard once the metadata is fetchable."""
     _project, version = await _make_project_and_version(db_session)
 
     mocker.patch(
@@ -8783,15 +8791,20 @@ async def test_promote_defers_on_migration_metadata_unfetchable(db_session, mock
     )
     await db_session.commit()
 
+    # The merge never ran, the branch was NOT deleted (reconciler needs it),
+    # and NO terminal failure was recorded — the version is held pending.
     merge_mock.assert_not_called()
-    assert result["status"] == "promotion_failed"
-    assert result["error"] == "migration_guard_blocked"
+    delete_branch_mock.assert_not_awaited()
+    assert result["status"] == "pending_managed_check_wait"
+    assert result["managed_check_wait"] is True
 
     await db_session.refresh(version)
     assert version.status == "open"
-    assert version.phase == "stabilize"
-    assert version.last_qualification["error"] == "migration_guard_blocked"
-    delete_branch_mock.assert_awaited()
+    assert version.last_qualification["status"] == "pending"
+    assert "error" not in version.last_qualification
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["why_not_native_automerge"] == "migration_guard_deferred"
 
 
 @pytest.mark.asyncio
@@ -14517,9 +14530,11 @@ async def test_promote_pending_ci_migration_pr_skips_auto_merge(db_session, mock
     # The pre-merge guard passes (validates clean against the target AT check
     # time) so execution reaches the pending-CI auto-merge fallback; the new
     # exclusion then diverts a migration-carrying PR away from native auto-merge.
+    # promote() consumes the 3-way verdict directly, so mock the chain (not the
+    # bool wrapper) to an "ok" verdict.
     mocker.patch(
-        "app.rollup_migration_validation.enforce_premerge_migration_guard",
-        new=AsyncMock(return_value=(True, None)),
+        "app.rollup_migration_validation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
     )
     # PR touches an Alembic migration → pr_touches_migrations returns True.
     mocker.patch(

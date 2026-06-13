@@ -927,8 +927,6 @@ async def _reconcile_if_managed_check_wait(
     Transient GitHub errors leave the version pending (fail-open) so the next
     sweep retries.  Returns True iff the version reached a terminal state.
     """
-    from app.rollup_migration_validation import enforce_premerge_migration_guard
-
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
@@ -1180,13 +1178,28 @@ async def _reconcile_if_managed_check_wait(
                 return False
 
             # 4. CI is green — re-run the Alembic dual-head guard before merging.
-            ok_to_merge, hold_reason = await enforce_premerge_migration_guard(
-                token, owner, repo, int(pr_number), promotion_target
+            # Use the 3-way verdict so 'defer' (metadata temporarily unavailable)
+            # leaves the version pending for the next sweep without cleanup, while
+            # 'block' (genuine collision) records the terminal failure.
+            from app.rollup_migration_validation import _validate_rollup_migration_chain
+
+            migration_verdict, hold_reason = await _validate_rollup_migration_chain(
+                token, owner, repo, int(pr_number), target_branch=promotion_target
             )
-            if not ok_to_merge:
+            if migration_verdict == "defer":
+                logger.info(
+                    "[RELEASE_QUALIFIER] reconcile managed_check_wait: migration "
+                    "chain guard DEFERRED for PR #%s (v%d) — leaving pending for "
+                    "next sweep. Reason: %s",
+                    pr_number,
+                    version.version_number,
+                    hold_reason,
+                )
+                return False
+            if migration_verdict == "block":
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile managed_check_wait: Alembic "
-                    "guard holds for PR #%s (v%d): %s — recording "
+                    "guard BLOCKED for PR #%s (v%d): %s — recording "
                     "migration_guard_blocked",
                     pr_number,
                     version.version_number,
