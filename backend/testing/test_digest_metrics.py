@@ -5045,6 +5045,126 @@ def test_first_attempt_breakdowns_repo_map_compliance_all_compliant():
     assert bd["compliance"]["without_rate"] == 0.0
 
 
+# ── _compute_first_attempt_breakdowns: diagnostics_after_edit arm (intent-to-treat) ─
+
+
+def _fa_dae_arm_task(
+    *, succeeded: bool, dae_arm: bool | None, had_dae: bool | None
+) -> object:
+    """Task fixture for diagnostics_after_edit assignment-vs-receipt tests."""
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if dae_arm is not None:
+        ctx["_diagnostics_after_edit_arm"] = dae_arm
+    if had_dae is not None:
+        ctx["_had_diagnostics_after_edit"] = had_dae
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_diagnostics_after_edit_arm_partitioning():
+    """Intent-to-treat: arm uses _diagnostics_after_edit_arm assignment, not _had_diagnostics_after_edit receipt."""
+    # 5 treatment-assigned (all succeeded), 5 holdback-assigned (none succeeded)
+    treatment = [_fa_dae_arm_task(succeeded=True, dae_arm=True, had_dae=True)] * 4 + [
+        _fa_dae_arm_task(succeeded=True, dae_arm=True, had_dae=False)
+    ] * 1
+    holdback = [_fa_dae_arm_task(succeeded=False, dae_arm=False, had_dae=False)] * 5
+    result = _compute_first_attempt_breakdowns(treatment + holdback)
+    bd = result["trial_breakdowns"]["diagnostics_after_edit"]
+    # Partitioned by assignment key, not receipt key
+    assert bd["with_n"] == 5
+    assert bd["without_n"] == 5
+    assert bd["with_rate"] == 1.0
+    assert bd["without_rate"] == 0.0
+    assert bd["lift"] == 1.0
+
+
+def test_first_attempt_breakdowns_diagnostics_after_edit_legacy_fallback():
+    """Legacy tasks without _diagnostics_after_edit_arm fall back to _had_diagnostics_after_edit."""
+    legacy_with = [_fa_dae_arm_task(succeeded=True, dae_arm=None, had_dae=True)] * 5
+    legacy_without = [
+        _fa_dae_arm_task(succeeded=False, dae_arm=None, had_dae=False)
+    ] * 5
+    result = _compute_first_attempt_breakdowns(legacy_with + legacy_without)
+    bd = result["trial_breakdowns"]["diagnostics_after_edit"]
+    assert bd["with_n"] == 5
+    assert bd["without_n"] == 5
+    assert bd["lift"] == 1.0
+
+
+def test_first_attempt_breakdowns_diagnostics_after_edit_assignment_overrides_receipt():
+    """When _diagnostics_after_edit_arm is present it wins over _had_diagnostics_after_edit."""
+    # Assigned to holdback but receipt=True: must land in holdback arm
+    holdback_with_receipt = _fa_dae_arm_task(
+        succeeded=True, dae_arm=False, had_dae=True
+    )
+    treatment = [_fa_dae_arm_task(succeeded=True, dae_arm=True, had_dae=True)] * 5
+    holdback = [holdback_with_receipt] + [
+        _fa_dae_arm_task(succeeded=False, dae_arm=False, had_dae=False)
+    ] * 4
+    result = _compute_first_attempt_breakdowns(treatment + holdback)
+    bd = result["trial_breakdowns"]["diagnostics_after_edit"]
+    assert bd["with_n"] == 5
+    assert bd["without_n"] == 5
+
+
+def test_first_attempt_breakdowns_diagnostics_after_edit_compliance_subdict_present():
+    """compliance sub-dict is present for diagnostics_after_edit (assignment key differs from context key)."""
+    tasks = (
+        [_fa_dae_arm_task(succeeded=True, dae_arm=True, had_dae=True)] * 4
+        + [_fa_dae_arm_task(succeeded=True, dae_arm=True, had_dae=False)] * 1
+        + [_fa_dae_arm_task(succeeded=False, dae_arm=False, had_dae=False)] * 5
+    )
+    result = _compute_first_attempt_breakdowns(tasks)
+    bd = result["trial_breakdowns"]["diagnostics_after_edit"]
+    assert "compliance" in bd
+    # 4 of 5 treatment tasks actually received the capability → 80%
+    assert bd["compliance"]["with_rate"] == 0.8
+    assert bd["compliance"]["without_rate"] == 0.2
+
+
+def test_first_attempt_breakdowns_diagnostics_after_edit_flat_alias_keys_present():
+    """diagnostics_after_edit flat alias keys are generated at the top level."""
+    tasks = [_fa_dae_arm_task(succeeded=True, dae_arm=True, had_dae=True)] * 5 + [
+        _fa_dae_arm_task(succeeded=False, dae_arm=False, had_dae=False)
+    ] * 5
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert "diagnostics_after_edit_lift" in result
+    assert "with_diagnostics_after_edit_n" in result
+    assert "without_diagnostics_after_edit_n" in result
+    assert result["with_diagnostics_after_edit_n"] == 5
+    assert result["without_diagnostics_after_edit_n"] == 5
+
+
+def test_evaluate_trial_verdict_purity_gate_blocks_adopt_when_assigned_arm_low_but_receipt_inflated():
+    """Purity gate blocks adopt when assigned-arm counts are low even though receipt-inflated totals meet threshold.
+
+    Mirrors the TestArmComposition.test_purity_gate_blocks_adopt_when_assigned_with_arm_insufficient
+    pattern but framed for the diagnostics_after_edit trial context.
+    """
+    from app.capability_trial_verdict import evaluate_trial_verdict
+
+    # n_with=40 / n_without=40 would ordinarily meet min_n_per_arm=30,
+    # but almost all tasks got there via receipt fallback, not assignment.
+    arm_comp = {
+        "with_assigned": 5,
+        "with_receipt": 35,
+        "without_assigned": 5,
+        "without_receipt": 35,
+    }
+    entry = evaluate_trial_verdict(
+        lift=0.10,
+        n_with=40,
+        n_without=40,
+        arm_composition=arm_comp,
+    )
+    assert entry["verdict"] == "continue-trial"
+    assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
+    assert entry["arm_composition"] == arm_comp
+
+
 # ── Migration-serialization slot contention ─────────────────────────────────
 
 

@@ -1697,6 +1697,178 @@ async def test_agent_heartbeat_repo_map_arm_write_once(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
+async def test_agent_heartbeat_persists_had_diagnostics_after_edit_true(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with had_diagnostics_after_edit=True persists _had_diagnostics_after_edit=True to task.context."""
+    project = Project(name="Heartbeat Diag After Edit True", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-true",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-true")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "had_diagnostics_after_edit": True},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_had_diagnostics_after_edit") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_had_diagnostics_after_edit_write_once(
+    client: AsyncClient, db_session
+):
+    """Second heartbeat with had_diagnostics_after_edit=False does not overwrite an already-set flag."""
+    project = Project(
+        name="Heartbeat Diag After Edit Write Once", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-once",
+        status=TaskStatus.IN_PROGRESS,
+        context={"_had_diagnostics_after_edit": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-once")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "had_diagnostics_after_edit": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    # Must remain True — write-once semantics
+    assert (task.context or {}).get("_had_diagnostics_after_edit") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_persists_diagnostics_after_edit_arm_true(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with diagnostics_after_edit_arm=True persists _diagnostics_after_edit_arm=True to task.context."""
+    project = Project(
+        name="Heartbeat Diag After Edit Arm True", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-arm-true",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-arm-true")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "diagnostics_after_edit_arm": True},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_diagnostics_after_edit_arm") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_persists_diagnostics_after_edit_arm_false(
+    client: AsyncClient, db_session
+):
+    """Heartbeat with diagnostics_after_edit_arm=False persists _diagnostics_after_edit_arm=False to task.context."""
+    project = Project(
+        name="Heartbeat Diag After Edit Arm False", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-arm-false",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-arm-false")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "diagnostics_after_edit_arm": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_diagnostics_after_edit_arm") is False
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_diagnostics_after_edit_arm_write_once(
+    client: AsyncClient, db_session
+):
+    """Second heartbeat with diagnostics_after_edit_arm=False does not overwrite an already-set flag."""
+    project = Project(
+        name="Heartbeat Diag After Edit Arm Write Once", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-diag-ae-arm-once",
+        status=TaskStatus.IN_PROGRESS,
+        context={"_diagnostics_after_edit_arm": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-diag-ae-arm-once")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "diagnostics_after_edit_arm": False},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    # Must remain True — write-once semantics
+    assert (task.context or {}).get("_diagnostics_after_edit_arm") is True
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(
     client: AsyncClient, db_session
 ):
@@ -2291,12 +2463,14 @@ async def test_agent_claim_bootstrap_guidance_requests_source_revision(
 
     task = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "repo_bootstrap",
-            "github_owner": "acme",
-            "github_repo": "source-revision",
-            "integration_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "repo_bootstrap",
+                "github_owner": "acme",
+                "github_repo": "source-revision",
+                "integration_branch": "main",
+            }
+        ],
         vm_instance_id="agent-vm-bootstrap-guidance-source-revision",
     )
     db_session.add(task)
@@ -20901,9 +21075,7 @@ async def test_agent_status_park_logs_sanitized_as_reason(
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
 
-    project = Project(
-        name="Park Logs Sanitize Test", user_id="test-user-park-sanitize"
-    )
+    project = Project(name="Park Logs Sanitize Test", user_id="test-user-park-sanitize")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
