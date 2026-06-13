@@ -9,7 +9,18 @@ import type { MergeGateFleetHealth } from '../types/digest';
  * and how many projects have a degraded gate. Renders nothing when there is no
  * gate activity (so the dashboard stays clean for fleets without no-CI repos).
  */
-export function MergeGateFleetHealthCard({ data }: { data?: MergeGateFleetHealth | null }) {
+export function MergeGateFleetHealthCard({ data, stale }: { data?: MergeGateFleetHealth | null; stale?: boolean }) {
+  if (!data && stale) {
+    return (
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 opacity-50">
+        <div className="flex items-center gap-2 mb-2">
+          <ShieldCheck className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+          <h3 className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest">Merge Gate Health</h3>
+        </div>
+        <div className="text-[10px] text-neutral-600">Data unavailable</div>
+      </div>
+    );
+  }
   if (!data || data.project_count <= 0) {
     return null;
   }

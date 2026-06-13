@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { RefObject } from 'react';
-import { Clock, ChevronDown, ChevronUp, Compass, CheckCircle } from 'lucide-react';
+import { Clock, ChevronDown, ChevronUp, Compass, CheckCircle, AlertCircle } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
 import { DirectionProgressSection } from './DirectionProgressSection';
 import type { DirectionProgress } from './DirectionProgressSection';
@@ -532,13 +532,32 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
               <SkeletonRow />
               <SkeletonRow />
             </div>
-          ) : !hasActivity || !digest ? (
-            <div className="flex items-center gap-2 text-xs text-neutral-600 py-1">
-              <CheckCircle className="w-3.5 h-3.5" />
-              All clear — nothing to catch up on
+          ) : !digest ? (
+            <div className="flex items-center gap-2 text-xs text-neutral-500 py-1">
+              <AlertCircle className="w-3.5 h-3.5" />
+              Catch-up data unavailable — retry
+            </div>
+          ) : !hasActivity ? (
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-2 text-xs text-neutral-600 py-1">
+                <CheckCircle className="w-3.5 h-3.5" />
+                All clear — nothing to catch up on
+              </div>
+              {digest.served_stale && (
+                <div className="flex items-center gap-1 text-[10px] text-amber-500/80">
+                  <AlertCircle className="w-3 h-3" />
+                  Stale data — last fetch may be outdated
+                </div>
+              )}
             </div>
           ) : (
             <div className="flex flex-col gap-3">
+              {digest.served_stale && (
+                <div className="flex items-center gap-1 text-[10px] text-amber-500/80">
+                  <AlertCircle className="w-3 h-3" />
+                  Stale data — last fetch may be outdated
+                </div>
+              )}
               <CatchUpNarrativeSummary digest={digest} activeWindow={activeWindow} />
               {digest.latest_cycle && (
                 <CatchUpLatestCycleSection latestCycle={digest.latest_cycle} />

@@ -115,8 +115,13 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         if (data?.daily_cost_usd != null) setDailyCostUsd(data.daily_cost_usd);
         if (data?.daily_cost_ceiling_usd != null) setDailyCostCeilingUsd(data.daily_cost_ceiling_usd);
         if (typeof data?.stale_heartbeat_count === 'number') setFleetStaleHeartbeatCount(data.stale_heartbeat_count);
-        setDigestLastSuccessAt(Date.now());
-        setDigestPollFailed(false);
+        // Treat served_stale as equivalent to a failed poll for display purposes
+        if (data?.served_stale === true) {
+          setDigestPollFailed(true);
+        } else {
+          setDigestLastSuccessAt(Date.now());
+          setDigestPollFailed(false);
+        }
       } else {
         setDigestPollFailed(true);
       }

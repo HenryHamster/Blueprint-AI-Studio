@@ -580,6 +580,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     sparkRef.current = next;
     setSparkData(next);
   }, [activeCount, queuedCount, digest?.failed_count]);
+  const digestIsStale = digestStale || Boolean(digest?.served_stale);
   const failedCount = digest?.failed_count ?? 0;
   const successRate = digest?.success_rate;
 
@@ -939,16 +940,16 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
           <RecentMergesTimeline mergeEvents={mergeEvents} loading={loading} />
 
           {/* Fleet-wide no-CI merge-gate verification health (read-only) */}
-          {digest?.merge_gate_fleet_health && digest.merge_gate_fleet_health.project_count > 0 && (
+          {(digest?.merge_gate_fleet_health || digestIsStale) && (
             <div className="mt-4">
-              <MergeGateFleetHealthCard data={digest.merge_gate_fleet_health} />
+              <MergeGateFleetHealthCard data={digest?.merge_gate_fleet_health} stale={digestIsStale} />
             </div>
           )}
 
           {/* Park/wake delivery health (read-only) */}
-          {digest?.park_wake_health && (
+          {(digest?.park_wake_health || digestIsStale) && (
             <div className="mt-4">
-              <ParkWakeHealthCard data={digest.park_wake_health} />
+              <ParkWakeHealthCard data={digest?.park_wake_health} stale={digestIsStale} />
             </div>
           )}
 

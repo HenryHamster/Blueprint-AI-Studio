@@ -250,6 +250,77 @@ describe('CatchUpPanel', () => {
     expect(text).toContain('1 need attention');
   });
 
+  test('renders unavailable state (not All clear) when digest is null', async () => {
+    // Use a unique project ID with no localStorage cache to test the null-digest branch
+    const projectId = 'project-no-cache-999';
+    localStorage.removeItem(`blueprint-admin:lastDigest:${projectId}`);
+    vi.mocked(apiFetch).mockImplementation(async (url: string) => {
+      if (url.includes('/digest')) {
+        return new Response('', { status: 500 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <CatchUpPanel
+          selectedProjectId={projectId}
+          lastVisitTimestamp={null}
+          refreshInterval={60000}
+          onSelectTask={() => {}}
+          needsAttentionCount={0}
+        />,
+      );
+    });
+
+    await act(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    });
+
+    const text = host?.textContent ?? '';
+    expect(text).not.toContain('All clear');
+    expect(text).toContain('unavailable');
+  });
+
+  test('renders staleness indicator when digest.served_stale is true', async () => {
+    const staleDigest = { ...BASE_DIGEST, served_stale: true };
+    vi.mocked(apiFetch).mockImplementation(async (url: string) => {
+      if (url.includes('/digest')) {
+        return new Response(JSON.stringify(staleDigest), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <CatchUpPanel
+          selectedProjectId="project-123"
+          lastVisitTimestamp={null}
+          refreshInterval={60000}
+          onSelectTask={() => {}}
+          needsAttentionCount={0}
+        />,
+      );
+    });
+
+    await act(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    });
+
+    const text = host?.textContent ?? '';
+    expect(text).toContain('Stale');
+  });
+
   test('renders discarded digest diagnostics (migration health, prevention efficacy, release infra)', async () => {
     const digestBody = {
       window_hours: 24,

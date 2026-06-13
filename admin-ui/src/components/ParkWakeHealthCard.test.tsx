@@ -42,8 +42,20 @@ describe('ParkWakeHealthCard', () => {
     expect(screen.getByText(/Delivery stalled past 30m/)).toBeInTheDocument();
   });
 
-  it('renders nothing when data is null', () => {
+  it('renders nothing when data is null and stale is false', () => {
     const { container } = render(<ParkWakeHealthCard data={null} />);
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders a greyed placeholder when data is null and stale is true', () => {
+    render(<ParkWakeHealthCard data={null} stale={true} />);
+    expect(screen.getByText('Park/Wake Health')).toBeInTheDocument();
+    expect(screen.getByText('Data unavailable')).toBeInTheDocument();
+  });
+
+  it('renders the full card even when stale is true and data is present', () => {
+    render(<ParkWakeHealthCard data={makeData()} stale={true} />);
+    expect(screen.getByText('3')).toBeInTheDocument();
+    expect(screen.getByText('currently parked')).toBeInTheDocument();
   });
 });

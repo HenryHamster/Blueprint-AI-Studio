@@ -130,6 +130,29 @@ describe('OrchestratorHealthBar cost pill', () => {
     expect(recoveredPill).not.toHaveTextContent('as of');
     expect(recoveredPill.className).not.toContain('opacity-75');
   });
+
+  it('dims cost pill when 200 response contains served_stale:true', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-13T12:00:00Z'));
+    apiFetchMock
+      .mockResolvedValueOnce(makeCostResponse(12.43, 50))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ daily_cost_usd: 12.43, daily_cost_ceiling_usd: 50, served_stale: true }),
+      } as Response);
+
+    render(<OrchestratorHealthBar {...baseProps} />);
+    await act(async () => {});
+
+    expect(screen.getByTitle(/Daily cost: \$12\.43 \/ \$50\.00/).textContent).not.toContain('as of');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+
+    const stalePill = screen.getByTitle(/Last digest poll failed; showing values as of 1m ago/);
+    expect(stalePill).toHaveTextContent('$12.43 / $50.00');
+    expect(stalePill).toHaveTextContent('as of 1m ago');
+    expect(stalePill.className).toContain('opacity-75');
+  });
 });
 
 describe('OrchestratorHealthBar cycle liveness verdict', () => {
