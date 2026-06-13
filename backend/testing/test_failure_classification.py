@@ -161,7 +161,9 @@ def _task(msg: str = "", ctx: dict | None = None) -> Task:
 
 
 CORPUS_PATH = (
-    Path(__file__).resolve().parent / "__fixtures__" / "credential_redaction_corpus.json"
+    Path(__file__).resolve().parent
+    / "__fixtures__"
+    / "credential_redaction_corpus.json"
 )
 
 
@@ -808,7 +810,9 @@ class TestNormalizeAgentFailureCategory:
     def test_reset_failed_routes_to_provision_failure(self):
         task = _task("reset_failed: warm re-target failed")
 
-        assert normalize_agent_failure_category("reset_failed", task) == PROVISION_FAILURE
+        assert (
+            normalize_agent_failure_category("reset_failed", task) == PROVISION_FAILURE
+        )
 
     def test_oauth_rotation_failed_routes_to_external_api(self):
         task = _task("OAuth rotation failed before running task")
@@ -1680,6 +1684,7 @@ class TestPrBranchDeleted:
         """The pr_branch_deleted category maps to SCOPE_EMPTY without falling
         through to the warning log that catches unmapped categories."""
         import logging
+
         task = _task("PR branch was already deleted (merged and auto-deleted)")
         with caplog.at_level(logging.WARNING):
             result = normalize_agent_failure_category("pr_branch_deleted", task)
@@ -1702,12 +1707,15 @@ class TestPrBranchDeleted:
     def test_pr_branch_deleted_is_scope_empty(self):
         """Verify pr_branch_deleted routes to SCOPE_EMPTY class."""
         task = _task("PR branch deleted after merge")
-        assert normalize_agent_failure_category("pr_branch_deleted", task) == SCOPE_EMPTY
+        assert (
+            normalize_agent_failure_category("pr_branch_deleted", task) == SCOPE_EMPTY
+        )
 
     def test_pr_branch_deleted_in_infra_classes(self):
         """pr_branch_deleted maps to SCOPE_EMPTY which is in INFRA_CLASSES,
         so direction-health analytics don't penalize the agent."""
         from app.failure_classification import INFRA_CLASSES
+
         assert SCOPE_EMPTY in INFRA_CLASSES
 
 
@@ -2887,8 +2895,8 @@ class TestRedactCredentials:
     def test_google_aiza_too_short_not_redacted(self):
         from app.failure_classification import _redact_credentials
 
-        # 34 chars — one short — must not match.
-        key = "AIza" + "A" * 34
+        # 10 trailing chars — below {20,} minimum — must not match.
+        key = "AIza" + "A" * 10
         out = _redact_credentials(f"key={key}")
         assert key in out
 

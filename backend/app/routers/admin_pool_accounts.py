@@ -998,6 +998,7 @@ async def reset_account_rate_limits(
     db_account.rate_limit_state = None
     db_account.enabled = True
     db_account.disabled_reason = None
+    db_account.disabled_at = None
     db_account.updated_at = _utcnow()
     session.add(db_account)
     await session.commit()

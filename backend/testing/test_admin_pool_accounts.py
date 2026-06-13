@@ -1675,7 +1675,9 @@ async def test_provider_model_breakdown_honors_project_id(client, db_session):
     await db_session.flush()
 
     # The test user must be a ProjectMember of project_a to pass the auth check.
-    db_session.add(ProjectMember(project_id=project_a.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project_a.id, user_id="test-user-123", role="owner")
+    )
     await db_session.flush()
 
     acct_id = uuid.uuid4()
@@ -1735,7 +1737,9 @@ async def test_provider_model_breakdown_honors_project_id(client, db_session):
     )
 
 
-async def test_provider_model_breakdown_project_id_rejects_non_member(client, db_session):
+async def test_provider_model_breakdown_project_id_rejects_non_member(
+    client, db_session
+):
     """A project the caller is NOT a member of must return 404."""
     # Create a project owned by a different user; test-user-123 has no membership.
     other_project = Project(name="pmb-other", user_id="other-user-999")
@@ -1794,18 +1798,12 @@ async def test_provider_model_breakdown_serve_stale_annotates_response(
         "generated_at": old_iso,
     }
     spy = AsyncMock(side_effect=[good, RuntimeError("statement timeout")])
-    mocker.patch.object(
-        _admin_pool_accounts, "_compute_provider_model_breakdown", spy
-    )
+    mocker.patch.object(_admin_pool_accounts, "_compute_provider_model_breakdown", spy)
 
     try:
-        r1 = await client.get(
-            "/api/admin/max-plan-accounts/provider-model-breakdown"
-        )
+        r1 = await client.get("/api/admin/max-plan-accounts/provider-model-breakdown")
         await asyncio.sleep(0.1)  # expire the fresh entry → next poll recomputes
-        r2 = await client.get(
-            "/api/admin/max-plan-accounts/provider-model-breakdown"
-        )
+        r2 = await client.get("/api/admin/max-plan-accounts/provider-model-breakdown")
     finally:
         app.dependency_overrides.pop(get_digest_cache, None)
 
@@ -1837,9 +1835,7 @@ async def test_account_health_summary_annotates_fresh_freshness(
     generated = _admin_pool_accounts._utcnow().isoformat()
     payload: Dict[str, Any] = {"accounts": [], "generated_at": generated}
     spy = AsyncMock(return_value=payload)
-    mocker.patch.object(
-        _admin_pool_accounts, "_compute_account_health_summary", spy
-    )
+    mocker.patch.object(_admin_pool_accounts, "_compute_account_health_summary", spy)
 
     try:
         res = await client.get("/api/admin/max-plan-accounts/health")
@@ -1868,3 +1864,36 @@ async def test_provider_model_breakdown_empty_accounts_carries_freshness(
     assert body["served_stale"] is False
     assert "generated_at" in body
     assert "precompute_age_seconds" in body
+
+
+# ── reset-rate-limits ──────────────────────────────────────────────────────
+
+
+async def test_reset_rate_limits_clears_disabled_at_column(client, db_session):
+    """reset-rate-limits must clear disabled_at in the DB so a subsequent manual
+    disable is not silently undone by the auto-recovery sweep."""
+    past = datetime.utcnow() - timedelta(hours=2)
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="Rate Limited Account",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/rl/versions/1",
+        secret_blob_ref="projects/test/secrets/rl/versions/1",
+        enabled=False,
+        disabled_at=past,
+        disabled_reason="auto-disabled after 3 rate-limit hit(s)",
+        rate_limit_state={"disabled_models": ["claude-opus-4-8"]},
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    res = await client.post(f"/api/admin/max-plan-accounts/{acct.id}/reset-rate-limits")
+    assert res.status_code == 200, res.text
+    assert "Rate-limit state cleared" in res.json()["message"]
+
+    await db_session.refresh(acct)
+    assert acct.disabled_at is None
+    assert acct.enabled is True
+    assert acct.disabled_reason is None
+    assert acct.rate_limit_state is None

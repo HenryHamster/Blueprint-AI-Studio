@@ -1171,8 +1171,8 @@ _CRED_REDACT_SUBS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"sk-proj-[A-Za-z0-9_-]{10,}"), "sk-proj-***"),
     # OpenAI generic API keys (sk-…); minimum 20 chars to avoid false positives
     (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-***"),
-    # Google AIza API keys (39 chars total: "AIza" + 35 alphanumeric)
-    (re.compile(r"AIza[A-Za-z0-9_-]{35}"), "AIza***"),
+    # Google AIza API keys (AIza + 20+ alphanumeric — open-ended to catch truncated or over-length keys)
+    (re.compile(r"AIza[A-Za-z0-9_-]{20,}"), "AIza***"),
     # Google OAuth access tokens (ya29.…)
     (re.compile(r"ya29\.[A-Za-z0-9_.\-]+"), "ya29***"),
     # JWT tokens: three base64url-encoded parts separated by dots

@@ -28,9 +28,11 @@ export function sanitize(text: string): string {
     .replace(
       // keep in sync with backend/app/broadcast.py and backend/app/failure_classification.py
       // Value group uses [^'"\\]|\\. (unambiguous alternation — avoids ReDoS on backslash-heavy inputs)
-      /(["']?)(access_token|refresh_token|id_token|api_key|client_secret|private_key|token)\1(\s*[:=]\s*)(["'])((?:[^'"\\]|\\.)+)\4/gi,
-      (_match, keyQuote: string, key: string, separator: string, valueQuote: string) =>
-        `${keyQuote}${key}${keyQuote}${separator}${valueQuote}***${valueQuote}`,
+      // Alternation handles quoted values (ReDoS-safe inner group) and unquoted values (8+ char floor)
+      // \b guards prevent matching 'api_key' inside compound names like OPENAI_API_KEY
+      /(['"]?\b(?:access_token|refresh_token|id_token|api_key|client_secret|private_key|token)\b['"]?\s*[:=]\s*)(?:(['"])((?:[^'"\\]|\\.)+)\2|([A-Za-z0-9_.+=\-/@]{8,}))/gi,
+      (_match, prefix: string, quote: string | undefined) =>
+        quote ? `${prefix}${quote}***${quote}` : `${prefix}***`,
     )
     .replace(/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, 'eyJ***')
     .replace(/Bearer\s+[^\s,'"]+/gi, 'Bearer ***')

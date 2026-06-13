@@ -212,11 +212,16 @@ async def broadcast_to_project(project_id: str, event_type: str, data: dict):
 # Log sanitization patterns — mirrors agent/src/index.ts sanitize() to catch secrets
 # that bypass agent-side sanitization (compromised agent, direct WS injection)
 # keep in sync with agent/src/utils/sanitize.ts and backend/app/failure_classification.py
-# Value group uses [^'"\\]|\\. (unambiguous: first alt rejects backslash, second starts with
-# backslash) — avoids the exponential backtracking that ((?:\\.|(?!\4)[\s\S])+) exhibits
-# on inputs with many backslashes and no closing quote.
+# Matches JSON-style "field": "value" and key=value / key: value pairs.
+# Alternation handles both quoted values (ReDoS-safe [^'"\\]|\\. inner group) and
+# unquoted values (8+ char floor to skip booleans/nulls).
+# \b guards prevent matching 'api_key' inside compound names like OPENAI_API_KEY.
+# Group 1: field name + separator (including optional surrounding quotes)
+# Group 2: quote char (quoted branch only)
+# Group 3: quoted value
+# Group 4: unquoted value
 _CRED_FIELD_RE = re.compile(
-    r"""(["\']?)(access_token|refresh_token|id_token|api_key|client_secret|private_key|token)\1(\s*[:=]\s*)(["\'])((?:[^'"\\]|\\.)+)\4""",
+    r"""(["\']?\b(?:access_token|refresh_token|id_token|api_key|client_secret|private_key|token)\b["\']?\s*[:=]\s*)(?:(["\'])((?:[^'"\\]|\\.)+)\2|([A-Za-z0-9_.+=\-/@]{8,}))""",
     re.IGNORECASE,
 )
 
@@ -249,7 +254,11 @@ def _sanitize_log(text: str) -> str:
     for pattern, replacement in _SANITIZE_PATTERNS:
         text = pattern.sub(replacement, text)
     text = _CRED_FIELD_RE.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}{m.group(1)}{m.group(3)}{m.group(4)}***{m.group(4)}",
+        lambda m: (
+            f"{m.group(1)}{m.group(2)}***{m.group(2)}"
+            if m.group(2)
+            else f"{m.group(1)}***"
+        ),
         text,
     )
     return text
