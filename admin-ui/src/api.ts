@@ -736,6 +736,7 @@ export interface LanePilotPreflightResponse {
   ready: boolean;
   checks: LanePilotPreflightCheck[];
   durable_verdict: string | null;
+  pilot_mode?: string;
 }
 
 export async function fetchLanePilotPreflight(

@@ -5769,3 +5769,113 @@ async def test_managed_check_wait_timeout_backstop_still_applies(db_session):
     assert version.last_qualification["status"] == "promotion_failed"
     assert version.last_qualification["error"] == "promotion_pending_timeout"
     assert "promotion_pending" not in version.last_qualification
+
+
+# ===========================================================================
+# managed_check_wait: 405 retriable vs terminal classification
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_405_retriable_vs_terminal(db_session, mocker):
+    """A 405 merge refusal with a terminal message records merge_refused_405_terminal
+    immediately; a retriable message leaves the version pending for the next sweep.
+
+    Exercises _classify_405_message and the two new branches in
+    _reconcile_if_managed_check_wait's merge-result else-block:
+      - terminal message ("Auto merge was disabled") -> promotion_failed with
+        error="merge_refused_405_terminal", version back to stabilize.
+      - retriable message ("Required status check ... has not passed") -> version
+        stays pending (reconciled=False), no promotion_failed recorded.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "deadbeef" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "completed", "conclusion": "success", "details": []}
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
+    mocker.patch("app.github.close_pull_request", new=AsyncMock(return_value={}))
+
+    # --- Terminal 405: "Auto merge was disabled" ---
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "conflict": False,
+                "message": "Auto merge was disabled on this pull request",
+            }
+        ),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True, "terminal 405 should return reconciled=True"
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "merge_refused_405_terminal"
+    assert "auto merge was disabled" in version.last_qualification.get("detail", "").lower()
+
+    # --- Retriable 405: "Required status check ... has not passed" ---
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "conflict": False,
+                "message": "Required status check 'CI / Backend' has not passed",
+            }
+        ),
+    )
+
+    _project2, version2 = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version2.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version2)
+    await db_session.commit()
+    await db_session.refresh(version2)
+
+    reconciled2 = await _reconcile_if_managed_check_wait(
+        version2.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled2 is False, "retriable 405 should return reconciled=False (leave pending)"
+    await db_session.refresh(version2)
+    assert version2.status == "open"
+    assert version2.last_qualification["status"] == "pending"
+    assert "promotion_pending" in version2.last_qualification

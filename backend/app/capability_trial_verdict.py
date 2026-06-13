@@ -107,6 +107,10 @@ class LanePilotAggregates(TypedDict, total=False):
     warm_resume_fraction: float | None
     checkpoint_fraction: float | None
     lane_fix_tasks_sampled: int
+    # Shadow-pilot arm count (pilot_arm="shadow"). Shadow arms are EXCLUDED from
+    # n_lane/n_control and from min_n threshold checks so they never influence
+    # KILL/ADOPT verdict decisions — they are observational only.
+    n_shadow: int
 
 
 def is_lane_pilot_arm_member(context: dict[str, Any]) -> str | None:
@@ -228,6 +232,7 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
                 **base,
                 "verdict": "KILL",
                 "verdict_reason": "lane_cost_ceiling_exceeded",
+                "cost_delta_pct": round(cost_delta * 100, 2),
                 "immediate_alert": False,
             }
 

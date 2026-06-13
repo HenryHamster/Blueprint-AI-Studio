@@ -210,6 +210,11 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                 <span className={`font-semibold ${preflight.ready ? 'text-emerald-300' : 'text-amber-300'}`}>
                   {preflight.ready ? 'Pilot ready to enable' : 'Prerequisites unmet'}
                 </span>
+                {preflight.pilot_mode && preflight.pilot_mode !== 'off' && (
+                  <span className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${preflight.pilot_mode === 'on' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-amber-500/40 bg-amber-500/15 text-amber-300'}`}>
+                    {preflight.pilot_mode === 'on' ? 'pilot on' : 'shadow'}
+                  </span>
+                )}
                 {preflight.durable_verdict && (
                   <span className={`ml-auto rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${preflight.durable_verdict === 'KILL' ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'}`}>
                     {preflight.durable_verdict}

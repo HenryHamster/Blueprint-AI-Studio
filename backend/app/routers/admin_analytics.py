@@ -73,12 +73,12 @@ async def _compute_shadow_lane_health(
         await session.execute(
             select(
                 func.count().label("shadow_lane_count"),
-                func.coalesce(
-                    func.sum(ImprovementLane.checkpoint_seq), 0
-                ).label("checkpoints_written"),
-                func.coalesce(
-                    func.sum(ImprovementLane.phase_requeues), 0
-                ).label("checkpoint_miss_count"),
+                func.coalesce(func.sum(ImprovementLane.checkpoint_seq), 0).label(
+                    "checkpoints_written"
+                ),
+                func.coalesce(func.sum(ImprovementLane.phase_requeues), 0).label(
+                    "checkpoint_miss_count"
+                ),
             ).where(*_base_filter)
         )
     ).one()
@@ -1183,7 +1183,9 @@ async def get_open_prs(
     )
     if not project or not project.github_owner or not project.github_repo:
         # Missing GitHub config is an operator-visible configuration state, not a GitHub outage.
-        return _build_open_prs_payload(project, [], degraded=False, degraded_reason=None)
+        return _build_open_prs_payload(
+            project, [], degraded=False, degraded_reason=None
+        )
 
     # Cache check (skipping early paths above because github_owner/repo can
     # change and we want to honor that immediately).
@@ -1667,6 +1669,7 @@ async def get_lane_pilot_preflight(
         LANE_PILOT_CAP_NAME,
     )
     from app.runtime_config_state import (  # noqa: PLC0415
+        get_lane_pilot_mode,
         is_improvement_lanes_enabled,
         is_review_fix_lane_pilot_enabled,
     )
@@ -1796,4 +1799,5 @@ async def get_lane_pilot_preflight(
         "ready": ready,
         "checks": checks,
         "durable_verdict": durable_verdict,
+        "pilot_mode": get_lane_pilot_mode(),
     }

@@ -105,6 +105,7 @@ WORKSPACE_WARM_RESERVED = "WARM_RESERVED"
 WORKSPACE_LEASED = "LEASED"
 
 _VALID_ARMS = ("lane", "control")
+_SHADOW_ARM = "shadow"
 
 # ── Checkpoint-phase recovery classification ──────────────────────────────────
 # Returned by ``checkpoint_or_recover_phase`` so the review-spawn path can act on
@@ -153,6 +154,15 @@ def is_review_fix_lane_pilot_enabled() -> bool:
 def is_review_fix_lane_shadow_enabled() -> bool:
     """True when review-fix lanes are in checkpoint-only shadow mode."""
     from app.runtime_config_state import is_review_fix_lane_shadow_enabled as _enabled
+
+    return _enabled()
+
+
+def is_review_fix_lane_pilot_shadow_mode_enabled() -> bool:
+    """True when the three-value pilot shadow mode is active (mode='shadow')."""
+    from app.runtime_config_state import (
+        is_review_fix_lane_pilot_shadow_mode_enabled as _enabled,
+    )
 
     return _enabled()
 
@@ -209,7 +219,10 @@ def record_lane_arm_assignment(
     recorded, all newly-assigned chains are forced to the 'lane' arm (holdback
     drops to 0, matching get_effective_holdback_fraction adopt->0.0 semantics).
     """
-    if not is_review_fix_lane_pilot_enabled() or not is_pilot_eligible_project(project):
+    if (
+        not is_review_fix_lane_pilot_enabled()
+        and not is_review_fix_lane_pilot_shadow_mode_enabled()
+    ) or not is_pilot_eligible_project(project):
         return None
     # KILL short-circuit: a durable KILL verdict suppresses all new assignments
     # regardless of whether the runtime flag is still True (reload survival).
@@ -674,7 +687,8 @@ async def checkpoint_and_reserve_on_phase_complete(
     # Reserve the freed warm-pool member to the lane (best-effort: only engages
     # when the source ran on a pool member). The lane's workspace_state mirrors
     # the reservation so operators see WARM_RESERVED on the lane row.
-    if not reserve_workspace:
+    # Shadow-arm lanes never take warm reservations — they are observational only.
+    if getattr(lane, "pilot_arm", None) == _SHADOW_ARM or not reserve_workspace:
         return True
     vm_id = getattr(source_task, "vm_instance_id", None)
     if vm_id:
@@ -1317,6 +1331,21 @@ def is_review_fix_lane_shadow_active_for_project(project: Any) -> bool:
     )
 
 
+def is_review_fix_lane_pilot_shadow_mode_active_for_project(project: Any) -> bool:
+    """True when the three-value shadow pilot mode is active for *project*.
+
+    Shadow pilot: arm assignment + checkpoint writing run, but no warm-pool
+    reservations are made and fix tasks are not routed to lane workspaces.
+    Distinct from the classic armless shadow (improvement_lanes_enabled=True,
+    pilot_enabled=False) which creates lanes with pilot_arm=None.
+    """
+    return (
+        is_review_fix_lane_pilot_shadow_mode_enabled()
+        and is_pilot_eligible_project(project)
+        and not is_review_fix_lane_killed(project)
+    )
+
+
 # ── Lane-arm time medians (feeds lane_relay_comparison in digest) ──────────────
 async def compute_lane_arm_time_medians(
     session: AsyncSession,
@@ -1494,6 +1523,23 @@ async def compute_lane_pilot_aggregates(
             )
         )
     ).all()
+
+    # Count distinct shadow-pilot chains separately (never included in the live
+    # lane/control counts — shadow arms are observational only).
+    shadow_rows = (
+        await session.execute(
+            select(Task.id, _orig_id_expr).where(
+                Task.project_id == project_id,
+                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                _arm_expr == _SHADOW_ARM,
+            )
+        )
+    ).all()
+    _shadow_chain_ids: set[str] = set()
+    for task_id_val, orig_id_val in shadow_rows:
+        chain_id = str(orig_id_val).strip() if orig_id_val else str(task_id_val)
+        _shadow_chain_ids.add(chain_id)
+    n_shadow = len(_shadow_chain_ids)
 
     # Group rows by chain, then compute per-arm counts.
     _chains: dict[str, dict[str, Any]] = {}
@@ -1715,6 +1761,7 @@ async def compute_lane_pilot_aggregates(
     return {
         "n_lane": n_lane,
         "n_control": n_control,
+        "n_shadow": n_shadow,
         "lane_merge_rate": lane_merge_rate,
         "control_merge_rate": control_merge_rate,
         "lane_cost_per_merged": lane_cost_per_merged,

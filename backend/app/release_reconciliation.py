@@ -87,6 +87,43 @@ _MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT = 10
 _MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT = 160
 
 
+_TERMINAL_405_SUBSTRINGS = (
+    "pull request is closed",
+    "auto merge was disabled",
+    "auto-merge was disabled",
+    "not enabled",
+    "merge commits are not allowed",
+)
+_RETRIABLE_405_SUBSTRINGS = (
+    "required status check",
+    "required checks",
+    "base branch was recently updated",
+    "waiting for status",
+)
+
+
+def _classify_405_message(msg: str) -> str:
+    """Classify a GitHub 405 merge-refusal message as 'terminal' or 'retriable'.
+
+    GitHub returns 405 for both permanent blockers (PR closed, auto-merge
+    disabled, branch-protection config changed) and transient ones (required
+    checks not yet passed).  A terminal 405 must be recorded as a distinct
+    failure so operators see the real cause; a retriable 405 should leave the
+    version pending for the next sweep.
+
+    Returns 'terminal', 'retriable', or 'unknown' (treated as retriable by the
+    caller so we never prematurely kill a version on an unrecognised message).
+    """
+    lower = msg.lower()
+    for substr in _TERMINAL_405_SUBSTRINGS:
+        if substr in lower:
+            return "terminal"
+    for substr in _RETRIABLE_405_SUBSTRINGS:
+        if substr in lower:
+            return "retriable"
+    return "unknown"
+
+
 def _trim_check_snapshot_text(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -1505,14 +1542,71 @@ async def _reconcile_if_managed_check_wait(
                     await session.commit()
                     return True
                 else:
-                    # Green CI but merge refused — re-check the head's CI state
-                    # live before committing to a terminal failure.  A required
-                    # check may have flipped back to queued/pending between the
-                    # initial classification and the merge call (check re-run,
-                    # late-registered expectation).  protection_blocked_review is
-                    # reserved for the CI-independent reviews-required case where
-                    # retrying will not help.
+                    # Green CI but merge refused — inspect the 405 message to
+                    # determine if this is a terminal condition (PR closed, auto-
+                    # merge disabled, protection config changed) or a retriable
+                    # one (required checks not yet passed on GitHub's side).
+                    # Terminal 405s are recorded immediately with a distinct
+                    # reason; retriable/unknown ones fall through to the CI
+                    # re-check to confirm before committing to a failure.
                     msg = merge_result.get("message", "merge not completed")
+                    cause_405 = _classify_405_message(msg)
+                    if cause_405 == "terminal":
+                        logger.warning(
+                            "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
+                            "for v%d merge refused with terminal 405 reason — "
+                            "recording merge_refused_405_terminal: %s",
+                            pr_number,
+                            version.version_number,
+                            msg,
+                        )
+                        await _cleanup_managed_check_wait_failure_artifacts(
+                            token,
+                            owner,
+                            repo,
+                            release_branch,
+                            version,
+                            int(pr_number),
+                        )
+                        await _record_promotion_failure(
+                            session,
+                            version,
+                            base_record,
+                            "merge_refused_405_terminal",
+                            detail=str(msg)[:300],
+                            pr_url=pr_url,
+                            lock_released=True,
+                        )
+                        await session.commit()
+                        return True
+                    if cause_405 == "retriable":
+                        # GitHub reports required checks not yet passed — CI is
+                        # still pending on GitHub's side despite our local green
+                        # classification.  Leave the version pending so the next
+                        # sweep retries once GitHub's required checks settle.
+                        logger.info(
+                            "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
+                            "for v%d merge refused with retriable 405 (required checks "
+                            "not yet passed on GitHub) — leaving pending: %s",
+                            pr_number,
+                            version.version_number,
+                            msg,
+                        )
+                        classified_at = _utcnow()
+                        await _persist_managed_check_wait_snapshot(
+                            session,
+                            version.id,
+                            pr_number=int(pr_number),
+                            ci_state=_CI_PENDING,
+                            snapshot=_managed_check_wait_snapshot(
+                                ci_state=_CI_PENDING,
+                                classified_at=classified_at,
+                                head_sha=pr_head_sha,
+                                reason="merge_refused_405_retriable",
+                                detail=str(msg)[:200],
+                            ),
+                        )
+                        return False
                     try:
                         recheck_result = await github.get_check_runs_cached(
                             token,

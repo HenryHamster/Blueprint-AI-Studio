@@ -688,6 +688,11 @@ runtime_config: Dict = {
     # dispatch/prompt context, recovery requeues, and KILL/ADOPT measurement.
     # A KILL verdict flips this back to False so every chain leaves full pilot.
     "review_fix_lane_pilot_enabled": False,
+    # Three-value pilot mode: "off" (inert), "shadow" (arm assignment +
+    # checkpoints, no warm reservation or fix routing), "on" (full pilot).
+    # Takes precedence over the boolean pair when set to "shadow" or "on".
+    # Default "off" preserves the legacy boolean-flag semantics.
+    "review_fix_lane_pilot_mode": "off",
     # Account-agnostic lease: when True, a same-tenant IDLE pool member may be
     # leased for a task whose resolved account (and model) differ from the
     # member's frozen boot account, and the warm-claim path re-materializes the
@@ -1361,6 +1366,10 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "review_fix_lane_pilot_enabled",
                         bool(config_json["review_fix_lane_pilot_enabled"]),
                     )
+                if "review_fix_lane_pilot_mode" in config_json:
+                    raw_mode = str(config_json["review_fix_lane_pilot_mode"]).lower()
+                    if raw_mode in ("off", "shadow", "on"):
+                        _set("review_fix_lane_pilot_mode", raw_mode)
                 if "warm_pool_enabled" in config_json:
                     _set(
                         "warm_pool_enabled",
@@ -1752,3 +1761,36 @@ def is_review_fix_lane_shadow_enabled() -> bool:
     return is_improvement_lanes_enabled() and not bool(
         runtime_config.get("review_fix_lane_pilot_enabled", False)
     )
+
+
+def get_lane_pilot_mode() -> str:
+    """Return the three-value pilot mode: 'off', 'shadow', or 'on'.
+
+    Derives the canonical mode from the explicit ``review_fix_lane_pilot_mode``
+    key when it is set to 'shadow' or 'on', then falls back to the legacy pair
+    (improvement_lanes_enabled + review_fix_lane_pilot_enabled) so existing
+    deployments that only use the boolean flags continue to work.
+    """
+    explicit = str(runtime_config.get("review_fix_lane_pilot_mode", "off"))
+    if explicit in ("shadow", "on"):
+        return explicit
+    # Legacy fallback: derive from the boolean flags.
+    if is_review_fix_lane_pilot_enabled():
+        return "on"
+    if is_review_fix_lane_shadow_enabled():
+        # Classic armless shadow (master on, pilot off) is NOT the new shadow
+        # pilot mode — it is preserved as the "off" baseline for the three-value
+        # scale, accessible via the substrate's original boolean semantics.
+        return "off"
+    return "off"
+
+
+def is_review_fix_lane_pilot_shadow_mode_enabled() -> bool:
+    """Return True when the pilot shadow mode is active.
+
+    Shadow mode (mode == 'shadow') runs arm assignment and checkpoint writing
+    but skips warm-pool reservations and fix-task lane routing.  Requires the
+    substrate master switch (improvement_lanes_enabled) to be True so lane rows
+    can actually be created.
+    """
+    return is_improvement_lanes_enabled() and get_lane_pilot_mode() == "shadow"

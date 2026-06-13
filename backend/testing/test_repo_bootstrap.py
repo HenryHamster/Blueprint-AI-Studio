@@ -10,7 +10,14 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth import create_agent_token
 from app.main import app
-from app.models import Project, ProjectMessage, ProjectStatus, Task, TaskHistory, TaskStatus
+from app.models import (
+    Project,
+    ProjectMessage,
+    ProjectStatus,
+    Task,
+    TaskHistory,
+    TaskStatus,
+)
 from app.auth import get_current_user, require_admin
 from app.payload_schemas import RepoBootstrapOverview
 
@@ -66,12 +73,14 @@ async def test_completed_bootstrap_status_persists_source_revision_from_structur
         project_id=project.id,
         title="Bootstrap: acme/structured-source-revision",
         description="First-cycle bootstrap",
-        payloads=[{
-            "type": "repo_bootstrap",
-            "github_owner": "acme",
-            "github_repo": "structured-source-revision",
-            "integration_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "repo_bootstrap",
+                "github_owner": "acme",
+                "github_repo": "structured-source-revision",
+                "integration_branch": "main",
+            }
+        ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -834,7 +843,10 @@ class TestRepoBootstrapCommandMemory:
             build_config={"language": "python"},
             context={
                 "repo_overview": dict(self._VALID_OVERVIEW),
-                "command_memory": {"status": "missing_commands", "detail": "no test cmd"},
+                "command_memory": {
+                    "status": "missing_commands",
+                    "detail": "no test cmd",
+                },
             },
         )
 
@@ -852,14 +864,19 @@ class TestRepoBootstrapCommandMemory:
 
         # Command memory is explicitly partial, NOT complete.
         assert bc.get("bootstrap_command_memory_status") == "missing_commands"
-        assert bc.get("bootstrap_command_memory_status") in _PARTIAL_COMMAND_MEMORY_STATUSES
+        assert (
+            bc.get("bootstrap_command_memory_status")
+            in _PARTIAL_COMMAND_MEMORY_STATUSES
+        )
         assert bc.get("bootstrap_command_memory_complete") is False, (
             "a valid overview must no longer imply complete command memory"
         )
         assert bc.get("bootstrap_command_memory_detail") == "no test cmd"
 
     @pytest.mark.asyncio
-    async def test_command_memory_confirmed_when_writeback_evidence_present(self, db_session):
+    async def test_command_memory_confirmed_when_writeback_evidence_present(
+        self, db_session
+    ):
         """Top-level write-back evidence from this task marks command memory confirmed."""
         from app.task_completion import _handle_repo_bootstrap_completion
 
@@ -885,7 +902,9 @@ class TestRepoBootstrapCommandMemory:
         assert bc.get("bootstrap_command_memory_paths") == ["backend"]
 
     @pytest.mark.asyncio
-    async def test_command_memory_confirmed_via_per_directory_evidence(self, db_session):
+    async def test_command_memory_confirmed_via_per_directory_evidence(
+        self, db_session
+    ):
         """A confirming_task_id stamp on a directory entry is accepted as evidence."""
         from app.task_completion import _handle_repo_bootstrap_completion
 
@@ -934,11 +953,16 @@ class TestRepoBootstrapCommandMemory:
         bc = project.build_config or {}
 
         assert bc.get("bootstrap_command_memory_status") == "unknown"
-        assert bc.get("bootstrap_command_memory_status") in _PARTIAL_COMMAND_MEMORY_STATUSES
+        assert (
+            bc.get("bootstrap_command_memory_status")
+            in _PARTIAL_COMMAND_MEMORY_STATUSES
+        )
         assert bc.get("bootstrap_command_memory_complete") is False
 
     @pytest.mark.asyncio
-    async def test_claimed_success_without_evidence_degrades_to_writeback_failed(self, db_session):
+    async def test_claimed_success_without_evidence_degrades_to_writeback_failed(
+        self, db_session
+    ):
         """An agent claiming success with no persisted evidence is downgraded to
         writeback_failed rather than trusted blindly."""
         from app.task_completion import _handle_repo_bootstrap_completion
@@ -958,7 +982,9 @@ class TestRepoBootstrapCommandMemory:
 
         assert bc.get("bootstrap_command_memory_status") == "writeback_failed"
         assert bc.get("bootstrap_command_memory_complete") is False
-        assert "without write-back evidence" in (bc.get("bootstrap_command_memory_detail") or "")
+        assert "without write-back evidence" in (
+            bc.get("bootstrap_command_memory_detail") or ""
+        )
 
     @pytest.mark.asyncio
     async def test_command_memory_recorded_even_on_degraded_overview(self, db_session):
@@ -980,6 +1006,192 @@ class TestRepoBootstrapCommandMemory:
         assert bc.get("bootstrap_degraded_reason") == "overview_missing"
         assert bc.get("bootstrap_command_memory_status") == "missing_commands"
         assert bc.get("bootstrap_command_memory_complete") is False
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_seeds_confirmed_commands_to_playbook(self, db_session):
+        """Bootstrap seeds test/build/lint playbook entries from confirmed directory commands."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        task_id_placeholder = str(uuid.uuid4())
+        project, bootstrap_task = await self._make_bootstrap_task(
+            db_session,
+            build_config={
+                "language": "python",
+                "last_command_writeback_task_id": task_id_placeholder,
+                "last_command_writeback_paths": ["backend"],
+                "directories": [
+                    {
+                        "path": "backend",
+                        "confirmed_test_cmd": "pytest",
+                        "confirmed_build_cmd": "pip install -e .",
+                        "confirming_task_id": task_id_placeholder,
+                    }
+                ],
+            },
+            context={"repo_overview": dict(self._VALID_OVERVIEW)},
+        )
+        # Align confirming_task_id to the actual bootstrap task id
+        bc = dict(project.build_config)
+        bc["last_command_writeback_task_id"] = str(bootstrap_task.id)
+        bc["directories"][0]["confirming_task_id"] = str(bootstrap_task.id)
+        project.build_config = bc
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+
+        doc = project.design_doc or {}
+        assert "playbook/test-detected" in doc, "test-detected entry must be seeded"
+        assert "playbook/build-detected" in doc, "build-detected entry must be seeded"
+        assert "playbook/lint-detected" not in doc, (
+            "lint-detected must not appear when not confirmed"
+        )
+
+        test_entry = doc["playbook/test-detected"]
+        assert "pytest" in test_entry["content"], (
+            "test entry must contain confirmed command"
+        )
+        assert "backend" in test_entry["content"], (
+            "test entry must include directory path"
+        )
+        assert test_entry["source_task_id"] == str(bootstrap_task.id)
+        assert test_entry["confirmed_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_playbook_seed_is_idempotent(self, db_session):
+        """Calling the handler twice does not overwrite an existing playbook entry."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project, bootstrap_task = await self._make_bootstrap_task(
+            db_session,
+            build_config={
+                "language": "python",
+                "last_command_writeback_task_id": None,
+                "directories": [
+                    {
+                        "path": ".",
+                        "confirmed_test_cmd": "pytest",
+                        "confirming_task_id": None,
+                    }
+                ],
+            },
+            context={"repo_overview": dict(self._VALID_OVERVIEW)},
+        )
+        # Pre-seed a test-detected entry with a different value
+        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+        pre_doc = {
+            "playbook/test-detected": {"content": "manual entry", "confirmed_count": 5}
+        }
+        project.design_doc = pre_doc
+        _flag_modified(project, "design_doc")
+        bc = dict(project.build_config)
+        bc["last_command_writeback_task_id"] = str(bootstrap_task.id)
+        bc["last_command_writeback_paths"] = ["."]
+        bc["directories"][0]["confirming_task_id"] = str(bootstrap_task.id)
+        project.build_config = bc
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+
+        doc = project.design_doc or {}
+        # The pre-existing entry must not be overwritten
+        assert doc.get("playbook/test-detected", {}).get("content") == "manual entry", (
+            "pre-existing playbook entry must not be overwritten by bootstrap seed"
+        )
+        assert doc.get("playbook/test-detected", {}).get("confirmed_count") == 5
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_skips_playbook_seed_for_self_repo(self, db_session):
+        """Bootstrap does not seed playbook entries for self-repo projects."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project = Project(
+            name=f"acme/self-{uuid.uuid4().hex[:8]}",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="self-repo",
+            is_self_repo=True,
+            build_config={
+                "language": "python",
+            },
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/self-repo",
+            description="Self-repo bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"repo_overview": dict(self._VALID_OVERVIEW)},
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(bootstrap_task)
+
+        bc = dict(project.build_config)
+        bc["last_command_writeback_task_id"] = str(bootstrap_task.id)
+        bc["last_command_writeback_paths"] = ["backend"]
+        bc["directories"] = [
+            {
+                "path": "backend",
+                "confirmed_test_cmd": "pytest",
+                "confirming_task_id": str(bootstrap_task.id),
+            }
+        ]
+        project.build_config = bc
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+
+        doc = project.design_doc or {}
+        assert "playbook/test-detected" not in doc, (
+            "self-repo projects must not get playbook seeds from bootstrap"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_skips_playbook_seed_when_command_memory_incomplete(
+        self, db_session
+    ):
+        """Bootstrap does not seed playbook entries when command memory is not confirmed."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project, bootstrap_task = await self._make_bootstrap_task(
+            db_session,
+            build_config={
+                "language": "python",
+                "directories": [
+                    {
+                        "path": "backend",
+                        "confirmed_test_cmd": "pytest",
+                    }
+                ],
+            },
+            context={
+                "repo_overview": dict(self._VALID_OVERVIEW),
+                "command_memory": {"status": "missing_commands"},
+            },
+        )
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+
+        doc = project.design_doc or {}
+        assert "playbook/test-detected" not in doc, (
+            "incomplete command memory must not trigger playbook seeding"
+        )
 
 
 @pytest.mark.asyncio
@@ -1007,12 +1219,14 @@ async def test_completed_bootstrap_status_with_command_memory_persists_to_contex
         project_id=project.id,
         title="Bootstrap: acme/cmd-mem-http",
         description="First-cycle bootstrap",
-        payloads=[{
-            "type": "repo_bootstrap",
-            "github_owner": "acme",
-            "github_repo": "cmd-mem-http",
-            "integration_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "repo_bootstrap",
+                "github_owner": "acme",
+                "github_repo": "cmd-mem-http",
+                "integration_branch": "main",
+            }
+        ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -1030,6 +1244,7 @@ async def test_completed_bootstrap_status_with_command_memory_persists_to_contex
         "last_command_writeback_paths": ["backend"],
     }
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
     _flag_modified(project, "build_config")
     await db_session.commit()
     await db_session.refresh(task)
