@@ -812,6 +812,7 @@ from app.github_pulls import (  # noqa: F401
     _UPDATE_BRANCH_NO_NEW_COMMITS_PHRASE,
     _is_no_new_commits_message,
     _tag_not_behind_if_no_new_commits,
+    get_pull_requests_for_head_branch,
 )
 from app.github_merge_summary import (  # noqa: F401
     build_merge_summary_body,

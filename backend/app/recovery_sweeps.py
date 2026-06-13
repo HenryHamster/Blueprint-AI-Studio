@@ -1485,6 +1485,176 @@ async def _check_evaluating_timeouts(progress_cb=None):
                             # STILL OPEN (or lookup failed) → leave EVALUATING.
                             # GUARDRAIL: never complete a task whose PR is open.
 
+                # ROLLUP-PARENT LOST-MARKER RECOVERY. When a rollup parent's
+                # rollup_pr_number marker was not persisted (crash/reap window
+                # between GitHub PR creation and the DB write), the parent stays
+                # EVALUATING forever — every convergence path is keyed on the
+                # marker.  Worse, the rollup machinery keeps re-commissioning
+                # child tasks against the now-deleted staging branch, burning VMs
+                # in a BRANCH_GONE loop.
+                #
+                # Detection: EVALUATING task has a staging branch in context
+                # (plan_branch / research_branch) but no rollup_pr_number and no
+                # pr_merged.  We query GitHub for closed PRs from that head
+                # branch; if one is merged we converge the parent.
+                #
+                # GUARDRAIL: only acts when GitHub confirms a merged PR.  If the
+                # lookup fails or the PR is still open (state=closed returns []),
+                # fall through unchanged and re-check after _LM_RECHECK_INTERVAL_S
+                # so the sweep catches the PR merging later.
+                _LM_RECHECK_INTERVAL_S = 1800  # 30 minutes between re-checks
+                _stg_branch = ctx.get("plan_branch") or ctx.get("research_branch")
+                _lm_last_checked_at = ctx.get("_lost_marker_checked_at")
+                _lm_recheck_due = not _lm_last_checked_at or (
+                    (
+                        datetime.utcnow()
+                        - datetime.fromisoformat(_lm_last_checked_at)
+                    ).total_seconds()
+                    > _LM_RECHECK_INTERVAL_S
+                )
+                if (
+                    _stg_branch
+                    and not ctx.get("rollup_pr_number")
+                    and not ctx.get("pr_merged")
+                    and _lm_recheck_due
+                ):
+                    _lm_merged = False
+                    _lm_pr_data: dict | None = None
+                    _lm_lookup_ok = False
+                    try:
+                        from app.routers.agent import get_github_token_for_task
+                        from app.github import get_pull_requests_for_head_branch
+
+                        _lm_token, _lm_owner, _lm_repo = await services._bounded(
+                            get_github_token_for_task(task.id, session),
+                            services._GH_CALL_TIMEOUT_S,
+                            what=f"lost-marker token {str(task.id)[:8]}",
+                        )
+                        _target_base = ctx.get("parent_base") or ctx.get(
+                            "original_base"
+                        )
+                        _lm_prs = await services._bounded(
+                            get_pull_requests_for_head_branch(
+                                _lm_token,
+                                _lm_owner,
+                                _lm_repo,
+                                _stg_branch,
+                                base=_target_base,
+                            ),
+                            services._GH_CALL_TIMEOUT_S,
+                            what=f"lost-marker list-prs {_stg_branch!r}",
+                        )
+                        # Fallback: if the base-filtered query returned nothing and
+                        # we had a base filter, retry without it — the actual base
+                        # ref may differ from what's in context.
+                        if not _lm_prs and _target_base:
+                            _lm_prs = await services._bounded(
+                                get_pull_requests_for_head_branch(
+                                    _lm_token,
+                                    _lm_owner,
+                                    _lm_repo,
+                                    _stg_branch,
+                                    base=None,
+                                ),
+                                services._GH_CALL_TIMEOUT_S,
+                                what=f"lost-marker list-prs unfiltered {_stg_branch!r}",
+                            )
+                        _lm_lookup_ok = True
+                        for _pr in _lm_prs or []:
+                            if _pr.get("merged_at") or bool(_pr.get("merged")):
+                                _lm_merged = True
+                                _lm_pr_data = _pr
+                                break
+                    except Exception as _lm_exc:
+                        logger.warning(
+                            f"[EVAL TIMEOUT lost-marker] Task {str(task.id)[:8]} "
+                            f"branch {_stg_branch!r} lookup failed: "
+                            f"{type(_lm_exc).__name__}: {_lm_exc} — leaving EVALUATING"
+                        )
+
+                    if _lm_lookup_ok and not _lm_merged:
+                        # No merged PR found (PR still open, not yet created, or
+                        # closed-unmerged).  Stamp a timestamp so we back off and
+                        # re-check after _LM_RECHECK_INTERVAL_S rather than
+                        # querying GitHub on every sweep cycle.
+                        from sqlalchemy.orm.attributes import flag_modified
+
+                        task.context = {
+                            **ctx,
+                            "_lost_marker_checked_at": datetime.utcnow().isoformat(),
+                        }
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.commit()
+                        ctx = task.context
+                    elif _lm_lookup_ok and _lm_merged and _lm_pr_data is not None:
+                        # Confirmed: rollup PR was merged.  Converge the parent.
+                        from sqlalchemy.orm.attributes import flag_modified
+                        from app.rollup_state import _clear_rollup_transient_state
+                        from app.models import Project
+
+                        _lm_pr_num = int(_lm_pr_data.get("number") or 0) or None
+                        _lm_pr_url = _lm_pr_data.get("html_url") or None
+                        _lm_base_ref = (_lm_pr_data.get("base") or {}).get(
+                            "ref"
+                        ) or None
+
+                        _lm_proj = await session.get(Project, task.project_id)
+                        (
+                            _lm_record_merged,
+                            _lm_terminal,
+                            _lm_landed,
+                        ) = await classify_rollup_merge_outcome(
+                            task,
+                            _lm_proj,
+                            session,
+                            pr_number=_lm_pr_num,
+                            merged_base_branch=_lm_base_ref,
+                            source="recovery_sweeps.lost_marker",
+                        )
+                        _lm_new_ctx = _clear_rollup_transient_state({**ctx})
+                        if _lm_pr_num:
+                            _lm_new_ctx["rollup_pr_number"] = _lm_pr_num
+                        if _lm_pr_url:
+                            _lm_new_ctx["rollup_pr_url"] = _lm_pr_url
+                        task.context = _lm_new_ctx
+                        if _lm_record_merged:
+                            mark_landed_on_integration(task)
+                        flag_modified(task, "context")
+                        task.status = (
+                            TaskStatus.COMPLETED
+                            if _lm_terminal
+                            else TaskStatus.EVALUATING
+                        )
+                        task.vm_instance_id = None
+                        task.last_heartbeat = None
+                        if _lm_terminal:
+                            task.latest_status_message = (
+                                f"✓ rollup PR #{_lm_pr_num} already merged to "
+                                f"{_lm_landed}; converged from stranded EVALUATING"
+                            )
+                        else:
+                            task.latest_status_message = (
+                                f"Lost-marker recovery: rollup PR #{_lm_pr_num} "
+                                f"merged into {_lm_landed}; awaiting downstream landing"
+                            )
+                        session.add(task)
+                        await session.commit()
+                        logger.info(
+                            f"[EVAL TIMEOUT lost-marker] Task {str(task.id)[:8]} "
+                            f"converged → {task.status} (rollup PR #{_lm_pr_num} "
+                            f"merged into {_lm_landed})"
+                        )
+                        await services.broadcast_to_project(
+                            str(task.project_id),
+                            "task_updated",
+                            {
+                                "task_id": str(task.id),
+                                "status": task.status,
+                            },
+                        )
+                        continue
+
                 # Approval-gate hard timeout. Parents with requires_approval=True
                 # remain in EVALUATING waiting for human approval; the
                 # evaluating_fail_hours backstop can be deferred by an active
