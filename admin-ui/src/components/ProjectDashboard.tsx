@@ -9,6 +9,7 @@ import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { BootstrapStatusPanel } from './BootstrapStatusPanel';
 import { OnboardingProofPanel } from './OnboardingProofPanel';
+import { VisualVerificationPilotPanel } from './VisualVerificationPilotPanel';
 import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, cancelProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
 
 export type { Project } from '../types/project';
@@ -951,6 +952,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
           {selectedProject && <CapabilityEvidencePanel project={selectedProject} />}
           {selectedProject && <BootstrapStatusPanel project={selectedProject} tasks={tasks} />}
           {selectedProject && <OnboardingProofPanel project={selectedProject} />}
+          {selectedProject && <VisualVerificationPilotPanel project={selectedProject} onNavigateToTask={onNavigateToTask} />}
           {selectedProject && <ComputeJobsPanel projectId={selectedProject.id} onNavigateToTask={onNavigateToTask} onLaunchCompute={onLaunchCompute} />}
         </>
       )}

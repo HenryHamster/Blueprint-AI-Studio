@@ -3179,3 +3179,84 @@ class TestLanePilotPreflight:
             f"/api/admin/improvement-lanes/preflight?project_id={uuid.uuid4()}"
         )
         assert resp.status_code == 404
+
+
+class TestVisualPilotStatus:
+    @pytest.mark.asyncio
+    async def test_returns_404_for_unknown_project(self, client: AsyncClient):
+        """Unknown project_id → HTTP 404."""
+        resp = await client.get(
+            f"/api/admin/visual-pilot-status?project_id={uuid.uuid4()}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_returns_200_with_required_fields_for_empty_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Project with no tasks returns 200 with zero counts and thresholds."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/visual-pilot-status?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["project_id"] == str(project.id)
+        assert body["admin_task_count"] == 0
+        assert body["entry_count"] == 0
+        assert body["infra_rate"] == 0.0
+        assert body["caught"] == []
+        assert body["caught_count"] == 0
+        assert "thresholds" in body
+        assert body["thresholds"]["target_admin_tasks"] == 25
+        assert body["thresholds"]["target_days"] == 42
+        assert body["thresholds"]["early_pause_infra_rate"] == 0.50
+        assert "generated_at" in body
+
+    @pytest.mark.asyncio
+    async def test_caught_list_contains_task_with_visual_issue(
+        self, client: AsyncClient, db_session
+    ):
+        """Task with caught_visual_issue=True appears in the caught list."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            title="Frontend update",
+            context={
+                "_pr_changed_files": ["admin-ui/src/App.tsx"],
+                "_self_review_outcome": {
+                    "visual_verification": {
+                        "passed": True,
+                        "pairs_inspected": 3,
+                        "pairs_changed": 2,
+                        "caught_visual_issue": True,
+                        "note": "caught a layout shift",
+                    }
+                },
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/visual-pilot-status?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["admin_task_count"] == 1
+        assert body["entry_count"] == 1
+        assert body["pairs_inspected"] == 3
+        assert body["pairs_changed"] == 2
+        assert body["caught_count"] == 1
+        caught = body["caught"]
+        assert len(caught) == 1
+        assert caught[0]["task_id"] == str(task.id)
+        assert caught[0]["task_title"] == "Frontend update"
+        assert caught[0]["note"] == "caught a layout shift"
