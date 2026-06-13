@@ -9426,17 +9426,47 @@ class TestBuildCycleStartReconciliation:
                 "text": "wait",
                 "recent_findings": ["f1", "f2"],
             },
+            # Live-held work is distinct from waiting-on-action.
+            {
+                "id": "d-held",
+                "status": "active",
+                "text": "held",
+                "recent_findings": ["f1"],
+            },
+            # Fresh completion before cycle start is also distinct.
+            {
+                "id": "d-recent",
+                "status": "active",
+                "text": "recent",
+                "recent_findings": ["f1"],
+            },
             # No tasks, no findings → idle.
             {"id": "d-idle", "status": "active", "text": "idle"},
         ]
         active_by_direction = {"d-busy": 2}
+        held_by_direction = {"d-held": 1}
+        per_direction_delta = [
+            {
+                "direction_id": "d-recent",
+                "direction_text": "recent",
+                "recent_merged_titles": [
+                    {"title": "fresh merge", "merge_verdict": "verified_landed"},
+                ],
+            },
+        ]
         out = _build_cycle_start_reconciliation(
-            direction_stats, {}, active_by_direction
+            direction_stats,
+            {},
+            active_by_direction,
+            held_by_direction,
+            per_direction_delta,
         )
         states = {p["direction_id"]: p["state"] for p in out["direction_pipeline"]}
         assert states == {
             "d-busy": "tasks_in_progress",
             "d-wait": "research_waiting_on_action",
+            "d-held": "held_on_dependency",
+            "d-recent": "recently_converted",
             "d-idle": "idle",
         }
         busy = next(
@@ -9447,7 +9477,66 @@ class TestBuildCycleStartReconciliation:
             p for p in out["direction_pipeline"] if p["direction_id"] == "d-wait"
         )
         assert wait["findings"] == 2
-        assert out["counts"]["active_directions"] == 3
+        held = next(
+            p for p in out["direction_pipeline"] if p["direction_id"] == "d-held"
+        )
+        assert held["held"] == 1
+        assert held["state"] == "held_on_dependency"
+        recent = next(
+            p for p in out["direction_pipeline"] if p["direction_id"] == "d-recent"
+        )
+        assert recent["recently_completed"] == 1
+        assert recent["state"] == "recently_converted"
+        assert out["counts"]["active_directions"] == 5
+        assert out["counts"]["pipeline_waiting_on_action"] == 1
+        assert out["counts"]["pipeline_tasks_in_progress"] == 1
+        assert out["counts"]["pipeline_held_on_dependency"] == 1
+        assert out["counts"]["pipeline_recently_converted"] == 1
+        assert out["counts"]["pipeline_idle"] == 1
+
+    def test_cycle_start_reconciliation_distinguishes_held_and_recently_converted_work(
+        self,
+    ):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {
+                "id": "d-held",
+                "status": "active",
+                "text": "held lane",
+                "recent_findings": ["f1"],
+            },
+            {
+                "id": "d-recent",
+                "status": "active",
+                "text": "fresh lane",
+                "recent_findings": ["f1", "f2"],
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            {},
+            {},
+            {"d-held": 1},
+            [
+                {
+                    "direction_id": "d-recent",
+                    "direction_text": "fresh lane",
+                    "recent_merged_titles": [
+                        {"title": "fresh merge", "merge_verdict": "verified_landed"},
+                    ],
+                },
+            ],
+        )
+        assert out is not None
+        states = {p["direction_id"]: p["state"] for p in out["direction_pipeline"]}
+        assert states == {
+            "d-held": "held_on_dependency",
+            "d-recent": "recently_converted",
+        }
+        assert out["counts"]["pipeline_waiting_on_action"] == 0
+        assert out["counts"]["pipeline_held_on_dependency"] == 1
+        assert out["counts"]["pipeline_recently_converted"] == 1
 
     def test_lists_are_capped_but_counts_carry_true_total(self):
         from app.strategic_spawning import (
@@ -9525,7 +9614,7 @@ class TestBuildCycleStartReconciliation:
             },
         ]
         out = _build_cycle_start_reconciliation(
-            direction_stats, pm, {}, per_direction_delta
+            direction_stats, pm, {}, None, per_direction_delta
         )
         assert out is not None
         acct = out["merge_accounting"]
@@ -9567,7 +9656,7 @@ class TestBuildCycleStartReconciliation:
             },
         ]
         out = _build_cycle_start_reconciliation(
-            direction_stats, {}, {}, per_direction_delta
+            direction_stats, {}, {}, None, per_direction_delta
         )
         assert out is not None
         assert out["merge_accounting"] == []
@@ -9607,7 +9696,7 @@ class TestBuildCycleStartReconciliation:
                 "recent_merged_titles": titles,
             },
         ]
-        out = _build_cycle_start_reconciliation([], {}, {}, per_direction_delta)
+        out = _build_cycle_start_reconciliation([], {}, {}, None, per_direction_delta)
         assert out is not None
         entry = out["merge_accounting"][0]
         assert entry["not_landed"] == _RECON_LIST_CAP + 4
@@ -9637,7 +9726,7 @@ class TestBuildCycleStartReconciliation:
                 "recent_not_landed_titles": ["ghost 10", "ghost 11", "ghost 12"],
             },
         ]
-        out = _build_cycle_start_reconciliation([], {}, {}, per_direction_delta)
+        out = _build_cycle_start_reconciliation([], {}, {}, None, per_direction_delta)
         assert out is not None
         entry = out["merge_accounting"][0]
         assert entry["landed"] == _RECENT_MERGED_TITLES_CAP

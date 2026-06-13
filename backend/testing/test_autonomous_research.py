@@ -13582,6 +13582,105 @@ async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_ses
         _shared_state.circuit_breakers.pop(str(project.id), None)
 
 
+@pytest.mark.asyncio
+async def test_operator_refresh_deferred_behind_bootstrap_pending_posts_once(
+    db_session,
+):
+    """Operator steering pending behind repo_bootstrap posts once and stays queued."""
+    project = Project(
+        name="Operator deferred behind bootstrap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-bootstrap-op")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Bootstrap: operator deferred",
+            payloads=[{"type": "repo_bootstrap"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_strategic_refresh")
+    assert marker is not None and marker.get("notified") is True
+
+    steering = _deferred_steering_messages(
+        await _system_messages(db_session, project.id)
+    )
+    assert len(steering) == 1, "bootstrap-pending halt must post exactly one notice"
+
+    await _spawn_research_task(project, db_session)
+    steering2 = _deferred_steering_messages(
+        await _system_messages(db_session, project.id)
+    )
+    assert len(steering2) == 1, "deferral notice must not re-emit every tick"
+
+
+@pytest.mark.asyncio
+async def test_qualification_refresh_deferred_behind_bootstrap_pending_stays_silent(
+    db_session,
+):
+    """Qualification-origin refreshes stay silent while repo_bootstrap is pending."""
+    project = Project(
+        name="Qualification deferred behind bootstrap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-bootstrap-qual")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Bootstrap: qualification silent",
+            payloads=[{"type": "repo_bootstrap"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_strategic_refresh")
+    assert marker is not None and marker.get("notified") is None
+
+    steering = _deferred_steering_messages(
+        await _system_messages(db_session, project.id)
+    )
+    assert len(steering) == 0, "qualification-origin marker must stay silent"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Qualification-origin refresh must force a strategic tick when due
 # ─────────────────────────────────────────────────────────────────────────────

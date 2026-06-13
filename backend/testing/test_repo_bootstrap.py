@@ -10,7 +10,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth import create_agent_token
 from app.main import app
-from app.models import Project, ProjectStatus, Task, TaskHistory, TaskStatus
+from app.models import Project, ProjectMessage, ProjectStatus, Task, TaskHistory, TaskStatus
 from app.auth import get_current_user, require_admin
 from app.payload_schemas import RepoBootstrapOverview
 
@@ -289,6 +289,149 @@ class TestRepoBootstrapStrategicGate:
         assert result is False, (
             "_spawn_strategic_review must defer (return False) when bootstrap is pending"
         )
+
+    @pytest.mark.asyncio
+    async def test_spawn_strategic_review_deferred_bootstrap_posts_once_for_operator(
+        self, db_session
+    ):
+        """Operator-origin refreshes behind repo_bootstrap post once and stay queued."""
+        from app.strategic_spawning import _spawn_strategic_review
+
+        project = self._make_project(
+            build_config={"language": "python"},
+            is_self_repo=False,
+        )
+        project.vision = {
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": "2026-01-01T00:00:00",
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        }
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: operator deferred",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        result = await _spawn_strategic_review(project, db_session)
+        assert result is False
+
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker is not None and marker.get("notified") is True
+
+        msgs = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.from_type == "system",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        steering = [
+            m
+            for m in msgs
+            if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+        ]
+        assert len(steering) == 1
+
+        await _spawn_strategic_review(project, db_session)
+        msgs2 = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.from_type == "system",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        steering2 = [
+            m
+            for m in msgs2
+            if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+        ]
+        assert len(steering2) == 1
+
+    @pytest.mark.asyncio
+    async def test_spawn_strategic_review_deferred_bootstrap_stays_silent_for_qualification(
+        self, db_session
+    ):
+        """Qualification-origin refreshes remain silent behind repo_bootstrap."""
+        from app.strategic_spawning import _spawn_strategic_review
+
+        project = self._make_project(
+            build_config={"language": "python"},
+            is_self_repo=False,
+        )
+        project.vision = {
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": "2026-01-01T00:00:00",
+                "reason": "post_qualification:promoted",
+                "count": 1,
+            },
+        }
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: qualification silent",
+            description="First-cycle bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        result = await _spawn_strategic_review(project, db_session)
+        assert result is False
+
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker is not None and marker.get("notified") is None
+
+        msgs = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.from_type == "system",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        steering = [
+            m
+            for m in msgs
+            if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+        ]
+        assert len(steering) == 0
 
     @pytest.mark.asyncio
     async def test_spawn_strategic_review_proceeds_when_bootstrap_completed(

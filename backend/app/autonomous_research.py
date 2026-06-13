@@ -663,6 +663,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     from app.strategic_spawning import _bootstrap_pending
 
     if await _bootstrap_pending(project, session):
+        await _maybe_notify_operator_refresh_deferred(
+            project,
+            session,
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+        )
         logger.info(
             "[AUTONOMOUS] Deferring research spawn for project %s — "
             "repo_bootstrap task is pending (bootstrap_completed_at not set)",

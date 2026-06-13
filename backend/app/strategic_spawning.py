@@ -1347,6 +1347,7 @@ def _build_cycle_start_reconciliation(
     direction_stats: list[dict],
     problem_model: dict | None,
     active_by_direction: dict[str, int] | None,
+    held_by_direction: dict[str, int] | None = None,
     per_direction_delta: list[dict] | None = None,
 ) -> dict | None:
     """Compute one authoritative cycle-start reconciliation of the strategic surfaces.
@@ -1376,8 +1377,11 @@ def _build_cycle_start_reconciliation(
         longer resolves to an active gap (closed/archived/never-existed), or that
         carry no gap linkage at all. These advance no tracked gap.
       * ``direction_pipeline`` — per active direction, whether its research is
-        ``research_waiting_on_action`` (findings surfaced but no task in flight),
-        ``tasks_in_progress`` (work already moving), or ``idle``.
+        ``research_waiting_on_action`` (findings surfaced but no task in flight
+        and no fresher completion/held signal), ``tasks_in_progress`` (work
+        already moving), ``held_on_dependency`` (live BLOCKED/PARKED work),
+        ``recently_converted`` (freshly completed/merged work with no active
+        task), or ``idle``.
       * ``merge_accounting`` — per active direction, where the merge BADGE
         (which asserts a PR shipped) disagrees with ancestry verification over
         the same recent merged-title window used for recent-work. Built from the
@@ -1399,6 +1403,7 @@ def _build_cycle_start_reconciliation(
     """
     pm = problem_model if isinstance(problem_model, dict) else {}
     active_by_direction = active_by_direction or {}
+    held_by_direction = held_by_direction or {}
 
     def _label(text: Any) -> str:
         return str(text or "")[:_RECON_LABEL_MAXLEN]
@@ -1503,14 +1508,34 @@ def _build_cycle_start_reconciliation(
     pipeline_counts = {
         "research_waiting_on_action": 0,
         "tasks_in_progress": 0,
+        "held_on_dependency": 0,
+        "recently_converted": 0,
         "idle": 0,
     }
+    recent_completed_by_direction: dict[str, int] = {}
+    for delta in per_direction_delta or []:
+        if not isinstance(delta, dict):
+            continue
+        did = str(delta.get("direction_id") or "")
+        if not did:
+            continue
+        recent_titles = delta.get("recent_merged_titles")
+        if isinstance(recent_titles, list):
+            recent_completed_by_direction[did] = sum(
+                1 for entry in recent_titles if isinstance(entry, dict)
+            )
     for d in active_dirs:
         did = str(d.get("id") or "")
         in_flight = int(active_by_direction.get(did, 0) or 0)
+        held = int(held_by_direction.get(did, 0) or 0)
+        recently_completed = int(recent_completed_by_direction.get(did, 0) or 0)
         findings = len(d.get("recent_findings") or [])
         if in_flight > 0:
             state = "tasks_in_progress"
+        elif held > 0:
+            state = "held_on_dependency"
+        elif recently_completed > 0:
+            state = "recently_converted"
         elif findings > 0:
             state = "research_waiting_on_action"
         else:
@@ -1522,15 +1547,25 @@ def _build_cycle_start_reconciliation(
                 "text": _label(d.get("text")),
                 "state": state,
                 "in_flight": in_flight,
+                "held": held,
+                "recently_completed": recently_completed,
                 "findings": findings,
             }
         )
     direction_pipeline.sort(
         key=lambda item: (
-            {"research_waiting_on_action": 0, "tasks_in_progress": 1, "idle": 2}.get(
-                str(item.get("state")), 3
+            {
+                "tasks_in_progress": 0,
+                "held_on_dependency": 1,
+                "recently_converted": 2,
+                "research_waiting_on_action": 3,
+                "idle": 4,
+            }.get(
+                str(item.get("state")), 5
             ),
             -int(item.get("findings") or 0),
+            -int(item.get("recently_completed") or 0),
+            -int(item.get("held") or 0),
             -int(item.get("in_flight") or 0),
             str(item.get("text") or ""),
         )
@@ -1664,6 +1699,8 @@ def _build_cycle_start_reconciliation(
             "direction_pipeline_overflow": pipeline_dropped,
             "pipeline_waiting_on_action": pipeline_counts["research_waiting_on_action"],
             "pipeline_tasks_in_progress": pipeline_counts["tasks_in_progress"],
+            "pipeline_held_on_dependency": pipeline_counts["held_on_dependency"],
+            "pipeline_recently_converted": pipeline_counts["recently_converted"],
             "pipeline_idle": pipeline_counts["idle"],
             # Merge-accounting drift: true direction-with-conflict total (shown +
             # overflow) plus aggregate landed/not-landed/unverifiable tallies.
@@ -2716,6 +2753,15 @@ async def _build_recent_interventions(
         .options(load_only(Task.id, Task.status, Task.context, Task.payloads))
     )
     active_tasks = list(active_tasks_result.scalars().all())
+    held_tasks_result = await session.execute(
+        select(Task)
+        .where(
+            Task.project_id == project.id,
+            Task.status.in_((TaskStatus.BLOCKED, TaskStatus.PARKED)),
+        )
+        .options(load_only(Task.id, Task.status, Task.context))
+    )
+    held_tasks = list(held_tasks_result.scalars().all())
 
     # Build direction lookup for text enrichment
     directions_by_id: dict[str, str] = {
@@ -3311,6 +3357,12 @@ async def _build_recent_interventions(
             active_by_scope[scope] = 0
         active_by_scope[scope] += 1
 
+    held_by_direction: dict[str, int] = {}
+    for t in held_tasks:
+        did = (t.context or {}).get("direction_id")
+        if did:
+            held_by_direction[did] = held_by_direction.get(did, 0) + 1
+
     # Directions whose shipped work has landed on the integration branch but is
     # NOT yet on the promotion target (promoted) — the capabilities whose
     # live/runtime metrics cannot move until the version promotes. The concrete
@@ -3346,6 +3398,7 @@ async def _build_recent_interventions(
         "per_direction_delta": per_direction_delta,
         "active_by_scope": active_by_scope,
         "active_by_direction": active_by_direction,
+        "held_by_direction": held_by_direction,
         "lookback_days": lookback_days,
         "undeployed_directions": undeployed_directions,
     }
@@ -3746,6 +3799,15 @@ async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
     return pending is not None
 
 
+async def _maybe_notify_operator_bootstrap_deferred(
+    project: Project, session: AsyncSession, reason: str
+) -> None:
+    """Reuse the one-time operator deferral notice for bootstrap-pending gates."""
+    from app.autonomous_research import _maybe_notify_operator_refresh_deferred
+
+    await _maybe_notify_operator_refresh_deferred(project, session, reason)
+
+
 async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
@@ -3764,6 +3826,11 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
 
     # Guard: defer architecture cycles until repo_bootstrap completes.
     if await _bootstrap_pending(project, session):
+        await _maybe_notify_operator_bootstrap_deferred(
+            project,
+            session,
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+        )
         logger.info(
             "[STRATEGIC] Deferring design doc update for project %s — "
             "repo_bootstrap task is pending (bootstrap_completed_at not set)",
@@ -4025,6 +4092,11 @@ async def _spawn_strategic_review(
     # this project is still being onboarded — skip this cycle. If bootstrap has
     # FAILED or is otherwise terminal, proceed gracefully (degraded path).
     if await _bootstrap_pending(project, session):
+        await _maybe_notify_operator_bootstrap_deferred(
+            project,
+            session,
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+        )
         logger.info(
             "[STRATEGIC] Deferring strategic review for project %s — "
             "repo_bootstrap task is pending (bootstrap_completed_at not set)",
@@ -5724,6 +5796,7 @@ async def _spawn_strategic_review(
         direction_stats,
         _verified_problem_model,
         (recent_interventions or {}).get("active_by_direction"),
+        (recent_interventions or {}).get("held_by_direction"),
         (recent_interventions or {}).get("per_direction_delta"),
     )
     # Soft size/health signal from the DURABLE pre-trim model so counts are honest
