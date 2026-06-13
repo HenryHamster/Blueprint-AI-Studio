@@ -2819,7 +2819,8 @@ async def test_low_actionability_challenge_non_disagrees_decays(db_session, mock
     # With new logic: agreement != "disagrees" → decay, NOT refinement.
     deferred = (task.context or {}).get("deferred_findings", [])
     assert not any(
-        f.get("title") == decayed["title"] and f.get("deferred_reason") == "low_actionability_refinement"
+        f.get("title") == decayed["title"]
+        and f.get("deferred_reason") == "low_actionability_refinement"
         for f in deferred
     )
 
@@ -2884,6 +2885,7 @@ async def test_finding_challenge_binds_identity_and_indeterminate_low_stays_defe
     await db_session.refresh(task)
     # Task should be parked awaiting a new challenge (EVALUATING).
     from app.models import TaskStatus as _TS
+
     assert task.status == _TS.EVALUATING
 
     # --- Part 2: indeterminate agreement with correct hash → decay, NOT refinement ---
@@ -12995,6 +12997,97 @@ class TestStampNoFindingsRefractory:
 
         direction = project.directions[0]
         assert direction["consecutive_unproductive_cycles"] == 2
+
+    def _make_saturated_project(self, direction_id="d-test", history=None, agg=None):
+        """Build a project whose direction is already saturated (2 consecutive unproductive cycles)."""
+        project = MagicMock()
+        project.directions = [
+            {
+                "id": direction_id,
+                "status": "active",
+                "research_history": history if history is not None else [],
+                "history_aggregate": agg if agg is not None else {},
+                "consecutive_unproductive_cycles": 2,
+            }
+        ]
+        return project
+
+    def test_auto_complete_requires_verified_merge_count(self):
+        """Auto-completion must use verified merge count, not raw prs_merged.
+
+        A saturated direction with 3 raw prs_merged but 0 verified_prs_merged
+        must NOT be auto-completed.  Only when the same merges carry a non-zero
+        verified_prs_merged should the direction flip to 'completed'.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # --- case 1: 3 raw merges, all unverified (verified_prs_merged=0) ---
+        # Each entry has prs_merged=1 but verified_prs_merged=0 (degraded).
+        unverified_history = [
+            {"prs_merged": 1, "verified_prs_merged": 0},
+            {"prs_merged": 1, "verified_prs_merged": 0},
+            {"prs_merged": 1, "verified_prs_merged": 0},
+        ]
+        task = self._make_task()
+        project = self._make_saturated_project(history=unverified_history)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "Direction with 3 unverified merges must NOT be auto-completed"
+        )
+
+        # --- case 2: same 3 merges, all verified (verified_prs_merged=1) ---
+        verified_history = [
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+        ]
+        task2 = self._make_task()
+        project2 = self._make_saturated_project(history=verified_history)
+        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
+        direction2 = project2.directions[0]
+        assert direction2.get("status") == "completed", (
+            "Direction with 3 verified merges must be auto-completed"
+        )
+        assert "verified" in direction2.get("auto_completed_reason", ""), (
+            "auto_completed_reason must reflect the verified count"
+        )
+
+    def test_auto_complete_aggregate_path_requires_verified_count(self):
+        """Auto-completion via history_aggregate must use total_verified_prs_merged.
+
+        When raw total_prs_merged >= 3 but total_verified_prs_merged == 0, the
+        direction must NOT be auto-completed.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Aggregate path: total raw merges=3, verified=0
+        agg_unverified = {
+            "total_prs_merged": 3,
+            "total_verified_prs_merged": 0,
+            "total_cycles": 5,
+        }
+        task = self._make_task()
+        project = self._make_saturated_project(agg=agg_unverified)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "Direction with only unverified aggregate merges must NOT be auto-completed"
+        )
+
+        # Aggregate path: total raw merges=3, verified=3
+        agg_verified = {
+            "total_prs_merged": 3,
+            "total_verified_prs_merged": 3,
+            "total_cycles": 5,
+        }
+        task2 = self._make_task()
+        project2 = self._make_saturated_project(agg=agg_verified)
+        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
+        direction2 = project2.directions[0]
+        assert direction2.get("status") == "completed", (
+            "Direction with 3 verified aggregate merges must be auto-completed"
+        )
 
 
 # --------------------------------------------------------------------------- #

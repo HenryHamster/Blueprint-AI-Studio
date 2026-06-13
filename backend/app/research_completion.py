@@ -51,6 +51,7 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
     _compute_acceptance_rate,
     _compute_productivity_score,
 )
+from app.direction_outcomes import verified_merged_count
 from app.failure_classification import (
     CO_DEFERRED_SHELVED,
     GRADER_CAUSE_REFUSAL,
@@ -1265,8 +1266,12 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
         if target.get("status") == "active" and target.get("possibly_saturated"):
             history = target.get("research_history", [])
             agg = target.get("history_aggregate", {})
-            total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-                agg.get("total_prs_merged") or 0
+            total_merged = sum(verified_merged_count(e) for e in history) + int(
+                agg.get(
+                    "total_verified_prs_merged",
+                    agg.get("total_prs_merged", 0),
+                )
+                or 0
             )
             if total_merged >= 3:
                 total_cycles = len(history) + (agg.get("total_cycles") or 0)
@@ -1275,7 +1280,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 target["auto_completed"] = True
                 target["auto_completed_reason"] = (
                     f"Auto-completed: direction saturated with {total_merged} "
-                    f"total PRs merged across {total_cycles} cycles"
+                    f"verified PRs merged across {total_cycles} cycles"
                 )
                 _auto_complete_info.append(
                     {
@@ -2355,9 +2360,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         )
                         return
                 if _challenge_enabled:
-                    _disagrees_with_rationale = _challenge_disagrees(
-                        _record
-                    ) and bool(((_record or {}).get("reason") or "").strip())
+                    _disagrees_with_rationale = _challenge_disagrees(_record) and bool(
+                        ((_record or {}).get("reason") or "").strip()
+                    )
                     if _disagrees_with_rationale:
                         f["low_actionability_refinement_reason"] = str(
                             (_record or {}).get("reason")

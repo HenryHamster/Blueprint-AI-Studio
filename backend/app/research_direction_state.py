@@ -31,6 +31,7 @@ from app.models import (
 )
 from app.broadcast import broadcast_to_project
 from app.direction_metrics import _fold_evicted_into_aggregate
+from app.direction_outcomes import verified_merged_count
 from app.research_context import (
     _build_research_context,
     build_recent_findings_evidence,
@@ -645,8 +646,14 @@ async def apply_post_spawn_state(
                     if d.get("status") == "active" and d.get("possibly_saturated"):
                         history = d.get("research_history", [])
                         agg = d.get("history_aggregate", {})
-                        total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-                            agg.get("total_prs_merged") or 0
+                        total_merged = sum(
+                            verified_merged_count(e) for e in history
+                        ) + int(
+                            agg.get(
+                                "total_verified_prs_merged",
+                                agg.get("total_prs_merged", 0),
+                            )
+                            or 0
                         )
                         if total_merged >= 3:
                             total_cycles = len(history) + (agg.get("total_cycles") or 0)
@@ -655,7 +662,7 @@ async def apply_post_spawn_state(
                             d["auto_completed"] = True
                             d["auto_completed_reason"] = (
                                 f"Auto-completed: direction saturated with {total_merged} "
-                                f"total PRs merged across {total_cycles} cycles"
+                                f"verified PRs merged across {total_cycles} cycles"
                             )
                             # Capture diagnosis info for deferred design_doc write
                             # inside with_design_doc_locked (after the directions commit).
@@ -666,7 +673,7 @@ async def apply_post_spawn_state(
                                 title="Direction auto-completed",
                                 message=(
                                     f"Direction '{d.get('text', did)[:80]}' was auto-completed: "
-                                    f"saturated with {total_merged} PRs merged across {total_cycles} cycles."
+                                    f"saturated with {total_merged} verified PRs merged across {total_cycles} cycles."
                                 ),
                             )
                             session.add(alert)
