@@ -2343,6 +2343,84 @@ async def test_pipelining_blocked_while_rollup_pr_open(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_pipelining_blocked_when_parent_has_blocked_children(db_session):
+    """Regression: a research parent with BLOCKED children (waiting on manual
+    approval or other blockers) should not trigger the pipelining exception.
+    BLOCKED is a non-terminal status indicating in-flight work, so a parent
+    with BLOCKED children is still progressing, not stuck.
+
+    Fix: include BLOCKED in the child status check when building
+    parents_with_active_children."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
+    _runtime_config["research_pipelining_window_minutes"] = 240
+    project = Project(
+        name="Pipelining Blocked When Children Blocked",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pipeblocked")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # EVALUATING-stale parent — would normally arm the pipelining exception.
+    parent = Task(
+        project_id=project.id,
+        title="Research: parent with blocked children",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-pipeblocked",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(parent)
+    await db_session.commit()
+
+    # A child task in BLOCKED status — the parent is in-flight, not stuck.
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="fix: a finding spawned by the parent research",
+        payloads=[{"type": "fix", "base_branch": "main"}],
+        status=TaskStatus.BLOCKED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    from sqlalchemy import update as _update
+
+    stale = datetime.utcnow() - timedelta(minutes=90)
+    await db_session.execute(
+        _update(Task).where(Task.id == parent.id).values(updated_at=stale)
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 1, (
+        f"A stale-EVALUATING parent with BLOCKED children is in-flight, not "
+        f"stuck — pipelining must be suppressed (expected 1 research: the parent "
+        f"only). Got {len(research)}."
+    )
+
+
 @pytest.mark.skipif(
     not USE_POSTGRES,
     reason="true cross-session insert concurrency requires PostgreSQL",
@@ -7259,6 +7337,45 @@ async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session
     assert tasks[0].payloads[0].get("type") in ("design_doc_update", "strategic_review")
 
 
+@pytest.mark.asyncio
+async def test_strategic_failures_auto_decay_persists_cleared_counter(db_session):
+    """When auto-decay fires, vision._strategic_failures and _strategic_failures_at are cleared."""
+    old_timestamp = (datetime.utcnow() - timedelta(hours=72)).isoformat()
+    project = Project(
+        name="Decay Persistence Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],  # No active directions — needs force_strategic to spawn
+        vision={
+            "purpose": "test purpose",
+            "_strategic_failures": 5,
+            "_strategic_failures_at": old_timestamp,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Verify initial state
+    assert project.vision.get("_strategic_failures") == 5
+    assert project.vision.get("_strategic_failures_at") == old_timestamp
+
+    await _spawn_research_task(project, db_session)
+
+    # Re-fetch from DB to ensure we get the latest vision
+    from app.models import Project as ProjectModel
+    from sqlalchemy import select
+
+    result = await db_session.execute(
+        select(ProjectModel).where(ProjectModel.id == project.id)
+    )
+    refreshed_project = result.scalar_one()
+
+    # After decay fires, the fields should be cleared from vision
+    assert refreshed_project.vision.get("_strategic_failures") is None
+    assert refreshed_project.vision.get("_strategic_failures_at") is None
+
+
 def test_project_has_purpose_resolves_problem_model_then_vision():
     """problem_model.intent.purpose is canonical; vision.purpose is the legacy fallback."""
     from app.problem_model import project_has_purpose
@@ -9957,6 +10074,75 @@ def test_compute_saturation_uses_only_last_three_entries():
     assert _compute_saturation(history) is True
 
 
+def test_compute_saturation_excludes_dedup_zeroed_cycles():
+    from app.research_completion import _compute_saturation
+
+    # 3 entries where one has non-zero hash_dedup — that one is dedup-zeroed and
+    # should be skipped; only 2 genuine cycles remain, so saturation is False.
+    history = [
+        {"tasks_created": 0},
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {"hash_dedup": 3, "word_overlap_dedup": 0},
+        },
+        {"tasks_created": 0},
+    ]
+    assert _compute_saturation(history) is False
+
+
+def test_compute_saturation_genuine_zeros_still_saturate():
+    from app.research_completion import _compute_saturation
+
+    # 3 entries all with tasks_created==0 and no dedup activity — these ARE genuine
+    # exhaustion cycles, so saturation should be True.
+    history = [
+        {"tasks_created": 0},
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {"hash_dedup": 0, "word_overlap_dedup": 0},
+        },
+        {"tasks_created": 0},
+    ]
+    assert _compute_saturation(history) is True
+
+
+def test_compute_saturation_word_overlap_dedup_also_excluded():
+    from app.research_completion import _compute_saturation
+
+    # A cycle with non-zero word_overlap_dedup and tasks_created==0 is dedup-zeroed;
+    # with only 2 genuine cycles remaining, saturation should be False.
+    history = [
+        {"tasks_created": 0},
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {"hash_dedup": 0, "word_overlap_dedup": 5},
+        },
+        {"tasks_created": 0},
+    ]
+    assert _compute_saturation(history) is False
+
+
+def test_compute_saturation_all_dedup_zeroed_not_saturated():
+    from app.research_completion import _compute_saturation
+
+    # All 3 recent entries are dedup-zeroed — no genuine exhaustion cycles at all.
+    history = [
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {"hash_dedup": 2, "word_overlap_dedup": 0},
+        },
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {"hash_dedup": 0, "word_overlap_dedup": 1},
+        },
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {"hash_dedup": 1, "word_overlap_dedup": 0},
+        },
+    ]
+    assert _compute_saturation(history) is False
+
+
 def test_detect_dedup_deadlock_insufficient_window():
     from app.research_completion import _detect_dedup_deadlock
 
@@ -12322,6 +12508,76 @@ async def test_system_verification_folds_into_direction_context(db_session, mock
     ctx = payload.get("direction_design_context")
     assert ctx is not None
     assert ctx.get("verification", {}).get("status") == "claimed_absent"
+
+
+@pytest.mark.asyncio
+async def test_direction_design_context_populated_from_keyed_systems_page(
+    db_session, mocker
+):
+    """direction_design_context["system"] comes from the flat systems/<id> key."""
+    system_id = "sys-abc"
+    direction = {
+        **_active_direction("d-ctx-keyed-sys", "Improve keyed system"),
+        "system_id": system_id,
+    }
+    sys_page = {"id": system_id, "status": "working", "modules": ["backend/app/abc.py"]}
+    project = Project(
+        name="Keyed System Page",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={f"systems/{system_id}": sys_page},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/abc.py"})
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    ctx = payload.get("direction_design_context")
+    assert ctx is not None
+    assert ctx.get("system_id") == system_id
+    assert ctx.get("system") == sys_page, (
+        "system page should be populated from flat systems/<id> key"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direction_design_context_uses_keyed_design_doc_pages(db_session, mocker):
+    """missing_capabilities comes from flat capabilities/<id> keys, not a nested dict."""
+    system_id = "sys-caps"
+    direction = {
+        **_active_direction("d-ctx-keyed-caps", "Improve keyed caps"),
+        "system_id": system_id,
+    }
+    project = Project(
+        name="Keyed Caps Page",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            f"systems/{system_id}": {"id": system_id, "status": "working"},
+            "capabilities/cap-x": {"status": "missing", "notes": "Not yet built"},
+            "capabilities/cap-y": {"status": "partial", "notes": "Half done"},
+            "capabilities/cap-z": {"status": "working", "notes": "Already done"},
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    ctx = payload.get("direction_design_context")
+    assert ctx is not None
+    missing = ctx.get("missing_capabilities", {})
+    assert "cap-x" in missing, "missing capability should appear under its bare id"
+    assert "cap-y" in missing, "partial capability should appear under its bare id"
+    assert "cap-z" not in missing, "working capability should be excluded"
 
 
 @pytest.mark.asyncio
@@ -15806,10 +16062,6 @@ async def test_filter_breakdown_type_filtered_is_per_direction(db_session):
     tf_a = history_a[-1]["filter_breakdown"]["type_filtered"]
     tf_b = history_b[-1]["filter_breakdown"]["type_filtered"]
 
-    assert tf_a == 2, (
-        f"Direction A type_filtered must be 2 (its own count), got {tf_a}"
-    )
-    assert tf_b == 1, (
-        f"Direction B type_filtered must be 1 (its own count), got {tf_b}"
-    )
+    assert tf_a == 2, f"Direction A type_filtered must be 2 (its own count), got {tf_a}"
+    assert tf_b == 1, f"Direction B type_filtered must be 1 (its own count), got {tf_b}"
     assert tf_a != tf_b, "Directions must not share the same type_filtered count"

@@ -1149,6 +1149,7 @@ async def _resolve_finding_challenge_completion(
     cctx = challenge.context or {}
     boundary = str(cctx.get("challenged_boundary") or "")
     first_verdict = str(cctx.get("challenged_first_verdict") or "")
+    challenged_finding_hash = cctx.get("challenged_finding_hash") or None
     source_id = cctx.get(FINDING_CHALLENGE_SOURCE_KEY)
 
     try:
@@ -1201,6 +1202,7 @@ async def _resolve_finding_challenge_completion(
             str(challenge.id),
             completed=completed,
             source_task_id=str(source_id) if source_id else None,
+            finding_hash=challenged_finding_hash,
         )
         challenge.latest_status_message = (
             f"Finding challenge ({boundary}): {record.agreement} — {record.reason}"

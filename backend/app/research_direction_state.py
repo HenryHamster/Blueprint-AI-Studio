@@ -155,11 +155,30 @@ def _append_archived_diagnosis(doc: dict, direction: dict, direction_id: str) ->
 
 
 def _compute_saturation(history: list) -> bool:
-    """Return True if last 3 cycles all produced 0 or 1 tasks."""
-    if len(history) < 3:
+    """Return True if last 3 *genuine* cycles all produced 0 or 1 tasks.
+
+    A cycle is dedup-zeroed (not genuine) when tasks_created==0 and dedup
+    filters (hash_dedup or word_overlap_dedup) account for the zero — meaning
+    the agent found real content but it was rejected as already-known. Those
+    cycles do not prove the direction is exhausted, so they are skipped when
+    building the saturation window.
+    """
+    genuine = []
+    for entry in reversed(history):
+        if entry.get("tasks_created", 0) == 0:
+            fb = entry.get("filter_breakdown") or {}
+            dedup_count = (fb.get("hash_dedup") or 0) + (
+                fb.get("word_overlap_dedup") or 0
+            )
+            if dedup_count > 0:
+                # Dedup-zeroed cycle — skip, not genuine exhaustion
+                continue
+        genuine.append(entry)
+        if len(genuine) == 3:
+            break
+    if len(genuine) < 3:
         return False
-    recent = history[-3:]
-    return all(entry.get("tasks_created", 0) <= 1 for entry in recent)
+    return all(entry.get("tasks_created", 0) <= 1 for entry in genuine)
 
 
 def _detect_dedup_deadlock(history: list, window: int = 3) -> tuple[bool, int]:

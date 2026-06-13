@@ -61,6 +61,7 @@ from app.failure_classification import (
 )
 from app.finding_deduplication import (
     build_dedup_state,
+    canonical_finding_body as _canonical_finding_body,
     extract_recent_terminal_finding_history,
     deduplicate_findings,
     extract_retired_failed_approaches,
@@ -548,6 +549,15 @@ def _consume_finding_challenge_record(
         return None
     if str(record.get("first_verdict") or "") != str(first_verdict):
         return None
+    # Identity check: reject if the record was stamped for a different finding.
+    record_fhash = record.get("finding_hash")
+    if record_fhash is not None:
+        current_fhash = _finding_hash(
+            finding.get("title", ""),
+            finding.get("description") or finding.get("prompt", ""),
+        )
+        if current_fhash != record_fhash:
+            return None
 
     attached = dict(record)
     finding[_FINDING_CHALLENGE_RECORD_KEY] = attached
@@ -1494,8 +1504,9 @@ def _is_high_stakes_finding(finding: Dict[str, Any]) -> bool:
         return False
     if finding.get("type") in _NON_SPAWNING_FINDING_TYPES:
         return False
-    # A finding must have either a prompt or description to potentially spawn work.
-    # A description-only high-stakes finding warrants challenge before spawn.
+    # A finding must have a non-blank prompt or description to potentially spawn work.
+    # Checks prompt first so that an explicitly blank prompt (e.g. "   ") treats the
+    # finding as bodiless even when a non-empty description is also present.
     if not str(finding.get("prompt") or finding.get("description") or "").strip():
         return False
     if finding.get("already_spawned"):
@@ -2328,6 +2339,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "Is this finding genuinely unactionable after repeated "
                             "deferral, or should it be refined and kept?"
                         ),
+                        finding_hash=_finding_hash(
+                            f.get("title", ""),
+                            f.get("description") or f.get("prompt", ""),
+                        ),
                     )
                     if _challenge is not None or (task.context or {}).get(
                         "awaiting_finding_challenge"
@@ -2340,15 +2355,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         )
                         return
                 if _challenge_enabled:
-                    if _challenge_confirms_verdict(_record, "LOW"):
-                        _low_actionability_decayed.append(f)
-                        _decayed.append(f)
-                    else:
+                    _disagrees_with_rationale = _challenge_disagrees(
+                        _record
+                    ) and bool(((_record or {}).get("reason") or "").strip())
+                    if _disagrees_with_rationale:
                         f["low_actionability_refinement_reason"] = str(
                             (_record or {}).get("reason")
-                            or "second opinion did not confirm low_actionability"
                         )[:500]
                         _low_actionability_refinement_deferred.append(f)
+                    else:
+                        _low_actionability_decayed.append(f)
+                        _decayed.append(f)
                 else:
                     _low_actionability_decayed.append(f)
                     _decayed.append(f)
@@ -2506,7 +2523,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             for _f in _high_stakes:
                 _h = _fh(
                     str(_f.get("title", "")),
-                    str(_f.get("description", "") or _f.get("prompt", "")),
+                    _canonical_finding_body(_f),
                 )
                 _hs_with_hash.append({**_f, "hash": _h})
             _manifest_items, _manifest_json = build_adversarial_challenge_manifest(
@@ -2641,7 +2658,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     for _f in findings:
                         _fhash = _fh(
                             str(_f.get("title", "")),
-                            str(_f.get("description", "") or _f.get("prompt", "")),
+                            _canonical_finding_body(_f),
                         )
                         if (
                             _fhash in _challenged_hashes_set
@@ -2765,7 +2782,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     for _f in findings:
                         _fhash = _fh(
                             str(_f.get("title", "")),
-                            str(_f.get("description", "") or _f.get("prompt", "")),
+                            _canonical_finding_body(_f),
                         )
                         if _fhash in _wholesale_hashes_set:
                             _retry_findings.append({**_f, "hash": _fhash})
@@ -2833,7 +2850,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for _f in findings:
             _fhash = _fh(
                 str(_f.get("title", "")),
-                str(_f.get("description", "") or _f.get("prompt", "")),
+                _canonical_finding_body(_f),
             )
             _verdict_obj = _adv_verdicts.get(_fhash)
             if _verdict_obj is None:
@@ -2924,7 +2941,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 for _f in findings
                 if _fh(
                     str(_f.get("title", "")),
-                    str(_f.get("description", "") or _f.get("prompt", "")),
+                    _canonical_finding_body(_f),
                 )
                 in _challenged_hashes_set
             ]
@@ -3018,7 +3035,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _finding_direction_by_hash = {
                 _fh(
                     str(_f.get("title", "")),
-                    str(_f.get("description", "") or _f.get("prompt", "")),
+                    _canonical_finding_body(_f),
                 ): str(
                     _f.get("direction_id")
                     or (task.context or {}).get("direction_id")
@@ -3483,7 +3500,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _title_to_fhash: dict[str, str] = {
         f.get("title", f"Research finding #{i + 1}"): _finding_hash(
             f.get("title", f"Research finding #{i + 1}"),
-            f.get("description", f.get("prompt", "")),
+            _canonical_finding_body(f),
         )
         for i, f in enumerate(findings)
     }
@@ -3687,7 +3704,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         scope = finding.get("scope", DEFAULT_TASK_SCOPE)
         risk = finding.get("risk", "low")
         title = finding.get("title", f"Research finding #{orig_i + 1}")
-        prompt = finding.get("prompt", finding.get("description", ""))
+        prompt = _canonical_finding_body(finding)
 
         # Pre-spawn scope-budget gate: catch obvious file-count/scope mismatch before
         # an agent is dispatched. Runs before history-based calibration so all
@@ -3817,6 +3834,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "cited path/symbol move or rename while the semantic "
                         "target still exists?"
                     ),
+                    finding_hash=_finding_hash(
+                        finding.get("title", ""),
+                        finding.get("description") or finding.get("prompt", ""),
+                    ),
                 )
                 if _challenge is not None or (task.context or {}).get(
                     "awaiting_finding_challenge"
@@ -3904,6 +3925,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     question=(
                         "Before dispatch, can this defect finding's target be "
                         "confirmed present or absent on current HEAD?"
+                    ),
+                    finding_hash=_finding_hash(
+                        finding.get("title", ""),
+                        finding.get("description") or finding.get("prompt", ""),
                     ),
                 )
                 if _challenge is not None or (task.context or {}).get(
@@ -4750,14 +4775,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 finding.get("finding_hash"),
                 _finding_hash(
                     str(finding.get("title", title) or ""),
-                    str(finding.get("description", finding.get("prompt", "")) or ""),
-                ),
-                # NEW-convention hash (description or prompt): ensures missing_hash
-                # (which uses `description or prompt`) matches this lineage even when
-                # description is an empty string and prompt is non-empty.
-                _finding_hash(
-                    str(finding.get("title", title) or ""),
-                    str(finding.get("description") or finding.get("prompt", "") or ""),
+                    _canonical_finding_body(finding),
                 ),
             )
             if isinstance(v, str) and v.strip()
@@ -5019,7 +5037,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if not stamped.get("finding_hash"):
             stamped["finding_hash"] = _finding_hash(
                 stamped.get("title", ""),
-                str(stamped.get("description") or stamped.get("prompt", "")),
+                _canonical_finding_body(stamped),
             )
         return stamped
 
@@ -5100,7 +5118,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _memo_enrollment_queue: list[tuple[str, str, str | None, str | None]] = []
     for _mf, _drop_reason in _memo_candidates[:MEMO_SPAWN_CAP_PER_CYCLE]:
         _mf_hash = _mf.get("finding_hash") or _finding_hash(
-            _mf.get("title", ""), _mf.get("description", "") or _mf.get("prompt", "")
+            _mf.get("title", ""), _canonical_finding_body(_mf)
         )
         if _mf_hash in _existing_memo_finding_hashes:
             logger.debug(

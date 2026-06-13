@@ -2765,9 +2765,10 @@ async def test_confirmed_low_actionability_decay_spawns_memo_with_second_opinion
 
 
 @_pytest.mark.asyncio
-async def test_low_actionability_challenge_indeterminate_redefers(db_session, mocker):
-    """A low-actionability challenge that does not confirm LOW keeps the
-    finding deferred for refinement instead of terminally dropping it."""
+async def test_low_actionability_challenge_non_disagrees_decays(db_session, mocker):
+    """A low-actionability challenge that does not explicitly disagree with a
+    substantive rationale (e.g. agreement='agrees' with a non-LOW verdict)
+    now decays the finding instead of routing to refinement."""
     from test_autonomous_research import _make_finding, _patch_research_externals
 
     mocker.patch.dict(
@@ -2811,25 +2812,118 @@ async def test_low_actionability_challenge_indeterminate_redefers(db_session, mo
     await _handle_research_completion(task, "", db_session)
     await db_session.refresh(task)
 
-    assert (task.context or {}).get("finding_structural_give_up") is None
+    # The finding was decayed, so finding_structural_give_up is set (not None).
+    give_up = (task.context or {}).get("finding_structural_give_up")
+    assert give_up is not None, "decayed finding must set finding_structural_give_up"
+    assert give_up.get("by_reason", {}).get("low_actionability", 0) == 1
+    # With new logic: agreement != "disagrees" → decay, NOT refinement.
     deferred = (task.context or {}).get("deferred_findings", [])
-    kept = next(f for f in deferred if f.get("title") == decayed["title"])
-    assert kept["deferred_reason"] == "low_actionability_refinement"
-    assert kept["finding_challenge"]["second_opinion_verdict"] == "indeterminate"
-    assert "sidecar failed" in kept["low_actionability_refinement_reason"]
-    children = (
-        (
-            await db_session.execute(
-                _select(_Task).where(_Task.parent_task_id == task.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
     assert not any(
-        c.context and c.context.get("memo_drop_reason") == "low_actionability_decay"
-        for c in children
+        f.get("title") == decayed["title"] and f.get("deferred_reason") == "low_actionability_refinement"
+        for f in deferred
     )
+
+
+@_pytest.mark.asyncio
+async def test_finding_challenge_binds_identity_and_indeterminate_low_stays_deferred(
+    db_session, mocker
+):
+    """Identity binding: a challenge record with a mismatched finding_hash is rejected
+    (the finding is re-challenged rather than consuming a stale verdict).
+    Indeterminate low stays deferred: when the record has agreement='indeterminate',
+    the finding is decayed rather than converted to a spawnable refinement."""
+    from app.finding_deduplication import finding_hash as fhash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"research_finding_challenge_enabled": True},
+    )
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-chal-identity"
+    )
+    finding_title = "Retry-budget overflow in challenge loop"
+    finding_desc = "The challenge loop does not cap retry depth."
+    f = _make_finding(finding_title, direction_id=direction["id"])
+    f["description"] = finding_desc
+    f["actionability_grade"] = "LOW"
+    f["deferred_reason"] = "low_actionability"
+    f["deferred_count"] = 3
+
+    correct_hash = fhash(finding_title, finding_desc)
+    wrong_hash = "000000deadbeef00"
+
+    # --- Part 1: hash mismatch → record not consumed → no refinement ---
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [f],
+        FINDING_CHALLENGE_VERDICT_KEY: {
+            "challenged_boundary": CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+            "first_verdict": "LOW",
+            "second_opinion_verdict": "actionable",
+            "agreement": "disagrees",
+            "reason": "finding is specific and actionable",
+            "sidecar_task_id": "sidecar-wrong-hash",
+            "finding_hash": wrong_hash,  # does NOT match the finding's hash
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Sentinel A", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+    # A mismatched hash means _consume returns None → challenge re-spawned → task parked.
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+    # Task should be parked awaiting a new challenge (EVALUATING).
+    from app.models import TaskStatus as _TS
+    assert task.status == _TS.EVALUATING
+
+    # --- Part 2: indeterminate agreement with correct hash → decay, NOT refinement ---
+    # Reset task status and install a verdict with indeterminate agreement.
+    task.status = _TS.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [f],
+        "awaiting_finding_challenge": None,
+        FINDING_CHALLENGE_VERDICT_KEY: {
+            "challenged_boundary": CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+            "first_verdict": "LOW",
+            "second_opinion_verdict": "",
+            "agreement": "indeterminate",
+            "reason": "could not reach a conclusion",
+            "sidecar_task_id": "sidecar-indet",
+            "finding_hash": correct_hash,  # matches the finding
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Sentinel B", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert not any(
+        fn.get("title") == finding_title
+        and fn.get("deferred_reason") == "low_actionability_refinement"
+        for fn in deferred
+    ), "indeterminate challenge must not promote to refinement"
 
 
 @_pytest.mark.asyncio
@@ -8943,6 +9037,57 @@ def test_adversarial_gate_unresolved_reason_distinguishes_parse_failure_modes():
     assert result["h2"]["unresolved_reason"] == "no_hash_matches"
 
 
+def test_adversarial_verdict_binds_by_index_without_hash():
+    """Acceptance test: verdicts with only 'index' (no 'hash') bind correctly.
+
+    A challenger may emit verdicts identified by index/position only (no hash field),
+    especially when the hash transcription is unreliable. The parser must accept
+    index-only arrays and bind them to findings by their manifest position.
+    """
+    h1 = "finding_hash_1111"
+    h2 = "finding_hash_2222"
+    h3 = "finding_hash_3333"
+
+    # Verdicts with explicit 'index' field but no 'hash' — pure index binding.
+    logs_index_only = (
+        "["
+        '{"index": 1, "verdict": "pass", "reason": "well-grounded at HEAD"},'
+        '{"index": 2, "verdict": "fail", "reason": "code was refactored"},'
+        '{"index": 3, "verdict": "pass", "reason": "confirmed stable"}'
+        "]"
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs_index_only, [h1, h2, h3])
+    assert outcome == "ok", f"index-only binding must succeed; got {outcome!r}"
+    assert result[h1]["passed"] is True
+    assert result[h1]["explicit"] is True
+    assert result[h1]["reason"] == "well-grounded at HEAD"
+    assert result[h2]["passed"] is False
+    assert result[h2]["explicit"] is True
+    assert result[h2]["reason"] == "code was refactored"
+    assert result[h3]["passed"] is True
+    assert result[h3]["explicit"] is True
+    assert result[h3]["reason"] == "confirmed stable"
+
+    # Verdicts by array position alone (no index or hash fields).
+    logs_position_only = (
+        "["
+        '{"verdict": "fail", "reason": "stale"},'
+        '{"verdict": "pass", "reason": "fresh"}'
+        "]"
+    )
+    result2, outcome2 = parse_adversarial_finding_verdicts(
+        logs_position_only, [h1, h2, h3]
+    )
+    assert outcome2 == "ok", f"array-position binding must succeed; got {outcome2!r}"
+    assert result2[h1]["passed"] is False
+    assert result2[h1]["explicit"] is True
+    assert result2[h2]["passed"] is True
+    assert result2[h2]["explicit"] is True
+    # h3 has no verdict at position 2 → fail-closed
+    assert result2[h3]["passed"] is False
+    assert result2[h3]["explicit"] is False
+
+
 # ---------------------------------------------------------------------------
 # Cross-seam contract: challenge handler output shape ↔ backend parser
 # ---------------------------------------------------------------------------
@@ -13074,3 +13219,137 @@ async def test_deferred_memo_enrollment_dedup_on_repeat_drop(db_session, mocker)
         .all()
     )
     assert len(rows_after) == 1, "dedup: still exactly one row after second drop"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-cycle filtered-hash suppression
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_pytest.mark.asyncio
+async def test_recently_filtered_hashes_persisted_after_dedup(db_session, mocker):
+    """When a finding is hash-deduped out (prior COMPLETED+pr_merged task), its hash
+    is persisted into direction.recently_filtered_finding_hashes for the next cycle."""
+    from app.finding_deduplication import finding_hash as _fhash
+    from test_autonomous_research import (
+        _active_direction,
+        _make_finding,
+        _make_research_task,
+        _patch_research_externals,
+    )
+
+    direction_id = "d-fh-persist01"
+    title = "Fix cross-cycle suppression regression"
+    # _make_finding produces description = f"Description: {title}"
+    description = f"Description: {title}"
+    fhash = _fhash(title, description)
+
+    direction = _active_direction(direction_id, "Hash-persist direction")
+    project = _Project(
+        name=f"HashPersist {direction_id}",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A prior COMPLETED task with pr_merged=True carries the same finding_hash,
+    # so build_dedup_state will add it to recent_finding_hashes.
+    prior = _Task(
+        project_id=project.id,
+        title=title,
+        status=TaskStatus.COMPLETED,
+        context={"finding_hash": fhash, "pr_merged": True},
+        created_by="ORCHESTRATOR",
+        vm_instance_id="test-vm-prior-fh01",
+    )
+    db_session.add(prior)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    finding = _make_finding(title=title, direction_id=direction_id)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    updated_dirs = project.directions or []
+    target_dir = next((d for d in updated_dirs if d.get("id") == direction_id), None)
+    assert target_dir is not None, "direction must still be present after completion"
+    persisted = target_dir.get("recently_filtered_finding_hashes") or []
+    assert fhash in persisted, (
+        f"hash-deduped finding hash {fhash!r} must be written to "
+        "direction.recently_filtered_finding_hashes for next-cycle suppression"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_recently_filtered_hashes_suppress_finding_next_cycle(db_session, mocker):
+    """A hash pre-loaded into direction.recently_filtered_finding_hashes (from a
+    prior cycle) suppresses the matching finding without any DB task carrying that
+    hash — pure persisted-state cross-cycle suppression."""
+    from app.finding_deduplication import finding_hash as _fhash
+    from test_autonomous_research import (
+        _active_direction,
+        _make_finding,
+        _make_research_task,
+        _patch_research_externals,
+    )
+
+    direction_id = "d-fh-suppress01"
+    title = "Fix pre-suppressed cross-cycle finding"
+    description = f"Description: {title}"
+    fhash = _fhash(title, description)
+
+    # Pre-populate the direction with the hash from a prior cycle.
+    direction = _active_direction(direction_id, "Suppression direction")
+    direction["recently_filtered_finding_hashes"] = [fhash]
+
+    project = _Project(
+        name=f"HashSuppress {direction_id}",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No prior task in the DB carries this finding_hash — suppression must come
+    # solely from the persisted recently_filtered_finding_hashes field.
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    finding = _make_finding(title=title, direction_id=direction_id)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 0, (
+        f"Finding with hash {fhash!r} pre-loaded in recently_filtered_finding_hashes "
+        "must be suppressed by the persisted state; no child task should be spawned"
+    )
