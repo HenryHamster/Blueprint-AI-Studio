@@ -262,6 +262,12 @@ PARK_WAKE_STRANDED = "park_wake_stranded"
 # (INFRA_CLASSES) so failed attempts don't consume the task's retry budget.
 DEAD_AUTH = "DEAD_AUTH"
 
+# Review-fix cap exhausted after the PR had already been approved. The work was
+# signed off, but merge mechanics (CI/rebase churn) burned the loop cap and the
+# PR was auto-closed. This must be visible in analytics/digests without being
+# treated as CODE_ERROR, PR_REJECTED, or direction-health damage.
+APPROVED_CAP_PR_CLOSED = "APPROVED_CAP_PR_CLOSED"
+
 # Context key stamped on a co-deferred dependent task's context. When a research
 # cycle decomposes findings, a dependent finding whose prerequisite was deferred
 # in the SAME cycle is "co-deferred": its spawned task is set to CANCELLED and the
@@ -453,6 +459,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         PARK_WAKE_TIMEOUT,
         PARK_WAKE_STRANDED,
         DEAD_AUTH,
+        APPROVED_CAP_PR_CLOSED,
     }
 )
 
@@ -507,6 +514,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     NO_PROGRESS_TIMEOUT,
     PARK_WAKE_TIMEOUT,
     PARK_WAKE_STRANDED,
+    APPROVED_CAP_PR_CLOSED,
 )
 
 

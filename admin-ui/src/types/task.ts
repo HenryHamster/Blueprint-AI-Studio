@@ -210,6 +210,18 @@ export interface Task {
     research_spawn_gate_challenged_merged?: number;
     research_spawn_gate_unchallenged_spawned?: number;
     research_spawn_gate_unchallenged_merged?: number;
+    // Durable acceptance-gate verdict stamped by acceptance_gate.py at completion.
+    // Absent for tasks that declared no acceptance evidence (legacy + undeclared).
+    // When present: kind mirrors AcceptanceEvidence.kind, proven is stricter than
+    // satisfied (machine-checked proof vs merely-delivered work).
+    code_acceptance_verdict?: {
+      satisfied: boolean;
+      proven: boolean;
+      kind: string | null;
+      reason: string;
+      consumed?: boolean;
+      consumed_by_task_id?: string;
+    };
     [key: string]: unknown;
   };
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];

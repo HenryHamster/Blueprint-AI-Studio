@@ -156,7 +156,6 @@ def _demand_window_minutes(runtime_config) -> int:
 _COST_GUARD_ALERT_TITLE = "Warm pool cost guard engaged: idle spend not amortized"
 
 
-
 def _cost_guard_config(runtime_config) -> dict:
     """Thresholds for the cost-aware auto-drain guard (safe defaults).
 
@@ -1742,6 +1741,12 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                     TaskStatus.FAILED,
                     TaskStatus.CANCELLED,
                     TaskStatus.EVALUATING,
+                    # BLOCKED/PARKED tasks relinquish their VM — the pool member
+                    # must be reclaimed as a durable backstop in case the proactive
+                    # park/block retire path failed (e.g. pool was disabled at park
+                    # time, or the member was never in LEASED state to begin with).
+                    TaskStatus.BLOCKED,
+                    TaskStatus.PARKED,
                 ):
                     reason = "pool_lease_orphaned"
                 elif leased_task.status == TaskStatus.QUEUED and (

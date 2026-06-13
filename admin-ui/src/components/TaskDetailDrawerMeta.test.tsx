@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
-import { fetchComputeJobs, resolveArtifactDownloadUrl } from '../api';
+import { fetchComputeJobs, resolveArtifactDownloadUrl, resolveViewportFailureDownloadUrl } from '../api';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -19,6 +19,7 @@ vi.mock('../api', () => ({
   fetchComputeJobs: vi.fn(async () => []),
   fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
   resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
+  resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
 
@@ -1251,7 +1252,6 @@ function makeComputeJob(overrides: Partial<import('../api').ComputeJob> = {}): i
     artifact_id: null,
     artifact: null,
     result_reference: null,
-    artifact_id: null,
     accelerator_type: null,
     accelerator_count: null,
     task_title: 'compute_experiment: benchmark run',
@@ -1574,5 +1574,164 @@ describe('DetailsTab — adversarial gate diagnostic', () => {
     expect(screen.getByTitle(new Date(vmImageBuildTs * 1000).toISOString())).toBeInTheDocument();
     expect(screen.getByTitle(vmRuntimeFingerprint)).toBeInTheDocument();
     expect(screen.getByText('runtime-fing')).toBeInTheDocument();
+  });
+});
+
+describe('DetailsTab — Acceptance Evidence', () => {
+  afterEach(() => cleanup());
+
+  it('renders nothing when code_acceptance_verdict is absent', () => {
+    const task = makeTask({ context: {} });
+    render(<DetailsTab task={task} />);
+    expect(screen.queryByText('Acceptance Evidence')).toBeNull();
+  });
+
+  it('renders a proven badge for a machine-checked satisfied verdict', () => {
+    const task = makeTask({
+      context: {
+        code_acceptance_verdict: {
+          satisfied: true,
+          proven: true,
+          kind: 'named_test',
+          reason: "named_test 'testing/test_foo.py' was added/modified and ran green",
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Acceptance Evidence')).toBeInTheDocument();
+    expect(screen.getByText('proven')).toBeInTheDocument();
+    expect(screen.getByText('named_test')).toBeInTheDocument();
+    expect(screen.getByText(/ran green/)).toBeInTheDocument();
+    expect(screen.queryByText('View screenshot')).toBeNull();
+  });
+
+  it('renders a satisfied badge for a soft/unproven satisfied verdict', () => {
+    const task = makeTask({
+      context: {
+        code_acceptance_verdict: {
+          satisfied: true,
+          proven: false,
+          kind: 'observable_behavior',
+          reason: 'declared observable_behavior shipped with a real diff',
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('satisfied')).toBeInTheDocument();
+    expect(screen.getByText('observable_behavior')).toBeInTheDocument();
+    // Satisfied badge should be amber
+    expect(screen.getByText('satisfied').className).toContain('amber');
+  });
+
+  it('renders a fail-closed badge for an unsatisfied verdict', () => {
+    const task = makeTask({
+      context: {
+        code_acceptance_verdict: {
+          satisfied: false,
+          proven: false,
+          kind: 'named_test',
+          reason: "declared named_test 'testing/test_missing.py' is not among the PR's changed files",
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('fail-closed')).toBeInTheDocument();
+    expect(screen.getByText(/not among the PR/)).toBeInTheDocument();
+    expect(screen.getByText('fail-closed').className).toContain('red');
+  });
+
+  it('shows View screenshot toggle for kind=visual', () => {
+    const task = makeTask({
+      context: {
+        code_acceptance_verdict: {
+          satisfied: true,
+          proven: true,
+          kind: 'visual',
+          reason: 'visual acceptance evidence matches the uploaded viewport screenshot',
+        },
+      },
+      payloads: [{ type: 'create', acceptance_evidence: { kind: 'visual', component: 'DashboardHome', viewport_width: 1280 } }],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('View screenshot')).toBeInTheDocument();
+  });
+
+  it('fetches and displays screenshot image when toggle is clicked', async () => {
+    vi.mocked(resolveViewportFailureDownloadUrl).mockResolvedValueOnce('https://signed.example.com/viewport/screenshot.png');
+    const task = makeTask({
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      context: {
+        code_acceptance_verdict: {
+          satisfied: true,
+          proven: true,
+          kind: 'visual',
+          reason: 'visual acceptance evidence matches the uploaded viewport screenshot',
+        },
+      },
+      payloads: [{ type: 'create', acceptance_evidence: { kind: 'visual', component: 'DashboardHome', viewport_width: 1280 } }],
+    });
+    render(<DetailsTab task={task} />);
+    const toggleBtn = screen.getByText('View screenshot');
+    fireEvent.click(toggleBtn);
+    expect(resolveViewportFailureDownloadUrl).toHaveBeenCalledWith('proj-1', 'DashboardHome', 1280);
+    const img = await screen.findByRole('img', { name: /viewport screenshot/i });
+    expect(img).toHaveAttribute('src', 'https://signed.example.com/viewport/screenshot.png');
+  });
+
+  it('shows error text when screenshot API rejects', async () => {
+    vi.mocked(resolveViewportFailureDownloadUrl).mockRejectedValueOnce(new Error('Screenshot not found'));
+    const task = makeTask({
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      context: {
+        code_acceptance_verdict: {
+          satisfied: true,
+          proven: true,
+          kind: 'visual',
+          reason: 'visual acceptance evidence matches the uploaded viewport screenshot',
+        },
+      },
+      payloads: [{ type: 'create', acceptance_evidence: { kind: 'visual', component: 'DashboardHome', viewport_width: 375 } }],
+    });
+    render(<DetailsTab task={task} />);
+    fireEvent.click(screen.getByText('View screenshot'));
+    await waitFor(() => expect(screen.getByText('Screenshot not found')).toBeInTheDocument());
+    expect(screen.queryByRole('img')).toBeNull();
+  });
+
+  it('does not show screenshot toggle for non-visual kinds', () => {
+    const task = makeTask({
+      context: {
+        code_acceptance_verdict: {
+          satisfied: true,
+          proven: true,
+          kind: 'downstream_artifact',
+          reason: "downstream_artifact 'release-deploy-artifact' is reflected in the shipped changed files",
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Acceptance Evidence')).toBeInTheDocument();
+    expect(screen.queryByText('View screenshot')).toBeNull();
+  });
+
+  it('hides screenshot when toggle is clicked a second time', async () => {
+    vi.mocked(resolveViewportFailureDownloadUrl).mockResolvedValue('https://signed.example.com/viewport/screenshot.png');
+    const task = makeTask({
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      context: {
+        code_acceptance_verdict: {
+          satisfied: true,
+          proven: true,
+          kind: 'visual',
+          reason: 'visual acceptance evidence matches',
+        },
+      },
+      payloads: [{ type: 'create', acceptance_evidence: { kind: 'visual', component: 'ImprovementLanesPanel', viewport_width: 375 } }],
+    });
+    render(<DetailsTab task={task} />);
+    fireEvent.click(screen.getByText('View screenshot'));
+    await screen.findByRole('img', { name: /viewport screenshot/i });
+    fireEvent.click(screen.getByText('Hide screenshot'));
+    expect(screen.queryByRole('img')).toBeNull();
   });
 });

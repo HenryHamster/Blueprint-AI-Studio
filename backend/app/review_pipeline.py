@@ -12,7 +12,7 @@ import os
 import re
 import uuid
 from datetime import timedelta
-from typing import Any
+from typing import Any, Callable, Iterable
 
 from sqlalchemy import func
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -61,6 +61,7 @@ from app.review_heuristics import (  # noqa: F401
     LANE_CI,
     LANE_CONFLICT,
     LANE_REVIEW_CONVERGENCE,
+    PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
@@ -105,6 +106,7 @@ from app.review_loop_convergence import (
     _CHURN_NARROW_FOCUS_PREFIX,
     _EARLY_REPEATING_ISSUES_PREFIX,
     _handle_cap_exhaustion,
+    _handle_persistent_conflict_escalation,
     _MID_BUDGET_NARROW_FOCUS_PREFIX,
     _SCOPE_PRESSURE_HARD_CAP_PREFIX,
     _is_pipeline_task_stale,
@@ -256,7 +258,18 @@ def _is_verification_only_rejection(
 # APPROVE." A blank/unknown severity is deliberately NOT in this set: an
 # unclassified issue cannot be PROVEN non-blocking, so it keeps blocking.
 _NON_BLOCKING_SEVERITIES = frozenset(
-    {"MINOR", "NIT", "NITPICK", "LOW", "INFO", "INFORMATIONAL", "TRIVIAL", "STYLE", "SUGGESTION", "NONE"}
+    {
+        "MINOR",
+        "NIT",
+        "NITPICK",
+        "LOW",
+        "INFO",
+        "INFORMATIONAL",
+        "TRIVIAL",
+        "STYLE",
+        "SUGGESTION",
+        "NONE",
+    }
 )
 
 
@@ -506,6 +519,7 @@ def _is_rollup_chain_source(source_task: "Task") -> bool:
             return True
     return False
 
+
 # Phase 2c (warm-VM continuity): how long after a source task's last heartbeat
 # (or its completion) the warm-VM pin is honored on the spawned task. After
 # this window the orchestrator's provisioning loop clears the pin and
@@ -513,7 +527,6 @@ def _is_rollup_chain_source(source_task: "Task") -> bool:
 # (agent finishing prior role + a few VM-heartbeat ticks during the next-role
 # poll) without keeping a stale pin alive long enough to mask a dead VM.
 WARM_HANDOFF_WINDOW_SECS = 240
-
 
 
 def _max_review_iterations(task: Task, direction_data: dict | None = None) -> int:
@@ -614,6 +627,10 @@ SPAWN_REASON_BLOCKED_REPEAT = "blocked_repeat_fingerprint"
 # while still under the requeue budget, suppressed the cold review and requeued
 # the failed phase as a lane-aware recovery task (see _handle_lane_checkpoint_recovery).
 SPAWN_REASON_LANE_RECOVERY = "lane_checkpoint_recovery"
+# The conflict-fix lane accumulated enough consecutive completions without
+# resolving the merge conflict that further attempts are unlikely to succeed.
+# Escalated to the operator before the lane sub-cap fires.
+SPAWN_REASON_PERSISTENT_CONFLICT = "persistent_conflict"
 
 # Grace window for the mid-retry defer: when a same-PR fix is FAILED/CANCELLED
 # with an infra failure_category and the failure is younger than this many minutes,
@@ -1249,7 +1266,9 @@ async def _check_fix_mid_retry_defer(
             )
             type_match = func.json_extract(Task.payloads, "$[0].type") == "fix"
         else:
-            pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
+            pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(
+                pr_number
+            )
             type_match = Task.payloads[0]["type"].as_string() == "fix"
 
         candidates = (
@@ -1279,9 +1298,10 @@ async def _check_fix_mid_retry_defer(
         )
         for t in candidates:
             fp = t.first_payload
-            if not is_rollup_source and (
-                fp.get("original_task_id") or ""
-            ) != resolved_original_id:
+            if (
+                not is_rollup_source
+                and (fp.get("original_task_id") or "") != resolved_original_id
+            ):
                 continue
             ctx = t.context or {}
             fc = ctx.get("failure_category")
@@ -1296,7 +1316,10 @@ async def _check_fix_mid_retry_defer(
                 if int(ctx.get("_resurrection_count", 0)) >= 1:
                     continue
             else:
-                if int(ctx.get("_blocked_optimistic_retries", 0)) >= _BLOCKED_OPTIMISTIC_RETRY_CAP:
+                if (
+                    int(ctx.get("_blocked_optimistic_retries", 0))
+                    >= _BLOCKED_OPTIMISTIC_RETRY_CAP
+                ):
                     continue
             return True
     except Exception:
@@ -1349,6 +1372,30 @@ def task_counts_toward_review_cap(task: Task) -> bool:
     if (task.context or {}).get("_review_stale_head"):
         return False
     return True
+
+
+def _recent_consecutive_lane_count(
+    tasks: Iterable[Task],
+    target_lane: str,
+    counts_toward_cap: Callable[[Task], bool] = task_counts_toward_review_cap,
+) -> int:
+    """Count the newest uninterrupted segment of cap-counting tasks in one lane."""
+
+    count = 0
+    sorted_tasks = sorted(
+        tasks,
+        key=lambda task: (
+            task.created_at.timestamp() if task.created_at is not None else 0.0
+        ),
+        reverse=True,
+    )
+    for task in sorted_tasks:
+        if not counts_toward_cap(task):
+            continue
+        if classify_iteration_lane(task) != target_lane:
+            break
+        count += 1
+    return count
 
 
 def _review_supersede_churn_count(task: Task | None) -> int:
@@ -1650,7 +1697,9 @@ async def _spawn_pipeline_task(
 
                 await _retire_lane(session, source_task.context or {})
             except Exception:  # noqa: BLE001
-                logger.debug("[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True)
+                logger.debug(
+                    "[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True
+                )
             return (None, False)
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -1668,7 +1717,9 @@ async def _spawn_pipeline_task(
 
             await _retire_lane(session, source_task.context or {})
         except Exception:  # noqa: BLE001
-            logger.debug("[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True)
+            logger.debug(
+                "[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True
+            )
         return (None, False)
 
     # ── verify_tests fast-path ──────────────────────────────────────────────
@@ -1691,10 +1742,11 @@ async def _spawn_pipeline_task(
         )
 
     supersede_churn_count = _review_supersede_churn_count(orig_task)
-    if (
-        source_task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
-        and task_counts_toward_review_cap(source_task)
-    ):
+    if source_task.status in (
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ) and task_counts_toward_review_cap(source_task):
         supersede_churn_count = 0
         if orig_task is not None:
             from sqlalchemy.orm.attributes import flag_modified
@@ -1789,11 +1841,13 @@ async def _spawn_pipeline_task(
             supersede_churn_last_snapshot = t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY]
             if orig_task is not None:
                 orig_ctx = dict(orig_task.context or {})
-                supersede_churn_count = int(
-                    orig_ctx.get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0
-                ) + 1
+                supersede_churn_count = (
+                    int(orig_ctx.get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0) + 1
+                )
                 orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = supersede_churn_count
-                orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = supersede_churn_last_snapshot
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = (
+                    supersede_churn_last_snapshot
+                )
                 orig_task.context = orig_ctx
                 flag_modified(orig_task, "context")
                 session.add(orig_task)
@@ -1845,11 +1899,13 @@ async def _spawn_pipeline_task(
             supersede_churn_last_snapshot = t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY]
             if orig_task is not None:
                 orig_ctx = dict(orig_task.context or {})
-                supersede_churn_count = int(
-                    orig_ctx.get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0
-                ) + 1
+                supersede_churn_count = (
+                    int(orig_ctx.get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0) + 1
+                )
                 orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = supersede_churn_count
-                orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = supersede_churn_last_snapshot
+                orig_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY] = (
+                    supersede_churn_last_snapshot
+                )
                 orig_task.context = orig_ctx
                 flag_modified(orig_task, "context")
                 session.add(orig_task)
@@ -1890,9 +1946,9 @@ async def _spawn_pipeline_task(
         from app.alert_dispatch import _maybe_create_escalation_alert
         from sqlalchemy.orm.attributes import flag_modified
 
-        churn_last = supersede_churn_last_snapshot or (
-            orig_task.context or {}
-        ).get(_REVIEW_SUPERSEDE_CHURN_LAST_KEY)
+        churn_last = supersede_churn_last_snapshot or (orig_task.context or {}).get(
+            _REVIEW_SUPERSEDE_CHURN_LAST_KEY
+        )
         detail = (
             "Supersession churn reached the bound after "
             f"{supersede_churn_count} consecutive superseded task(s) with no "
@@ -1956,9 +2012,7 @@ async def _spawn_pipeline_task(
                 )
             )
         except Exception as _ne:  # noqa: BLE001
-            logger.warning(
-                f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}"
-            )
+            logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
         _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
         session.add(source_task)
         return (None, False)
@@ -2026,8 +2080,8 @@ async def _spawn_pipeline_task(
         )
     else:
         pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
-        type_match = Task.payloads[0]["type"].as_string().in_(
-            ("review", "fix", "panel_review")
+        type_match = (
+            Task.payloads[0]["type"].as_string().in_(("review", "fix", "panel_review"))
         )
     pr_pipeline_tasks = (
         (
@@ -2245,6 +2299,11 @@ async def _spawn_pipeline_task(
         if _counts_toward_cap(_lt):
             _lane = classify_iteration_lane(_lt)
             lane_counts[_lane] = lane_counts.get(_lane, 0) + 1
+    recent_consecutive_conflict_count = _recent_consecutive_lane_count(
+        pr_pipeline_tasks,
+        LANE_CONFLICT,
+        _counts_toward_cap,
+    )
     non_review_total = (
         lane_counts[LANE_CONFLICT]
         + lane_counts[LANE_CI]
@@ -2322,6 +2381,38 @@ async def _spawn_pipeline_task(
         session.add(source_task)
         return (None, False)
 
+    # ── Persistent-conflict early escalation ───────────────────────────────
+    # When the conflict-fix lane has already accumulated >= threshold completions
+    # without resolving the conflict and this spawn would add another conflict
+    # attempt, stop early and close with a conflict-named terminal outcome. Fires
+    # BEFORE the lane sub-cap (LANE_CAP_CONFLICT_DEFAULT=4) so the PR closes at
+    # attempt 3 instead of grinding to cap or global exhaustion.
+    _persistent_conflict_threshold = _runtime_config.get(
+        "review_persistent_conflict_threshold",
+        PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
+    )
+    if (
+        _spawn_lane == LANE_CONFLICT
+        and recent_consecutive_conflict_count >= _persistent_conflict_threshold
+    ):
+        logger.warning(
+            f"[PIPELINE] PR #{pr_number} persistent merge conflict: "
+            f"{recent_consecutive_conflict_count} consecutive conflict-fix "
+            f"iterations completed without resolution "
+            f"(threshold={_persistent_conflict_threshold})"
+        )
+        await _handle_persistent_conflict_escalation(
+            source_task,
+            resolved_original_id,
+            pr_number,
+            pr_iterations,
+            recent_consecutive_conflict_count,
+            session,
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_PERSISTENT_CONFLICT)
+        session.add(source_task)
+        return (None, False)
+
     # ── Per-lane sub-cap checks ─────────────────────────────────────────────
     # Block a spawn when its lane's sub-cap is exhausted or non-review lanes
     # collectively hit the collective ceiling. These fire before the global cap
@@ -2330,13 +2421,22 @@ async def _spawn_pipeline_task(
     # path). Conflict/CI exhaustion routes to _handle_cap_exhaustion which
     # uses _pr_is_preservable_on_cap to preserve rollup work.
     _lane_exhausted: str | None = None
-    if _spawn_lane == LANE_ARBITRATION and lane_counts[LANE_ARBITRATION] >= _lane_cap_arbitration:
+    if (
+        _spawn_lane == LANE_ARBITRATION
+        and lane_counts[LANE_ARBITRATION] >= _lane_cap_arbitration
+    ):
         _lane_exhausted = LANE_ARBITRATION
-    elif _spawn_lane == LANE_CONFLICT and lane_counts[LANE_CONFLICT] >= _lane_cap_conflict:
+    elif (
+        _spawn_lane == LANE_CONFLICT
+        and lane_counts[LANE_CONFLICT] >= _lane_cap_conflict
+    ):
         _lane_exhausted = LANE_CONFLICT
     elif _spawn_lane == LANE_CI and lane_counts[LANE_CI] >= _lane_cap_ci:
         _lane_exhausted = LANE_CI
-    elif _spawn_lane != LANE_REVIEW_CONVERGENCE and non_review_total >= _lane_cap_non_review:
+    elif (
+        _spawn_lane != LANE_REVIEW_CONVERGENCE
+        and non_review_total >= _lane_cap_non_review
+    ):
         _lane_exhausted = "non_review_collective"
 
     if _lane_exhausted is not None:
@@ -2550,7 +2650,9 @@ async def _spawn_pipeline_task(
     # "pin_reviewer_model" runtime flag (default on). Carry-forward always happens
     # (fix spawns thread it through review_loop so the next review sees it).
     _pin_reviewer = bool(_runtime_config.get("pin_reviewer_model", True))
-    reviewer_model_for_chain = source_loop.get("reviewer_model") if _pin_reviewer else None
+    reviewer_model_for_chain = (
+        source_loop.get("reviewer_model") if _pin_reviewer else None
+    )
     if task_type == "review" and _pin_reviewer:
         if reviewer_model_for_chain:
             # Use the pinned model from a prior review in this chain.
@@ -2621,7 +2723,9 @@ async def _spawn_pipeline_task(
 
     churn_detections = int(source_loop.get("churn_detections", 0) or 0)
     # Carry forward any prior churn cap reduction so it survives across iterations.
-    churn_cap_reduction: int | None = (source_task.context or {}).get("_churn_cap_reduction")
+    churn_cap_reduction: int | None = (source_task.context or {}).get(
+        "_churn_cap_reduction"
+    )
     # Stuck-cycle detection: if the same CRITICAL/MAJOR issues repeat across consecutive
     # iterations, escalate for manual review instead of consuming the full iteration budget.
     if task_type == "fix" and iteration >= 2 and len(new_review_history) >= 2:
@@ -2830,10 +2934,7 @@ async def _spawn_pipeline_task(
         # escalate to the operator at iteration K instead of burning the full
         # budget. Only fires from iteration K onward so a normally-converging
         # loop (which lands APPROVE well before K) is never escalated early.
-        if (
-            task_type == "fix"
-            and iteration >= EARLY_NONCONVERGENCE_ESCALATE_AT
-        ):
+        if task_type == "fix" and iteration >= EARLY_NONCONVERGENCE_ESCALATE_AT:
             should_escalate, nonconvergence_reason = detect_early_nonconvergence(
                 new_review_history
             )
@@ -2845,9 +2946,7 @@ async def _spawn_pipeline_task(
                     f"grinding to cap."
                 )
                 try:
-                    nc_orig = await session.get(
-                        Task, uuid.UUID(resolved_original_id)
-                    )
+                    nc_orig = await session.get(Task, uuid.UUID(resolved_original_id))
                     if nc_orig:
                         # Discretionary gate, same as stuck-cycle: only
                         # approval-gate when require_approval_gates is on.
@@ -2886,8 +2985,7 @@ async def _spawn_pipeline_task(
                             )
                         except Exception as _ne:  # noqa: BLE001
                             logger.warning(
-                                f"[NOTIFY] APPROVAL_NEEDED dispatch setup "
-                                f"failed: {_ne}"
+                                f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}"
                             )
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
@@ -3314,11 +3412,7 @@ async def _spawn_pipeline_task(
         # Issue ledger: carries contested regions across iterations so each fix/review
         # agent sees the full oscillation history without re-deriving from history.
         # Only written when the ledger has at least one contested region.
-        **(
-            {"issue_ledger": _issue_ledger}
-            if _issue_ledger.get("contested")
-            else {}
-        ),
+        **({"issue_ledger": _issue_ledger} if _issue_ledger.get("contested") else {}),
         # Reviewer-model pin: first review stamps the resolved model; subsequent
         # reviews and fix tasks carry it forward so all reviews on the chain use
         # the same model (prevents reviewer personality drift mid-chain).

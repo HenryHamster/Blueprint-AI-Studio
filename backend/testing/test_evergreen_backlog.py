@@ -523,3 +523,169 @@ async def test_admin_enroll_list_and_observability_endpoints(client, db_session)
     obs_body = obs.json()
     assert "reason_counts" in obs_body
     assert "recent" in obs_body
+
+
+# --------------------------------------------------------------------------- #
+# Deferred-memo enrollment integration (flag-gated).
+# --------------------------------------------------------------------------- #
+
+
+async def test_deferred_memo_enrollment_flag_gated(db_session, mocker):
+    """Deferred-memo enrollment into the evergreen backlog is gated on
+    evergreen_fill_deferred_memo_enrollment.
+
+    flag=False (default) — research completion drops a LOW-actionability finding
+    as a memo but creates NO EvergreenBacklogItem rows.
+
+    flag=True — the same drop enrolls exactly one row with
+    provenance='deferred_memo', the correct finding_key, and direction_id.
+
+    Dedup — a second enroll call for the same finding_key on the same project
+    returns the existing row without creating a duplicate.
+    """
+    import uuid
+    from unittest.mock import AsyncMock
+    import app.research_completion as _rc
+    from app.research_completion import _handle_research_completion
+    from app.models import Project
+    from test_autonomous_research import (
+        _active_direction,
+        _make_research_task,
+        _patch_research_externals,
+    )
+
+    direction_id = "d-ev-flag-gate01"
+
+    async def _make_project_and_task(db_session, dir_suffix=""):
+        _dir_id = direction_id + dir_suffix
+        direction = _active_direction(_dir_id, "Evergreen deferred memo test")
+        project = Project(
+            name=f"ev-memo-{uuid.uuid4().hex[:8]}",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = await _make_research_task(project, direction, db_session)
+        return project, direction, task
+
+    def _low_finding(dir_suffix=""):
+        return {
+            "title": "Memo: fix wall-clock budget for reaper stale-EVALUATING sweep",
+            "description": "Reaper stale-EVALUATING sweep has no wall-clock budget.",
+            "prompt": "Implement a wall-clock budget for the reaper.",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction_id + dir_suffix,
+            "actionability_grade": "LOW",
+            "finding_hash": "ev-fg-hash-001",
+        }
+
+    def _patch_for_run(mocker, finding):
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_head_commit",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.research_completion.cited_paths_changed_since",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.research_completion._has_validation_backend",
+            return_value=False,
+        )
+        mocker.patch(
+            "app.research_completion._summarize_ungrounded_claims_grounded",
+            new=AsyncMock(return_value=None),
+        )
+
+    # ---- FLAG OFF: no rows enrolled ----
+    project_off, _, task_off = await _make_project_and_task(db_session, "-off")
+    _patch_for_run(mocker, _low_finding("-off"))
+    _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = False
+    try:
+        await _handle_research_completion(task_off, "", db_session)
+    finally:
+        _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = False
+
+    rows_off = (
+        (
+            await db_session.execute(
+                select(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == project_off.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows_off == [], "flag=False: no backlog items should be enrolled"
+
+    # ---- FLAG ON: one row enrolled with correct fields ----
+    project_on, _, task_on = await _make_project_and_task(db_session, "-on")
+    _patch_for_run(mocker, _low_finding("-on"))
+    _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = True
+    try:
+        await _handle_research_completion(task_on, "", db_session)
+    finally:
+        _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = False
+
+    rows_on = (
+        (
+            await db_session.execute(
+                select(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == project_on.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows_on) == 1, "flag=True: exactly one backlog item enrolled"
+    enrolled = rows_on[0]
+    assert enrolled.provenance == "deferred_memo"
+    assert enrolled.finding_key == "ev-fg-hash-001"
+    assert enrolled.status == "enrolled"
+    assert enrolled.direction_id == direction_id + "-on"
+    assert "wall-clock" in enrolled.title.lower() or "reaper" in enrolled.title.lower()
+
+    # ---- DEDUP: re-enrolling the same finding_key returns the existing row ----
+    dup = await enroll_backlog_item(
+        db_session,
+        project_id=project_on.id,
+        finding_key="ev-fg-hash-001",
+        title="Duplicate attempt — should not create a new row",
+        provenance="deferred_memo",
+    )
+    assert dup is not None
+    assert dup.id == enrolled.id, "duplicate enroll returns the existing row"
+
+    rows_dedup = (
+        (
+            await db_session.execute(
+                select(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == project_on.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows_dedup) == 1, "dedup: still exactly one row after second enroll"

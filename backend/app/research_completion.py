@@ -4953,6 +4953,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             [(f, "low_actionability_decay") for f in _low_actionability_decayed]
         )
     _research_direction_id = (task.context or {}).get("direction_id")
+    _deferred_memo_enroll = bool(
+        _runtime_config.get("evergreen_fill_deferred_memo_enrollment", False)
+    )
+    _memo_enrollment_queue: list[tuple[str, str, str | None, str | None]] = []
     for _mf, _drop_reason in _memo_candidates[:MEMO_SPAWN_CAP_PER_CYCLE]:
         _mf_hash = _mf.get("finding_hash") or _finding_hash(
             _mf.get("title", ""), _mf.get("description", "") or _mf.get("prompt", "")
@@ -5028,12 +5032,42 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _memo_task.status = TaskStatus.FAILED
             raise
         _spawned_memo_ids.append(str(_memo_task.id))
+        if _deferred_memo_enroll:
+            _eq_detail = ((_mf.get("description") or "")[:1000]) or None
+            _memo_enrollment_queue.append(
+                (_mf_hash, _memo_topic, _eq_detail, _memo_dir_id)
+            )
     if _spawned_memo_ids:
         logger.info(
             "[RESEARCH] Spawned %d memo task(s) for dropped findings (task %s)",
             len(_spawned_memo_ids),
             task.id,
         )
+    if _memo_enrollment_queue:
+        try:
+            from app.evergreen_backlog import (  # noqa: PLC0415
+                enroll_backlog_item as _enroll_backlog_item,
+            )
+
+            await session.flush()
+            for _eq_hash, _eq_title, _eq_detail, _eq_dir_id in _memo_enrollment_queue:
+                await _enroll_backlog_item(
+                    session,
+                    project_id=task.project_id,
+                    finding_key=_eq_hash,
+                    title=_eq_title,
+                    detail=_eq_detail,
+                    direction_id=_eq_dir_id,
+                    provenance="deferred_memo",
+                )
+        except Exception:
+            logger.warning(
+                "[RESEARCH] deferred-memo evergreen enrollment failed"
+                " (task %s, count %d)",
+                task.id,
+                len(_memo_enrollment_queue),
+                exc_info=True,
+            )
 
     _deferral_reasons: list[str] = []
     if _low_actionability_deferred:

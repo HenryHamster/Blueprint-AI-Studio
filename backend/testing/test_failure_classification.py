@@ -10,6 +10,7 @@ from app.failure_classification import (
     AGENT_ERROR_REPORT_CONTEXT_KEY,
     AGENT_TIMEOUT,
     ALL_FAILURE_CLASSES,
+    APPROVED_CAP_PR_CLOSED,
     CODE_ERROR,
     EXTERNAL_API,
     VIEWPORT_REGRESSION,
@@ -183,6 +184,22 @@ class TestPersistFailureCategoryTimeoutSubtype:
         persist_failure_category(task, CODE_ERROR)
         assert task.context["failure_category"] == CODE_ERROR
         assert "timeout_subtype" not in task.context
+
+
+class TestApprovedCapPrClosedFailureClass:
+    def test_registered_budget_exempt_and_distinct_from_code_error(self):
+        from app.failure_classification import INFRA_CLASSES
+
+        assert APPROVED_CAP_PR_CLOSED == "APPROVED_CAP_PR_CLOSED"
+        assert APPROVED_CAP_PR_CLOSED in ALL_FAILURE_CLASSES
+        assert APPROVED_CAP_PR_CLOSED in INFRA_CLASSES
+        assert APPROVED_CAP_PR_CLOSED != CODE_ERROR
+
+    def test_classify_persisted_approved_cap_category(self):
+        task = _task(ctx={"failure_category": APPROVED_CAP_PR_CLOSED})
+
+        assert classify_failure(task) == APPROVED_CAP_PR_CLOSED
+        assert classify_failure_taxonomy(task) == TAXONOMY_INFRA_RELATED
 
 
 def _effort_timeout_task(subtype: str, *, effort: str = "medium") -> Task:

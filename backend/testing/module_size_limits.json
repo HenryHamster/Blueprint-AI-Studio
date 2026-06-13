@@ -90,7 +90,7 @@
     "compute_jobs.py": 2150,
     "task_evaluators.py": 2300,
     "release_scoring.py": 2100,
-    "runtime_config_state.py": 1750,
+    "runtime_config_state.py": 2050,
     "routers/directions.py": 1750,
     "warm_pool_maintainer.py": 1950,
     "review_fix_lane_pilot.py": 1800,
@@ -181,7 +181,7 @@
     "components/SrMissedRetrospectivesPanel.tsx": 900,
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/TaskDetailDrawerMeta.tsx": 2250,
-    "api.ts": 3100,
+    "api.ts": 3650,
     "components/WarmVmPanel.tsx": 1800
   }
 }

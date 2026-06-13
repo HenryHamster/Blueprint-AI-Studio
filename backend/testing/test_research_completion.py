@@ -12211,3 +12211,233 @@ class TestStampNoFindingsRefractory:
 
         direction = project.directions[0]
         assert direction["consecutive_unproductive_cycles"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Deferred-memo enrollment: flag-off no-op, flag-on creates row, dedup.
+# --------------------------------------------------------------------------- #
+
+
+@_pytest.mark.asyncio
+async def test_deferred_memo_enrollment_flag_off_no_op(db_session, mocker):
+    """flag=False: a LOW-actionability dropped finding spawns a memo task but
+    does NOT enroll any EvergreenBacklogItem row."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    import app.research_completion as _rc
+    from app.models import EvergreenBacklogItem
+    from sqlmodel import select as _sel
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-ev-flag-off01"
+    )
+    finding = _make_finding("Low-actionability finding", direction_id=direction["id"])
+    finding["actionability_grade"] = "LOW"
+    finding["finding_hash"] = "ev-flag-off-hash-001"
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+    mocker.patch(
+        "app.research_completion.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.research_completion.resolve_head_commit",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.research_completion.cited_paths_changed_since",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.research_completion._has_validation_backend", return_value=False
+    )
+    mocker.patch(
+        "app.research_completion._summarize_ungrounded_claims_grounded",
+        new=AsyncMock(return_value=None),
+    )
+
+    _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = False
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = False
+
+    rows = (
+        (
+            await db_session.execute(
+                _sel(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == _project.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == [], "flag=False: no backlog items should be enrolled"
+
+
+@_pytest.mark.asyncio
+async def test_deferred_memo_enrollment_flag_on_enrolls(db_session, mocker):
+    """flag=True: a LOW-actionability dropped finding enrolls one EvergreenBacklogItem
+    with provenance='deferred_memo', correct finding_key, title, and direction_id."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    import app.research_completion as _rc
+    from app.models import EvergreenBacklogItem
+    from sqlmodel import select as _sel
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-ev-flag-on01"
+    )
+    finding = _make_finding(
+        "Fix: contain eligibility-pipeline crashes", direction_id=direction["id"]
+    )
+    finding["actionability_grade"] = "LOW"
+    finding["finding_hash"] = "ev-flag-on-hash-001"
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+    mocker.patch(
+        "app.research_completion.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.research_completion.resolve_head_commit",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.research_completion.cited_paths_changed_since",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.research_completion._has_validation_backend", return_value=False
+    )
+    mocker.patch(
+        "app.research_completion._summarize_ungrounded_claims_grounded",
+        new=AsyncMock(return_value=None),
+    )
+
+    _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = True
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = False
+
+    rows = (
+        (
+            await db_session.execute(
+                _sel(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == _project.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1, "flag=True: exactly one backlog item enrolled"
+    item = rows[0]
+    assert item.provenance == "deferred_memo"
+    assert item.finding_key == "ev-flag-on-hash-001"
+    assert item.status == "enrolled"
+    assert item.direction_id == direction["id"]
+    assert "eligibility" in item.title.lower() or "Fix" in item.title
+
+
+@_pytest.mark.asyncio
+async def test_deferred_memo_enrollment_dedup_on_repeat_drop(db_session, mocker):
+    """A second research cycle that drops the same finding hash with the flag on
+    re-enrolls (dedup) and leaves exactly one EvergreenBacklogItem row."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    import app.research_completion as _rc
+    from app.models import EvergreenBacklogItem
+    from app.evergreen_backlog import enroll_backlog_item
+    from sqlmodel import select as _sel
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-ev-dedup01"
+    )
+    finding = _make_finding("Dedup dropped finding", direction_id=direction["id"])
+    finding["actionability_grade"] = "LOW"
+    finding["finding_hash"] = "ev-dedup-hash-001"
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+    mocker.patch(
+        "app.research_completion.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.research_completion.resolve_head_commit",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.research_completion.cited_paths_changed_since",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.research_completion._has_validation_backend", return_value=False
+    )
+    mocker.patch(
+        "app.research_completion._summarize_ungrounded_claims_grounded",
+        new=AsyncMock(return_value=None),
+    )
+
+    _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = True
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        _rc._runtime_config["evergreen_fill_deferred_memo_enrollment"] = False
+
+    rows_first = (
+        (
+            await db_session.execute(
+                _sel(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == _project.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows_first) == 1
+
+    # Simulate a repeat drop (same finding_key, same project).
+    dup = await enroll_backlog_item(
+        db_session,
+        project_id=_project.id,
+        finding_key="ev-dedup-hash-001",
+        title="Duplicate drop attempt",
+        provenance="deferred_memo",
+    )
+    assert dup is not None
+    assert dup.id == rows_first[0].id, "second enroll returns the existing row"
+
+    rows_after = (
+        (
+            await db_session.execute(
+                _sel(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == _project.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows_after) == 1, "dedup: still exactly one row after second drop"

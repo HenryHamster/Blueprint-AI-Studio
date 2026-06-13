@@ -499,7 +499,11 @@ async def _resolve_quality_grader_completion(
     if not pending_application and (
         verdict_key in ctx
         or (
-            ("awaiting_adversarial_grader" if is_adversarial else "awaiting_quality_grader")
+            (
+                "awaiting_adversarial_grader"
+                if is_adversarial
+                else "awaiting_quality_grader"
+            )
             not in ctx
         )
     ):
@@ -546,7 +550,9 @@ async def _resolve_quality_grader_completion(
                     source_sha = source_sha or pool_vm.agent_source_sha
                     runtime_fp = runtime_fp or pool_vm.agent_runtime_fingerprint
                     if pool_vm.agent_image_name:
-                        gate_record["grader_agent_image_name"] = pool_vm.agent_image_name
+                        gate_record["grader_agent_image_name"] = (
+                            pool_vm.agent_image_name
+                        )
                     if pool_vm.agent_image_build_ts is not None:
                         gate_record["grader_agent_image_build_ts"] = (
                             pool_vm.agent_image_build_ts
@@ -621,7 +627,9 @@ async def _resolve_quality_grader_completion(
             "unresolved_count": len(finding_verdicts) - _diag_explicit,
             "vm_image_name": gate_record.get("grader_agent_image_name"),
             "vm_image_build_ts": gate_record.get("grader_agent_image_build_ts"),
-            "vm_runtime_fingerprint": gate_record.get("grader_agent_runtime_fingerprint"),
+            "vm_runtime_fingerprint": gate_record.get(
+                "grader_agent_runtime_fingerprint"
+            ),
             "vm_source_sha": gate_record.get("grader_agent_source_sha"),
         }
         gate_record["cause"] = _grader_cause
@@ -854,9 +862,7 @@ async def _resolve_safeguard_challenge_completion(
     if not pending_application:
         completed = payload.status == TaskStatus.COMPLETED
         challenge_logs = payload.logs or challenge.latest_status_message or ""
-        verdict = parse_safeguard_challenge_outcome(
-            challenge_logs, completed=completed
-        )
+        verdict = parse_safeguard_challenge_outcome(challenge_logs, completed=completed)
         challenge.latest_status_message = (
             f"Safeguard challenge: {verdict['outcome']} — {verdict['reasoning']}"
         )[:500]
@@ -882,7 +888,9 @@ async def _resolve_safeguard_challenge_completion(
 
     # Re-read findings from the stored plan_output and re-invoke the gate function.
     _plan_output = safeguard.plan_output
-    if isinstance(_plan_output, dict) and isinstance(_plan_output.get("findings"), list):
+    if isinstance(_plan_output, dict) and isinstance(
+        _plan_output.get("findings"), list
+    ):
         findings = _plan_output["findings"]
     elif isinstance(_plan_output, list):
         findings = _plan_output
@@ -891,9 +899,7 @@ async def _resolve_safeguard_challenge_completion(
 
     await _maybe_release_safeguard_gate(safeguard, findings, session)
     await session.refresh(safeguard)
-    _clear_sidecar_application_pending(
-        safeguard, lane=lane, sidecar_id=challenge.id
-    )
+    _clear_sidecar_application_pending(safeguard, lane=lane, sidecar_id=challenge.id)
     session.add(safeguard)
     await session.commit()
 
@@ -981,8 +987,7 @@ async def _resolve_review_second_opinion(
 
     if pending_application:
         record = dict(
-            (review.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
-            or {}
+            (review.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY) or {}
         )
         panel = {"pending_replay": True} if record else None
     else:
@@ -1073,8 +1078,7 @@ async def _resolve_review_second_opinion(
         review.status = TaskStatus.COMPLETED
         session.add(review)
         challenger.latest_status_message = (
-            f"Second-opinion panel: {record['state']} "
-            f"→ {record['reconciled_verdict']}"
+            f"Second-opinion panel: {record['state']} → {record['reconciled_verdict']}"
         )[:500]
         session.add(challenger)
         await session.commit()
@@ -1115,9 +1119,7 @@ async def _resolve_review_second_opinion(
     ctx = dict(review.context or {})
     ctx.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
     review.context = ctx
-    _clear_sidecar_application_pending(
-        review, lane=lane, sidecar_id=challenger.id
-    )
+    _clear_sidecar_application_pending(review, lane=lane, sidecar_id=challenger.id)
     session.add(review)
     await session.commit()
 
@@ -1239,9 +1241,7 @@ async def _resolve_finding_challenge_completion(
             resume_logs = source.latest_status_message or ""
         await handler(source, resume_logs, session)
         await session.refresh(source)
-        _clear_sidecar_application_pending(
-            source, lane=lane, sidecar_id=challenge.id
-        )
+        _clear_sidecar_application_pending(source, lane=lane, sidecar_id=challenge.id)
         session.add(source)
     else:
         logger.warning(
@@ -2234,9 +2234,7 @@ async def _process_post_commit(
                                         event_driven_unblock_dependents,
                                     )
 
-                                    await event_driven_unblock_dependents(
-                                        task, session
-                                    )
+                                    await event_driven_unblock_dependents(task, session)
                                 except Exception:
                                     logger.exception(
                                         "[PIPELINE] event_driven_unblock_dependents "
@@ -2745,9 +2743,7 @@ async def _process_post_commit(
                             review_was_parallelized = bool(
                                 vj.get("review_was_parallelized", False)
                             )
-                            reviewed_head_sha = str(
-                                vj.get("reviewed_head_sha") or ""
-                            )
+                            reviewed_head_sha = str(vj.get("reviewed_head_sha") or "")
                             verdict_parsed = True
                             logger.info(
                                 f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}"
@@ -2906,9 +2902,7 @@ async def _process_post_commit(
                         verdict = "APPROVE"
                         task.context = {**(task.context or {}), **_markers}
                         session.add(task)
-                        feedback = (
-                            f"{_vd_note}\n\n{feedback}" if feedback else _vd_note
-                        )
+                        feedback = f"{_vd_note}\n\n{feedback}" if feedback else _vd_note
 
                 # If verdict was unparseable, flag the original task for manual review
                 if verdict_unparseable:
@@ -3009,9 +3003,7 @@ async def _process_post_commit(
                             _shared_state.get_project_integration_branch(
                                 _review_project
                             ),
-                            _shared_state.get_project_promotion_target(
-                                _review_project
-                            ),
+                            _shared_state.get_project_promotion_target(_review_project),
                         ),
                     ):
                         _challenger = await spawn_review_second_opinion(
@@ -3040,9 +3032,7 @@ async def _process_post_commit(
                             return {"status": "accepted"}
                         # spawn refused: a challenge is already in flight. Stay
                         # parked rather than act on the unreconciled verdict.
-                        if (task.context or {}).get(
-                            "awaiting_review_second_opinion"
-                        ):
+                        if (task.context or {}).get("awaiting_review_second_opinion"):
                             return {"status": "accepted"}
                     else:
                         # Gate on but verdict not high-stakes — proceed
@@ -4813,7 +4803,9 @@ async def _process_post_commit(
                     # as current-head (no action).
                     if reviewed_head_sha and head_sha and reviewed_head_sha != head_sha:
                         _stale_discard_count = int(
-                            (task.context or {}).get("stale_head_consecutive_discards", 0)
+                            (task.context or {}).get(
+                                "stale_head_consecutive_discards", 0
+                            )
                         )
                         if _stale_discard_count < 2:
                             # Discard: mark this review as stale, respawn fresh review.
@@ -4824,7 +4816,8 @@ async def _process_post_commit(
                             # inherit the running count and eventually accept on the 2nd hit.
                             task.context = {
                                 **(task.context or {}),
-                                "stale_head_consecutive_discards": _stale_discard_count + 1,
+                                "stale_head_consecutive_discards": _stale_discard_count
+                                + 1,
                                 "_review_stale_head": True,
                             }
                             flag_modified(task, "context")
@@ -6243,14 +6236,12 @@ async def park_task(
         existing_reg = (
             (
                 await session.execute(
-                    select(TaskWakeRegistration)
-                    .where(
+                    select(TaskWakeRegistration).where(
                         TaskWakeRegistration.task_id == task.id,
                         TaskWakeRegistration.wake_source_kind
                         == str(wake_source_kind)[:64],
-                        TaskWakeRegistration.wake_source_ref == (
-                            str(wake_source_ref)[:255] if wake_source_ref else None
-                        ),
+                        TaskWakeRegistration.wake_source_ref
+                        == (str(wake_source_ref)[:255] if wake_source_ref else None),
                         TaskWakeRegistration.delivery_state.in_(
                             [WakeDeliveryState.PENDING, WakeDeliveryState.FIRED]
                         ),
@@ -6293,6 +6284,31 @@ async def park_task(
     task.parked_at = now
     task.park_reason = (reason or f"waiting on {wake_source_kind}")[:2000]
     task.vm_stopped_at = now
+
+    # Retire any LEASED pool member before clearing vm_instance_id. Once the
+    # linkage is gone, the terminal-completion path (_release_pool_member_if_terminal)
+    # can't find the member and it stays LEASED forever, silently exhausting pool
+    # capacity. Best-effort: a pool failure must never block the park itself.
+    _park_pool_vm_id = task.vm_instance_id
+    if _park_pool_vm_id:
+        try:
+            from app.models import PoolVmState  # noqa: PLC0415
+            from app.warm_pool import (  # noqa: PLC0415
+                is_warm_pool_enabled,
+                mark_pool_vm_retiring,
+            )
+
+            if is_warm_pool_enabled():
+                await mark_pool_vm_retiring(
+                    session, _park_pool_vm_id, source_states=(PoolVmState.LEASED,)
+                )
+        except Exception:
+            logger.exception(
+                "[PARK] pool-member retire failed for task %s vm=%s",
+                task.id,
+                _park_pool_vm_id,
+            )
+
     task.vm_instance_id = None
 
     reg = TaskWakeRegistration(
@@ -6621,8 +6637,12 @@ async def expire_wake(session, registration: TaskWakeRegistration, *, now=None) 
                 ),
                 "deadline_at": deadline_at.isoformat() if deadline_at else None,
                 "job_status": job_status,
-                "job_created_at": job_created_at.isoformat() if job_created_at else None,
-                "job_started_at": job_started_at.isoformat() if job_started_at else None,
+                "job_created_at": job_created_at.isoformat()
+                if job_created_at
+                else None,
+                "job_started_at": job_started_at.isoformat()
+                if job_started_at
+                else None,
                 "job_completed_at": (
                     job_completed_at.isoformat() if job_completed_at else None
                 ),

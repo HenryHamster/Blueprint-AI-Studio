@@ -4828,6 +4828,7 @@ class TestFailureClassificationInvariants:
         from app.failure_classification import (
             AGENT_STALLED,
             AGENT_TIMEOUT,
+            APPROVED_CAP_PR_CLOSED,
             BLOCKED_PRECONDITION,
             BRANCH_GONE,
             DEAD_AUTH,
@@ -4864,6 +4865,9 @@ class TestFailureClassificationInvariants:
                 # Dead OAuth/API session: permanent provider-infra failure,
                 # auto-disables account fleet-wide. Not a code defect.
                 DEAD_AUTH,
+                # Approved PR closed by cap burn — not a code defect, so it
+                # must not penalize direction health or consume retry budget.
+                APPROVED_CAP_PR_CLOSED,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "

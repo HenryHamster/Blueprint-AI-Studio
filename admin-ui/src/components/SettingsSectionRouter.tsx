@@ -338,6 +338,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           anyAutonomousEnabled={props.anyAutonomousEnabled}
           onPauseAllAutonomous={props.onPauseAllAutonomous}
           onRestartOrchestrator={props.onRestartOrchestrator}
+          selectedProjectId={props.selectedProjectId}
         />
       );
     case 'deploy':

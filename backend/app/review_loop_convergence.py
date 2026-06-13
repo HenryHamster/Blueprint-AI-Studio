@@ -422,7 +422,11 @@ async def _handle_cap_exhaustion(
     ``scope`` is either "global" (cross-chain) or "per-chain" — used only for
     human-readable messages.
     """
-    from app.failure_classification import CODE_ERROR, persist_failure_category
+    from app.failure_classification import (
+        APPROVED_CAP_PR_CLOSED,
+        CODE_ERROR,
+        persist_failure_category,
+    )
     from app.alert_dispatch import _maybe_create_failure_alert
     from app.github import close_pull_request, create_pr_comment
     from app.routers.agent import get_github_token_for_task
@@ -473,11 +477,11 @@ async def _handle_cap_exhaustion(
 
     # FIX D: if the cap was exhausted on an already-APPROVED PR (benign merge-
     # mechanics churn after sign-off, not an unresolved review rejection), land
-    # CANCELLED with failure_detail='cap_exhausted_after_approve' and do NOT
-    # record CODE_ERROR — that would falsely ding the account/direction for a
-    # non-failure. GUARDRAIL: _cap_exhausted_after_approve returns False on any
-    # outstanding CHANGES_REQUESTED, preserving today's FAILED + CODE_ERROR path
-    # for genuine non-convergence.
+    # CANCELLED with failure_detail='cap_exhausted_after_approve' and record the
+    # distinct APPROVED_CAP_PR_CLOSED outcome instead of CODE_ERROR. GUARDRAIL:
+    # _cap_exhausted_after_approve returns False on any outstanding
+    # CHANGES_REQUESTED, preserving today's FAILED + CODE_ERROR path for genuine
+    # non-convergence.
     if await _cap_exhausted_after_approve(
         orig, source_task, resolved_original_id, pr_number, session
     ):
@@ -486,13 +490,15 @@ async def _handle_cap_exhaustion(
         logger.info(
             f"[PIPELINE] Cap reached for PR #{pr_number} AFTER approval — landing "
             f"orig {resolved_original_id[:8]} CANCELLED (cap_exhausted_after_approve), "
-            f"no CODE_ERROR recorded"
+            f"recording {APPROVED_CAP_PR_CLOSED}"
         )
         orig.status = TaskStatus.CANCELLED
         orig.latest_status_message = (
             f"Review-fix cap reached ({iterations} iterations, {cap_label}) after "
-            f"approval — PR #{pr_number} auto-closed (no rejection)"
+            f"approval — PR #{pr_number} auto-closed because merge mechanics exhausted "
+            f"the cap (no rejection)"
         )
+        persist_failure_category(orig, APPROVED_CAP_PR_CLOSED)
         ctx = dict(orig.context or {})
         ctx["failure_detail"] = "cap_exhausted_after_approve"
         ctx["review_cap_iterations"] = iterations
@@ -510,9 +516,22 @@ async def _handle_cap_exhaustion(
             )
             return
         # Best-effort: still close the GitHub PR and record the terminal
-        # outcome for direction state, but as a SUCCESS-shaped (non-failure)
-        # signal — skip record_task_result/record_direction_result failure dings
-        # and the failure alert.
+        # outcome as a distinct, budget-exempt failure class so analytics and
+        # digests can list approved PR closures without CODE_ERROR/PR_REJECTED.
+        record_task_result(
+            success=False,
+            failure_class=APPROVED_CAP_PR_CLOSED,
+            task_id=str(orig.id),
+            task_type=(orig.first_payload or {}).get("type", ""),
+        )
+        _direction_id = str((orig.context or {}).get("direction_id") or "")
+        if _direction_id:
+            record_direction_result(
+                _direction_id,
+                success=False,
+                failure_class=APPROVED_CAP_PR_CLOSED,
+                project_id=str(orig.project_id) if orig.project_id else "",
+            )
         try:
             from app.task_completion import _record_remediation_if_terminal
 
@@ -533,7 +552,8 @@ async def _handle_cap_exhaustion(
                     pr_number,
                     f"Auto-closed: review-fix cap reached ({iterations} iterations, "
                     f"{cap_label}) after approval — no outstanding changes requested. "
-                    f"Work was signed off; closing as superseded.",
+                    f"Work was signed off, but merge mechanics exhausted the cap; "
+                    f"closing as superseded.",
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
@@ -786,4 +806,181 @@ async def _handle_cap_exhaustion(
     except Exception as e:  # noqa: BLE001
         logger.warning(
             f"[PIPELINE] Cap-exhaustion: failed to create alert for PR #{pr_number}: {e}"
+        )
+
+
+async def _handle_persistent_conflict_escalation(
+    source_task: Task,
+    resolved_original_id: str,
+    pr_number: int,
+    iterations: int,
+    conflict_lane_count: int,
+    session: AsyncSession,
+) -> None:
+    """Terminal handler for PRs with a persistent, unresolvable merge conflict.
+
+    Called when the conflict-fix lane count reaches
+    PERSISTENT_CONFLICT_ESCALATION_THRESHOLD consecutive attempts without
+    resolving the conflict. Closes the PR, marks the orig FAILED with
+    failure_detail="persistent_merge_conflict", and posts an explicit
+    conflict-named PR comment and alert so operators can distinguish this
+    from generic review non-convergence.
+
+    Fires BEFORE the lane sub-cap check so the loop stops at iteration 3
+    (threshold=2 prior completions) rather than grinding to LANE_CAP_CONFLICT=4
+    or the global cap (~16).
+    """
+    from app.failure_classification import CODE_ERROR, persist_failure_category
+    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.github import close_pull_request, create_pr_comment
+    from app.routers.agent import get_github_token_for_task
+    from app.routers.agent_status import record_task_result
+    from app.shared_state import record_direction_result
+
+    source_task.latest_status_message = (
+        f"Persistent merge conflict on PR #{pr_number} — "
+        f"{conflict_lane_count} conflict-fix attempts failed to resolve it; "
+        f"escalating for manual intervention"
+    )
+    session.add(source_task)
+
+    try:
+        orig = await session.get(Task, uuid.UUID(resolved_original_id))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Persistent-conflict: failed to load orig "
+            f"{resolved_original_id[:8]}: {e}"
+        )
+        return
+    if orig is None:
+        logger.warning(
+            f"[PIPELINE] Persistent-conflict: orig {resolved_original_id[:8]} not found"
+        )
+        return
+
+    already_handled = orig.status in (
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ) and (orig.context or {}).get("failure_detail") in (
+        "persistent_merge_conflict",
+        "review_cap_exhausted",
+        "cap_exhausted_after_approve",
+        "review_cap_preserved_for_handmerge",
+    )
+    if already_handled:
+        logger.info(
+            f"[PIPELINE] Persistent-conflict re-triggered for PR #{pr_number} — "
+            f"orig {resolved_original_id[:8]} already terminal, skipping"
+        )
+        await session.commit()
+        return
+
+    orig.status = TaskStatus.FAILED
+    if _runtime_config.get("require_approval_gates", True):
+        orig.requires_approval = True
+    orig.latest_status_message = (
+        f"Merge conflict on PR #{pr_number} persisted after {conflict_lane_count} "
+        f"fix attempts — auto-closed, manual conflict resolution required"
+    )
+    persist_failure_category(orig, CODE_ERROR)
+    ctx = dict(orig.context or {})
+    ctx["failure_detail"] = "persistent_merge_conflict"
+    ctx["review_cap_iterations"] = iterations
+    ctx["pr_rejected"] = True
+    ctx["pr_rejection_note"] = (
+        f"Auto-closed by Blueprint: merge conflict persisted after "
+        f"{conflict_lane_count} fix attempts"
+    )
+    orig.context = ctx
+    _set_review_loop_terminal_outcome(
+        orig,
+        kind="persistent_conflict",
+        reason="persistent_merge_conflict",
+        pr_number=pr_number,
+        iterations=iterations,
+        detail=f"conflict_lane_count={conflict_lane_count}",
+    )
+    session.add(orig)
+    try:
+        await session.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Persistent-conflict: failed to commit orig "
+            f"{resolved_original_id[:8]}: {e}",
+            exc_info=True,
+        )
+        return
+
+    record_task_result(
+        success=False,
+        failure_class=CODE_ERROR,
+        task_id=str(orig.id),
+        task_type=(orig.first_payload or {}).get("type", ""),
+    )
+    _direction_id = str((orig.context or {}).get("direction_id") or "")
+    if _direction_id:
+        record_direction_result(
+            _direction_id,
+            success=False,
+            failure_class=CODE_ERROR,
+            project_id=str(orig.project_id) if orig.project_id else "",
+        )
+
+    try:
+        from app.task_completion import _record_remediation_if_terminal
+
+        await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
+        await session.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Persistent-conflict: failed to record remediation for "
+            f"PR #{pr_number}: {e}"
+        )
+
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+        try:
+            await create_pr_comment(
+                gh_token,
+                owner,
+                repo,
+                pr_number,
+                f"Auto-closed: merge conflict on this PR persisted after "
+                f"{conflict_lane_count} automated fix attempts. "
+                f"Manual conflict resolution required before this work can land.",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Persistent-conflict: comment failed on PR #{pr_number}: {e}"
+            )
+        closed = await close_pull_request(
+            gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
+        )
+        if closed:
+            logger.info(
+                f"[PIPELINE] Closed PR #{pr_number} after persistent merge conflict "
+                f"({conflict_lane_count} conflict-fix attempts)"
+            )
+        else:
+            logger.warning(
+                f"[PIPELINE] close_pull_request returned False for PR #{pr_number} "
+                f"(persistent conflict)"
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Persistent-conflict: failed to close PR #{pr_number}: {e}",
+            exc_info=True,
+        )
+
+    try:
+        await _maybe_create_failure_alert(
+            orig,
+            session,
+            f"PR #{pr_number} has a persistent merge conflict ({conflict_lane_count} "
+            f"fix attempts failed) — auto-closed, manual resolution required",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Persistent-conflict: failed to create alert for PR "
+            f"#{pr_number}: {e}"
         )

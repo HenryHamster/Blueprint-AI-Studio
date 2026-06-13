@@ -3036,3 +3036,113 @@ export async function fetchLaneDiag(
   if (!res.ok) throw new Error(`Failed to fetch lane diagnostics: ${res.status}`);
   return res.json();
 }
+
+// --- Evergreen fill observability + backlog ----------------------------------
+
+export interface EvergreenFillDecisionRecord {
+  action: string;
+  reason: string;
+  trigger: string | null;
+  project_id: string | null;
+}
+
+export interface EvergreenFillObservabilityResponse {
+  created_count: number;
+  reason_counts: Record<string, number>;
+  trigger_counts: Record<string, number>;
+  recent: EvergreenFillDecisionRecord[];
+}
+
+export interface EvergreenBacklogItem {
+  id: string;
+  project_id: string;
+  finding_key: string;
+  title: string;
+  detail: string | null;
+  status: string;
+  outcome: string | null;
+  provenance: string;
+  direction_id: string | null;
+  attempts: number;
+  spawned_task_id: string | null;
+  verified_against_sha: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface EvergreenBacklogResponse {
+  items: EvergreenBacklogItem[];
+}
+
+export type EvergreenBacklogSummaryResponse = Record<string, number>;
+
+interface EvergreenBacklogSummaryEnvelope {
+  project_id: string;
+  counts: EvergreenBacklogSummaryResponse;
+}
+
+export interface EvergreenFillSettings {
+  evergreen_fill_mode: string;
+  evergreen_fill_interval_minutes: number;
+  evergreen_fill_util_threshold: number;
+  evergreen_fill_min_free_slots: number;
+  evergreen_fill_max_active: number;
+  evergreen_fill_daily_cap: number;
+  evergreen_fill_deferred_memo_enrollment: boolean;
+}
+
+export async function fetchEvergreenFillObservability(
+  signal?: AbortSignal,
+): Promise<EvergreenFillObservabilityResponse> {
+  const res = await apiFetch('/api/admin/evergreen/fill-observability', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch evergreen fill observability: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEvergreenBacklog(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<EvergreenBacklogResponse> {
+  const params = new URLSearchParams({ project_id: projectId });
+  const res = await apiFetch(`/api/admin/evergreen/backlog?${params}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch evergreen backlog: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEvergreenBacklogSummary(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<EvergreenBacklogSummaryResponse> {
+  const params = new URLSearchParams({ project_id: projectId });
+  const res = await apiFetch(`/api/admin/evergreen/backlog-summary?${params}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch evergreen backlog summary: ${res.status}`);
+  const data = await res.json() as EvergreenBacklogSummaryEnvelope;
+  return data.counts ?? {};
+}
+
+export async function fetchEvergreenFillSettings(signal?: AbortSignal): Promise<EvergreenFillSettings> {
+  const res = await apiFetch('/api/admin/settings', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch settings: ${res.status}`);
+  const data = await res.json();
+  return {
+    evergreen_fill_mode: data?.evergreen_fill_mode ?? 'off',
+    evergreen_fill_interval_minutes: data?.evergreen_fill_interval_minutes ?? 15,
+    evergreen_fill_util_threshold: data?.evergreen_fill_util_threshold ?? 0.5,
+    evergreen_fill_min_free_slots: data?.evergreen_fill_min_free_slots ?? 2,
+    evergreen_fill_max_active: data?.evergreen_fill_max_active ?? 1,
+    evergreen_fill_daily_cap: data?.evergreen_fill_daily_cap ?? 3,
+    evergreen_fill_deferred_memo_enrollment: data?.evergreen_fill_deferred_memo_enrollment ?? false,
+  };
+}
+
+export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSettings>): Promise<void> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update evergreen fill settings: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update evergreen fill settings: ${res.status}`);
+  }
+}

@@ -1515,6 +1515,28 @@ async def update_agent_status(
                         ),
                     )
                     task.vm_stopped_at = _utcnow()
+                    # Retire any LEASED pool member before the commit. enter_blocked_state
+                    # does not clear vm_instance_id, so the linkage is still intact here.
+                    # The terminal-completion path never fires for BLOCKED tasks, so this
+                    # is the last chance to release the member before it leaks permanently.
+                    try:
+                        from app.models import PoolVmState  # noqa: PLC0415
+                        from app.warm_pool import (  # noqa: PLC0415
+                            is_warm_pool_enabled,
+                            mark_pool_vm_retiring,
+                        )
+
+                        if task.vm_instance_id and is_warm_pool_enabled():
+                            await mark_pool_vm_retiring(
+                                session,
+                                task.vm_instance_id,
+                                source_states=(PoolVmState.LEASED,),
+                            )
+                    except Exception:
+                        logger.warning(
+                            "[AGENT STATUS] pool-member retire failed for BLOCKED task %s",
+                            task.id,
+                        )
                     session.add(task)
                     await session.commit()
                     # Surface one deduplicated, operator-visible precondition

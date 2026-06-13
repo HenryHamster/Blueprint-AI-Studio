@@ -1,6 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Loader2, RotateCcw } from 'lucide-react';
 import { useTaskCapabilities } from '../taskCapabilities';
+import {
+  fetchEvergreenFillSettings,
+  patchEvergreenFillSettings,
+  type EvergreenFillSettings,
+} from '../api';
+import { EvergreenFillObservabilityPanel } from './EvergreenFillObservabilityPanel';
+import { EvergreenBacklogPanel } from './EvergreenBacklogPanel';
 
 interface SettingsOrchestratorSectionProps {
   maxConcurrentVMs: number;
@@ -40,6 +47,7 @@ interface SettingsOrchestratorSectionProps {
   anyAutonomousEnabled: boolean;
   onPauseAllAutonomous: () => Promise<void>;
   onRestartOrchestrator: () => Promise<void>;
+  selectedProjectId?: string | null;
 }
 
 function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
@@ -92,6 +100,7 @@ export function SettingsOrchestratorSection({
   anyAutonomousEnabled,
   onPauseAllAutonomous,
   onRestartOrchestrator,
+  selectedProjectId = null,
 }: SettingsOrchestratorSectionProps) {
   // Reservable task types derive from the published capability contract so a
   // newly registered reservable type gets a control here automatically.
@@ -109,6 +118,63 @@ export function SettingsOrchestratorSection({
   const [ciBackstopInputVal, setCiBackstopInputVal] = useState(String(ciBackstopTimeoutMinutes));
   const [restarting, setRestarting] = useState(false);
   const [restartStatus, setRestartStatus] = useState<'idle' | 'success' | 'error'>('idle');
+
+  // Evergreen fill settings — fetched directly and patched on change.
+  const [fillSettings, setFillSettings] = useState<EvergreenFillSettings>({
+    evergreen_fill_mode: 'off',
+    evergreen_fill_interval_minutes: 15,
+    evergreen_fill_util_threshold: 0.5,
+    evergreen_fill_min_free_slots: 2,
+    evergreen_fill_max_active: 1,
+    evergreen_fill_daily_cap: 3,
+    evergreen_fill_deferred_memo_enrollment: false,
+  });
+  const [fillIntervalInput, setFillIntervalInput] = useState('15');
+  const [fillUtilInput, setFillUtilInput] = useState('0.5');
+  const [fillMinSlotsInput, setFillMinSlotsInput] = useState('2');
+  const [fillMaxActiveInput, setFillMaxActiveInput] = useState('1');
+  const [fillDailyCapInput, setFillDailyCapInput] = useState('3');
+
+  const loadFillSettings = useCallback(async () => {
+    try {
+      const s = await fetchEvergreenFillSettings();
+      setFillSettings(s);
+      setFillIntervalInput(String(s.evergreen_fill_interval_minutes));
+      setFillUtilInput(String(s.evergreen_fill_util_threshold));
+      setFillMinSlotsInput(String(s.evergreen_fill_min_free_slots));
+      setFillMaxActiveInput(String(s.evergreen_fill_max_active));
+      setFillDailyCapInput(String(s.evergreen_fill_daily_cap));
+    } catch {
+      // silently ignore — defaults remain
+    }
+  }, []);
+
+  useEffect(() => { void loadFillSettings(); }, [loadFillSettings]);
+
+  const patchFill = useCallback(async (patch: Partial<EvergreenFillSettings>) => {
+    try {
+      await patchEvergreenFillSettings(patch);
+      setFillSettings(s => ({ ...s, ...patch }));
+    } catch {
+      void loadFillSettings();
+    }
+  }, [loadFillSettings]);
+
+  const commitFillNumber = useCallback((
+    key: keyof EvergreenFillSettings,
+    raw: string,
+    min: number,
+    max: number,
+    fallback: number,
+    setter: (v: string) => void,
+  ) => {
+    const n = parseFloat(raw);
+    if (!isNaN(n) && n >= min && n <= max) {
+      void patchFill({ [key]: n });
+    } else {
+      setter(String(fallback));
+    }
+  }, [patchFill]);
 
   useEffect(() => { setVmInputVal(String(maxConcurrentVMs)); }, [maxConcurrentVMs]);
   useEffect(() => { setRetriesInputVal(String(maxRetries)); }, [maxRetries]);
@@ -390,6 +456,125 @@ export function SettingsOrchestratorSection({
           Pause All Autonomous
         </button>
       </div>
+
+      {/* Evergreen Fill */}
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Evergreen Fill</h3>
+        <p className="text-xs text-neutral-500 mb-3">
+          Automatically spawn backlog tasks when utilization is low. Use <em>observe</em> to see what would be created before enabling.
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="md:col-span-2 lg:col-span-3">
+            <label className="block text-xs font-medium text-neutral-400 mb-1.5">Mode</label>
+            <div className="flex gap-1 bg-neutral-950 border border-neutral-700 rounded-lg p-1 w-fit">
+              {(['off', 'observe', 'enforce'] as const).map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => void patchFill({ evergreen_fill_mode: mode })}
+                  className={`px-3 py-1.5 text-xs rounded-md transition-colors capitalize ${
+                    fillSettings.evergreen_fill_mode === mode
+                      ? 'bg-neutral-700 text-neutral-100'
+                      : 'text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  {mode}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label htmlFor="fill-interval" className="block text-xs font-medium text-neutral-400 mb-1.5">Interval (1-1440 min)</label>
+            <input
+              id="fill-interval"
+              type="number"
+              min={1}
+              max={1440}
+              value={fillIntervalInput}
+              onChange={e => setFillIntervalInput(e.target.value)}
+              onBlur={() => commitFillNumber('evergreen_fill_interval_minutes', fillIntervalInput, 1, 1440, fillSettings.evergreen_fill_interval_minutes, setFillIntervalInput)}
+              onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_interval_minutes', fillIntervalInput, 1, 1440, fillSettings.evergreen_fill_interval_minutes, setFillIntervalInput); }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label htmlFor="fill-util-threshold" className="block text-xs font-medium text-neutral-400 mb-1.5">Util Threshold (0–1)</label>
+            <input
+              id="fill-util-threshold"
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={fillUtilInput}
+              onChange={e => setFillUtilInput(e.target.value)}
+              onBlur={() => commitFillNumber('evergreen_fill_util_threshold', fillUtilInput, 0, 1, fillSettings.evergreen_fill_util_threshold, setFillUtilInput)}
+              onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_util_threshold', fillUtilInput, 0, 1, fillSettings.evergreen_fill_util_threshold, setFillUtilInput); }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label htmlFor="fill-min-slots" className="block text-xs font-medium text-neutral-400 mb-1.5">Min Free Slots (0–100)</label>
+            <input
+              id="fill-min-slots"
+              type="number"
+              min={0}
+              max={100}
+              value={fillMinSlotsInput}
+              onChange={e => setFillMinSlotsInput(e.target.value)}
+              onBlur={() => commitFillNumber('evergreen_fill_min_free_slots', fillMinSlotsInput, 0, 100, fillSettings.evergreen_fill_min_free_slots, setFillMinSlotsInput)}
+              onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_min_free_slots', fillMinSlotsInput, 0, 100, fillSettings.evergreen_fill_min_free_slots, setFillMinSlotsInput); }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label htmlFor="fill-max-active" className="block text-xs font-medium text-neutral-400 mb-1.5">Max Active (0–50)</label>
+            <input
+              id="fill-max-active"
+              type="number"
+              min={0}
+              max={50}
+              value={fillMaxActiveInput}
+              onChange={e => setFillMaxActiveInput(e.target.value)}
+              onBlur={() => commitFillNumber('evergreen_fill_max_active', fillMaxActiveInput, 0, 50, fillSettings.evergreen_fill_max_active, setFillMaxActiveInput)}
+              onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_max_active', fillMaxActiveInput, 0, 50, fillSettings.evergreen_fill_max_active, setFillMaxActiveInput); }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label htmlFor="fill-daily-cap" className="block text-xs font-medium text-neutral-400 mb-1.5">Daily Cap (0–200)</label>
+            <input
+              id="fill-daily-cap"
+              type="number"
+              min={0}
+              max={200}
+              value={fillDailyCapInput}
+              onChange={e => setFillDailyCapInput(e.target.value)}
+              onBlur={() => commitFillNumber('evergreen_fill_daily_cap', fillDailyCapInput, 0, 200, fillSettings.evergreen_fill_daily_cap, setFillDailyCapInput)}
+              onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_daily_cap', fillDailyCapInput, 0, 200, fillSettings.evergreen_fill_daily_cap, setFillDailyCapInput); }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div className="flex items-end">
+            <div className="w-full">
+              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Deferred-Memo Enrollment</label>
+              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2">
+                <Toggle
+                  enabled={fillSettings.evergreen_fill_deferred_memo_enrollment}
+                  onChange={v => void patchFill({ evergreen_fill_deferred_memo_enrollment: v })}
+                />
+                <span className="text-xs text-neutral-400">
+                  {fillSettings.evergreen_fill_deferred_memo_enrollment ? 'Enabled' : 'Disabled'}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Evergreen Fill Observability */}
+      <EvergreenFillObservabilityPanel />
+
+      {/* Evergreen Backlog (project-scoped) */}
+      <EvergreenBacklogPanel projectId={selectedProjectId} />
 
       {/* Restart */}
       <div>

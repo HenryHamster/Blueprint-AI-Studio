@@ -76,6 +76,7 @@ from app.sr_review_quality_metrics import (  # noqa: F401
 from app.failure_classification import (
     AGENT_STALLED,
     AGENT_TIMEOUT,
+    APPROVED_CAP_PR_CLOSED,
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
     CODE_ERROR,
@@ -122,6 +123,7 @@ _FAILURE_CLASS_LABELS = {
     NO_PROGRESS_TIMEOUT: "No-Progress Timeout",
     PARK_WAKE_TIMEOUT: "Park/Wake — source never fired (timed out)",
     PARK_WAKE_STRANDED: "Park/Wake — stranded (no live wake registration)",
+    APPROVED_CAP_PR_CLOSED: "Approved Cap PR Closed — fix-loop cap hit post-approval",
 }
 
 _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5

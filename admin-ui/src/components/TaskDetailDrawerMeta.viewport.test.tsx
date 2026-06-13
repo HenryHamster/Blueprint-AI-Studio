@@ -20,6 +20,7 @@ vi.mock('../api', () => ({
   fetchComputeJobs: vi.fn(async () => []),
   fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
   resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
+  resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
 
@@ -389,5 +390,51 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
     const content = host.textContent ?? '';
     expect(content).not.toContain('LLM Provider');
     expect(content).not.toContain('LLM Model');
+  });
+
+  test('acceptance evidence section renders at 375px without overflow — proven verdict', async () => {
+    const acceptanceTask: Task = {
+      ...richTask,
+      id: 'task-acceptance-proven',
+      context: {
+        ...richTask.context,
+        code_acceptance_verdict: {
+          satisfied: true,
+          proven: true,
+          kind: 'named_test',
+          reason: "named_test 'testing/test_acceptance_gate.py' was added/modified, ran green under a verified merge, and exercises a changed production seam (3 non-test file(s))",
+        },
+      },
+    };
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<DetailsTab task={acceptanceTask} />); });
+    });
+  });
+
+  test('acceptance evidence section renders at 1280px without overflow — fail-closed verdict', async () => {
+    const failClosedTask: Task = {
+      ...richTask,
+      id: 'task-acceptance-fail-closed',
+      context: {
+        ...richTask.context,
+        code_acceptance_verdict: {
+          satisfied: false,
+          proven: false,
+          kind: 'visual',
+          reason: "declared visual acceptance evidence but no matching viewport screenshot was uploaded for component 'DashboardHome' at 1280px",
+        },
+      },
+    };
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<DetailsTab task={failClosedTask} />); });
+    });
   });
 });

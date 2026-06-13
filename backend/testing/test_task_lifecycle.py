@@ -36,6 +36,8 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    PoolVm,
+    PoolVmState,
     ArtifactType,
     Alert,
     AlertSeverity,
@@ -7561,6 +7563,56 @@ async def test_park_task_vm_instance_id_invariant(tl_db):
     )
     assert task.status == TaskStatus.PARKED
     assert task.vm_stopped_at is not None
+
+
+@pytest.mark.asyncio
+async def test_park_task_retires_leased_pool_member_before_clearing_vm_id(tl_db, mocker):
+    """park_task must release a LEASED warm-pool member before dropping linkage."""
+    session, _factory = tl_db
+    mocker.patch("app.warm_pool.is_warm_pool_enabled", return_value=True)
+
+    project = await _make_project(session)
+    original_vm_id = f"agent-vm-{uuid.uuid4().hex}"
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="compute_experiment",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=original_vm_id,
+    )
+    pool_member = PoolVm(
+        vm_instance_id=original_vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        leased_task_id=task.id,
+    )
+    idle_member = PoolVm(
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        project_id=project.id,
+        state=PoolVmState.IDLE,
+    )
+    session.add(pool_member)
+    session.add(idle_member)
+    await session.commit()
+
+    await park_task(
+        session,
+        task,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref="job-xyz",
+        source_metadata={"compute_job_id": "job-xyz"},
+        wake_action=WakeAction.RESUME,
+        reason="waiting on compute job",
+    )
+    await session.commit()
+    await session.refresh(task)
+    await session.refresh(pool_member)
+    await session.refresh(idle_member)
+
+    assert task.vm_instance_id is None
+    assert pool_member.state == PoolVmState.RETIRING
+    assert pool_member.leased_task_id is None
+    assert idle_member.state == PoolVmState.IDLE
 
 
 @pytest.mark.asyncio

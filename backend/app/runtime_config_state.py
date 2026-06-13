@@ -1299,6 +1299,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("safeguard_challenge_gate_mode", raw_mode)
+                if "evergreen_fill_deferred_memo_enrollment" in config_json:
+                    _set(
+                        "evergreen_fill_deferred_memo_enrollment",
+                        bool(config_json["evergreen_fill_deferred_memo_enrollment"]),
+                    )
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",
