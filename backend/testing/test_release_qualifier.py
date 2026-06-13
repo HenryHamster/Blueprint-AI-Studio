@@ -22560,3 +22560,117 @@ async def test_requalification_no_open_version(db_session):
     out = await rr.compute_requalification_readiness(db_session, project.id)
     assert out["requalification_ready"] is False
     assert out["open_version_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# _recover_confidence_from_ci_unresolved — unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestRecoverConfidenceFromCiUnresolved:
+    """Unit tests for release_promotion._recover_confidence_from_ci_unresolved."""
+
+    def _fn(self, base_record, policy=None):
+        from app.release_promotion import _recover_confidence_from_ci_unresolved
+
+        return _recover_confidence_from_ci_unresolved(base_record, policy=policy)
+
+    def test_non_ci_unresolved_blocker_returns_unchanged(self):
+        """Record with a blocker other than ci_unresolved is returned unchanged."""
+        record = {"blocker": "ci_not_green", "confidence": 0.0}
+        out = self._fn(record)
+        assert out is record
+
+    def test_no_blocker_returns_unchanged(self):
+        """Record with no blocker field is returned unchanged."""
+        record = {"confidence": 0.95}
+        out = self._fn(record)
+        assert out is record
+
+    def test_ci_unresolved_with_valid_sub_scores_recovers_confidence(self):
+        """Core recovery path: ci_unresolved + valid sub_scores → real confidence via compute_composite."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+        }
+        out = self._fn(record)
+        # Recovered confidence should be >0 (all sub_scores perfect)
+        assert out["confidence"] > 0.0
+        assert out.get("confidence_recovered_from_ci_unresolved") is True
+        # blocker should now be absent or None (no remaining hard blocker)
+        assert out.get("blocker") is None or out.get("blocker") == ""
+        # Original fields preserved
+        assert out["sub_scores"] == record["sub_scores"]
+
+    def test_ci_unresolved_recovery_blocker_clears_when_ci_green(self):
+        """After recovery, ci_unresolved blocker is gone (re-ran compute_composite with ci_green=True)."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.95},
+            "smoketest_enabled": True,
+        }
+        out = self._fn(record)
+        assert out.get("blocker") != "ci_unresolved"
+        assert out.get("confidence_recovered_from_ci_unresolved") is True
+
+    def test_ci_unresolved_no_sub_scores_marks_recovery_failed(self):
+        """ci_unresolved with no sub_scores key and confidence=0.0 → confidence_recovery_failed."""
+        record = {"blocker": "ci_unresolved", "confidence": 0.0}
+        out = self._fn(record)
+        assert out.get("confidence_recovery_failed") is True
+        assert "sub_scores absent" in (out.get("confidence_recovery_failure_reason") or "")
+
+    def test_ci_unresolved_sub_scores_not_dict_marks_recovery_failed(self):
+        """ci_unresolved with sub_scores that is not a dict → confidence_recovery_failed."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": [1.0, 0.9],
+        }
+        out = self._fn(record)
+        assert out.get("confidence_recovery_failed") is True
+        assert "not a dict" in (out.get("confidence_recovery_failure_reason") or "")
+
+    def test_ci_unresolved_malformed_audit_score_marks_recovery_failed(self):
+        """ci_unresolved with non-numeric audit sub_score → confidence_recovery_failed."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": "bad", "test_erosion": 0.9, "smoketest": 0.9},
+        }
+        out = self._fn(record)
+        assert out.get("confidence_recovery_failed") is True
+        assert "audit" in (out.get("confidence_recovery_failure_reason") or "")
+
+    def test_ci_unresolved_malformed_test_erosion_marks_recovery_failed(self):
+        """ci_unresolved with non-numeric test_erosion sub_score → confidence_recovery_failed."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 0.9, "test_erosion": None, "smoketest": 0.9},
+        }
+        out = self._fn(record)
+        assert out.get("confidence_recovery_failed") is True
+        assert "test_erosion" in (out.get("confidence_recovery_failure_reason") or "")
+
+    def test_ci_unresolved_non_zero_confidence_no_sub_scores_returns_unchanged(self):
+        """ci_unresolved but confidence>0.0 with missing sub_scores returns unchanged (not recovery_failed)."""
+        record = {"blocker": "ci_unresolved", "confidence": 0.88}
+        out = self._fn(record)
+        assert out is record
+        assert "confidence_recovery_failed" not in out
+
+    def test_ci_unresolved_smoketest_disabled_recovers_without_smoketest(self):
+        """Recovery works when smoketest_enabled=False (drops smoketest dimension from scoring)."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
+            "smoketest_enabled": False,
+        }
+        out = self._fn(record)
+        assert out.get("confidence_recovered_from_ci_unresolved") is True
+        assert out["confidence"] > 0.0

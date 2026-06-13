@@ -1329,10 +1329,11 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
        an agent crash before any checkpoint attempt — so ``mark_checkpoint_missing``
        never fired and ``phase_requeues`` never incremented. Route each through
        the lane's BOUNDED recovery: reuse ``mark_checkpoint_missing`` to bump the
-       requeue counter and decide. While UNDER budget, requeue-from-checkpoint by
-       clearing the stale binding (CAS ACTIVE -> PARKED, ``clear_task=True``) so
-       the next resume re-dispatches the phase from durable checkpoint context;
-       once the budget is exhausted, CAS ACTIVE -> KILLED.
+       requeue counter and decide. While UNDER budget, dispatch a new
+       checkpoint-recovery task (rebinding the lane to it, lane stays ACTIVE) when
+       PR dispatch context exists in the stale task's payload; when dispatch context
+       is absent (task vanished or payload has no ``pr_number``), CAS ACTIVE ->
+       KILLED deterministically. Once the budget is exhausted, CAS ACTIVE -> KILLED.
 
     2. A PROPOSED lane whose ``created_at`` is older than the staleness threshold
        — activation never completed. CAS PROPOSED -> KILLED (abandoned/

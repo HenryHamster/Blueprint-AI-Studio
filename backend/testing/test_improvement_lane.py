@@ -2289,7 +2289,7 @@ async def test_sweep_stranded_lanes_class1_live_task_not_stranded(
 
 
 @pytest.mark.asyncio
-async def test_sweep_stranded_lanes_class1_under_budget_parks_with_clear_task(
+async def test_sweep_stranded_lanes_class1_under_budget_no_dispatch_context_kills(
     db: AsyncSession,
 ):
     """Stranded ACTIVE lane under the requeue budget with no PR dispatch context
