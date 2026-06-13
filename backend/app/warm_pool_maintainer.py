@@ -1475,13 +1475,16 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                 "[WARM-POOL] stale-PROPOSED CAS miss lane=%s: %s", lane.id, exc
             )
 
-    # --- Class 3: PARKED lanes whose chain completed without triggering a spawn ---
+    # --- Class 3: PARKED lanes whose entire chain is terminal with no live tasks ---
     # retire_chain_lane is only called from review_pipeline.py guard paths (on the
-    # NEXT spawn attempt). If a fix PR merges cleanly and no further spawn occurs,
-    # the lane stays PARKED indefinitely. Detect this by finding PARKED lanes older
-    # than a threshold whose most recent terminal chain task carries a
-    # spawn_reason of 'already_merged' or 'pr_closed_unmerged'.
-    _TERMINAL_SPAWN_REASONS = frozenset({"already_merged", "pr_closed_unmerged"})
+    # NEXT spawn attempt). If the chain ends for any reason (merged PR, cancelled
+    # task, operator kill, best-effort retire threw and was swallowed) and no further
+    # spawn occurs, the lane stays PARKED indefinitely. Detect this by finding
+    # PARKED lanes older than a threshold that have NO non-terminal chain tasks.
+    # A lane is safe to retire when zero tasks carry its lane ID in a live
+    # (non-terminal) status — regardless of what spawn_reason the last terminal
+    # task carried. A lane that still has an active/queued chain task is legitimately
+    # awaiting its fix and must NOT be retired.
     parked_stale_seconds = int(
         runtime_config.get(
             "improvement_lane_parked_terminal_stale_seconds",
@@ -1490,8 +1493,6 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
         or 3600
     )
     parked_cutoff = now - timedelta(seconds=parked_stale_seconds)
-
-    from app.review_pipeline import SPAWN_REASON_KEY
 
     stale_parked = (
         (
@@ -1508,32 +1509,26 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
 
     for lane in stale_parked:
         lane_id_str = str(lane.id)
-        # Find terminal tasks belonging to this lane's chain. Use Python-side
+        # Find non-terminal tasks belonging to this lane's chain. Use Python-side
         # context filtering to stay dialect-agnostic (SQLite / Postgres).
-        terminal_tasks = (
+        # If any non-terminal task references this lane, the chain is still live.
+        live_tasks = (
             (
                 await session.execute(
-                    select(Task)
-                    .where(
+                    select(Task).where(
                         Task.project_id == lane.project_id,
-                        Task.status.in_(list(_LANE_TERMINAL_TASK_STATUSES)),
+                        Task.status.notin_(list(_LANE_TERMINAL_TASK_STATUSES)),
                     )
-                    .order_by(Task.updated_at.desc())
                 )
             )
             .scalars()
             .all()
         )
-        # Find the most recent terminal task in this lane's chain.
-        matched_reason: str | None = None
-        for t in terminal_tasks:
-            ctx = t.context or {}
-            if ctx.get("_review_fix_lane_id") == lane_id_str:
-                reason = ctx.get(SPAWN_REASON_KEY)
-                if reason in _TERMINAL_SPAWN_REASONS:
-                    matched_reason = reason
-                break
-        if matched_reason is None:
+        chain_is_live = any(
+            (t.context or {}).get("_review_fix_lane_id") == lane_id_str
+            for t in live_tasks
+        )
+        if chain_is_live:
             continue
         try:
             await cas_transition(
@@ -1544,9 +1539,8 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
             )
             logger.info(
                 "[WARM-POOL] retired stale PARKED lane %s -> RETIRED "
-                "(chain terminal spawn_reason=%s; parked_at=%s)",
+                "(no live chain tasks; parked_at=%s)",
                 lane.id,
-                matched_reason,
                 lane.parked_at,
             )
             reserved = (

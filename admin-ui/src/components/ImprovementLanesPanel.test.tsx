@@ -30,6 +30,9 @@ const LANE_RESPONSE = {
       workspace_vm_instance_id: 'vm-warm-1',
       reservation_expires_at: '2026-06-11T12:00:00Z',
       reserved_vm_instance_id: 'vm-warm-1',
+      reservation_claimed_by_fix_count: 3,
+      reservation_expired_before_fix_count: 1,
+      reservation_force_expired_count: 0,
       pilot_arm: 'lane',
       phase_requeues: 1,
       llm_input_tokens_total: 500,
@@ -54,6 +57,9 @@ const LANE_RESPONSE = {
       workspace_vm_instance_id: null,
       reservation_expires_at: null,
       reserved_vm_instance_id: null,
+      reservation_claimed_by_fix_count: 0,
+      reservation_expired_before_fix_count: 0,
+      reservation_force_expired_count: 0,
       pilot_arm: null,
       phase_requeues: 0,
       llm_input_tokens_total: 0,
@@ -241,6 +247,45 @@ describe('ImprovementLanesPanel', () => {
     expect(screen.getByTestId('shadow-lane-health').textContent).toContain('20.0%');
     // Miss-rate badge also appears in the header
     expect(screen.getByTestId('improvement-lanes-shadow-miss-rate').textContent).toBe('miss 20%');
+  });
+
+  test('renders warm-resume engagement breakdown for lane with non-zero claimed count', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    // lane-1 has claimed=3, expired=1, force=0
+    const breakdown = rows[0].querySelector('[data-testid="reservation-cause-breakdown"]');
+    expect(breakdown).toBeTruthy();
+    expect(breakdown?.textContent).toContain('Claimed');
+    expect(breakdown?.textContent).toContain('3');
+    expect(breakdown?.textContent).toContain('Expired early');
+    expect(breakdown?.textContent).toContain('1');
+    expect(breakdown?.textContent).toContain('Force-expired');
+
+    // claimed > 0 → emerald color class
+    const claimedSpan = breakdown?.querySelector('[class*="emerald"]');
+    expect(claimedSpan).toBeTruthy();
+
+    // expired > 0 → amber color class
+    const expiredSpan = breakdown?.querySelector('[class*="amber"]');
+    expect(expiredSpan).toBeTruthy();
+  });
+
+  test('renders cold lane reservation breakdown without failure styling when all counts are zero', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    // lane-2 has all zeros — should not display emerald/amber/red classes for values
+    const breakdown = rows[1].querySelector('[data-testid="reservation-cause-breakdown"]');
+    expect(breakdown).toBeTruthy();
+    expect(breakdown?.textContent).toContain('0');
+    // no amber or red spans for the count values (they are all zero → neutral styling)
+    const amberOrRedSpans = breakdown?.querySelectorAll('[class*="amber"], [class*="red"]');
+    expect(amberOrRedSpans?.length ?? 0).toBe(0);
   });
 
   test('renders correct badge classes for all five lane statuses', async () => {

@@ -99,6 +99,9 @@ class LanePilotAggregates(TypedDict, total=False):
     control_reserved_idle_cost_per_merged: float | None
     gate_integrity_violations: int
     checkpoint_loss_rate: float | None
+    # Diagnostic counters for the attempt-level checkpoint-loss formula.
+    checkpoint_attempts_total: int
+    checkpoint_requeues_total: int
     # Treatment-engagement telemetry (optional; absent when no fix tasks yet).
     # warm_resume_fraction: fraction of lane-arm fix tasks that carried the
     #   warm-resume receipt (actually claimed a warm workspace).

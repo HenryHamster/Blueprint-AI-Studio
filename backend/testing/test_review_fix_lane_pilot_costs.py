@@ -666,10 +666,10 @@ async def test_gate_integrity_violations_counts_review_with_lane_id(db_session):
 
 @pytest.mark.asyncio
 async def test_checkpoint_loss_rate_reflects_phase_requeues(db_session):
-    """checkpoint_loss_rate is the fraction of lane rows with phase_requeues > 0."""
+    """checkpoint_loss_rate is the attempt-level fraction of checkpoint phases lost."""
     project = await _make_project(db_session, is_self_repo=True)
 
-    # Lane 1: no requeues (no loss)
+    # Lane 1: 4 successful checkpoints, no requeues
     lane_ok = await create_lane(
         db_session,
         project_id=project.id,
@@ -681,8 +681,9 @@ async def test_checkpoint_loss_rate_reflects_phase_requeues(db_session):
         pilot_arm="lane",
     )
     lane_ok.phase_requeues = 0
+    lane_ok.checkpoint_seq = 4
 
-    # Lane 2: has a requeue (checkpoint loss)
+    # Lane 2: 5 successful checkpoints, 1 requeue (checkpoint loss)
     lane_lost = await create_lane(
         db_session,
         project_id=project.id,
@@ -694,13 +695,69 @@ async def test_checkpoint_loss_rate_reflects_phase_requeues(db_session):
         pilot_arm="lane",
     )
     lane_lost.phase_requeues = 1
+    lane_lost.checkpoint_seq = 5
 
     db_session.add_all([lane_ok, lane_lost])
     await db_session.commit()
 
     agg = await compute_lane_pilot_aggregates(db_session, project.id)
-    # 1 of 2 lanes had a checkpoint loss → 0.5
-    assert agg["checkpoint_loss_rate"] == pytest.approx(0.5)
+    # total_requeues=1, total_attempts=10 → rate = 0.1
+    assert agg["checkpoint_loss_rate"] == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_loss_rate_attempt_level_formula(db_session):
+    """Attempt-level rate stays below 5% kill ceiling even when a lane had requeues.
+
+    Two lanes each with checkpoint_seq=10 and one with phase_requeues=1:
+    rate = 1 / (20 + 1) ≈ 0.0476 — below kill ceiling — whereas the old
+    lane-level formula (1/2 = 0.5) would have triggered a premature KILL.
+    """
+    project = await _make_project(db_session, is_self_repo=True)
+    for i in range(2):
+        lane = await create_lane(
+            db_session,
+            project_id=project.id,
+            direction_id=None,
+            title=f"lane-attempt-{i}",
+            goal=f"lane-attempt-{i}",
+            branch_name=f"branch-attempt-{i}",
+            base_branch="main",
+            pilot_arm="lane",
+        )
+        lane.checkpoint_seq = 10
+        lane.phase_requeues = 1 if i == 0 else 0
+        db_session.add(lane)
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+    # 1 requeue / 21 attempts ≈ 0.0476 (below the 0.05 kill ceiling)
+    assert agg["checkpoint_loss_rate"] == pytest.approx(1 / 21)
+    assert agg["checkpoint_loss_rate"] < 0.05
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_loss_rate_diagnostic_fields_present(db_session):
+    """checkpoint_attempts_total and checkpoint_requeues_total are returned."""
+    project = await _make_project(db_session, is_self_repo=True)
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="lane-diag",
+        goal="lane-diag",
+        branch_name="branch-diag",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    lane.checkpoint_seq = 8
+    lane.phase_requeues = 2
+    db_session.add(lane)
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+    assert agg["checkpoint_attempts_total"] == 10  # 8 + 2
+    assert agg["checkpoint_requeues_total"] == 2
 
 
 @pytest.mark.asyncio

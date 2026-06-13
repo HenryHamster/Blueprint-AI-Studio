@@ -1669,9 +1669,15 @@ async def compute_lane_pilot_aggregates(
     )
     lane_rows_only = [ln for ln in lane_rows if ln.pilot_arm == "lane"]
     checkpoint_loss_rate: float | None = None
+    checkpoint_attempts_total = 0
+    checkpoint_requeues_total = 0
     if lane_rows_only:
-        lost = sum(1 for ln in lane_rows_only if (ln.phase_requeues or 0) > 0)
-        checkpoint_loss_rate = lost / len(lane_rows_only)
+        total_seq = sum(int(ln.checkpoint_seq or 0) for ln in lane_rows_only)
+        total_requeues = sum(int(ln.phase_requeues or 0) for ln in lane_rows_only)
+        checkpoint_attempts_total = total_seq + total_requeues
+        checkpoint_requeues_total = total_requeues
+        if checkpoint_attempts_total:
+            checkpoint_loss_rate = total_requeues / checkpoint_attempts_total
 
     # ── Gate-integrity violation count (non-circular, direct Task scan) ─────────
     # Count review/audit tasks in the lane arm that ACTUALLY carry transient lane
@@ -1772,6 +1778,8 @@ async def compute_lane_pilot_aggregates(
         "control_reserved_idle_cost_per_merged": control_reserved_idle_cost_per_merged,
         "gate_integrity_violations": gate_integrity_violations,
         "checkpoint_loss_rate": checkpoint_loss_rate,
+        "checkpoint_attempts_total": checkpoint_attempts_total,
+        "checkpoint_requeues_total": checkpoint_requeues_total,
         "warm_resume_fraction": warm_resume_fraction,
         "checkpoint_fraction": checkpoint_fraction,
         "lane_fix_tasks_sampled": lane_fix_tasks_sampled,

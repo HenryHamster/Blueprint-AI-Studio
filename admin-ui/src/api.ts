@@ -651,6 +651,9 @@ export interface ImprovementLaneRow {
   workspace_vm_instance_id: string | null;
   reservation_expires_at: string | null;
   reserved_vm_instance_id: string | null;
+  reservation_claimed_by_fix_count: number | null;
+  reservation_expired_before_fix_count: number | null;
+  reservation_force_expired_count: number | null;
   pilot_arm: string | null;
   phase_requeues: number;
   llm_input_tokens_total: number | null;

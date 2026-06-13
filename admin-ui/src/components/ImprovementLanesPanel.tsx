@@ -392,6 +392,26 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                         <div className="mt-0.5 text-neutral-500">
                           Expires {reservationExpiresAt}
                         </div>
+                        <div className="mt-1 space-y-0.5 text-[10px]" data-testid="reservation-cause-breakdown">
+                          <div>
+                            <span className="text-neutral-500">Claimed </span>
+                            <span className={lane.reservation_claimed_by_fix_count != null && lane.reservation_claimed_by_fix_count > 0 ? 'font-medium text-emerald-400' : 'text-neutral-400'}>
+                              {lane.reservation_claimed_by_fix_count ?? '—'}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-neutral-500">Expired early </span>
+                            <span className={lane.reservation_expired_before_fix_count != null && lane.reservation_expired_before_fix_count > 0 ? 'font-medium text-amber-400' : 'text-neutral-400'}>
+                              {lane.reservation_expired_before_fix_count ?? '—'}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-neutral-500">Force-expired </span>
+                            <span className={lane.reservation_force_expired_count != null && lane.reservation_force_expired_count > 0 ? 'font-medium text-red-400' : 'text-neutral-400'}>
+                              {lane.reservation_force_expired_count ?? '—'}
+                            </span>
+                          </div>
+                        </div>
                       </div>
 
                       <div>
