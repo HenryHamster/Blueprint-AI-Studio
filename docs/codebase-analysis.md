@@ -33,7 +33,7 @@ Blueprint is an **autonomous Claude Code launcher platform** that manages the co
 │  - Clone repo + run Claude Code CLI                              │
 │  - Heartbeat mechanism & log streaming                           │
 │  - Git workflow (branch creation, PR submission)                 │
-│  - 20 task handlers (create, refactor, plan, research, …)       │
+│  - 27 bespoke task handlers (create, refactor, plan, research, …) │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -85,8 +85,9 @@ Agent VMs ↔ Orchestrator (short-lived JWT)
 
 ```
 Orchestrator → Admin UI (real-time log streaming)
-  WS /api/projects/{project_id}/ws?ws_ticket=<signed_ticket>
-  Messages: {task_id, logs, task_status, metrics}
+  POST /api/projects/{project_id}/ws-ticket — mint a short-lived ticket
+  WS /api/projects/{project_id}/ws          — send {"ticket": "..."} first
+  Messages: {"event": "...", "data": {...}}
   Secrets are redacted before broadcast.
 
 Internal background services (asyncio tasks, crash-monitored):
@@ -120,10 +121,10 @@ Orchestrator ↔ GCP
 - **Firebase** ID tokens verified by Firebase Admin SDK.
 - **Allowlist**: `AllowedUser` table gates access (email + role: `admin` / `user`).
 - **Admin API Key**: `ADMIN_API_KEY` env var for programmatic access.
-- **WebSocket**: Temporary `ws_ticket` (1-min JWT) issued per project access check; prevents token leakage in browser URL history.
+- **WebSocket**: Temporary ticket issued per project access check and sent as the first WebSocket message, so it does not appear in browser URL history.
 
 ### Agent VM authentication
-- **Short-lived JWT**: 2-hour tokens signed with `AGENT_JWT_SECRET`.
+- **Short-lived JWT**: Standard 1-hour tokens signed with `AGENT_JWT_SECRET`, with an 8-hour bootstrap token for cold-start agents before their first successful refresh.
 - **Claims**: `task_id`, `vm_instance_id`, `task_type` (endpoint-scoped).
 - **Revocation**: Tokens blacklisted (in-memory `_terminated_task_ids` dict) when task reaches a terminal state; 9-hour TTL (> 8-hour JWT lifetime).
 - **Refresh**: `/api/agent/refresh-token` endpoint for within-VM refresh.

@@ -1,6 +1,6 @@
 # Blueprint
 
-Blueprint is a platform for launching, monitoring, and scaling autonomous Claude Code instances on sandboxed GCP Virtual Machines. Assign a repo and a prompt, and Blueprint provisions an isolated VM, runs Claude Code, pushes a branch, and opens a PR.
+Blueprint is a platform for launching, monitoring, and scaling autonomous Claude Code instances on sandboxed GCP virtual machines. Assign a repo and a prompt, and Blueprint provisions an isolated VM, runs Claude Code, pushes a branch, and opens a PR.
 
 Blueprint also supports autonomous research mode: the orchestrator can generate and dispatch tasks from configurable strategic directions without manual intervention.
 
@@ -37,7 +37,7 @@ Agent VMs          Background workers
   - `gcp_cleanup_service` — sweeps orphaned VMs every 15 min
   - `secret_reconciliation_service` / `pipeline_alert_scan_service` / `digest_precompute_service` — keep runtime secrets, operator alerts, and digest cache state in sync
 
-- **Admin UI** (`admin-ui/`) — React dashboard for monitoring agents, reviewing directions, configuring settings, and viewing analytics. It also consumes the WebSocket log stream.
+- **Admin UI** (`admin-ui/`) — React dashboard for monitoring agents, reviewing directions, configuring settings, and viewing analytics. It also consumes the project WebSocket log stream.
 
 - **Launcher UI** (root `src/`) — Root Vite app for creating new tasks and viewing progress. Runs on port 3000 in local dev.
 
@@ -52,7 +52,9 @@ Local mode runs agents as subprocesses instead of GCP VMs. You still need Postgr
 ```bash
 # 1. Copy and fill in environment variables
 cp .env.example .env
-# Set at minimum: ANTHROPIC_API_KEY, ADMIN_API_KEY, LOCAL_MODE=true, DATABASE_URL
+# Set at minimum: ADMIN_API_KEY, VITE_ADMIN_API_KEY, LOCAL_MODE=true, DATABASE_URL.
+# Set ANTHROPIC_API_KEY if you want agents to use the Anthropic API fallback
+# instead of a local Claude login / Max-plan account.
 
 # 2. Start PostgreSQL
 docker compose up -d db
@@ -66,6 +68,11 @@ cd backend && bash run_migrations.sh
 # 4. Install backend dependencies and run the API (separate terminal)
 cd backend
 pip install -r requirements.txt
+export DATABASE_URL=postgresql+asyncpg://postgres:supersecret_blueprint_pass@localhost:5432/postgres
+export ADMIN_API_KEY=dev-admin-key
+export AGENT_JWT_SECRET=dev-jwt-secret
+export WS_TICKET_SECRET=dev-ws-ticket-secret
+export LOCAL_MODE=true
 uvicorn app.main:app --reload --port 8080
 
 # 5. In another terminal, start the UIs (launcher on :3000, admin on :3001)
@@ -132,14 +139,14 @@ See `.env.example` for the complete template with all variables.
 4. The orchestrator worker picks up the queued task and provisions a GCP VM, or a local subprocess in `LOCAL_MODE=true`
 5. The agent boots and claims its task via the JWT-authenticated API
 6. It clones the repo, creates a working branch, and runs Claude Code
-7. Logs stream back to the admin UI in real time via WebSocket
+7. Logs stream back to the admin UI in real time through a ticket-authenticated WebSocket
 8. On success, it commits, pushes, creates a PR, and reports `COMPLETED`
 9. On failure, it reports `FAILED` with logs and retries up to 3 times
 10. The VM is reaped if it stops heartbeating or exceeds its hard TTL
 
 ## Task Types
 
-Blueprint supports 26 task types, each handled by a dedicated agent handler:
+Blueprint's agent currently has bespoke handlers for 27 task types. The canonical list lives in `agent/src/taskCapabilities.ts`; runtime read/write permissions are loaded from `GET /api/agent/task-capabilities`.
 
 | Type | Description |
 |---|---|
@@ -169,13 +176,14 @@ Blueprint supports 26 task types, each handled by a dedicated agent handler:
 | `compute_experiment` | Launch a budgeted compute job and monitor it to a terminal state |
 | `web_research` | Web-first research that produces a cited knowledge document |
 | `design` | Codebase-grounded design work that produces a durable design document |
+| `repo_bootstrap` | Inspect a newly onboarded repository and produce bootstrap metadata for setup, build, and environment guidance |
 
 ## Autonomous Research Mode
 
 When enabled, Blueprint continuously generates and dispatches tasks without manual intervention:
 
 1. **Strategic directions** define areas of focus (e.g., "Improve test coverage", "Reduce latency")
-2. The **autonomous research worker** selects eligible directions and spawns `research` tasks
+2. The orchestrator worker's autonomous-research step selects eligible directions and spawns `research` tasks during the normal dispatch loop
 3. Research findings feed into a **strategic cycle**: `design_doc_update` → `strategic_review` → new directions
 4. A **starvation handler** creates fallback directions when the pipeline runs low
 5. Completed task deduplication prevents re-proposing work that was already done
@@ -284,8 +292,8 @@ Local mode runs agents as subprocess instead of GCP VMs. Full CI suite runs on P
 
 - VMs have no public IP — outbound only via Cloud NAT
 - Agent service account has zero default GCP permissions
-- Short-lived JWTs scoped to individual tasks (2-hour expiry)
-- 1-hour hard TTL + heartbeat-based reaper + orphan cleanup
+- Short-lived JWTs scoped to individual tasks (1-hour standard expiry; 8-hour bootstrap token for cold starts)
+- Task timeout and VM self-destruct safeguards plus heartbeat-based reaper and orphan cleanup
 - GitHub tokens refreshed before each push operation
 - Prompt injection scanning on PR content (100+ patterns)
 - Per-project circuit breaker to halt runaway failure loops

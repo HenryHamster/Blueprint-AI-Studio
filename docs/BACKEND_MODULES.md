@@ -98,8 +98,8 @@ Uses `asyncpg` driver for true async/await with PostgreSQL.
 Authentication & authorization.
 
 **Functions:**
-- `verify_agent_jwt()` — Check agent VM token (scoped to task ID, 2-hour expiry)
-- `create_agent_token()` — Issue new JWT for agent
+- `verify_agent_jwt()` — Check agent VM token scoped to a task ID
+- `create_agent_token()` — Issue an agent JWT (1-hour standard TTL; 8-hour bootstrap TTL before first refresh)
 - `get_current_user()` — FastAPI dependency for Firebase-authenticated requests
 - `verify_ws_ticket()` — Validate WebSocket ticket for real-time log streaming
 - `create_ws_ticket()` — Generate short-lived WebSocket admission token

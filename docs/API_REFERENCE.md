@@ -240,6 +240,12 @@ parameter), obtained from `POST /api/projects/{project_id}/ws-ticket`.
 
 These endpoints are for agent VMs. All require valid agent JWT.
 
+### `GET /api/agent/task-capabilities`
+
+Return the task capability contract used by agents and operator surfaces. The
+agent uses each entry's `agent_mode` to derive read-only vs. write permissions
+at startup; `agent/src/taskCapabilities.ts` contains the bespoke dispatch list.
+
 ### `POST /api/agent/claim`
 
 Claim a task and start work.
@@ -421,9 +427,30 @@ Get a signed GCS URL to upload a file artifact.
 
 ---
 
+### `GET /api/agent/artifacts/download-url`
+
+Get a signed GCS URL for an existing artifact. The response model is
+`ArtifactDownloadResponse`.
+
+---
+
 ### `POST /api/agent/viewport/failure-screenshot-upload-url`
 
 Get a signed upload URL for viewport-failure screenshots.
+
+---
+
+### `POST /api/agent/compute-jobs`
+
+Create a compute job for the current task.
+
+### `GET /api/agent/compute-jobs/{job_id}`
+
+Fetch the current status and result metadata for an agent-launched compute job.
+
+### `POST /api/agent/compute-analysis`
+
+Submit or request analysis for compute-experiment output.
 
 ---
 
@@ -452,13 +479,6 @@ Read a project playbook entry.
 ### `GET /api/agent/projects/{project_id}/gaps/{gap_id}`
 
 Fetch a specific gap entry for the agent research workflow.
-
----
-
-### `POST /api/agent/tasks/{original_task_id}/reviewer-merge`
-
-Reviewer-merge helper invoked by a fresh-reviewer agent to record/perform the
-merge decision for the task it reviewed.
 
 ---
 
@@ -608,8 +628,27 @@ Cross-project access returns 404 (not 403) to prevent id enumeration.
 - `GET /api/agent/projects/{project_id}/playbook/{key:path}` — a single
   `playbook/<key>` design-doc entry with full content (honors `pending_source`
   visibility rules).
+- `GET /api/agent/projects/{project_id}/design-doc/{key:path}` — a single
+  design-doc entry by key.
+- `GET /api/agent/projects/{project_id}/problem_model` and
+  `GET /api/agent/projects/{project_id}/problem-model` — the project's problem
+  model; both spellings are supported.
+- `GET /api/agent/projects/{project_id}/messages/{ref}` — fetch one project
+  message by reference.
+- `GET /api/agent/projects/{project_id}/qualification` — current qualification
+  context for strategic/release work.
 - `GET /api/agent/projects/{project_id}/gaps/{gap_id}` — a single problem-model
   gap (active or archived) with full history/past_moves/evidence.
+
+### Agent knowledge and build-config helpers
+
+- `GET /api/agent/knowledge-documents` and
+  `GET /api/agent/knowledge-documents/{document_id}` — retrieve knowledge
+  documents available to the current task.
+- `PATCH /api/agent/projects/{project_id}/build-config/commands` — update
+  discovered build/test command metadata for a project.
+- `POST /api/agent/build-config-discovery` — submit build-config discovery
+  observations from a bootstrap or fix-loop run.
 
 ---
 
@@ -651,50 +690,6 @@ The user GitHub OAuth/webhook router exposes:
 - `GET /api/github/oauth/authorize`
 - `GET /api/github/oauth/callback`
 - `POST /api/github/webhook`
-
-## Admin API
-
-Admin routes are mounted under `/api/admin` unless noted otherwise.
-
-### Common admin families
-
-- `GET /api/admin/settings`, `PATCH /api/admin/settings`, `GET /api/admin/providers`
-- `GET /api/admin/github/repos`, `GET /api/admin/github/branches`
-- `POST /api/admin/restart-orchestrator`
-- `POST /api/admin/memory/tracemalloc/start`, `POST /api/admin/memory/tracemalloc/stop`, `GET /api/admin/memory/snapshot`
-- `POST /api/admin/github-quota/refresh`, `POST /api/admin/github-quota/reset-tracking`
-- `GET /api/admin/projects`, `GET /api/admin/projects/{project_id}`, `PATCH /api/admin/projects/{project_id}`, `DELETE /api/admin/projects/{project_id}`
-- `POST /api/admin/projects/onboard`
-- `POST /api/admin/projects/{project_id}/detect-build-config`
-- `POST /api/admin/projects/{project_id}/running-update/acknowledge`
-- `GET /api/admin/autonomous-status`, `POST /api/admin/autonomous/pause-all`
-- `GET /api/admin/health-overview`, `GET /api/admin/warm-vm-state`, `GET /api/admin/pr-behind-detector-stats`
-- `GET /api/admin/activity`
-- `GET /api/admin/alerts`, `POST /api/admin/alerts/{alert_id}/dismiss`, `POST /api/admin/alerts/dismiss-all`
-- `GET /api/admin/messages`, `POST /api/admin/messages`
-- `GET /api/admin/digest`
-- `GET /api/admin/provider-cost-summary`, `GET /api/admin/fix-loop-convergence`, `GET /api/admin/outer-loop-convergence`, `GET /api/admin/pipeline-regressions`
-- `GET /api/admin/recent-orchestrator-errors`
-- `POST /api/admin/projects/{project_id}/self-audit`, `POST /api/admin/projects/{project_id}/qualify`, `POST /api/admin/tasks/{task_id}/rollup`
-- `GET /api/admin/projects/{project_id}/findings`
-- `GET|PUT /api/admin/projects/{project_id}/playbook`
-- `DELETE /api/admin/projects/{project_id}/playbook/{key}`
-- `POST /api/admin/projects/{project_id}/playbook/seed`
-- `POST /api/admin/projects/{project_id}/backfill-branches`
-- `GET|PATCH /api/admin/projects/{project_id}/integration-branch`
-- `GET|PATCH /api/admin/projects/{project_id}/promotion-target`
-
-### Deploy state routes
-
-Mounted from `backend/app/routers/deploy.py`:
-
-- `GET /deploy-state`
-- `POST /deploy-state/pause`
-- `POST /deploy-state/resume`
-- `POST /deploy-state/reset-health`
-- `POST /deploy-state/mark-stable`
-- `POST /deploy-state/rollback`
-- `GET /zone-health`
 
 ## Admin API
 
@@ -837,6 +832,14 @@ branch-routing endpoints. The remaining config endpoints:
 | GET | `/api/admin/open-prs` | All open PRs from GitHub cross-referenced with linked tasks. |
 | GET | `/api/admin/projects/{project_id}/efficiency-axes` | Per-axis current/baseline/drift/history for the project's efficiency baseline. |
 | GET | `/api/admin/projects/{project_id}/llm-cost-breakdown` | Per-provider and per-model LLM cost/token breakdown over a window. |
+
+#### Compute Jobs (`admin_compute_jobs.py`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/admin/projects/{project_id}/compute-jobs` | List compute jobs for a project, optionally including recently finished jobs. |
+| POST | `/api/admin/compute-jobs/{job_id}/kill` | Request termination of an active compute job. |
+| POST | `/api/admin/compute-jobs/{job_id}/analyze` | Trigger analysis for a compute job's output. |
 
 #### Pipeline Observability & Convergence (`admin_pipeline_observability.py`)
 

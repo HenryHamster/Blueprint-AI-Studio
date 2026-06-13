@@ -4,11 +4,11 @@ The admin UI is a React + TypeScript application built with Vite. It provides a 
 
 ## Architecture
 
-- **Framework:** React 18 + TypeScript
+- **Framework:** React 19 + TypeScript
 - **Build tool:** Vite (with HMR for development)
 - **Styling:** Tailwind CSS
 - **Testing:** Vitest + Playwright (viewport regression tests)
-- **Deployment:** Built artifact deployed to Cloud Run alongside the backend
+- **Deployment:** Built artifact deployed with the frontend hosting flow described in [../Deploy.md](../Deploy.md)
 
 ## Development Setup
 
@@ -73,9 +73,9 @@ npm run test:viewport      # Run all viewport tests
 npm run test:viewport my-component  # Run specific component
 ```
 
-Tests use the `*.viewport.test.tsx` naming convention and are skipped by the default jsdom suite. See [CONTRIBUTING.md#viewport-regression-check](./CONTRIBUTING.md#viewport-regression-check) for details on adding a test for a new component.
+Tests use the `*.viewport.test.tsx` naming convention and are skipped by the default jsdom suite. See [../docs/TESTING_GUIDE.md#viewport-tests-playwright-browser-based](../docs/TESTING_GUIDE.md#viewport-tests-playwright-browser-based) for details on adding a test for a new component.
 
-For headless Chromium setup help, see [CONTRIBUTING.md#running-locally-without-system-chromium-libs](./CONTRIBUTING.md#running-locally-without-system-chromium-libs).
+For headless Chromium setup help, see [../docs/TESTING_GUIDE.md#viewport-tests-playwright-browser-based](../docs/TESTING_GUIDE.md#viewport-tests-playwright-browser-based).
 
 ## Styling
 
@@ -110,7 +110,7 @@ All backend routes require authentication (Firebase token or API key).
 - Run `npm install` from repo root to ensure hoisted node_modules are available
 
 **Viewport tests fail with missing Chromium?**
-- See [CONTRIBUTING.md#running-locally-without-system-chromium-libs](./CONTRIBUTING.md#running-locally-without-system-chromium-libs)
+- See [../docs/TESTING_GUIDE.md#viewport-tests-playwright-browser-based](../docs/TESTING_GUIDE.md#viewport-tests-playwright-browser-based)
 
 **WebSocket disconnects?**
 - Check backend is running on correct port (default 8080)

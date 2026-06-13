@@ -1655,6 +1655,45 @@ class TestClassifyFailureScopeEmpty:
         assert SCOPE_EMPTY in INFRA_CLASSES
 
 
+class TestPrBranchDeleted:
+    """Agent-emitted 'pr_branch_deleted' routes to SCOPE_EMPTY (task had no work)
+    so it doesn't consume retry budget or penalize direction health."""
+
+    def test_pr_branch_deleted_maps_without_warning(self, caplog):
+        """The pr_branch_deleted category maps to SCOPE_EMPTY without falling
+        through to the warning log that catches unmapped categories."""
+        import logging
+        task = _task("PR branch was already deleted (merged and auto-deleted)")
+        with caplog.at_level(logging.WARNING):
+            result = normalize_agent_failure_category("pr_branch_deleted", task)
+        assert result == SCOPE_EMPTY
+        # Verify no warning was logged for the unmapped category
+        assert not any(
+            "[FAILURE_CLASS] Unknown agent failure_category" in record.message
+            for record in caplog.records
+        )
+
+    def test_pr_branch_deleted_via_context_fast_path(self):
+        """classify_failure's context['failure_category'] fast path also honors
+        the lowercase 'pr_branch_deleted' label."""
+        task = _task(
+            "PR branch was already deleted",
+            {"failure_category": "pr_branch_deleted"},
+        )
+        assert classify_failure(task) == SCOPE_EMPTY
+
+    def test_pr_branch_deleted_is_scope_empty(self):
+        """Verify pr_branch_deleted routes to SCOPE_EMPTY class."""
+        task = _task("PR branch deleted after merge")
+        assert normalize_agent_failure_category("pr_branch_deleted", task) == SCOPE_EMPTY
+
+    def test_pr_branch_deleted_in_infra_classes(self):
+        """pr_branch_deleted maps to SCOPE_EMPTY which is in INFRA_CLASSES,
+        so direction-health analytics don't penalize the agent."""
+        from app.failure_classification import INFRA_CLASSES
+        assert SCOPE_EMPTY in INFRA_CLASSES
+
+
 class TestClassifyFailureOrchestratorDefer:
     """The orchestrator defers a task on a precondition it cannot satisfy yet
     (a file is being edited by another in-flight task, or the task overlaps a

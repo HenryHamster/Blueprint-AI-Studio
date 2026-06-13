@@ -177,6 +177,11 @@ BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 # merge. The respawn already skips merged PRs gracefully (review_pipeline); this
 # only stops the FIRST attempt from being mislabeled a code defect.
 BRANCH_GONE = "BRANCH_GONE"
+# Agent completed the task but the PR branch was already deleted (merged and
+# auto-deleted), so there was nothing to review or fix. Similar to SCOPE_EMPTY
+# (task had no work to do), routed to that class so it doesn't consume retry
+# budget or penalize direction health.
+PR_BRANCH_DELETED = "PR_BRANCH_DELETED"
 # Cluster sibling pre-emption — the agent's declared related_files were already
 # covered by a sibling cluster's merged PR before this task ran. The agent did
 # the right thing by detecting the overlap and exiting cleanly; this is NOT a
@@ -716,6 +721,11 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # ``scope_empty`` — agent-emitted when declared related_files were already
     # covered by a sibling cluster's merged PR; exits cleanly without retries.
     "scope_empty": SCOPE_EMPTY,
+    # ``pr_branch_deleted`` — agent completed the task but the PR branch was
+    # already deleted (merged and auto-deleted), so there was nothing to review
+    # or fix. Similar to SCOPE_EMPTY (task had no work to do), routed to that
+    # class so it doesn't consume retry budget or penalize direction health.
+    "pr_branch_deleted": SCOPE_EMPTY,
     # ``reassigned`` — agent self-terminated gracefully because the task is no
     # longer assigned to its VM (non-transient heartbeat 4xx = reassignment/
     # deauth, or cancel/supersede during startup). Posted synchronously from the

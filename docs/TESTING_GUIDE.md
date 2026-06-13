@@ -425,13 +425,14 @@ describe('detectLoopDivergence', () => {
 ### Local Checks Before Pushing
 
 ```bash
-# All at once
+# Lint/build only for changed stacks
 ./check
 
-# Specific layers
-./check lint       # Code style
-./check test       # Full backend test suite (slow)
-./check build      # Frontend build + agent type check
+# Include the repo's configured smoke tests for changed stacks
+./check test
+
+# Force repo-wide lint/build scope instead of changed-file scoping
+./check full
 ```
 
 ### GitHub Actions
