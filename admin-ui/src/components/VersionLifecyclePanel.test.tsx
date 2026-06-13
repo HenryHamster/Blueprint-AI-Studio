@@ -92,6 +92,25 @@ describe('VersionLifecyclePanel', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
   });
 
+  it('renders the promotion policy source and fallback reason', () => {
+    vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+
+    render(
+      <VersionLifecyclePanel
+        data={makeVersionLifecycleResponse({
+          promotion_policy_source: 'hardcoded_defaults',
+          promotion_policy_error: 'ScannerError: promotion_policy.yaml did not parse',
+        })}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+      />
+    );
+
+    expect(screen.getByTestId('promotion-policy-source')).toHaveTextContent('hardcoded_defaults');
+    expect(screen.getByTestId('promotion-policy-source-error')).toHaveTextContent('ScannerError: promotion_policy.yaml did not parse');
+  });
+
   describe('phase updates reflect immediately', () => {
     it('shows new phase immediately after successful phase change without waiting for refresh', async () => {
       const setVersionPhaseMock = vi.fn().mockResolvedValue({

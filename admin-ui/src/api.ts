@@ -1713,6 +1713,8 @@ export interface PromotionReadiness {
   deploy_failed_count?: number;
 }
 
+export type PromotionPolicySource = 'runtime_config' | 'yaml_file' | 'hardcoded_defaults';
+
 export interface StagedDirection {
   id: string | null;
   text: string | null;
@@ -1754,6 +1756,8 @@ export interface VersionLifecycleResponse {
   /** Which value is in effect: a per-project override or the fleet-wide default. */
   promotion_enabled_source?: 'project' | 'fleet';
   promotion_readiness?: PromotionReadiness | null;
+  promotion_policy_source?: PromotionPolicySource;
+  promotion_policy_error?: string | null;
   staged_directions?: StagedDirection[];
   /** Challenged-vs-unchallenged decision-quality cohort comparison. Advisory/display only. */
   challenged_vs_unchallenged?: ChallengedVsUnchallengedTelemetry | null;

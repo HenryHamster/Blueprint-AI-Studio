@@ -21,6 +21,7 @@ import {
   type StagedDirection,
   type VersionLifecycleResponse,
   type VersionQualification,
+  type PromotionPolicySource,
   type PromotionReadiness,
   type QualificationState,
   type ChallengedVsUnchallengedTelemetry,
@@ -104,6 +105,44 @@ function OutOfBandPromotionBadge({ oob }: { oob: OutOfBandPromotion }) {
       <span className="font-mono text-violet-500/90">{oob.candidate_sha.slice(0, 7)}→{oob.promoted_sha.slice(0, 7)}</span>
       <span className="text-violet-600/90">{timeAgo(oob.recorded_at)}</span>
     </span>
+  );
+}
+
+const POLICY_SOURCE_STYLE: Record<PromotionPolicySource, string> = {
+  runtime_config: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
+  yaml_file: 'bg-sky-500/10 border-sky-500/30 text-sky-400',
+  hardcoded_defaults: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+};
+
+function PromotionPolicyBadge({
+  source,
+  error,
+}: {
+  source?: PromotionPolicySource | null;
+  error?: string | null;
+}) {
+  if (!source) return null;
+  const style = POLICY_SOURCE_STYLE[source] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700';
+  return (
+    <div className="flex flex-wrap items-start gap-x-2 gap-y-0.5 text-[10px]">
+      <span className="text-neutral-500 uppercase tracking-wide">Policy source</span>
+      <span
+        data-testid="promotion-policy-source"
+        className={`px-1.5 py-0.5 rounded border font-semibold ${style}`}
+        title={`Promotion policy loaded from ${source}`}
+      >
+        {source}
+      </span>
+      {error && (
+        <span
+          data-testid="promotion-policy-source-error"
+          className="text-amber-400"
+          title={error}
+        >
+          fallback: {error}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -1060,6 +1099,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const promotionEnabled = data.promotion_enabled ?? false;
   const optimisticPromotionEnabled = promotionEnabledOverride ?? promotionEnabled;
   const readiness = data.promotion_readiness;
+  const policySource = data.promotion_policy_source ?? null;
+  const policyError = data.promotion_policy_error ?? null;
   // A promotion in flight (audit passed, promotion PR open and auto-merging)
   // makes the qualify + phase-flip levers unsafe: re-qualifying clobbers the
   // promotion-pending record and a phase flip clears the in-flight indication
@@ -1354,6 +1395,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             </>
           )}
         </div>
+        {policySource && (
+          <PromotionPolicyBadge source={policySource} error={policyError} />
+        )}
         {cv && (
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">

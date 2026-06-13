@@ -304,31 +304,18 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
         return None
 
 
-def _load_policy() -> dict[str, Any]:
-    """Resolve the promotion rubric: live runtime_config → YAML file → defaults.
+def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
+    """Resolve the promotion rubric and return its active source + fallback reason.
 
-    Resolution order:
-      1. ``runtime_config['promotion_threshold'/'promotion_weights']`` — the
-         live, admin-tunable rubric (seeded from the YAML at startup, then
-         operator-overridable via PATCH /api/admin/settings with no redeploy).
-      2. ``backend/promotion_policy.yaml`` — the on-disk file, when the
-         runtime_config values are absent/unusable (e.g. a unit test importing
-         the module without seeding).
-      3. The hardcoded ``_DEFAULT_POLICY`` rubric.
-
-    On ANY read or parse failure at the YAML tier — missing file, unreadable,
-    malformed YAML, missing/non-numeric keys, PyYAML import failure — log a
-    warning and return a copy of ``_DEFAULT_POLICY``.  Never raises: a broken
-    policy source must not take down the qualifier (it would only fail-open the
-    gate; the caller still decides whether to act on the composite).
-
-    The returned dict always has the shape
-    ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
-       "threshold": float}`` with every value coerced to float.
+    The policy payload itself keeps the legacy ``{"weights": ..., "threshold": ...}``
+    shape. This helper layers operator-visible provenance on top so callers can tell
+    whether the active rubric came from runtime config, the YAML file, or the
+    hardcoded defaults after a YAML failure.
     """
     from_config = _policy_from_runtime_config()
     if from_config is not None:
-        return from_config
+        return from_config, "runtime_config", None
+
     try:
         import yaml
 
@@ -364,18 +351,49 @@ def _load_policy() -> dict[str, Any]:
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
 
-        return {"weights": weights, "threshold": threshold}
+        return {"weights": weights, "threshold": threshold}, "yaml_file", None
     except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
+        error = f"{exc.__class__.__name__}: {exc}"
         logger.warning(
             "[RELEASE_QUALIFIER] failed to load promotion_policy.yaml (%s); "
             "falling back to hardcoded defaults",
             exc,
         )
         # Return a deep-ish copy so callers can't mutate the module constant.
-        return {
-            "weights": dict(_DEFAULT_POLICY["weights"]),
-            "threshold": _DEFAULT_POLICY["threshold"],
-        }
+        return (
+            {
+                "weights": dict(_DEFAULT_POLICY["weights"]),
+                "threshold": _DEFAULT_POLICY["threshold"],
+            },
+            "hardcoded_defaults",
+            error,
+        )
+
+
+def _load_policy() -> dict[str, Any]:
+    """Resolve the promotion rubric: live runtime_config → YAML file → defaults.
+
+    Resolution order:
+      1. ``runtime_config['promotion_threshold'/'promotion_weights']`` — the
+         live, admin-tunable rubric (seeded from the YAML at startup, then
+         operator-overridable via PATCH /api/admin/settings with no redeploy).
+      2. ``backend/promotion_policy.yaml`` — the on-disk file, when the
+         runtime_config values are absent/unusable (e.g. a unit test importing
+         the module without seeding).
+      3. The hardcoded ``_DEFAULT_POLICY`` rubric.
+
+    On ANY read or parse failure at the YAML tier — missing file, unreadable,
+    malformed YAML, missing/non-numeric keys, PyYAML import failure — log a
+    warning and return a copy of ``_DEFAULT_POLICY``.  Never raises: a broken
+    policy source must not take down the qualifier (it would only fail-open the
+    gate; the caller still decides whether to act on the composite).
+
+    The returned dict always has the shape
+    ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
+       "threshold": float}`` with every value coerced to float.
+    """
+    policy, _, _ = _resolve_policy_with_provenance()
+    return policy
 
 
 # Terminal task statuses — a qualifier child in any of these has finished

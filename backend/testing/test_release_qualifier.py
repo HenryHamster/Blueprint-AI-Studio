@@ -797,6 +797,58 @@ class TestLoadPolicy:
         assert policy["threshold"] == pytest.approx(0.88)
 
 
+class TestLoadPolicyProvenance:
+    def test_runtime_config_provenance_is_reported(self, mocker):
+        """A valid runtime_config rubric is reported as runtime_config."""
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.75,
+                "promotion_weights": {
+                    "audit": 0.5,
+                    "test_erosion": 0.25,
+                    "smoketest": 0.25,
+                },
+            },
+            clear=False,
+        )
+
+        policy, source, error = rq._resolve_policy_with_provenance()
+        assert source == "runtime_config"
+        assert error is None
+        assert policy["threshold"] == pytest.approx(0.75)
+
+    def test_yaml_provenance_is_reported(self, mocker, tmp_path):
+        """A valid YAML file is reported as yaml_file when runtime_config is unset."""
+        _point_policy_at(
+            mocker,
+            tmp_path,
+            "weights:\n  audit: 0.5\n  test_erosion: 0.25\n"
+            "  smoketest: 0.25\nthreshold: 0.8\n",
+        )
+
+        policy, source, error = rq._resolve_policy_with_provenance()
+        assert source == "yaml_file"
+        assert error is None
+        assert policy["weights"]["audit"] == pytest.approx(0.5)
+
+    def test_hardcoded_defaults_provenance_includes_parse_error(
+        self, mocker, tmp_path
+    ):
+        """A broken YAML file falls back to hardcoded defaults with an error string."""
+        _point_policy_at(mocker, tmp_path, "weights: {unterminated: [1, 2")
+
+        policy, source, error = rq._resolve_policy_with_provenance()
+        assert source == "hardcoded_defaults"
+        assert error is not None
+        assert "ScannerError" in error or "ParserError" in error or "while parsing" in error
+        assert policy["weights"] == {
+            "audit": 0.40,
+            "test_erosion": 0.30,
+            "smoketest": 0.30,
+        }
+
+
 # ===========================================================================
 # _score_audit / _score_smoketest — artifact → sub-score derivation
 # ===========================================================================

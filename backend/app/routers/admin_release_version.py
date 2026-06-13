@@ -357,6 +357,7 @@ async def get_version_lifecycle(
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
         resolve_lifecycle_audit_evidence,
+        _resolve_policy_with_provenance,
     )
     from app.models import Project  # noqa: PLC0415
     from app.strategic_spawning import (  # noqa: PLC0415
@@ -371,6 +372,7 @@ async def get_version_lifecycle(
         project_row = (
             await session.execute(select(Project).where(Project.id == project_id))
         ).scalar_one_or_none()
+        _, promotion_policy_source, promotion_policy_error = _resolve_policy_with_provenance()
 
         open_row = (
             (
@@ -599,6 +601,8 @@ async def get_version_lifecycle(
                 else "fleet"
             ),
             "promotion_readiness": promotion_readiness,
+            "promotion_policy_source": promotion_policy_source,
+            "promotion_policy_error": promotion_policy_error,
             # Directions deliberately queued (status=staged) to begin only after the
             # current version promotes. Surfaced read-only so an operator can confirm
             # staged work is queued and spot items rotting past their target version.

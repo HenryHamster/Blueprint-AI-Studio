@@ -8902,6 +8902,126 @@ class TestVersionLifecycleInfraFailureFields:
         assert lq["consecutive_infra_errors"] is None
         assert lq["audit_missing_reason"] is None
 
+
+class TestVersionLifecyclePolicyProvenance:
+    """GET /version-lifecycle exposes promotion policy source and fallback detail."""
+
+    @pytest.mark.asyncio
+    async def test_policy_provenance_is_included_on_successful_load(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier._resolve_policy_with_provenance",
+                return_value=(
+                    {
+                        "weights": {
+                            "audit": 0.5,
+                            "test_erosion": 0.25,
+                            "smoketest": 0.25,
+                        },
+                        "threshold": 0.8,
+                    },
+                    "yaml_file",
+                    None,
+                ),
+            ),
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["promotion_policy_source"] == "yaml_file"
+        assert body["promotion_policy_error"] is None
+
+    @pytest.mark.asyncio
+    async def test_policy_provenance_exposes_hardcoded_default_reason(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier._resolve_policy_with_provenance",
+                return_value=(
+                    {
+                        "weights": {
+                            "audit": 0.4,
+                            "test_erosion": 0.3,
+                            "smoketest": 0.3,
+                        },
+                        "threshold": 0.9,
+                    },
+                    "hardcoded_defaults",
+                    "ScannerError: promotion_policy.yaml did not parse",
+                ),
+            ),
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["promotion_policy_source"] == "hardcoded_defaults"
+        assert body["promotion_policy_error"] == "ScannerError: promotion_policy.yaml did not parse"
+
     @pytest.mark.asyncio
     async def test_recent_version_echoes_deploy_confirm_deadline_for_unconfirmed(
         self, client: AsyncClient, db_session
