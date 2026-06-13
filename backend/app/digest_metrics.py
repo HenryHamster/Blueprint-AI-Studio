@@ -408,6 +408,22 @@ async def compute_trial_arm_accumulation(
         _assign_flag_expr = (
             case((_primary_expr.is_not(None), 1), else_=0) if _has_assignment else None
         )
+        # Delivered = assignment key set AND receipt key also set (treatment ran).
+        _receipt_expr_for_delivery = func.json_extract(Task.context, f"$.{context_key}")
+        _delivered_flag_expr = (
+            case(
+                (
+                    and_(
+                        _primary_expr.is_not(None),
+                        _receipt_expr_for_delivery.is_not(None),
+                    ),
+                    1,
+                ),
+                else_=0,
+            )
+            if _has_assignment
+            else None
+        )
     else:
         _primary_expr = Task.context[_assign_key].astext
         _fallback_expr = Task.context[context_key].astext
@@ -419,6 +435,22 @@ async def compute_trial_arm_accumulation(
         succ_expr = Task.context["_first_attempt_succeeded"].astext
         _assign_flag_expr = (
             case((_primary_expr.is_not(None), 1), else_=0) if _has_assignment else None
+        )
+        # Delivered = assignment key set AND receipt key also set (treatment ran).
+        _receipt_expr_for_delivery = Task.context[context_key].astext
+        _delivered_flag_expr = (
+            case(
+                (
+                    and_(
+                        _primary_expr.is_not(None),
+                        _receipt_expr_for_delivery.is_not(None),
+                    ),
+                    1,
+                ),
+                else_=0,
+            )
+            if _has_assignment
+            else None
         )
 
     filters = [
@@ -432,13 +464,14 @@ async def compute_trial_arm_accumulation(
     with_n = with_succ = without_n = without_succ = 0
     if _has_assignment:
         stmt = (
-            select(arm_expr, succ_expr, _assign_flag_expr, func.count())
+            select(arm_expr, succ_expr, _assign_flag_expr, _delivered_flag_expr, func.count())
             .where(*filters)
-            .group_by(arm_expr, succ_expr, _assign_flag_expr)
+            .group_by(arm_expr, succ_expr, _assign_flag_expr, _delivered_flag_expr)
         )
         rows = (await session.execute(stmt)).all()
         with_assigned = with_receipt = without_assigned = without_receipt = 0
-        for arm_val, succ_val, is_assigned_val, cnt in rows:
+        with_assigned_delivered = 0
+        for arm_val, succ_val, is_assigned_val, is_delivered_val, cnt in rows:
             cnt = int(cnt)
             is_assigned = bool(is_assigned_val)
             if _json_truthy(arm_val):
@@ -447,6 +480,8 @@ async def compute_trial_arm_accumulation(
                     with_succ += cnt
                 if is_assigned:
                     with_assigned += cnt
+                    if bool(is_delivered_val):
+                        with_assigned_delivered += cnt
                 else:
                     with_receipt += cnt
             else:
@@ -494,6 +529,7 @@ async def compute_trial_arm_accumulation(
     if _has_assignment:
         result["arm_composition"] = {
             "with_assigned": with_assigned,
+            "with_assigned_delivered": with_assigned_delivered,
             "with_receipt": with_receipt,
             "without_assigned": without_assigned,
             "without_receipt": without_receipt,

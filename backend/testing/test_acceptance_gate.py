@@ -309,6 +309,7 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
             "downstream_artifact 'release-promotion-record' is reflected in "
             "the shipped changed files"
         ),
+        "proof_ref": "release-promotion-record",
     }
     consumer = _make_code_task(changed_files=["backend/app/consumer.py"])
     consumer.project_id = project_id

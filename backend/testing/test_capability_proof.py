@@ -15,6 +15,8 @@ from unittest.mock import MagicMock, patch
 
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
+    _extract_proof_ref,
+    _proof_kind_from_verdict,
     annotate_capability_proof_status,
     carry_proof_records_for_consolidation,
     enrich_problem_model_capability_proofs,
@@ -57,19 +59,24 @@ def _make_project():
 
 
 def _named_test_verdict(test_path="testing/test_foo.py::test_bar", proven=True):
+    # Matches the real stored shape written by record_code_acceptance_verdict.
     return {
         "proven": proven,
         "satisfied": proven,
-        "evidence": {"test_path": test_path},
+        "kind": "named_test",
+        "reason": f"named_test {test_path!r} was added/modified, ran green",
+        "proof_ref": test_path if proven else None,
     }
 
 
 def _artifact_verdict(artifact_id="art-123", proven=True):
+    # Matches the real stored shape written by record_code_acceptance_verdict.
     return {
         "proven": proven,
         "satisfied": proven,
-        "consumed": proven,
-        "evidence": {"artifact_id": artifact_id},
+        "kind": "downstream_artifact",
+        "reason": f"downstream_artifact {artifact_id!r} is reflected in shipped files",
+        "proof_ref": artifact_id if proven else None,
     }
 
 
@@ -82,7 +89,9 @@ class TestShouldRecordCapabilityProof:
             provides_capability="language-aware-repo-map",
             verdict=_named_test_verdict(),
         )
-        assert should_record_capability_proof(task, task.context[CODE_ACCEPTANCE_VERDICT_KEY])
+        assert should_record_capability_proof(
+            task, task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+        )
 
     def test_not_proven_returns_false(self):
         task = _make_task(
@@ -254,6 +263,67 @@ class TestRecordCapabilityProof:
         assert "cap-alpha" in recorded
         assert "cap-beta" in recorded
         assert len(project.capability_proof_records) == 2
+
+
+def test_proof_ref_and_kind_from_production_verdict_shape():
+    """proof_kind and proof_ref must reflect the real stored verdict shape.
+
+    The stored verdict (written by record_code_acceptance_verdict) carries
+    top-level ``kind`` and ``proof_ref`` keys — no ``evidence`` sub-object.
+    This test exercises _proof_kind_from_verdict and _extract_proof_ref with
+    that real shape, then drives the full record_capability_proof pipeline to
+    confirm the stamped entry carries correct provenance.
+    """
+    named_test_selector = "backend/testing/test_capability_proof.py::test_proof_ref_and_kind_from_production_verdict_shape"
+
+    # Real stored shape for a named_test proven verdict.
+    named_test_stored = {
+        "satisfied": True,
+        "proven": True,
+        "kind": "named_test",
+        "reason": f"named_test {named_test_selector!r} was added/modified, ran green",
+        "proof_ref": named_test_selector,
+    }
+    assert _proof_kind_from_verdict(named_test_stored) == "named_test"
+    assert _extract_proof_ref(named_test_stored) == named_test_selector
+
+    # Real stored shape for a downstream_artifact proven verdict.
+    artifact_stored = {
+        "satisfied": True,
+        "proven": True,
+        "kind": "downstream_artifact",
+        "reason": "downstream_artifact 'release-deploy-artifact' is reflected in shipped files",
+        "proof_ref": "release-deploy-artifact",
+    }
+    assert _proof_kind_from_verdict(artifact_stored) == "downstream_artifact"
+    assert _extract_proof_ref(artifact_stored) == "release-deploy-artifact"
+
+    # Real stored shape for a visual proven verdict.
+    visual_stored = {
+        "satisfied": True,
+        "proven": True,
+        "kind": "visual",
+        "reason": "visual acceptance evidence matches the uploaded viewport screenshot",
+        "proof_ref": "DashboardHome@375",
+    }
+    assert _proof_kind_from_verdict(visual_stored) == "visual"
+    assert _extract_proof_ref(visual_stored) == "DashboardHome@375"
+
+    # Drive the full record_capability_proof pipeline with a named_test verdict.
+    task = _make_task(
+        provides_capability="capability-proof-provenance",
+        verdict=named_test_stored,
+        commit_sha="sha-prod-shape",
+    )
+    project = _make_project()
+    with patch("app.capability_proof.flag_modified"):
+        recorded = record_capability_proof(task, project)
+
+    assert recorded == ["capability-proof-provenance"]
+    entry = project.capability_proof_records["capability-proof-provenance"][0]
+    assert entry["proof_kind"] == "named_test"
+    assert entry["proof_ref"] == named_test_selector
+    assert entry["commit_sha"] == "sha-prod-shape"
 
 
 # ── trial measurement → durable adoption verdict ──────────────────────────────

@@ -5530,6 +5530,94 @@ async def test_batch_cap_does_not_shrink_under_fleet_load(db_session, mocker):
 
 
 @_pytest.mark.asyncio
+async def test_fresh_depends_on_indices_not_corrupted_by_prior_deferred_prepend(
+    db_session, mocker
+):
+    """A fresh finding's depends_on_indices are 0-based into the agent's own
+    (fresh-only) output. When prior-cycle deferred findings are prepended to the
+    combined findings list, each fresh index must be shifted up by the number of
+    prepended findings so it still resolves to the intended fresh sibling — not to
+    a recovered deferred finding that happened to occupy the same raw slot.
+
+    Setup: one prior deferred finding (occupies combined-list index 0); two fresh
+    findings A (combined index 1) and B (combined index 2) where B declares
+    depends_on_indices=[0] — meaning "depends on fresh sibling at position 0" in
+    the agent's view (i.e., finding A). After the rebase the index becomes [1],
+    resolving to A's child task. Without the fix the raw index [0] resolves to the
+    prior deferred finding's child task, wiring the wrong edge."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-prq-rebase"
+    )
+
+    # Prior-cycle deferred finding; will be prepended at combined-list index 0.
+    prior = _make_finding(title="Prior deferred finding", direction_id=direction["id"])
+    prior["deferred_reason"] = "low_actionability"
+    prior["deferred_count"] = 1
+
+    # Fresh findings from the current agent run.
+    # finding_a is at fresh-index 0 → combined-index 1 after prepend.
+    finding_a = _make_finding(title="Foundation fresh A", direction_id=direction["id"])
+    # finding_b depends on fresh-index 0 (finding_a); combined-index 2 after prepend.
+    finding_b = _make_finding(title="Dependent fresh B", direction_id=direction["id"])
+    finding_b["depends_on_indices"] = [0]  # agent's view: sibling at fresh position 0
+
+    # Inject the prior deferred finding so _handle_research_completion will prepend it.
+    task.context = dict(task.context or {})
+    task.context["prior_deferred_findings"] = [prior]
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(task, "context")
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Filter out memo/notification tasks.
+    spawn_children = [
+        c for c in children if (c.first_payload or {}).get("type") != "memo"
+    ]
+
+    child_by_title = {c.title: c for c in spawn_children}
+    assert "Foundation fresh A" in child_by_title, (
+        "finding_a must spawn as a child task"
+    )
+    assert "Dependent fresh B" in child_by_title, "finding_b must spawn as a child task"
+
+    child_a = child_by_title["Foundation fresh A"]
+    child_b = child_by_title["Dependent fresh B"]
+
+    assert str(child_a.id) in (child_b.depends_on or []), (
+        "finding_b's depends_on edge must point at finding_a's child task "
+        "(the intended fresh sibling), not the prior deferred finding"
+    )
+    # Prior deferred finding's child (if any) must NOT be in finding_b's depends_on.
+    prior_children = [c for c in spawn_children if c.title == prior["title"]]
+    for pc in prior_children:
+        assert str(pc.id) not in (child_b.depends_on or []), (
+            "finding_b must not be wired to the prior deferred finding — "
+            "its depends_on_indices was not correctly rebased"
+        )
+
+
+@_pytest.mark.asyncio
 async def test_independent_deferred_finding_keeps_throttle(db_session, mocker):
     """A deferred finding with NO live dependent keeps the existing throttle: it is
     shelved under its own (low_actionability) reason and is NOT re-tagged as a

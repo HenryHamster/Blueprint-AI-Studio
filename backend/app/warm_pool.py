@@ -660,6 +660,11 @@ async def lease_idle_pool_vm(
                 expired_reservation_lane_id,
                 member.vm_instance_id,
             )
+            await record_lane_reservation_cause(
+                session,
+                expired_reservation_lane_id,
+                "expired_before_fix",
+            )
     logger.info(
         "[WARM-POOL] leased pool VM vm_instance_id=%s project=%s task=%s "
         "lease_expires_at=%s",
@@ -853,7 +858,7 @@ async def clear_lane_warm_workspace_if_matching_member(
         update(ImprovementLane)
         .where(
             ImprovementLane.id == uuid.UUID(str(lane_id)),
-            ImprovementLane.workspace_state == "WARM_RESERVED",
+            ImprovementLane.workspace_state != "COLD",
             ImprovementLane.workspace_vm_instance_id == workspace_vm_instance_id,
         )
         .values(workspace_state="COLD", workspace_vm_instance_id=None)
@@ -986,7 +991,9 @@ async def try_pool_dispatch(
     # allowlist ⇒ fleet-wide (is_project_warm_pool_scoped returns True for all),
     # so legacy behavior is byte-identical.
     if not is_project_warm_pool_scoped(task.project_id):
-        record_pool_lease_miss("out_of_scope", account=required_account, project_id=task.project_id)
+        record_pool_lease_miss(
+            "out_of_scope", account=required_account, project_id=task.project_id
+        )
         return None
 
     if is_warm_pool_suppressed():
@@ -1065,7 +1072,9 @@ async def try_pool_dispatch(
             session, project_id=task.project_id
         )
         reason = "no_compatible_member" if idle_present else "no_idle_member"
-        record_pool_lease_miss(reason, account=required_account, project_id=task.project_id)
+        record_pool_lease_miss(
+            reason, account=required_account, project_id=task.project_id
+        )
         # Best-effort workspace-state correction: the lane cannot stay
         # WARM_RESERVED when no compatible member is available — its reservation
         # is stale or already gone. Degrade to COLD so the lane's next phase

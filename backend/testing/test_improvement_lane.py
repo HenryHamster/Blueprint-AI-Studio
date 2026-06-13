@@ -1734,3 +1734,177 @@ async def test_sweep_stranded_lanes_class3_retires_lane_releases_reservation(
     await db.refresh(member)
     assert member.reserved_lane_id is None
     assert member.reservation_expires_at is None
+
+
+# ---------------------------------------------------------------------------
+# cas_transition — terminal transitions reset workspace fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_terminal_transition_resets_workspace_state_to_cold(db: AsyncSession):
+    """A lane transitioning to a terminal status (KILLED) resets workspace_state
+    to COLD and clears workspace_vm_instance_id."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/ws-kill",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    lane.workspace_state = "LEASED"
+    lane.workspace_vm_instance_id = "pool-vm-ws-test-1"
+    await db.commit()
+
+    updated = await cas_transition(
+        db,
+        lane.id,
+        ImprovementLaneStatus.ACTIVE,
+        ImprovementLaneStatus.KILLED,
+    )
+    await db.commit()
+
+    assert updated.status == ImprovementLaneStatus.KILLED.value
+    assert updated.workspace_state == "COLD"
+    assert updated.workspace_vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_transition_retired_resets_workspace_state_to_cold(
+    db: AsyncSession,
+):
+    """A lane transitioning to RETIRED also resets workspace_state and clears the VM ref."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/ws-retire",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    lane.workspace_state = "WARM_RESERVED"
+    lane.workspace_vm_instance_id = "pool-vm-ws-test-2"
+    await db.commit()
+
+    updated = await cas_transition(
+        db,
+        lane.id,
+        ImprovementLaneStatus.PARKED,
+        ImprovementLaneStatus.RETIRED,
+    )
+    await db.commit()
+
+    assert updated.status == ImprovementLaneStatus.RETIRED.value
+    assert updated.workspace_state == "COLD"
+    assert updated.workspace_vm_instance_id is None
+
+
+# ---------------------------------------------------------------------------
+# clear_lane_warm_workspace_if_matching_member — covers LEASED state
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_clear_lane_warm_workspace_if_matching_member_clears_leased_state(
+    db: AsyncSession,
+):
+    """clear_lane_warm_workspace_if_matching_member clears a lane in LEASED state,
+    not just WARM_RESERVED, when the VM instance ID matches."""
+    from app.warm_pool import clear_lane_warm_workspace_if_matching_member
+
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/ws-clear-leased",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    lane.workspace_state = "LEASED"
+    lane.workspace_vm_instance_id = "pool-vm-leased-clear-1"
+    await db.commit()
+
+    cleared = await clear_lane_warm_workspace_if_matching_member(
+        db, lane.id, "pool-vm-leased-clear-1"
+    )
+    await db.commit()
+
+    assert cleared is True
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.workspace_state == "COLD"
+    assert refreshed.workspace_vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_clear_lane_warm_workspace_if_matching_member_clears_warm_reserved(
+    db: AsyncSession,
+):
+    """clear_lane_warm_workspace_if_matching_member still clears WARM_RESERVED lanes."""
+    from app.warm_pool import clear_lane_warm_workspace_if_matching_member
+
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/ws-clear-reserved",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    lane.workspace_state = "WARM_RESERVED"
+    lane.workspace_vm_instance_id = "pool-vm-warm-reserved-clear-1"
+    await db.commit()
+
+    cleared = await clear_lane_warm_workspace_if_matching_member(
+        db, lane.id, "pool-vm-warm-reserved-clear-1"
+    )
+    await db.commit()
+
+    assert cleared is True
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.workspace_state == "COLD"
+    assert refreshed.workspace_vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_clear_lane_warm_workspace_if_matching_member_noop_on_cold(
+    db: AsyncSession,
+):
+    """clear_lane_warm_workspace_if_matching_member is a no-op for COLD lanes."""
+    from app.warm_pool import clear_lane_warm_workspace_if_matching_member
+
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/ws-cold-noop",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    lane.workspace_state = "COLD"
+    lane.workspace_vm_instance_id = None
+    await db.commit()
+
+    cleared = await clear_lane_warm_workspace_if_matching_member(
+        db, lane.id, "any-vm-id"
+    )
+    await db.commit()
+
+    assert cleared is False
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.workspace_state == "COLD"

@@ -2406,9 +2406,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 _orig_at = f.get("originally_researched_at")
                 if _orig_at:
                     try:
-                        _orig_dt = datetime.fromisoformat(_orig_at)
-                        if _orig_dt.tzinfo is None:
-                            _orig_dt = _orig_dt.replace(tzinfo=timezone.utc)
+                        _orig_dt = datetime.fromisoformat(_orig_at).replace(tzinfo=None)
                         if _orig_dt < _ttl_cutoff:
                             _expired_count += 1
                             continue

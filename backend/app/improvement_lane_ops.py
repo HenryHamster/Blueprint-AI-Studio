@@ -138,6 +138,8 @@ async def cas_transition(
     ):
         lane.retired_at = now
         lane.current_task_id = None
+        lane.workspace_state = "COLD"
+        lane.workspace_vm_instance_id = None
 
     lane.updated_at = now
     return lane

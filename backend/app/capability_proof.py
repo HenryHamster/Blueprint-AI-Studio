@@ -46,39 +46,26 @@ _CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 
 
 def _extract_proof_ref(verdict: dict) -> str | None:
-    """Return the most specific proof reference from a verdict dict."""
-    # named_test: use test_path (the declared test selector)
-    evidence = verdict.get("evidence") or {}
-    if isinstance(evidence, dict):
-        test_path = evidence.get("test_path") or evidence.get("named_test")
-        if test_path:
-            return str(test_path)
-        artifact_id = evidence.get("artifact_id") or evidence.get("downstream_artifact")
-        if artifact_id:
-            return str(artifact_id)
-    # Fall back to top-level fields some older verdict shapes use.
-    test_path = verdict.get("test_path")
-    if test_path:
-        return str(test_path)
-    artifact_id = verdict.get("artifact_id")
-    if artifact_id:
-        return str(artifact_id)
+    """Return the proof reference from a stored verdict dict.
+
+    The stored verdict (written by acceptance_gate.record_code_acceptance_verdict)
+    carries a top-level ``proof_ref`` key set at evaluation time.
+    """
+    proof_ref = verdict.get("proof_ref")
+    if proof_ref:
+        return str(proof_ref)
     return None
 
 
 def _proof_kind_from_verdict(verdict: dict) -> str:
-    """Derive the proof kind label from a proven verdict dict."""
-    evidence = verdict.get("evidence") or {}
-    if isinstance(evidence, dict):
-        if evidence.get("test_path") or evidence.get("named_test"):
-            return _PROOF_KIND_NAMED_TEST
-        if evidence.get("artifact_id") or evidence.get("downstream_artifact"):
-            return _PROOF_KIND_DOWNSTREAM_ARTIFACT
-    if verdict.get("test_path"):
-        return _PROOF_KIND_NAMED_TEST
-    if verdict.get("artifact_id"):
-        return _PROOF_KIND_DOWNSTREAM_ARTIFACT
-    return _PROOF_KIND_NAMED_TEST  # default when evidence shape is unknown
+    """Derive the proof kind label from a stored verdict dict.
+
+    The stored verdict carries a top-level ``kind`` key set at evaluation time.
+    """
+    kind = verdict.get("kind")
+    if kind:
+        return str(kind)
+    return _PROOF_KIND_NAMED_TEST  # default when kind is absent
 
 
 def should_record_capability_proof(task: Any, verdict: Any) -> bool:
@@ -146,9 +133,7 @@ def enrich_problem_model_capability_proofs(
         )
         entry2["proof_status"] = "proven" if entries else "unproven"
         if entries:
-            entry2["proof_records"] = [
-                dict(proof_entry) for proof_entry in entries
-            ]
+            entry2["proof_records"] = [dict(proof_entry) for proof_entry in entries]
         annotated_caps.append(entry2)
 
     annotated["capabilities"] = annotated_caps

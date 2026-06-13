@@ -2943,3 +2943,227 @@ class TestPersistTrialVerdictsNoticeEmission:
         mock_notice, mock_refresh = await _run_case({"repo_map": decided_entry}, repeated_entry)
         mock_notice.assert_not_called()
         mock_refresh.assert_not_called()
+
+
+# ── engagement guard for generic trials ──────────────────────────────────────
+
+
+class TestEngagementGuard:
+    """Generic-trial engagement guard: futility REJECT suppressed when delivery low."""
+
+    def _cfg(self, **overrides):
+        base = {
+            "min_n_per_arm": 30,
+            "adopt_lift": 0.05,
+            "reject_lift": -0.03,
+            "futility_n": 90,
+            "futility_min_delivery_rate": 0.50,
+        }
+        base.update(overrides)
+        return base
+
+    # ── acceptance test (named by spec) ──────────────────────────────────────
+
+    def test_generic_trial_futility_blocked_when_treatment_not_delivered(self):
+        """Acceptance: futility bound reached but delivery rate < 0.50 → continue-trial."""
+        comp = {
+            "with_assigned": 90,
+            "with_assigned_delivered": 27,  # 27/90 = 0.30 < 0.50
+            "with_receipt": 0,
+            "without_assigned": 90,
+            "without_receipt": 0,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.01,
+            n_with=90,
+            n_without=90,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "treatment_not_engaging"
+        assert entry.get("immediate_alert") is True
+        assert "delivery_rate" in entry
+        assert abs(entry["delivery_rate"] - 0.30) < 0.01
+
+    # ── additional coverage ───────────────────────────────────────────────────
+
+    def test_futility_bound_low_delivery_returns_continue_treatment_not_engaging(self):
+        # 30/90 = 0.333 < 0.50 → engage guard fires
+        comp = {
+            "with_assigned": 90,
+            "with_assigned_delivered": 30,
+            "with_receipt": 0,
+            "without_assigned": 90,
+            "without_receipt": 0,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.02,
+            n_with=90,
+            n_without=90,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "treatment_not_engaging"
+        assert entry.get("immediate_alert") is True
+
+    def test_futility_bound_high_delivery_still_rejects(self):
+        # 50/90 = 0.556 >= 0.50 → guard does not fire, futility REJECT stands
+        comp = {
+            "with_assigned": 90,
+            "with_assigned_delivered": 50,
+            "with_receipt": 0,
+            "without_assigned": 90,
+            "without_receipt": 0,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.01,
+            n_with=90,
+            n_without=90,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "reject"
+        assert entry["verdict_reason"] == "futility_bound_reached"
+        assert not entry.get("immediate_alert")
+
+    def test_engagement_guard_absent_when_arm_composition_none(self):
+        # No arm_composition → guard skipped, reject stands
+        entry = evaluate_trial_verdict(
+            lift=0.01,
+            n_with=90,
+            n_without=90,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "reject"
+        assert entry["verdict_reason"] == "futility_bound_reached"
+
+    def test_engagement_guard_absent_when_with_assigned_delivered_missing(self):
+        # arm_composition present but no with_assigned_delivered key → guard skipped
+        comp = {
+            "with_assigned": 90,
+            "with_receipt": 0,
+            "without_assigned": 90,
+            "without_receipt": 0,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.01,
+            n_with=90,
+            n_without=90,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "reject"
+        assert entry["verdict_reason"] == "futility_bound_reached"
+
+    def test_engagement_guard_skipped_when_with_assigned_zero(self):
+        # with_assigned=0 → engagement guard division is skipped.
+        # The purity gate then fires (with_assigned < min_n) before the reject lands.
+        comp = {
+            "with_assigned": 0,
+            "with_assigned_delivered": 0,
+            "with_receipt": 90,
+            "without_assigned": 0,
+            "without_receipt": 90,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.01,
+            n_with=90,
+            n_without=90,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        # Purity gate fires (0 < min_n=30) — not the engagement guard.
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insufficient_assigned_arm_data"
+
+    def test_configurable_futility_min_delivery_rate(self):
+        # Custom threshold of 0.70 means 0.60 delivery triggers the guard
+        comp = {
+            "with_assigned": 90,
+            "with_assigned_delivered": 54,  # 54/90 = 0.60 < 0.70
+            "with_receipt": 0,
+            "without_assigned": 90,
+            "without_receipt": 0,
+        }
+        cfg = self._cfg(futility_min_delivery_rate=0.70)
+        entry = evaluate_trial_verdict(
+            lift=0.01,
+            n_with=90,
+            n_without=90,
+            config=cfg,
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "treatment_not_engaging"
+
+    def test_delivery_rate_recorded_in_entry(self):
+        # entry["delivery_rate"] and immediate_alert=True must be present
+        comp = {
+            "with_assigned": 90,
+            "with_assigned_delivered": 18,  # 18/90 = 0.20
+            "with_receipt": 0,
+            "without_assigned": 90,
+            "without_receipt": 0,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.01,
+            n_with=90,
+            n_without=90,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["delivery_rate"] == pytest.approx(0.20, abs=0.01)
+        assert entry["immediate_alert"] is True
+
+    def test_treatment_not_engaging_supersedes_prior_futility_reject(self):
+        """treatment_not_engaging in _SUFFICIENT_DATA_CONTINUE_REASONS allows overwrite."""
+        from unittest.mock import patch
+
+        project = MagicMock()
+        prior = {
+            "verdict": "reject",
+            "verdict_reason": "futility_bound_reached",
+            "lift": 0.01,
+            "n_with": 90,
+            "n_without": 90,
+        }
+        project.capability_adoption_verdicts = {"repo_map": prior}
+        newer = {
+            "verdict": "continue-trial",
+            "verdict_reason": "treatment_not_engaging",
+            "immediate_alert": True,
+            "delivery_rate": 0.20,
+            "lift": 0.01,
+            "n_with": 90,
+            "n_without": 90,
+        }
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", newer)
+
+        assert project.capability_adoption_verdicts["repo_map"]["verdict"] == "continue-trial"
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict_reason"]
+            == "treatment_not_engaging"
+        )
+
+    def test_engagement_guard_does_not_fire_below_futility_n(self):
+        # Arms not yet at futility_n → ordinary ambiguous_lift, guard never checked
+        comp = {
+            "with_assigned": 50,
+            "with_assigned_delivered": 5,  # very low delivery, but below futility_n
+            "with_receipt": 0,
+            "without_assigned": 50,
+            "without_receipt": 0,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.02,
+            n_with=50,
+            n_without=50,
+            config=self._cfg(),
+            arm_composition=comp,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "ambiguous_lift"

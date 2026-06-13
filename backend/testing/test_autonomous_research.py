@@ -8824,6 +8824,90 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
 
 
 @pytest.mark.asyncio
+async def test_collection_expires_stale_deferred_findings(db_session):
+    """A deferred finding whose originally_researched_at is older than the TTL is
+    excluded at collection time and counted as expired, keeping the injected payload
+    bounded and the expiry observability honest."""
+    import app.shared_state as _ss
+
+    # Disable the completed-research cooldown so the prior COMPLETED task does not
+    # block spawning — we are testing the TTL expiry logic, not the cooldown guard.
+    _ss.runtime_config["completed_research_cooldown_minutes"] = 0
+    try:
+        direction_id = "d-ttl-test01"
+        direction = _active_direction(direction_id, "TTL expiry test direction")
+        project = Project(
+            name="TTL Expiry Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+            vision={"purpose": "test"},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        ttl_days = 7
+        # Stale finding: originally researched 8 days ago (beyond the 7-day default TTL)
+        stale_ts = (datetime.utcnow() - timedelta(days=ttl_days + 1)).isoformat()
+        stale_finding = _make_finding("Stale TTL finding", direction_id)
+        stale_finding["originally_researched_at"] = stale_ts
+
+        # Fresh finding: originally researched 1 day ago (within TTL)
+        fresh_ts = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        fresh_finding = _make_finding("Fresh TTL finding", direction_id)
+        fresh_finding["originally_researched_at"] = fresh_ts
+
+        prev_completed = Task(
+            project_id=project.id,
+            title="Research: prior cycle",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [direction],
+                    "base_branch": "main",
+                    "current_direction_id": direction_id,
+                }
+            ],
+            context={"deferred_findings": [stale_finding, fresh_finding]},
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(prev_completed)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.id != prev_completed.id,
+                Task.created_by == "ORCHESTRATOR",
+            )
+        )
+        new_tasks = [
+            t
+            for t in result.scalars().all()
+            if t.first_payload.get("type") == "research"
+        ]
+        assert len(new_tasks) == 1, (
+            f"Expected one new research task, got {len(new_tasks)}"
+        )
+        new_task = new_tasks[0]
+        prior = (new_task.context or {}).get("prior_deferred_findings", [])
+        titles = [f.get("title") for f in prior]
+        assert "Fresh TTL finding" in titles, (
+            f"Fresh deferred finding must be injected, got: {titles}"
+        )
+        assert "Stale TTL finding" not in titles, (
+            f"Stale deferred finding older than TTL must be excluded, got: {titles}"
+        )
+    finally:
+        _ss.runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
 async def test_deferred_research_recovery_filters_before_cap_and_keeps_scope(
     db_session,
 ):

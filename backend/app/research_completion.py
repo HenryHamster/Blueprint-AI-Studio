@@ -2467,6 +2467,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
                 f"to findings list for task {task.id}"
             )
+            # Rebase fresh findings' intra-batch depends_on_indices before the
+            # prepend. The agent emits 0-based indices into its own (fresh-only)
+            # findings array, so each index must be shifted up by the number of
+            # recovered findings that will occupy the front of the combined list.
+            _n_prepended = len(prior_actionable)
+            for _fresh_f in findings:
+                _deps = _fresh_f.get("depends_on_indices")
+                if _deps:
+                    _fresh_f["depends_on_indices"] = [j + _n_prepended for j in _deps]
             findings = prior_actionable + findings
 
     # Adversarial spawn-gate (DEFAULT ON). When enabled and no adversarial

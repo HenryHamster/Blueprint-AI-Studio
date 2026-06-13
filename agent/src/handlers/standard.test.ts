@@ -4117,9 +4117,11 @@ describe('operator_requested_review_for branch-existence check', () => {
 });
 
 // ── Repo-map arm assignment heartbeat ────────────────────────────────────────
-// TASK_ID = 'task-123' has a djb2 hash of ~0.782.
-//   fraction=0.5  → 0.782 >= 0.5 → treatment arm (repoMapArm=true)
-//   fraction=1.0  → 0.782 <  1.0 → holdback arm  (repoMapArm=false)
+// TASK_ID = 'task-123' arm assignments under the salted djb2 hash ('repo_map:task-123'):
+//   salted hash ≈ 0.089
+//   fraction=0.05 → 0.089 >= 0.05 → treatment arm (repoMapArm=true)
+//   fraction=0.5  → 0.089 <  0.5  → holdback arm  (repoMapArm=false)
+//   fraction=1.0  → 0.089 <  1.0  → holdback arm  (repoMapArm=false)
 
 /** Extract the sendHeartbeatSync options dict that contains had_repo_map. */
 function capturedRepoMapHeartbeatOpts(): Record<string, unknown> | undefined {
@@ -4141,6 +4143,24 @@ describe('receipt-only capability trial arm assignment', () => {
     expect(assignCapabilityHoldbackArm(TASK_ID, 'module_interfaces', 0.5)).toBe(false);
     expect(assignCapabilityHoldbackArm(TASK_ID, 'related_tests', 0.5)).toBe(true);
     expect(assignCapabilityHoldbackArm(TASK_ID, 'affected_consumers', 0.5)).toBe(true);
+  });
+
+  it('repo_map and diagnostics_after_edit arms diverge — computed from distinct salted hashes', () => {
+    // If both trials used the same unsalted hash (the pre-fix bug), every task
+    // would get identical assignments and this loop would never find divergence.
+    // Finding at least one task where the arms differ proves they are computed
+    // from independent salted inputs (capability:taskId).
+    let foundDivergence = false;
+    for (let i = 0; i < 200; i++) {
+      const taskId = `task-salt-${i}`;
+      const repoMap = assignCapabilityHoldbackArm(taskId, 'repo_map', 0.5);
+      const diag = assignCapabilityHoldbackArm(taskId, 'diagnostics_after_edit', 0.5);
+      if (repoMap !== diag) {
+        foundDivergence = true;
+        break;
+      }
+    }
+    expect(foundDivergence).toBe(true);
   });
 
   it('suppresses only held-back capability sections and emits independent create-task arms', async () => {
@@ -4289,7 +4309,8 @@ describe('repo-map arm assignment in sendHeartbeatSync', () => {
       description: '',
       context: {},
       project_context: {},
-      project_metadata: { repo_map_holdback_fraction: 0.5 },
+      // salted hash('repo_map:task-123') ≈ 0.089; fraction=0.05 → 0.089 >= 0.05 → treatment
+      project_metadata: { repo_map_holdback_fraction: 0.05 },
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const opts = capturedRepoMapHeartbeatOpts();
@@ -4299,14 +4320,14 @@ describe('repo-map arm assignment in sendHeartbeatSync', () => {
   });
 
   it('sends repo_map_arm=true and had_repo_map=false when treatment arm with empty buildRepoMap result', async () => {
-    // Treatment arm assigned (fraction=0.5, TASK_ID hash=0.782 >= 0.5) but buildRepoMap returns ''
+    // Treatment arm assigned (salted hash('repo_map:task-123') ≈ 0.089 >= fraction 0.05) but buildRepoMap returns ''
     vi.mocked(buildRepoMap).mockReturnValue('');
     const task = {
       title: 'Task',
       description: '',
       context: {},
       project_context: {},
-      project_metadata: { repo_map_holdback_fraction: 0.5 },
+      project_metadata: { repo_map_holdback_fraction: 0.05 },
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const opts = capturedRepoMapHeartbeatOpts();

@@ -28,6 +28,12 @@ _DEFAULT_MIN_N_PER_ARM = 30  # minimum tasks per arm before deciding
 _DEFAULT_ADOPT_LIFT = 0.05  # lift >= this → adopt
 _DEFAULT_REJECT_LIFT = -0.03  # lift <= this → reject
 _DEFAULT_FUTILITY_N_MULTIPLIER = 3  # futility_n = min_n_per_arm * this
+# Engagement guard: at the futility bound, suppress REJECT when the fraction of
+# with-arm-assigned tasks that actually received the capability is below this
+# threshold.  A trial where the treatment was never delivered cannot produce a
+# valid futility verdict — the measured (near-zero) lift is an artifact of
+# non-delivery, not a genuine null effect.
+_DEFAULT_FUTILITY_MIN_DELIVERY_RATE = 0.50
 
 
 def _default_config() -> dict[str, Any]:
@@ -36,6 +42,7 @@ def _default_config() -> dict[str, Any]:
         "adopt_lift": _DEFAULT_ADOPT_LIFT,
         "reject_lift": _DEFAULT_REJECT_LIFT,
         "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
+        "futility_min_delivery_rate": _DEFAULT_FUTILITY_MIN_DELIVERY_RATE,
     }
 
 
@@ -81,7 +88,9 @@ LANE_PILOT_CHECKPOINT_RECEIPT_KEY = "_review_fix_checkpoint"
 
 _DECIDED_VERDICTS = frozenset({"adopt", "reject", "ADOPT", "KILL"})
 _CONTINUE_VERDICTS = frozenset({"continue-trial", "CONTINUE"})
-_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset({"ambiguous_lift", "receipt_only_trial"})
+_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset(
+    {"ambiguous_lift", "receipt_only_trial", "treatment_not_engaging"}
+)
 
 
 class LanePilotAggregates(TypedDict, total=False):
@@ -315,6 +324,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
             "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
+            "futility_min_delivery_rate": _DEFAULT_FUTILITY_MIN_DELIVERY_RATE,
         },
     },
     {
@@ -326,6 +336,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
             "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
+            "futility_min_delivery_rate": _DEFAULT_FUTILITY_MIN_DELIVERY_RATE,
         },
     },
     {
@@ -337,6 +348,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
             "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
+            "futility_min_delivery_rate": _DEFAULT_FUTILITY_MIN_DELIVERY_RATE,
         },
     },
     {
@@ -348,6 +360,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
             "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
+            "futility_min_delivery_rate": _DEFAULT_FUTILITY_MIN_DELIVERY_RATE,
         },
     },
     {
@@ -359,6 +372,7 @@ TRIAL_DEFINITIONS: list[TrialDefinition] = [
             "adopt_lift": _DEFAULT_ADOPT_LIFT,
             "reject_lift": _DEFAULT_REJECT_LIFT,
             "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
+            "futility_min_delivery_rate": _DEFAULT_FUTILITY_MIN_DELIVERY_RATE,
         },
     },
     {
@@ -442,6 +456,7 @@ def evaluate_trial_verdict(
     adopt_threshold = float(cfg["adopt_lift"])
     reject_threshold = float(cfg["reject_lift"])
     futility_n = int(cfg["futility_n"])
+    futility_min_delivery_rate = float(cfg["futility_min_delivery_rate"])
 
     entry: dict[str, Any] = {
         "lift": lift,
@@ -476,6 +491,23 @@ def evaluate_trial_verdict(
     else:
         # Lift is ambiguous — check futility bound before continuing the trial.
         if n_with >= futility_n and n_without >= futility_n:
+            # Engagement guard: if the with-arm delivery rate is below the
+            # threshold, the treatment was never truly delivered — the
+            # near-zero lift is an artifact of non-delivery, not a genuine
+            # null effect.  Emit continue-trial so the operator can diagnose
+            # the infrastructure gap rather than durably rejecting a
+            # capability that was never trialed.
+            if arm_composition is not None:
+                _with_assigned = int(arm_composition.get("with_assigned") or 0)
+                _with_delivered = arm_composition.get("with_assigned_delivered")
+                if _with_delivered is not None and _with_assigned > 0:
+                    _delivery_rate = int(_with_delivered) / _with_assigned
+                    if _delivery_rate < futility_min_delivery_rate:
+                        entry["delivery_rate"] = round(_delivery_rate, 4)
+                        entry["immediate_alert"] = True
+                        entry["verdict"] = "continue-trial"
+                        entry["verdict_reason"] = "treatment_not_engaging"
+                        return entry
             verdict = "reject"
             verdict_reason = "futility_bound_reached"
         else:

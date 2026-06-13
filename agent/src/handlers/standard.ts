@@ -118,13 +118,6 @@ function resolvePrTitlePrefix(task: Record<string, unknown>): string {
   return typeof prefix === 'string' ? prefix.trim() : '';
 }
 
-function stableTaskHashFraction(taskId: string): number {
-  let h = 5381;
-  for (let i = 0; i < taskId.length; i++) {
-    h = ((h << 5) + h + taskId.charCodeAt(i)) >>> 0;
-  }
-  return h / 0xffffffff;
-}
 
 export interface StandardHandlerOpts {
   taskId: string;
@@ -162,7 +155,7 @@ export interface StandardHandlerOpts {
   };
 }
 
-type CapabilityHoldbackName = 'module_interfaces' | 'related_tests' | 'affected_consumers';
+type CapabilityHoldbackName = 'module_interfaces' | 'related_tests' | 'affected_consumers' | 'repo_map' | 'diagnostics_after_edit';
 
 function holdbackFraction(meta: Record<string, unknown> | undefined, capability: CapabilityHoldbackName): number {
   const value = meta?.[`${capability}_holdback_fraction`];
@@ -488,11 +481,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     : 0.0;
   let repoMapArm: boolean | null = null;
   if (holdbackFraction > 0) {
-    // djb2 hash of the taskId string -> stable float in [0, 1)
-    const taskHash = stableTaskHashFraction(taskId);
-    repoMapArm = taskHash >= holdbackFraction; // true = treatment, false = holdback
+    repoMapArm = assignCapabilityHoldbackArm(taskId, 'repo_map', holdbackFraction) ?? true;
     if (!repoMapArm) {
-      sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (hash=${taskHash.toFixed(4)}, fraction=${holdbackFraction}) — suppressing repo map\n`);
+      sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (fraction=${holdbackFraction}) — suppressing repo map\n`);
       repoMap = '';
     }
   }
@@ -508,10 +499,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   let diagnosticsAfterEditArm: boolean | null = null;
   let hadDiagnosticsAfterEdit: boolean | undefined;
   if (diagnosticsEligible && diagnosticsHoldbackFraction > 0) {
-    const taskHash = stableTaskHashFraction(taskId);
-    diagnosticsAfterEditArm = taskHash >= diagnosticsHoldbackFraction;
+    diagnosticsAfterEditArm = assignCapabilityHoldbackArm(taskId, 'diagnostics_after_edit', diagnosticsHoldbackFraction) ?? true;
     if (!diagnosticsAfterEditArm) {
-      sendLog(ws, `[DiagnosticsAfterEdit] holdback arm for task ${taskId} (hash=${taskHash.toFixed(4)}, fraction=${diagnosticsHoldbackFraction}) - not writing Claude hook\n`);
+      sendLog(ws, `[DiagnosticsAfterEdit] holdback arm for task ${taskId} (fraction=${diagnosticsHoldbackFraction}) - not writing Claude hook\n`);
     } else if (diagnosticsEnabled) {
       hadDiagnosticsAfterEdit = writeDiagnosticsAfterEditHook();
       if (!hadDiagnosticsAfterEdit) {
