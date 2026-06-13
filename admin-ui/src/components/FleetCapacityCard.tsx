@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { Skeleton } from './DashboardMetricCards';
 import { snapshotFreshness } from '../utils/time';
@@ -22,6 +23,12 @@ const _SAT_RANK: Record<NonNullable<FleetUtilizationResponse['saturation']>, num
 function pct(v: number | null | undefined): string {
   if (v == null) return '—';
   return `${Math.round(v * 100)}%`;
+}
+
+/** Render a VM count: amber "unknown" when null, the number when known (including 0). */
+function renderCount(v: number | null | undefined): ReactNode {
+  if (v == null) return <span className="text-amber-400">unknown</span>;
+  return <>{v}</>;
 }
 
 function shortSha(sha: string | null | undefined): string {
@@ -145,24 +152,27 @@ export function FleetCapacityCard({
                 </div>
                 <div className="flex justify-between gap-2">
                   <span className="text-neutral-500">Active task VMs</span>
-                  <span className="font-mono text-neutral-300 text-right">{data.active_task_vms ?? '—'}</span>
+                  <span className="font-mono text-neutral-300 text-right">{renderCount(data.active_task_vms)}</span>
                 </div>
                 <div className="flex justify-between gap-2">
                   <span className="text-neutral-500">Managed VM inventory</span>
-                  <span className="font-mono text-neutral-300 text-right">{data.managed_vm_count ?? '—'}</span>
+                  <span className="font-mono text-neutral-300 text-right">{renderCount(data.managed_vm_count)}</span>
                 </div>
                 <div className="flex justify-between gap-2">
                   <span className="text-neutral-500">Idle pool adjustment</span>
-                  <span className="font-mono text-neutral-300 text-right">{data.idle_pool_vms ?? '—'}</span>
+                  <span className="font-mono text-neutral-300 text-right">{renderCount(data.idle_pool_vms)}</span>
                 </div>
                 <div className="flex justify-between gap-2 sm:col-span-2">
                   <span className="text-neutral-500">Slots available</span>
                   <span className="font-mono text-neutral-300 text-right">
-                    {data.vm_slots_available ?? '—'}
+                    {renderCount(data.vm_slots_available)}
                     {data.vm_saturation ? ` · ${_SAT_STYLE[data.vm_saturation]?.label ?? 'Unknown'}` : ''}
                   </span>
                 </div>
               </div>
+              {data.vm_saturation == null && (
+                <p className="text-[10px] text-amber-400/80">VM measurements partially unavailable — slot saturation unknown</p>
+              )}
             </div>
           )}
           {data.saturation == null && (

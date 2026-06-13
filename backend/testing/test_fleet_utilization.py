@@ -261,18 +261,22 @@ async def test_vm_slot_fields_with_session(monkeypatch):
             # First call returns active count, second returns rows for occupancy
             return _FakeResult()
 
-    # Patch count_idle_pool_vms to return 1
     async def _fake_idle(session, **kw):
         return 1
 
+    async def _fake_orphaned(session, **kw):
+        return 0
+
     monkeypatch.setattr(warm_pool, "count_idle_pool_vms", _fake_idle)
+    monkeypatch.setattr(warm_pool, "count_orphaned_leased_pool_vms", _fake_orphaned)
 
     snap = await get_fleet_utilization_snapshot(session=_FakeSession())
     assert snap["vm_cap"] == 10
     assert snap["active_task_vms"] == 3
     assert snap["managed_vm_count"] == 6
     assert snap["idle_pool_vms"] == 1
-    # effective = max(3, 6-1) = 5; slots_available = 10-5 = 5
+    assert snap["orphaned_leased_vms"] == 0
+    # effective = max(3, 6-1-0) = 5; slots_available = 10-5 = 5
     assert snap["vm_slots_available"] == 5
     assert snap["vm_saturation"] == "healthy"  # 5/10 = 0.5 < 0.70
 
@@ -365,11 +369,66 @@ async def test_vm_saturation_effective_uses_max_of_active_vs_managed(monkeypatch
     async def _fake_idle(session, **kw):
         return 2
 
+    async def _fake_orphaned(session, **kw):
+        return 0
+
     monkeypatch.setattr(warm_pool, "count_idle_pool_vms", _fake_idle)
+    monkeypatch.setattr(warm_pool, "count_orphaned_leased_pool_vms", _fake_orphaned)
 
     snap = await get_fleet_utilization_snapshot(session=_FakeSession())
     assert snap["vm_slots_available"] == 1  # 10 - 9 = 1
     assert snap["vm_saturation"] == "saturated"  # 9/10 = 0.90 >= 0.90
+
+
+async def test_vm_slot_fields_exclude_orphaned_leases(monkeypatch):
+    """Orphaned LEASED pool rows are subtracted from effective occupancy.
+
+    managed=8, idle=0, orphaned=3 → effective = max(active, 8-0-3) = max(2, 5) = 5;
+    vm_slots_available = 10-5 = 5. Without orphan subtraction effective would be 8
+    and slots_available would be 2 — understating available capacity.
+    """
+    import app.runtime_config_state as rcs
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setitem(rcs.runtime_config, "max_concurrent_vms", 10)
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    monkeypatch.setattr(
+        max_plan_pool, "_account_available_for_model", lambda acct, model: True
+    )
+
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 8)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: True)
+
+    class _FakeResult:
+        def scalar(self):
+            return 2
+
+        def all(self):
+            return []
+
+    class _FakeSession:
+        async def execute(self, stmt):
+            return _FakeResult()
+
+    async def _fake_idle(session, **kw):
+        return 0
+
+    async def _fake_orphaned(session, **kw):
+        return 3
+
+    monkeypatch.setattr(warm_pool, "count_idle_pool_vms", _fake_idle)
+    monkeypatch.setattr(warm_pool, "count_orphaned_leased_pool_vms", _fake_orphaned)
+
+    snap = await get_fleet_utilization_snapshot(session=_FakeSession())
+    assert snap["orphaned_leased_vms"] == 3
+    assert snap["active_task_vms"] == 2
+    assert snap["managed_vm_count"] == 8
+    assert snap["idle_pool_vms"] == 0
+    # effective = max(2, 8-0-3) = 5; slots_available = 10-5 = 5
+    assert snap["vm_slots_available"] == 5
+    assert snap["vm_saturation"] == "healthy"  # 5/10 = 0.5 < 0.70
 
 
 # ── VM-slot segment in strategic axis formatter ──────────────────────────────

@@ -108,6 +108,7 @@ async def get_fleet_utilization_snapshot(
     active_task_vms: int | None = None
     managed_vm_count: int | None = None
     idle_pool_vms: int | None = None
+    orphaned_leased_vms: int | None = None
     vm_slots_available: int | None = None
     vm_saturation: str | None = None
 
@@ -164,21 +165,34 @@ async def get_fleet_utilization_snapshot(
             managed_vm_count = None
 
         try:
-            from app.warm_pool import count_idle_pool_vms, is_warm_pool_enabled
+            from app.warm_pool import (
+                count_idle_pool_vms,
+                count_orphaned_leased_pool_vms,
+                is_warm_pool_enabled,
+            )
 
+            _pool_enabled = is_warm_pool_enabled()
             idle_pool_vms = (
-                await count_idle_pool_vms(session) if is_warm_pool_enabled() else 0
+                await count_idle_pool_vms(session) if _pool_enabled else 0
+            )
+            orphaned_leased_vms = (
+                await count_orphaned_leased_pool_vms(session) if _pool_enabled else 0
             )
         except Exception:  # noqa: BLE001 — best-effort, never blank the snapshot
             idle_pool_vms = None
+            orphaned_leased_vms = None
 
         if (
             active_task_vms is not None
             and managed_vm_count is not None
             and idle_pool_vms is not None
+            and orphaned_leased_vms is not None
             and vm_cap
         ):
-            effective = max(active_task_vms, managed_vm_count - idle_pool_vms)
+            effective = max(
+                active_task_vms,
+                managed_vm_count - idle_pool_vms - orphaned_leased_vms,
+            )
             vm_slots_available = max(0, vm_cap - effective)
             if vm_slots_available == 0:
                 vm_saturation = "saturated"
@@ -203,6 +217,7 @@ async def get_fleet_utilization_snapshot(
         "active_task_vms": active_task_vms,
         "managed_vm_count": managed_vm_count,
         "idle_pool_vms": idle_pool_vms,
+        "orphaned_leased_vms": orphaned_leased_vms,
         "vm_slots_available": vm_slots_available,
         "vm_saturation": vm_saturation,
     }
