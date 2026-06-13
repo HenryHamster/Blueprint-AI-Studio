@@ -58,7 +58,7 @@ vi.mock('os', () => ({
 }));
 
 // ── Imports (after mocks) ────────────────────────────────────────────────────
-import { resetForNextRole, clearStaleProviderCredentials } from './reset.js';
+import { resetForNextRole, clearStaleProviderCredentials, TMP_OUTPUT_NAMES } from './reset.js';
 import {
   registerChildPid,
   killAllChildren,
@@ -209,6 +209,7 @@ describe('resetForNextRole', () => {
     expect(unlinkPaths).toContain('/tmp/release_audit_challenge_X.json');
     expect(unlinkPaths).toContain('/tmp/self_audit_findings_X.json');
     expect(unlinkPaths).toContain('/tmp/self_review_X.json');
+    expect(unlinkPaths).toContain('/tmp/symbols_X.json');
     // Stale basenames that were incorrectly in the old list must be absent.
     expect(unlinkPaths).not.toContain('/tmp/debug_output_X.json');
     expect(unlinkPaths).not.toContain('/tmp/perf_output_X.json');
@@ -503,6 +504,67 @@ describe('resetForNextRole', () => {
     const step1Log = logMessages.find((m) => m.includes('killAllChildren'));
     expect(step1Log).toBeDefined();
     expect(step1Log).not.toMatch(/unkillable/);
+  });
+});
+
+// ── resetForNextRole — integration: full /tmp artifact surface ───────────────
+describe('resetForNextRole — integration: full /tmp artifact surface', () => {
+  let killSpy: KillSpy | null = null;
+  let consoleErrorSpy: ConsoleSpy | null = null;
+  let consoleLogSpy: ConsoleSpy | null = null;
+
+  beforeEach(() => {
+    clearPidRegistry();
+    killSpy = installKillSpy();
+    consoleErrorSpy = installConsoleSpy('error');
+    consoleLogSpy = installConsoleSpy('log');
+    fsPromisesMocks.unlink.mockReset();
+    fsPromisesMocks.rm.mockReset();
+    execFileImpl.mockReset();
+    fsPromisesMocks.unlink.mockResolvedValue(undefined);
+    fsPromisesMocks.rm.mockResolvedValue(undefined);
+    execFileImpl.mockResolvedValue('');
+  });
+
+  afterEach(() => {
+    killSpy?.mockRestore();
+    consoleErrorSpy?.mockRestore();
+    consoleLogSpy?.mockRestore();
+    killSpy = null;
+    consoleErrorSpy = null;
+    consoleLogSpy = null;
+    clearPidRegistry();
+  });
+
+  it('unlinks every path derived from TMP_OUTPUT_NAMES for the prior task', async () => {
+    const taskId = 'integration-test-task-abc123';
+
+    await resetForNextRole({ workspace: '/ws', priorTaskId: taskId });
+
+    const unlinkPaths = fsPromisesMocks.unlink.mock.calls.map((c) => c[0] as string);
+
+    // Dynamic check: every name in TMP_OUTPUT_NAMES must appear in unlink calls.
+    // This keeps coverage in sync with TMP_OUTPUT_NAMES automatically — adding a
+    // new name to the list will cause this test to verify it is also cleaned up.
+    for (const name of TMP_OUTPUT_NAMES) {
+      expect(unlinkPaths).toContain(`/tmp/${name}_${taskId}.json`);
+    }
+
+    // The agent prompt file is cleaned up explicitly (outside TMP_OUTPUT_NAMES).
+    expect(unlinkPaths).toContain(`/tmp/agent_prompt_${taskId}.txt`);
+
+    // Total unlink count: one per TMP_OUTPUT_NAMES entry + the agent_prompt file.
+    // Verifies no extra stale or unexpected paths are touched.
+    expect(unlinkPaths).toHaveLength(TMP_OUTPUT_NAMES.length + 1);
+  });
+
+  it('includes "symbols" to prevent ctags file leak on warm VMs between roles', () => {
+    // handlers/standard.ts:393 writes /tmp/symbols_{taskId}.json (ctags symbol
+    // index) during workspace prep. If 'symbols' is absent from TMP_OUTPUT_NAMES
+    // the file leaks across warm-VM role boundaries and accumulates until the VM
+    // is recycled. Regression guard: dropping 'symbols' from the list fails this
+    // test immediately.
+    expect(TMP_OUTPUT_NAMES).toContain('symbols');
   });
 });
 

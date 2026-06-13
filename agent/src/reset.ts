@@ -75,6 +75,7 @@ export const TMP_OUTPUT_NAMES = [
   'release_audit_challenge',
   'self_audit_findings',
   'self_review',
+  'symbols',
 ];
 
 export interface ResetOptions {
