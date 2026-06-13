@@ -255,6 +255,105 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
         return False
 
 
+async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> bool:
+    """Best-effort re-detection for a non-empty, detection-complete project with no test command.
+
+    When onboarding-time detection completed but found no test command for a
+    non-empty external repo, the no-CI merge gate falls open to UNVERIFIED on
+    every subsequent PR.  This helper attempts a single bounded re-detection
+    using the same detector and operator-override-preserving path as
+    :func:`maybe_refresh_empty_build_config`, but guards on the OPPOSITE
+    condition: fires only when detection was NOT marked incomplete or empty (so
+    it never competes with that path) and the project currently has no
+    detectable test command.
+
+    Returns True iff re-detection found a test command and persisted it.
+    Best-effort: never raises into the caller; logs, rolls back the session on
+    failure, and returns False.
+    """
+    try:
+        existing = project.build_config or {}
+        # Only fire for non-empty, detection-complete projects with no test cmd.
+        # repo_is_empty / detection_incomplete are handled by
+        # maybe_refresh_empty_build_config — do not compete with that path.
+        if existing.get("repo_is_empty") or existing.get("detection_incomplete"):
+            return False
+        if not getattr(project, "github_owner", None) or not getattr(
+            project, "github_repo", None
+        ):
+            return False
+
+        from app import ci_resolution
+
+        if ci_resolution.has_detectable_tests(project):
+            return False
+
+        from pydantic import ValidationError
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.github import get_repo_installation_token
+        from app.routers.admin_onboard import _detect_build_config
+        from app.schemas import BuildConfig as BuildConfigSchema
+        from app.shared_state import get_project_integration_branch
+
+        integration_branch = ref or get_project_integration_branch(project)
+
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
+        if not token:
+            return False
+
+        detected = await _detect_build_config(
+            token,
+            project.github_owner,
+            project.github_repo,
+            ref=integration_branch,
+        )
+        if not detected:
+            return False
+
+        detected = apply_operator_build_config_overrides(detected, existing)
+
+        # Only persist when re-detection actually found a test command.
+        class _Stub:
+            pass
+
+        _stub = _Stub()
+        _stub.build_config = detected
+        if not ci_resolution.has_detectable_tests(_stub):
+            return False
+
+        try:
+            validated = BuildConfigSchema(**detected)
+            project.build_config = validated.model_dump(exclude_none=True)
+        except ValidationError:
+            # Detection produced a shape the schema rejects — store raw so the
+            # operator can fix it in the UI (mirrors the manual re-detect path).
+            project.build_config = detected
+        flag_modified(project, "build_config")
+        await session.commit()
+        logger.info(
+            "[BUILD_CONFIG] Re-detected test command for non-empty project %s "
+            "(integration branch %s) — no-CI gate will now run tests",
+            getattr(project, "id", None),
+            integration_branch,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — best-effort, must never block a merge path
+        logger.warning(
+            "[BUILD_CONFIG] Re-detection of missing test command failed for "
+            "project %s; leaving config unchanged",
+            getattr(project, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 — keep the caller's session usable
+            pass
+        return False
+
+
 _MAX_DISCOVERED_ENTRIES = 50
 _MAX_CMD_LENGTH = 500
 

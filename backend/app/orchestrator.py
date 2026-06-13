@@ -1857,7 +1857,9 @@ async def orchestrator_worker():
                 # pinned slots_available at 0 with 0 active tasks — total dispatch
                 # freeze). Gated on the pool being enabled, same as idle_pool_count.
                 orphaned_leased_count = (
-                    await count_orphaned_leased_pool_vms(session) if _pool_enabled else 0
+                    await count_orphaned_leased_pool_vms(session)
+                    if _pool_enabled
+                    else 0
                 )
                 gcp_dispatch_vms = max(
                     0, actual_vm_count - idle_pool_count - orphaned_leased_count
@@ -5912,26 +5914,68 @@ async def orchestrator_worker():
                                             )
                                             _unverified_merge_reason = "kill_switch_off"
                                         else:
-                                            _ci_reason = (
-                                                "the project declares no CI "
-                                                "(requires_ci_checks=False) and no "
-                                                "test command is detectable — merging "
-                                                "UNVERIFIED"
+                                            # Before taking the unverified
+                                            # immediate-pass, attempt a bounded
+                                            # re-detection. A heuristic miss at
+                                            # onboarding time must not permanently
+                                            # disable the gate for this repo.
+                                            from app.build_config_detection import (
+                                                maybe_redetect_missing_test_command,
                                             )
-                                            _unverified_merge_reason = (
-                                                "no_detectable_test_command"
+
+                                            _redetected = await maybe_redetect_missing_test_command(
+                                                _ci_proj,
+                                                session,
+                                                ref=_ci_base_ref,
                                             )
-                                        logger.info(
-                                            f"[CI] PR #{ci_pr_number} has 0 check-runs and "
-                                            f"{_ci_reason} — treating as passed so the "
-                                            f"merge can proceed"
-                                        )
-                                        ci_result = {
-                                            "status": "completed",
-                                            "conclusion": "success",
-                                            "details": _resolved.get("details", []),
-                                            "failed_logs": "",
-                                        }
+                                            if (
+                                                _redetected
+                                                and ci_resolution.should_run_no_ci_test_gate(
+                                                    _ci_proj,
+                                                    _ci_base_ref,
+                                                    gate_enabled=_gate_on,
+                                                )
+                                            ):
+                                                _no_ci_verify_gate = True
+                                                _no_ci_verify_base = _ci_base_ref
+                                                logger.info(
+                                                    f"[CI] PR #{ci_pr_number} has 0 "
+                                                    f"check-runs — re-detection found "
+                                                    f"a test command for external "
+                                                    f"no-CI repo; gating on "
+                                                    f"verify_tests instead of merging "
+                                                    f"UNVERIFIED"
+                                                )
+                                                ci_result = {
+                                                    "status": "pending",
+                                                    "conclusion": None,
+                                                    "details": _resolved.get(
+                                                        "details", []
+                                                    ),
+                                                    "failed_logs": "",
+                                                }
+                                            else:
+                                                _ci_reason = (
+                                                    "the project declares no CI "
+                                                    "(requires_ci_checks=False) and no "
+                                                    "test command is detectable — merging "
+                                                    "UNVERIFIED"
+                                                )
+                                                _unverified_merge_reason = (
+                                                    "no_detectable_test_command"
+                                                )
+                                        if not _no_ci_verify_gate:
+                                            logger.info(
+                                                f"[CI] PR #{ci_pr_number} has 0 check-runs and "
+                                                f"{_ci_reason} — treating as passed so the "
+                                                f"merge can proceed"
+                                            )
+                                            ci_result = {
+                                                "status": "completed",
+                                                "conclusion": "success",
+                                                "details": _resolved.get("details", []),
+                                                "failed_logs": "",
+                                            }
                                 else:
                                     ci_result = {
                                         "status": "pending",
