@@ -124,3 +124,137 @@ async def test_lane_pilot_aggregates_include_reserved_idle_and_exclude_shadow(db
     assert agg["control_reserved_idle_cost_per_merged"] == pytest.approx(0.0)
     assert agg["control_cost_per_merged"] == pytest.approx(4.0)
     assert agg["lane_cost_per_merged"] < 100.0
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_aggregates_include_failed_fix_task_cost(db_session):
+    """Verify a FAILED fix task's cost is included in lane_cost_per_merged.
+
+    Intent-to-treat semantics: a failed attempt still incurs cost that should be
+    accounted for in the cost-per-merged calculation. This test creates a chain
+    where a fix task fails, then a re-review and successful fix follow, so the
+    FAILED task's cost is included in the final chain cost.
+    """
+    project = await _make_project(db_session, is_self_repo=True)
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="lane-with-failed-fix",
+        goal="lane-with-failed-fix",
+        branch_name="lane-with-failed-fix",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    lane.reserved_idle_cost_usd_total = 0.0
+
+    root_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+        },
+        estimated_cost_usd=0.5,
+    )
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "prompt": "review",
+                "base_branch": "main",
+                "original_task_id": str(root_task.id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "pr_merged": False,
+        },
+        estimated_cost_usd=1.0,
+    )
+    # First fix attempt that FAILS
+    failed_fix_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_task.id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "pr_merged": False,
+        },
+        estimated_cost_usd=0.8,
+    )
+    # Re-review after the failed fix
+    re_review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "prompt": "re-review",
+                "base_branch": "main",
+                "original_task_id": str(root_task.id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "pr_merged": False,
+        },
+        estimated_cost_usd=1.0,
+    )
+    # Successful fix after re-review
+    successful_fix_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_task.id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "pr_merged": True,
+        },
+        estimated_cost_usd=1.2,
+    )
+
+    db_session.add_all(
+        [
+            lane,
+            root_task,
+            review_task,
+            failed_fix_task,
+            re_review_task,
+            successful_fix_task,
+        ]
+    )
+    await db_session.commit()
+    await db_session.refresh(lane)
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+
+    # Verify the chain is counted as one lane chain
+    assert agg["n_lane"] == 1
+    assert agg["n_control"] == 0
+
+    # Total cost should include the failed fix task's cost:
+    # root(0.5) + review(1.0) + failed_fix(0.8) + re_review(1.0) + successful_fix(1.2) = 4.5
+    assert agg["lane_runtime_cost_per_merged"] == pytest.approx(4.5)
+    assert agg["lane_cost_per_merged"] == pytest.approx(4.5)

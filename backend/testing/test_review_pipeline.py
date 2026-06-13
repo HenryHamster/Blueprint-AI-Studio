@@ -1610,9 +1610,7 @@ def _mock_cap_exhaustion_github(mocker):
 
 
 @pytest.mark.asyncio
-async def test_approved_cap_exhaustion_records_distinct_outcome(
-    db_session, mocker
-):
+async def test_approved_cap_exhaustion_records_distinct_outcome(db_session, mocker):
     """FIX D: when the review-fix cap is reached on an already-APPROVED PR
     (orig.review_loop.review_approved=True, no outstanding CHANGES_REQUESTED),
     the orig lands CANCELLED with failure_detail=cap_exhausted_after_approve and
@@ -15282,6 +15280,182 @@ async def test_lane_pilot_aggregates_count_original_chains_not_iterations(db_ses
     )
     assert agg["checkpoint_fraction"] == 1.0, (
         f"expected checkpoint_fraction=1.0, got {agg['checkpoint_fraction']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_aggregates_partial_warm_resume_fraction(db_session):
+    """compute_lane_pilot_aggregates returns fractional engagement at partial values.
+
+    Two lane-arm chains are created:
+    - Chain A fix task has LANE_PILOT_WARM_RESUME_RECEIPT_KEY=True and
+      LANE_PILOT_CHECKPOINT_RECEIPT_KEY=True.
+    - Chain B fix task has neither receipt key.
+
+    warm_resume_fraction and checkpoint_fraction must both be 0.5 (1 out of 2),
+    not 0.0 or 1.0.  A separate variant also verifies that the two fractions are
+    measured independently: chain A has checkpoint only, chain B has warm-resume
+    only, so both fractions are 0.5 but from different chains.
+    """
+    from app.capability_trial_verdict import (
+        LANE_PILOT_ASSIGNMENT_KEY,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import compute_lane_pilot_aggregates
+
+    project = await _make_db_project(db_session, is_self_repo=True)
+
+    # ── Chain A: fix task carries both warm-resume + checkpoint receipts ──────
+    root_a_id = uuid.uuid4()
+    root_a = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_a.id = root_a_id
+
+    fix_a = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_a_id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": True,
+            LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+            LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    # ── Chain B: fix task carries neither receipt ────────────────────────────
+    root_b_id = uuid.uuid4()
+    root_b = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_b.id = root_b_id
+
+    fix_b = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_b_id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": False,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    db_session.add_all([root_a, fix_a, root_b, fix_b])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+
+    assert agg["lane_fix_tasks_sampled"] == 2, (
+        f"expected 2 engagement chains, got {agg['lane_fix_tasks_sampled']}"
+    )
+    assert agg["warm_resume_fraction"] == pytest.approx(0.5), (
+        f"expected warm_resume_fraction=0.5 (1/2), got {agg['warm_resume_fraction']}"
+    )
+    assert agg["checkpoint_fraction"] == pytest.approx(0.5), (
+        f"expected checkpoint_fraction=0.5 (1/2), got {agg['checkpoint_fraction']}"
+    )
+
+    # ── Second scenario: fractions diverge because receipts are on different chains
+    # Create a fresh project so state is isolated.
+    project2 = await _make_db_project(db_session, is_self_repo=True)
+
+    # Chain C: checkpoint only (no warm-resume).
+    root_c_id = uuid.uuid4()
+    root_c = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_c.id = root_c_id
+
+    fix_c = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_c_id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": True,
+            LANE_PILOT_CHECKPOINT_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    # Chain D: warm-resume only (no checkpoint).
+    root_d_id = uuid.uuid4()
+    root_d = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "create", "base_branch": "main"}],
+        context={LANE_PILOT_ASSIGNMENT_KEY: "lane"},
+    )
+    root_d.id = root_d_id
+
+    fix_d = make_task(
+        project_id=project2.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix",
+                "base_branch": "main",
+                "original_task_id": str(root_d_id),
+            }
+        ],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "pr_merged": False,
+            LANE_PILOT_WARM_RESUME_RECEIPT_KEY: True,
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    db_session.add_all([root_c, fix_c, root_d, fix_d])
+    await db_session.commit()
+
+    agg2 = await compute_lane_pilot_aggregates(db_session, project2.id)
+
+    assert agg2["lane_fix_tasks_sampled"] == 2, (
+        f"expected 2 engagement chains in project2, got {agg2['lane_fix_tasks_sampled']}"
+    )
+    # Both fractions are 0.5 but from different chains — verifies they are
+    # measured independently and not conflated.
+    assert agg2["warm_resume_fraction"] == pytest.approx(0.5), (
+        f"expected warm_resume_fraction=0.5 (chain D only), got {agg2['warm_resume_fraction']}"
+    )
+    assert agg2["checkpoint_fraction"] == pytest.approx(0.5), (
+        f"expected checkpoint_fraction=0.5 (chain C only), got {agg2['checkpoint_fraction']}"
     )
 
 

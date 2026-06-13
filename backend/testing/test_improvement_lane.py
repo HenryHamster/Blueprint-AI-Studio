@@ -625,6 +625,34 @@ def test_merge_manifest_patch_bounded():
     )
 
 
+def test_merge_manifest_patch_eviction_priority_phase_log_before_critical_files():
+    """When phase_log and critical_files are the same length, phase_log is evicted first."""
+    import json
+
+    from app.improvement_lane_ops import _merge_manifest_patch
+    from app.models import _LANE_MANIFEST_MAX_BYTES
+
+    # Build a manifest over the byte limit with equal-length phase_log and critical_files.
+    item = "x" * 200
+    existing = {
+        "phase_log": [item] * 25,
+        "critical_files": [item] * 25,
+    }
+    # Confirm it's already over budget so trimming fires.
+    assert len(json.dumps(existing, default=str).encode()) > _LANE_MANIFEST_MAX_BYTES
+
+    # A no-op patch — just trigger the trim of the existing manifest.
+    merged = _merge_manifest_patch(existing, {})
+
+    phase_log_len = len(merged.get("phase_log", []))
+    critical_files_len = len(merged.get("critical_files", []))
+
+    assert phase_log_len < critical_files_len, (
+        f"phase_log ({phase_log_len}) should be shorter than "
+        f"critical_files ({critical_files_len}) after eviction"
+    )
+
+
 def test_merge_manifest_patch_bounded_with_all_append_only_lists():
     """Long critical_files and remaining lists are trimmed like other append-only fields."""
     import json
@@ -1080,7 +1108,9 @@ async def test_retire_chain_lane_shadow_parked_no_reservation(db: AsyncSession):
     did_retire = await retire_chain_lane(db, ctx)
     await db.commit()
 
-    assert did_retire is True, "retire_chain_lane must return True for PARKED shadow lane"
+    assert did_retire is True, (
+        "retire_chain_lane must return True for PARKED shadow lane"
+    )
     refreshed = await db.get(ImprovementLane, lane.id)
     assert refreshed.status == ImprovementLaneStatus.RETIRED.value, (
         f"Shadow PARKED lane must become RETIRED at chain end, got {refreshed.status}"
@@ -1337,3 +1367,73 @@ async def test_sweep_exhausted_lane_budgets_inert_when_disabled(db: AsyncSession
     assert (
         await db.get(ImprovementLane, lane_over.id)
     ).status == ImprovementLaneStatus.ACTIVE.value
+
+
+# ── confirm_lane_warm_resume unit tests ──────────────────────────────────────
+
+
+def test_confirm_lane_warm_resume_with_checkpoint():
+    """has_checkpoint=True stamps both receipt keys as True."""
+    from app.capability_trial_verdict import (
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+    ctx: dict = {}
+    confirm_lane_warm_resume(ctx, has_checkpoint=True)
+
+    assert ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] is True
+    assert ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] is True
+
+
+def test_confirm_lane_warm_resume_without_checkpoint():
+    """has_checkpoint=False stamps warm key True but checkpoint key False."""
+    from app.capability_trial_verdict import (
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+    ctx: dict = {}
+    confirm_lane_warm_resume(ctx, has_checkpoint=False)
+
+    assert ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] is True
+    assert ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] is False
+
+
+def test_confirm_lane_warm_resume_empty_dict():
+    """Calling on an empty dict produces exactly the two receipt keys."""
+    from app.capability_trial_verdict import (
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+    ctx: dict = {}
+    confirm_lane_warm_resume(ctx, has_checkpoint=True)
+
+    assert set(ctx.keys()) == {
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+    }
+
+
+def test_confirm_lane_warm_resume_existing_keys_overwritten():
+    """Stale values in ctx are overwritten; no duplication or extra keys introduced."""
+    from app.capability_trial_verdict import (
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    )
+    from app.review_fix_lane_pilot import confirm_lane_warm_resume
+
+    ctx: dict = {
+        LANE_PILOT_WARM_RESUME_RECEIPT_KEY: False,
+        LANE_PILOT_CHECKPOINT_RECEIPT_KEY: False,
+        "other_key": "preserved",
+    }
+    confirm_lane_warm_resume(ctx, has_checkpoint=True)
+
+    assert ctx[LANE_PILOT_WARM_RESUME_RECEIPT_KEY] is True
+    assert ctx[LANE_PILOT_CHECKPOINT_RECEIPT_KEY] is True
+    assert ctx["other_key"] == "preserved"
