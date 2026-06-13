@@ -2573,6 +2573,148 @@ class TestImprovementLanes:
             _app.dependency_overrides.pop(require_admin, None)
 
 
+class TestShadowLaneHealth:
+    """Tests for shadow_health rollup in GET /api/admin/improvement-lanes."""
+
+    @pytest.mark.asyncio
+    async def test_shadow_health_basic_counts(self, client: AsyncClient, db_session):
+        """Shadow lane with checkpoint_seq=2 → shadow_lane_count=1, checkpoints_written=2."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane(
+            project.id,
+            checkpoint_seq=2,
+            checkpoints=[
+                {"seq": 1, "phase": "fix", "created_at": "2026-01-01T00:00:00", "sha": "a1"},
+                {"seq": 2, "phase": "review", "created_at": "2026-01-01T01:00:00", "sha": "a2"},
+            ],
+            workspace_state="COLD",
+            pilot_arm=None,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        sh = resp.json()["shadow_health"]
+        assert sh["shadow_lane_count"] == 1
+        assert sh["checkpoints_written"] == 2
+        assert sh["checkpoint_miss_count"] == 0
+        assert sh["miss_rate"] is None
+
+    @pytest.mark.asyncio
+    async def test_shadow_health_miss_rate(self, client: AsyncClient, db_session):
+        """Two shadow lanes with phase_requeues=1 and 0 → miss_rate=1/(2+1)."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane_a = _make_lane(
+            project.id,
+            branch_name="lane/a",
+            checkpoint_seq=2,
+            phase_requeues=1,
+            workspace_state="COLD",
+            pilot_arm=None,
+        )
+        lane_b = _make_lane(
+            project.id,
+            branch_name="lane/b",
+            checkpoint_seq=1,
+            phase_requeues=0,
+            workspace_state="COLD",
+            pilot_arm=None,
+        )
+        db_session.add(lane_a)
+        db_session.add(lane_b)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        sh = resp.json()["shadow_health"]
+        assert sh["shadow_lane_count"] == 2
+        assert sh["checkpoints_written"] == 3
+        assert sh["checkpoint_miss_count"] == 1
+        # miss_rate = 1 / (3 + 1) = 0.25
+        assert abs(sh["miss_rate"] - 0.25) < 1e-6
+
+    @pytest.mark.asyncio
+    async def test_shadow_health_exhausted_closes(self, client: AsyncClient, db_session):
+        """KILLED shadow lane with manifest.recovery.exhausted=True → exhausted_close_count=1."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane(
+            project.id,
+            checkpoint_seq=1,
+            status=ImprovementLaneStatus.KILLED.value,
+            workspace_state="COLD",
+            pilot_arm=None,
+            manifest={"recovery": {"exhausted": True, "attempt": 3, "reason": "no_checkpoint"}},
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        sh = resp.json()["shadow_health"]
+        assert sh["exhausted_close_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_shadow_health_excludes_itt_lanes(self, client: AsyncClient, db_session):
+        """Lanes with pilot_arm set are ITT arms and must NOT appear in the shadow rollup."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # ITT arm lane — should be excluded
+        itt_lane = _make_lane(
+            project.id,
+            branch_name="lane/itt",
+            checkpoint_seq=5,
+            phase_requeues=2,
+            workspace_state="COLD",
+            pilot_arm="lane",
+        )
+        # Shadow lane — should be included
+        shadow_lane = _make_lane(
+            project.id,
+            branch_name="lane/shadow",
+            checkpoint_seq=3,
+            phase_requeues=0,
+            workspace_state="COLD",
+            pilot_arm=None,
+        )
+        db_session.add(itt_lane)
+        db_session.add(shadow_lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        sh = resp.json()["shadow_health"]
+        assert sh["shadow_lane_count"] == 1
+        assert sh["checkpoints_written"] == 3
+        assert sh["checkpoint_miss_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_shadow_health_empty(self, client: AsyncClient, db_session):
+        """No shadow lanes → shadow_lane_count=0 and miss_rate=None."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        sh = resp.json()["shadow_health"]
+        assert sh["shadow_lane_count"] == 0
+        assert sh["checkpoints_written"] == 0
+        assert sh["checkpoint_miss_count"] == 0
+        assert sh["miss_rate"] is None
+
+
 class TestLaneBaselines:
     """Tests for GET /api/admin/lane-baselines."""
 

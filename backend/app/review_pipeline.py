@@ -606,6 +606,9 @@ SPAWN_REASON_KEY = "_last_pipeline_spawn_reason"
 SPAWN_REASON_SPAWNED = "spawned"
 SPAWN_REASON_DEDUP = "dedup_same_type"
 SPAWN_REASON_ALREADY_MERGED = "already_merged"
+# PR was closed without merging — distinct from already_merged so callers can
+# log accurately (a closed-unmerged PR is NOT the same as a mid-flight merge).
+SPAWN_REASON_PR_CLOSED_UNMERGED = "pr_closed_unmerged"
 SPAWN_REASON_DEFERRED = "deferred_cross_type"
 SPAWN_REASON_CAP = "cap_exhausted"
 SPAWN_REASON_STUCK = "stuck_cycle"
@@ -1720,6 +1723,28 @@ async def _spawn_pipeline_task(
             logger.debug(
                 "[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True
             )
+        return (None, False)
+
+    # Guard: don't spawn if PR was closed without merge.
+    _pr_closed = (orig_task is not None and (orig_task.context or {}).get("pr_closed_unmerged")) or (
+        (source_task.context or {}).get("pr_closed_unmerged")
+    )
+    if _pr_closed:
+        logger.info(
+            f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR closed without merge"
+        )
+        source_task.latest_status_message = (
+            f"PR #{pr_number} closed without merge — skipping {task_type}"
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_PR_CLOSED_UNMERGED)
+        session.add(source_task)
+        # Retire the chain's lane row so it reaches a terminal state promptly.
+        try:
+            from app.review_fix_lane_pilot import retire_chain_lane as _retire_lane
+
+            await _retire_lane(session, source_task.context or {})
+        except Exception:  # noqa: BLE001
+            logger.debug("[PIPELINE] retire_chain_lane (pr_closed_unmerged) failed (non-critical)", exc_info=True)
         return (None, False)
 
     # ── verify_tests fast-path ──────────────────────────────────────────────

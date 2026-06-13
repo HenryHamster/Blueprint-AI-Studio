@@ -1435,12 +1435,17 @@ async def compute_lane_pilot_aggregates(
 ) -> dict[str, Any]:
     """Build per-arm aggregates for ``evaluate_lane_pilot_verdict``.
 
-    Sample counts, merge rate, and cost-per-merged come from durable Task rows
-    carrying the intent-to-treat arm assignment. Checkpoint-loss rate comes from
-    ImprovementLane rows (phase_requeues). Gate-integrity violations are detected
-    by querying for review/audit tasks that ACTUALLY carry transient lane context
-    keys — a non-circular durable signal that is 0 under correct operation and
-    non-zero only when the strip-transient guard was bypassed.
+    Sample counts and merge/runtime cost come from durable Task rows carrying the
+    intent-to-treat arm assignment. Reserved-idle warm-pool spend is read from the
+    lane row bound to each chain and folded into the lane arm's total treatment
+    cost; control chains do not hold reservations, so their reserved-idle
+    component is zero by construction. The returned snapshot also exposes the
+    runtime vs reserved-idle split.
+    Checkpoint-loss rate comes from ImprovementLane rows (phase_requeues).
+    Gate-integrity violations are detected by querying for review/audit tasks that
+    ACTUALLY carry transient lane context keys — a non-circular durable signal
+    that is 0 under correct operation and non-zero only when the strip-transient
+    guard was bypassed.
     """
     from sqlalchemy import func
 
@@ -1464,15 +1469,22 @@ async def compute_lane_pilot_aggregates(
         _arm_expr = func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}")
         _merged_expr = func.json_extract(Task.context, "$.pr_merged")
         _orig_id_expr = func.json_extract(Task.payloads, "$[0].original_task_id")
+        _chain_lane_id_expr = func.json_extract(Task.context, f"$.{LANE_CHAIN_ID_KEY}")
     else:
         _arm_expr = Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext
         _merged_expr = Task.context["pr_merged"].astext
         _orig_id_expr = Task.payloads[0]["original_task_id"].as_string()
+        _chain_lane_id_expr = Task.context[LANE_CHAIN_ID_KEY].astext
 
     task_rows = (
         await session.execute(
             select(
-                Task.id, Task.estimated_cost_usd, _arm_expr, _merged_expr, _orig_id_expr
+                Task.id,
+                Task.estimated_cost_usd,
+                _arm_expr,
+                _merged_expr,
+                _orig_id_expr,
+                _chain_lane_id_expr,
             ).where(
                 Task.project_id == project_id,
                 Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
@@ -1483,27 +1495,70 @@ async def compute_lane_pilot_aggregates(
 
     # Group rows by chain, then compute per-arm counts.
     _chains: dict[str, dict[str, Any]] = {}
-    for task_id_val, cost, arm_val, merged_val, orig_id_val in task_rows:
+    for task_id_val, cost, arm_val, merged_val, orig_id_val, lane_id_val in task_rows:
         arm = str(arm_val) if arm_val is not None else None
         if arm not in ("lane", "control"):
             continue
         chain_id = str(orig_id_val).strip() if orig_id_val else str(task_id_val)
         if chain_id not in _chains:
-            _chains[chain_id] = {"arm": arm, "merged": False, "cost": 0.0}
-        _chains[chain_id]["cost"] += float(cost or 0.0)
+            _chains[chain_id] = {
+                "arm": arm,
+                "merged": False,
+                "runtime_cost": 0.0,
+                "reserved_idle_cost": 0.0,
+                "lane_id": None,
+            }
+        _chains[chain_id]["runtime_cost"] += float(cost or 0.0)
+        if lane_id_val:
+            _chains[chain_id]["lane_id"] = str(lane_id_val).strip()
         if merged_val in (True, 1, "true", "True"):
             _chains[chain_id]["merged"] = True
 
+    lane_ids = {
+        chain["lane_id"]
+        for chain in _chains.values()
+        if chain["arm"] == "lane" and chain.get("lane_id")
+    }
+    lane_reserved_idle_cost_by_id: dict[str, float] = {}
+    if lane_ids:
+        lane_rows = (
+            await session.execute(
+                select(ImprovementLane.id, ImprovementLane.reserved_idle_cost_usd_total).where(
+                    ImprovementLane.project_id == project_id,
+                    ImprovementLane.pilot_arm == "lane",
+                    ImprovementLane.id.in_(lane_ids),
+                )
+            )
+        ).all()
+        lane_reserved_idle_cost_by_id = {
+            str(lane_id): float(reserved_idle_cost or 0.0)
+            for lane_id, reserved_idle_cost in lane_rows
+        }
+
+    for chain in _chains.values():
+        if chain["arm"] == "lane" and chain.get("lane_id"):
+            chain["reserved_idle_cost"] = lane_reserved_idle_cost_by_id.get(
+                str(chain["lane_id"]), 0.0
+            )
+
     arm_merged_count: dict[str, int] = {"lane": 0, "control": 0}
-    arm_cost_merged: dict[str, float] = {"lane": 0.0, "control": 0.0}
+    arm_runtime_cost_merged: dict[str, float] = {"lane": 0.0, "control": 0.0}
+    arm_reserved_idle_cost_merged: dict[str, float] = {"lane": 0.0, "control": 0.0}
+    arm_total_cost_merged: dict[str, float] = {"lane": 0.0, "control": 0.0}
     arm_chain_total: dict[str, int] = {"lane": 0, "control": 0}
 
     for chain in _chains.values():
         arm = chain["arm"]
+        if arm not in ("lane", "control"):
+            continue
         arm_chain_total[arm] += 1
         if chain["merged"]:
             arm_merged_count[arm] += 1
-            arm_cost_merged[arm] += chain["cost"]
+            arm_runtime_cost_merged[arm] += chain["runtime_cost"]
+            arm_reserved_idle_cost_merged[arm] += chain["reserved_idle_cost"]
+            arm_total_cost_merged[arm] += (
+                chain["runtime_cost"] + chain["reserved_idle_cost"]
+            )
 
     n_lane = arm_chain_total["lane"]
     n_control = arm_chain_total["control"]
@@ -1519,12 +1574,32 @@ async def compute_lane_pilot_aggregates(
         else None
     )
     lane_cost_per_merged: float | None = (
-        arm_cost_merged["lane"] / arm_merged_count["lane"]
+        arm_total_cost_merged["lane"] / arm_merged_count["lane"]
         if arm_merged_count["lane"] > 0
         else None
     )
     control_cost_per_merged: float | None = (
-        arm_cost_merged["control"] / arm_merged_count["control"]
+        arm_total_cost_merged["control"] / arm_merged_count["control"]
+        if arm_merged_count["control"] > 0
+        else None
+    )
+    lane_runtime_cost_per_merged: float | None = (
+        arm_runtime_cost_merged["lane"] / arm_merged_count["lane"]
+        if arm_merged_count["lane"] > 0
+        else None
+    )
+    control_runtime_cost_per_merged: float | None = (
+        arm_runtime_cost_merged["control"] / arm_merged_count["control"]
+        if arm_merged_count["control"] > 0
+        else None
+    )
+    lane_reserved_idle_cost_per_merged: float | None = (
+        arm_reserved_idle_cost_merged["lane"] / arm_merged_count["lane"]
+        if arm_merged_count["lane"] > 0
+        else None
+    )
+    control_reserved_idle_cost_per_merged: float | None = (
+        arm_reserved_idle_cost_merged["control"] / arm_merged_count["control"]
         if arm_merged_count["control"] > 0
         else None
     )
@@ -1640,6 +1715,10 @@ async def compute_lane_pilot_aggregates(
         "control_merge_rate": control_merge_rate,
         "lane_cost_per_merged": lane_cost_per_merged,
         "control_cost_per_merged": control_cost_per_merged,
+        "lane_runtime_cost_per_merged": lane_runtime_cost_per_merged,
+        "control_runtime_cost_per_merged": control_runtime_cost_per_merged,
+        "lane_reserved_idle_cost_per_merged": lane_reserved_idle_cost_per_merged,
+        "control_reserved_idle_cost_per_merged": control_reserved_idle_cost_per_merged,
         "gate_integrity_violations": gate_integrity_violations,
         "checkpoint_loss_rate": checkpoint_loss_rate,
         "warm_resume_fraction": warm_resume_fraction,

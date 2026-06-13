@@ -1057,6 +1057,36 @@ async def test_retire_chain_lane_noop_without_chain_id(db: AsyncSession):
     assert did_retire is False
 
 
+@pytest.mark.asyncio
+async def test_retire_chain_lane_shadow_parked_no_reservation(db: AsyncSession):
+    """Shadow-mode (armless) lanes have no warm-pool reservation but accumulate
+    PARKED rows.  retire_chain_lane must still CAS PARKED -> RETIRED and return
+    True even when no PoolVm is reserved for the lane."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="Shadow lane",
+        goal="Shadow goal",
+        branch_name="lane/shadow-retire",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    # No PoolVm reservation — this is the shadow (armless) path.
+    await db.commit()
+
+    ctx = {LANE_CHAIN_ID_KEY: str(lane.id)}
+    did_retire = await retire_chain_lane(db, ctx)
+    await db.commit()
+
+    assert did_retire is True, "retire_chain_lane must return True for PARKED shadow lane"
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.RETIRED.value, (
+        f"Shadow PARKED lane must become RETIRED at chain end, got {refreshed.status}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # kill_project_lanes — bulk KILL on pilot termination
 # ---------------------------------------------------------------------------

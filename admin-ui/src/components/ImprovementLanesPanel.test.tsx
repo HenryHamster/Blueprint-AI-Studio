@@ -220,6 +220,29 @@ describe('ImprovementLanesPanel', () => {
     expect(await screen.findByText('drain failed')).toBeTruthy();
   });
 
+  test('renders shadow health rollup block when shadow_health is present', async () => {
+    const responseWithHealth = {
+      ...LANE_RESPONSE,
+      shadow_health: {
+        shadow_lane_count: 1,
+        checkpoints_written: 4,
+        checkpoint_miss_count: 1,
+        exhausted_close_count: 0,
+        miss_rate: 0.2,
+      },
+    };
+    fetchImprovementLanes.mockResolvedValueOnce(responseWithHealth);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    expect(screen.getByTestId('shadow-lane-health')).toBeTruthy();
+    expect(screen.getByTestId('shadow-lane-health').textContent).toContain('Shadow checkpoint health');
+    expect(screen.getByTestId('shadow-lane-health').textContent).toContain('20.0%');
+    // Miss-rate badge also appears in the header
+    expect(screen.getByTestId('improvement-lanes-shadow-miss-rate').textContent).toBe('miss 20%');
+  });
+
   test('renders correct badge classes for all five lane statuses', async () => {
     const ALL_STATUSES_RESPONSE = {
       lanes: [

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset, XCircle } from 'lucide-react';
-import { drainLanePilot, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse } from '../api';
+import { drainLanePilot, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type ShadowLaneHealth } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, formatDurationSec, parseTimestamp } from '../utils/time';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -63,6 +63,7 @@ function shadowClasses(shadow: boolean): string {
 
 export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps) {
   const [lanes, setLanes] = useState<ImprovementLaneRow[]>([]);
+  const [shadowHealth, setShadowHealth] = useState<ShadowLaneHealth | null>(null);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [collapsedPref, setCollapsedPref] = useState<boolean | null>(() => readCollapsedPreference());
@@ -83,6 +84,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
       ]);
       if (signal?.aborted) return;
       setLanes(lanesData.lanes ?? []);
+      setShadowHealth(lanesData.shadow_health ?? null);
       setPreflight(preflightData);
     } catch (e) {
       if (e instanceof Error && e.name === 'AbortError') return;
@@ -112,6 +114,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
 
   useEffect(() => {
     setLanes([]);
+    setShadowHealth(null);
     setFetchError(null);
     setPreflight(null);
     setLoading(Boolean(projectId));
@@ -166,6 +169,14 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
             className="rounded-full border border-orange-500/30 bg-orange-500/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-orange-300"
           >
             {shadowCount} shadow
+          </span>
+        )}
+        {shadowHealth && shadowHealth.shadow_lane_count > 0 && shadowHealth.miss_rate != null && (
+          <span
+            data-testid="improvement-lanes-shadow-miss-rate"
+            className={`rounded-full border px-1.5 py-0.5 text-[10px] font-bold leading-none ${shadowHealth.miss_rate > 0 ? 'border-amber-500/30 bg-amber-500/15 text-amber-300' : 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300'}`}
+          >
+            miss {(shadowHealth.miss_rate * 100).toFixed(0)}%
           </span>
         )}
         {collapsed && fetchError && (
@@ -225,6 +236,43 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
               </div>
             </div>
           )}
+          {shadowHealth && shadowHealth.shadow_lane_count > 0 && (
+            <div
+              data-testid="shadow-lane-health"
+              className="mb-3 rounded border border-orange-500/20 bg-orange-500/10 p-2 text-xs"
+            >
+              <div className="mb-1 font-semibold text-orange-300">Shadow checkpoint health</div>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-400 sm:grid-cols-4">
+                <div>
+                  <span className="text-neutral-500">Lanes </span>
+                  <span className="text-neutral-200">{shadowHealth.shadow_lane_count}</span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Written </span>
+                  <span className="text-neutral-200">{shadowHealth.checkpoints_written}</span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Misses </span>
+                  <span className={shadowHealth.checkpoint_miss_count > 0 ? 'text-amber-300' : 'text-neutral-200'}>
+                    {shadowHealth.checkpoint_miss_count}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Miss rate </span>
+                  <span className={shadowHealth.miss_rate != null && shadowHealth.miss_rate > 0 ? 'text-amber-300' : 'text-neutral-200'}>
+                    {shadowHealth.miss_rate != null ? `${(shadowHealth.miss_rate * 100).toFixed(1)}%` : '—'}
+                  </span>
+                </div>
+                {shadowHealth.exhausted_close_count > 0 && (
+                  <div className="col-span-2 sm:col-span-4">
+                    <span className="text-neutral-500">Exhausted closes </span>
+                    <span className="text-red-300">{shadowHealth.exhausted_close_count}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="mb-2 flex items-center justify-between gap-2">
             <button
               type="button"

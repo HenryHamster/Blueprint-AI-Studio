@@ -663,12 +663,21 @@ export interface ImprovementLaneRow {
   [key: string]: unknown;
 }
 
+export interface ShadowLaneHealth {
+  shadow_lane_count: number;
+  checkpoints_written: number;
+  checkpoint_miss_count: number;
+  exhausted_close_count: number;
+  miss_rate: number | null;
+}
+
 export interface ImprovementLanesResponse {
   lanes: ImprovementLaneRow[];
   total_returned: number;
   offset: number;
   limit: number;
   project_id: string;
+  shadow_health?: ShadowLaneHealth;
   [key: string]: unknown;
 }
 

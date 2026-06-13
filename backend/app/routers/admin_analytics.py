@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy import text, or_
+from sqlalchemy import func, text, or_
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -23,6 +23,7 @@ from app.models import (
     ProjectMessage,
     ReleaseVersion,
     ImprovementLane,
+    ImprovementLaneStatus,
     PoolVm,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
@@ -52,6 +53,64 @@ ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # $/sec
 SPOT_RATE = VM_COST_RATES["e2-standard-2"][1] / 3600  # $/sec
 
 logger = logging.getLogger(__name__)
+
+
+async def _compute_shadow_lane_health(
+    project_id: "uuid.UUID", session: "AsyncSession"
+) -> Dict[str, Any]:
+    """Compute project-scoped shadow checkpoint health via SQL aggregates.
+
+    Shadow lanes are those with pilot_arm IS NULL and checkpoint_seq > 0 (no ITT
+    arm assigned, but the checkpoint contract has run at least once).  Uses SQL
+    aggregates to avoid hydrating full ORM objects on every admin lanes poll.
+    """
+    _base_filter = [
+        ImprovementLane.project_id == project_id,
+        ImprovementLane.pilot_arm.is_(None),
+        ImprovementLane.checkpoint_seq > 0,
+    ]
+    agg_row = (
+        await session.execute(
+            select(
+                func.count().label("shadow_lane_count"),
+                func.coalesce(
+                    func.sum(ImprovementLane.checkpoint_seq), 0
+                ).label("checkpoints_written"),
+                func.coalesce(
+                    func.sum(ImprovementLane.phase_requeues), 0
+                ).label("checkpoint_miss_count"),
+            ).where(*_base_filter)
+        )
+    ).one()
+
+    shadow_lane_count = agg_row.shadow_lane_count
+    checkpoints_written = int(agg_row.checkpoints_written)
+    checkpoint_miss_count = int(agg_row.checkpoint_miss_count)
+
+    # exhausted_close_count needs a JSONB condition; run as a separate count.
+    exhausted_close_count = (
+        await session.execute(
+            select(func.count()).where(
+                *_base_filter,
+                ImprovementLane.status == ImprovementLaneStatus.KILLED.value,
+                ImprovementLane.manifest["recovery"]["exhausted"].as_boolean(),
+            )
+        )
+    ).scalar() or 0
+
+    # None when no misses have been observed (distinguishes "no data" from 0%).
+    miss_rate: float | None = (
+        checkpoint_miss_count / (checkpoints_written + checkpoint_miss_count)
+        if checkpoint_miss_count > 0
+        else None
+    )
+    return {
+        "shadow_lane_count": shadow_lane_count,
+        "checkpoints_written": checkpoints_written,
+        "checkpoint_miss_count": checkpoint_miss_count,
+        "exhausted_close_count": exhausted_close_count,
+        "miss_rate": miss_rate,
+    }
 
 
 def _derive_completed_at(t: "Task") -> datetime:
@@ -1437,12 +1496,18 @@ async def get_improvement_lanes(
             }
         )
 
+    # Shadow health rollup: all armless lanes with checkpoints (full project scope,
+    # not just the paginated window) so the operator sees aggregate health independent
+    # of the current page.
+    shadow_health = await _compute_shadow_lane_health(project_id, session)
+
     return {
         "lanes": rows,
         "total_returned": len(rows),
         "offset": offset,
         "limit": limit,
         "project_id": str(project_id),
+        "shadow_health": shadow_health,
     }
 
 

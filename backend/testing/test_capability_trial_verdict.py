@@ -1945,12 +1945,22 @@ def _good_aggs(
     cost_improvement=0.10,
     gate_violations=0,
     checkpoint_loss=0.01,
+    lane_runtime_cost: float | None = None,
+    lane_reserved_idle_cost: float = 0.0,
+    control_runtime_cost: float | None = None,
+    control_reserved_idle_cost: float = 0.0,
 ) -> dict:
     """Build a healthy aggregate dict (ADOPT territory by default)."""
     control_rate = 0.70
     lane_rate = control_rate + merge_lift
-    control_cost = 1000.0
-    lane_cost = control_cost * (1.0 - cost_improvement)
+    control_runtime = 1000.0 if control_runtime_cost is None else control_runtime_cost
+    lane_runtime = (
+        control_runtime * (1.0 - cost_improvement)
+        if lane_runtime_cost is None
+        else lane_runtime_cost
+    )
+    control_cost = control_runtime + control_reserved_idle_cost
+    lane_cost = lane_runtime + lane_reserved_idle_cost
     return {
         "n_lane": n,
         "n_control": n,
@@ -1958,6 +1968,10 @@ def _good_aggs(
         "control_merge_rate": control_rate,
         "lane_cost_per_merged": lane_cost,
         "control_cost_per_merged": control_cost,
+        "lane_runtime_cost_per_merged": lane_runtime,
+        "control_runtime_cost_per_merged": control_runtime,
+        "lane_reserved_idle_cost_per_merged": lane_reserved_idle_cost,
+        "control_reserved_idle_cost_per_merged": control_reserved_idle_cost,
         "gate_integrity_violations": gate_violations,
         "checkpoint_loss_rate": checkpoint_loss,
     }
@@ -2002,6 +2016,37 @@ class TestEvaluateLanePilotVerdict:
         assert result["verdict"] == "KILL"
         assert result["verdict_reason"] == "lane_cost_ceiling_exceeded"
         assert result["immediate_alert"] is False
+
+    def test_kill_on_reserved_idle_cost_pushing_total_above_ceiling(self):
+        """Reserved-idle spend is part of the lane total, so it can trigger KILL."""
+        aggs = _good_aggs(
+            cost_improvement=0.10,
+            lane_runtime_cost=900.0,
+            lane_reserved_idle_cost=200.0,
+            control_runtime_cost=1000.0,
+        )
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["lane_runtime_cost_per_merged"] == 900.0
+        assert result["lane_reserved_idle_cost_per_merged"] == 200.0
+        assert result["lane_cost_per_merged"] == 1100.0
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "lane_cost_ceiling_exceeded"
+
+    def test_adopt_fails_when_reserved_idle_erases_runtime_savings(self):
+        """Runtime looks cheap, but total cost misses the 5% ADOPT improvement bar."""
+        aggs = _good_aggs(
+            merge_lift=0.05,
+            cost_improvement=0.10,
+            lane_runtime_cost=900.0,
+            lane_reserved_idle_cost=80.0,
+            control_runtime_cost=1000.0,
+        )
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["lane_runtime_cost_per_merged"] == 900.0
+        assert result["lane_reserved_idle_cost_per_merged"] == 80.0
+        assert result["lane_cost_per_merged"] == 980.0
+        assert result["verdict"] == "CONTINUE"
+        assert result["verdict_reason"] == "accumulating_data"
 
     def test_kill_on_gate_integrity_violations(self):
         # 3 gate violations → KILL + immediate_alert.
@@ -2122,6 +2167,10 @@ class TestEvaluateLanePilotVerdict:
             "control_merge_rate",
             "lane_cost_per_merged",
             "control_cost_per_merged",
+            "lane_runtime_cost_per_merged",
+            "control_runtime_cost_per_merged",
+            "lane_reserved_idle_cost_per_merged",
+            "control_reserved_idle_cost_per_merged",
             "gate_integrity_violations",
             "checkpoint_loss_rate",
             "thresholds",
@@ -2145,6 +2194,13 @@ class TestEvaluateLanePilotVerdict:
             "adopt_cost_improvement",
         ):
             assert key in result["thresholds"]
+        for field in (
+            "lane_runtime_cost_per_merged",
+            "control_runtime_cost_per_merged",
+            "lane_reserved_idle_cost_per_merged",
+            "control_reserved_idle_cost_per_merged",
+        ):
+            assert field in result
 
     def test_snapshot_fields_present_on_continue(self):
         aggs = _good_aggs(n=10)
@@ -2152,6 +2208,7 @@ class TestEvaluateLanePilotVerdict:
         assert result["verdict"] == "CONTINUE"
         assert "thresholds" in result
         assert "immediate_alert" in result
+        assert "lane_reserved_idle_cost_per_merged" in result
 
 
 class TestEvaluateLanePilotVerdictEngagement:
@@ -2276,6 +2333,10 @@ class TestLaneRelayComparison:
             "control_merge_rate": 0.7,
             "lane_cost_per_merged": 1.0,
             "control_cost_per_merged": 1.2,
+            "lane_runtime_cost_per_merged": 1.0,
+            "control_runtime_cost_per_merged": 1.2,
+            "lane_reserved_idle_cost_per_merged": 0.0,
+            "control_reserved_idle_cost_per_merged": 0.0,
             "gate_integrity_violations": 0,
             "checkpoint_loss_rate": 0.1,
             "warm_resume_fraction": 0.9,

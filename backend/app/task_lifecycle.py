@@ -3202,6 +3202,15 @@ async def _process_post_commit(
                 action_taken = False
                 head_sha = ""
                 if verdict == "APPROVE":
+                    # Retire the chain's lane now that the review approved — no fix
+                    # will be spawned, so the lane must reach a terminal state here
+                    # rather than staying PARKED until the warm-pool hard ceiling.
+                    try:
+                        from app.review_fix_lane_pilot import retire_chain_lane as _retire_lane_approve
+
+                        await _retire_lane_approve(session, task.context or {})
+                    except Exception:  # noqa: BLE001
+                        logger.debug("[PIPELINE] retire_chain_lane (APPROVE) failed (non-critical)", exc_info=True)
                     # Rollup gate handoff: when the original task is parking in CI wait
                     # (rollup-to-main / large rollup path in rollup_management), the parent
                     # owns the merge gate. The review task must NOT merge directly — it

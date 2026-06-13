@@ -93,6 +93,10 @@ class LanePilotAggregates(TypedDict, total=False):
     control_merge_rate: float | None
     lane_cost_per_merged: float | None
     control_cost_per_merged: float | None
+    lane_runtime_cost_per_merged: float | None
+    control_runtime_cost_per_merged: float | None
+    lane_reserved_idle_cost_per_merged: float | None
+    control_reserved_idle_cost_per_merged: float | None
     gate_integrity_violations: int
     checkpoint_loss_rate: float | None
     # Treatment-engagement telemetry (optional; absent when no fix tasks yet).
@@ -146,6 +150,10 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
     control_merge_rate = aggregates.get("control_merge_rate")
     lane_cost = aggregates.get("lane_cost_per_merged")
     control_cost = aggregates.get("control_cost_per_merged")
+    lane_runtime_cost = aggregates.get("lane_runtime_cost_per_merged")
+    control_runtime_cost = aggregates.get("control_runtime_cost_per_merged")
+    lane_reserved_idle_cost = aggregates.get("lane_reserved_idle_cost_per_merged")
+    control_reserved_idle_cost = aggregates.get("control_reserved_idle_cost_per_merged")
     gate_violations = int(aggregates.get("gate_integrity_violations") or 0)
     checkpoint_loss = aggregates.get("checkpoint_loss_rate")
     warm_resume_fraction = aggregates.get("warm_resume_fraction")
@@ -171,6 +179,10 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
         "control_merge_rate": control_merge_rate,
         "lane_cost_per_merged": lane_cost,
         "control_cost_per_merged": control_cost,
+        "lane_runtime_cost_per_merged": lane_runtime_cost,
+        "control_runtime_cost_per_merged": control_runtime_cost,
+        "lane_reserved_idle_cost_per_merged": lane_reserved_idle_cost,
+        "control_reserved_idle_cost_per_merged": control_reserved_idle_cost,
         "gate_integrity_violations": gate_violations,
         "checkpoint_loss_rate": checkpoint_loss,
         "warm_resume_fraction": warm_resume_fraction,

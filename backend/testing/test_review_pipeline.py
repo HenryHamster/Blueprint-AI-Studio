@@ -9723,6 +9723,93 @@ async def test_merge_success_caller_runs_one_shots_when_uncontended(db_session, 
 
 
 @pytest.mark.asyncio
+async def test_approve_verdict_retires_improvement_lane(db_session, mocker):
+    """When _process_post_commit processes an APPROVE verdict on a review task
+    that carries LANE_CHAIN_ID_KEY, it must retire the chain's ImprovementLane
+    so the lane reaches a terminal state immediately rather than staying
+    ACTIVE/PARKED until the next TTL sweep.
+
+    Regression: retire_chain_lane is called with task.context inside the
+    `if verdict == 'APPROVE':` block; removing or bypassing that call would
+    leave the lane live indefinitely — not caught by unit tests on
+    retire_chain_lane alone."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.improvement_lane_ops import create_lane
+    from app.models import ImprovementLane, ImprovementLaneStatus
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY
+
+    _mock_merge_success_deps(mocker)
+
+    project = await _make_db_project(db_session)
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/approve-retire",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    await db_session.flush()
+
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={},
+    )
+    await _persist(db_session, parent)
+
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 7777,
+                "branch": "lane/approve-retire",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            LANE_CHAIN_ID_KEY: str(lane.id),
+            "review_loop": {
+                "pr_number": 7777,
+                "branch": "lane/approve-retire",
+                "base_branch": "main",
+                "original_task_id": str(parent.id),
+                "iteration": 1,
+                "review_approved": True,
+                "ci_passed": True,
+            },
+        },
+        latest_status_message="APPROVE",
+    )
+    review_task.vm_instance_id = f"agent-vm-lane-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="APPROVE",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refreshed_lane = await fresh.get(ImprovementLane, lane.id)
+
+    assert refreshed_lane.status == ImprovementLaneStatus.RETIRED.value, (
+        f"Lane must be RETIRED after APPROVE verdict, got {refreshed_lane.status}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_small_auto_merge_to_distinct_promotion_target_alerts_without_pr_merged(
     db_session, mocker
 ):
@@ -11714,6 +11801,79 @@ async def test_already_merged_skip_retires_active_lane(db_session, mocker):
     await db_session.refresh(lane)
     assert lane.status == ImprovementLaneStatus.RETIRED.value, (
         f"Lane must be RETIRED after already-merged skip, got {lane.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pr_closed_unmerged_skips_spawn_and_retires_lane(db_session, mocker):
+    """When a chain's PR was closed without merge, _spawn_pipeline_task must skip
+    the spawn and retire the chain's ImprovementLane so it reaches RETIRED rather
+    than staying PARKED indefinitely."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+
+    from app.improvement_lane_ops import create_lane
+    from app.models import ImprovementLaneStatus
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/closed-unmerged",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    await db_session.flush()
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small", "pr_closed_unmerged": True},
+    )
+    db_session.add(original_task)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9998,
+                "branch": "lane/closed-unmerged",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+            LANE_CHAIN_ID_KEY: str(lane.id),
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=9998,
+        branch="lane/closed-unmerged",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None and created is False, (
+        "Review spawn must be skipped for a PR closed without merge"
+    )
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.RETIRED.value, (
+        f"Lane must be RETIRED after pr_closed_unmerged skip, got {lane.status}"
     )
 
 

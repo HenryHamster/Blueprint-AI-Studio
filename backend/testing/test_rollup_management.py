@@ -2083,3 +2083,107 @@ async def test_requeue_banked_cost_uses_machine_type_rate(cleanup_db, mocker):
         f"Banked cost for e2-standard-4 child: expected {expected_large}, got {cost_large}; "
         "machine-type rate may not be applied correctly in _requeue_parent_task"
     )
+
+
+# ---------------------------------------------------------------------------
+# SPAWN_REASON_PR_CLOSED_UNMERGED: parent must not fail when fix or review
+# spawn returns None because the PR was closed without merging.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rollup_fix_spawn_none_pr_closed_unmerged_does_not_fail_parent(
+    cleanup_db, mocker
+):
+    """When _spawn_pipeline_task returns None and sets SPAWN_REASON_PR_CLOSED_UNMERGED
+    on the fix-spawn path (small rollup, merge conflict), the parent must remain
+    EVALUATING and must NOT be transitioned to FAILED."""
+    from app.review_pipeline import SPAWN_REASON_KEY, SPAWN_REASON_PR_CLOSED_UNMERGED
+
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="dirty")
+
+    async def _spawn_closed_unmerged(parent, task_type, session, *args, **kwargs):
+        parent.context = {
+            **(parent.context or {}),
+            SPAWN_REASON_KEY: SPAWN_REASON_PR_CLOSED_UNMERGED,
+        }
+        return (None, True)
+
+    mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        side_effect=_spawn_closed_unmerged,
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status != TaskStatus.FAILED, (
+        "parent must not be FAILED when fix spawn returns None due to PR closed without merge"
+    )
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_rollup_review_spawn_none_pr_closed_unmerged_does_not_fail_parent(
+    cleanup_db, mocker
+):
+    """When _spawn_pipeline_task returns None and sets SPAWN_REASON_PR_CLOSED_UNMERGED
+    on the review-spawn path (large rollup), the parent must remain EVALUATING
+    and must NOT be transitioned to FAILED."""
+    from app.review_pipeline import SPAWN_REASON_KEY, SPAWN_REASON_PR_CLOSED_UNMERGED
+
+    # Use automerge deps but override get_pull_request to report a large PR
+    # (additions > 100) so the large-rollup → review path is taken.
+    mock_merge, _ = _mock_automerge_deps(mocker, pr_files=_files("backend/app/models.py"))
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {"additions": 200, "deletions": 50, "merged": False, "state": "open"},
+        ],
+    )
+
+    async def _spawn_closed_unmerged(parent, task_type, session, *args, **kwargs):
+        parent.context = {
+            **(parent.context or {}),
+            SPAWN_REASON_KEY: SPAWN_REASON_PR_CLOSED_UNMERGED,
+        }
+        return (None, True)
+
+    mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        side_effect=_spawn_closed_unmerged,
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status != TaskStatus.FAILED, (
+        "parent must not be FAILED when review spawn returns None due to PR closed without merge"
+    )
+    assert parent.status == TaskStatus.EVALUATING
