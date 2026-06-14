@@ -1392,6 +1392,34 @@ describe('matchesAuthFailure', () => {
   it('does not cross-match provider-specific auth failures', () => {
     expect(matchesAuthFailure('API key not valid', 'anthropic')).toBe(false);
   });
+
+  it('detects a Codex OAuth refresh-token-reuse 401 (prod 2026-06-14 SavarinCodex)', () => {
+    // The codex CLI emits this when its stored refresh token was already
+    // consumed/rotated. Before coverage was added, runClaudeCode returned a bare
+    // non-zero exit instead of throwing AuthFailureError, so panel_review
+    // fail-closed the challenge and stranded the gated PR's merge.
+    const body =
+      'ERROR codex_login::auth::manager: Failed to refresh token: 401 Unauthorized: ' +
+      '{"error":{"message":"Your refresh token has already been used to generate a new ' +
+      'access token. Please try signing in again.","type":"invalid_request_error",' +
+      '"code":"refresh_token_reused"}}';
+    expect(matchesAuthFailure(body, 'openai')).toBe(true);
+  });
+
+  it('detects the "refresh token was already used / sign in again" variant', () => {
+    const body =
+      'Failed to refresh token: Your access token could not be refreshed because your ' +
+      'refresh token was already used. Please log out and sign in again.';
+    expect(matchesAuthFailure(body, 'openai')).toBe(true);
+  });
+
+  it('treats OAuth refresh-token death as provider-agnostic (generic pattern)', () => {
+    expect(matchesAuthFailure('error: refresh_token_reused')).toBe(true);
+  });
+
+  it('does not classify a benign token-refresh log line as an auth failure', () => {
+    expect(matchesAuthFailure('Scheduled proactive token refresh in 1800s')).toBe(false);
+  });
 });
 describe('RateLimitError', () => {
   it('is an instance of RateLimitError and Error', () => {

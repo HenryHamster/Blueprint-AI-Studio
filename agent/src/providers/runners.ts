@@ -198,6 +198,20 @@ const AUTH_FAILURE_PATTERNS_GENERIC: readonly string[] = [
   'token expired',
   'token invalid',
   'token revoked',
+  // OAuth refresh-token death: the stored refresh token was already
+  // consumed/rotated, so the access token can no longer be refreshed and the
+  // account needs an interactive re-auth — NOT a transient retry. Production
+  // 2026-06-14: SavarinCodex (the sole live Codex account) emitted these
+  // `refresh_token_reused` 401s; without coverage here matchesAuthFailure
+  // missed it, so runClaudeCode returned a bare non-zero exit instead of
+  // throwing AuthFailureError, and the panel_review handler fail-closed the
+  // challenge as a review failure — terminally failing it and stranding the
+  // gated PR's merge. These markers route the crash to the standard retryable
+  // auth-failure path (account auto-disabled + task requeued onto a live one).
+  'refresh_token_reused',
+  'refresh token has already been used',
+  'refresh token was already used',
+  'please log out and sign in again',
 ] as const;
 
 const AUTH_FAILURE_PATTERNS: Readonly<Record<ProviderName, readonly string[]>> = {
