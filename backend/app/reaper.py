@@ -85,9 +85,7 @@ from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 logger = logging.getLogger(__name__)
 
 
-def _normalize_reaper_retry_failure_class(
-    failure_class: str, context: object
-) -> str:
+def _normalize_reaper_retry_failure_class(failure_class: str, context: object) -> str:
     """Match clone retry classification for raw lowercase scope-overflow labels."""
     if failure_class != "CODE_ERROR" or not isinstance(context, dict):
         return failure_class
@@ -2292,8 +2290,17 @@ async def reaper_service():
                             da_ctx.pop("_slot_released", None)
                             task.retry_after_until = None
                             da_ctx.pop("provision_failures", None)
+                            # Clear the stale DEAD_AUTH verdict and matched pattern so
+                            # the next attempt is classified fresh for its own provider.
+                            # Without this, the short-circuit in _classify_failure_class
+                            # (task.context["failure_class"]) fires on the new attempt and
+                            # disables whatever account that attempt runs on — including
+                            # accounts from a different provider — with the stale pattern
+                            # as the reason. (Incident 2026-06-14: Codex dead-auth
+                            # disabled all Anthropic accounts via this leak.)
+                            da_ctx.pop("failure_class", None)
+                            da_ctx.pop("dead_auth_matched_pattern", None)
                             task.context = da_ctx
-                            persist_authoritative_verdict(task, DEAD_AUTH)
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),

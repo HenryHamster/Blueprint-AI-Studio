@@ -3031,6 +3031,87 @@ class TestDeadAuthClassification:
             f"expected provider_model_config subtype, got {subtype!r}"
         )
 
+    # ── Cross-provider isolation (incident 2026-06-14) ─────────────────────
+
+    def test_stale_dead_auth_verdict_short_circuits_new_attempt(self):
+        """Demonstrate the cross-provider bug: a stale failure_class = 'DEAD_AUTH'
+        in task.context causes _classify_failure_class to short-circuit and return
+        DEAD_AUTH for any subsequent attempt — even on a completely different provider.
+
+        This is the bug that disabled all 6 Anthropic accounts when Codex dead-auths
+        wrote failure_class='DEAD_AUTH' + dead_auth_matched_pattern='token_invalidated'
+        into task context, and the reaper reaped the next attempt (on an Anthropic
+        account) using the short-circuit path.
+        """
+        from app.failure_classification import DEAD_AUTH
+
+        ctx = {
+            "failure_class": "DEAD_AUTH",  # stale verdict from Codex dead-auth
+            "dead_auth_matched_pattern": "token_invalidated",  # OpenAI-only pattern
+            "failure_category": "claude_code_failed",
+            "llm_provider": "anthropic",  # task now runs on Anthropic
+            "llm_auth_mode": "oauth",
+        }
+        t = _task("Some Anthropic failure", ctx)
+        t.api_call_summary = None
+        # The short-circuit fires: returns stale DEAD_AUTH without re-checking
+        # whether token_invalidated is even an Anthropic dead-auth pattern.
+        assert classify_failure(t) == DEAD_AUTH
+
+    def test_cleared_dead_auth_context_classifies_anthropic_task_correctly(self):
+        """After the requeue fix: failure_class and dead_auth_matched_pattern are
+        cleared from context on dead-auth requeue, so the next attempt's
+        classification is done fresh for the new provider.
+
+        Regression test for incident 2026-06-14 — cross-provider dead-auth disable.
+        Codex (openai/oauth) tasks that dead-auth with 'token_invalidated' must
+        not cause Anthropic accounts to be disabled.
+        """
+        from app.failure_classification import DEAD_AUTH
+
+        # Simulate the state AFTER the requeue path clears stale keys:
+        # failure_class and dead_auth_matched_pattern are gone; the task now
+        # carries a new Anthropic account assignment.
+        ctx = {
+            # These were cleared by the fix (popped before task.context = da_ctx):
+            # "failure_class": "DEAD_AUTH",       ← cleared
+            # "dead_auth_matched_pattern": ...,    ← cleared
+            #
+            # New Anthropic account assigned by the orchestrator:
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "failure_category": "claude_code_failed",
+        }
+        t = _task("Anthropic task failed for non-auth reason", ctx)
+        t.api_call_summary = None
+        # Without stale context, classify_failure runs the full heuristic.
+        # An Anthropic task with a generic failure status and no dead-auth
+        # patterns must NOT classify as DEAD_AUTH.
+        result = classify_failure(t)
+        assert result != DEAD_AUTH, (
+            f"Anthropic task must not classify as DEAD_AUTH after Codex dead-auth "
+            f"requeue clears stale context; got {result!r}"
+        )
+
+    def test_openai_dead_auth_pattern_does_not_match_anthropic_task(self):
+        """Provider isolation: 'token_invalidated' is an OpenAI-only dead-auth
+        pattern. An Anthropic task must not match it even if it appears in stderr.
+
+        This validates that _task_dead_auth_patterns() uses the task's own
+        provider patterns (not all providers') — an Anthropic task only triggers
+        DEAD_AUTH on 'oauth_org_not_allowed', never on 'token_invalidated'.
+        """
+        from app.failure_classification import DEAD_AUTH
+
+        report = self._anthropic_oauth_report(
+            stderr_tail="token_invalidated: some error from somewhere"
+        )
+        t = self._dead_auth_task(report)
+        # Anthropic patterns do NOT include "token_invalidated", so this must
+        # fall through to a non-DEAD_AUTH class.
+        assert classify_failure(t) != DEAD_AUTH
+        assert "dead_auth_matched_pattern" not in t.context
+
 
 class TestRedactCredentials:
     """Unit tests for the _redact_credentials helper.
