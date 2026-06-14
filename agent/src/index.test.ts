@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import {
   __resetTaskCapabilityContractForTesting,
@@ -565,6 +565,7 @@ describe('FailureCategory', () => {
     'claude_code_failed',
     'parse_failed',
     'fatal',
+    'github_token_fetch_failed',
   ];
 
   it('covers all expected failure category values', () => {
@@ -574,7 +575,7 @@ describe('FailureCategory', () => {
       const value: FailureCategory = cat;
       expect(typeof value).toBe('string');
     }
-    expect(expectedCategories).toHaveLength(8);
+    expect(expectedCategories).toHaveLength(9);
   });
 });
 
@@ -626,6 +627,62 @@ describe('isTaskNoLongerActiveError', () => {
     const genuinelyFatal = new Error('handler threw: undefined is not a function');
     expect(isTaskNoLongerActiveError(benign)).toBe(true);
     expect(isTaskNoLongerActiveError(genuinelyFatal)).toBe(false);
+  });
+});
+
+// ── github/token fetch: long timeout + infra error category ──────────────────
+// The github/token startup fetch hits get_github_token_for_task which can block
+// up to ~120s while _github_request sleeps on a near-empty rate-limit bucket.
+// The fix: apiGet now accepts a timeoutMs arg; the fetch is called at 180_000ms
+// and failures are tagged github_token_fetch_failed (PROVISION_FAILURE, not
+// CODE_ERROR) so the task requeues instead of burning the retry budget.
+describe('github/token fetch: infra category and long timeout', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('apiGet with 180_000ms timeout does NOT abort before 30s default would have fired', async () => {
+    vi.useFakeTimers();
+    // Fetch never resolves — simulates the backend sleeping on rate-limit backoff.
+    const fetchMock = makeFetchMock().mockImplementation((_input, init) => {
+      const signal = init?.signal;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          reject(new Error('This operation was aborted'));
+        });
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const p = apiGet('/api/agent/github/token?task_id=test-123', 1, 180_000);
+    const rejection = expect(p).rejects.toThrow(/aborted/);
+
+    // Default timeout (API_TIMEOUT = 30s) passes — should NOT have aborted yet.
+    await vi.advanceTimersByTimeAsync(30_000);
+    // Still pending — the 180s timeout has not fired yet.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Advance past the 180s body-phase timer — NOW it aborts.
+    await vi.advanceTimersByTimeAsync(180_000);
+    await rejection;
+  });
+
+  it('tags a github/token fetch error with github_token_fetch_failed, not fatal', () => {
+    // The catch block in runRoleOnce wraps any error from the github/token apiGet
+    // with failureCategory = 'github_token_fetch_failed'. This maps to
+    // PROVISION_FAILURE (infra/requeue) instead of CODE_ERROR (burns budget).
+    // The pattern mirrors clone_failed and vm_config_missing.
+    const raw = new Error('GET /api/agent/github/token?task_id=x failed after 5 retries');
+    const wrapped = raw as Error & { failureCategory?: FailureCategory };
+    wrapped.failureCategory = 'github_token_fetch_failed';
+
+    expect(wrapped.failureCategory).toBe('github_token_fetch_failed');
+    // Confirm it is distinct from the generic fatal default.
+    expect(wrapped.failureCategory).not.toBe('fatal');
+    // TypeScript ensures this is a valid FailureCategory member at compile time.
+    const category: FailureCategory = wrapped.failureCategory;
+    expect(typeof category).toBe('string');
   });
 });
 

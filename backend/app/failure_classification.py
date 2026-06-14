@@ -762,6 +762,13 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # cf28097f): without this label the generic ``fatal`` + init-banner-only tail
     # was reclassified to RATE_LIMIT ("usage exhausted") above.
     "vm_config_missing": PROVISION_FAILURE,
+    # ``github_token_fetch_failed`` — the agent's startup github/token fetch
+    # (get_github_token_for_task) timed out or failed. The backend legitimately
+    # blocks up to ~120s while _github_request sleeps on a near-empty rate-limit
+    # bucket, so a credential-fetch failure is an infra/transient event, not a
+    # code fault. Route to PROVISION_FAILURE so the task requeues on a fresh VM
+    # without burning the terminal retry budget or cascading the parent plan.
+    "github_token_fetch_failed": PROVISION_FAILURE,
     # ``park_wake_timeout`` / ``park_wake_stranded`` — park/wake orchestration
     # outcomes written by the reaper's wake-delivery sweep / expire path (lowercase
     # literals matching the canonical class VALUES). Mapped here so the

@@ -82,7 +82,7 @@ export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand,
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api' | 'vm_config_missing';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api' | 'vm_config_missing' | 'github_token_fetch_failed';
 
 // ── Graceful-shutdown signalling (cluster C7) ────────────────────────────────
 // A non-error "shutdown requested" control signal. Thrown from the deep call
@@ -1101,8 +1101,8 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
   };
 }
 
-export async function apiGet(path: string, retries = API_MAX_RETRIES) {
-  return apiRequest('GET', path, () => ({ headers: apiHeaders }), retries, API_TIMEOUT);
+export async function apiGet(path: string, retries = API_MAX_RETRIES, timeoutMs = API_TIMEOUT) {
+  return apiRequest('GET', path, () => ({ headers: apiHeaders }), retries, timeoutMs);
 }
 
 // ── Task-capability contract (agent permission source of truth) ──────────────
@@ -1117,7 +1117,10 @@ export async function apiGet(path: string, retries = API_MAX_RETRIES) {
 let _taskCapabilityContractLoaded = false;
 
 export async function fetchTaskCapabilityContract(): Promise<TaskCapabilityContract> {
-  const res = await apiGet('/api/agent/task-capabilities') as { task_capabilities?: TaskCapabilityContract };
+  // Use the same 180s timeout as the github/token fetch — both endpoints call
+  // get_github_token_for_task under the hood, which can legitimately block up to
+  // ~120s while _github_request sleeps on a near-empty rate-limit bucket.
+  const res = await apiGet('/api/agent/task-capabilities', API_MAX_RETRIES, 180_000) as { task_capabilities?: TaskCapabilityContract };
   const contract = res.task_capabilities;
   if (!contract || typeof contract !== 'object') {
     throw new Error('GET /api/agent/task-capabilities returned no task_capabilities map');
@@ -3416,8 +3419,21 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
 
   try {
     // Get GitHub credentials
+    // Timeout must cover the backend's worst case for get_github_token_for_task:
+    // _github_request sleeps up to 120s on a near-empty rate-limit bucket, plus up
+    // to 3 retries each with a 15s httpx timeout. 180s comfortably covers the full
+    // backoff. The same path is already covered at 240s for the PR-create call
+    // (line ~2724); the token-only fetch here uses 180s (no extra GitHub round-trips
+    // beyond token minting). Any failure here is infrastructure, not a code fault.
     statusRef.value = 'Fetching GitHub credentials...';
-    const ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string; owner: string; repo: string } };
+    let ghRes: { data: { token: string; owner: string; repo: string } };
+    try {
+      ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
+      throw err;
+    }
     const { token: ghToken, owner, repo } = ghRes.data;
     log(`GitHub: ${owner}/${repo}`);
 

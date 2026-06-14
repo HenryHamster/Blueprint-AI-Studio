@@ -884,6 +884,29 @@ class TestNormalizeAgentFailureCategory:
         )
         assert classify_failure(task) == PROVISION_FAILURE
 
+    def test_github_token_fetch_failed_routes_to_provision_failure(self):
+        """Agent emits github_token_fetch_failed when the startup github/token fetch
+        times out or fails. The backend can legitimately block up to ~120s while
+        _github_request sleeps on a near-empty rate-limit bucket, so a credential
+        fetch failure is infra/transient — must route to PROVISION_FAILURE so the
+        task requeues on a fresh VM without burning the terminal retry budget or
+        cascading the parent plan (incident 2026-06-13/14: task ca3279e1 cascaded
+        parent e9dbc87e because the 30s timeout fired and was classified CODE_ERROR)."""
+        task = _task("GET /api/agent/github/token?task_id=x failed after 5 retries")
+        assert (
+            normalize_agent_failure_category("github_token_fetch_failed", task)
+            == PROVISION_FAILURE
+        )
+
+    def test_github_token_fetch_failed_via_classify_failure_context_fast_path(self):
+        """End-to-end: classify_failure sees github_token_fetch_failed in context and
+        routes to PROVISION_FAILURE without falling through to the text classifier."""
+        task = _task(
+            "Fatal error: GET /api/agent/github/token?task_id=x failed after 5 retries",
+            {"failure_category": "github_token_fetch_failed"},
+        )
+        assert classify_failure(task) == PROVISION_FAILURE
+
     def test_reassigned_routes_to_reassigned_class(self):
         """Agent self-terminates gracefully on a non-transient heartbeat 4xx
         (reassignment/deauth) or cancel/supersede during startup and posts
@@ -2932,7 +2955,10 @@ class TestDeadAuthClassification:
         }
         t = _task(full_status, ctx)
         t.api_call_summary = None
-        from app.failure_classification import RATE_LIMIT, normalize_agent_failure_category
+        from app.failure_classification import (
+            RATE_LIMIT,
+            normalize_agent_failure_category,
+        )
 
         # Drive via the production write-boundary path: normalize_agent_failure_category
         # persists failure_class to context (agent_status.py:1085-1096), then
