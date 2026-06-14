@@ -379,7 +379,7 @@ async def _compute_digest(
                     # windowed compute_format_compliance_metrics measure; loaded
                     # here so the direct access doesn't trigger a lazy-load.
                     Task.format_compliance_summary,
-                )
+                raiseload=True,)
             )
             .limit(_DIGEST_TASK_ROW_CAP)
         )
@@ -437,7 +437,7 @@ async def _compute_digest(
                     # windowed compute_format_compliance_metrics measure; loaded
                     # here so the direct access doesn't trigger a lazy-load.
                     Task.format_compliance_summary,
-                )
+                raiseload=True,)
             )
             .limit(_DIGEST_TASK_ROW_CAP)
         )
@@ -534,7 +534,7 @@ async def _compute_digest(
                     Task.vm_spot,
                     Task.previous_error_fingerprint,
                     Task.auto_remediation,
-                )
+                raiseload=True,)
             )
         )
         active_tasks_all: List[Task] = []
@@ -564,7 +564,7 @@ async def _compute_digest(
                     Task.vm_spot,
                     Task.previous_error_fingerprint,
                     Task.auto_remediation,
-                )
+                raiseload=True,)
             )
         )
         active_tasks_all = list(active_result.scalars().all())

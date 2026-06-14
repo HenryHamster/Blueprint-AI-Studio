@@ -2733,7 +2733,7 @@ async def _build_recent_interventions(
                 # silently and the strategic cycle stalls.
                 Task.title,
                 Task.description,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
         .limit(500)
@@ -2753,7 +2753,7 @@ async def _build_recent_interventions(
             Task.project_id == project.id,
             Task.status.in_(_IN_FLIGHT_TASK_STATUSES),
         )
-        .options(load_only(Task.id, Task.status, Task.context, Task.payloads))
+        .options(load_only(Task.id, Task.status, Task.context, Task.payloads, raiseload=True))
     )
     active_tasks = list(active_tasks_result.scalars().all())
     held_tasks_result = await session.execute(
@@ -2762,7 +2762,7 @@ async def _build_recent_interventions(
             Task.project_id == project.id,
             Task.status.in_((TaskStatus.BLOCKED, TaskStatus.PARKED)),
         )
-        .options(load_only(Task.id, Task.status, Task.context))
+        .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
     )
     held_tasks = list(held_tasks_result.scalars().all())
 
@@ -2875,7 +2875,7 @@ async def _build_recent_interventions(
         _parents_result = await session.execute(
             select(Task)
             .where(Task.id.in_(_all_parent_ids))
-            .options(load_only(Task.id, Task.context, Task.status_log))
+            .options(load_only(Task.id, Task.context, Task.status_log, raiseload=True))
         )
         for _p in _parents_result.scalars().all():
             _p_ctx = _p.context or {}

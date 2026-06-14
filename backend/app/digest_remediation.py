@@ -225,7 +225,7 @@ async def compute_remediation_and_patterns(
                 Task.status,
                 Task.previous_error_fingerprint,
                 Task.context,
-            )
+            raiseload=True,)
         )
     )
     _inflight_fp_tasks = list(_inflight_fp_result.scalars().all())
@@ -447,7 +447,7 @@ async def compute_remediation_funnel(
     remediations_failed = sum(1 for t in _rem_tasks if t.status == TaskStatus.FAILED)
 
     _held_projects_q = select(Project).options(
-        load_only(Project.id, Project.directions)
+        load_only(Project.id, Project.directions, raiseload=True)
     )
     if project_id:
         _held_projects_q = _held_projects_q.where(Project.id == project_id)

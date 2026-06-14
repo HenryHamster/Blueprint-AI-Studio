@@ -540,7 +540,8 @@ async def _compute_account_health_summary(
                             Task.latest_status_message,
                             Task.updated_at,
                             Task.project_id,  # classify_failure → record_residual_fingerprint
-                            Task.payloads,  # classify_failure reads first_payload (L-P2)
+                            Task.payloads,  # classify_failure reads first_payload (L-P2),
+                            raiseload=True
                         )
                     )
                     .where(

@@ -62,7 +62,7 @@ async def _sweep_orphan_direction_holds(session) -> int:
     projects = (
         (
             await session.execute(
-                select(Project).options(load_only(Project.id, Project.directions))
+                select(Project).options(load_only(Project.id, Project.directions, raiseload=True))
             )
         )
         .scalars()

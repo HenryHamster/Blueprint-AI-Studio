@@ -250,7 +250,7 @@ async def _maybe_auto_playbook(
                 Task.context,
                 Task.created_at,
                 Task.status_log,
-            )
+            raiseload=True,)
         )
         .limit(200)
     )

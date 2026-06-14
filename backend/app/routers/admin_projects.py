@@ -1103,7 +1103,7 @@ async def get_direction_task_counts(
                 Task.context,
                 Task.title,
                 Task.latest_status_message,
-            )
+            raiseload=True,)
         )
         .limit(5000)
     )
@@ -1284,7 +1284,7 @@ async def get_task_type_cost_adherence(
                 Task.vm_spot,
                 Task.vm_machine_type,
                 Task.vm_runtime_cost_banked_db,
-            )
+            raiseload=True,)
         )
         .limit(10000)
     )

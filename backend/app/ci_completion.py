@@ -918,7 +918,7 @@ async def _attempt_merge_with_retry_and_escalation(
                                 Task.payloads,
                                 Task.project_id,
                                 Task.status_log,
-                            )
+                            raiseload=True,)
                         )
                         .where(
                             Task.project_id == task.project_id,
@@ -1039,7 +1039,7 @@ async def _attempt_merge_with_retry_and_escalation(
                                 Task.payloads,
                                 Task.project_id,
                                 Task.status_log,
-                            )
+                            raiseload=True,)
                         )
                         .where(
                             Task.project_id == task.project_id,
@@ -1279,7 +1279,7 @@ async def _attempt_merge_with_retry_and_escalation(
                                     Task.payloads,
                                     Task.project_id,
                                     Task.status_log,
-                                )
+                                raiseload=True,)
                             )
                             .where(
                                 Task.project_id == task.project_id,
@@ -1615,7 +1615,7 @@ async def handle_ci_completion(
                             Task.payloads,
                             Task.project_id,
                             Task.status_log,
-                        )
+                        raiseload=True,)
                     )
                     .where(
                         Task.project_id == task.project_id,

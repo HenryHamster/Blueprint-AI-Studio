@@ -277,7 +277,7 @@ async def count_merged_since(
     """
     stmt = (
         select(Task)
-        .options(load_only(Task.id, Task.status_log, Task.created_at))
+        .options(load_only(Task.id, Task.status_log, Task.created_at, raiseload=True))
         .where(
             Task.project_id == project_id,
             Task.status == TaskStatus.COMPLETED,

@@ -73,7 +73,7 @@ async def get_activity(
                 Task.context,
                 Task.latest_status_message,
                 Task.plan_output,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
         .limit(limit * 3)

@@ -206,7 +206,7 @@ async def persist_version_lane_baseline(
     t_opened = _strip_tz(opened_at)
     t_closed = _strip_tz(closed_at)
 
-    _opts = load_only(*_TASK_SNAPSHOT_COLUMNS)
+    _opts = load_only(*_TASK_SNAPSHOT_COLUMNS, raiseload=True)
     _proj_filter = [Task.project_id == project_id]
 
     completed_tasks = list(

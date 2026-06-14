@@ -872,11 +872,13 @@ class TestSchemaRevisionSync:
             content = f.read()
 
         # Every github helper the back-merge module is allowed to call directly.
-        # All four are read/merge-only — none writes to a branch:
-        #   create_pull_request  — open (or reuse) the back-merge PR (idempotent)
-        #   merge_pull_request   — land the back-merge through the normal merge API
-        #   get_pull_request     — read PR state / mergeability
+        # All are read/merge-only — none writes to a branch:
+        #   create_pull_request   — open (or reuse) the back-merge PR (idempotent)
+        #   merge_pull_request    — land the back-merge through the normal merge API
+        #   get_pull_request      — read PR state / mergeability
         #   get_check_runs_cached — read CI status before attempting the merge
+        #   get_pr_files          — read per-file list for module-size violation check
+        #   get_file_text_at_ref  — fetch file content at a ref for line-count check
         # A branch-write helper (e.g. github.commit_file_changes, create_branch,
         # merge_branch, update_branch, delete_branch — all real symbols in the
         # app.github namespace) is deliberately absent: inlining the dual-head
@@ -888,6 +890,8 @@ class TestSchemaRevisionSync:
             "merge_pull_request",
             "get_pull_request",
             "get_check_runs_cached",
+            "get_pr_files",
+            "get_file_text_at_ref",
         }
         used = set(re.findall(r"\bgithub\.(\w+)\b", content))
         unexpected = sorted(used - ALLOWED_BACKMERGE_GITHUB_HELPERS)
@@ -907,14 +911,16 @@ class TestSchemaRevisionSync:
 
         # Guard the guard: an accidental "allow everything" (empty-set) regression
         # would make the subset check vacuous. The allowlist must stay exactly the
-        # four documented read/merge helpers.
+        # documented read/merge helpers.
         assert ALLOWED_BACKMERGE_GITHUB_HELPERS == {
             "create_pull_request",
             "merge_pull_request",
             "get_pull_request",
             "get_check_runs_cached",
+            "get_pr_files",
+            "get_file_text_at_ref",
         }, (
-            "The back-merge github-helper allowlist must stay the four read/merge helpers."
+            "The back-merge github-helper allowlist must stay the documented read/merge helpers."
         )
 
         # The block path must still route to the spawned resolver — if this

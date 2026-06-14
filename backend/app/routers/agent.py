@@ -733,7 +733,7 @@ async def _refresh_sr_catch_rate(
                         Task.project_id,
                         Task.strategic_cycle_id,
                         Task.payloads,
-                    )
+                    raiseload=True,)
                 )
                 .where(*_where)
                 .order_by(Task.created_at.desc())
@@ -1055,7 +1055,7 @@ async def claim_task(
             Task.payloads,
             Task.context,
             Task.project_id,
-        )
+        raiseload=True,)
         _active_queued_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1125,7 +1125,7 @@ async def claim_task(
             Task.model,
             Task.strategic_cycle_id,
             Task.fix_loop_history,
-        )
+        raiseload=True,)
         _terminal_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1212,7 +1212,7 @@ async def claim_task(
             Task.model,
             Task.strategic_cycle_id,
             Task.fix_loop_history,
-        )
+        raiseload=True,)
         _history_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1517,7 +1517,7 @@ async def claim_task(
                 Task.account_id,
                 Task.provider,
                 Task.model,
-            )
+            raiseload=True,)
             _sibling_ranked = (
                 select(
                     Task.id.label("task_id"),
@@ -2210,7 +2210,7 @@ async def claim_task(
                         await session.execute(
                             select(Task)
                             .where(Task.id.in_(_parsed_ids))
-                            .options(load_only(Task.id, Task.status, Task.context))
+                            .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
                         )
                     ).scalars()
                     for _src_task in _src_rows:
@@ -3424,7 +3424,7 @@ async def claim_task(
                     Task.created_at > _utcnow() - timedelta(days=14),
                 )
                 .options(
-                    load_only(Task.id, Task.context, Task.payloads, Task.created_at)
+                    load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True)
                 )
                 .order_by(Task.created_at.desc())
                 .limit(2000)

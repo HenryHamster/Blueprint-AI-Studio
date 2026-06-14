@@ -288,7 +288,7 @@ async def get_all_tasks(
                     Artifact.storage_uri,
                     Artifact.iteration,
                     Artifact.created_at,
-                )
+                raiseload=True,)
             )
             .where(Artifact.task_id.in_(task_ids))
             .order_by(Artifact.created_at.asc())
@@ -321,7 +321,7 @@ async def get_all_tasks(
         # Fetch logs columns separately to avoid loading large blobs in the main query
         logs_stmt = (
             select(Artifact)
-            .options(load_only(Artifact.task_id, Artifact.artifact_type, Artifact.logs))
+            .options(load_only(Artifact.task_id, Artifact.artifact_type, Artifact.logs, raiseload=True))
             .where(
                 Artifact.task_id.in_(task_ids),
                 Artifact.artifact_type.in_(
@@ -2356,7 +2356,7 @@ async def reset_iteration_cap(
             Task.archived.is_(False),
             _pr_number_match(session, pr_number),
         )
-        .options(load_only(Task.id, Task.archived, Task.payloads))
+        .options(load_only(Task.id, Task.archived, Task.payloads, raiseload=True))
     )
     archived_count = 0
     for t in failed_result.scalars().all():

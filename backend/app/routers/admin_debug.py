@@ -1390,7 +1390,7 @@ async def get_global_diagnostics(
                 # payloads is read by classify_failure → _classify_stuck_failure;
                 # omitting it here triggers MissingGreenlet on lazy-load.
                 Task.payloads,
-            )
+            raiseload=True,)
         )
         .where(
             Task.status.in_(active_statuses),
@@ -1435,7 +1435,7 @@ async def get_global_diagnostics(
             func.coalesce(func.jsonb_array_length(Project.directions), 0) > 0,
             Project.not_archived(),
         )
-        .options(load_only(Project.id, Project.directions))
+        .options(load_only(Project.id, Project.directions, raiseload=True))
         .limit(500)
     )
     remediation_by_project: Dict[str, List[DirectionRemediationInfo]] = {}
@@ -1608,7 +1608,7 @@ async def get_recent_findings(
     cutoff = _utcnow() - timedelta(days=7)
     result = await session.execute(
         select(Task)
-        .options(load_only(Task.id, Task.plan_output, Task.created_at, Task.context))
+        .options(load_only(Task.id, Task.plan_output, Task.created_at, Task.context, raiseload=True))
         .where(
             Task.project_id == project_id,
             Task.status == TaskStatus.COMPLETED,

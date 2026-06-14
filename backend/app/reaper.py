@@ -1194,7 +1194,7 @@ async def reaper_service():
                             Task.previous_error_fingerprint,
                             Task.requeue_in_flight,
                             Task.description,
-                        )
+                        raiseload=True,)
                     )
                     .where(
                         Task.status.in_(
@@ -3683,7 +3683,7 @@ async def reaper_service():
                                         Task.status_log,
                                         Task.attempt_count,
                                         Task.created_at,
-                                    )
+                                    raiseload=True,)
                                 )
                                 .where(
                                     Task.status == TaskStatus.EVALUATING,
@@ -3727,7 +3727,7 @@ async def reaper_service():
                                             Task.status_log,
                                             Task.latest_status_message,
                                             Task.payloads,
-                                        )
+                                        raiseload=True,)
                                     )
                                     .where(Task.parent_task_id.in_(_parent_ids))
                                 )

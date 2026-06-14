@@ -318,7 +318,7 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
             await session.execute(
                 select(Task)
                 .options(
-                    load_only(Task.id, Task.status, Task.payloads, Task.project_id)
+                    load_only(Task.id, Task.status, Task.payloads, Task.project_id, raiseload=True)
                 )
                 .where(
                     Task.project_id == project_id,

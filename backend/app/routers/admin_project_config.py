@@ -78,7 +78,7 @@ async def cost_summary(
                         Task.vm_provisioned_at,
                         Task.vm_stopped_at,
                         Task.created_at,
-                    )
+                    raiseload=True,)
                 )
                 .where(
                     Task.created_at >= cutoff,
@@ -172,7 +172,8 @@ async def get_auto_remediation_config(
                 )
                 .options(
                     load_only(
-                        Task.id, Task.status, Task.title, Task.context, Task.created_at
+                        Task.id, Task.status, Task.title, Task.context, Task.created_at,
+                        raiseload=True
                     )
                 )
                 .order_by(Task.created_at.desc())

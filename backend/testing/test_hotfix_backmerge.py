@@ -3190,3 +3190,202 @@ async def test_open_backmerge_pr_no_duplicate_when_prior_resolver_pr_still_open(
     assert len(resolvers) == 1, (
         f"a still-open resolution PR must dedupe the next cycle — got {len(resolvers)}"
     )
+
+
+# ===========================================================================
+# Module size violation alerts (step 3c)
+# ===========================================================================
+
+
+def _make_pr_file(filename: str) -> dict:
+    """Minimal PR-files entry for a single changed file."""
+    return {"filename": filename, "status": "modified"}
+
+
+def _make_file_content(n_lines: int) -> str:
+    """Synthesise a file body with exactly ``n_lines`` lines."""
+    return "\n".join(f"line {i}" for i in range(n_lines))
+
+
+async def test_module_size_check_emits_warning_alert_on_violation(db_session, mocker):
+    """When a back-merge PR changes a tracked module that now exceeds its cap,
+    a WARNING Alert is emitted and the merge still proceeds (status=merged)."""
+    project = await _make_project(db_session)
+    # create_pull_request returns a PR with head.sha so step 3c resolves the ref.
+    _patch_github(
+        mocker,
+        create_return={"number": 55, "html_url": "http://pr/55"},
+        merge_return={"merged": True},
+    )
+
+    # PR touches orchestrator.py (tracked under backend, cap 7750 lines).
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_make_pr_file("backend/app/orchestrator.py")]),
+    )
+    # The file at the LTS branch head is 8000 lines — over cap.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(8000)),
+    )
+
+    result = await hb.open_backmerge_pr(
+        db_session, project.id, merged_pr_url="http://pr/hotfix-99"
+    )
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+    a = alerts[0]
+    assert a.severity == AlertSeverity.WARNING
+    assert "orchestrator.py" in a.title
+    assert "~8000 lines" in a.title  # bucket for 8000 = (8000 // 100) * 100 = 8000
+    assert "cap 7750" in a.title
+
+
+async def test_module_size_check_does_not_block_merge(db_session, mocker):
+    """A size violation must NEVER block the back-merge (status=merged even
+    when violations are detected)."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 66, "html_url": "http://pr/66"},
+        merge_return={"merged": True},
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_make_pr_file("backend/app/orchestrator.py")]),
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(9000)),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+
+
+async def test_module_size_check_dedupes_same_bucket(db_session, mocker):
+    """A second back-merge cycle with the same module still in the same 100-line
+    bucket does NOT create a second alert."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 77, "html_url": "http://pr/77"},
+        merge_return={"merged": True},
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_make_pr_file("backend/app/orchestrator.py")]),
+    )
+    # First call: 8010 lines → bucket 8000.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(8010)),
+    )
+
+    await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+    assert len(await _alerts_for(db_session, project.id)) == 1
+
+    # Second call: 8050 lines — still in the same bucket 8000.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(8050)),
+    )
+    await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    # Still exactly one alert.
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+
+
+async def test_module_size_check_refires_on_larger_bucket(db_session, mocker):
+    """When the same module grows into the next 100-line bucket, a new alert is
+    emitted (the bucket is encoded in the alert title, so titles differ)."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 88, "html_url": "http://pr/88"},
+        merge_return={"merged": True},
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_make_pr_file("backend/app/orchestrator.py")]),
+    )
+
+    # First cycle: 8010 lines → bucket 8000 → alert A.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(8010)),
+    )
+    await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+    assert len(await _alerts_for(db_session, project.id)) == 1
+
+    # Second cycle: 8120 lines → bucket 8100 → title differs → new alert B.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(8120)),
+    )
+    await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 2
+    titles = {a.title for a in alerts}
+    assert any("~8000 lines" in t for t in titles)
+    assert any("~8100 lines" in t for t in titles)
+
+
+async def test_module_size_check_exception_does_not_block_merge(db_session, mocker):
+    """A GitHub API failure during the size check is silently swallowed and
+    the back-merge still proceeds to completion."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 99, "html_url": "http://pr/99"},
+        merge_return={"merged": True},
+    )
+    # The first get_pr_files call (step 3b migration guard) returns [] so it
+    # proceeds.  The second call (step 3c size check) raises — must be caught.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(side_effect=[[], RuntimeError("transient API failure")]),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    assert await _alerts_for(db_session, project.id) == []
+
+
+async def test_module_size_check_within_cap_no_alert(db_session, mocker):
+    """A tracked module that is within its cap produces no alert."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 100, "html_url": "http://pr/100"},
+        merge_return={"merged": True},
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_make_pr_file("backend/app/orchestrator.py")]),
+    )
+    # 7000 lines — under the 7750 cap.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(7000)),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    assert await _alerts_for(db_session, project.id) == []

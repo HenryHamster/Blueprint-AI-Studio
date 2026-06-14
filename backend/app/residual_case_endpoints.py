@@ -87,7 +87,7 @@ async def get_residual_fingerprints(
                 # triggers async lazy-load and raises MissingGreenlet under FastAPI.
                 Task.status,
                 Task.status_log,
-            )
+            raiseload=True,)
         )
         .limit(500)
     )
@@ -139,7 +139,7 @@ async def get_residual_fingerprints(
                     ResidualRemediationCase.suspended_at,
                     ResidualRemediationCase.audit_defer_count,
                     ResidualRemediationCase.audit_deferred_system_id,
-                )
+                raiseload=True,)
             )
         )
         for c in case_rows.scalars().all():

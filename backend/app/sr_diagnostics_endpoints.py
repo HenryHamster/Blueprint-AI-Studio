@@ -191,7 +191,7 @@ async def list_sr_missed_retrospectives(
                 Task.context,
                 Task.project_id,
                 Task.payloads,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
     )
@@ -351,7 +351,7 @@ async def list_sr_unhandled_edges_retrospectives(
                 Task.context,
                 Task.project_id,
                 Task.payloads,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
     )
@@ -532,7 +532,7 @@ async def get_sr_alert_drilldown(
                 Task.context,
                 Task.payloads,
                 Task.strategic_cycle_id,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
         .limit(2000)
@@ -663,7 +663,7 @@ async def get_prompt_fingerprint_analytics(
                 Task.payloads,
                 Task.prompt_fingerprint,
                 Task.project_id,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
         .limit(2000)
@@ -849,7 +849,7 @@ async def fetch_sr_reviewer_disagreement_tasks(
                 Task.context,
                 Task.project_id,
                 Task.payloads,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
     )
@@ -1057,7 +1057,7 @@ async def get_direction_sr_breakdown(
             Task.created_at >= cutoff,
         )
         .options(
-            load_only(Task.id, Task.title, Task.context, Task.payloads, Task.project_id)
+            load_only(Task.id, Task.title, Task.context, Task.payloads, Task.project_id, raiseload=True)
         )
         .order_by(Task.created_at.desc())
         .limit(2000)
@@ -1099,7 +1099,7 @@ async def get_sr_recent_misses(
                 Task.context,
                 Task.payloads,
                 Task.project_id,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
     )
@@ -1254,7 +1254,7 @@ async def spawn_sr_investigation(
             Task.context["spawned_by"].as_string() == _SR_INVESTIGATION_SPAWNED_BY,
             Task.context["sr_category"].as_string() == req.category,
         )
-        .options(load_only(Task.id, Task.status))
+        .options(load_only(Task.id, Task.status, raiseload=True))
         .limit(1)
     )
     existing = (await session.execute(dedup_stmt)).scalars().first()
@@ -1333,7 +1333,7 @@ async def get_sr_investigation_task_ids(
             Task.status.in_(_SR_INVESTIGATION_ACTIVE_STATUSES),
             Task.context["spawned_by"].as_string() == _SR_INVESTIGATION_SPAWNED_BY,
         )
-        .options(load_only(Task.id, Task.context))
+        .options(load_only(Task.id, Task.context, raiseload=True))
     )
     tasks = (await session.execute(stmt)).scalars().all()
 
@@ -1465,7 +1465,7 @@ async def get_research_actionability(
     # Determine time window from the N most recent strategic cycles.
     cycle_result = await session.execute(
         select(StrategicCycle)
-        .options(load_only(StrategicCycle.id, StrategicCycle.created_at))
+        .options(load_only(StrategicCycle.id, StrategicCycle.created_at, raiseload=True))
         .where(StrategicCycle.project_id == project_id)
         .order_by(StrategicCycle.created_at.desc())
         .limit(cycles)
@@ -1481,7 +1481,7 @@ async def get_research_actionability(
     # (planning, etc.) and would otherwise leak into the grade distribution.
     research_result = await session.execute(
         select(Task)
-        .options(load_only(Task.id, Task.plan_output, Task.created_at, Task.context))
+        .options(load_only(Task.id, Task.plan_output, Task.created_at, Task.context, raiseload=True))
         .where(
             Task.project_id == project_id,
             Task.status == TaskStatus.COMPLETED,
@@ -1516,7 +1516,7 @@ async def get_research_actionability(
                 Task.payloads,
                 Task.latest_status_message,
                 Task.plan_output,
-            )
+            raiseload=True,)
         )
         .where(
             Task.project_id == project_id,

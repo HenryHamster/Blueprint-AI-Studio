@@ -247,7 +247,7 @@ async def _compute_health_overview(
                 Task.created_at >= prev_window_start,
                 Task.archived.is_(False),
             )
-            .options(load_only(Task.id, Task.status, Task.created_at, Task.status_log))
+            .options(load_only(Task.id, Task.status, Task.created_at, Task.status_log, raiseload=True))
             .limit(_XP_LIMIT)
         )
         xp_tasks = xp_result.scalars().all()
@@ -347,7 +347,7 @@ async def _compute_health_overview(
     queued_result = await session.execute(
         select(Task)
         .where(*active_filters, Task.status == TaskStatus.QUEUED)
-        .options(load_only(*QUEUED_SCAN_COLUMNS))
+        .options(load_only(*QUEUED_SCAN_COLUMNS, raiseload=True))
         .limit(_ACTIVE_TASKS_LIMIT)
     )
     queued_tasks = list(queued_result.scalars().all())
@@ -819,7 +819,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 Task.started_at,
                 Task.project_id,
                 Task.status_log,
-            )
+            raiseload=True,)
         )
         .limit(_WARM_VM_SCAN_LIMIT)
     )
@@ -866,7 +866,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 Task.payloads,
                 Task.project_id,
                 Task.status_log,
-            )
+            raiseload=True,)
         )
         .limit(_WARM_VM_SCAN_LIMIT)
     )
@@ -899,7 +899,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 Task.status,
                 Task.title,
                 Task.status_log,
-            )
+            raiseload=True,)
         )
         .order_by(Task.last_heartbeat.desc())
         .limit(_WARM_VM_SCAN_LIMIT)
@@ -1274,7 +1274,7 @@ async def _get_backlog_reuse_funnel(session: AsyncSession) -> dict:
             (
                 await session.execute(
                     select(Project)
-                    .options(load_only(Project.id, Project.design_doc))
+                    .options(load_only(Project.id, Project.design_doc, raiseload=True))
                     .limit(500)
                 )
             )

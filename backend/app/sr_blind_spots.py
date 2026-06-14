@@ -191,7 +191,7 @@ async def _scan_blind_spot_counts(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
+        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True))
         .order_by(Task.created_at.desc())
         .limit(_TASK_SCAN_CAP)
     )
@@ -1141,7 +1141,7 @@ async def aggregate_sr_reviewer_disagreements(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
+        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True))
         .order_by(Task.created_at.desc())
         .limit(_TASK_SCAN_CAP)
     )
@@ -1186,7 +1186,7 @@ async def aggregate_sr_reviewer_disagreements_envelope(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
+        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True))
         .order_by(Task.created_at.desc())
         .limit(_TASK_SCAN_CAP)
     )

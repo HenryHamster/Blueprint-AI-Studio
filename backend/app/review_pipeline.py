@@ -1285,7 +1285,7 @@ async def _check_fix_mid_retry_defer(
                             Task.context,
                             Task.payloads,
                             Task.updated_at,
-                        )
+                        raiseload=True,)
                     )
                     .where(
                         Task.project_id == source_task.project_id,
@@ -2131,7 +2131,7 @@ async def _spawn_pipeline_task(
                         # latest_status_message on the most-recent failed task; without
                         # this column the mutation crashes mid-cycle.
                         Task.status_log,
-                    )
+                    raiseload=True,)
                 )
                 .where(
                     Task.project_id == source_task.project_id,

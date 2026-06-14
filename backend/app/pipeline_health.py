@@ -247,7 +247,7 @@ async def compute_pipeline_health_summary(
                 Task.latest_status_message,
                 Task.payloads,
                 Task.status_log,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
         .limit(_HEALTH_SUMMARY_TASK_CAP)

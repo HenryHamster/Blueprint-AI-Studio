@@ -54,7 +54,9 @@ The caller commits the session.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -93,6 +95,20 @@ logger = logging.getLogger(__name__)
 # back-merge conflict resolution gates the next promotion; >= 90).
 _RESOLUTION_PRIORITY = 95
 
+# Path to the module size limits JSON, relative to this file
+# (backend/app/ -> backend/testing/).
+_MODULE_SIZE_LIMITS_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "testing", "module_size_limits.json")
+)
+
+# Maps a file-path prefix to its section name in module_size_limits.json.
+# Listed longest-first so a more-specific prefix always wins on a match.
+_FILE_PREFIX_MAP: list[tuple[str, str]] = [
+    ("backend/app/", "backend"),
+    ("agent/src/", "agent"),
+    ("admin-ui/src/", "frontend"),
+]
+
 # Task type for the conflict-resolution task.  ``create`` (not ``plan``): runs
 # the agent directly against automain so the resolver prompt reaches the
 # executor verbatim.  A plan task would decompose into subtasks via the
@@ -129,6 +145,148 @@ _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
 # a network lookup.  ``Task.created_at`` is naive-UTC (``_utcnow``); the cutoff
 # uses the same source so the comparison is apples-to-apples.
 _RESOLVER_PR_LOOKBACK = timedelta(hours=24)
+
+
+# ---------------------------------------------------------------------------
+# Module size-violation helpers (step 3c)
+# ---------------------------------------------------------------------------
+
+
+def _load_size_limits() -> dict:
+    """Load module_size_limits.json; return {} on any read/parse error."""
+    try:
+        with open(_MODULE_SIZE_LIMITS_PATH) as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001 — advisory; never propagate
+        return {}
+
+
+def _map_pr_file_to_section(filename: str) -> tuple[str, str] | None:
+    """Map a PR changed-file path to ``(section, rel_key)`` for cap lookup.
+
+    Returns ``None`` for files that belong to no tracked section.
+    """
+    for prefix, section in _FILE_PREFIX_MAP:
+        if filename.startswith(prefix):
+            return section, filename[len(prefix):]
+    return None
+
+
+async def _check_module_size_violations(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    ref: str,
+    project_id: uuid.UUID,
+) -> list[dict]:
+    """Return cap violations for tracked modules changed in the PR.
+
+    Fetches the PR file list, maps each changed file to its section/rel key in
+    ``module_size_limits.json``, retrieves its content at ``ref`` (the LTS
+    branch head), counts lines, and compares against the cap.  Returns one
+    record per violation: ``{section, rel, count, cap}``.
+
+    Returns ``[]`` when the limits file is absent, when no tracked modules are
+    changed, or when all changed tracked modules are within cap.
+    """
+    limits = _load_size_limits()
+    if not limits:
+        return []
+
+    pr_files = await github.get_pr_files(token, owner, repo, pr_number, str(project_id))
+    violations: list[dict] = []
+    for f in pr_files:
+        filename = f.get("filename") or ""
+        mapping = _map_pr_file_to_section(filename)
+        if mapping is None:
+            continue
+        section, rel = mapping
+        cap = (limits.get(section) or {}).get(rel)
+        if cap is None:
+            continue
+        text = await github.get_file_text_at_ref(
+            filename, token=token, owner=owner, repo=repo, ref=ref,
+            project_id=str(project_id),
+        )
+        if text is None:
+            continue
+        count = len(text.splitlines())
+        if count > cap:
+            violations.append({"section": section, "rel": rel, "count": count, "cap": cap})
+    return violations
+
+
+async def _emit_size_violation_alerts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    violations: list[dict],
+    pr_number: int,
+    trigger_desc: str,
+    *,
+    project: Project | None = None,
+) -> None:
+    """Emit a deduped WARNING Alert for each module size violation.
+
+    The alert title encodes the violation in 100-line buckets so the same
+    alert is not re-emitted on every periodic back-merge cycle, but a new
+    alert fires when the module grows into the next 100-line bucket.
+    """
+    for v in violations:
+        section = v["section"]
+        rel = v["rel"]
+        count = v["count"]
+        cap = v["cap"]
+        bucket = (count // 100) * 100
+        alert_title = (
+            f"Module size violation in back-merge: {section}/{rel} "
+            f"(~{bucket} lines, cap {cap})"
+        )
+        existing = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.title == alert_title,
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            logger.debug(
+                "[BACKMERGE] size violation alert already open for %s/%s; skipping",
+                section,
+                rel,
+            )
+            continue
+        trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
+        alert = Alert(
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            title=alert_title,
+            message=(
+                f"Back-merge PR #{pr_number}{trigger_clause} includes `{rel}` "
+                f"({section}) at approximately {bucket}+ lines, exceeding its "
+                f"{cap}-line cap. Consider (a) decomposing `{rel}` into smaller "
+                f"modules or (b) bumping the cap in module_size_limits.json with "
+                f"justification. The back-merge proceeded normally."
+            ),
+        )
+        session.add(alert)
+        await session.flush()
+        await _broadcast_alert(project_id, alert)
+        logger.warning(
+            "[BACKMERGE] size violation: %s/%s has %d lines (cap %d) "
+            "in back-merge PR #%s",
+            section,
+            rel,
+            count,
+            cap,
+            pr_number,
+        )
 
 
 async def reconcile_main_into_automain(
@@ -402,6 +560,32 @@ async def open_backmerge_pr(
             promotion_target=promotion_target,
         )
         return {"status": "migration_conflict", "pr_url": pr_url}
+
+    # 3c. Module size violation check — non-blocking, best-effort advisory.
+    #     Detects oversized tracked modules before CI runs so the operator
+    #     can prepare a decomposition or cap-bump.  The merge is NEVER blocked
+    #     by this check: any exception is caught and logged at DEBUG level.
+    try:
+        violations = await _check_module_size_violations(
+            token, owner, repo, pr_number, promotion_target, project_id
+        )
+        if violations:
+            await _emit_size_violation_alerts(
+                session,
+                project_id,
+                violations,
+                pr_number,
+                trigger_desc,
+                project=project,
+            )
+    except Exception as exc:  # noqa: BLE001 — advisory; never block the merge
+        logger.debug(
+            "[BACKMERGE] size-violation check for PR #%s (project %s) failed: "
+            "%s — continuing to merge",
+            pr_number,
+            project_id,
+            exc,
+        )
 
     # 4. Merge the PR — merge_method="merge" preserves the main commit history.
     #    merge_pull_request does NOT raise on 405/409; it returns merged=False.

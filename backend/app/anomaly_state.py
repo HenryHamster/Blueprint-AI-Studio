@@ -43,7 +43,7 @@ async def hydrate_persistent_anomalies(session) -> int:
         projects = (
             (
                 await session.execute(
-                    select(Project).options(load_only(Project.id, Project.design_doc))
+                    select(Project).options(load_only(Project.id, Project.design_doc, raiseload=True))
                 )
             )
             .scalars()

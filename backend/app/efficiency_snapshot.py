@@ -320,7 +320,7 @@ async def _load_recent_tasks(
                 # triggering an async lazy-load (used by compute_llm_cost_by_task_type
                 # and compute_effort_model_efficiency when called from this path).
                 Task.payloads,
-            )
+            raiseload=True,)
         )
         .limit(5000)
     )
@@ -3479,7 +3479,7 @@ async def compute_project_window_spend_usd(
                 Task.llm_input_tokens_banked_db,
                 Task.llm_output_tokens_banked_db,
                 Task.llm_call_count_banked_db,
-            )
+            raiseload=True,)
         )
     )
     now = _utcnow()

@@ -1069,7 +1069,7 @@ async def create_direction_research_task(
                 Task.idempotency_key == claim_key,
                 Task.status.in_(active_statuses),
             )
-            .options(load_only(Task.id, Task.status))
+            .options(load_only(Task.id, Task.status, raiseload=True))
         )
     ).scalar_one_or_none()
     if existing_claim is not None:
@@ -1091,7 +1091,7 @@ async def create_direction_research_task(
                     Task.status.in_(active_statuses),
                     Task.payloads[0]["type"].as_string() == "research",
                 )
-                .options(load_only(Task.id, Task.payloads, Task.status))
+                .options(load_only(Task.id, Task.payloads, Task.status, raiseload=True))
             )
         )
         .scalars()
