@@ -18803,6 +18803,11 @@ async def test_viewport_failure_screenshot_download_url(
     fake_client = mocker.MagicMock()
     fake_client.bucket.return_value.blob.side_effect = _fake_blob
     mocker.patch("google.cloud.storage.Client", return_value=fake_client)
+    mock_creds = mocker.MagicMock()
+    mock_creds.service_account_email = "test-sa@example.iam.gserviceaccount.com"
+    mock_creds.token = "fake_token"
+    mocker.patch("google.auth.default", return_value=(mock_creds, "test-project"))
+    mocker.patch("google.auth.transport.requests.Request")
 
     resp = await client.get(
         "/api/admin/viewport-failures/download-url",

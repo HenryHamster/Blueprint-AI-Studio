@@ -13,7 +13,7 @@ path runs but no network/credentials are required.
 """
 
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -120,9 +120,17 @@ async def test_generate_download_signed_url_signs_valid_reference(mocker):
     client = mocker.patch("app.storage.storage.Client")
     client.return_value.bucket.return_value.blob.return_value = blob
 
-    url = await storage.generate_download_signed_url(
-        f"gs://{BUCKET}/tasks/{uuid.uuid4()}/o.json"
-    )
+    mock_creds = MagicMock()
+    mock_creds.service_account_email = "test-sa@example.iam.gserviceaccount.com"
+    mock_creds.token = "fake_token"
+
+    with (
+        patch("google.auth.default", return_value=(mock_creds, "test-project")),
+        patch("google.auth.transport.requests.Request"),
+    ):
+        url = await storage.generate_download_signed_url(
+            f"gs://{BUCKET}/tasks/{uuid.uuid4()}/o.json"
+        )
     assert url == "https://signed.example/get"
     # V4 GET signature, not PUT.
     _, kwargs = blob.generate_signed_url.call_args
@@ -228,6 +236,11 @@ async def _make_compute_job_with_artifact(session, project, task):
 
 
 def _mock_signing(mocker, *, url="https://signed.example/download", raises=None):
+    mock_creds = MagicMock()
+    mock_creds.service_account_email = "test-sa@example.iam.gserviceaccount.com"
+    mock_creds.token = "fake_token"
+    mocker.patch("google.auth.default", return_value=(mock_creds, "test-project"))
+    mocker.patch("google.auth.transport.requests.Request")
     client = mocker.patch("app.storage.storage.Client")
     blob = client.return_value.bucket.return_value.blob.return_value
     if raises is not None:

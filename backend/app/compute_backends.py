@@ -28,12 +28,24 @@ import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Protocol
 
 from app import compute
 from app import storage
 from app.models import ComputeJob, ComputeJobStatus
 from app.vm_lifecycle import _ensure_vm_deleted
+
+# Scripts baked into the GCP compute-job startup script as base64 blobs.
+# Loaded at module import time so a missing file fails fast at startup, not
+# during live VM provisioning. See backend/app/_compute_scripts/__init__.py.
+_COMPUTE_SCRIPTS_DIR = Path(__file__).parent / "_compute_scripts"
+_COMMAND_RUNNER_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "command_runner.py").read_bytes()
+).decode("ascii")
+_ARTIFACT_UPLOAD_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "artifact_upload.py").read_bytes()
+).decode("ascii")
 
 logger = logging.getLogger(__name__)
 
@@ -370,13 +382,17 @@ class GcpComputeBackend:
         else:
             artifact_expiry_base = spec.deadline_at
         artifact_expiry_at = _artifact_upload_expiry(artifact_expiry_base)
-        artifact_upload_url = await storage.generate_compute_job_artifact_upload_signed_url(
-            spec.job_id,
-            expires_at=artifact_expiry_at,
+        artifact_upload_url = (
+            await storage.generate_compute_job_artifact_upload_signed_url(
+                spec.job_id,
+                expires_at=artifact_expiry_at,
+            )
         )
         ok = await compute.provision_ephemeral_vm(
             external_id,
-            startup_script=_build_gcp_startup_script(spec, artifact_upload_url=artifact_upload_url),
+            startup_script=_build_gcp_startup_script(
+                spec, artifact_upload_url=artifact_upload_url
+            ),
             machine_type=spec.machine_type,
             provisioning_model=spec.provisioning_model,
             accelerator=spec.accelerator,
@@ -953,9 +969,14 @@ def _build_gcp_startup_script(
     )
     artifact_upload_url = shlex.quote(artifact_upload_url)
     upload_timeout = _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS
+    max_log_bytes = _MAX_COMMAND_LOG_BYTES
+    command_runner_b64 = _COMMAND_RUNNER_B64
+    artifact_upload_b64 = _ARTIFACT_UPLOAD_B64
     return f"""#!/bin/bash
 set -u -o pipefail
 TTL_SECONDS={deadline_seconds}
+echo '{command_runner_b64}' | base64 -d > /tmp/blueprint_command_runner.py
+echo '{artifact_upload_b64}' | base64 -d > /tmp/blueprint_artifact_upload.py
 ARTIFACTS_UPLOADED=0
 upload_artifacts() {{
   if [ "$ARTIFACTS_UPLOADED" -ne 0 ]; then
@@ -976,22 +997,8 @@ upload_artifacts() {{
           ARTIFACTS_UPLOADED=1
         fi
       elif command -v python3 >/dev/null 2>&1; then
-        if timeout {upload_timeout} python3 - {artifact_upload_url} {artifact_bundle} <<'PY' >/dev/null 2>&1; then
-import pathlib
-import sys
-import urllib.request
-
-url = sys.argv[1]
-path = pathlib.Path(sys.argv[2])
-request = urllib.request.Request(
-    url,
-    data=path.read_bytes(),
-    method="PUT",
-    headers={{"Content-Type": "application/gzip"}},
-)
-with urllib.request.urlopen(request, timeout=120) as response:
-    response.read()
-PY
+        if timeout {upload_timeout} python3 /tmp/blueprint_artifact_upload.py \
+          {artifact_upload_url} {artifact_bundle} >/dev/null 2>&1; then
           ARTIFACTS_UPLOADED=1
         fi
       fi
@@ -1018,53 +1025,10 @@ rm -f {command_log_path}
 mkdir -p {artifact_dir}
 {cwd_line}
 EXIT_CODE=0
-if python3 - \
+if python3 /tmp/blueprint_command_runner.py \
   {command} \
-  {command_log_path} <<'PY'; then
-import json
-import pathlib
-import subprocess
-import sys
-
-command = sys.argv[1]
-log_path = pathlib.Path(sys.argv[2])
-log_path.parent.mkdir(parents=True, exist_ok=True)
-proc = subprocess.Popen(
-    ["bash", "-lc", command],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-)
-captured = bytearray()
-truncated = False
-assert proc.stdout is not None
-while True:
-    chunk = proc.stdout.read(8192)
-    if not chunk:
-        break
-    if len(captured) < {_MAX_COMMAND_LOG_BYTES}:
-        remaining = {_MAX_COMMAND_LOG_BYTES} - len(captured)
-        if len(chunk) <= remaining:
-            captured.extend(chunk)
-        else:
-            captured.extend(chunk[:remaining])
-            truncated = True
-    else:
-        truncated = True
-exit_code = proc.wait()
-if proc.stdout is not None:
-    proc.stdout.close()
-if captured or truncated:
-    payload = {{
-        "text": captured.decode("utf-8", "replace"),
-        "truncated": truncated,
-        "byte_count": len(captured),
-    }}
-    log_path.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
-sys.exit(exit_code)
-PY
+  {command_log_path} \
+  {max_log_bytes}; then
   EXIT_CODE=0
   echo "{_SERIAL_REASON_PREFIX}completed"
   echo "{_SERIAL_STATUS_PREFIX}SUCCEEDED"

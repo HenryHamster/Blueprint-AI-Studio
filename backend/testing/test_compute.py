@@ -1440,7 +1440,7 @@ def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
     assert "trap upload_artifacts EXIT HUP INT TERM QUIT" in script
     assert "https://storage.example.com/upload" in script
     assert "curl --fail --silent --show-error" in script
-    assert "python3 - " in script
+    assert "/tmp/blueprint_command_runner.py" in script
     assert "BLUEPRINT_COMPUTE_COMMAND_LOG=" in script
     assert "TTL_SECONDS=330" in script
     assert "runtime_ttl" in script

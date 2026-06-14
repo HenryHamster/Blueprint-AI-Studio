@@ -29,6 +29,7 @@ import json
 import re
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -36,6 +37,10 @@ from typing import Callable
 import pytest
 
 from app import compute
+from app.compute_backends import (
+    ComputeLaunchSpec,
+    _build_gcp_startup_script,
+)
 from app.compute_startup_script import (
     build_agent_startup_script,
     build_pool_agent_startup_script,
@@ -85,6 +90,24 @@ def _render_pool_startup_script() -> str:
     )
 
 
+def _render_gcp_compute_startup_script() -> str:
+    """Render the GCP compute-job VM startup script with placeholder values."""
+    from datetime import datetime, timedelta, timezone
+
+    spec = ComputeLaunchSpec(
+        job_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        command="echo hello",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        runtime_deadline_seconds=3600,
+    )
+    return _build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload?sig=placeholder",
+    )
+
+
 GENERATORS: list[ShellGenerator] = [
     ShellGenerator(
         name="compute.startup_script",
@@ -93,6 +116,10 @@ GENERATORS: list[ShellGenerator] = [
     ShellGenerator(
         name="compute.pool_startup_script",
         render=_render_pool_startup_script,
+    ),
+    ShellGenerator(
+        name="compute.gcp_startup_script",
+        render=_render_gcp_compute_startup_script,
     ),
     # Future entries: append here. Each renderer returns rendered bash.
 ]
@@ -1326,9 +1353,8 @@ class TestPackerSmokeCapabilityContract:
             "reaches configureAgentPermissions, so it must call "
             "loadBakeSmokeCapabilityContract() before handlers.memo()."
         )
-        assert (
-            smoke.index("loadBakeSmokeCapabilityContract")
-            < smoke.index("await handlers.memo(")
+        assert smoke.index("loadBakeSmokeCapabilityContract") < smoke.index(
+            "await handlers.memo("
         ), (
             f"{smoke_name} must load the bake-smoke capability contract "
             "BEFORE invoking handlers.memo(), not after."
@@ -1367,9 +1393,9 @@ class TestPackerSmokeCapabilityContract:
             "bake-smoke-capability-contract.ts must load via the real "
             "loadTaskCapabilityContract so validation is exercised, not bypassed."
         )
-        relative_helper_path = (
-            _BAKE_SMOKE_CONTRACT_HELPER.relative_to(_AGENT_DIR).as_posix()
-        )
+        relative_helper_path = _BAKE_SMOKE_CONTRACT_HELPER.relative_to(
+            _AGENT_DIR
+        ).as_posix()
         assert relative_helper_path.startswith("src/"), (
             "bake-smoke-capability-contract.ts must live under agent/src so the "
             "agent typecheck covers it."
@@ -1430,7 +1456,7 @@ class TestPackerSourceShaBakeContract:
             "agent.pkr.hcl must declare a source_git_sha variable."
         )
         assert 'env("GITHUB_SHA")' in hcl, (
-            "source_git_sha must default to env(\"GITHUB_SHA\") so CI bakes the commit."
+            'source_git_sha must default to env("GITHUB_SHA") so CI bakes the commit.'
         )
 
     def test_image_label_carries_source_git_sha(self):
