@@ -635,6 +635,63 @@ class TestComputeCheckpointRecoveryWaste:
         result = _compute_checkpoint_recovery_waste([task])
         assert result["total"] == 0
 
+    def test_exhausted_count_from_lane_rows(self):
+        """Exhausted checkpoint-recovery kills are counted from KILLED lane rows."""
+        from app.models import ImprovementLane
+
+        # Create mock lanes in KILLED status with exhausted recovery markers
+        lane_exhausted = ImprovementLane(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            title="exhausted lane",
+            goal="test",
+            branch_name="test-branch",
+            base_branch="main",
+            status="KILLED",
+            manifest={
+                "recovery": {
+                    "reason": "checkpoint_recovery_exhausted",
+                    "attempt": 3,
+                    "exhausted": True,
+                    "at": _utcnow().isoformat(),
+                }
+            },
+        )
+        lane_not_exhausted = ImprovementLane(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            title="active lane",
+            goal="test",
+            branch_name="test-branch",
+            base_branch="main",
+            status="ACTIVE",
+            manifest={
+                "recovery": {
+                    "reason": "checkpoint_missing",
+                    "attempt": 1,
+                    "exhausted": False,
+                    "at": _utcnow().isoformat(),
+                }
+            },
+        )
+        lane_killed_no_recovery = ImprovementLane(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            title="killed lane no recovery",
+            goal="test",
+            branch_name="test-branch",
+            base_branch="main",
+            status="KILLED",
+            manifest={},
+        )
+
+        result = _compute_checkpoint_recovery_waste(
+            [], lanes=[lane_exhausted, lane_not_exhausted, lane_killed_no_recovery]
+        )
+        assert result["exhausted_count"] == 1
+        assert result["total"] == 0
+        assert result["by_reason"] == {}
+
 
 class TestPersistCheckpointRecoveryWasteInBaseline:
     @pytest.mark.asyncio
@@ -710,3 +767,67 @@ class TestPersistCheckpointRecoveryWasteInBaseline:
         assert crw["total"] == 0
         assert crw["by_reason"] == {}
         assert crw["exhausted_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_persist_counts_exhausted_lane_kills(self, db_session):
+        """persist_version_lane_baseline counts KILLED lanes with exhausted recovery markers."""
+        from app.models import ImprovementLane
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        opened = now - timedelta(days=7)
+        closed = now - timedelta(days=1)
+
+        # Create a KILLED lane with exhausted recovery marker
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="exhausted lane",
+            goal="test goal",
+            branch_name="test-branch",
+            base_branch="main",
+            status="KILLED",
+            created_at=opened + timedelta(hours=1),
+            manifest={
+                "recovery": {
+                    "reason": "checkpoint_recovery_exhausted",
+                    "attempt": 3,
+                    "exhausted": True,
+                    "at": (opened + timedelta(hours=2)).isoformat(),
+                }
+            },
+        )
+        db_session.add(lane)
+
+        # Create another KILLED lane WITHOUT exhausted marker (should not count)
+        lane_no_exhausted = ImprovementLane(
+            project_id=project.id,
+            title="killed lane no exhausted",
+            goal="test goal",
+            branch_name="other-branch",
+            base_branch="main",
+            status="KILLED",
+            created_at=opened + timedelta(hours=3),
+            manifest={},
+        )
+        db_session.add(lane_no_exhausted)
+        await db_session.commit()
+
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=12,
+            opened_at=opened,
+            closed_at=closed,
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+        crw = result.get("checkpoint_recovery_waste")
+        assert crw is not None
+        assert crw["exhausted_count"] == 1
+        assert crw["total"] == 0  # No recovery tasks, only exhausted kills from lanes
+        assert crw["by_reason"] == {}

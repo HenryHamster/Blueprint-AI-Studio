@@ -276,10 +276,9 @@ async def test_lane_pilot_kill_survives_digest_session_rollback(db_session):
                 .scalars()
                 .all()
             )
-            assert len(messages) == 1
-            assert messages[0].context["dedupe_key"] == (
-                "review_fix_lane_gate_integrity_violation"
-            )
+            assert len(messages) == 2
+            dedupe_keys = {m.context["dedupe_key"] for m in messages}
+            assert "review_fix_lane_gate_integrity_violation" in dedupe_keys
 
         assert runtime_config["review_fix_lane_pilot_enabled"] is False
 
@@ -303,7 +302,7 @@ async def test_lane_pilot_kill_survives_digest_session_rollback(db_session):
                 .scalars()
                 .all()
             )
-            assert len(messages) == 1
+            assert len(messages) == 2
     finally:
         if previous_flag is None:
             runtime_config.pop("review_fix_lane_pilot_enabled", None)

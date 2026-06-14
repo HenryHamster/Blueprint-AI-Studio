@@ -2998,6 +2998,39 @@ class TestDeadAuthClassification:
         assert result == PROVISION_FAILURE
         assert "dead_auth_matched_pattern" not in t.context
 
+    def test_model_no_access_is_config_rejection(self):
+        # Acceptance proof: a 'selected model may not exist / no access' failure
+        # from panel_review_lens_failed must classify as EXTERNAL_API
+        # (provider_model_config subtype), NOT PROVISION_FAILURE.
+        # PROVISION_FAILURE burns the retry budget; EXTERNAL_API does not.
+        full_status = (
+            "Panel review fan-out failed: lens 'security' agent pass exited 1.\n"
+            "Error: 404 The model `o3-mini` does not exist or you do not have "
+            "access to it.\n"
+        )
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+
+        result = classify_failure(t)
+        assert result == EXTERNAL_API, (
+            f"model-no-access panel_review_lens_failed must classify as EXTERNAL_API, got {result!r}"
+        )
+
+        from app.failure_classification import (
+            EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+            classify_external_api_subtype,
+        )
+
+        subtype = classify_external_api_subtype(t)
+        assert subtype == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG, (
+            f"expected provider_model_config subtype, got {subtype!r}"
+        )
+
 
 class TestRedactCredentials:
     """Unit tests for the _redact_credentials helper.

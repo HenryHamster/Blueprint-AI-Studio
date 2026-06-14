@@ -21,8 +21,8 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.digest_metrics import compute_lane_waste_diagnostics
-from app.models import Project, Task, TaskStatus, _utcnow
-from app.review_fix_lane_pilot import LANE_RECOVERY_REASON_KEY
+from app.models import ImprovementLane, Project, Task, TaskStatus, _utcnow
+from app.review_fix_lane_pilot import LANE_RECOVERY_MANIFEST_KEY, LANE_RECOVERY_REASON_KEY
 from app.task_locking import with_design_doc_locked
 from app.routers.admin_analytics import (
     _compute_lane_diag,
@@ -108,14 +108,14 @@ _TASK_SNAPSHOT_COLUMNS = (
 )
 
 
-def _compute_checkpoint_recovery_waste(tasks: List[Task]) -> Dict[str, Any]:
+def _compute_checkpoint_recovery_waste(tasks: List[Task], lanes: List[Any] | None = None) -> Dict[str, Any]:
     """Count checkpoint-recovery tasks by reason from a version task window.
 
     Recovery tasks carry ``LANE_RECOVERY_REASON_KEY`` in their context, stamped
     by the review-spawn path when a checkpoint miss is classified as RECOVER.
-    Groups by the reason string and returns a total count.  Exhausted-budget
-    kills do not spawn recovery tasks (the lane falls back to classic cold
-    review), so ``exhausted_count`` is always 0 from task evidence alone.
+    Groups by the reason string and returns a total count. Exhausted-budget
+    kills are counted from ImprovementLane rows in KILLED status with an
+    exhausted recovery marker in the manifest.
     """
     by_reason: Dict[str, int] = {}
     for task in tasks:
@@ -124,10 +124,20 @@ def _compute_checkpoint_recovery_waste(tasks: List[Task]) -> Dict[str, Any]:
         if reason is not None:
             key = str(reason)
             by_reason[key] = by_reason.get(key, 0) + 1
+
+    exhausted_count = 0
+    if lanes:
+        for lane in lanes:
+            if lane.status == "KILLED":
+                manifest = lane.manifest or {}
+                recovery = manifest.get(LANE_RECOVERY_MANIFEST_KEY)
+                if isinstance(recovery, dict) and recovery.get("exhausted") is True:
+                    exhausted_count += 1
+
     return {
         "by_reason": by_reason,
         "total": sum(by_reason.values()),
-        "exhausted_count": 0,
+        "exhausted_count": exhausted_count,
     }
 
 
@@ -239,6 +249,20 @@ async def persist_version_lane_baseline(
         .all()
     )
 
+    version_lanes = list(
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.project_id == project_id,
+                    ImprovementLane.created_at >= t_opened,
+                    ImprovementLane.created_at < t_closed,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     scoped = [t for t in completed_tasks if _review_loop_pr_number(t)]
     diag = _compute_lane_diag(scoped, _SNAPSHOT_PR_BREAKDOWN_LIMIT)
 
@@ -263,7 +287,7 @@ async def persist_version_lane_baseline(
     )
     diag["relay_medians"] = _compute_relay_medians(diag["per_pr_phase_breakdown"])
     diag["checkpoint_recovery_waste"] = _compute_checkpoint_recovery_waste(
-        all_terminal_tasks
+        all_terminal_tasks, lanes=version_lanes
     )
 
     now = _utcnow()

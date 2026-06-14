@@ -64,7 +64,12 @@ from app.review_pipeline import (
     reconciled_approve_markers,
     should_auto_approve_diff,
 )
-from app.failure_classification import classify_failure
+from app.failure_classification import (
+    classify_failure,
+    classify_external_api_subtype,
+    EXTERNAL_API,
+    EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+)
 from app.branch_resolution import (
     classify_rollup_merge_outcome,
     is_custom_staged_rollup_root,
@@ -1011,6 +1016,76 @@ async def _resolve_review_second_opinion(
         )
 
     if panel is None:
+        # Model-config-rejection: the challenger's model is operator-configured but
+        # inaccessible (e.g. "model does not exist or you do not have access").
+        # Silently failing closed would set requires_approval=True on every trunk
+        # APPROVE — converting the gate into an invisible universal merge block.
+        # Instead: degrade visibly, preserve the primary verdict, signal operators.
+        if (
+            not pending_application
+            and payload.status == TaskStatus.FAILED
+            and classify_failure(challenger, logs=payload.logs) == EXTERNAL_API
+            and classify_external_api_subtype(challenger, logs=payload.logs)
+            == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
+        ):
+            logger.warning(
+                "[REVIEW SECOND-OPINION] Challenge %s for review %s: panel model "
+                "unavailable (provider model-config rejection) — degrading gracefully, "
+                "primary verdict %r preserved",
+                challenger.id,
+                review.id,
+                primary_verdict,
+            )
+            _deg_record: dict = {
+                "state": "degraded_model_unavailable",
+                "reconciled_verdict": primary_verdict,
+                "surviving_issues": primary_issues,
+                "challenger_task_id": str(challenger.id),
+                "review_task_id": str(review.id),
+            }
+            _deg_ctx = dict(review.context or {})
+            _deg_ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
+            _deg_ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = _deg_record
+            _set_sidecar_application_pending(
+                _deg_ctx,
+                lane=lane,
+                sidecar_id=challenger.id,
+                verdict_key=REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+            )
+            review.context = _deg_ctx
+            flag_modified(review, "context")
+            review.status = TaskStatus.COMPLETED
+            session.add(review)
+            challenger.latest_status_message = (
+                "Second-opinion panel model unavailable — degraded to primary verdict"
+            )[:500]
+            session.add(challenger)
+            await session.commit()
+            _deg_reconstructed = AgentStatusPayload(
+                task_id=review.id,
+                status=TaskStatus.COMPLETED,
+                verdict_json=json.dumps(
+                    {
+                        "verdict": _deg_record["reconciled_verdict"],
+                        "issues": _deg_record.get("surviving_issues", []),
+                        "feedback": parked.get("feedback", ""),
+                        "investigated_files": parked.get("investigated_files", []),
+                    }
+                ),
+            )
+            await session.commit()
+            await _process_post_commit(review.id, _deg_reconstructed)
+            await session.refresh(review)
+            _deg_ctx2 = dict(review.context or {})
+            _deg_ctx2.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
+            review.context = _deg_ctx2
+            _clear_sidecar_application_pending(
+                review, lane=lane, sidecar_id=challenger.id
+            )
+            session.add(review)
+            await session.commit()
+            return
+
         original_task_id = parked.get("original_task_id") or ""
         ctx = dict(review.context or {})
         ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)

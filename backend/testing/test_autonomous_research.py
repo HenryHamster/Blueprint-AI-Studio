@@ -37,6 +37,7 @@ from app.max_plan_pool import _max_plan_pools, _account_by_id
 from app.capability_demand import collect_missing_capability_demand
 from app.payload_schemas import validate_internal_payload
 from app.task_evaluators import ADVERSARIAL_GATE_VERDICT_KEY
+from app.auth import create_agent_token
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
     "DATABASE_URL", ""
@@ -8095,6 +8096,86 @@ async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(
     )
     assert bug_reports[0].context.get("source") == "dedup_deadlock"
     assert bug_reports[0].context.get("consecutive_empty_cycles") == 3
+
+
+@pytest.mark.asyncio
+async def test_already_fixed_deadlock_pivots_agent(client: AsyncClient, db_session):
+    """A direction in already-fixed deadlock exposes an agent-facing pivot signal
+    in its research direction context so the next cycle stops re-deriving shipped work."""
+    direction_id = "d-afdead01"
+    # Three consecutive history entries where every spawned task was SCOPE_EMPTY
+    # (tasks_created >= 1 and scope_empty_noop_count >= tasks_created).
+    noop_history = [
+        {
+            "timestamp": f"2026-01-1{i}T00:00:00",
+            "task_id": f"00000000-0000-0000-0000-00000000000{i}",
+            "tasks_created": 2,
+            "scope_empty_noop_count": 2,
+            "summary": "all tasks no-op — work already on HEAD",
+            "finding_titles": [],
+            "key_finding_descriptions": [],
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+        }
+        for i in range(1, 4)
+    ]
+    project = Project(
+        name="Already-Fixed Deadlock Pivot Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                "id": direction_id,
+                "title": "Improve performance",
+                "priority": "medium",
+                "status": "active",
+                "research_history": noop_history,
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Improve performance",
+        payloads=[
+            {
+                "type": "research",
+                "directions": project.directions,
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id="agent-vm-afdead01",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-afdead01")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context")
+    assert dc is not None, "direction_context must be present in research task claim response"
+    assert dc.get("already_fixed_deadlock_detected") is True, (
+        "A direction whose last 3 cycles all produced only SCOPE_EMPTY tasks "
+        "must surface already_fixed_deadlock_detected=True in direction_context"
+    )
+    # Sanity: dedup deadlock should NOT be triggered (tasks_created > 0 each cycle)
+    assert dc.get("deadlock_detected") is False, (
+        "dedup deadlock must not fire when tasks_created > 0 each cycle"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

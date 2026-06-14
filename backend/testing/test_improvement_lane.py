@@ -2603,3 +2603,56 @@ async def test_checkpoint_accumulates_phase_cost_and_tokens(db: AsyncSession):
     assert lane.llm_input_tokens_total == 1200
     assert lane.llm_output_tokens_total == 400
     assert abs(lane.vm_cost_usd_total - 0.08) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# rebind_lane_to_recovery — releases reserved PoolVm
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recovery_rebind_releases_reserved_vm(db: AsyncSession):
+    """rebind_lane_to_recovery must release any PoolVm reserved for the lane.
+
+    When a lane drops to checkpoint recovery the workspace becomes COLD and the
+    recovery task cold-dispatches, so the previously-reserved warm VM is no
+    longer needed. Leaving it reserved would silently consume warm-pool capacity
+    until the hard-TTL sweep expired it.
+    """
+    from datetime import timedelta
+
+    from app.review_fix_lane_pilot import rebind_lane_to_recovery
+    from app.time_utils import _utcnow
+
+    project_id = await _make_project(db)
+    lane = await _make_active_lane(db, project_id, current_task_id=None, phase_requeues=1)
+
+    now = _utcnow()
+    member = PoolVm(
+        vm_instance_id=f"pool-vm-rebind-{uuid.uuid4().hex[:8]}",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+        reservation_expires_at=now + timedelta(seconds=900),
+        reservation_hard_expires_at=now + timedelta(seconds=3600),
+    )
+    db.add(member)
+    await db.commit()
+
+    recovery_task_id = uuid.uuid4()
+    await rebind_lane_to_recovery(
+        db,
+        lane,
+        task_id=recovery_task_id,
+        reason="checkpoint_verification_failed",
+    )
+    await db.commit()
+
+    await db.refresh(lane)
+    await db.refresh(member)
+
+    assert lane.workspace_state == "COLD"
+    assert lane.current_task_id == recovery_task_id
+    assert member.reserved_lane_id is None
+    assert member.reservation_expires_at is None
+    assert member.reservation_hard_expires_at is None

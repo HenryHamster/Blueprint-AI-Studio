@@ -1289,6 +1289,17 @@ async def sweep_exhausted_lane_budgets(session) -> int:
                 member.reservation_hard_expires_at = None
                 session.add(member)
                 await record_lane_reservation_cause(session, lane.id, "force_expired")
+            from app.review_fix_lane_pilot import emit_lane_event_message
+
+            lane_title = getattr(lane, "title", None) or str(lane.id)
+            await emit_lane_event_message(
+                session,
+                lane.project_id,
+                lane.id,
+                "lane_killed_exhausted",
+                f"lane '{lane_title}' KILLED — checkpoint recovery exhausted "
+                f"(phase_requeues={lane.phase_requeues})",
+            )
         except LaneCASError as exc:  # noqa: PERF203 — CAS miss per iteration is intentional
             logger.debug(
                 "[WARM-POOL] exhausted-budget CAS miss lane=%s: %s", lane.id, exc
@@ -1538,6 +1549,17 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                         await record_lane_reservation_cause(
                             session, lane.id, "force_expired"
                         )
+                    from app.review_fix_lane_pilot import emit_lane_event_message
+
+                    lane_title = getattr(lane, "title", None) or str(lane.id)
+                    await emit_lane_event_message(
+                        session,
+                        lane.project_id,
+                        lane.id,
+                        "lane_killed_stranded",
+                        f"lane '{lane_title}' KILLED — stranded with no recovery "
+                        f"context (phase_requeues={lane_locked.phase_requeues})",
+                    )
             else:
                 await cas_transition(
                     session,
@@ -1568,6 +1590,17 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                     await record_lane_reservation_cause(
                         session, lane.id, "force_expired"
                     )
+                from app.review_fix_lane_pilot import emit_lane_event_message
+
+                lane_title = getattr(lane, "title", None) or str(lane.id)
+                await emit_lane_event_message(
+                    session,
+                    lane.project_id,
+                    lane.id,
+                    "lane_killed_exhausted",
+                    f"lane '{lane_title}' KILLED — stranded and requeue budget "
+                    f"exhausted (phase_requeues={lane_locked.phase_requeues})",
+                )
             transitioned += 1
         except LaneCASError as exc:
             # Concurrent maintainer/sweep tick already transitioned this lane —

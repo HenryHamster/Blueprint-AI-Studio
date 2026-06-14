@@ -2888,8 +2888,10 @@ async def claim_task(
             # pivot to direction_update/direction_note findings on stuck directions.
             if task_type == "research":
                 from app.research_completion import _detect_dedup_deadlock
+                from app.research_direction_state import _detect_already_fixed_deadlock
 
                 deadlocked, _ = _detect_dedup_deadlock(history)
+                af_deadlocked, _ = _detect_already_fixed_deadlock(history)
                 research_recent_outcomes = [
                     {
                         "tasks_created": h.get("tasks_created", 0),
@@ -3058,6 +3060,7 @@ async def claim_task(
                         direction.get("possibly_saturated", False)
                     ),
                     "deadlock_detected": bool(deadlocked),
+                    "already_fixed_deadlock_detected": bool(af_deadlocked),
                     "recent_outcomes": research_recent_outcomes,
                     "failure_stage_pattern": research_failure_stage_pattern,
                     "scope_success_rates": research_scope_rates,

@@ -7566,7 +7566,9 @@ async def test_park_task_vm_instance_id_invariant(tl_db):
 
 
 @pytest.mark.asyncio
-async def test_park_task_retires_leased_pool_member_before_clearing_vm_id(tl_db, mocker):
+async def test_park_task_retires_leased_pool_member_before_clearing_vm_id(
+    tl_db, mocker
+):
     """park_task must release a LEASED warm-pool member before dropping linkage."""
     session, _factory = tl_db
     mocker.patch("app.warm_pool.is_warm_pool_enabled", return_value=True)
@@ -8521,6 +8523,101 @@ async def test_second_opinion_unparseable_challenge_escalates(tl_db, mocker):
     assert review_task.status == TaskStatus.COMPLETED
     assert not merge_mock.called, "unparseable challenge must not merge"
     assert not captured_spawn, "unparseable challenge must not spawn fix"
+    assert original.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_model_unavailable_fails_open(tl_db, mocker):
+    """A FAILED challenge caused by a provider model-config rejection (model
+    inaccessible) must degrade gracefully: the primary verdict is preserved,
+    requires_approval is NOT set, and the reconciliation record carries
+    state='degraded_model_unavailable'."""
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        _merge_mock,
+        _captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7782)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None
+
+    # Challenger fails with a model-no-access error (OpenAI 404).
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.FAILED,
+        logs=(
+            "Panel review fan-out failed: lens 'security' agent pass exited 1.\n"
+            "Error: 404 The model `o3-mini` does not exist or you do not have "
+            "access to it.\n"
+        ),
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    await session.refresh(original)
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec is not None, "reconciliation record must be written"
+    assert rec.get("state") == "degraded_model_unavailable", (
+        f"expected degraded_model_unavailable, got {rec.get('state')!r}"
+    )
+    assert rec.get("reconciled_verdict") == "APPROVE", (
+        "primary verdict must be preserved on model-unavailable degradation"
+    )
+    assert review_task.status == TaskStatus.COMPLETED
+    assert not getattr(original, "requires_approval", False), (
+        "model-unavailable degradation must NOT set requires_approval"
+    )
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_generic_failed_challenge_still_fails_closed(
+    tl_db, mocker
+):
+    """A FAILED challenge without a model-config-rejection pattern (e.g. a plain
+    PROVISION_FAILURE) still fails closed and sets requires_approval."""
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        _merge_mock,
+        _captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7783)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None
+
+    # Challenger fails with a generic infra error (not a model-config rejection).
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.FAILED,
+        logs="VM startup failed: SSH connection refused after 120s",
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    await session.refresh(original)
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec is not None and rec.get("escalated") is True, (
+        "generic FAILED challenge must still escalate (fail-closed)"
+    )
     assert original.requires_approval is True
 
 

@@ -809,6 +809,15 @@ async def close_lane_checkpoint_exhausted(
         lane.phase_requeues or 0,
         reason,
     )
+    lane_title = getattr(lane, "title", None) or str(lane.id)
+    await emit_lane_event_message(
+        session,
+        lane.project_id,
+        lane.id,
+        "lane_killed_exhausted",
+        f"lane '{lane_title}' KILLED — checkpoint recovery exhausted "
+        f"(phase_requeues={lane.phase_requeues or 0}): {reason}",
+    )
     return True
 
 
@@ -895,6 +904,8 @@ async def rebind_lane_to_recovery(
     """
     from app.models import ImprovementLaneStatus
 
+    from app.models import PoolVm
+
     if lane is None or lane.status != ImprovementLaneStatus.ACTIVE.value:
         return
     lane.current_task_id = task_id
@@ -903,6 +914,23 @@ async def rebind_lane_to_recovery(
         lane, reason=reason, attempt=lane.phase_requeues or 0, exhausted=False
     )
     session.add(lane)
+    reserved = (
+        (
+            await session.execute(
+                select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from app.warm_pool import record_lane_reservation_cause
+
+    for member in reserved:
+        member.reserved_lane_id = None
+        member.reservation_expires_at = None
+        member.reservation_hard_expires_at = None
+        session.add(member)
+        await record_lane_reservation_cause(session, lane.id, "force_expired")
 
 
 # ── Fix-side warm resume wiring ───────────────────────────────────────────────
@@ -1240,6 +1268,13 @@ async def apply_lane_pilot_kill(
         cleared,
         lanes_killed,
     )
+    await emit_lane_event_message(
+        session,
+        project_id,
+        None,
+        "pilot_auto_disabled",
+        f"lane-pilot auto-disabled for project {project_id}: {reason}",
+    )
     return {
         "flag_disabled": True,
         "reservations_cleared": cleared,
@@ -1295,6 +1330,56 @@ async def apply_lane_pilot_kill_in_transaction(
         except Exception:
             await session.rollback()
             raise
+
+
+async def emit_lane_event_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    lane_id: uuid.UUID | None,
+    event_type: str,
+    detail: str,
+) -> None:
+    """Post a deduplicated WARNING operator message for a lane terminal/degraded event.
+
+    Dedupe key is ``lane_<event_type>_<lane_id>`` for per-lane events and
+    ``pilot_<event_type>_<project_id>`` for project-level pilot events, so each
+    lane emits at most one open message per event type and the board never floods.
+    """
+    from app.models import MessageType, ProjectMessage
+
+    if lane_id is not None:
+        dedupe_key = f"lane_{event_type}_{lane_id}"
+    else:
+        dedupe_key = f"pilot_{event_type}_{project_id}"
+
+    existing = (
+        (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == "open",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    already = any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing)
+    if already:
+        return
+    session.add(
+        ProjectMessage(
+            project_id=project_id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=f"[LANE-PILOT] {detail}",
+            context={
+                "event_type": event_type,
+                "lane_id": str(lane_id) if lane_id is not None else None,
+                "dedupe_key": dedupe_key,
+            },
+        )
+    )
 
 
 async def raise_gate_integrity_alert(

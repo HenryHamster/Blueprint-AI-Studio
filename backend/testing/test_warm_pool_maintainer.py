@@ -3971,3 +3971,95 @@ async def test_fleet_guard_engaged_skips_per_project_check(
 
     assert result is None, "fleet guard must block the lease"
     per_project_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Acceptance proof: lane kill emits deduplicated operator message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lane_kill_emits_operator_message(db_session, lanes_on):
+    """Acceptance proof: killing a lane for exhausted checkpoint recovery via
+    sweep_exhausted_lane_budgets emits a deduplicated WARNING ProjectMessage
+    naming the lane and cause, and a second sweep does NOT emit a duplicate."""
+    from sqlmodel import select as sm_select
+
+    from app.models import ProjectMessage
+
+    project = await _make_project(db_session, name="Kill Operator Msg")
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        phase_requeues=_LANE_MAX_PHASE_REQUEUES + 1,
+        name="op-msg-lane",
+    )
+
+    killed = await sweep_exhausted_lane_budgets(db_session)
+    assert killed == 1
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.KILLED.value
+
+    msgs = (
+        (
+            await db_session.execute(
+                sm_select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.status == "open",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    lane_msgs = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "lane_killed_exhausted"
+    ]
+    assert len(lane_msgs) == 1, "exactly one operator message should be emitted"
+    assert str(lane.id) in (lane_msgs[0].context or {}).get("lane_id", ""), (
+        "message context must name the killed lane"
+    )
+    assert "op-msg-lane title" in lane_msgs[0].content, (
+        "message content must name the lane title"
+    )
+
+    # Re-insert a fresh over-budget lane and sweep again — the dedup key is
+    # per-lane so the second lane gets its own message, but the FIRST lane
+    # must NOT produce a duplicate.
+    lane2 = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        phase_requeues=_LANE_MAX_PHASE_REQUEUES + 1,
+        name="op-msg-lane-2",
+    )
+    killed2 = await sweep_exhausted_lane_budgets(db_session)
+    assert killed2 == 1
+
+    msgs_after = (
+        (
+            await db_session.execute(
+                sm_select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.status == "open",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    lane_msgs_after = [
+        m
+        for m in msgs_after
+        if (m.context or {}).get("event_type") == "lane_killed_exhausted"
+    ]
+    assert len(lane_msgs_after) == 2, (
+        "second sweep should emit one new message for the new lane only (no dup for lane 1)"
+    )
+    lane_ids_in_msgs = {(m.context or {}).get("lane_id") for m in lane_msgs_after}
+    assert str(lane.id) in lane_ids_in_msgs
+    assert str(lane2.id) in lane_ids_in_msgs

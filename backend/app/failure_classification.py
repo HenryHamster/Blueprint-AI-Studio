@@ -408,6 +408,10 @@ _PROVIDER_MODEL_CONFIG_PATTERNS: tuple[str, ...] = (
     "is not supported for generatecontent",
     "unsupported service_tier",
     "unsupported value: 'service_tier'",
+    # OpenAI: model access errors ("the model ... does not exist or you do not have
+    # access to it"; "the selected model may not exist or you may not have access")
+    "does not exist or you do not have access",
+    "may not exist or you may not have access",
 )
 
 
