@@ -35,6 +35,7 @@ same way the reproduce-on-HEAD verdict does.
 
 from __future__ import annotations
 
+import logging
 import uuid
 import operator
 import re
@@ -51,6 +52,7 @@ from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.artifact_prerequisites import downstream_artifact_logical_key
 from app.models import Artifact
 from app.models import ArtifactConsumption
+from app.models import Project
 from app.models import Task
 from app.models import TaskStatus
 from app.payload_schemas import (
@@ -59,6 +61,8 @@ from app.payload_schemas import (
     read_acceptance_evidence,
 )
 from app.viewport_evidence import resolve_visual_evidence
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared fail-closed numeric comparison core (compute + code share this).
@@ -724,6 +728,20 @@ async def record_artifact_consumptions_for_task(
             producer.context = producer_ctx
             flag_modified(producer, "context")
             session.add(producer)
+            try:
+                from app.capability_proof import record_capability_proof
+
+                producer_project = await session.get(Project, producer.project_id)
+                if producer_project is not None:
+                    record_capability_proof(producer, producer_project)
+                    session.add(producer_project)
+            except Exception:  # noqa: BLE001 — proof recording must never block consumption
+                logger.warning(
+                    "[ACCEPTANCE_GATE] capability proof recording failed for producer"
+                    " task %s after downstream_artifact consumption",
+                    getattr(producer, "id", None),
+                    exc_info=True,
+                )
 
     if recorded_id_strings:
         ctx = dict(task.context or {})
