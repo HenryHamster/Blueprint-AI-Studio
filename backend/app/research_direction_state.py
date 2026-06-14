@@ -271,6 +271,20 @@ def direction_saturation_refractory_minutes() -> float:
     return 2.0 * direction_refractory_minutes()
 
 
+def direction_dedup_deadlock_recovery_hours() -> float:
+    """Cooldown for dedup-deadlocked directions before auto-recovery.
+
+    Shorter than the general ``direction_auto_recovery_hours`` (48h default)
+    because dedup-deadlocks often resolve as soon as in-flight tasks drain —
+    a shorter cooldown lets the direction re-enter rotation sooner.  The
+    general 48h floor applies if this value is not explicitly configured.
+    """
+    value = _runtime_config.get("dedup_deadlock_auto_recovery_hours")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return 8.0
+
+
 async def apply_post_spawn_state(
     session: AsyncSession,
     task: Task,
@@ -633,6 +647,25 @@ async def apply_post_spawn_state(
                                 f"[RESEARCH] Dedup deadlock: direction {did}, "
                                 f"{_consec} consecutive empty cycles (task {task.id})"
                             )
+                        # Auto-pause the direction to remove it from the research
+                        # rotation. The existing auto-recovery path in
+                        # direction_lifecycle._process_direction_lifecycle reactivates
+                        # it once the cooldown elapses (direction_dedup_deadlock_recovery_hours,
+                        # default 8h), giving in-flight tasks time to drain and HEAD
+                        # to advance so genuinely-new findings become possible.
+                        # needs_manual_intervention is intentionally NOT set here so
+                        # the time-based recovery fires unblocked.
+                        d["status"] = "paused"
+                        d["auto_paused"] = True
+                        d["paused_at"] = now_iso
+                        d["paused_reason"] = (
+                            f"dedup_deadlock: {_consec} consecutive zero-task cycles"
+                        )
+                        d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
+                        logger.info(
+                            f"[RESEARCH] Auto-paused direction {did} (dedup_deadlock, "
+                            f"{_consec} consecutive empty cycles, task {task.id})"
+                        )
 
                     # Already-fixed deadlock detection: check prior completed cycles
                     # (exclude the just-added entry — its children haven't resolved yet).

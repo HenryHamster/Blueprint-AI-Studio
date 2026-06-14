@@ -3013,6 +3013,164 @@ async def test_research_history_records_finding_challenge_summary(db_session):
 
 
 @_pytest.mark.asyncio
+async def test_dedup_deadlock_holds_direction_out_of_rotation_and_auto_recovers(
+    db_session, mocker
+):
+    """Detecting a dedup deadlock auto-pauses the direction and auto-recovery restores it.
+
+    Three consecutive dedup-zero research cycles must:
+    - Set direction status to 'paused' with auto_paused=True and a 'dedup_deadlock:' reason
+    - Increment auto_pause_count
+    - Create a WARNING alert and a BUG_REPORT message
+    - Be reversible: _process_direction_lifecycle reactivates the direction once the
+      cooldown (direction_dedup_deadlock_recovery_hours, default 8h) elapses.
+    """
+    from datetime import datetime, timedelta
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.direction_lifecycle import _process_direction_lifecycle
+    from app.models import Alert
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-deadlock-rr"
+    # Two pre-existing dedup-zero history entries (both with hash_dedup activity)
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-old-dl1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 2,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-old-dl2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1,
+                "word_overlap_dedup": 1,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+    ]
+    direction = {
+        **_active_direction(direction_id, "Dedup deadlock direction"),
+        "research_history": old_history,
+    }
+    project = _Project(
+        name="Deadlock Recovery Test",
+        user_id="test-user-dlrr",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Call apply_post_spawn_state with a 3rd dedup-zero cycle (triggers deadlock: 3
+    # consecutive zero-task cycles, >=2 with dedup activity).
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        1,  # hash_dedup_count — dedup activity in this 3rd cycle
+        0,  # word_overlap_count
+        0,  # file_overlap_count
+        0,  # evidence_overlap_count
+        0,  # type_filtered_count
+        0,  # empty_prompt_count
+        "research-branch",
+        "main",
+        0,  # research_depth
+        None,  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", (
+        f"direction should be paused on dedup deadlock, got {d['status']!r}"
+    )
+    assert d.get("auto_paused") is True, "auto_paused must be set"
+    assert (d.get("paused_reason") or "").startswith("dedup_deadlock:"), (
+        f"paused_reason must start with 'dedup_deadlock:', got {d.get('paused_reason')!r}"
+    )
+    assert d.get("auto_pause_count") == 1, (
+        f"auto_pause_count should be 1, got {d.get('auto_pause_count')}"
+    )
+    assert d.get("paused_at") is not None, "paused_at must be stamped"
+
+    # Verify a WARNING alert was created for the deadlock
+    result = await db_session.execute(
+        _select(Alert).where(
+            Alert.project_id == project.id,
+            Alert.title == "Dedup deadlock detected",
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    assert result.scalars().first() is not None, (
+        "expected a 'Dedup deadlock detected' alert"
+    )
+
+    # Simulate 50h elapsed since the pause (past the 8h dedup_deadlock recovery window)
+    dirs = list(project.directions)
+    dirs[0]["paused_at"] = (datetime.utcnow() - timedelta(hours=50)).isoformat()
+    project.directions = dirs
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Run direction lifecycle — should auto-recover the direction past the cooldown
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "active", (
+        f"direction should be active after cooldown, got {d['status']!r}"
+    )
+    assert d.get("auto_recovered_at") is not None, "auto_recovered_at must be stamped"
+    assert not d.get("auto_paused"), "auto_paused should be cleared on recovery"
+    assert not d.get("paused_reason"), "paused_reason should be cleared on recovery"
+
+
+@_pytest.mark.asyncio
 async def test_low_actionability_flag_off_preserves_legacy_drop_without_memo(
     db_session, mocker
 ):
@@ -13516,4 +13674,104 @@ async def test_recently_filtered_hashes_suppress_finding_next_cycle(db_session, 
     assert len(children) == 0, (
         f"Finding with hash {fhash!r} pre-loaded in recently_filtered_finding_hashes "
         "must be suppressed by the persisted state; no child task should be spawned"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canary spawn-gate classification (acceptance gate)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_gate_canary_classifies_real_verdict_vs_fail_closed():
+    """classify_canary_spawn_gate_result correctly distinguishes real verdicts from
+    fail-closed outcomes and pending state.
+
+    This is the acceptance gate for the on-demand canary feature: a real serving
+    agent that returns a parseable verdict must yield status='real_verdict' with
+    explicit_count>0; a grader that fails closed (no parseable verdict) must yield
+    status='fail_closed'; an unresolved canary must yield status='pending'.
+    """
+    from app.routers.admin_debug import (
+        classify_canary_spawn_gate_result,
+        _CANARY_PROBE_HASH,
+    )
+    from app.task_evaluators import (
+        ADVERSARIAL_PARSE_OK,
+        ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+    )
+
+    # 1. Pending — grader has not yet returned
+    result = classify_canary_spawn_gate_result(None)
+    assert result["status"] == "pending"
+    assert result["parse_outcome"] is None
+    assert result["explicit_count"] == 0
+
+    # 2. Real verdict — grader returned an explicit pass for the probe finding
+    gate_real = {
+        "parse_outcome": ADVERSARIAL_PARSE_OK,
+        "finding_verdicts": {
+            _CANARY_PROBE_HASH: {
+                "passed": True,
+                "explicit": True,
+                "reason": "premise holds",
+            }
+        },
+        "grader_task_id": "grader-abc",
+    }
+    result = classify_canary_spawn_gate_result(gate_real)
+    assert result["status"] == "real_verdict", (
+        f"Expected real_verdict for ok parse with explicit verdict; got {result['status']!r}"
+    )
+    assert result["explicit_count"] == 1
+    assert result["parse_outcome"] == ADVERSARIAL_PARSE_OK
+
+    # 3. Real verdict — grader returned an explicit FAIL (still a real verdict; gate is healthy)
+    gate_fail_verdict = {
+        "parse_outcome": ADVERSARIAL_PARSE_OK,
+        "finding_verdicts": {
+            _CANARY_PROBE_HASH: {
+                "passed": False,
+                "explicit": True,
+                "reason": "premise wrong",
+            }
+        },
+        "grader_task_id": "grader-abc",
+    }
+    result = classify_canary_spawn_gate_result(gate_fail_verdict)
+    assert result["status"] == "real_verdict", (
+        "An explicit fail verdict is still a real_verdict — gate is functioning"
+    )
+
+    # 4. Fail-closed — grader returned no JSON array (wholesale non-response)
+    gate_no_json = {
+        "parse_outcome": ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+        "finding_verdicts": {
+            _CANARY_PROBE_HASH: {
+                "passed": False,
+                "explicit": False,
+                "unresolved_reason": ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+            }
+        },
+        "grader_task_id": "grader-def",
+    }
+    result = classify_canary_spawn_gate_result(gate_no_json)
+    assert result["status"] == "fail_closed", (
+        f"Expected fail_closed for no-JSON-array outcome; got {result['status']!r}"
+    )
+    assert result["explicit_count"] == 0
+
+    # 5. Fail-closed — ok parse outcome but zero explicit verdicts (degenerate)
+    gate_ok_no_explicit = {
+        "parse_outcome": ADVERSARIAL_PARSE_OK,
+        "finding_verdicts": {
+            _CANARY_PROBE_HASH: {
+                "passed": False,
+                "explicit": False,
+            }
+        },
+        "grader_task_id": "grader-ghi",
+    }
+    result = classify_canary_spawn_gate_result(gate_ok_no_explicit)
+    assert result["status"] == "fail_closed", (
+        "ok parse with zero explicit verdicts must be fail_closed"
     )

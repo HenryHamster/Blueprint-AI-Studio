@@ -2556,3 +2556,112 @@ async def test_already_satisfied_deadlock_no_quiesce_when_merged_pr_in_window(
     assert len(af_alerts) == 0, (
         "Direction with a merged PR in the recent window must NOT be quiesced as already-fixed"
     )
+
+
+@pytest.mark.asyncio
+async def test_dedup_deadlock_auto_recovery_uses_shorter_cooldown(db_session, mocker):
+    """Dedup-deadlocked directions recover after 8h (shorter cooldown), not 48h.
+
+    A direction paused with paused_reason='dedup_deadlock:...' should be
+    reactivated after direction_dedup_deadlock_recovery_hours() (default 8h),
+    not the generic direction_auto_recovery_hours (48h default). At ~10h (past
+    8h but under 48h), the direction must transition back to active.
+    """
+    now = datetime.utcnow()
+    # Paused 10 hours ago — past the 8h dedup-deadlock cooldown, under 48h generic cooldown
+    paused_at = now - timedelta(hours=10)
+
+    direction = {
+        "id": "d-dedup-deadlock-recovery",
+        "text": "Dedup-deadlocked direction",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "dedup_deadlock: 3 consecutive empty cycles",
+        "paused_at": paused_at.isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+
+    project = Project(
+        name="Dedup Deadlock Recovery Test",
+        user_id="u-dedup-recovery",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "active", (
+        "Dedup-deadlocked direction should be reactivated after 8h cooldown "
+        f"(was paused 10h ago); got status={d['status']!r}"
+    )
+    assert not d.get("auto_paused"), "auto_paused should be cleared on recovery"
+    assert not d.get("paused_reason"), "paused_reason should be cleared on recovery"
+    assert d.get("auto_recovered_at") is not None, (
+        "auto_recovered_at should be stamped on recovery"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedup_deadlock_not_recovered_before_cooldown(db_session, mocker):
+    """Dedup-deadlocked direction does NOT recover before the 8h cooldown expires.
+
+    At 5h (past the typical generic checks but under the 8h dedup-deadlock
+    cooldown), the direction must remain paused.
+    """
+    now = datetime.utcnow()
+    # Paused 5 hours ago — under the 8h dedup-deadlock cooldown
+    paused_at = now - timedelta(hours=5)
+
+    direction = {
+        "id": "d-dedup-deadlock-no-recovery",
+        "text": "Dedup-deadlocked direction still in cooldown",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "dedup_deadlock: 3 consecutive empty cycles",
+        "paused_at": paused_at.isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+
+    project = Project(
+        name="Dedup Deadlock No Recovery Test",
+        user_id="u-dedup-no-recovery",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", (
+        "Dedup-deadlocked direction should remain paused within the 8h cooldown "
+        f"(paused 5h ago); got status={d['status']!r}"
+    )

@@ -15645,3 +15645,163 @@ class TestSpawnGateCensus:
         data = resp.json()
         assert data["cycles_scanned"] == 1
         assert data["graders_attempted_total"] == 2
+
+
+class TestCanaryAdversarialChallenge:
+    """Tests for POST/GET /api/admin/projects/{id}/canary/adversarial-challenge."""
+
+    @pytest.mark.asyncio
+    async def test_post_spawns_canary_and_returns_ids(
+        self, client: AsyncClient, db_session
+    ):
+        """Happy path: POST spawns the canary and grader, returns both task IDs."""
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(db_session)
+        grader_id = uuid.uuid4()
+
+        mock_grader = Task(
+            project_id=project.id,
+            title="[GRADE] canary grader",
+            payloads=[{"type": "investigate", "scope": "small"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        mock_grader.id = grader_id
+
+        with patch(
+            "app.routers.admin_debug.spawn_forward_quality_grader",
+            new_callable=AsyncMock,
+            return_value=mock_grader,
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/canary/adversarial-challenge"
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "canary_task_id" in data
+        assert data["grader_task_id"] == str(grader_id)
+        # canary_task_id is a valid UUID
+        uuid.UUID(data["canary_task_id"])
+
+    @pytest.mark.asyncio
+    async def test_post_returns_409_when_grader_already_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """409 is returned when spawn_forward_quality_grader returns None (already in flight)."""
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(db_session)
+
+        with patch(
+            "app.routers.admin_debug.spawn_forward_quality_grader",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/canary/adversarial-challenge"
+            )
+
+        assert resp.status_code == 409
+        assert "already in flight" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_get_returns_404_when_task_not_found(
+        self, client: AsyncClient, db_session
+    ):
+        """GET returns 404 when the canary_task_id does not exist."""
+        project = await _make_project(db_session)
+        bogus_id = uuid.uuid4()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/canary/adversarial-challenge/{bogus_id}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_returns_404_when_task_is_not_canary(
+        self, client: AsyncClient, db_session
+    ):
+        """GET rejects tasks not flagged as canaries (_is_canary not in context)."""
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        non_canary = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={},  # no _is_canary
+        )
+        db_session.add(non_canary)
+        await db_session.commit()
+        await db_session.refresh(non_canary)
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/canary/adversarial-challenge/{non_canary.id}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_returns_pending_when_no_gate_record(
+        self, client: AsyncClient, db_session
+    ):
+        """GET returns status=pending when the grader has not yet written a verdict."""
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        canary = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            context={"_is_canary": True, "awaiting_adversarial_grader": str(uuid.uuid4())},
+        )
+        db_session.add(canary)
+        await db_session.commit()
+        await db_session.refresh(canary)
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/canary/adversarial-challenge/{canary.id}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "pending"
+        assert data["canary_task_id"] == str(canary.id)
+        assert "grader_task_id" in data
+
+    @pytest.mark.asyncio
+    async def test_get_returns_grader_task_id_from_db(
+        self, client: AsyncClient, db_session
+    ):
+        """GET includes grader_task_id from the canary context in the response."""
+        from app.task_evaluators import ADVERSARIAL_GATE_VERDICT_KEY, ADVERSARIAL_PARSE_OK
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        grader_id = str(uuid.uuid4())
+        gate_record = {
+            "parse_outcome": ADVERSARIAL_PARSE_OK,
+            "finding_verdicts": {
+                "hash-abc": {"explicit": True, "verdict": "pass"}
+            },
+            "grader_task_id": grader_id,
+        }
+        canary = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_is_canary": True,
+                ADVERSARIAL_GATE_VERDICT_KEY: gate_record,
+            },
+        )
+        db_session.add(canary)
+        await db_session.commit()
+        await db_session.refresh(canary)
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/canary/adversarial-challenge/{canary.id}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "real_verdict"
+        assert data["explicit_count"] == 1
+        assert data["grader_task_id"] == grader_id
+        assert data["canary_task_id"] == str(canary.id)
