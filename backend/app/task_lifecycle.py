@@ -489,6 +489,13 @@ async def _resolve_quality_grader_completion(
         return
 
     ctx = dict(source.context or {})
+    # ``parent_task_id`` is immutable; snapshot it now, while ``source`` is
+    # freshly loaded. The rollup-trigger decision below runs AFTER the resume
+    # handler + commits, by which point a best-effort sub-op rollback (or the
+    # connection-drop path) may have expired ``source`` — reading
+    # ``source.parent_task_id`` there fires a sync expired-load inside the async
+    # session and raises MissingGreenlet (prod 2026-06-13, sidecar-recovery).
+    _source_parent_task_id = source.parent_task_id
     lane = "adversarial_grader" if is_adversarial else "quality_grader"
     verdict_key = (
         ADVERSARIAL_GATE_VERDICT_KEY if is_adversarial else QUALITY_GRADER_VERDICT_KEY
@@ -775,7 +782,7 @@ async def _resolve_quality_grader_completion(
     _source_id_str = str(source.id)
     _source_project_id_str = str(source.project_id)
     _source_status = source.status
-    if source.parent_task_id:
+    if _source_parent_task_id:
         try:
             await _check_and_trigger_rollup(source, session)
         except Exception:
@@ -1176,6 +1183,11 @@ async def _resolve_finding_challenge_completion(
         return
 
     ctx = dict(source.context or {})
+    # Snapshot the immutable parent id while ``source`` is fresh — see the
+    # identical guard in _resolve_quality_grader_completion: the rollup decision
+    # below runs after a commit/possible rollback that can expire ``source``, and
+    # a live ``source.parent_task_id`` read there raises MissingGreenlet.
+    _source_parent_task_id = source.parent_task_id
     lane = "finding_challenge"
     pending_application = _sidecar_application_pending(
         ctx, lane=lane, sidecar_id=challenge.id
@@ -1254,7 +1266,7 @@ async def _resolve_finding_challenge_completion(
     _source_id_str = str(source.id)
     _source_project_id_str = str(source.project_id)
     _source_status = source.status
-    if source.parent_task_id:
+    if _source_parent_task_id:
         try:
             await _check_and_trigger_rollup(source, session)
         except Exception:

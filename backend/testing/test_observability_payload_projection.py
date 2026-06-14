@@ -133,6 +133,77 @@ async def test_outer_loop_convergence_walks_non_code_outcomes_without_lazy_load(
 
 
 @pytest.mark.asyncio
+async def test_lane_diag_walks_hydrated_original_without_lazy_load(
+    client: AsyncClient, db_session
+):
+    """/lane-diag's waste reducer walks the hydrated chain-original too.
+
+    Prod 2026-06-13 (147x): ``/api/admin/lane-diag`` 500ed with MissingGreenlet
+    because ``_load_outer_loop_original_tasks`` hydrated chain-originals with a
+    projection that omitted columns the NEW lane-waste reducer reads — first
+    ``fix_loop_history`` (``classify_lane_waste_category`` ->
+    ``has_terminal_divergence``), then ``started_at`` / ``status_log`` /
+    ``updated_at`` / ``archived``. ``getattr(t, "fix_loop_history", None)`` does
+    NOT suppress the deferred load, so walking a hydrated original lazy-loaded
+    inside the async session and crashed the whole endpoint.
+
+    Repro shape: a chain-original that itself carries ``review_loop`` context
+    (so the reducer groups + walks it) but is NON-terminal (EVALUATING) — so it
+    is excluded from the wide terminal pool and reaches the reducer ONLY through
+    the narrow ``_load_outer_loop_original_tasks`` hydration. Pre-fix this dies
+    with MissingGreenlet; post-fix it returns 200.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Chain-original O: in-window, NON-terminal (excluded from the wide terminal
+    # query), carries review_loop so the waste reducer walks it. Reached only via
+    # the narrow hydration projection — the exact row that lazy-loaded in prod.
+    original = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        created_at=now - timedelta(hours=2),
+        payloads=[{"type": "create"}],
+        context={
+            "review_loop": {
+                "iteration": 0,
+                "pr_number": 7311,
+            }
+        },
+    )
+    # Terminal review child C references O as its chain-original, so O is
+    # hydrated by _load_outer_loop_original_tasks.
+    review_child = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=now - timedelta(minutes=20),
+        payloads=[{"type": "create"}],
+        context={
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original.id),
+                "pr_number": 7311,
+            }
+        },
+    )
+    db_session.add_all([original, review_child])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}")
+    assert resp.status_code == 200
+    lane_waste = resp.json()["lane_waste"]
+    # Both the terminal child and the hydrated original are walked as waste rows.
+    walked_ids = {
+        row["task_id"] for chain in lane_waste["chains"] for row in chain["tasks"]
+    }
+    assert str(original.id) in walked_ids
+    assert str(review_child.id) in walked_ids
+
+
+@pytest.mark.asyncio
 async def test_outer_loop_convergence_trend_walks_non_code_outcomes(
     client: AsyncClient, db_session
 ):
