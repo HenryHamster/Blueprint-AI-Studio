@@ -10,7 +10,7 @@ disconnect-class errors via the dispatch hook, and verify the
 connection.invalidate() call + counter behavior.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -22,6 +22,7 @@ from app.database import (
     _install_disconnect_invalidation,
     _install_pool_keepalive,
     _is_connection_poisoning_error,
+    dispose_engine,
     get_db_pool_invalidation_stats,
 )
 
@@ -316,3 +317,33 @@ def test_pool_keepalive_registered_on_connect_event_and_applies_to_raw_conn(
     dbapi_conn.driver_connection = raw_conn
     captured["fn"](dbapi_conn, MagicMock())
     assert keepalive_calls == [raw_conn]
+
+
+# ── dispose_engine: graceful pool close on shutdown ───────────────────────────
+
+
+async def test_dispose_engine_noop_when_engine_uninitialized(monkeypatch):
+    """No-op — and never *creates* an engine — when the lazy engine was never
+    instantiated (e.g. a DB-free import that touched no session)."""
+    monkeypatch.setattr(db_module._LazyEngine, "_engine", None)
+    await dispose_engine()  # must not raise
+    assert db_module._LazyEngine._engine is None  # and must not instantiate one
+
+
+async def test_dispose_engine_disposes_live_engine(monkeypatch):
+    """Awaits the live engine's dispose() exactly once so Cloud Run drain
+    closes pooled asyncpg connections instead of abandoning them."""
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+    monkeypatch.setattr(db_module._LazyEngine, "_engine", fake_engine)
+    await dispose_engine()
+    fake_engine.dispose.assert_awaited_once()
+
+
+async def test_dispose_engine_swallows_dispose_failure(monkeypatch):
+    """Shutdown hardening is best-effort: a dispose() failure never propagates."""
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(db_module._LazyEngine, "_engine", fake_engine)
+    await dispose_engine()  # must not raise
+    fake_engine.dispose.assert_awaited_once()

@@ -479,6 +479,29 @@ class _LazyEngine:
 
 engine = _LazyEngine()
 
+
+async def dispose_engine() -> None:
+    """Gracefully close the main query pool's connections at app shutdown.
+
+    Cloud Run drains an instance with SIGTERM. Without an explicit dispose the
+    process exits with its asyncpg pool sockets still open, so Cloud SQL has to
+    reap them on its own timeout — leaving orphaned server-side connections that
+    keep counting against ``max_connections`` during the instance scale-in churn
+    of a busy fleet. Disposing here closes them cleanly on the way out.
+
+    No-op when the lazy engine was never instantiated (e.g. a test import that
+    never touched the DB) — read the class attribute directly so this never
+    *creates* an engine just to dispose it. Best-effort: never raises.
+    """
+    eng = _LazyEngine._engine
+    if eng is None:
+        return
+    try:
+        await eng.dispose()
+    except Exception as exc:  # noqa: BLE001 — shutdown hardening is best-effort
+        logger.warning("[DB] engine.dispose() on shutdown failed: %s", exc)
+
+
 # Session factory for background tasks and dependency injection.
 #
 # expire_on_commit=False semantics (audit Phase C4 — M-C1):
