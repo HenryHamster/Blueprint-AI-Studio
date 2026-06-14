@@ -695,6 +695,21 @@ async def _load_outer_loop_original_tasks(
                 # outright is fine — no projection needed.
                 Task.payloads,
                 Task.latest_status_message,
+                # The lane-waste reducer (digest_metrics._lane_waste_task_row,
+                # reached via compute_lane_waste_diagnostics) ALSO walks these
+                # hydrated originals and reads more columns: fix_loop_history
+                # (classify_lane_waste_category -> has_terminal_divergence),
+                # started_at, status_log + updated_at (_lane_waste_completed_at),
+                # and archived (task_counts_toward_review_cap). Leaving any
+                # deferred lazy-loads inside the async session and raises
+                # MissingGreenlet (prod 2026-06-13: /api/admin/lane-diag 500
+                # storm — getattr(t, "fix_loop_history", None) does NOT suppress
+                # the deferred load).
+                Task.fix_loop_history,
+                Task.started_at,
+                Task.status_log,
+                Task.updated_at,
+                Task.archived,
             )
         )
     )

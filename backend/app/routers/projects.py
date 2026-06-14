@@ -98,6 +98,13 @@ async def _safe_ws_close(ws: WebSocket, code: int, reason: str = "") -> None:
         finalised; surfaced 2026-05-04 from the 90s idle-timeout path
         (projects.py:341) when the socket was already half-closed.
 
+    A third shape surfaced 2026-06-14 from the agent auth-handshake abort path
+    (peer sends ``WebSocketDisconnect 1006`` during ``receive_json``): the
+    follow-up ``ws.close()`` reaches uvicorn's ``asgi_send`` ->
+    ``websockets.legacy.protocol`` on an already-torn-down transport and raises
+    a bare ``AttributeError`` (no message to match on). Cosmetic for the same
+    reason — the socket is gone — so swallow it too.
+
     Both are cosmetic for our purposes — the connection is gone either
     way, and the finally block will still run ``manager.disconnect``.
     Any other RuntimeError is real and re-raised.
@@ -109,6 +116,10 @@ async def _safe_ws_close(ws: WebSocket, code: int, reason: str = "") -> None:
         if "websocket.close" in msg or "close message has been sent" in msg:
             return
         raise
+    except AttributeError:
+        # Closing an already-finalised socket; the transport attrs the close
+        # frame would touch are gone. The connection is already dead.
+        return
 
 
 router = APIRouter(tags=["projects"])
