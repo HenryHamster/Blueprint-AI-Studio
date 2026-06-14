@@ -3312,6 +3312,62 @@ async def test_sweep_stranded_lanes_creates_recovery_task_when_context_available
 
 
 @pytest.mark.asyncio
+async def test_sweep_stranded_lanes_continues_after_non_cas_exception(
+    db_session, lanes_on, mocker
+):
+    """sweep_stranded_lanes must not abort when a general (non-LaneCASError)
+    exception is raised while processing the first stranded lane — the second
+    lane must still be processed."""
+    project = await _make_project(db_session, name="Non-CAS Continue")
+
+    cancelled1 = await _make_task(db_session, project, TaskStatus.CANCELLED)
+    cancelled2 = await _make_task(db_session, project, TaskStatus.CANCELLED)
+
+    lane1 = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=cancelled1.id,
+        name="lane-fail",
+    )
+    lane2 = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=cancelled2.id,
+        name="lane-ok",
+    )
+
+    call_count = 0
+    real_mcm = None
+
+    async def _patched_mcm(session, lane_id, **kwargs):
+        nonlocal call_count, real_mcm
+        call_count += 1
+        if lane_id == lane1.id:
+            raise RuntimeError("simulated unexpected error on lane1")
+        return await real_mcm(session, lane_id, **kwargs)
+
+    from app.improvement_lane_ops import mark_checkpoint_missing as _real_mcm
+
+    real_mcm = _real_mcm
+    mocker.patch("app.improvement_lane_ops.mark_checkpoint_missing", new=_patched_mcm)
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+
+    # lane1 errored — not counted; lane2 was processed (KILLED, no PR context).
+    assert transitioned == 1, "second lane must still be processed after non-CAS error"
+    assert call_count == 2, "mark_checkpoint_missing was attempted for both lanes"
+
+    await db_session.refresh(lane2)
+    assert lane2.status == ImprovementLaneStatus.KILLED.value, (
+        "lane2 must be KILLED despite lane1 raising a non-CAS exception"
+    )
+
+
+@pytest.mark.asyncio
 async def test_expired_reservation_sweep_skips_concurrently_leased_member(
     db_session, warm_pool_on, mocker
 ):

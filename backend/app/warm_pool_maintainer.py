@@ -1606,6 +1606,18 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
             # Concurrent maintainer/sweep tick already transitioned this lane —
             # the loser no-ops rather than double-killing.
             logger.debug("[WARM-POOL] stranded-lane CAS miss lane=%s: %s", lane.id, exc)
+        except Exception as exc:  # noqa: BLE001
+            # Unexpected error (DB transient, serialization failure, etc.) —
+            # roll back any partial work for this lane and continue so the
+            # remaining stranded lanes are still processed.
+            logger.warning(
+                "[WARM-POOL] unexpected error processing stranded lane %s — skipping: %s",
+                lane.id,
+                exc,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
 
     # --- Class 2: stale PROPOSED lanes whose activation never completed ---
     stale_seconds = int(

@@ -1251,6 +1251,108 @@ def test_lane_baseline_cross_version_trend():
     assert mc["classification"] == "stable"
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_cost_scalars_propagated_to_payload(db_session, mocker):
+    """checkpoint_and_reserve_on_phase_complete propagates LLM + VM cost scalars.
+
+    A bug zeroing or omitting tokens_in, tokens_out, or vm_cost_usd on the
+    LaneCheckpointPayload must cause this test to fail.
+    """
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.models import ImprovementLaneStatus
+    from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    TOKENS_IN = 1234
+    TOKENS_OUT = 5678
+    VM_COST = 0.42
+
+    mocker.patch(
+        "app.models.get_task_total_llm_totals",
+        return_value=(TOKENS_IN, TOKENS_OUT, 0),
+    )
+    mocker.patch(
+        "app.models.get_task_total_vm_cost_usd",
+        return_value=VM_COST,
+    )
+
+    captured_payloads: list = []
+
+    async def _capture_checkpoint(session, lane_id, *, phase, task_id, checkpoint):
+        captured_payloads.append(checkpoint)
+
+    mocker.patch(
+        "app.improvement_lane_ops.checkpoint_lane",
+        side_effect=_capture_checkpoint,
+    )
+
+    project = await _make_project(db_session, is_self_repo=True)
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="cost-scalar-lane",
+        goal="cost-scalar",
+        branch_name="feat/cost-scalar",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    await db_session.flush()
+    await cas_transition(
+        db_session,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=None,
+    )
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id=None,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    lane.current_task_id = source_task.id
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
+
+    result = await checkpoint_and_reserve_on_phase_complete(
+        db_session,
+        source_task,
+        lane,
+        sha="abc1234def5678",
+        summary="cost scalar test",
+        reserve_workspace=False,
+    )
+
+    assert result is True, "checkpoint should be written"
+    assert len(captured_payloads) == 1, "checkpoint_lane must be called exactly once"
+    payload = captured_payloads[0]
+    assert payload.tokens_in == TOKENS_IN, (
+        f"tokens_in mismatch: got {payload.tokens_in}, expected {TOKENS_IN}"
+    )
+    assert payload.tokens_out == TOKENS_OUT, (
+        f"tokens_out mismatch: got {payload.tokens_out}, expected {TOKENS_OUT}"
+    )
+    assert payload.vm_cost_usd == pytest.approx(VM_COST), (
+        f"vm_cost_usd mismatch: got {payload.vm_cost_usd}, expected {VM_COST}"
+    )
+
+
 def test_lane_baseline_trend_returns_none_when_fewer_than_two():
     """compute_lane_baseline_trend returns None for 0 or 1 baselines."""
     from app.digest_metrics import compute_lane_baseline_trend
