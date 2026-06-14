@@ -17,6 +17,7 @@ import {
   writeStrategicHelpers,
   runStrategicChallenge,
   buildStrategicChallengeExecutorSection,
+  blockedChallengeRecord,
 } from './strategic-helpers.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
@@ -704,6 +705,22 @@ prompts, schemas, tools, or orchestration.` : '';
       ws, statusRef, model, effort, disallowedTools,
       runClaudeCode, sendLog,
     });
+    // Persisting the challenge record gates evidence_progress on the BACKEND: an
+    // advancing/met self-rating only earns `challenge_approved` when a persisted
+    // ok-record endorsed that exact (direction_id, status) — see
+    // strategic_completion.challenge_approves_evidence_progress / _retirement, which
+    // return False for a MISSING or non-ok record (the deterministic scaffolding
+    // backstop stays active). So a missing record fails CLOSED, identical to a
+    // blocked/invalid one. A persist failure must therefore DEGRADE, not kill the
+    // cycle: throwing here discarded the entire (already-completed) multi-pass
+    // analysis and forced a from-scratch retry, so a single transient project-row
+    // 429 / abort during a DB-contention window re-ran a ~25-min analysis across all
+    // retries and still ended terminal (task 9aec276e — three full attempts burned,
+    // each dying only on this one write). On failure we keep the cycle running but
+    // present the executor a BLOCKED view, so its prompt matches the backend's
+    // fail-closed reality (no approvals this cycle) instead of advertising approvals
+    // the backend will reject.
+    let effectiveChallengeRecord = challengeRecord;
     try {
       await apiPost('/api/agent/strategic', {
         task_id: taskId,
@@ -712,11 +729,13 @@ prompts, schemas, tools, or orchestration.` : '';
       });
       sendLog(ws, `[INFO] Strategic challenge recorded (status=${challengeRecord.status})\n`);
     } catch (e) {
-      const error = new Error(`Failed to persist strategic challenge record: ${String(e)}`);
-      sendLog(ws, `[ERROR] ${error.message}\n`);
-      throw error;
+      effectiveChallengeRecord = blockedChallengeRecord(`challenge persist failed: ${String(e)}`);
+      sendLog(
+        ws,
+        `[WARNING] Failed to persist strategic challenge record — degrading to no-approvals and continuing (evidence_progress fails closed this cycle): ${String(e)}\n`,
+      );
     }
-    const strategicChallengeSection = buildStrategicChallengeExecutorSection(challengeRecord);
+    const strategicChallengeSection = buildStrategicChallengeExecutorSection(effectiveChallengeRecord);
 
     // ── Pass 2: Executor — translate analysis into API calls ──
     // Short, focused pass. The analysis is done. This just calls the tools.

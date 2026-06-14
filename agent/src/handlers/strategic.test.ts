@@ -59,6 +59,19 @@ vi.mock('./strategic-helpers.js', () => ({
   // pass — that keeps runClaudeCode.mock.calls[0] the executor prompt for the
   // existing executor-prompt assertions.
   runStrategicChallenge: vi.fn().mockResolvedValue(DEFAULT_CHALLENGE_RECORD),
+  // Degraded record the handler substitutes when the challenge persist fails:
+  // a blocked record approves nothing, so the executor section renders
+  // status=blocked with no approved pairs (matches the backend's fail-closed gate).
+  blockedChallengeRecord: (note: string) => ({
+    challenge_version: 1,
+    status: 'blocked' as const,
+    evidence_progress: [],
+    retirement_approvals: [],
+    retirement_critique_quality: { verdict: 'not_assessed', rationale: note },
+    portfolio_shape_risk: { verdict: 'not_assessed', rationale: note },
+    portfolio_operations: [],
+    notes: note,
+  }),
   // Echo the record's status + approved pairs so wiring tests can assert the
   // section is built from the record runStrategicChallenge returned and is
   // threaded into the executor prompt.
@@ -615,25 +628,49 @@ describe('handleStrategic strategic challenge gate', () => {
     expect(executorPrompt).toContain('SOFT NON-ERROR OUTCOME');
   });
 
-  it('fails closed when challenge persistence fails before executor', async () => {
+  it('degrades to no-approvals (does NOT fail the task) when challenge persistence fails', async () => {
+    // A persist failure must NOT discard the completed analysis and kill the cycle:
+    // the backend gate fails closed on a missing record, so the cycle continues and
+    // the executor is shown a BLOCKED (no-approvals) view that matches that reality.
+    // Regression for task 9aec276e — a transient project-row 429 / abort on this one
+    // write burned three full ~25-min strategic analyses and still ended terminal.
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
     } as unknown as { ok: boolean; analysisText: string });
 
-    vi.mocked(runStrategicChallenge).mockResolvedValueOnce(
-      DEFAULT_CHALLENGE_RECORD as unknown as Awaited<ReturnType<typeof runStrategicChallenge>>,
-    );
-    vi.mocked(apiPost).mockRejectedValueOnce(new Error('challenge store failed'));
+    // The challenge itself produced an OK record with an approved pair — proving the
+    // degradation comes from the persist failure, not from a blocked challenge.
+    vi.mocked(runStrategicChallenge).mockResolvedValueOnce({
+      ...DEFAULT_CHALLENGE_RECORD,
+      evidence_progress: [
+        { direction_id: 'd-7', status: 'advancing', verdict: 'approved', rationale: 'real' },
+      ],
+    } as unknown as Awaited<ReturnType<typeof runStrategicChallenge>>);
+    // Only the set_strategic_challenge persist fails; later strategic POSTs succeed.
+    vi.mocked(apiPost).mockImplementation(async (_path: string, body?: Record<string, unknown>) => {
+      if (body && (body as { op?: string }).op === 'set_strategic_challenge') {
+        throw new Error('challenge store failed');
+      }
+      return {};
+    });
 
     const statusRef = { value: '' };
-    await expect(
-      handleStrategic(
-        'task-challenge-fail', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
-      ),
-    ).rejects.toThrow('Failed to persist strategic challenge record: Error: challenge store failed');
+    // No throw: the cycle survives the persist failure.
+    await handleStrategic(
+      'task-challenge-fail', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
+    );
+    // Restore the default impl so the rejecting one does not leak to later suites
+    // (this block's beforeEach only mockClear()s — it does not reset the impl).
+    vi.mocked(apiPost).mockReset();
+    vi.mocked(apiPost).mockResolvedValue({});
 
-    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    // The executor still ran — the analysis was NOT discarded.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalled();
+    // …and it was shown the BLOCKED view (no approvals), matching the backend's
+    // fail-closed gate, NOT the OK record's approved d-7 pair.
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toContain('CHALLENGE_SECTION(status=blocked;approved=;retirements=)');
   });
 });
 

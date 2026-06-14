@@ -251,6 +251,51 @@ def get_db_pool_invalidation_stats() -> dict:
     }
 
 
+# --- Connection-poisoning classifier (2026-06-14 flap) --------------------
+#
+# A query that hits a CLIENT-side command_timeout, that is cancelled by the
+# server-side statement_timeout, or that races asyncpg's protocol into the
+# "another operation is in progress" / "cannot switch to state" condition, leaves
+# the connection in a state that is unsafe to hand back to the pool. None of
+# these set SQLAlchemy's ``is_disconnect`` flag (the socket is still open), so
+# without help the bad connection is returned to the pool and the next checkout
+# inherits the wedge — surfacing as the
+# ``InternalClientError: cannot switch to state N; another operation (M) is in
+# progress`` cascade that hung the orchestrator/reaper background tasks for
+# ~7 min and flapped the service on 2026-06-14. Treat these as eject-worthy
+# alongside the disconnect class.
+_POISON_EXC_NAMES = frozenset(
+    {"TimeoutError", "QueryCanceledError", "InternalClientError"}
+)
+_POISON_MESSAGE_SUBSTRINGS = (
+    "another operation is in progress",
+    "cannot switch to state",
+)
+
+
+def _is_connection_poisoning_error(exc: object) -> bool:
+    """True when ``exc`` (or its ``__cause__`` chain) indicates a connection left
+    in a timed-out / protocol-wedged state that must be ejected from the pool
+    rather than reused.
+
+    Deliberately narrow: routine SQL errors (FK / unique violations, check
+    constraint failures, etc.) match neither the exception-name set nor the
+    message substrings, so the pool is NOT churned on every query error — only on
+    the timeout / protocol-corruption class that genuinely poisons a connection.
+    """
+    seen = 0
+    cur = exc
+    while cur is not None and seen < 6:
+        seen += 1
+        if type(cur).__name__ in _POISON_EXC_NAMES:
+            return True
+        message = str(cur).lower()
+        if any(sub in message for sub in _POISON_MESSAGE_SUBSTRINGS):
+            return True
+        cur = getattr(cur, "__cause__", None)
+    return False
+
+
 def _install_disconnect_invalidation(engine: AsyncEngine) -> None:
     """Eject pool connections after a disconnection-class error.
 
@@ -285,13 +330,22 @@ def _install_disconnect_invalidation(engine: AsyncEngine) -> None:
     @event.listens_for(engine.sync_engine, "handle_error")
     def _invalidate_on_disconnect(ctx: object) -> None:
         global _invalidate_failure_count, _invalidate_total_count
-        # `is_disconnect` is the authoritative SQLAlchemy-set flag. Dialects
-        # populate it via `do_is_disconnect()` BEFORE listeners run; for
-        # asyncpg this catches "connection is closed", "admin shutdown",
-        # "connection does not exist", etc.
-        if not getattr(ctx, "is_disconnect", False):
-            return
         original_exc = getattr(ctx, "original_exception", None)
+        # Eject on TWO classes:
+        #   1. The disconnect class — `is_disconnect` is the authoritative
+        #      SQLAlchemy-set flag (populated via `do_is_disconnect()` BEFORE
+        #      listeners run); for asyncpg this catches "connection is closed",
+        #      "admin shutdown", "connection does not exist", etc.
+        #   2. The timeout / protocol-wedge class — command_timeout, server
+        #      statement_timeout cancel, and "another operation is in progress" /
+        #      "cannot switch to state". These do NOT set is_disconnect (the
+        #      socket is still open) but still leave the connection unsafe to
+        #      reuse; without ejecting them the poisoned connection re-enters the
+        #      pool and wedges the next checkout (2026-06-14 flap).
+        # Routine SQL errors match neither and leave the pool untouched.
+        is_disconnect = bool(getattr(ctx, "is_disconnect", False))
+        if not (is_disconnect or _is_connection_poisoning_error(original_exc)):
+            return
         connection = getattr(ctx, "connection", None)
         if connection is None:
             return
@@ -300,9 +354,10 @@ def _install_disconnect_invalidation(engine: AsyncEngine) -> None:
             _invalidate_total_count += 1
             _invalidate_failure_count = 0  # reset on success
             logger.warning(
-                "[DB] Invalidated pool connection after %s "
+                "[DB] Invalidated pool connection after %s [%s] "
                 "(total_invalidations=%d) — pool will recycle on next checkout",
                 type(original_exc).__name__,
+                "disconnect" if is_disconnect else "timeout/protocol-wedge",
                 _invalidate_total_count,
             )
         except Exception as inv_exc:
@@ -332,6 +387,61 @@ def _install_disconnect_invalidation(engine: AsyncEngine) -> None:
                 _invalidate_failure_count = 0
 
 
+# Client-side per-query deadline (seconds), passed straight to asyncpg.connect.
+#
+# server_settings.statement_timeout is SERVER-side: it only bounds a query the
+# server is actively running on a LIVE connection. It cannot bound a query whose
+# connection died mid-flight (no FIN/RST — an NLB idle drop / firewall eviction),
+# nor one wedged behind asyncpg's "another operation is in progress" protocol
+# lock — those hang with NO deadline until the background-task liveness watchdog
+# cancels the whole task (~405s), the 2026-06-14 flap. command_timeout is the
+# CLIENT-side backstop for exactly those cases. Set ABOVE statement_timeout so on
+# a healthy connection the server-side cancel still wins (clean abort, connection
+# stays usable) and this only fires when the server cannot respond at all.
+_STATEMENT_TIMEOUT_MS = 120_000
+_COMMAND_TIMEOUT_SECONDS = 150
+
+
+def _engine_connect_args() -> dict:
+    """asyncpg ``connect_args`` for the main pool. Extracted so the timeout
+    hardening is unit-testable without standing up a live engine."""
+    return {
+        # CLIENT-side per-query deadline — backstop for dead / protocol-wedged
+        # connections that server_settings.statement_timeout cannot bound.
+        "command_timeout": _COMMAND_TIMEOUT_SECONDS,
+        "server_settings": {
+            "lock_timeout": "30000",  # 30s - prevents indefinite lock waits on FOR UPDATE
+            "timezone": "UTC",  # Ensure naive timestamps are interpreted as UTC
+            "idle_in_transaction_session_timeout": "60000",  # 60s - auto-rollback leaked transactions
+            "statement_timeout": str(_STATEMENT_TIMEOUT_MS),  # kill runaway queries server-side
+        },
+    }
+
+
+def _install_pool_keepalive(engine: AsyncEngine) -> None:
+    """Apply TCP keepalive to every pooled asyncpg connection at connect time.
+
+    ``enable_tcp_keepalive`` was previously wired only to the dedicated
+    LISTEN/NOTIFY connections (event_fanout, jwt_revocation). The main query pool
+    ran with the OS-default keepalive (Linux ``TCP_KEEPIDLE``=7200s), so a
+    silently dropped pool socket went undetected for up to ~2h. Combined with the
+    (previous) absence of a client-side command_timeout, a mid-query connection
+    loss hung the issuing background task until the liveness watchdog cancelled it
+    (2026-06-14). Registering ``enable_tcp_keepalive`` on the pool's ``connect``
+    event brings pool sockets to the same ~45s dead-peer detection
+    (KEEPIDLE 30s + KEEPINTVL 5s x KEEPCNT 3) as the LISTEN connections.
+    """
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_pool_keepalive(dbapi_connection: object, _record: object) -> None:
+        # For the asyncpg dialect the raw asyncpg.Connection (which
+        # enable_tcp_keepalive reaches through to the underlying socket) is
+        # exposed as ``driver_connection``; fall back to the DBAPI wrapper
+        # defensively. enable_tcp_keepalive never raises.
+        raw = getattr(dbapi_connection, "driver_connection", dbapi_connection)
+        enable_tcp_keepalive(raw)
+
+
 def _make_engine():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable is required")
@@ -339,22 +449,16 @@ def _make_engine():
         DATABASE_URL,
         echo=os.getenv("SQL_ECHO", "false").lower() == "true",
         future=True,
-        # Sized for Cloud SQL db-g1-small max_connections=200 cap across 5 Cloud Run instances; bump when tier upgrades.
+        # Sized for Cloud SQL max_connections=200 cap across the Cloud Run fleet; bump when the tier upgrades.
         pool_size=10,
         max_overflow=15,
         pool_timeout=30,
         pool_recycle=540,
         pool_pre_ping=True,
-        connect_args={
-            "server_settings": {
-                "lock_timeout": "30000",  # 30s - prevents indefinite lock waits on FOR UPDATE
-                "timezone": "UTC",  # Ensure naive timestamps are interpreted as UTC
-                "idle_in_transaction_session_timeout": "60000",  # 60s - auto-rollback leaked transactions
-                "statement_timeout": "120000",  # 120s - kill runaway queries
-            },
-        },
+        connect_args=_engine_connect_args(),
     )
     _install_disconnect_invalidation(eng)
+    _install_pool_keepalive(eng)
     return eng
 
 
