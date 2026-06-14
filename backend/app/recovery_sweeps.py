@@ -3842,15 +3842,33 @@ async def _sweep_stranded_sidecar_sources() -> None:
                     sidecar.id,
                     sidecar.status,
                 )
+                # Capture ids as plain strings BEFORE resolution. The resolver's
+                # best-effort sub-op rollbacks (and the connection-drop path)
+                # expire every ORM instance even under expire_on_commit=False, so
+                # a post-failure ``source.id`` / ``sidecar.id`` read fires a sync
+                # expired-load inside the async session -> MissingGreenlet, which
+                # masks the real error AND aborts the rest of the batch.
+                _sidecar_id_str = str(sidecar.id)
+                _source_id_str = str(source.id)
                 try:
                     await trigger_stranded_sidecar_resolution(sidecar, session)
                     retried += 1
                 except Exception:
                     logger.exception(
                         "[SIDECAR-RECOVERY] Application retry failed for sidecar %s / source %s",
-                        sidecar.id,
-                        source.id,
+                        _sidecar_id_str,
+                        _source_id_str,
                     )
+                    # Roll back the (possibly failed-transaction) session so the
+                    # next source in the batch starts clean rather than cascading
+                    # PendingRollbackError through the remaining iterations.
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        logger.debug(
+                            "[SIDECAR-RECOVERY] post-failure rollback failed",
+                            exc_info=True,
+                        )
             if retried:
                 logger.info(
                     "[SIDECAR-RECOVERY] Retried %d unapplied side-car verdict(s)",
