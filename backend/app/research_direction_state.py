@@ -217,6 +217,34 @@ def _detect_dedup_deadlock(history: list, window: int = 3) -> tuple[bool, int]:
     return True, consecutive
 
 
+def _detect_already_fixed_deadlock(history: list, window: int = 3) -> tuple[bool, int]:
+    """Detect already-fixed deadlock: last `window` consecutive history entries whose
+    spawned tasks all terminated as SCOPE_EMPTY no-ops.
+
+    Unlike the dedup deadlock (tasks_created==0), this mode DOES create tasks each
+    cycle — the tasks simply terminate as CANCELLED+SCOPE_EMPTY because the work was
+    already done on HEAD. Only entries that have ``scope_empty_noop_count`` populated
+    (written by ``_update_direction_research_outcomes`` after child termination) are
+    eligible. Legacy entries without the key stop the consecutive window.
+
+    Returns (is_deadlocked, consecutive_noop_count).
+    """
+    consecutive = 0
+    for e in reversed(history):
+        if "scope_empty_noop_count" not in e:
+            # Legacy entry without the field — treat as window break.
+            break
+        tasks_created = e.get("tasks_created", 0)
+        scope_empty = e.get("scope_empty_noop_count", 0)
+        if tasks_created >= 1 and scope_empty >= tasks_created:
+            consecutive += 1
+        else:
+            break
+    if consecutive < window:
+        return False, 0
+    return True, consecutive
+
+
 def direction_refractory_minutes() -> float:
     """Refractory window stamped on a direction when its research cycle completes.
 
@@ -604,6 +632,67 @@ async def apply_post_spawn_state(
                             logger.warning(
                                 f"[RESEARCH] Dedup deadlock: direction {did}, "
                                 f"{_consec} consecutive empty cycles (task {task.id})"
+                            )
+
+                    # Already-fixed deadlock detection: check prior completed cycles
+                    # (exclude the just-added entry — its children haven't resolved yet).
+                    _af_deadlocked, _af_consec = _detect_already_fixed_deadlock(
+                        d["research_history"][:-1]
+                    )
+                    if _af_deadlocked and d.get("status") == "active":
+                        _existing_af_alert = (
+                            (
+                                await session.execute(
+                                    select(Alert).where(
+                                        Alert.project_id == task.project_id,
+                                        Alert.title
+                                        == "Already-fixed deadlock detected",
+                                        Alert.dismissed_at.is_(None),
+                                        Alert.message.contains(did),
+                                    )
+                                )
+                            )
+                            .scalars()
+                            .first()
+                        )
+                        if not _existing_af_alert:
+                            _af_alert = Alert(
+                                project_id=task.project_id,
+                                severity=AlertSeverity.WARNING,
+                                title="Already-fixed deadlock detected",
+                                message=(
+                                    f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
+                                    f"{_af_consec} consecutive research cycles whose spawned "
+                                    f"tasks all terminated as SCOPE_EMPTY (work already done "
+                                    f"on HEAD). The direction is spending compute re-discovering "
+                                    f"already-shipped fixes."
+                                ),
+                                task_id=task.id,
+                            )
+                            session.add(_af_alert)
+                            _af_msg = ProjectMessage(
+                                project_id=task.project_id,
+                                message_type=MessageType.BUG_REPORT,
+                                from_type="agent",
+                                from_task_id=task.id,
+                                content=(
+                                    f"Already-fixed deadlock for direction "
+                                    f"'{d.get('text', did)[:80]}' (id: {did}): "
+                                    f"{_af_consec} consecutive research cycles produced tasks "
+                                    f"that all resolved as SCOPE_EMPTY (the work was already "
+                                    f"done on HEAD). Consider resetting the direction's scope "
+                                    f"or retiring it if the goal is fully achieved."
+                                ),
+                                context={
+                                    "source": "already_fixed_deadlock",
+                                    "direction_id": did,
+                                    "consecutive_noop_cycles": _af_consec,
+                                },
+                            )
+                            session.add(_af_msg)
+                            logger.warning(
+                                f"[RESEARCH] Already-fixed deadlock: direction {did}, "
+                                f"{_af_consec} consecutive scope-empty cycles (task {task.id})"
                             )
 
                     _evicted_out: list = []

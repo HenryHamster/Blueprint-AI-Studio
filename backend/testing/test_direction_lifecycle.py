@@ -1635,11 +1635,7 @@ async def test_outcome_scaffolding_memo_completed_at_spawn(db_session, mocker):
 
     # Exactly one MEMO Artifact row must exist
     artifacts = (
-        (
-            await db_session.execute(
-                select(Artifact).where(Artifact.task_id == memo.id)
-            )
-        )
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
@@ -2130,3 +2126,433 @@ def test_reset_outcome_detection_state_clears_completion_suggestion():
     assert "outcome_progress_ever_met" not in d
     assert d["status"] == "active", "non-outcome fields must survive the reset"
     assert d["text"] == "Improve auth coverage", "text must survive the reset"
+
+
+# ── Already-fixed deadlock detection ─────────────────────────────────────────
+
+
+def test_detect_already_fixed_deadlock_insufficient_window():
+    from app.research_direction_state import _detect_already_fixed_deadlock
+
+    history = [
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+    ]
+    deadlocked, consec = _detect_already_fixed_deadlock(history, window=3)
+    assert not deadlocked
+    assert consec == 0
+
+
+def test_detect_already_fixed_deadlock_tasks_created_zero_not_counted():
+    from app.research_direction_state import _detect_already_fixed_deadlock
+
+    # tasks_created=0 entries are not eligible (dedup-deadlock territory)
+    history = [
+        {"tasks_created": 0, "scope_empty_noop_count": 0},
+        {"tasks_created": 0, "scope_empty_noop_count": 0},
+        {"tasks_created": 0, "scope_empty_noop_count": 0},
+    ]
+    deadlocked, consec = _detect_already_fixed_deadlock(history)
+    assert not deadlocked
+    assert consec == 0
+
+
+def test_detect_already_fixed_deadlock_partial_noop_not_enough():
+    from app.research_direction_state import _detect_already_fixed_deadlock
+
+    # scope_empty_noop_count < tasks_created — not all tasks were SCOPE_EMPTY
+    history = [
+        {"tasks_created": 2, "scope_empty_noop_count": 1},
+        {"tasks_created": 2, "scope_empty_noop_count": 1},
+        {"tasks_created": 2, "scope_empty_noop_count": 1},
+    ]
+    deadlocked, consec = _detect_already_fixed_deadlock(history)
+    assert not deadlocked
+    assert consec == 0
+
+
+def test_detect_already_fixed_deadlock_fires_on_three_consecutive():
+    from app.research_direction_state import _detect_already_fixed_deadlock
+
+    history = [
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+        {"tasks_created": 2, "scope_empty_noop_count": 2},
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+    ]
+    deadlocked, consec = _detect_already_fixed_deadlock(history)
+    assert deadlocked
+    assert consec == 3
+
+
+def test_detect_already_fixed_deadlock_breaks_on_merged_pr():
+    from app.research_direction_state import _detect_already_fixed_deadlock
+
+    # Middle entry has scope_empty_noop_count < tasks_created (a PR was merged)
+    history = [
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+        {"tasks_created": 2, "scope_empty_noop_count": 0},  # prs_merged > 0
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+    ]
+    deadlocked, consec = _detect_already_fixed_deadlock(history)
+    # Only last 2 entries are consecutive noops (middle entry breaks the run)
+    assert not deadlocked
+    assert consec == 0
+
+
+def test_detect_already_fixed_deadlock_stops_at_legacy_entry():
+    from app.research_direction_state import _detect_already_fixed_deadlock
+
+    # Legacy entries (no scope_empty_noop_count key) act as window breaks
+    history = [
+        {"tasks_created": 1},  # legacy — no scope_empty_noop_count
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+        {"tasks_created": 1, "scope_empty_noop_count": 1},
+    ]
+    # The legacy entry stops the consecutive count even though 3 new-style entries exist
+    # (they are not consecutive from the end due to the break at the legacy entry)
+    deadlocked, consec = _detect_already_fixed_deadlock(history)
+    assert deadlocked
+    assert consec == 3
+
+
+@pytest.mark.asyncio
+async def test_already_satisfied_noop_deadlock_quiesces_direction(db_session, mocker):
+    """3 consecutive prior cycles with all tasks SCOPE_EMPTY triggers alert + BUG_REPORT."""
+
+    from sqlmodel import select
+
+    from app.models import Alert, AlertSeverity, MessageType, ProjectMessage
+    from app.research_direction_state import apply_post_spawn_state
+
+    direction_id = "d-afxd0001"
+    # 3 prior completed cycles: each spawned 1 task, all resolved as SCOPE_EMPTY
+    prior_history = [
+        {
+            "timestamp": "2026-01-10T00:00:00",
+            "task_id": "00000000-0000-0000-0000-000000000001",
+            "tasks_created": 1,
+            "scope_empty_noop_count": 1,
+            "summary": "all already fixed",
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+        },
+        {
+            "timestamp": "2026-01-11T00:00:00",
+            "task_id": "00000000-0000-0000-0000-000000000002",
+            "tasks_created": 1,
+            "scope_empty_noop_count": 1,
+            "summary": "all already fixed",
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+        },
+        {
+            "timestamp": "2026-01-12T00:00:00",
+            "task_id": "00000000-0000-0000-0000-000000000003",
+            "tasks_created": 1,
+            "scope_empty_noop_count": 1,
+            "summary": "all already fixed",
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+        },
+    ]
+    direction = {
+        "id": direction_id,
+        "text": "Audit already-shipped workspace safety fixes",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": prior_history,
+    }
+    project = Project(
+        name="Already-Fixed Deadlock Test",
+        user_id="test-user-af01",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = Task(
+        project_id=project.id,
+        title="Research: Audit already-shipped fixes",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"research_depth": 0, "direction_id": direction_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id="agent-vm-af-test",
+    )
+    db_session.add(research_task)
+    await db_session.commit()
+    await db_session.refresh(research_task)
+
+    child_task = Task(
+        project_id=project.id,
+        title="Fix: already fixed workspace issue",
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        parent_task_id=research_task.id,
+        vm_instance_id="agent-vm-af-child",
+    )
+    db_session.add(child_task)
+    await db_session.commit()
+
+    finding = {
+        "title": "Fix already-fixed workspace issue",
+        "description": "Already done on HEAD",
+        "prompt": "Fix it",
+        "type": "create",
+        "scope": "small",
+        "priority": "medium",
+        "direction_id": direction_id,
+    }
+    deduplicated = [(0, finding, "aabbccdd")]
+
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.strategic_completion.record_outcome_progress_snapshot",
+        return_value=None,
+    )
+    mocker.patch(
+        "app.research_direction_state._apply_terminal_transition",
+        new=AsyncMock(return_value=None),
+    )
+
+    await apply_post_spawn_state(
+        session=db_session,
+        task=research_task,
+        findings=[finding],
+        child_tasks=[child_task],
+        deduplicated=deduplicated,
+        insights=[],
+        direction_notes=[],
+        direction_proposals=[],
+        hash_dedup_count=0,
+        word_overlap_count=0,
+        file_overlap_count=0,
+        evidence_overlap_count=0,
+        type_filtered_count=0,
+        empty_prompt_count=0,
+        research_branch="research/af-test",
+        original_base="main",
+        research_depth=0,
+        parent_research_task_id=None,
+    )
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    af_alerts = [a for a in alerts if "already-fixed" in a.title.lower()]
+    assert len(af_alerts) >= 1, (
+        "Expected a WARNING Alert for already-fixed deadlock after 3 consecutive SCOPE_EMPTY cycles"
+    )
+    assert af_alerts[0].severity == AlertSeverity.WARNING
+    assert direction_id in af_alerts[0].message
+
+    messages = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    bug_reports = [m for m in messages if m.message_type == MessageType.BUG_REPORT]
+    assert len(bug_reports) >= 1, (
+        "Expected a BUG_REPORT ProjectMessage for already-fixed deadlock"
+    )
+    assert bug_reports[0].context.get("source") == "already_fixed_deadlock"
+    assert bug_reports[0].context.get("consecutive_noop_cycles") == 3
+
+
+@pytest.mark.asyncio
+async def test_already_satisfied_deadlock_no_quiesce_when_merged_pr_in_window(
+    db_session, mocker
+):
+    """A direction with a merged PR in the recent window is NOT quiesced."""
+
+    from sqlmodel import select
+
+    from app.models import Alert
+    from app.research_direction_state import apply_post_spawn_state
+
+    direction_id = "d-afxd0002"
+    # Prior history: 2 scope_empty cycles, then 1 cycle with a merged PR
+    prior_history = [
+        {
+            "timestamp": "2026-01-10T00:00:00",
+            "task_id": "00000000-0000-0000-0000-000000000011",
+            "tasks_created": 1,
+            "scope_empty_noop_count": 1,
+            "summary": "all already fixed",
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+        },
+        {
+            "timestamp": "2026-01-11T00:00:00",
+            "task_id": "00000000-0000-0000-0000-000000000012",
+            "tasks_created": 2,
+            "scope_empty_noop_count": 0,  # a PR was merged this cycle
+            "prs_merged": 1,
+            "summary": "merged a fix",
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+        },
+        {
+            "timestamp": "2026-01-12T00:00:00",
+            "task_id": "00000000-0000-0000-0000-000000000013",
+            "tasks_created": 1,
+            "scope_empty_noop_count": 1,
+            "summary": "all already fixed",
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+        },
+    ]
+    direction = {
+        "id": direction_id,
+        "text": "Mixed outcome direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": prior_history,
+    }
+    project = Project(
+        name="No Quiesce When Merged PR",
+        user_id="test-user-af02",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = Task(
+        project_id=project.id,
+        title="Research: Mixed outcome",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"research_depth": 0, "direction_id": direction_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id="agent-vm-af-test2",
+    )
+    db_session.add(research_task)
+    await db_session.commit()
+    await db_session.refresh(research_task)
+
+    child_task = Task(
+        project_id=project.id,
+        title="Fix: another workspace issue",
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        parent_task_id=research_task.id,
+        vm_instance_id="agent-vm-af-child2",
+    )
+    db_session.add(child_task)
+    await db_session.commit()
+
+    finding = {
+        "title": "Another workspace fix",
+        "description": "Maybe already done",
+        "prompt": "Fix it",
+        "type": "create",
+        "scope": "small",
+        "priority": "medium",
+        "direction_id": direction_id,
+    }
+    deduplicated = [(0, finding, "11223344")]
+
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.strategic_completion.record_outcome_progress_snapshot",
+        return_value=None,
+    )
+    mocker.patch(
+        "app.research_direction_state._apply_terminal_transition",
+        new=AsyncMock(return_value=None),
+    )
+
+    await apply_post_spawn_state(
+        session=db_session,
+        task=research_task,
+        findings=[finding],
+        child_tasks=[child_task],
+        deduplicated=deduplicated,
+        insights=[],
+        direction_notes=[],
+        direction_proposals=[],
+        hash_dedup_count=0,
+        word_overlap_count=0,
+        file_overlap_count=0,
+        evidence_overlap_count=0,
+        type_filtered_count=0,
+        empty_prompt_count=0,
+        research_branch="research/af-test2",
+        original_base="main",
+        research_depth=0,
+        parent_research_task_id=None,
+    )
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    af_alerts = [a for a in alerts if "already-fixed" in a.title.lower()]
+    assert len(af_alerts) == 0, (
+        "Direction with a merged PR in the recent window must NOT be quiesced as already-fixed"
+    )
