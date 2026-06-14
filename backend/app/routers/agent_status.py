@@ -553,6 +553,15 @@ async def _persist_post_commit_pending(factory, task_id, reason: str, payload_du
                     **(locked.context or {}),
                     "_post_commit_pending_meta": {
                         "at": _utcnow().isoformat(),
+                        # Preserve-once wall-clock anchor for the sweep's age
+                        # backstop. Unlike "at" (refreshed on every re-mark) and
+                        # total_attempts (which cannot advance when the bump
+                        # UPDATE is itself row-lock-starved), first_pending_at
+                        # survives re-marks, so a marker that can never be drained
+                        # is still terminalized by age. See the post-commit sweep's
+                        # POST_COMMIT_MAX_PENDING_AGE_S backstop.
+                        "first_pending_at": prior_meta.get("first_pending_at")
+                        or _utcnow().isoformat(),
                         "reason": reason,
                         "payload": payload_dump,
                         "attempts": int(prior_meta.get("attempts", 0)) + 1,
