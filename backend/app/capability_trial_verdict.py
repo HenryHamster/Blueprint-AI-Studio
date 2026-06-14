@@ -776,6 +776,23 @@ async def persist_trial_verdicts_in_transaction(
                 actual_verdict = (
                     (project.capability_adoption_verdicts or {}).get(cap_name) or {}
                 ).get("verdict")
+                # Record a durable capability proof when the trial reaches or
+                # maintains an adopt verdict.  The dedup key inside
+                # record_capability_proof_from_trial ensures idempotency.
+                if actual_verdict in ("adopt", "ADOPT"):
+                    try:
+                        from app.capability_proof import (
+                            record_capability_proof_from_trial,
+                        )
+
+                        record_capability_proof_from_trial(project, cap_name, entry)
+                    except Exception:
+                        logger.exception(
+                            "[CAPABILITY_TRIAL] capability proof recording failed for "
+                            "%s on project %s (non-fatal)",
+                            cap_name,
+                            project_id,
+                        )
                 if (
                     actual_verdict in _DECIDED_VERDICTS
                     and actual_verdict != prior_verdict

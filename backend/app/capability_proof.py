@@ -32,6 +32,7 @@ __all__ = [
     "carry_proof_records_for_consolidation",
     "enrich_problem_model_capability_proofs",
     "record_capability_proof",
+    "record_capability_proof_from_trial",
     "should_record_capability_proof",
 ]
 
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 _PROOF_KIND_NAMED_TEST = "named_test"
 _PROOF_KIND_DOWNSTREAM_ARTIFACT = "downstream_artifact"
+_PROOF_KIND_TRIAL_ADOPTION = "trial_adoption"
 _MAX_PROOF_ENTRIES_PER_CAPABILITY = 10
 
 # Context key where we read the acceptance verdict.
@@ -217,6 +219,67 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
         )
 
     return recorded
+
+
+def record_capability_proof_from_trial(
+    project: Any,
+    cap_name: str,
+    entry: dict[str, Any],
+) -> None:
+    """Record a bounded proof entry when a trial reaches an evidence-grounded ADOPT verdict.
+
+    Called from persist_trial_verdicts_in_transaction after a successful adopt
+    verdict is written. The dedup key ``trial:<normalized_cap_name>`` ensures a
+    standing ADOPT does not produce duplicate proof entries on re-evaluation.
+
+    Non-raising: all errors are logged at WARNING level so they cannot roll back
+    the surrounding session commit.
+    """
+    from app.time_utils import _utcnow
+
+    verdict = entry.get("verdict")
+    if verdict not in ("adopt", "ADOPT"):
+        return
+
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        return
+
+    # Stable dedup key: one proof record per capability trial adoption.
+    dedup_task_id = f"trial:{norm}"
+    proved_at = _utcnow().isoformat()
+
+    proof_entry: dict[str, Any] = {
+        "task_id": dedup_task_id,
+        "proved_at": proved_at,
+        "proof_kind": _PROOF_KIND_TRIAL_ADOPTION,
+        "proof_ref": norm,
+        "lift": entry.get("lift"),
+        "n_with": entry.get("n_with"),
+        "n_without": entry.get("n_without"),
+        "verdict_reason": entry.get("verdict_reason"),
+    }
+
+    if not isinstance(getattr(project, "capability_proof_records", None), dict):
+        project.capability_proof_records = {}
+
+    entries: list[dict] = list(project.capability_proof_records.get(norm) or [])
+    if any(e.get("task_id") == dedup_task_id for e in entries):
+        return
+
+    entries.append(proof_entry)
+    if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+        entries = entries[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+    project.capability_proof_records[norm] = entries
+    flag_modified(project, "capability_proof_records")
+    logger.info(
+        "[CAPABILITY_PROOF] recorded trial-adoption proof for cap=%s lift=%s"
+        " n_with=%s n_without=%s",
+        norm,
+        proof_entry.get("lift"),
+        proof_entry.get("n_with"),
+        proof_entry.get("n_without"),
+    )
 
 
 def carry_proof_records_for_consolidation(

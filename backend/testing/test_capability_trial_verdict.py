@@ -3485,3 +3485,71 @@ class TestHoldbackContaminationGuard:
         )
         assert entry["verdict"] == "continue-trial"
         assert entry["verdict_reason"] == "holdback_contaminated"
+
+
+# ── trial-adopt → capability proof integration ────────────────────────────────
+
+
+def test_adopt_verdict_records_capability_proof():
+    """Evidence-grounded ADOPT records exactly one durable trial-based proof entry.
+
+    Verifies:
+    - proof_kind is 'trial_adoption'
+    - per-arm counts and lift are carried in the entry
+    - the recorded proof flips the registry capability's proof_status to 'proven'
+    - re-evaluating a standing ADOPT is idempotent (dedup by task_id)
+    """
+    from app.capability_proof import record_capability_proof_from_trial
+    from app.capability_registry import annotate_capability_proof_status
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    adopt_entry = {
+        "verdict": "adopt",
+        "verdict_reason": "sufficient_data",
+        "lift": 0.08,
+        "n_with": 40,
+        "n_without": 38,
+    }
+
+    with patch("app.capability_proof.flag_modified"):
+        record_capability_proof_from_trial(project, "repo_map", adopt_entry)
+
+    # Entry recorded under normalized cap name.
+    assert "repo-map" in project.capability_proof_records
+    entries = project.capability_proof_records["repo-map"]
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["proof_kind"] == "trial_adoption"
+    assert e["lift"] == 0.08
+    assert e["n_with"] == 40
+    assert e["n_without"] == 38
+    assert e["task_id"] == "trial:repo-map"
+
+    # Registry capability flips to 'proven'.
+    vocab = [{"name": "repo-map", "status": "working"}]
+    annotated = annotate_capability_proof_status(
+        vocab, project.capability_proof_records
+    )
+    assert annotated[0]["proof_status"] == "proven"
+
+    # Re-evaluation is idempotent — no duplicate entry.
+    with patch("app.capability_proof.flag_modified"):
+        record_capability_proof_from_trial(project, "repo_map", adopt_entry)
+    assert len(project.capability_proof_records["repo-map"]) == 1
+
+
+def test_non_adopt_verdicts_do_not_record_capability_proof():
+    """reject / no_effect / continue-trial verdicts must never record a proof entry."""
+    from app.capability_proof import record_capability_proof_from_trial
+
+    for non_adopt in ("reject", "no_effect", "continue-trial", "KILL", "CONTINUE"):
+        project = MagicMock()
+        project.capability_proof_records = {}
+        entry = {"verdict": non_adopt, "lift": 0.01, "n_with": 40, "n_without": 40}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "repo_map", entry)
+        assert project.capability_proof_records == {}, (
+            f"Unexpected proof recorded for verdict={non_adopt!r}"
+        )

@@ -15,12 +15,14 @@ from unittest.mock import MagicMock, patch
 
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
+    _PROOF_KIND_TRIAL_ADOPTION,
     _extract_proof_ref,
     _proof_kind_from_verdict,
     annotate_capability_proof_status,
     carry_proof_records_for_consolidation,
     enrich_problem_model_capability_proofs,
     record_capability_proof,
+    record_capability_proof_from_trial,
     should_record_capability_proof,
 )
 from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
@@ -577,3 +579,117 @@ class TestCarryProofRecordsForConsolidation:
         carry_proof_records_for_consolidation(consolidated, proof_records)
 
         assert set(proof_records.keys()) == original_keys
+
+
+# ── record_capability_proof_from_trial ───────────────────────────────────────
+
+
+class TestRecordCapabilityProofFromTrial:
+    def test_adopt_verdict_records_proof_entry(self):
+        project = _make_project()
+        entry = {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.08,
+            "n_with": 40,
+            "n_without": 38,
+        }
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "repo_map", entry)
+
+        assert "repo-map" in project.capability_proof_records
+        entries = project.capability_proof_records["repo-map"]
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["proof_kind"] == _PROOF_KIND_TRIAL_ADOPTION
+        assert e["lift"] == 0.08
+        assert e["n_with"] == 40
+        assert e["n_without"] == 38
+        assert e["proof_ref"] == "repo-map"
+        assert e["task_id"] == "trial:repo-map"
+        assert "proved_at" in e
+
+    def test_adopt_uppercase_records_proof_entry(self):
+        project = _make_project()
+        entry = {"verdict": "ADOPT", "lift": 0.06, "n_with": 35, "n_without": 33}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "module_interfaces", entry)
+
+        assert "module-interfaces" in project.capability_proof_records
+
+    def test_reject_verdict_records_nothing(self):
+        project = _make_project()
+        entry = {"verdict": "reject", "lift": -0.05, "n_with": 40, "n_without": 40}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "repo_map", entry)
+
+        assert project.capability_proof_records == {}
+
+    def test_no_effect_verdict_records_nothing(self):
+        project = _make_project()
+        entry = {"verdict": "no_effect", "lift": 0.01, "n_with": 90, "n_without": 90}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "repo_map", entry)
+
+        assert project.capability_proof_records == {}
+
+    def test_continue_trial_records_nothing(self):
+        project = _make_project()
+        entry = {"verdict": "continue-trial", "lift": None, "n_with": 5, "n_without": 5}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "repo_map", entry)
+
+        assert project.capability_proof_records == {}
+
+    def test_dedup_key_is_idempotent_on_re_evaluation(self):
+        project = _make_project()
+        entry = {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 38}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "repo_map", entry)
+            record_capability_proof_from_trial(project, "repo_map", entry)
+
+        # Second call must not duplicate the entry.
+        assert len(project.capability_proof_records["repo-map"]) == 1
+
+    def test_cap_bounded_at_max_entries(self):
+        cap_key = "repo-map"
+        existing = [
+            {
+                "task_id": f"task-{i}",
+                "proved_at": "2026-01-01T00:00:00",
+                "proof_kind": "named_test",
+                "proof_ref": cap_key,
+                "commit_sha": "",
+            }
+            for i in range(_MAX_PROOF_ENTRIES_PER_CAPABILITY)
+        ]
+        project = _make_project()
+        project.capability_proof_records = {cap_key: existing[:]}
+
+        entry = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 48}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "repo_map", entry)
+
+        result = project.capability_proof_records[cap_key]
+        assert len(result) == _MAX_PROOF_ENTRIES_PER_CAPABILITY
+        assert result[-1]["task_id"] == "trial:repo-map"
+
+    def test_proof_flips_registry_capability_to_proven(self):
+        project = _make_project()
+        entry = {"verdict": "adopt", "lift": 0.08, "n_with": 40, "n_without": 38}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "repo_map", entry)
+
+        vocab = [{"name": "repo-map", "status": "working"}]
+        annotated = annotate_capability_proof_status(
+            vocab, project.capability_proof_records
+        )
+        assert annotated[0]["proof_status"] == "proven"
+
+    def test_normalizes_cap_name_with_underscores(self):
+        project = _make_project()
+        entry = {"verdict": "adopt", "lift": 0.07, "n_with": 35, "n_without": 33}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, "related_tests", entry)
+
+        assert "related-tests" in project.capability_proof_records
