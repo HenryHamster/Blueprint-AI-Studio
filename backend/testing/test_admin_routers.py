@@ -1628,6 +1628,52 @@ class TestApplyOperatorBuildConfigOverrides:
         # Operator-owned requires_ci_checks is still carried forward.
         assert merged["requires_ci_checks"] is False
 
+    def test_has_ci_false_clamps_stale_requires_ci_checks_true(self):
+        """Secondary fix: detection reconcile — has_ci=False + stale
+        requires_ci_checks=True is an impossible-to-satisfy state that strands
+        main-targeting rollup PRs.  Re-detection must clamp requires_ci_checks
+        to False when has_ci=False so the state is self-consistent."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        # Stale existing config claims CI checks are required, but fresh
+        # detection found zero CI workflows.
+        merged = apply_operator_build_config_overrides(
+            {"language": "python", "has_ci": False},
+            {"requires_ci_checks": True},
+        )
+        assert merged["has_ci"] is False
+        # The contradiction is resolved: requires_ci_checks is clamped to False.
+        assert merged["requires_ci_checks"] is False
+
+    def test_has_ci_false_already_ungated_preserved(self):
+        """Clamping is a no-op when existing requires_ci_checks is already False."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        merged = apply_operator_build_config_overrides(
+            {"language": "python", "has_ci": False},
+            {"requires_ci_checks": False},
+        )
+        assert merged["has_ci"] is False
+        assert merged["requires_ci_checks"] is False
+
+    def test_has_ci_none_does_not_clamp_requires_ci_checks(self):
+        """has_ci=None (incomplete detection) must not trigger the clamp — only
+        a definitive False does."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        merged = apply_operator_build_config_overrides(
+            {"language": "python", "has_ci": None},
+            {"requires_ci_checks": True},
+        )
+        # has_ci=None is not authoritative; requires_ci_checks is preserved as-is.
+        assert merged["requires_ci_checks"] is True
+
     def test_has_ci_round_trips_through_schema(self):
         """has_ci survives BuildConfig validation; None is dropped by
         exclude_none=True so legacy/undetected configs round-trip unchanged."""
@@ -2827,9 +2873,7 @@ class TestAutonomyDebug:
         )
         await db_session.commit()
 
-        resp = await client.get(
-            f"/api/admin/projects/{project.id}/autonomy-debug"
-        )
+        resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
         assert resp.status_code == 200, resp.text
         data = resp.json()
 
@@ -9095,7 +9139,10 @@ class TestVersionLifecyclePolicyProvenance:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["promotion_policy_source"] == "hardcoded_defaults"
-        assert body["promotion_policy_error"] == "ScannerError: promotion_policy.yaml did not parse"
+        assert (
+            body["promotion_policy_error"]
+            == "ScannerError: promotion_policy.yaml did not parse"
+        )
 
     @pytest.mark.asyncio
     async def test_recent_version_echoes_deploy_confirm_deadline_for_unconfirmed(
@@ -12500,11 +12547,13 @@ class TestModifyTaskApplySeam:
         mocker.patch(
             "app.github.get_pr_files",
             new_callable=AsyncMock,
-            return_value=[{
-                "filename": "backend/alembic/versions/0002_dup.py",
-                "status": "added",
-                "patch": '+revision = "0002"\n+down_revision = "0001"',
-            }],
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0002_dup.py",
+                    "status": "added",
+                    "patch": '+revision = "0002"\n+down_revision = "0001"',
+                }
+            ],
         )
         mocker.patch(
             "app.github.get_pull_request_diff",
@@ -13545,11 +13594,13 @@ class TestTriggerRollup:
         mocker.patch(
             "app.github.get_pr_files",
             new_callable=AsyncMock,
-            return_value=[{
-                "filename": "backend/alembic/versions/0002_dup.py",
-                "status": "added",
-                "patch": '+revision = "0002"\n+down_revision = "0001"',
-            }],
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0002_dup.py",
+                    "status": "added",
+                    "patch": '+revision = "0002"\n+down_revision = "0001"',
+                }
+            ],
         )
         mocker.patch(
             "app.github.get_pull_request_diff",

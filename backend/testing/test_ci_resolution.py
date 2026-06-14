@@ -35,7 +35,9 @@ def test_requires_ci_checks_defaults_true():
 
 
 def test_requires_ci_checks_false_when_declared():
-    assert ci_resolution.requires_ci_checks(_proj({"requires_ci_checks": False})) is False
+    assert (
+        ci_resolution.requires_ci_checks(_proj({"requires_ci_checks": False})) is False
+    )
 
 
 def test_proceed_on_no_checks_ci_repo_non_staging_keeps_polling():
@@ -56,6 +58,32 @@ def test_proceed_on_no_checks_no_ci_project_proceeds_any_base():
     p = _proj({"requires_ci_checks": False})
     assert ci_resolution.proceed_on_no_checks(p, "main") is True
     assert ci_resolution.proceed_on_no_checks(p, None) is True
+
+
+def test_proceed_on_no_checks_has_ci_false_proceeds_even_when_requires_ci_stale():
+    # Primary fix: has_ci=False is authoritative — the repo has zero CI workflows
+    # and can never produce check-runs.  A stale requires_ci_checks=True must NOT
+    # strand a rollup PR into main by polling forever.
+    p = _proj({"has_ci": False, "requires_ci_checks": True})
+    assert ci_resolution.proceed_on_no_checks(p, "main") is True
+    assert ci_resolution.proceed_on_no_checks(p, "automain") is True
+    assert ci_resolution.proceed_on_no_checks(p, None) is True
+
+
+def test_proceed_on_no_checks_has_ci_true_still_polls():
+    # Inverse guard: a repo with actual CI workflows must keep polling when no
+    # checks are registered yet — "not registered yet", not "will never run".
+    p = _proj({"has_ci": True})
+    assert ci_resolution.proceed_on_no_checks(p, "main") is False
+
+
+def test_proceed_on_no_checks_has_ci_none_falls_back_to_requires_ci():
+    # has_ci=None (undetermined — detection was incomplete) does not trigger the
+    # has_ci override path; falls back to requires_ci_checks as before.
+    p_gated = _proj({"has_ci": None})
+    assert ci_resolution.proceed_on_no_checks(p_gated, "main") is False
+    p_ungated = _proj({"has_ci": None, "requires_ci_checks": False})
+    assert ci_resolution.proceed_on_no_checks(p_ungated, "main") is True
 
 
 def test_proceed_on_no_checks_none_project():
@@ -178,7 +206,9 @@ def _no_ci_repo():
     return _proj(
         {
             "requires_ci_checks": False,
-            "directories": [{"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}],
+            "directories": [
+                {"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}
+            ],
         }
     )
 
@@ -207,7 +237,9 @@ def test_gate_skipped_on_internal_staging_base():
     # tests on internal rollups, even for a no-CI project with detectable tests.
     p = _no_ci_repo()
     assert (
-        ci_resolution.should_run_no_ci_test_gate(p, "research/cycle-1", gate_enabled=True)
+        ci_resolution.should_run_no_ci_test_gate(
+            p, "research/cycle-1", gate_enabled=True
+        )
         is False
     )
     assert (
@@ -219,7 +251,9 @@ def test_gate_skipped_on_internal_staging_base():
 def test_gate_skipped_for_ci_gated_repo():
     # CI-gated repo (requires_ci_checks default True): the no_checks branch keeps
     # polling; the gate must never engage.
-    p = _proj({"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}]})
+    p = _proj(
+        {"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}]}
+    )
     assert (
         ci_resolution.should_run_no_ci_test_gate(p, "main", gate_enabled=True) is False
     )
@@ -483,9 +517,11 @@ def test_classify_verdict_disabled_tests_absence_changes_nothing():
         **base,
         "disabledTests": {"count": 0, "markers": []},  # malformed/zero → ignored
     }
-    assert ci_resolution.classify_merge_test_verdict(
-        base
-    ) == ci_resolution.classify_merge_test_verdict(with_field) == ("pass", "")
+    assert (
+        ci_resolution.classify_merge_test_verdict(base)
+        == ci_resolution.classify_merge_test_verdict(with_field)
+        == ("pass", "")
+    )
 
 
 def test_classify_verdict_disabled_tests_pairs_with_heavy_skip_blocks():
@@ -607,9 +643,7 @@ def test_preserve_small_flaky_quarantine_with_markers_passes():
             "coverage": {"passed": 1400, "skipped": 3, "total": 1403},
             "disabledTests": {
                 "count": 3,
-                "markers": [
-                    {"file": "a.test.ts", "marker": "it.skip", "line": "1"}
-                ],
+                "markers": [{"file": "a.test.ts", "marker": "it.skip", "line": "1"}],
             },
         }
     )
@@ -716,8 +750,21 @@ def test_fall_open_reason_declared_build_passed_without_flag_keeps_probe_passed(
     # tree) ALL keep today's probe_passed behaviour exactly — the new reason is
     # never emitted on uncertainty.
     for probe in (
-        {"ran": True, "passed": True, "could_not_run": False, "declared": True, "label": "make build"},
-        {"ran": True, "passed": True, "could_not_run": False, "declared": True, "label": "make build", "wrote_no_artifact": False},
+        {
+            "ran": True,
+            "passed": True,
+            "could_not_run": False,
+            "declared": True,
+            "label": "make build",
+        },
+        {
+            "ran": True,
+            "passed": True,
+            "could_not_run": False,
+            "declared": True,
+            "label": "make build",
+            "wrote_no_artifact": False,
+        },
     ):
         phrase, key = ci_resolution.classify_unverified_fall_open_reason(
             {"detected": False, "probe": probe}
@@ -1112,7 +1159,9 @@ async def test_merge_sha_red_threads_failed_logs(mocker):
             "failed_logs": "  [backend] Failing tests:\n    FAILED testing/test_bar.py::test_baz",
         }
 
-    mocker.patch("app.github.get_check_runs_cached", side_effect=_check_runs_side_effect)
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
     mocker.patch(
         "app.github.list_pull_requests_for_commit",
         new=AsyncMock(
@@ -1345,9 +1394,9 @@ async def test_explicit_pr_number_filters_associated_prs(mocker):
 def test_build_config_schema_persists_requires_ci_checks_false():
     from app.schemas import BuildConfig as BuildConfigSchema
 
-    persisted = BuildConfigSchema(
-        **{"requires_ci_checks": False}
-    ).model_dump(exclude_none=True)
+    persisted = BuildConfigSchema(**{"requires_ci_checks": False}).model_dump(
+        exclude_none=True
+    )
     # exclude_none must NOT strip an explicit False (False is not None).
     assert persisted["requires_ci_checks"] is False
 
@@ -1434,7 +1483,12 @@ def test_classify_verdict_probe_fail_blank_output_gets_fallback():
     outcome, detail = ci_resolution.classify_merge_test_verdict(
         {
             "detected": False,
-            "probe": {"ran": True, "passed": False, "could_not_run": False, "output": ""},
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "output": "",
+            },
         }
     )
     assert outcome == "fail"
@@ -1446,7 +1500,12 @@ def test_classify_verdict_probe_could_not_run_stays_undetected():
     outcome, detail = ci_resolution.classify_merge_test_verdict(
         {
             "detected": False,
-            "probe": {"ran": True, "passed": False, "could_not_run": True, "output": ""},
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": True,
+                "output": "",
+            },
         }
     )
     assert outcome == "undetected"
@@ -1459,7 +1518,12 @@ def test_classify_verdict_probe_pass_stays_undetected():
     outcome, _ = ci_resolution.classify_merge_test_verdict(
         {
             "detected": False,
-            "probe": {"ran": True, "passed": True, "could_not_run": False, "output": ""},
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "output": "",
+            },
         }
     )
     assert outcome == "undetected"
@@ -1467,7 +1531,10 @@ def test_classify_verdict_probe_pass_stays_undetected():
 
 def test_classify_verdict_probe_not_ran_stays_undetected():
     outcome, _ = ci_resolution.classify_merge_test_verdict(
-        {"detected": False, "probe": {"ran": False, "passed": False, "could_not_run": False}}
+        {
+            "detected": False,
+            "probe": {"ran": False, "passed": False, "could_not_run": False},
+        }
     )
     assert outcome == "undetected"
 
@@ -1579,7 +1646,10 @@ def test_declared_build_is_clear_failure_predicate():
 # ── Acceptance probe: classify_unverified_fall_open_reason ────────────────────
 def test_fall_open_reason_probe_passed_distinct_key():
     phrase, key = ci_resolution.classify_unverified_fall_open_reason(
-        {"detected": False, "probe": {"ran": True, "passed": True, "could_not_run": False}}
+        {
+            "detected": False,
+            "probe": {"ran": True, "passed": True, "could_not_run": False},
+        }
     )
     assert key == "probe_passed"
     assert "probe" in phrase
@@ -1587,7 +1657,10 @@ def test_fall_open_reason_probe_passed_distinct_key():
 
 def test_fall_open_reason_probe_could_not_run_distinct_key():
     phrase, key = ci_resolution.classify_unverified_fall_open_reason(
-        {"detected": False, "probe": {"ran": True, "passed": False, "could_not_run": True}}
+        {
+            "detected": False,
+            "probe": {"ran": True, "passed": False, "could_not_run": True},
+        }
     )
     assert key == "probe_could_not_run"
     assert "probe" in phrase
@@ -1653,7 +1726,10 @@ def test_fall_open_reason_declared_build_could_not_run_wording():
 def test_fall_open_reason_generic_probe_unchanged_when_not_declared():
     # A generic probe (no declared marker) keeps the original phrasing.
     phrase, key = ci_resolution.classify_unverified_fall_open_reason(
-        {"detected": False, "probe": {"ran": True, "passed": True, "could_not_run": False}}
+        {
+            "detected": False,
+            "probe": {"ran": True, "passed": True, "could_not_run": False},
+        }
     )
     assert key == "probe_passed"
     assert phrase == "acceptance probe passed (changed code compiles/builds)"
@@ -1717,7 +1793,9 @@ def _record(project, *, verified, reason, when):
 
 def test_runtime_history_keeps_four_legacy_keys_and_adds_outcome():
     project = _proj()
-    _record(project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:00")
+    _record(
+        project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:00"
+    )
     block = ci_resolution.merge_gate_runtime_block(project)
     # Legacy keys unchanged.
     assert block["last_run_at"] == "2026-06-01T00:00:00"
@@ -1756,15 +1834,24 @@ def test_runtime_history_bounded_at_cap_drops_oldest():
     outcomes = block["recent_outcomes"]
     assert len(outcomes) == ci_resolution._RECENT_OUTCOMES_CAP
     # Oldest dropped, newest kept (most recent last).
-    assert outcomes[0]["at"] == f"2026-06-05T00:00:{(total - ci_resolution._RECENT_OUTCOMES_CAP):02d}"
+    assert (
+        outcomes[0]["at"]
+        == f"2026-06-05T00:00:{(total - ci_resolution._RECENT_OUTCOMES_CAP):02d}"
+    )
     assert outcomes[-1]["at"] == f"2026-06-05T00:00:{(total - 1):02d}"
 
 
 def test_runtime_tally_accumulates_per_reason_across_repeated_fall_opens():
     project = _proj()
-    _record(project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:01")
-    _record(project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:02")
-    _record(project, verified=False, reason="suite_all_skipped", when="2026-06-01T00:00:03")
+    _record(
+        project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:01"
+    )
+    _record(
+        project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:02"
+    )
+    _record(
+        project, verified=False, reason="suite_all_skipped", when="2026-06-01T00:00:03"
+    )
     _record(project, verified=True, reason=None, when="2026-06-01T00:00:04")
     block = ci_resolution.merge_gate_runtime_block(project)
     assert block["unverified_reason_counts"] == {
@@ -1784,7 +1871,9 @@ def test_runtime_total_fall_opens_can_exceed_window_after_eviction():
     project = _proj()
     # First fall-open of a rare reason, then flood the window with verified runs
     # so the rare fall-open is evicted from recent_outcomes but stays tallied.
-    _record(project, verified=False, reason="suite_all_skipped", when="2026-06-05T00:00:00")
+    _record(
+        project, verified=False, reason="suite_all_skipped", when="2026-06-05T00:00:00"
+    )
     for i in range(1, ci_resolution._RECENT_OUTCOMES_CAP + 1):
         _record(project, verified=True, reason=None, when=f"2026-06-05T00:01:{i:02d}")
     block = ci_resolution.merge_gate_runtime_block(project)
@@ -1845,7 +1934,9 @@ def test_unverified_reason_sets_are_disjoint():
         ci_resolution.BENIGN_UNVERIFIED_REASONS
         & ci_resolution.DEGRADED_UNVERIFIED_REASONS
     )
-    assert not overlap, f"reason keys classified as BOTH benign and degraded: {sorted(overlap)}"
+    assert not overlap, (
+        f"reason keys classified as BOTH benign and degraded: {sorted(overlap)}"
+    )
 
 
 def test_unverified_reason_sets_union_is_canonical():

@@ -85,8 +85,15 @@ def apply_operator_build_config_overrides(
     # The no-CI merge policy is operator-owned and never emitted by repo
     # detection; carry an explicit choice (including False) forward so manual
     # re-detect and empty-config auto-refresh do not silently re-gate the repo.
+    # Safety clamp: if the freshly detected config has has_ci=False (the repo
+    # has zero CI workflows and can never produce check-runs), override a stale
+    # requires_ci_checks=True from the existing config — that combination is an
+    # impossible-to-satisfy state that would strand main-targeting rollup PRs.
     if "requires_ci_checks" in existing:
-        detected["requires_ci_checks"] = existing["requires_ci_checks"]
+        if detected.get("has_ci") is False and existing.get("requires_ci_checks"):
+            detected["requires_ci_checks"] = False
+        else:
+            detected["requires_ci_checks"] = existing["requires_ci_checks"]
     # Per-project parallelism overrides are operator-owned and never emitted
     # by repo detection; carry them forward so re-detect does not silently
     # lift a deliberate throttle (see schemas.BuildConfig).
