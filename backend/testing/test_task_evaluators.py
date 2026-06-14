@@ -489,10 +489,21 @@ def test_compute_malformed_criterion_is_ignored():
 # ── StructuredVerdictStrategy ───────────────────────────────────────────────
 
 
-def test_structured_verdict_missing_contract_fails():
-    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), '{"verdict":"APPROVE"}')
+def test_structured_verdict_no_verdict_signal_fails():
+    # A payload with no APPROVE/REQUEST_CHANGES signal anywhere — truly absent,
+    # no anchored token, no overall_verdict — must fail the gate.
+    v = StructuredVerdictStrategy().evaluate(
+        _task("panel_review"), '{"analysis":"looks good","confidence":0.9}'
+    )
     assert v.passed is False
     assert "structured verdict" in v.reason.lower()
+
+
+def test_structured_verdict_verdict_field_resolves_via_fallback():
+    # {"verdict":"APPROVE"} uses the wrong field name (not overall_verdict) but
+    # the anchored-prose floor resolves "verdict":"APPROVE" as a clear signal.
+    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), '{"verdict":"APPROVE"}')
+    assert v.passed is True
 
 
 def test_structured_verdict_valid_panel_review_passes():
@@ -526,7 +537,9 @@ def _panel_lenses(*, drop_field: tuple[str, str] | None = None) -> dict:
     return lenses
 
 
-def test_structured_verdict_present_lens_missing_verdict_fails():
+def test_structured_verdict_incomplete_lens_verdict_still_passes():
+    # Lenses are optional telemetry — a lens with a missing verdict field is
+    # skipped, but the overall_verdict still resolves and the gate passes.
     payload = json.dumps(
         {
             "overall_verdict": "APPROVE",
@@ -535,11 +548,12 @@ def test_structured_verdict_present_lens_missing_verdict_fails():
         }
     )
     v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
-    assert v.passed is False
-    assert "structured verdict" in v.reason.lower()
+    assert v.passed is True
+    assert v.strategy == "structured-verdict"
 
 
-def test_structured_verdict_present_lens_missing_summary_fails():
+def test_structured_verdict_incomplete_lens_summary_still_passes():
+    # A lens with a missing summary field is skipped; overall_verdict resolves.
     payload = json.dumps(
         {
             "overall_verdict": "APPROVE",
@@ -548,8 +562,8 @@ def test_structured_verdict_present_lens_missing_summary_fails():
         }
     )
     v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
-    assert v.passed is False
-    assert "structured verdict" in v.reason.lower()
+    assert v.passed is True
+    assert v.strategy == "structured-verdict"
 
 
 def test_structured_verdict_non_json_garbage_fails():

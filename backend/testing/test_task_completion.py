@@ -651,7 +651,9 @@ class TestLogFileOverlaps:
 def _patch_ensure_branch_deps(mocker):
     """Patch asyncio.sleep and failure-alert plumbing for _ensure_branch tests."""
     mocker.patch("app.task_completion.asyncio.sleep", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch("app.routers.agent_status.record_task_result")
 
 
@@ -2248,7 +2250,9 @@ class TestReleasePoolMemberIfTerminal:
         try:
             task, _ = await self._lease_member_to_task(db_session, vm_id="vm-other")
             # A different task points at the same vm_instance_id.
-            interloper = make_task(project_id=task.project_id, vm_instance_id="vm-other")
+            interloper = make_task(
+                project_id=task.project_id, vm_instance_id="vm-other"
+            )
             db_session.add(interloper)
             await db_session.commit()
             await db_session.refresh(interloper)
@@ -2289,7 +2293,9 @@ class TestReleasePoolMemberIfTerminal:
             # No diagnosis_task_id / direction_id / auto_remediation — the
             # remediation body returns early, but the pool member must still
             # be reconciled.
-            await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+            await _record_remediation_if_terminal(
+                task, TaskStatus.COMPLETED, db_session
+            )
             await db_session.commit()
             member = await get_pool_vm(db_session, "vm-wrap")
             assert member.state == PoolVmState.IDLE
@@ -2307,7 +2313,9 @@ class TestPlanSubtaskScopeAwareEffort:
         return json.dumps({"subtasks": subtasks})
 
     async def _setup_plan_task(self, db_session, mocker, parent_effort="medium"):
-        mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+        mocker.patch(
+            "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+        )
         mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
@@ -3066,7 +3074,9 @@ class TestSafeguardMergeGateChallenge:
             title="create: cross-cutting PR",
             status=TaskStatus.EVALUATING,
             requires_approval=True,
-            payloads=[{"type": "create", "prompt": "add feature", "base_branch": "main"}],
+            payloads=[
+                {"type": "create", "prompt": "add feature", "base_branch": "main"}
+            ],
         )
         db_session.add(orig)
         await db_session.commit()
@@ -3129,9 +3139,7 @@ class TestSafeguardMergeGateChallenge:
         )
 
     @pytest.mark.asyncio
-    async def test_safeguard_gate_maintained_when_challenge_confirms(
-        self, db_session
-    ):
+    async def test_safeguard_gate_maintained_when_challenge_confirms(self, db_session):
         """A finding confirmed by the challenge keeps the gate closed."""
         from app.task_completion import _maybe_release_safeguard_gate
         from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
@@ -3168,9 +3176,7 @@ class TestSafeguardMergeGateChallenge:
         )
 
     @pytest.mark.asyncio
-    async def test_safeguard_gate_maintained_when_mode_off(
-        self, db_session
-    ):
+    async def test_safeguard_gate_maintained_when_mode_off(self, db_session):
         """With safeguard_challenge_gate_mode='off', gate is maintained unconditionally."""
         import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
@@ -3198,9 +3204,7 @@ class TestSafeguardMergeGateChallenge:
         )
 
     @pytest.mark.asyncio
-    async def test_safeguard_gate_released_on_downgraded(
-        self, db_session
-    ):
+    async def test_safeguard_gate_released_on_downgraded(self, db_session):
         """A finding downgraded below critical/high by the challenge releases the gate."""
         import app.shared_state as shared_state
         from app.task_completion import _maybe_release_safeguard_gate
@@ -3282,15 +3286,23 @@ class TestSafeguardMergeGateChallenge:
         # A challenge task with SAFEGUARD_CHALLENGE_SOURCE_KEY pointing to the
         # safeguard must have been created in the DB.
         all_tasks = (
-            await db_session.execute(
-                select(Task).where(Task.project_id == safeguard.project_id)
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == safeguard.project_id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         challenge_tasks = [
-            t for t in all_tasks
-            if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY) == str(safeguard.id)
+            t
+            for t in all_tasks
+            if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY)
+            == str(safeguard.id)
         ]
-        assert challenge_tasks, "A challenge task pointing to the safeguard must have been created"
+        assert challenge_tasks, (
+            "A challenge task pointing to the safeguard must have been created"
+        )
 
     @pytest.mark.asyncio
     async def test_safeguard_observe_mode_spawns_challenge_but_maintains_gate(
@@ -3335,15 +3347,23 @@ class TestSafeguardMergeGateChallenge:
         )
         # A challenge task with SAFEGUARD_CHALLENGE_SOURCE_KEY must have been created.
         all_tasks = (
-            await db_session.execute(
-                select(Task).where(Task.project_id == safeguard.project_id)
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == safeguard.project_id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         challenge_tasks = [
-            t for t in all_tasks
-            if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY) == str(safeguard.id)
+            t
+            for t in all_tasks
+            if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY)
+            == str(safeguard.id)
         ]
-        assert challenge_tasks, "A shadow challenge task must have been created in observe mode"
+        assert challenge_tasks, (
+            "A shadow challenge task must have been created in observe mode"
+        )
 
     @pytest.mark.asyncio
     async def test_safeguard_observe_mode_records_shadow_verdict_on_reentry(
@@ -3513,7 +3533,9 @@ class TestSafeguardMergeGateChallenge:
         await db_session.refresh(safeguard)
 
         result = await spawn_safeguard_challenge(safeguard, "some findings", db_session)
-        assert result is None, "spawn must return None when a challenge is already in flight"
+        assert result is None, (
+            "spawn must return None when a challenge is already in flight"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3613,28 +3635,116 @@ def test_reconcile_revised_falls_back_to_challenge_issues_when_no_overlap():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Panel-review verdict parser tolerance tests (regression for #10096 incident)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_parse_panel_review_no_lenses_overall_approve():
+    """Exact shape that wedged PR #10096: overall_verdict APPROVE with prose summary,
+    no lenses key. Must resolve to a usable APPROVE, not None."""
+    raw = {
+        "overall_verdict": "APPROVE",
+        "summary": "Correctness [APPROVE]: ... Security [APPROVE]: ...",
+    }
+    panel = _parse_panel_review_output(json.dumps(raw))
+    assert panel is not None, "no-lenses APPROVE must not return None"
+    assert panel["overall_verdict"] == "APPROVE"
+    # reconcile_review_second_opinion must treat it as confirmed approve
+    rec = reconcile_review_second_opinion("APPROVE", [], panel)
+    assert rec["reconciled_verdict"] == "APPROVE"
+    assert rec["state"] == "challenged_confirmed"
+
+
+def test_parse_panel_review_prose_only_verdict_via_anchored_floor():
+    """Prose-only output with an anchored verdict token resolves via the fallback."""
+    prose = 'After reviewing all changes, my verdict is: "APPROVE"\nNo issues found.'
+    panel = _parse_panel_review_output(prose)
+    assert panel is not None, "anchored prose APPROVE must resolve"
+    assert panel["overall_verdict"] == "APPROVE"
+
+
+def test_parse_panel_review_request_changes_prose_anchored():
+    """Anchored REQUEST_CHANGES in prose resolves correctly."""
+    prose = 'verdict: "REQUEST_CHANGES"\nSee the issues list above.'
+    panel = _parse_panel_review_output(prose)
+    assert panel is not None
+    assert panel["overall_verdict"] == "REQUEST_CHANGES"
+
+
+def test_parse_panel_review_genuinely_absent_returns_none():
+    """No resolvable verdict anywhere — must return None (fail-closed escalation preserved)."""
+    assert _parse_panel_review_output("") is None
+    assert _parse_panel_review_output(None) is None
+    assert _parse_panel_review_output("The review looks fine overall.") is None
+    assert _parse_panel_review_output('{"status": "ok", "score": 9}') is None
+
+
+def test_parse_panel_review_structured_lenses_still_captured():
+    """Well-formed lenses payload still parses AND records per-lens telemetry."""
+    raw = _panel_verdict(
+        "REQUEST_CHANGES", issues=[{"description": "bug", "severity": "high"}]
+    )
+    panel = _parse_panel_review_output(json.dumps(raw))
+    assert panel is not None
+    assert panel["overall_verdict"] == "REQUEST_CHANGES"
+    # Lens telemetry must be preserved when lenses are well-formed.
+    assert "lenses" in panel
+    for lens in ("correctness", "security", "code_quality", "test_coverage"):
+        assert lens in panel["lenses"]
+        assert panel["lenses"][lens]["verdict"] == "REQUEST_CHANGES"
+    assert panel.get("issues") == [{"description": "bug", "severity": "high"}]
+
+
+def test_parse_panel_review_partial_lenses_resolves_without_error():
+    """Partial lenses (only some of the required lenses present) still resolves the verdict."""
+    raw = {
+        "overall_verdict": "APPROVE",
+        "summary": "LGTM",
+        "lenses": {
+            "correctness": {"verdict": "APPROVE", "summary": "looks right"},
+        },
+    }
+    panel = _parse_panel_review_output(json.dumps(raw))
+    assert panel is not None
+    assert panel["overall_verdict"] == "APPROVE"
+
+
+def test_parse_panel_review_embedded_json_in_prose():
+    """JSON with overall_verdict embedded in surrounding prose text resolves."""
+    prose = (
+        'After reviewing:\n\n{"overall_verdict": "APPROVE", "summary": "all good"}\n\n'
+        "Hope that helps."
+    )
+    panel = _parse_panel_review_output(prose)
+    assert panel is not None
+    assert panel["overall_verdict"] == "APPROVE"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Security audit completion handler — idempotency under replay
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-_SECURITY_AUDIT_FINDINGS_JSON = json.dumps([
-    {
-        "severity": "critical",
-        "title": "SQL Injection in login endpoint",
-        "description": "User input is interpolated directly into SQL queries.",
-        "fix_prompt": "Parameterize all SQL queries in backend/app/routers/auth.py.",
-        "file_path": "backend/app/routers/auth.py",
-        "line_number": 42,
-    },
-    {
-        "severity": "high",
-        "title": "Missing auth check on admin endpoint",
-        "description": "The /admin/reset endpoint has no @require_role decorator.",
-        "fix_prompt": "Add @require_role decorator to the reset endpoint.",
-        "file_path": "backend/app/routers/admin.py",
-        "line_number": 87,
-    },
-])
+_SECURITY_AUDIT_FINDINGS_JSON = json.dumps(
+    [
+        {
+            "severity": "critical",
+            "title": "SQL Injection in login endpoint",
+            "description": "User input is interpolated directly into SQL queries.",
+            "fix_prompt": "Parameterize all SQL queries in backend/app/routers/auth.py.",
+            "file_path": "backend/app/routers/auth.py",
+            "line_number": 42,
+        },
+        {
+            "severity": "high",
+            "title": "Missing auth check on admin endpoint",
+            "description": "The /admin/reset endpoint has no @require_role decorator.",
+            "fix_prompt": "Add @require_role decorator to the reset endpoint.",
+            "file_path": "backend/app/routers/admin.py",
+            "line_number": 87,
+        },
+    ]
+)
 
 
 class TestHandleSecurityAuditCompletion:
@@ -3681,7 +3791,9 @@ class TestHandleSecurityAuditCompletion:
             project_id=project.id,
             title="security_audit: main",
             status=TaskStatus.COMPLETED,
-            payloads=[{"type": "security_audit", "prompt": "audit", "base_branch": "main"}],
+            payloads=[
+                {"type": "security_audit", "prompt": "audit", "base_branch": "main"}
+            ],
         )
         db_session.add(audit_task)
         await db_session.commit()
@@ -3696,7 +3808,9 @@ class TestHandleSecurityAuditCompletion:
             status=TaskStatus.QUEUED,
             parent_task_id=audit_task.id,
             context={"security_audit_task_id": str(audit_task.id), "finding_index": 0},
-            payloads=[{"type": "create", "prompt": "fix sql injection", "base_branch": "main"}],
+            payloads=[
+                {"type": "create", "prompt": "fix sql injection", "base_branch": "main"}
+            ],
         )
         db_session.add(prior_child)
         await db_session.commit()
@@ -3707,10 +3821,16 @@ class TestHandleSecurityAuditCompletion:
 
         # Exactly one child should exist — the pre-existing one; no new ones spawned
         children = (
-            await db_session.execute(
-                sqlmodel_select(TaskModel).where(TaskModel.parent_task_id == audit_task.id)
+            (
+                await db_session.execute(
+                    sqlmodel_select(TaskModel).where(
+                        TaskModel.parent_task_id == audit_task.id
+                    )
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(children) == 1, (
             f"Expected 1 child (pre-existing), got {len(children)} — duplicate children spawned on replay"
         )
@@ -3739,7 +3859,9 @@ class TestHandleSecurityAuditCompletion:
             project_id=project.id,
             title="security_audit: atomic",
             status=TaskStatus.COMPLETED,
-            payloads=[{"type": "security_audit", "prompt": "audit", "base_branch": "main"}],
+            payloads=[
+                {"type": "security_audit", "prompt": "audit", "base_branch": "main"}
+            ],
         )
         db_session.add(audit_task)
         await db_session.commit()
@@ -3759,10 +3881,16 @@ class TestHandleSecurityAuditCompletion:
 
         await db_session.refresh(audit_task)
         children = (
-            await db_session.execute(
-                sqlmodel_select(TaskModel).where(TaskModel.parent_task_id == audit_task.id)
+            (
+                await db_session.execute(
+                    sqlmodel_select(TaskModel).where(
+                        TaskModel.parent_task_id == audit_task.id
+                    )
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
         # When children exist, parent must be EVALUATING — proved by one commit only
         # in the spawn+flip path (the plan_output save at top + one final commit)
@@ -3793,31 +3921,41 @@ class TestHandleSecurityAuditCompletion:
             project_id=project.id,
             title="security_audit: low only",
             status=TaskStatus.COMPLETED,
-            payloads=[{"type": "security_audit", "prompt": "audit", "base_branch": "main"}],
+            payloads=[
+                {"type": "security_audit", "prompt": "audit", "base_branch": "main"}
+            ],
         )
         db_session.add(audit_task)
         await db_session.commit()
         await db_session.refresh(audit_task)
 
-        low_only_logs = json.dumps([
-            {
-                "severity": "low",
-                "title": "Minor logging issue",
-                "description": "Log level inconsistency.",
-                "fix_prompt": "Fix logging levels.",
-                "file_path": "backend/app/main.py",
-                "line_number": 10,
-            }
-        ])
+        low_only_logs = json.dumps(
+            [
+                {
+                    "severity": "low",
+                    "title": "Minor logging issue",
+                    "description": "Log level inconsistency.",
+                    "fix_prompt": "Fix logging levels.",
+                    "file_path": "backend/app/main.py",
+                    "line_number": 10,
+                }
+            ]
+        )
 
         await self._run(db_session, mocker, audit_task, logs=low_only_logs)
 
         await db_session.refresh(audit_task)
         children = (
-            await db_session.execute(
-                sqlmodel_select(TaskModel).where(TaskModel.parent_task_id == audit_task.id)
+            (
+                await db_session.execute(
+                    sqlmodel_select(TaskModel).where(
+                        TaskModel.parent_task_id == audit_task.id
+                    )
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
         assert len(children) == 0
         assert audit_task.status == TaskStatus.COMPLETED

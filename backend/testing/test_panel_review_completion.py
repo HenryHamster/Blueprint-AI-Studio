@@ -86,13 +86,19 @@ class TestParsePanelReviewOutput:
         assert out is not None
         assert out["lenses"]["security"]["summary"].startswith("No auth")
 
-    def test_missing_declared_lens_returns_none(self):
+    def test_missing_declared_lens_still_resolves(self):
+        # A missing lens is skipped as optional telemetry; the overall_verdict
+        # still resolves so a correctly-decided review is never discarded on a
+        # structural check for a field nothing downstream consumes.
         out = _parse_panel_review_output(
             json.dumps(_panel_review_payload(drop_lens="security"))
         )
-        assert out is None
+        assert out is not None
+        assert out["overall_verdict"] == "APPROVE"
+        assert "security" not in (out.get("lenses") or {})
 
-    def test_present_lens_missing_verdict_returns_none(self):
+    def test_present_lens_missing_verdict_still_resolves(self):
+        # A lens with no verdict field is skipped; overall_verdict still resolves.
         out = _parse_panel_review_output(
             json.dumps(
                 _panel_review_payload(
@@ -100,15 +106,46 @@ class TestParsePanelReviewOutput:
                 )
             )
         )
-        assert out is None
+        assert out is not None
+        assert out["overall_verdict"] == "APPROVE"
+        assert "correctness" not in (out.get("lenses") or {})
 
-    def test_present_lens_missing_summary_returns_none(self):
+    def test_present_lens_missing_summary_still_resolves(self):
+        # A lens with no summary field is skipped; overall_verdict still resolves.
         out = _parse_panel_review_output(
             json.dumps(
                 _panel_review_payload(drop_lens_field=("security", "summary"))
             )
         )
-        assert out is None
+        assert out is not None
+        assert out["overall_verdict"] == "APPROVE"
+        assert "security" not in (out.get("lenses") or {})
+
+    def test_no_lenses_key_resolves_overall_verdict(self):
+        # Regression test for incident #10096: challenger returned APPROVE in
+        # overall_verdict with per-lens summaries folded into prose — no `lenses`
+        # object at all. Must resolve to APPROVE, not escalate to manual review.
+        body = json.dumps(
+            {
+                "overall_verdict": "APPROVE",
+                "summary": (
+                    "Correctness [APPROVE]: logic is correct. "
+                    "Security [APPROVE]: no regressions. "
+                    "Code Quality [APPROVE]: patterns aligned."
+                ),
+            }
+        )
+        out = _parse_panel_review_output(body)
+        assert out is not None
+        assert out["overall_verdict"] == "APPROVE"
+        assert "lenses" not in out
+
+    def test_prose_only_with_anchored_verdict_resolves(self):
+        # Method 3 (anchored-prose floor): a quoted "APPROVE" in the output
+        # resolves even when no JSON object is present.
+        out = _parse_panel_review_output('Overall verdict: "APPROVE" — all checks passed.')
+        assert out is not None
+        assert out["overall_verdict"] == "APPROVE"
 
     def test_non_json_garbage_returns_none(self):
         out = _parse_panel_review_output("This PR looks fine to me, approving!")
@@ -384,23 +421,9 @@ def test_build_panel_review_pr_body_is_labelled_and_includes_lenses():
     ("logs", "reason_fragment"),
     [
         ("   ", "empty"),
+        # No overall_verdict anywhere — genuinely unparseable, still fails.
         ('{"summary":"missing verdict","lenses":{}}', "structured verdict"),
-        (
-            json.dumps(_panel_review_payload(drop_lens="test_coverage")),
-            "structured verdict",
-        ),
-        (
-            json.dumps(
-                _panel_review_payload(drop_lens_field=("correctness", "verdict"))
-            ),
-            "structured verdict",
-        ),
-        (
-            json.dumps(
-                _panel_review_payload(drop_lens_field=("security", "summary"))
-            ),
-            "structured verdict",
-        ),
+        # Bare prose with no anchored APPROVE/REQUEST_CHANGES — still fails.
         ("This PR looks fine to me, approving!", "structured verdict"),
     ],
 )
