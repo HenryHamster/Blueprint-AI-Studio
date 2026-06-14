@@ -126,8 +126,8 @@ jobs:
           gcloud run deploy blueprint-orchestrator \
             --image "${{ env.AR_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE }}:${{ github.sha }}" \
             --region ${{ env.REGION }} \
-            --min-instances 2 \
-            --max-instances 6 \
+            --min-instances 3 \
+            --max-instances 12 \
             --concurrency 20 \
             --update-env-vars DEPLOY_SHA=${{ github.sha }}
 
