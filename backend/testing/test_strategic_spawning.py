@@ -278,6 +278,64 @@ async def test_strategy_only_cycle_spawns_strategic_review(db_session):
 
 
 @pytest.mark.asyncio
+async def test_strategy_only_cycle_records_strategic_cycle_row(db_session):
+    """Strategy-only cycles must create + link a StrategicCycle row.
+
+    Regression (digest "latest strategic cycle" card kept going blank):
+    strategy-only reviews historically minted no cycle_id, so ~2/3 of strategic
+    cycles (architecture_review_frequency defaults to every 3rd) were never
+    recorded in StrategicCycle. The card only ever reflected the rarer, fragile
+    architecture cycles, and showed nothing fresh whenever one stalled. A
+    strategy-only spawn must now create a ``phase2_running`` row linked to the
+    review task — with no architecture phase1 — so the normal phase-2
+    completion accounting finalizes it like any other cycle.
+    """
+    from app.models import StrategicCycle
+
+    # arch_frequency=3, _strategic_cycle_count=1 → next=2 → strategy-only cycle.
+    project = _make_project(
+        vision={
+            "_strategic_cycle_count": 1,
+            "_research_spawn_count": 5,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
+    _shared_state.runtime_config["architecture_review_frequency"] = 3
+    try:
+        await _spawn_research_task(project, db_session)
+    finally:
+        _shared_state.runtime_config["architecture_review_frequency"] = old
+
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert len(tasks) == 1, f"Expected one task, got {len(tasks)}"
+    review_task = tasks[0]
+    assert review_task.payloads[0]["type"] == "strategic_review"
+
+    # The review task carries a freshly-minted cycle id (task column + context).
+    cycle_id = review_task.strategic_cycle_id
+    assert cycle_id, "strategy-only review task has no strategic_cycle_id"
+    assert (review_task.context or {}).get("strategic_cycle_id") == cycle_id
+
+    # A StrategicCycle row exists for it, advanced to phase2_running, linked via
+    # phase2_task_id, with no architecture phase1 task — and phase1_started_at
+    # set so the digest's DESC ordering surfaces it as the project's latest.
+    cycle = await db_session.get(StrategicCycle, cycle_id)
+    assert cycle is not None, "strategy-only cycle created no StrategicCycle row"
+    assert cycle.project_id == project.id
+    assert cycle.outcome == "phase2_running"
+    assert cycle.phase2_task_id == review_task.id
+    assert cycle.phase1_task_id is None
+    assert cycle.phase1_completed_at is not None
+    assert cycle.phase1_started_at is not None
+
+
+@pytest.mark.asyncio
 async def test_arch_frequency_zero_always_spawns_strategic_review(db_session):
     """arch_frequency=0 disables architecture cycles → always strategic_review."""
     # _strategic_cycle_count=2 would be an arch cycle with freq=3, but freq=0 disables it.
