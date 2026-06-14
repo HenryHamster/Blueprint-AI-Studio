@@ -396,6 +396,17 @@ function emptyChallengeRecord(
   };
 }
 
+// Public: a blocked record (approves nothing) for callers that must degrade a
+// cycle to fail-closed AFTER the challenge ran fine but a downstream step failed —
+// e.g. the `set_strategic_challenge` persist threw, so the backend holds no record
+// (its gate fails closed) and the executor must be shown a matching no-approvals
+// view rather than approvals the backend will reject. Mirrors the blocked/invalid
+// shape so `buildStrategicChallengeExecutorSection` renders the "approving NOTHING"
+// caveats.
+export function blockedChallengeRecord(note: string): StrategicChallengeRecord {
+  return emptyChallengeRecord('blocked', note);
+}
+
 // Only treat genuine strings as strings — never stringify a nested object (which
 // would yield "[object Object]"). Mirrors index.ts:strVal without the import.
 function _safeStr(v: unknown): string {
