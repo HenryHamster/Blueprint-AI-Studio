@@ -1282,3 +1282,18 @@ async def lifespan(app):
                 "[LIFESPAN] Failed to close leader session on shutdown: %s",
                 _close_exc,
             )
+    # Gracefully dispose the main query pool so a Cloud Run drain (SIGTERM)
+    # closes pooled asyncpg connections cleanly instead of abandoning them for
+    # Cloud SQL to reap — orphaned server-side connections otherwise linger
+    # against max_connections during instance scale-in churn. Bounded so a hung
+    # close can never stall the shutdown past the grace window.
+    from app.database import dispose_engine
+
+    try:
+        await asyncio.wait_for(dispose_engine(), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[SHUTDOWN] engine.dispose() exceeded 5s grace — abandoning pool"
+        )
+    except Exception as _disp_exc:  # noqa: BLE001 — shutdown best-effort
+        logger.warning("[SHUTDOWN] engine.dispose() failed: %s", _disp_exc)
