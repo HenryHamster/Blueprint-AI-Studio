@@ -71,6 +71,26 @@ class DigestCache:
         self._last_good.clear()
         self._served_stale.clear()
 
+    def invalidate_matching(self, predicate: Callable[[Hashable], bool]) -> int:
+        """Drop cached entries whose key matches ``predicate``.
+
+        In-flight futures are intentionally left alone. Callers that must avoid
+        a just-finished stale in-flight result should also include a mutation
+        generation in their cache key.
+        """
+        keys = {
+            key
+            for key in set(self._results)
+            | set(self._last_good)
+            | set(self._served_stale)
+            if predicate(key)
+        }
+        for key in keys:
+            self._results.pop(key, None)
+            self._last_good.pop(key, None)
+            self._served_stale.pop(key, None)
+        return len(keys)
+
     async def get_or_compute(
         self,
         key: Hashable,

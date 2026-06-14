@@ -1,9 +1,26 @@
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react';
-import { ChevronDown, ChevronUp, FileDown, GitBranch, HelpCircle, Plus, RefreshCw, Sliders, Users, X } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronUp, FileDown, GitBranch, HelpCircle, Loader2, Pencil, Plus, RefreshCw, Sliders, Trash2, Users, X } from 'lucide-react';
 import { parseTimestamp, timeAgo } from '../utils/time';
-import type { AuthMode, MaxPlanAccount, ProviderCatalogEntry, ProviderName } from '../types/settings';
+import type { AccountMutationResult, AccountMutationReturn, AccountUpdatePayload, AuthMode, MaxPlanAccount, ProviderCatalogEntry, ProviderName } from '../types/settings';
 
 const PROVIDER_ORDER: ProviderName[] = ['anthropic', 'openai', 'gemini'];
+
+// Availability snapshot keys the BACKEND owns on provider_metadata. The edit
+// dialog never lets the operator touch these directly; when an operator edits
+// other metadata we merge their changes OVER the full stored map so these
+// survive the wholesale provider_metadata replace the PATCH endpoint performs.
+const BACKEND_OWNED_METADATA_KEYS = new Set([
+  'available_models',
+  'available_models_refreshed_at',
+  'available_models_error',
+]);
+
+function parseCapInput(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const n = parseInt(trimmed, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
 
 const FALLBACK_AUTH_MODES: Record<ProviderName, AuthMode[]> = {
   anthropic: ['oauth', 'api_key'],
@@ -109,9 +126,10 @@ interface SettingsAccountsSectionProps {
   isAdmin: boolean;
   maxPlanAccounts: MaxPlanAccount[];
   onToggleAccount: (id: string, enabled: boolean) => void;
-  onRemoveAccount: (id: string) => void;
+  onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
   onResetRateLimits: (id: string) => void;
   onRefreshAccountModels: (id: string) => void;
+  onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
@@ -207,10 +225,12 @@ function AccountRow({
   account,
   isCapExpanded,
   capDraft,
+  providers,
   onToggleAccount,
   onRemoveAccount,
   onResetRateLimits,
   onRefreshAccountModels,
+  onUpdateAccount,
   onUpdateAccountCaps,
   setExpandedAccountCaps,
   setCapDraft,
@@ -218,15 +238,70 @@ function AccountRow({
   account: MaxPlanAccount;
   isCapExpanded: boolean;
   capDraft: { daily_task_cap: string; max_concurrent_tasks: string; auto_disable_after_rate_limits: string };
+  providers: Record<string, ProviderCatalogEntry>;
   onToggleAccount: (id: string, enabled: boolean) => void;
-  onRemoveAccount: (id: string) => void;
+  onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
   onResetRateLimits: (id: string) => void;
   onRefreshAccountModels: (id: string) => void;
+  onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
   setExpandedAccountCaps: (value: string | null) => void;
   setCapDraft: (value: { daily_task_cap: string; max_concurrent_tasks: string; auto_disable_after_rate_limits: string }) => void;
 }) {
   const now = useClockNow();
+
+  // Per-row, per-action pending state: the label of the in-flight mutation
+  // (e.g. 'toggle', 'delete', 'refresh') or null when idle. Drives spinners and
+  // disables every other action on the row so an operator can't double-fire.
+  const [busy, setBusy] = useState<string | null>(null);
+  const [isEditing, setIsEditing] = useState(false);
+  // Delete confirmation: `confirming` shows the inline confirm; `conflictDetail`
+  // is set after a 409 so the operator can choose a force retry.
+  const [deleteState, setDeleteState] = useState<{ confirming: boolean; conflictDetail: string | null }>({
+    confirming: false,
+    conflictDetail: null,
+  });
+
+  // Wrap a void mutation so the row reflects a pending state and re-enables on
+  // settle. Used for toggle/reset/refresh where the result is not inspected.
+  const run = async (label: string, fn: () => unknown): Promise<void> => {
+    setBusy(label);
+    try {
+      await fn();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleConfirmDelete = async (force: boolean) => {
+    setBusy('delete');
+    try {
+      const result = (await onRemoveAccount(account.id, force)) as AccountMutationResult | undefined;
+      if (result && result.conflict) {
+        setDeleteState({ confirming: true, conflictDetail: result.detail || 'Account is referenced by active work.' });
+        return;
+      }
+      // Success, or a non-conflict failure already surfaced via toast: close the
+      // confirm affordance either way (the row disappears on success).
+      setDeleteState({ confirming: false, conflictDetail: null });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleSave = async (payload: AccountUpdatePayload) => {
+    setBusy('save');
+    try {
+      const result = (await onUpdateAccount(account.id, payload)) as AccountMutationResult | undefined;
+      // Close on success or on a void callback (tests); keep open so the
+      // operator can correct input when the backend rejected the patch.
+      if (!result || result.ok) setIsEditing(false);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const isBusy = busy !== null;
 
   let tokenAge: string | null = null;
   let isExpiring = false;
@@ -251,9 +326,10 @@ function AccountRow({
     <div className={`bg-neutral-900 rounded-lg p-3 border ${isRateLimited ? 'border-amber-900/60' : account.disabled_reason ? 'border-red-900/60' : 'border-neutral-800'}`}>
       <div className="flex items-center gap-3">
         <button
-          onClick={() => onToggleAccount(account.id, !account.enabled)}
+          onClick={() => run('toggle', () => onToggleAccount(account.id, !account.enabled))}
+          disabled={isBusy}
           data-viewport-allow-small-target
-          className={`w-2.5 h-2.5 rounded-full shrink-0 ${isRateLimited ? 'bg-amber-500' : account.enabled ? 'bg-emerald-500' : 'bg-neutral-600'}`}
+          className={`w-2.5 h-2.5 rounded-full shrink-0 disabled:opacity-50 ${busy === 'toggle' ? 'animate-pulse ' : ''}${isRateLimited ? 'bg-amber-500' : account.enabled ? 'bg-emerald-500' : 'bg-neutral-600'}`}
           title={isRateLimited ? 'Rate-limited' : account.enabled ? 'Enabled (click to disable)' : 'Disabled (click to enable)'}
         />
         <div className="flex-1 min-w-0">
@@ -278,7 +354,7 @@ function AccountRow({
           {accountSupportsAvailabilityCheck(account) && (
             <AccountAvailabilityLine
               account={account}
-              onRefresh={() => onRefreshAccountModels(account.id)}
+              onRefresh={() => run('refresh', () => onRefreshAccountModels(account.id))}
             />
           )}
         </div>
@@ -296,23 +372,75 @@ function AccountRow({
             });
           }}
           title={isCapExpanded ? 'Close caps editor' : 'Edit usage caps'}
+          disabled={isBusy}
           data-viewport-allow-small-target
-          className="text-neutral-600 hover:text-neutral-300 transition-colors shrink-0 p-1"
+          className="text-neutral-600 hover:text-neutral-300 disabled:opacity-40 transition-colors shrink-0 p-1"
         >
           <Sliders className="w-3.5 h-3.5" />
         </button>
         <button
-          onClick={() => onRemoveAccount(account.id)}
+          onClick={() => { setIsEditing(v => !v); setExpandedAccountCaps(null); }}
+          title={isEditing ? 'Close editor' : 'Edit account'}
+          aria-label={`Edit account ${account.name}`}
+          disabled={isBusy}
           data-viewport-allow-small-target
-          className="text-neutral-600 hover:text-red-400 text-sm transition-colors shrink-0"
+          className={`hover:text-neutral-200 disabled:opacity-40 transition-colors shrink-0 p-1 ${isEditing ? 'text-cyan-400' : 'text-neutral-600'}`}
         >
-          &times;
+          <Pencil className="w-3.5 h-3.5" />
+        </button>
+        <button
+          onClick={() => setDeleteState({ confirming: true, conflictDetail: null })}
+          title="Delete account"
+          aria-label={`Delete account ${account.name}`}
+          disabled={isBusy}
+          data-viewport-allow-small-target
+          className="text-neutral-600 hover:text-red-400 disabled:opacity-40 transition-colors shrink-0 p-1"
+        >
+          {busy === 'delete' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
         </button>
       </div>
+      {deleteState.confirming && (
+        <div className="mt-2 pt-2 border-t border-red-900/40 space-y-1.5">
+          {deleteState.conflictDetail ? (
+            <div className="text-[11px] text-amber-400 flex items-start gap-1.5">
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+              <span>{deleteState.conflictDetail}</span>
+            </div>
+          ) : (
+            <div className="text-[11px] text-neutral-400">Delete <span className="text-neutral-200">{account.name}</span>? This revokes its stored secret.</div>
+          )}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => handleConfirmDelete(Boolean(deleteState.conflictDetail))}
+              disabled={isBusy}
+              className="bg-red-950/50 hover:bg-red-900/50 disabled:opacity-40 text-red-300 text-[11px] py-1 px-3 rounded border border-red-900/60 inline-flex items-center gap-1.5"
+            >
+              {busy === 'delete' && <Loader2 className="w-3 h-3 animate-spin" />}
+              {deleteState.conflictDetail ? 'Force delete' : 'Delete'}
+            </button>
+            <button
+              onClick={() => setDeleteState({ confirming: false, conflictDetail: null })}
+              disabled={isBusy}
+              className="text-[11px] text-neutral-500 hover:text-neutral-300 disabled:opacity-40"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+      {isEditing && (
+        <AccountEditForm
+          account={account}
+          providers={providers}
+          busy={busy === 'save'}
+          onCancel={() => setIsEditing(false)}
+          onSave={handleSave}
+        />
+      )}
       {account.disabled_reason && (
         <div className="mt-2 pt-2 border-t border-red-900/40 text-[11px] text-red-400 flex items-center justify-between gap-2">
           <span>&#9888; {account.disabled_reason}</span>
-          <button data-viewport-allow-small-target onClick={() => onToggleAccount(account.id, true)} className="text-red-300 hover:text-red-200 underline">Re-enable</button>
+          <button data-viewport-allow-small-target disabled={isBusy} onClick={() => run('toggle', () => onToggleAccount(account.id, true))} className="text-red-300 hover:text-red-200 disabled:opacity-40 underline">Re-enable</button>
         </div>
       )}
       {isRateLimited && (
@@ -331,11 +459,12 @@ function AccountRow({
             );
           })}
           <button
-            onClick={() => onResetRateLimits(account.id)}
+            onClick={() => run('reset', () => onResetRateLimits(account.id))}
+            disabled={isBusy}
             data-viewport-allow-small-target
-            className="mt-1.5 w-full text-[11px] text-amber-400/70 hover:text-amber-300 bg-amber-950/30 hover:bg-amber-950/50 rounded-lg px-2 py-1 transition-colors"
+            className="mt-1.5 w-full text-[11px] text-amber-400/70 hover:text-amber-300 disabled:opacity-40 bg-amber-950/30 hover:bg-amber-950/50 rounded-lg px-2 py-1 transition-colors"
           >
-            Clear rate limits
+            {busy === 'reset' ? 'Clearing…' : 'Clear rate limits'}
           </button>
         </div>
       )}
@@ -407,6 +536,232 @@ function AccountRow({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// In-place editor for an existing account. Token/secret entry is strictly
+// write-only — the field is never seeded from backend data, so a stored secret
+// is never echoed. The PATCH body carries only the fields the operator actually
+// changed (diffed against the current row), and provider_metadata edits are
+// merged over the full stored map so backend-owned availability keys survive.
+function AccountEditForm({
+  account,
+  providers,
+  busy,
+  onCancel,
+  onSave,
+}: {
+  account: MaxPlanAccount;
+  providers: Record<string, ProviderCatalogEntry>;
+  busy: boolean;
+  onCancel: () => void;
+  onSave: (payload: AccountUpdatePayload) => void;
+}) {
+  const [name, setName] = useState(account.name);
+  const [enabled, setEnabled] = useState(account.enabled);
+  const [provider, setProvider] = useState<ProviderName>(account.provider);
+  const [authMode, setAuthMode] = useState<AuthMode>(account.auth_mode);
+  const [token, setToken] = useState('');
+  const [dailyTaskCap, setDailyTaskCap] = useState(account.daily_task_cap != null ? String(account.daily_task_cap) : '');
+  const [maxConcurrent, setMaxConcurrent] = useState(account.max_concurrent_tasks != null ? String(account.max_concurrent_tasks) : '');
+  const [autoDisable, setAutoDisable] = useState(account.auto_disable_after_rate_limits != null ? String(account.auto_disable_after_rate_limits) : '');
+  const [metaDraft, setMetaDraft] = useState<Record<string, string>>(() => {
+    const initial: Record<string, string> = {};
+    for (const [k, v] of Object.entries(account.provider_metadata || {})) {
+      if (!BACKEND_OWNED_METADATA_KEYS.has(k) && typeof v === 'string') initial[k] = v;
+    }
+    return initial;
+  });
+  const [metaDirty, setMetaDirty] = useState(false);
+  const [claudeConfigJson, setClaudeConfigJson] = useState('');
+  const [claudeConfigDirty, setClaudeConfigDirty] = useState(false);
+  const [clearClaudeConfig, setClearClaudeConfig] = useState(false);
+
+  const providerNames = Object.keys(providers).length > 0 ? (Object.keys(providers) as ProviderName[]) : PROVIDER_ORDER;
+  const authModes = (Object.keys(providers[provider]?.auth_modes ?? {}) as AuthMode[]).length > 0
+    ? (Object.keys(providers[provider]?.auth_modes ?? {}) as AuthMode[])
+    : FALLBACK_AUTH_MODES[provider];
+  const requiredFields = providers[provider]?.auth_modes?.[authMode]?.required_metadata_fields ?? [];
+  const metaFieldKeys = Array.from(new Set([...requiredFields, ...Object.keys(metaDraft)]));
+
+  const providerChanged = provider !== account.provider;
+  const authChanged = authMode !== account.auth_mode;
+  const identityChanged = providerChanged || authChanged;
+  const targetIsAnthropicOauth = provider === 'anthropic' && authMode === 'oauth';
+  const isJsonSecret = (provider === 'openai' && authMode === 'oauth') || (provider === 'gemini' && authMode === 'service_account');
+
+  const nameValid = name.trim().length > 0;
+  const missingMeta = metaFieldKeys.filter(f => (requiredFields.includes(f)) && !(metaDraft[f] ?? '').trim());
+  const tokenMissing = identityChanged && !token.trim();
+  const canSave = nameValid && !tokenMissing && (!identityChanged || missingMeta.length === 0) && !busy;
+
+  const buildPayload = (): AccountUpdatePayload => {
+    const payload: AccountUpdatePayload = {};
+    const trimmedName = name.trim();
+    if (trimmedName && trimmedName !== account.name) payload.name = trimmedName;
+    if (enabled !== account.enabled) payload.enabled = enabled;
+    if (providerChanged) payload.provider = provider;
+    if (authChanged) payload.auth_mode = authMode;
+    if (token.trim()) payload.secret = token.trim();
+
+    const newDaily = parseCapInput(dailyTaskCap);
+    if (newDaily !== (account.daily_task_cap ?? null)) payload.daily_task_cap = newDaily;
+    const newConcurrent = parseCapInput(maxConcurrent);
+    if (newConcurrent !== (account.max_concurrent_tasks ?? null)) payload.max_concurrent_tasks = newConcurrent;
+    const newAutoDisable = parseCapInput(autoDisable);
+    if (newAutoDisable !== (account.auto_disable_after_rate_limits ?? null)) payload.auto_disable_after_rate_limits = newAutoDisable;
+
+    if (metaDirty || identityChanged) {
+      // Keys the operator cleared in the form. We rebuild the map without them
+      // rather than `delete`-ing, and copy every other stored key forward — so
+      // backend-owned availability keys (not editable here) always survive.
+      const cleared = new Set(metaFieldKeys.filter(key => !(metaDraft[key] ?? '').trim()));
+      const merged: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(account.provider_metadata || {})) {
+        if (!cleared.has(k)) merged[k] = v;
+      }
+      for (const key of metaFieldKeys) {
+        const val = (metaDraft[key] ?? '').trim();
+        if (val) merged[key] = val;
+      }
+      payload.provider_metadata = merged;
+    }
+
+    if (targetIsAnthropicOauth) {
+      if (clearClaudeConfig) payload.claude_config_json = null;
+      else if (claudeConfigDirty && claudeConfigJson.trim()) payload.claude_config_json = claudeConfigJson;
+    }
+    return payload;
+  };
+
+  const inputCls = 'w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600';
+
+  return (
+    <div className="mt-2 pt-3 border-t border-neutral-800/60 bg-neutral-950/40 rounded-lg p-3 space-y-3">
+      <div className="text-[10px] font-semibold text-neutral-300 uppercase tracking-wider">Edit account</div>
+      <div>
+        <div className="text-[10px] text-neutral-500 mb-1 uppercase">Name</div>
+        <input aria-label="Account name" value={name} onChange={e => setName(e.target.value)} className={inputCls} />
+      </div>
+      <label className="flex items-center gap-2 text-xs text-neutral-300 cursor-pointer">
+        <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} className="accent-emerald-500" />
+        Enabled
+      </label>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+        <div>
+          <div className="text-[10px] text-neutral-500 mb-1 uppercase">Provider</div>
+          <select
+            aria-label="Provider"
+            value={provider}
+            onChange={e => {
+              const next = e.target.value as ProviderName;
+              setProvider(next);
+              const modes = (Object.keys(providers[next]?.auth_modes ?? {}) as AuthMode[]);
+              const fallback = modes.length ? modes : FALLBACK_AUTH_MODES[next];
+              if (!fallback.includes(authMode)) setAuthMode(fallback[0]);
+            }}
+            className={inputCls}
+          >
+            {providerNames.map(p => <option key={p} value={p}>{p}</option>)}
+          </select>
+        </div>
+        <div>
+          <div className="text-[10px] text-neutral-500 mb-1 uppercase">Auth mode</div>
+          <select aria-label="Auth mode" value={authMode} onChange={e => setAuthMode(e.target.value as AuthMode)} className={inputCls}>
+            {authModes.map(m => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </div>
+      </div>
+      {metaFieldKeys.length > 0 && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+          {metaFieldKeys.map(field => {
+            const hint = METADATA_HINTS[field];
+            return (
+              <div key={field}>
+                <div className="text-[10px] text-neutral-500 mb-1 uppercase">{field}{requiredFields.includes(field) && <span className="text-red-400"> *</span>}</div>
+                <input
+                  aria-label={`metadata ${field}`}
+                  value={metaDraft[field] ?? ''}
+                  onChange={e => { setMetaDraft({ ...metaDraft, [field]: e.target.value }); setMetaDirty(true); }}
+                  placeholder={hint?.placeholder ?? field}
+                  className={inputCls}
+                />
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <div>
+        <div className="text-[10px] text-neutral-500 mb-1 uppercase flex items-center gap-1">
+          New token / secret
+          {identityChanged && <span className="text-red-400 normal-case">(required — provider/auth changed)</span>}
+        </div>
+        {isJsonSecret ? (
+          <textarea
+            aria-label="New token"
+            value={token}
+            onChange={e => setToken(e.target.value)}
+            rows={3}
+            placeholder="Leave blank to keep current secret"
+            className={`${inputCls} font-mono resize-none`}
+          />
+        ) : (
+          <input
+            aria-label="New token"
+            value={token}
+            onChange={e => setToken(e.target.value)}
+            type="password"
+            autoComplete="new-password"
+            placeholder="Leave blank to keep current token"
+            className={`${inputCls} font-mono`}
+          />
+        )}
+      </div>
+      {targetIsAnthropicOauth && (
+        <div>
+          <div className="text-[10px] text-neutral-500 mb-1 uppercase">claude_config_json <span className="normal-case text-neutral-600">(optional)</span></div>
+          <textarea
+            aria-label="claude_config_json"
+            value={claudeConfigJson}
+            disabled={clearClaudeConfig}
+            onChange={e => { setClaudeConfigJson(e.target.value); setClaudeConfigDirty(true); }}
+            rows={2}
+            placeholder='Leave blank to keep current; paste JSON to replace'
+            className={`${inputCls} font-mono resize-none disabled:opacity-40`}
+          />
+          <label className="flex items-center gap-2 text-[11px] text-neutral-500 mt-1 cursor-pointer">
+            <input type="checkbox" checked={clearClaudeConfig} onChange={e => setClearClaudeConfig(e.target.checked)} className="accent-red-500" />
+            Clear stored claude_config_json
+          </label>
+        </div>
+      )}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <label className="block">
+          <div className="text-[10px] text-neutral-500 mb-1">Tasks/day</div>
+          <input aria-label="Tasks per day cap" type="number" min={1} value={dailyTaskCap} placeholder="unlimited" onChange={e => setDailyTaskCap(e.target.value)} className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600" />
+        </label>
+        <label className="block">
+          <div className="text-[10px] text-neutral-500 mb-1">Max concurrent</div>
+          <input aria-label="Max concurrent cap" type="number" min={1} value={maxConcurrent} placeholder="unlimited" onChange={e => setMaxConcurrent(e.target.value)} className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600" />
+        </label>
+        <label className="block">
+          <div className="text-[10px] text-neutral-500 mb-1">Auto-disable</div>
+          <input aria-label="Auto-disable cap" type="number" min={1} value={autoDisable} placeholder="off" onChange={e => setAutoDisable(e.target.value)} className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600" />
+        </label>
+      </div>
+      <div className="flex items-center gap-2 pt-1">
+        <button
+          onClick={() => { if (canSave) onSave(buildPayload()); }}
+          disabled={!canSave}
+          className="bg-cyan-900/40 hover:bg-cyan-800/50 disabled:opacity-30 disabled:cursor-not-allowed text-cyan-200 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-cyan-900/60 inline-flex items-center gap-1.5"
+        >
+          {busy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+          Save changes
+        </button>
+        <button onClick={onCancel} data-viewport-allow-small-target className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors">Cancel</button>
+        {tokenMissing && <span className="text-[11px] text-amber-400 ml-auto">New token required</span>}
+      </div>
     </div>
   );
 }
@@ -716,6 +1071,7 @@ export function SettingsAccountsSection({
   onRemoveAccount,
   onResetRateLimits,
   onRefreshAccountModels,
+  onUpdateAccount,
   onUpdateAccountCaps,
   showUserManagement,
   onToggleUserManagement,
@@ -840,10 +1196,12 @@ export function SettingsAccountsSection({
               account={account}
               isCapExpanded={expandedAccountCaps === account.id}
               capDraft={capDraft}
+              providers={providers}
               onToggleAccount={onToggleAccount}
               onRemoveAccount={onRemoveAccount}
               onResetRateLimits={onResetRateLimits}
               onRefreshAccountModels={onRefreshAccountModels}
+              onUpdateAccount={onUpdateAccount}
               onUpdateAccountCaps={onUpdateAccountCaps}
               setExpandedAccountCaps={setExpandedAccountCaps}
               setCapDraft={setCapDraft}

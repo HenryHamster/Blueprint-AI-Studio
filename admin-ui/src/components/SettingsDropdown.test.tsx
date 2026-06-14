@@ -68,6 +68,7 @@ function makeProps(overrides: Record<string, unknown> = {}) {
     onRemoveAccount: vi.fn(),
     onResetRateLimits: vi.fn(),
     onRefreshAccountModels: vi.fn(),
+    onUpdateAccount: vi.fn(),
     newAccountName: '',
     setNewAccountName: vi.fn(),
     newAccountProvider: 'anthropic' as const,

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { AuthMode, CategoryRoutingEntry, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskCapabilityContract, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
+import type { AccountMutationResult, AccountUpdatePayload, AuthMode, CategoryRoutingEntry, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskCapabilityContract, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import { resolveTaskCapabilities } from '../taskCapabilities';
 import type { NotificationConfig } from '../components/SettingsNotificationsSection';
 import type { BuildConfig } from '../types/project';
@@ -82,7 +82,11 @@ export function useSettings(addToast: AddToast) {
         setHealthCheckUrls(data.health_check_urls ?? []);
         setAgentPromptSuffixes(data.agent_prompt_suffixes ?? {});
         setUsingMaxPlan(data.using_max_plan ?? false);
-        setMaxPlanAccounts(data.max_plan_accounts || []);
+        // NB: the account roster is intentionally NOT read from /settings here.
+        // It is owned by the dedicated, always-fresh /max-plan-accounts roster
+        // endpoint (fetchMaxPlanAccounts) so add/edit/delete mutations reflect
+        // immediately and the UI never races a stale, cache-derived settings
+        // copy. /settings still carries `max_plan_accounts` for older clients.
         setProviderTierModelMap(data.provider_tier_model_map ?? {});
         setTaskTypeCategories(data.task_type_categories ?? {});
         setCategoryRouting(data.category_routing ?? {});
@@ -142,6 +146,26 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  // Authoritative roster fetch. Every account mutation funnels its post-write
+  // refresh through here (not fetchSettings) so the interactive roster stays
+  // consistent and decoupled from the heavy /settings + health/provider-model
+  // polling paths. Returns nothing; failures are logged and leave prior state.
+  const fetchMaxPlanAccounts = async () => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/max-plan-accounts`);
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (Array.isArray(data?.accounts)) {
+          setMaxPlanAccounts(data.accounts as MaxPlanAccount[]);
+        }
+      } else {
+        console.error('Failed to fetch max-plan accounts: HTTP', res.status);
+      }
+    } catch (err) {
+      console.error('Failed to fetch max-plan accounts:', err);
+    }
+  };
+
   const addMaxPlanAccount = async () => {
     if (!newAccountName || !newAccountToken) return;
     try {
@@ -170,7 +194,7 @@ export function useSettings(addToast: AddToast) {
         setNewAccountDailyTaskCap(null);
         setNewAccountMaxConcurrentTasks(null);
         setNewAccountAutoDisableAfterRateLimits(null);
-        fetchSettings();
+        await fetchMaxPlanAccounts();
         addToast('Account added', 'success');
       } else {
         const data = await res.json().catch(() => ({}));
@@ -184,17 +208,59 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
-  const removeMaxPlanAccount = async (id: string) => {
+  // Delete an account. On HTTP 409 (active task / warm-VM references) the
+  // result carries `conflict: true` + the backend detail so the caller can
+  // re-issue with force=true; other failures toast and return ok:false.
+  const removeMaxPlanAccount = async (id: string, force = false): Promise<AccountMutationResult> => {
+    try {
+      const url = `${API_BASE_URL}/api/admin/max-plan-accounts/${id}${force ? '?force=true' : ''}`;
+      const res = await fetch(url, { method: 'DELETE', headers: await authHeaders() });
+      if (res.ok) {
+        await fetchMaxPlanAccounts();
+        addToast('Account removed', 'success');
+        return { ok: true };
+      }
+      const data = await res.json().catch(() => ({}));
+      const detail = typeof data?.detail === 'string' ? data.detail : null;
+      if (res.status === 409) {
+        // Surface the conflict to the caller (offer a force retry) WITHOUT a
+        // toast — the inline affordance carries the detail instead.
+        return { ok: false, conflict: true, detail };
+      }
+      addToast(detail ? `Remove failed: ${detail}` : `Remove failed (HTTP ${res.status})`, 'error');
+      return { ok: false, detail };
+    } catch (err) {
+      console.error('Failed to remove account:', err);
+      const msg = err instanceof Error ? err.message : 'unknown error';
+      addToast(`Remove failed: ${msg}`, 'error');
+      return { ok: false, detail: msg };
+    }
+  };
+
+  // Generic PATCH for the edit dialog: name/enabled/caps/provider/auth_mode/
+  // secret/provider_metadata/claude_config_json. Returns a structured result so
+  // the dialog can keep itself open and show the backend detail on failure.
+  const updateMaxPlanAccount = async (id: string, payload: AccountUpdatePayload): Promise<AccountMutationResult> => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts/${id}`, {
-        method: 'DELETE', headers: await authHeaders(),
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify(payload),
       });
       if (res.ok) {
-        fetchSettings();
-      } else {
-        addToast('Failed to remove account', 'error');
+        await fetchMaxPlanAccounts();
+        addToast('Account updated', 'success');
+        return { ok: true };
       }
-    } catch (err) { console.error('Failed to remove account:', err); addToast('Failed to remove account', 'error'); }
+      const data = await res.json().catch(() => ({}));
+      const detail = typeof data?.detail === 'string' ? data.detail : null;
+      addToast(detail ? `Update failed: ${detail}` : `Update failed (HTTP ${res.status})`, 'error');
+      return { ok: false, detail };
+    } catch (err) {
+      console.error('Failed to update account:', err);
+      const msg = err instanceof Error ? err.message : 'unknown error';
+      addToast(`Update failed: ${msg}`, 'error');
+      return { ok: false, detail: msg };
+    }
   };
 
   const toggleMaxPlanAccount = async (id: string, enabled: boolean) => {
@@ -204,9 +270,11 @@ export function useSettings(addToast: AddToast) {
         body: JSON.stringify({ enabled }),
       });
       if (res.ok) {
-        fetchSettings();
+        await fetchMaxPlanAccounts();
       } else {
-        addToast('Failed to update account', 'error');
+        const data = await res.json().catch(() => ({}));
+        const detail = typeof data?.detail === 'string' ? data.detail : null;
+        addToast(detail ? `Failed to update account: ${detail}` : 'Failed to update account', 'error');
       }
     } catch (err) { console.error('Failed to toggle account:', err); addToast('Failed to update account', 'error'); }
   };
@@ -221,7 +289,7 @@ export function useSettings(addToast: AddToast) {
         body: JSON.stringify(caps),
       });
       if (res.ok) {
-        fetchSettings();
+        await fetchMaxPlanAccounts();
         addToast('Caps updated', 'success');
       } else {
         const data = await res.json().catch(() => ({}));
@@ -242,9 +310,11 @@ export function useSettings(addToast: AddToast) {
       });
       if (res.ok) {
         addToast('Rate limits cleared', 'success');
-        fetchSettings();
+        await fetchMaxPlanAccounts();
       } else {
-        addToast('Failed to reset rate limits', 'error');
+        const data = await res.json().catch(() => ({}));
+        const detail = typeof data?.detail === 'string' ? data.detail : null;
+        addToast(detail ? `Failed to reset rate limits: ${detail}` : 'Failed to reset rate limits', 'error');
       }
     } catch (err) { console.error('Failed to reset rate limits:', err); addToast('Failed to reset rate limits', 'error'); }
   };
@@ -265,7 +335,7 @@ export function useSettings(addToast: AddToast) {
         } else {
           addToast('Model availability refreshed', 'success');
         }
-        fetchSettings();
+        await fetchMaxPlanAccounts();
       } else {
         const data = await res.json().catch(() => ({}));
         const detail = typeof data?.detail === 'string' ? data.detail : null;
@@ -776,9 +846,10 @@ export function useSettings(addToast: AddToast) {
     buildConfig, setBuildConfig,
     // Handlers
     fetchSettings,
+    fetchMaxPlanAccounts,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
     refreshAccountModels,
-    updateAccountCaps,
+    updateAccountCaps, updateMaxPlanAccount,
     connectGitHub,
     updateAgentPromptSuffixes,
     updateProviderTierModels, updateTaskTypeModelPreferenceConfig,

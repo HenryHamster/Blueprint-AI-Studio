@@ -153,6 +153,45 @@ export interface ProviderMetadata {
   [key: string]: unknown;
 }
 
+// Result of an account mutation (PATCH/DELETE) routed through the dedicated
+// roster path. `conflict` is set when the backend returned HTTP 409 (active
+// task / warm-VM references blocking a delete) so the UI can offer a force
+// retry; `detail` carries the backend's human-readable detail string for
+// toasts or inline messaging.
+export interface AccountMutationResult {
+  ok: boolean;
+  conflict?: boolean;
+  detail?: string | null;
+}
+
+// Return type of an account mutation callback. It may be wired to the real
+// async hook handler (resolves to a structured result the UI inspects for
+// conflict/force + success) OR to a no-op stub in tests/storybook (returns
+// void). The void member is intentional; the lint rule is disabled for this
+// one alias so the rest of the prop chain references it by name.
+// eslint-disable-next-line @typescript-eslint/no-invalid-void-type
+export type AccountMutationReturn = void | Promise<AccountMutationResult>;
+
+// Partial PATCH body for an existing account. Token/secret rotation is
+// write-only and set-only: `secret` is included only when the operator types a
+// new value — it is never read back from the roster, so the edit dialog never
+// echoes a stored secret. Provider/auth-mode changes require a new `secret`
+// (enforced server-side). `provider_metadata`, when present, fully replaces the
+// stored map server-side, so the UI must merge backend-owned availability keys
+// into it to avoid clobbering them.
+export interface AccountUpdatePayload {
+  name?: string;
+  enabled?: boolean;
+  provider?: ProviderName;
+  auth_mode?: AuthMode;
+  secret?: string;
+  provider_metadata?: Record<string, unknown>;
+  claude_config_json?: string | null;
+  daily_task_cap?: number | null;
+  max_concurrent_tasks?: number | null;
+  auto_disable_after_rate_limits?: number | null;
+}
+
 export interface MaxPlanAccount {
   id: string;
   name: string;

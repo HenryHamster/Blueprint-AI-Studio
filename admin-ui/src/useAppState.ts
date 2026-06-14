@@ -130,9 +130,10 @@ export function useAppState() {
     providerSettingsDefaults, taskTypeProviderOverrides,
     buildConfig, setBuildConfig,
     fetchSettings,
+    fetchMaxPlanAccounts,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
     refreshAccountModels,
-    updateAccountCaps,
+    updateAccountCaps, updateMaxPlanAccount,
     connectGitHub,
     updateAgentPromptSuffixes,
     updateProviderTierModels, updateTaskTypeModelPreferenceConfig,
@@ -355,6 +356,7 @@ export function useAppState() {
   useEffect(() => {
     if (!user) return;
     fetchSettings();
+    fetchMaxPlanAccounts();
     fetchProjects();
     fetchAlerts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -505,7 +507,13 @@ export function useAppState() {
 
   const handleToggleSettings = () => {
     setShowSettings(prev => {
-      if (!prev) fetchSettings();
+      if (!prev) {
+        fetchSettings();
+        // Refresh the authoritative roster every time the panel opens so a
+        // just-added/edited account is always present (fixes "new accounts
+        // don't appear") without waiting on the heavy settings payload.
+        fetchMaxPlanAccounts();
+      }
       return !prev;
     });
   };
@@ -634,7 +642,7 @@ export function useAppState() {
     newAccountDailyTaskCap, setNewAccountDailyTaskCap,
     newAccountMaxConcurrentTasks, setNewAccountMaxConcurrentTasks,
     newAccountAutoDisableAfterRateLimits, setNewAccountAutoDisableAfterRateLimits,
-    addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits, refreshAccountModels, updateAccountCaps,
+    addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits, refreshAccountModels, updateAccountCaps, updateMaxPlanAccount,
     providerTierModelMap, taskTypeModelPreferences,
     taskTypeCategories, categoryRouting, taskTypeRouting,
     providerSettingsByEffort,

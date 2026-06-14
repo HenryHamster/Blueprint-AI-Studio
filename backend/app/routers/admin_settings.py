@@ -300,8 +300,8 @@ async def get_settings(
     current_user: dict = Depends(require_admin),
 ):
     from app.shared_state import runtime_config as _runtime_config
-    from app.max_plan_pool import _max_plan_pools
     from app.models import UserIntegration
+    from app.routers.admin_pool_accounts import list_authoritative_max_plan_accounts
 
     # Check if the user has a GitHub integration
     github_account = None
@@ -312,7 +312,9 @@ async def get_settings(
     if integration and integration.github_account_name:
         github_account = integration.github_account_name
 
-    user_pool = _max_plan_pools.get(current_user["user_id"], [])
+    max_plan_accounts = await list_authoritative_max_plan_accounts(
+        session, current_user["user_id"]
+    )
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
@@ -611,7 +613,7 @@ async def get_settings(
         "using_max_plan": len(
             [
                 a
-                for a in user_pool
+                for a in max_plan_accounts
                 if a.get("enabled", True)
                 and a.get("provider", LLMProviderName.ANTHROPIC.value)
                 == LLMProviderName.ANTHROPIC.value
@@ -620,40 +622,7 @@ async def get_settings(
             ]
         )
         > 0,
-        "max_plan_accounts": [
-            {
-                "id": a["id"],
-                "name": a["name"],
-                "enabled": a.get("enabled", True),
-                "provider": a.get("provider", LLMProviderName.ANTHROPIC.value),
-                "auth_mode": a.get("auth_mode", LLMAuthMode.OAUTH.value),
-                "provider_metadata": a.get("provider_metadata", {}),
-                "active_tasks": a["active_tasks"],
-                "total_tasks": a["total_tasks"],
-                "token_created_at": a.get("token_created_at"),
-                "rl_hit_count": a.get("rl_hit_count", 0),
-                "daily_task_cap": a.get("daily_task_cap"),
-                "max_concurrent_tasks": a.get("max_concurrent_tasks"),
-                "auto_disable_after_rate_limits": a.get(
-                    "auto_disable_after_rate_limits"
-                ),
-                "daily_task_count": int(a.get("daily_task_count") or 0),
-                "daily_task_count_reset_at": (
-                    a["daily_task_count_reset_at"].isoformat()
-                    if a.get("daily_task_count_reset_at")
-                    else None
-                ),
-                "disabled_reason": a.get("disabled_reason"),
-                "disabled_models": {
-                    model: {
-                        "hits": info.get("hits", 0),
-                        "at": info["at"].isoformat() if info.get("at") else None,
-                    }
-                    for model, info in a.get("disabled_models", {}).items()
-                },
-            }
-            for a in user_pool
-        ],
+        "max_plan_accounts": max_plan_accounts,
     }
 
 

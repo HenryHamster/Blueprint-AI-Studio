@@ -1,8 +1,8 @@
 import { useState, type ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { SettingsAccountsSection } from './SettingsAccountsSection';
-import type { MaxPlanAccount, ProviderCatalogEntry } from '../types/settings';
+import type { AccountMutationResult, MaxPlanAccount, ProviderCatalogEntry } from '../types/settings';
 
 function makeAccount(overrides: Partial<MaxPlanAccount> = {}): MaxPlanAccount {
   return {
@@ -27,6 +27,8 @@ function Harness({
   onAddAccount?: () => void;
 } & Partial<ComponentProps<typeof SettingsAccountsSection>>) {
   const onUpdateAccountCaps = overrides.onUpdateAccountCaps ?? vi.fn();
+  const onUpdateAccount = overrides.onUpdateAccount ?? vi.fn();
+  const onRemoveAccount = overrides.onRemoveAccount ?? vi.fn();
   const [newAccountName, setNewAccountName] = useState(overrides.newAccountName ?? '');
   const [newAccountProvider, setNewAccountProvider] = useState(overrides.newAccountProvider ?? 'anthropic');
   const [newAccountAuthMode, setNewAccountAuthMode] = useState(overrides.newAccountAuthMode ?? 'oauth');
@@ -43,10 +45,11 @@ function Harness({
       onConnectGitHub={vi.fn()}
       isAdmin={true}
       maxPlanAccounts={overrides.maxPlanAccounts ?? []}
-      onToggleAccount={vi.fn()}
-      onRemoveAccount={vi.fn()}
+      onToggleAccount={overrides.onToggleAccount ?? vi.fn()}
+      onRemoveAccount={onRemoveAccount}
       onResetRateLimits={vi.fn()}
       onRefreshAccountModels={vi.fn()}
+      onUpdateAccount={onUpdateAccount}
       onUpdateAccountCaps={onUpdateAccountCaps}
       showUserManagement={false}
       onToggleUserManagement={vi.fn()}
@@ -139,5 +142,108 @@ describe('SettingsAccountsSection', () => {
       max_concurrent_tasks: 8,
       auto_disable_after_rate_limits: 9,
     });
+  });
+
+  it('opens_edit_dialog_and_patches_full_account_payload_without_secret_echo', () => {
+    const onUpdateAccount = vi.fn().mockResolvedValue({ ok: true } as AccountMutationResult);
+    render(
+      <Harness
+        maxPlanAccounts={[
+          makeAccount({
+            id: 'acct-9',
+            name: 'Old Name',
+            enabled: true,
+            provider: 'anthropic',
+            auth_mode: 'oauth',
+            daily_task_cap: 5,
+            max_concurrent_tasks: null,
+            auto_disable_after_rate_limits: null,
+          }),
+        ]}
+        onUpdateAccount={onUpdateAccount}
+      />
+    );
+
+    // Open the per-row edit dialog.
+    fireEvent.click(screen.getByRole('button', { name: 'Edit account Old Name' }));
+
+    // The token/secret field is strictly write-only: it must NOT echo any
+    // stored secret — it starts empty even though the account exists.
+    const tokenInput = screen.getByLabelText('New token') as HTMLInputElement;
+    expect(tokenInput.value).toBe('');
+    expect(tokenInput.getAttribute('type')).toBe('password');
+
+    // Edit a full set of fields: rename, disable, change a cap, rotate token.
+    fireEvent.change(screen.getByLabelText('Account name'), { target: { value: 'New Name' } });
+    fireEvent.click(screen.getByLabelText('Enabled'));
+    fireEvent.change(screen.getByLabelText('Tasks per day cap'), { target: { value: '12' } });
+    fireEvent.change(tokenInput, { target: { value: 'sk-ant-oat01-rotated' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    expect(onUpdateAccount).toHaveBeenCalledTimes(1);
+    const [id, payload] = onUpdateAccount.mock.calls[0];
+    expect(id).toBe('acct-9');
+    expect(payload).toMatchObject({
+      name: 'New Name',
+      enabled: false,
+      daily_task_cap: 12,
+      secret: 'sk-ant-oat01-rotated',
+    });
+    // Unchanged identity is not echoed back into the patch.
+    expect(payload).not.toHaveProperty('provider');
+    expect(payload).not.toHaveProperty('auth_mode');
+  });
+
+  it('requires a new token when provider/auth mode changes', () => {
+    const onUpdateAccount = vi.fn().mockResolvedValue({ ok: true } as AccountMutationResult);
+    render(
+      <Harness
+        maxPlanAccounts={[makeAccount({ id: 'acct-2', name: 'Switcher', provider: 'openai', auth_mode: 'api_key' })]}
+        onUpdateAccount={onUpdateAccount}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Edit account Switcher' }));
+    // Switch auth mode without supplying a token.
+    fireEvent.change(screen.getByLabelText('Auth mode'), { target: { value: 'oauth' } });
+
+    const save = screen.getByRole('button', { name: 'Save changes' });
+    expect(save).toBeDisabled();
+    expect(screen.getByText('New token required')).toBeInTheDocument();
+    fireEvent.click(save);
+    expect(onUpdateAccount).not.toHaveBeenCalled();
+  });
+
+  it('surfaces delete conflict detail and offers a force delete', async () => {
+    const onRemoveAccount = vi.fn()
+      .mockResolvedValueOnce({ ok: false, conflict: true, detail: '2 active task(s) block removal' } as AccountMutationResult)
+      .mockResolvedValueOnce({ ok: true } as AccountMutationResult);
+    render(<Harness maxPlanAccounts={[makeAccount({ name: 'Primary' })]} onRemoveAccount={onRemoveAccount} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete account Primary' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+
+    expect(await screen.findByText('2 active task(s) block removal')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Force delete' }));
+
+    await waitFor(() => expect(onRemoveAccount).toHaveBeenCalledTimes(2));
+    expect(onRemoveAccount).toHaveBeenNthCalledWith(1, 'acct-1', false);
+    expect(onRemoveAccount).toHaveBeenNthCalledWith(2, 'acct-1', true);
+  });
+
+  it('disables row actions while an edit save is pending', async () => {
+    let resolveSave: (v: AccountMutationResult) => void = () => {};
+    const onUpdateAccount = vi.fn(() => new Promise<AccountMutationResult>(res => { resolveSave = res; }));
+    render(<Harness maxPlanAccounts={[makeAccount({ name: 'Primary' })]} onUpdateAccount={onUpdateAccount} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit account Primary' }));
+    fireEvent.change(screen.getByLabelText('Account name'), { target: { value: 'Renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    // Sibling row actions are disabled while the save is in flight.
+    expect(screen.getByRole('button', { name: 'Delete account Primary' })).toBeDisabled();
+
+    resolveSave({ ok: true });
+    await waitFor(() => expect(onUpdateAccount).toHaveBeenCalledTimes(1));
   });
 });
