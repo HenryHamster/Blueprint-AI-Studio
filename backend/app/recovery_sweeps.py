@@ -450,6 +450,19 @@ async def _summarize_latest_review_for_chain(parent: Task, session) -> dict | No
 _QUEUED_PIPELINE_SUPERSEDE_AFTER_SECONDS = 30 * 60
 
 
+# Wall-clock backstop for the post-commit sweep. A pending marker older than
+# this is terminalized by age even when its attempts/total_attempts counters
+# never advanced — which is exactly what happens when the bump UPDATE that
+# advances total_attempts is itself starved by the same row-lock contention it
+# is trying to escape (asyncpg LockNotAvailableError on the bump → total_attempts
+# frozen → the MAX_TOTAL_ATTEMPTS ceiling can never fire → the sweep churns the
+# task forever, burning a lock_timeout every cycle). Root-cause fix for the
+# 2026-06-14 stuck-task lock-churn incident (task 73281cea). Generous vs. any
+# legitimate post-commit (240s per-call budget, retried at the 60s sweep cadence
+# — a healthy marker clears in minutes, never 90 min).
+POST_COMMIT_MAX_PENDING_AGE_S = 90 * 60
+
+
 def _ci_backstop_timeout_reason(
     *,
     ci_ws_val: object,
@@ -2686,6 +2699,80 @@ async def _sweep_post_commit_pending():
                     pending_meta.get("total_attempts", attempts) or attempts
                 )
                 payload_dump = pending_meta.get("payload")
+
+                # Wall-clock backstop (see POST_COMMIT_MAX_PENDING_AGE_S). The
+                # attempts/total_attempts ceilings below can only fire once the
+                # bump UPDATE that advances them commits — but that bump is the
+                # very write the row-lock contention starves, so a wedged marker
+                # would churn forever. Terminalize by age in an ISOLATED session
+                # with a fail-fast lock_timeout, so an abandon write that hits the
+                # same contention neither poisons the batch nor burns ~30s of
+                # cycle time (mirrors the bump isolation that
+                # test_post_commit_sweep_bump_failure_does_not_poison_batch guards).
+                # Prefer first_pending_at (preserve-once); fall back to "at" for
+                # legacy markers written before that field existed.
+                _age_anchor = pending_meta.get("first_pending_at") or pending_meta.get(
+                    "at"
+                )
+                _pending_age_s = None
+                if _age_anchor:
+                    try:
+                        _pending_age_s = (
+                            _utcnow() - datetime.fromisoformat(_age_anchor)
+                        ).total_seconds()
+                    except (ValueError, TypeError):
+                        _pending_age_s = None
+                if (
+                    _pending_age_s is not None
+                    and _pending_age_s >= POST_COMMIT_MAX_PENDING_AGE_S
+                ):
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} pending for "
+                        f"{int(_pending_age_s)}s (>= {POST_COMMIT_MAX_PENDING_AGE_S}s) "
+                        f"with attempts={attempts}, total_attempts={total_attempts} — "
+                        f"bump is likely row-lock-starved; terminalizing by age "
+                        f"(post_commit_abandoned)"
+                    )
+                    try:
+                        async with services.AsyncSessionLocal() as age_session:
+                            # Postgres-only fast-fail on row contention; on SQLite
+                            # (test DB) SET LOCAL is a no-op syntax error, so
+                            # dialect-gate it (mirrors the bump path).
+                            if resolve_dialect_name(age_session) == "postgresql":
+                                await age_session.execute(
+                                    text("SET LOCAL lock_timeout = '5s'")
+                                )
+                            refreshed = await age_session.get(Task, task.id)
+                            if refreshed and refreshed.post_commit_pending:
+                                _new_ctx = dict(refreshed.context or {})
+                                _new_ctx["_post_commit_abandoned"] = {
+                                    "at": _utcnow().isoformat(),
+                                    "after_attempts": attempts,
+                                    "after_total_attempts": total_attempts,
+                                    "after_pending_age_s": int(_pending_age_s),
+                                    "reason": "max_pending_age_exceeded",
+                                    "last_reason": pending_meta.get("reason"),
+                                }
+                                _new_ctx.pop("_post_commit_pending_meta", None)
+                                refreshed.context = _new_ctx
+                                refreshed.post_commit_pending = False
+                                refreshed.post_commit_failed = True
+                                from sqlalchemy.orm.attributes import flag_modified
+
+                                flag_modified(refreshed, "context")
+                                age_session.add(refreshed)
+                                await age_session.commit()
+                    except Exception as _age_exc:
+                        # The abandon write hit the same contention. Don't poison
+                        # the batch and don't fall through to the heavy retry for a
+                        # task we've already decided to terminalize — the next
+                        # sweep re-attempts the abandon once the lock frees.
+                        logger.warning(
+                            f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} age-abandon "
+                            f"write blocked (likely row-lock contention): "
+                            f"{type(_age_exc).__name__}: {_age_exc} — retry next sweep"
+                        )
+                    continue
 
                 if (
                     attempts >= MAX_ATTEMPTS

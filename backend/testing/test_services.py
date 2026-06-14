@@ -2756,6 +2756,80 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
     assert bad_attempts == 4, f"bad task attempts should stay at 4, got {bad_attempts}"
 
 
+@pytest.mark.asyncio
+async def test_post_commit_sweep_abandons_lock_starved_marker_by_age(svc_db, mocker):
+    """Root-cause regression for the 2026-06-14 stuck-task lock-churn incident
+    (task 73281cea). A marker whose attempts/total_attempts stay LOW because its
+    bump UPDATE is perpetually row-lock-starved (LockNotAvailableError on the bump
+    → total_attempts frozen) would otherwise churn the sweep forever: the
+    MAX_TOTAL_ATTEMPTS ceiling can't fire when total_attempts can't advance. The
+    wall-clock backstop must terminalize it by age (first_pending_at older than
+    POST_COMMIT_MAX_PENDING_AGE_S) WITHOUT invoking the heavy retry.
+
+    Would FAIL pre-fix: an old marker with low counters is neither abandoned
+    (neither ceiling met) nor cleared (the retry keeps failing) → pending forever,
+    and _process_post_commit is invoked every sweep."""
+    import uuid as _uuid
+    from datetime import timedelta as _td
+    from app.recovery_sweeps import POST_COMMIT_MAX_PENDING_AGE_S
+
+    project = await _make_project(svc_db)
+    stuck_id = _uuid.uuid4()
+    old_ts = (
+        _naive_utcnow() - _td(seconds=POST_COMMIT_MAX_PENDING_AGE_S + 600)
+    ).isoformat()
+    stuck = Task(
+        id=stuck_id,
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "stuck"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={
+            "_post_commit_pending_meta": {
+                "at": old_ts,
+                "first_pending_at": old_ts,
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": str(stuck_id),
+                    "status": "COMPLETED",
+                    "logs": "{}",
+                },
+                # LOW counters: neither the 5-attempt nor the 20-total ceiling
+                # would fire — only the age backstop can terminalize this.
+                "attempts": 1,
+                "total_attempts": 2,
+            }
+        },
+    )
+    svc_db.add(stuck)
+    await svc_db.commit()
+
+    # The age backstop must short-circuit BEFORE the heavy retry runs.
+    called: list[str] = []
+
+    async def fake_process(task_id, _payload):
+        called.append(str(task_id))
+        raise RuntimeError("retry must not run for an age-terminalized marker")
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit", side_effect=fake_process
+    )
+
+    await _sweep_post_commit_pending()
+
+    assert called == [], "heavy retry should be short-circuited by the age backstop"
+
+    await svc_db.refresh(stuck)
+    assert stuck.post_commit_pending is False
+    assert stuck.post_commit_failed is True
+    ctx = stuck.context or {}
+    assert "_post_commit_pending_meta" not in ctx, "stale pending marker must be cleared"
+    abandoned = ctx.get("_post_commit_abandoned") or {}
+    assert abandoned.get("reason") == "max_pending_age_exceeded"
+    assert abandoned.get("after_pending_age_s", 0) >= POST_COMMIT_MAX_PENDING_AGE_S
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # C6: _sweep_post_commit_pending — transient failures must NOT burn the cap
 # ══════════════════════════════════════════════════════════════════════════════
