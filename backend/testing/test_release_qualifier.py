@@ -13991,6 +13991,112 @@ async def test_promote_genuine_merge_block_still_fails(db_session, mocker):
 
 
 # ===========================================================================
+# No-CI repo promotion: managed_check_wait instead of native auto-merge
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_promote_no_ci_repo_does_not_wait_on_native_automerge(
+    db_session, mocker
+):
+    """promote() on a no-CI repo must NOT hand the PR to GitHub native auto-merge.
+
+    When the promotion PR does not merge immediately (GitHub 405 / merged=False,
+    no conflict), the normal path enables GitHub native auto-merge and waits for
+    CI checks to trigger it.  On a no-CI repo no checks will ever run, so native
+    auto-merge never fires and the version strands indefinitely.
+
+    The fix: when ``requires_ci_checks(project)`` is False, promote() must enter
+    ``managed_check_wait`` (same retryable sub-state as migration-carrying PRs)
+    instead of calling ``enable_auto_merge``.  The reconciler sweep will then
+    retry the merge directly without waiting for non-existent checks.
+    """
+    # Build a no-CI project (build_config.requires_ci_checks=False).
+    project = Project(
+        name="NoCiRepo",
+        user_id="noci-user",
+        github_owner="acme",
+        github_repo="noci",
+        integration_branch="automain",
+        promotion_target="main",
+        build_config={"requires_ci_checks": False},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    candidate = "noci0001" * 5
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_pull_request_merge_state",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 55, "html_url": "http://pr/55"}),
+    )
+    # The merge returns merged=False (no conflict) — GitHub is waiting on checks.
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": False, "conflict": False}),
+    )
+    auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new=AsyncMock(return_value={"enabled": True}),
+    )
+    delete_branch_mock = mocker.patch(
+        "app.github.delete_branch", new=AsyncMock(return_value=True)
+    )
+    # No migrations touched — migration guard is not the trigger.
+    mocker.patch(
+        "app.rollup_migration_validation.pr_touches_migrations",
+        new=AsyncMock(return_value=False),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        candidate,
+        composite={"confidence": 0.91},
+        base_record={"candidate_sha": candidate},
+    )
+    await db_session.commit()
+
+    # Must NOT call enable_auto_merge — checks will never run.
+    auto_merge_mock.assert_not_called()
+    # Release branch kept — the reconciler needs it.
+    delete_branch_mock.assert_not_awaited()
+
+    # Result is a retryable managed_check_wait, NOT pending_auto_merge.
+    assert result["status"] == "pending_managed_check_wait"
+    assert result["managed_check_wait"] is True
+    assert result["pr_number"] == 55
+    assert result["pr_url"] == "http://pr/55"
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["auto_merge_enabled"] is False
+    assert pending["why_not_native_automerge"] == "no_ci_repo"
+    assert pending["pr_number"] == 55
+    # No terminal failure.
+    assert "error" not in version.last_qualification
+
+
+# ===========================================================================
 # Round 5 — R4-H2: release-branch deletion after a successful promotion
 # ===========================================================================
 

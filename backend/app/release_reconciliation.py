@@ -51,7 +51,7 @@ from app.release_promotion import (
     _resolve_github_with_session,
 )
 from app.rollup_migration_validation import _validate_migration_chain_post_merge
-from app.release_scoring import _CI_GREEN, _CI_PENDING, _CI_RED, _classify_check_runs
+from app.release_scoring import _CI_GREEN, _CI_NO_CHECKS, _CI_PENDING, _CI_RED, _classify_check_runs
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -1577,23 +1577,39 @@ async def _reconcile_if_managed_check_wait(
                 return True
 
             if ci_state != _CI_GREEN:
-                # Checks pending or no-checks — leave pending for next sweep.
-                classified_at = _utcnow()
-                await _persist_managed_check_wait_snapshot(
-                    session,
-                    version.id,
-                    pr_number=int(pr_number),
-                    ci_state=ci_state,
-                    snapshot=_managed_check_wait_snapshot(
-                        ci_state=ci_state,
-                        classified_at=classified_at,
-                        head_sha=pr_head_sha,
-                        check_result=check_result,
-                    ),
-                )
-                return False
+                # For a no-CI repo, a definitive no_checks result means CI will
+                # never run — treat it as "proceed" and fall through to the merge
+                # step rather than leaving the version stranded waiting on checks
+                # that cannot run.
+                from app.ci_resolution import requires_ci_checks
 
-            # 4. CI is green — re-run the Alembic dual-head guard before merging.
+                if ci_state == _CI_NO_CHECKS and not requires_ci_checks(project):
+                    logger.info(
+                        "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
+                        "for v%d reports no_checks on a no-CI repo — proceeding "
+                        "to merge attempt",
+                        pr_number,
+                        version.version_number,
+                    )
+                else:
+                    # Checks pending or no-checks on a CI-gated repo — leave
+                    # pending for the next sweep.
+                    classified_at = _utcnow()
+                    await _persist_managed_check_wait_snapshot(
+                        session,
+                        version.id,
+                        pr_number=int(pr_number),
+                        ci_state=ci_state,
+                        snapshot=_managed_check_wait_snapshot(
+                            ci_state=ci_state,
+                            classified_at=classified_at,
+                            head_sha=pr_head_sha,
+                            check_result=check_result,
+                        ),
+                    )
+                    return False
+
+            # 4. CI is green (or no_checks on a no-CI repo) — re-run the Alembic dual-head guard before merging.
             # Use the 3-way verdict so 'defer' (metadata temporarily unavailable)
             # leaves the version pending for the next sweep without cleanup, while
             # 'block' (genuine collision) records the terminal failure.

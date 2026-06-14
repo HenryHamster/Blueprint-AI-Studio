@@ -1335,6 +1335,46 @@ async def promote(
                 "pr_url": pr_url,
                 "managed_check_wait": True,
             }
+
+        # No-CI repo guard: if the project declares it has no CI checks, native
+        # auto-merge will never fire (no checks will ever run), so handing the
+        # PR to GitHub native auto-merge leaves the version stranded indefinitely.
+        # Enter managed_check_wait instead so the reconciler retries the merge
+        # directly on the next sweep (which will see no_checks and proceed).
+        from app.ci_resolution import requires_ci_checks
+
+        if not requires_ci_checks(project):
+            logger.info(
+                "[RELEASE_QUALIFIER] promote: promotion PR #%s for v%d pending "
+                "merge on a no-CI repo — entering managed_check_wait instead of "
+                "native auto-merge; reconciler will retry the merge directly",
+                pr_number,
+                version.version_number,
+            )
+            locked = await _relock_version_for_promotion_write(
+                session, version, lock_released=True
+            )
+            if locked is not None and locked.status == "open":
+                q = dict(locked.last_qualification or {})
+                q.update(base_record)
+                q["status"] = "pending"
+                q["promotion_pending"] = {
+                    "pr_number": pr_number,
+                    "pr_url": pr_url,
+                    "auto_merge_enabled": False,
+                    "managed_check_wait": True,
+                    "why_not_native_automerge": "no_ci_repo",
+                    "enabled_at": _utcnow().isoformat(),
+                }
+                locked.last_qualification = q
+                session.add(locked)
+            return {
+                "status": "pending_managed_check_wait",
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "managed_check_wait": True,
+            }
+
         try:
             am_result = await github.enable_auto_merge(
                 token,

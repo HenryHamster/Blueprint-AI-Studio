@@ -6021,6 +6021,87 @@ async def test_managed_check_wait_no_checks_persists_snapshot_idempotently(
 
 
 @pytest.mark.asyncio
+async def test_managed_check_wait_no_checks_no_ci_repo_proceeds_to_merge(
+    db_session, mocker
+):
+    """A managed_check_wait version on a no-CI repo with no_checks CI proceeds
+    to a merge attempt instead of persisting a snapshot and returning False.
+
+    This exercises the fall-through added at release_reconciliation.py:1586:
+    when ci_state == no_checks AND requires_ci_checks(project) is False, the
+    reconciler skips the snapshot-and-return path and falls through to the
+    Alembic guard + merge attempt.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "cafe1234" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "no_checks",
+                "conclusion": None,
+                "details": [],
+            }
+        ),
+    )
+    # Alembic guard passes (no migration files touched).
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    promoted_sha = "merge001" * 5
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=promoted_sha),
+    )
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    # Mark the project as no-CI so requires_ci_checks() returns False.
+    project.build_config = {"requires_ci_checks": False}
+    db_session.add(project)
+    candidate_sha = "abcd" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # The reconciler must proceed to merge (returns True) rather than persisting
+    # a check_snapshot and returning False — which would strand the version.
+    assert reconciled is True
+    merge_mock.assert_called_once()
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.last_qualification["status"] == "promoted"
+    assert version.promoted_sha == promoted_sha
+
+
+@pytest.mark.asyncio
 async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
     mocker,
 ):
