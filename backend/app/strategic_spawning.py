@@ -4138,6 +4138,46 @@ async def _spawn_strategic_review(
         )
         return False
 
+    # Capture project scalars — and, for strategy-only cycles, the baseline
+    # snapshots — NOW, while ``project`` is guaranteed live (it was fresh-read
+    # under the caller's lock). The payload build below takes ~30s and
+    # ``_build_recent_interventions`` COMMITs mid-way; a Cloud SQL connection
+    # drop anywhere in that window invalidates the connection and rolls the
+    # session back, which EXPIRES every ORM instance (expire_on_commit=False
+    # governs commit, not rollback). After that, any synchronous
+    # ``project.<attr>`` read lazy-loads and raises MissingGreenlet in async
+    # context. That is exactly what broke the architecture Phase1->Phase2
+    # handoff (_handle_design_doc_completion -> here): every architecture cycle
+    # stalled and the digest "latest strategic cycle" card went blank. The
+    # previous capture sat AFTER the build, so the capture line itself could
+    # raise; holding the scalars here means the post-build INSERT/finalize path
+    # never touches the expirable instance.
+    strategy_only = cycle_id is None
+    _project_id = project.id
+    _project_name = project.name
+    _base_vision: dict = {}
+    _base_problem_model: dict = {}
+    _base_running_update: str = ""
+    if strategy_only:
+        # Strategy-only cycles (no architecture Phase 1) historically minted no
+        # cycle_id and so were never recorded in StrategicCycle. With
+        # architecture_review_frequency defaulting to every 3rd cycle, ~2/3 of
+        # all strategic cycles were invisible to the digest "latest cycle" card
+        # and to the strategist's own cycle-history context — and the card had
+        # nothing fresh to show whenever the rare (and fragile) architecture
+        # cycle stalled. Mint a cycle id and snapshot the baselines so this
+        # review is recorded and finalized by the normal phase-2 completion
+        # accounting (strategic_completion.mark_phase2_completed), exactly like
+        # an architecture cycle's Phase 2.
+        cycle_id = strategic_cycle.new_cycle_id()
+        _base_vision = dict(project.vision or {})
+        _base_problem_model = dict(project.problem_model or {})
+        _base_running_update = (
+            project.running_update
+            if isinstance(project.running_update, str)
+            else ""
+        )
+
     # Build direction stats with rich data. Include `active` + `paused` +
     # `proposed`: paused entries are a strong user signal the strategic agent
     # should respect rather than re-propose; proposed entries exist so the
@@ -6027,12 +6067,9 @@ async def _spawn_strategic_review(
     # recomputed by the surviving spawner's cycle.
     from app.autonomous_research import _try_research_spawn_advisory_lock
 
-    # Capture before any rollback: rollback expires all ORM instances in the
-    # identity map (expire_on_commit=False does not apply to rollback), so
-    # accessing project.id after rollback triggers a synchronous lazy-load
-    # that raises MissingGreenlet in async context (BUG_REPORT e530efec).
-    _project_id = project.id
-
+    # ``_project_id`` was captured at function entry (before the payload build),
+    # so the rollback-expiry MissingGreenlet (BUG_REPORT e530efec) cannot bite
+    # this finalize path even when the connection dropped mid-build.
     if not await _try_research_spawn_advisory_lock(session, _project_id):
         await session.rollback()
         logger.warning(
@@ -6051,14 +6088,14 @@ async def _spawn_strategic_review(
         return False
 
     new_task = Task(
-        project_id=project.id,
-        title=f"Strategic review: {project.name}",
+        project_id=_project_id,
+        title=f"Strategic review: {_project_name}",
         description="Vision and direction review",
         payloads=[payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        context={"strategic_cycle_id": cycle_id} if cycle_id else {},
+        context={"strategic_cycle_id": cycle_id},
         strategic_cycle_id=cycle_id,
     )
     session.add(new_task)
@@ -6069,20 +6106,36 @@ async def _spawn_strategic_review(
         details={"spawned_by": "STRATEGIC_CYCLE", "phase": "strategic_review"},
     )
     session.add(history)
-    if cycle_id:
-        # Audit W2: record phase1 completion + phase2 task_id on the cycle
-        # row instead of patching vision._strategic_cycle_history JSONB.
-        await strategic_cycle.mark_phase1_completed(
+    if strategy_only:
+        # Phase-2-only cycle: create the row now (architecture cycles created
+        # theirs at design_doc spawn). ``phase1_*`` stays empty — there is no
+        # architecture phase — and the baselines were snapshotted at function
+        # entry while the instance was live. Created only after the re-armed
+        # spawn guards above passed, so a bail leaves no orphan row.
+        await strategic_cycle.create(
             session,
-            cycle_id,
-            phase2_task_id=new_task.id,
+            project_id=_project_id,
+            cycle_id=cycle_id,
+            phase1_task_id=None,
+            baseline_vision=_base_vision,
+            baseline_problem_model=_base_problem_model,
+            baseline_running_update=_base_running_update,
         )
+    # Audit W2: record phase1 completion + phase2 task_id on the cycle row
+    # instead of patching vision._strategic_cycle_history JSONB. For a
+    # strategy-only cycle this flips the just-created row to phase2_running with
+    # phase1_completed_at set (its architecture phase is a no-op).
+    await strategic_cycle.mark_phase1_completed(
+        session,
+        cycle_id,
+        phase2_task_id=new_task.id,
+    )
     await session.commit()
     # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
     from app.strategic_events import emit_strategic_cycle_started
 
     await emit_strategic_cycle_started(
-        project.id,
+        _project_id,
         new_task.id,
         2,
         cycle_id=cycle_id,
@@ -6090,7 +6143,7 @@ async def _spawn_strategic_review(
         steering_excerpt=steering_excerpt,
     )
     logger.info(
-        f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}"
+        f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {_project_id}"
     )
     return True
 
