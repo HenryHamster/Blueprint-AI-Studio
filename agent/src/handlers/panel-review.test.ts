@@ -17,6 +17,13 @@ vi.mock('../index.js', () => ({
     return '';
   }),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+  // panel-review.ts calls matchesAuthFailure(output, PROVIDER) inside
+  // throwIfLensAuthCrash on any non-zero lens exit. Default false (an ordinary
+  // crash is a genuine review failure → fail closed); the dead-auth test
+  // overrides this to true to exercise the AuthFailureError rethrow path.
+  matchesAuthFailure: vi.fn(() => false),
+  AuthFailureError: class AuthFailureError extends Error {},
+  PROVIDER: 'codex',
   // Defaults to the native-subagent (parallel) path; serial-fallback tests
   // override this to false.
   providerSupportsNativeSubagents: vi.fn(() => true),
@@ -100,6 +107,8 @@ vi.mock('child_process', () => ({
 
 import { execFileSync } from 'child_process';
 import {
+  AuthFailureError,
+  matchesAuthFailure,
   persistAndPostStatus,
   providerSupportsNativeSubagents,
   readHandlerOutput,
@@ -139,6 +148,9 @@ describe('handlePanelReview', () => {
     // path (native sub-agent / parallel) and a clean exit between tests.
     vi.mocked(providerSupportsNativeSubagents).mockReturnValue(true);
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    // mockReturnValue survives clearAllMocks, so the dead-auth test's override
+    // would leak; restore the default (an ordinary crash is not an auth failure).
+    vi.mocked(matchesAuthFailure).mockReturnValue(false);
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ title: 'Panel review PR', body: 'Review this carefully.' }),
@@ -320,6 +332,25 @@ describe('handlePanelReview', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('panel_review_lens_failed');
+  });
+
+  it('serial fallback: a lens pass crashing on dead provider auth rethrows AuthFailureError, never failing the panel closed', async () => {
+    // A dead Codex OAuth account (refresh_token_reused) made a lens pass exit
+    // non-zero with an auth-failure signature. That reviewer is UNAVAILABLE
+    // (infra), not a review verdict — it must route to the retryable
+    // AuthFailureError path (account disabled + task requeued), NOT record a
+    // terminal panel_review_lens_failed that strands a mergeable gated PR.
+    vi.mocked(providerSupportsNativeSubagents).mockReturnValue(false);
+    vi.mocked(matchesAuthFailure).mockReturnValue(true);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 1,
+      allOutput: 'refresh token already used, please sign in again',
+      lastResultText: '',
+    });
+
+    await expect(runHandler()).rejects.toBeInstanceOf(AuthFailureError);
+    // Must NOT have failed the panel closed — the gate stays open for a requeue.
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalled();
   });
 
   describe('challenge mode', () => {

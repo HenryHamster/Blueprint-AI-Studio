@@ -16,6 +16,9 @@ import {
   extractInvestigatedFiles,
   resolveBaseBranch,
   readHandlerOutput,
+  matchesAuthFailure,
+  AuthFailureError,
+  PROVIDER,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
@@ -542,6 +545,22 @@ export async function handlePanelReview(
     });
   };
 
+  // A reviewer whose agent pass crashed on dead provider auth is UNAVAILABLE —
+  // an infra condition, NOT a review verdict. Route it to the standard retryable
+  // AuthFailureError path (account auto-disabled + task requeued onto a live
+  // account) so a single dead reviewer account can never terminally fail the
+  // challenge and strand the gated PR's merge (production 2026-06-14: a dead
+  // Codex OAuth account fail-closed PR #80's challenge for hours). The provider
+  // runner already throws AuthFailureError for matched signatures, so this only
+  // fires if a non-zero exit ever surfaces auth text without the runner having
+  // thrown first. Gated on exitCode !== 0: a clean exit with an unusable verdict
+  // is a genuine review failure and still fails closed for review integrity.
+  const throwIfLensAuthCrash = (lensExitCode: number, output: string, where: string): void => {
+    if (lensExitCode !== 0 && matchesAuthFailure(output, PROVIDER)) {
+      throw new AuthFailureError(`panel review ${where} authentication failed — ${output.slice(-500)}`);
+    }
+  };
+
   const lensVerdicts = {} as Record<PanelReviewLensId, PanelReviewLensVerdict>;
 
   if (providerSupportsNativeSubagents()) {
@@ -579,6 +598,7 @@ export async function handlePanelReview(
     );
 
     if (exitCode !== 0) {
+      throwIfLensAuthCrash(exitCode, lastResultText || allOutput, 'orchestrating pass');
       await failPanelClosed(
         `orchestrating panel pass exited ${exitCode}`,
         lastResultText || allOutput.slice(-20_000),
@@ -629,6 +649,7 @@ export async function handlePanelReview(
       const rawLensVerdict = readHandlerOutput(taskId, panelReviewLensOutputType(lens.id), ws);
       const normalizedLens = normalizeLensVerdict(rawLensVerdict, lens.id);
       if (exitCode !== 0 || !normalizedLens) {
+        throwIfLensAuthCrash(exitCode, lastResultText || allOutput, `lens '${lens.id}'`);
         const reason = exitCode !== 0
           ? `lens '${lens.id}' agent pass exited ${exitCode}`
           : `lens '${lens.id}' produced no usable verdict`;
