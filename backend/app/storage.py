@@ -15,6 +15,9 @@ import datetime
 import logging
 import asyncio
 import json
+import threading
+import google.auth
+from google.auth.transport.requests import Request as _GoogleAuthRequest
 from google.cloud import storage
 
 logger = logging.getLogger(__name__)
@@ -116,6 +119,55 @@ def compute_job_id_for_artifact_uri(storage_uri: str) -> uuid.UUID | None:
         return None
 
 
+# Cloud Run delivers the default service account as token-only
+# ``google.auth.compute_engine.credentials.Credentials`` — an OAuth access token
+# with NO private key — so google-cloud-storage's *local* V4 signer raises
+# ``AttributeError: you need a private key to sign credentials``. The orchestrator
+# SA is granted ``roles/iam.serviceAccountTokenCreator`` on itself
+# (infra/terraform/iam.tf) precisely so signing can be delegated to the IAM
+# Credentials ``signBlob`` API; supplying ``service_account_email`` +
+# ``access_token`` to ``generate_signed_url`` selects that path. The ADC object is
+# cached and refreshed under a lock because signing runs in a thread pool.
+_iam_signer_lock = threading.Lock()
+_iam_signer_credentials_cache = None
+
+
+def _iam_signer_credentials():
+    """Return refreshed ADC usable for IAM-API blob signing (SA email + token)."""
+    global _iam_signer_credentials_cache
+    with _iam_signer_lock:
+        creds = _iam_signer_credentials_cache
+        if creds is None:
+            creds, _project = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            _iam_signer_credentials_cache = creds
+        if not creds.valid:
+            creds.refresh(_GoogleAuthRequest())
+        return creds
+
+
+def _generate_v4_signed_url(blob, **kwargs) -> str:
+    """Mint a V4 signed URL, delegating to IAM ``signBlob`` for token-only creds.
+
+    Tries the library's local signer first so a real private key (developer ADC
+    or unit tests) still signs without an IAM round-trip. On Cloud Run the local
+    signer raises ``AttributeError`` because the metadata-server credentials hold
+    no private key; we then sign via the IAM Credentials API by passing the
+    service-account email + access token (requires
+    ``roles/iam.serviceAccountTokenCreator`` on the runtime SA — already granted).
+    """
+    try:
+        return blob.generate_signed_url(**kwargs)
+    except AttributeError:
+        creds = _iam_signer_credentials()
+        return blob.generate_signed_url(
+            **kwargs,
+            service_account_email=creds.service_account_email,
+            access_token=creds.token,
+        )
+
+
 async def generate_download_signed_url(
     storage_uri: str, expiration_minutes: int = 60
 ) -> str:
@@ -134,7 +186,8 @@ async def generate_download_signed_url(
         blob = (
             storage.Client(project=GCP_PROJECT_ID).bucket(bucket_name).blob(object_name)
         )
-        return blob.generate_signed_url(
+        return _generate_v4_signed_url(
+            blob,
             version="v4",
             expiration=datetime.timedelta(minutes=expiration_minutes),
             method="GET",
@@ -195,7 +248,8 @@ async def generate_compute_job_artifact_upload_signed_url(
         )
         if expiration.tzinfo is None:
             expiration = expiration.replace(tzinfo=datetime.timezone.utc)
-        return blob.generate_signed_url(
+        return _generate_v4_signed_url(
+            blob,
             version="v4",
             expiration=expiration,
             method="PUT",
