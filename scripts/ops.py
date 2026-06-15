@@ -447,48 +447,9 @@ def cmd_health(_args):
 
 
 def cmd_diagnostics(_args):
-    """Pipeline diagnostics: stuck tasks, circuit breakers, queue depth."""
-    data = api("GET", "/api/admin/diagnostics")
-    print("=== PIPELINE DIAGNOSTICS ===")
-    print(f"  Queued:      {data.get('queued_count', '?')}")
-    print(f"  In progress: {data.get('in_progress_count', '?')}")
-    print(f"  Stuck:       {data.get('total_stuck_count', '?')}")
-
-    stuck = data.get('stuck_tasks', [])
-    if stuck:
-        print("\n--- Stuck Tasks ---")
-        for s in stuck:
-            tid = s.get('task_id', '?')[:8] if s.get('task_id') else '?'
-            title = (s.get('title') or '?')[:55]
-            reason = s.get('reason', '?')
-            print(f"  {tid}  {title:<55}  {reason}")
-
-    projects = data.get('projects', [])
-    if projects:
-        print("\n--- Projects ---")
-        for p in projects:
-            pid = p.get('project_id', '?')[:8]
-            cb = p.get('circuit_breaker_state', 'CLOSED')
-            q = p.get('queued_count', 0)
-            ip = p.get('in_progress_count', 0)
-            stuck_ct = p.get('stuck_count', 0)
-            print(f"  {pid}  queued={q}  running={ip}  stuck={stuck_ct}  breaker={cb}")
-
-    cbs = data.get('circuit_breakers', {})
-    if cbs:
-        print("\n--- Circuit Breakers ---")
-        for pid, cb in cbs.items():
-            state = cb.get('state', '?')
-            fails = cb.get('failure_count', 0)
-            cooldown = cb.get('cooldown_ends_at', '')
-            suffix = f"  cooldown_until={cooldown}" if cooldown else ""
-            print(f"  {pid[:8]}  state={state}  failures={fails}{suffix}")
-
-    zh = data.get('zone_health', {})
-    if zh:
-        avail = zh.get('available', '?')
-        exhausted = zh.get('exhausted', [])
-        print(f"\n  Zones: {avail} available" + (f", exhausted: {', '.join(exhausted)}" if exhausted else ""))
+    """DEPRECATED — use: python scripts/blueprint.py diagnostics"""
+    print("DEPRECATED: use python scripts/blueprint.py diagnostics")
+    sys.exit(1)
 
 
 def cmd_alerts(args):

@@ -17,11 +17,14 @@ import blueprint_api
 HELP_INVOCATIONS = [
     [],
     ["status"],
+    ["diagnostics"],
     ["tasks"],
     ["tasks", "list"],
     ["tasks", "show"],
     ["tasks", "cancel"],
     ["tasks", "requeue"],
+    ["tasks", "scope"],
+    ["tasks", "tree"],
     ["versions"],
     ["versions", "list"],
     ["versions", "show"],
@@ -57,6 +60,26 @@ def mock_api(monkeypatch):
 
     def fake_api(method, path, body=None, timeout=30):
         calls.append((method, path, body))
+        if "/admin/diagnostics" in path:
+            return {
+                "stuck_tasks": [
+                    {"task_id": "aabbccdd-0000-0000-0000-000000000000",
+                     "title": "stuck task", "reason": "HEARTBEAT_STALE",
+                     "stuck_for_seconds": 3600},
+                    {"task_id": "eeff0011-0000-0000-0000-000000000000",
+                     "title": "another stuck", "reason": "HEARTBEAT_STALE",
+                     "stuck_for_seconds": 900},
+                ],
+                "circuit_breakers": {
+                    "proj-1": {"state": "CLOSED", "failure_count": 0,
+                               "cooldown_ends_at": None},
+                },
+                "direction_remediation": [],
+                "total_stuck_count": 2,
+                "queued_count": 2,
+                "in_progress_count": 5,
+                "warnings": [],
+            }
         if "/admin/state" in path:
             return {
                 "deploy": {
@@ -199,6 +222,76 @@ def test_status_error_path(monkeypatch, capsys):
     assert "fleet" in parsed
 
 
+def test_diagnostics_json(mock_api, capsys):
+    """diagnostics --json surfaces stuck-task, circuit-breaker, and grouped-failure
+    sections, with grouped_failures derived client-side from the fetched stuck tasks."""
+    rc = blueprint.main(["--json", "diagnostics"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+
+    # stuck_tasks passes through as a list from the API
+    assert isinstance(parsed["stuck_tasks"], list)
+    assert len(parsed["stuck_tasks"]) == 2
+
+    # circuit_breakers passes through as a dict keyed by project id
+    assert isinstance(parsed["circuit_breakers"], dict)
+    assert parsed["circuit_breakers"]["proj-1"]["state"] == "CLOSED"
+
+    # grouped_failures is computed client-side by reason — both stuck tasks
+    # share HEARTBEAT_STALE, so it collapses to one key with two task ids
+    assert isinstance(parsed["grouped_failures"], dict)
+    assert "HEARTBEAT_STALE" in parsed["grouped_failures"]
+    assert len(parsed["grouped_failures"]["HEARTBEAT_STALE"]) == 2
+
+    # summary counts come straight from the diagnostics payload
+    assert parsed["total_stuck"] == 2
+    assert parsed["queued_count"] == 2
+    assert parsed["in_progress_count"] == 5
+
+    # exactly one diagnostics GET — grouping must not trigger extra API calls
+    diag_calls = [p for m, p, _ in mock_api if "/admin/diagnostics" in p]
+    assert len(diag_calls) == 1
+
+
+def test_diagnostics_groups_by_stuck_reason_field(mock_api, monkeypatch, capsys):
+    """Grouping falls back to the live API's `stuck_reason` field when `reason`
+    is absent, so triage works against the deployed endpoint shape."""
+    def fake_api(method, path, body=None, timeout=30):
+        return {
+            "stuck_tasks": [
+                {"task_id": "11", "title": "a", "stuck_reason": "no_heartbeat"},
+                {"task_id": "22", "title": "b", "stuck_reason": "long_queued"},
+            ],
+            "circuit_breakers": {},
+            "total_stuck_count": 2,
+            "queued_count": 0,
+            "in_progress_count": 0,
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    rc = blueprint.main(["--json", "diagnostics"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert set(parsed["grouped_failures"]) == {"no_heartbeat", "long_queued"}
+
+
+def test_diagnostics_error_path(monkeypatch, capsys):
+    """A diagnostics endpoint failure degrades to an error dict, not a crash."""
+    def fail_api(method, path, body=None, timeout=30):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(blueprint, "api", fail_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["--json", "diagnostics"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "diagnostics" in parsed["errors"]
+    assert "connection refused" in parsed["errors"]["diagnostics"]
+    assert parsed["stuck_tasks"] == []
+    assert parsed["grouped_failures"] == {}
+
+
 def test_tasks_list_json(mock_api, capsys):
     rc = blueprint.main(["--json", "tasks", "list", "--status", "IN_PROGRESS"])
     assert rc == 0
@@ -280,6 +373,124 @@ def test_logs_graceful_when_gcloud_missing(monkeypatch, capsys):
     assert rc == 0
     err = capsys.readouterr().err
     assert "gcloud not found" in err
+
+
+def test_tasks_scope_json(mock_api, capsys):
+    """tasks scope --json returns id, prompt, and metadata for a task."""
+    rc = blueprint.main(["--json", "tasks", "scope", "task-123"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["id"] == "task-123"
+    # prompt key is present (may be empty string if fixture has none)
+    assert "prompt" in parsed
+    assert "prompt_length" in parsed
+
+
+def test_tasks_scope_human_render(mock_api, capsys):
+    """tasks scope human output includes the task id and status."""
+    rc = blueprint.main(["tasks", "scope", "task-123"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "task-123"[:8] in out
+    assert "IN_PROGRESS" in out
+
+
+def test_tasks_scope_verbose_flag_accepted(mock_api, capsys):
+    """-v flag is accepted without error."""
+    rc = blueprint.main(["tasks", "scope", "task-123", "-v"])
+    assert rc == 0
+
+
+def _make_tree_api(monkeypatch):
+    """Return a mock_api fixture that includes child_task_ids for tree tests."""
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if "/tasks/child-456" in path:
+            return {
+                "id": "child-456",
+                "title": "child task",
+                "task_type": "create",
+                "status": "COMPLETED",
+                "created_at": "2026-06-15T00:00:00Z",
+                "payloads": [{"type": "create", "pr_number": 99}],
+                "context": {"pr_merged": True},
+                "child_task_ids": [],
+            }
+        if "/tasks/task-123" in path:
+            return {
+                "id": "task-123",
+                "title": "parent task",
+                "task_type": "research",
+                "status": "EVALUATING",
+                "created_at": "2026-06-15T00:00:00Z",
+                "payloads": [{"type": "research", "prompt": "do research"}],
+                "context": {},
+                "child_task_ids": ["child-456"],
+            }
+        if "/tasks" in path:
+            return {"tasks": [], "total": 0}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    return calls
+
+
+def test_tasks_tree_json(monkeypatch, capsys):
+    """tasks tree --json renders parent plus children with status/PR/merge state."""
+    calls = _make_tree_api(monkeypatch)
+    rc = blueprint.main(["--json", "tasks", "tree", "task-123"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    # parent is present
+    assert parsed["parent"]["id"] == "task-123"
+    assert parsed["parent"]["status"] == "EVALUATING"
+    # child is present with merge state
+    assert len(parsed["children"]) == 1
+    child = parsed["children"][0]
+    assert child["id"] == "child-456"
+    assert child["status"] == "COMPLETED"
+    assert child["context"]["pr_merged"] is True
+    # both parent and child were fetched
+    fetched_paths = [p for _, p, _ in calls if "/tasks/" in p]
+    assert any("task-123" in p for p in fetched_paths)
+    assert any("child-456" in p for p in fetched_paths)
+
+
+def test_tasks_tree_human_render(monkeypatch, capsys):
+    """Human-readable tree output includes status icon and merge state."""
+    _make_tree_api(monkeypatch)
+    rc = blueprint.main(["tasks", "tree", "task-123"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "TREE" in out
+    assert "merged=" in out
+    # child is rendered (COMPLETED → icon D)
+    assert "[D]" in out
+
+
+def test_tasks_tree_no_children(monkeypatch, capsys):
+    """tree renders a no-children message when child_task_ids is empty."""
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        return {
+            "id": "task-123", "title": "parent", "task_type": "research",
+            "status": "IN_PROGRESS", "payloads": [], "context": {},
+            "child_task_ids": [],
+        }
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["tasks", "tree", "task-123"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no children" in out
 
 
 def test_tasks_cancel_requeue_guards(mock_api, monkeypatch, capsys):

@@ -13,6 +13,7 @@ the global ``--json`` flag is passed (before or after the subcommand).
 
 Subcommand groups:
     status            current version phase, deploy state, promotion eligibility
+    diagnostics       stuck tasks, circuit breakers, grouped failure modes
     tasks list|show   list/filter tasks, or show one by id
     versions list|show  release versions with phase/status/sha and a summary
     promote-recover   promotion + recovery operator levers (confirm before mutate)
@@ -21,6 +22,7 @@ Subcommand groups:
 Examples:
     python scripts/blueprint.py status
     python scripts/blueprint.py --json status
+    python scripts/blueprint.py diagnostics
     python scripts/blueprint.py tasks list --status IN_PROGRESS --type create
     python scripts/blueprint.py tasks show 7ab3f93a
     python scripts/blueprint.py versions show
@@ -179,10 +181,91 @@ def _render_status(data: dict) -> None:
             print(f"  {endpoint}: {err}")
 
 
+# ── diagnostics ──────────────────────────────────────────────────────────────
+
+def cmd_diagnostics(args: argparse.Namespace) -> None:
+    """Pipeline triage: stuck tasks, circuit breakers, grouped failure modes.
+
+    Read-only view over GET /api/admin/diagnostics. Groups the returned stuck
+    tasks by failure reason client-side (no extra API call) so the operator can
+    see at a glance which failure mode dominates. Uses ``_safe_read`` so a
+    diagnostics-endpoint failure degrades to an error dict rather than crashing.
+    """
+    diag, err = _safe_read("/api/admin/diagnostics")
+    diag = diag or {}
+    stuck_tasks = diag.get("stuck_tasks") or []
+    circuit_breakers = diag.get("circuit_breakers") or {}
+
+    grouped: dict = {}
+    for task in stuck_tasks:
+        # The live API emits ``stuck_reason``; the documented shape calls it
+        # ``reason``. Accept either so grouping works against both.
+        reason = task.get("reason") or task.get("stuck_reason") or "unknown"
+        grouped.setdefault(reason, []).append(task.get("task_id"))
+
+    data = {
+        "stuck_tasks": stuck_tasks,
+        "circuit_breakers": circuit_breakers,
+        "grouped_failures": grouped,
+        "total_stuck": diag.get("total_stuck_count", len(stuck_tasks)),
+        "queued_count": diag.get("queued_count"),
+        "in_progress_count": diag.get("in_progress_count"),
+        "warnings": diag.get("warnings") or [],
+        "errors": {"diagnostics": err} if err else {},
+    }
+    _emit(args, data, _render_diagnostics)
+
+
+def _render_diagnostics(data: dict) -> None:
+    print("=== DIAGNOSTICS ===")
+    print(f"  stuck={data.get('total_stuck')}  queued={data.get('queued_count')}  "
+          f"in_progress={data.get('in_progress_count')}")
+
+    stuck = data.get("stuck_tasks") or []
+    print("\n=== STUCK TASKS ===")
+    if not stuck:
+        print("  (none)")
+    else:
+        for s in stuck:
+            tid = (s.get("task_id") or "?")[:8]
+            title = (s.get("title") or "")[:50]
+            reason = s.get("reason") or s.get("stuck_reason") or "?"
+            secs = s.get("stuck_for_seconds")
+            secs_str = f"  {secs}s" if secs is not None else ""
+            print(f"  {tid}  {reason:18} {title}{secs_str}")
+
+    cbs = data.get("circuit_breakers") or {}
+    print("\n=== CIRCUIT BREAKERS ===")
+    if not cbs:
+        print("  (none)")
+    else:
+        for pid, cb in cbs.items():
+            state = (cb or {}).get("state", "?")
+            fails = (cb or {}).get("failure_count", 0)
+            cooldown = (cb or {}).get("cooldown_ends_at")
+            suffix = f"  cooldown_until={cooldown}" if cooldown else ""
+            print(f"  {pid[:8]}  state={state}  failures={fails}{suffix}")
+
+    grouped = data.get("grouped_failures") or {}
+    print("\n=== GROUPED FAILURES ===")
+    if not grouped:
+        print("  (none)")
+    else:
+        for reason, ids in sorted(grouped.items(), key=lambda kv: -len(kv[1])):
+            sample = ", ".join((i or "?")[:8] for i in ids)
+            print(f"  {reason:18} {len(ids)}  ({sample})")
+
+    errors = data.get("errors") or {}
+    if errors:
+        print("\n=== READ ERRORS (diagnostics unavailable) ===")
+        for endpoint, e in errors.items():
+            print(f"  {endpoint}: {e}")
+
+
 # ── tasks ──────────────────────────────────────────────────────────────────--
 
 def cmd_tasks(args: argparse.Namespace) -> None:
-    """Dispatch ``tasks list`` / ``tasks show`` / ``tasks cancel`` / ``tasks requeue``."""
+    """Dispatch task subcommands: list / show / cancel / requeue / scope / tree."""
     sub = getattr(args, "tasks_cmd", None) or "list"
     if sub == "show":
         _tasks_show(args)
@@ -190,6 +273,10 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_cancel(args)
     elif sub == "requeue":
         _tasks_requeue(args)
+    elif sub == "scope":
+        _tasks_scope(args)
+    elif sub == "tree":
+        _tasks_tree(args)
     else:
         _tasks_list(args)
 
@@ -283,6 +370,90 @@ def _tasks_requeue(args: argparse.Namespace) -> None:
 def _tasks_show(args: argparse.Namespace) -> None:
     task = api("GET", f"/api/admin/tasks/{args.task_id}")
     _emit(args, task, _render_task_detail)
+
+
+def _tasks_scope(args: argparse.Namespace) -> None:
+    task = api("GET", f"/api/admin/tasks/{args.task_id}")
+    verbose = getattr(args, "verbose", False)
+    payload = first_payload(task)
+    prompt = payload.get("prompt", "")
+    ctx = task.get("context") or {}
+    data = {
+        "id": task.get("id"),
+        "title": task.get("title"),
+        "task_type": task.get("task_type"),
+        "status": task.get("status"),
+        "prompt": prompt,
+        "prompt_length": len(prompt),
+        "research_question": ctx.get("research_question"),
+        "scope": ctx.get("scope"),
+    }
+    _emit(args, data, lambda d: _render_task_scope(d, verbose))
+
+
+def _render_task_scope(d: dict, verbose: bool) -> None:
+    tid = (d.get("id") or "?")[:8]
+    print(f"=== {tid} [{d.get('task_type', '?')}] {d.get('status', '?')} ===")
+    print(f"  Title: {d.get('title', '?')}")
+    rq = d.get("research_question")
+    if rq:
+        print(f"\n  Research Question:\n    {rq}")
+    scope = d.get("scope")
+    if scope:
+        print(f"\n  Scope: {scope}")
+    prompt = d.get("prompt", "")
+    if prompt:
+        limit = len(prompt) if verbose else 500
+        print(f"\n  Prompt ({d.get('prompt_length')} chars):")
+        print(f"    {prompt[:limit]}")
+        if not verbose and len(prompt) > limit:
+            print(f"    ... ({len(prompt) - limit} more chars, use -v for full)")
+
+
+def _tasks_tree(args: argparse.Namespace) -> None:
+    parent = api("GET", f"/api/admin/tasks/{args.parent_id}")
+    child_ids = parent.get("child_task_ids") or []
+    show_all = getattr(args, "all", False)
+    children = []
+    for cid in child_ids:
+        try:
+            child = api("GET", f"/api/admin/tasks/{cid}")
+            children.append(child)
+        except Exception:  # noqa: BLE001
+            children.append({"id": cid, "status": "UNKNOWN", "title": "(fetch failed)"})
+
+    if not show_all:
+        children = [
+            c for c in children
+            if first_payload(c).get("type") not in ("review", "fix", "debug")
+            and c.get("task_type") not in ("review", "fix", "debug")
+        ]
+
+    data = {"parent": parent, "children": children}
+    _emit(args, data, _render_task_tree)
+
+
+def _render_task_tree(data: dict) -> None:
+    p = data["parent"]
+    pid = (p.get("id") or "?")[:8]
+    print(f"=== TREE {pid} ===")
+    print(f"  [{p.get('status', '?'):13}] {pid}  {p.get('title', '?')[:70]}")
+    children = data["children"]
+    if not children:
+        print("  (no children)")
+        return
+    icons = {"QUEUED": "Q", "PROVISIONING": "P", "IN_PROGRESS": "R",
+             "COMPLETED": "D", "FAILED": "F", "CANCELLED": "X",
+             "EVALUATING": "E", "UNKNOWN": "?"}
+    print(f"\n  Children ({len(children)}):")
+    for c in children:
+        cid = (c.get("id") or "?")[:8]
+        status = c.get("status", "?")
+        icon = icons.get(status, "?")
+        merged = (c.get("context") or {}).get("pr_merged", False)
+        pr = first_payload(c).get("pr_number", "-")
+        title = (c.get("title") or "")[:55]
+        print(f"    [{icon}] {cid}  merged={str(merged):<5}  pr={pr:<4}  {title}")
 
 
 def _render_task_detail(t: dict) -> None:
@@ -660,8 +831,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="blueprint",
-        description="Unified Blueprint operator CLI (status/tasks/versions/"
-                    "promote-recover/logs).",
+        description="Unified Blueprint operator CLI (status/diagnostics/tasks/"
+                    "versions/promote-recover/logs).",
         parents=[common],
     )
     sub = parser.add_subparsers(dest="command")
@@ -669,6 +840,10 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     sub.add_parser("status", parents=[common],
                    help="Version phase, deploy state, and promotion eligibility.")
+
+    # diagnostics
+    sub.add_parser("diagnostics", parents=[common],
+                   help="Stuck tasks, circuit breakers, and grouped failure modes.")
 
     # tasks
     p_tasks = sub.add_parser("tasks", parents=[common], help="List or show tasks.")
@@ -693,6 +868,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_tasks_requeue.add_argument("task_id", help="Task id (full uuid).")
     p_tasks_requeue.add_argument("--yes", action="store_true",
                                  help="Skip the confirmation prompt (for scripting).")
+    p_tasks_scope = tasks_sub.add_parser("scope", parents=[common],
+                                         help="Show prompt, research question, and payload scope for a task.")
+    p_tasks_scope.add_argument("task_id", help="Task id (full uuid).")
+    p_tasks_scope.add_argument("-v", "--verbose", action="store_true",
+                               help="Show full prompt text (default truncates at 500 chars).")
+    p_tasks_tree = tasks_sub.add_parser("tree", parents=[common],
+                                        help="Show a parent task and its children with status/PR/merge state.")
+    p_tasks_tree.add_argument("parent_id", help="Parent task id (full uuid).")
+    p_tasks_tree.add_argument("--all", action="store_true",
+                              help="Include review/fix/debug children (hidden by default).")
 
     # versions
     p_versions = sub.add_parser("versions", parents=[common],
@@ -742,6 +927,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 _DISPATCH = {
     "status": cmd_status,
+    "diagnostics": cmd_diagnostics,
     "tasks": cmd_tasks,
     "versions": cmd_versions,
     "promote-recover": cmd_promote_recover,
