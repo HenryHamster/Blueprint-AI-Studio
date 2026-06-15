@@ -165,6 +165,10 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
         "ground_truth": "Task.format_compliance_summary",
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)",
     },
+    "llm_cost_attribution": {
+        "ground_truth": "Task.llm_*_tokens_banked + api_call_summary tokens priced via LLM_TOKEN_PRICING",
+        "consumer": "read_baseline_with_drift -> llm_cost_attribution (strategic_spawning digest payload)",
+    },
 }
 
 # LLM token pricing table: (provider, model) -> (input_$/token, output_$/token).
@@ -263,7 +267,10 @@ _SNAPSHOT_HISTORY_MAX = 365
 #     accumulator to a windowed figure matching the dispatch-funnel window.
 # v7: three improvement-lane axes registered (lane_cost_per_merged_pr,
 #     lane_warm_resume_rate, checkpoint_loss_rate).
-METRIC_DEF_VERSION = "v7"
+# v8: per-driver LLM cost attribution block (by_model, by_task_type, rework_share,
+#     total_llm_usd) folded into the daily snapshot for retroactive decomposition
+#     of llm_cost_per_merged_pr drift.
+METRIC_DEF_VERSION = "v8"
 
 
 async def _load_recent_tasks(
@@ -2362,6 +2369,40 @@ def _compute_cold_start_breakdown_p50(
     }
 
 
+def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
+    """Compact per-driver LLM cost breakdown for durable daily snapshot storage.
+
+    Calls the three existing pure helpers (compute_llm_cost_breakdown,
+    compute_llm_cost_by_task_type, compute_pr_rework_chain_breakdown) and keeps
+    only the dollar-total fields needed for retroactive drift decomposition:
+    per-(provider,model) cost, per-task-type cost, and the first-pass/rework
+    split.  Priced rows only in by_model so zero-cost unpriced combos don't
+    inflate the block; unpriced_coverage carries the honesty signal.
+    """
+    breakdown = compute_llm_cost_breakdown(tasks)
+    by_type_rows = compute_llm_cost_by_task_type(tasks)
+    rework = compute_pr_rework_chain_breakdown(tasks)
+
+    total_usd = round(breakdown["totals"]["total_cost_usd"], 6)
+    by_model = [
+        {"provider": r["provider"], "model": r["model"], "cost_usd": r["total_cost_usd"]}
+        for r in breakdown["by_model"]
+        if r.get("priced") and r["total_cost_usd"] > 0
+    ]
+    by_task_type = [
+        {"task_type": r["task_type"], "cost_usd": r["total_cost_usd"]}
+        for r in by_type_rows
+        if r["total_cost_usd"] > 0
+    ]
+    return {
+        "by_model": by_model,
+        "by_task_type": by_task_type,
+        "rework_share": rework.get("rework_share_of_total_llm_cost"),
+        "total_llm_usd": total_usd,
+        "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
+    }
+
+
 async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
@@ -2454,6 +2495,15 @@ async def compute_current_axes(
             "overall"
         ],
         "format_compliance_by_type": _fc["by_type"],
+        # Durable per-driver LLM cost attribution (v8): compact breakdown of
+        # total LLM dollars by (provider,model), by task-type, and by
+        # first-pass/rework split. Folded into the daily snapshot so the
+        # llm_cost_per_merged_pr drift observed across days can be decomposed
+        # retroactively — which model, which task type, or which rework share
+        # drove the change — without relying on the on-demand live endpoint
+        # (which only covers the current window). Reconciles with the scalar
+        # llm_cost_per_merged_pr axis via the shared _task_llm_attempts path.
+        "llm_cost_attribution": _compact_llm_cost_attribution(tasks),
     }
 
 
@@ -2504,7 +2554,7 @@ async def write_snapshot(
                         "seeded_at": captured_at,
                         "snapshot_captured_at": captured_at,
                     }
-            for _key in ("agent_timeout_rate", FORMAT_COMPLIANCE_KEY):
+            for _key in ("agent_timeout_rate", FORMAT_COMPLIANCE_KEY, "llm_cost_attribution"):
                 if snapshot.get(_key) is not None:
                     _prov[_key] = {
                         "seeded_at": captured_at,
@@ -2526,7 +2576,7 @@ async def write_snapshot(
             # calls find provenance already populated and skip this block.
             existing_snapshots = list(container.get("snapshots") or [])
             if not provenance and existing_snapshots:
-                for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY]:
+                for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY, "llm_cost_attribution"]:
                     _bval = baseline.get(_member)
                     if _bval is None:
                         continue
@@ -2611,6 +2661,15 @@ async def write_snapshot(
             ):
                 baseline[FORMAT_COMPLIANCE_KEY] = snapshot[FORMAT_COMPLIANCE_KEY]
                 provenance[FORMAT_COMPLIANCE_KEY] = {
+                    "seeded_at": captured_at,
+                    "snapshot_captured_at": captured_at,
+                }
+            if (
+                baseline.get("llm_cost_attribution") is None
+                and snapshot.get("llm_cost_attribution") is not None
+            ):
+                baseline["llm_cost_attribution"] = snapshot["llm_cost_attribution"]
+                provenance["llm_cost_attribution"] = {
                     "seeded_at": captured_at,
                     "snapshot_captured_at": captured_at,
                 }
@@ -2735,13 +2794,33 @@ async def read_baseline_with_drift(
         if snap.get("pool_dispatch_funnel")
     ]
 
+    # Durable per-driver LLM cost attribution trend: day-over-day series of
+    # the compact attribution block's headline scalars (rework_share +
+    # total_llm_usd) so an operator can confirm that a fix reduced rework spend
+    # or that a specific model's share contracted across consecutive snapshots.
+    # Mirrors the reuse_dropout_trend pattern: omits snapshots that predate v8
+    # (those have no llm_cost_attribution key and are naturally excluded).
+    llm_cost_attribution_trend = [
+        {
+            "captured_at": snap.get("captured_at"),
+            "rework_share": (snap.get("llm_cost_attribution") or {}).get(
+                "rework_share"
+            ),
+            "total_llm_usd": (snap.get("llm_cost_attribution") or {}).get(
+                "total_llm_usd"
+            ),
+        }
+        for snap in snapshots
+        if snap.get("llm_cost_attribution")
+    ]
+
     # Per-member provenance: records when each baseline member was seeded and
     # from which snapshot's window its value came.  For baselines that predate
     # provenance recording, infer retroactively on the read path (not persisted
     # here — the next write_snapshot will persist it inside the lock).
     member_provenance: Dict[str, Any] = dict(baseline.get("_member_provenance") or {})
     if not member_provenance and snapshots:
-        for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY]:
+        for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY, "llm_cost_attribution"]:
             _bval = baseline.get(_member)
             if _bval is None:
                 continue
@@ -2998,6 +3077,13 @@ async def read_baseline_with_drift(
         # keyed by task type.  None for snapshots that predate this field (no
         # baseline/drift semantics — snapshot-only observability field).
         "format_compliance_by_type": latest.get("format_compliance_by_type"),
+        # Durable per-driver LLM cost attribution from the latest snapshot: compact
+        # breakdown of total LLM dollars by (provider,model), by task-type, and by
+        # first-pass/rework split (llm_cost_attribution) plus a day-over-day trend
+        # of the headline scalars so drift can be decomposed retroactively instead
+        # of only reading that llm_cost_per_merged_pr changed.
+        "llm_cost_attribution": latest.get("llm_cost_attribution"),
+        "llm_cost_attribution_trend": llm_cost_attribution_trend,
     }
 
 

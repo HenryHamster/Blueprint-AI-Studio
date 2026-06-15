@@ -1010,6 +1010,19 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
             "dominant_subtype": raw_atr.get("dominant_subtype"),
             "dominant_share": raw_atr.get("dominant_share"),
         }
+    raw_attr = snapshot.get("llm_cost_attribution") or {}
+    if raw_attr:
+        by_model = raw_attr.get("by_model") or []
+        by_type = raw_attr.get("by_task_type") or []
+        result["llm_cost_attribution"] = {
+            "total_llm_usd": raw_attr.get("total_llm_usd"),
+            "rework_share": raw_attr.get("rework_share"),
+            # Dominant driver signals: the single highest-cost model and task type
+            # so the strategist sees WHY llm_cost_per_merged_pr drifted, not just
+            # THAT it did.  Both are sorted desc by cost_usd by _compact_llm_cost_attribution.
+            "dominant_model": by_model[0] if by_model else None,
+            "dominant_task_type": by_type[0] if by_type else None,
+        }
     return result
 
 

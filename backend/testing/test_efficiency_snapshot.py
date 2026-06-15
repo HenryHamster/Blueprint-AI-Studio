@@ -5917,3 +5917,141 @@ def test_pr_chain_rework_empty_task_list():
     assert result["rework_share_of_total_vm_cost"] is None
     assert result["top_rework_prs"] == []
     assert result["unpriced_chain_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# llm_cost_attribution snapshot persistence tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_attribution_persisted_in_snapshot(db_session):
+    """write_snapshot stores a compact llm_cost_attribution block with by_model,
+    by_task_type, rework_share, and total_llm_usd so LLM cost drift is
+    decomposable from persisted history without the on-demand live endpoint.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # create task (first-pass): merged, 2000 in + 1000 out
+    create_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 42}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # fix task (rework) for same PR: 1000 in + 500 out
+    fix_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "fix", "pr_number": 42}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(create_task)
+    db_session.add(fix_task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    attr = snap.get("llm_cost_attribution")
+    assert attr is not None, "llm_cost_attribution must be present in snapshot"
+
+    expected_create_cost = round(2000 * input_rate + 1000 * output_rate, 6)
+    expected_fix_cost = round(1000 * input_rate + 500 * output_rate, 6)
+    expected_total = round(expected_create_cost + expected_fix_cost, 6)
+
+    assert attr["total_llm_usd"] == pytest.approx(expected_total, abs=1e-9)
+    assert attr["by_model"], "by_model must not be empty for priced tasks"
+    sonnet_row = next(
+        (r for r in attr["by_model"] if r["model"] == "claude-sonnet-4-6"), None
+    )
+    assert sonnet_row is not None, "claude-sonnet-4-6 must appear in by_model"
+    assert sonnet_row["cost_usd"] == pytest.approx(expected_total, abs=1e-9)
+
+    # Rework share: fix task is rework; create task is first-pass — both on PR 42.
+    assert attr["rework_share"] is not None
+    expected_rework_share = round(expected_fix_cost / expected_total, 4)
+    assert attr["rework_share"] == pytest.approx(expected_rework_share, abs=1e-6)
+
+    assert "by_task_type" in attr
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_surfaces_llm_cost_attribution_breakdown(db_session):
+    """read_baseline_with_drift surfaces llm_cost_attribution from the latest
+    snapshot and llm_cost_attribution_trend as a day-over-day series, mirroring
+    the warm-start-origin and reuse-dropout patterns.
+
+    Acceptance criterion: named test must run green and exercise non-test
+    production code paths in efficiency_snapshot.py (write_snapshot +
+    read_baseline_with_drift).
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "pr_number": 7}],
+            api_call_summary={
+                "total_input_tokens": 3000,
+                "total_output_tokens": 1500,
+                "llm_call_count": 12,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    # llm_cost_attribution surfaces the latest snapshot's block.
+    attr = drift.get("llm_cost_attribution")
+    assert attr is not None, "llm_cost_attribution must be present in drift response"
+    assert "by_model" in attr
+    assert "by_task_type" in attr
+    assert "rework_share" in attr
+    assert "total_llm_usd" in attr
+    expected_total = round(3000 * input_rate + 1500 * output_rate, 6)
+    assert attr["total_llm_usd"] == pytest.approx(expected_total, abs=1e-9)
+
+    # llm_cost_attribution_trend is a list with one entry per snapshot that
+    # carries an llm_cost_attribution block.
+    trend = drift.get("llm_cost_attribution_trend")
+    assert isinstance(trend, list), "llm_cost_attribution_trend must be a list"
+    assert len(trend) >= 1, "at least one trend entry must be present"
+    for entry in trend:
+        assert "captured_at" in entry
+        assert "rework_share" in entry
+        assert "total_llm_usd" in entry
