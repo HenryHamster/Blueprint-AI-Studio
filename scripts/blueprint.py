@@ -623,6 +623,13 @@ def cmd_versions(args: argparse.Namespace) -> None:
                     if str(v.get("version_number")) == str(target):
                         ver = v
                         break
+        if not ver and target is not None:
+            # Fallback: fetch from the historical summary endpoint if not in recent list.
+            ver_summary, _ = _safe_read(
+                f"/api/admin/projects/{pid}/release-versions/{target}/summary"
+            )
+            if ver_summary:
+                ver = ver_summary
         if not ver:
             msg = (f"version {target} not found"
                    if target is not None else "no open version")
@@ -633,7 +640,7 @@ def cmd_versions(args: argparse.Namespace) -> None:
             "phase": ver.get("phase"),
             "status": ver.get("status", "open" if ver is cv else None),
             "promoted_sha": ver.get("promoted_sha") or ver.get("served_sha"),
-            "merged_task_count": ver.get("merged_task_count"),
+            "merged_task_count": ver.get("merged_task_count") or ver.get("merged_count"),
             "qualification_state": ver.get("qualification_state"),
             "acceptance_aggregate": ver.get("acceptance_aggregate"),
             "goal": ver.get("goal"),
@@ -649,11 +656,26 @@ def cmd_versions(args: argparse.Namespace) -> None:
                 ver_summary, _ = _safe_read(
                     f"/api/admin/release-versions/{ver_id}/summary"
                 )
-                summary["tasks_merged"] = (ver_summary or {}).get("tasks_merged") or []
-                summary["highlights"] = (ver_summary or {}).get("highlights")
-                summary["serving_status"] = (ver_summary or {}).get("serving_status")
+                if ver_summary:
+                    summary["tasks_merged"] = ver_summary.get("tasks_merged") or []
+                    summary["highlights"] = ver_summary.get("highlights")
+                    summary["serving_status"] = ver_summary.get("serving_status")
+                    # Populate with rich data from the summary endpoint.
+                    if ver_summary.get("phase") is not None:
+                        summary["phase"] = ver_summary["phase"]
+                    if ver_summary.get("goal") is not None:
+                        summary["goal"] = ver_summary["goal"]
+                    if ver_summary.get("merged_count") is not None:
+                        summary["merged_task_count"] = ver_summary["merged_count"]
+                    if ver_summary.get("acceptance_aggregate") is not None:
+                        summary["acceptance_aggregate"] = ver_summary["acceptance_aggregate"]
+                else:
+                    summary["tasks_merged"] = []
             else:
-                summary["tasks_merged"] = []
+                # Fallback endpoint response already has tasks_merged and highlights
+                summary["tasks_merged"] = ver.get("tasks_merged") or []
+                summary["highlights"] = ver.get("highlights")
+                summary["serving_status"] = ver.get("serving_status")
         _emit(args, summary, _render_version_summary)
         return
 

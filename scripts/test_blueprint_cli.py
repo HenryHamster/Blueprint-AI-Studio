@@ -144,11 +144,30 @@ def mock_api(monkeypatch):
             }
         if "/release-versions/uuid-v11/summary" in path:
             return {
+                "phase": "stabilize",
+                "goal": "Stabilize the codebase",
+                "merged_count": 10,
+                "acceptance_aggregate": {"proven": 8, "total": 10},
                 "tasks_merged": [
                     {"task_type": "create", "title": "Shipped feature A", "pr_number": 90},
                     {"task_type": "refactor", "title": "Clean up module", "pr_number": 91},
                 ],
                 "highlights": {"headline": "10 tasks merged; focus on stability"},
+                "serving_status": "SERVING",
+            }
+        if "/release-versions/5/summary" in path:
+            return {
+                "version_number": 5,
+                "phase": "build",
+                "status": "promoted",
+                "merged_count": 7,
+                "acceptance_aggregate": {"proven": 6, "total": 7},
+                "merged_task_count": 7,
+                "tasks_merged": [
+                    {"task_type": "fix", "title": "Old fix from v5", "pr_number": 50},
+                    {"task_type": "create", "title": "Old feature from v5", "pr_number": 51},
+                ],
+                "highlights": {"headline": "7 tasks merged; early version"},
                 "serving_status": "SERVING",
             }
         if "/tasks/" in path:
@@ -384,6 +403,47 @@ def test_versions_show_historical_fetches_summary(mock_api, capsys):
     # the /summary endpoint must have been called
     assert any("/release-versions/" in p and "/summary" in p
                for _, p, _ in mock_api)
+
+
+def test_versions_show_historical_includes_phase_goal_merged_acceptance(mock_api, capsys):
+    """versions show <N> for a closed version includes phase, goal, merged_tasks,
+    and acceptance from the summary endpoint."""
+    rc = blueprint.main(["--json", "versions", "show", "11"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["version_number"] == 11
+    # These fields should come from the /summary endpoint
+    assert parsed["phase"] == "stabilize"
+    assert parsed["goal"] == "Stabilize the codebase"
+    assert parsed["merged_task_count"] == 10
+    assert parsed["acceptance_aggregate"] == {"proven": 8, "total": 10}
+
+
+def test_versions_show_historical_human_render(mock_api, capsys):
+    """Human-readable versions show <N> prints phase, goal, merged_tasks, and acceptance."""
+    rc = blueprint.main(["versions", "show", "11"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "phase:" in out
+    assert "stabilize" in out
+    assert "goal:" in out
+    assert "Stabilize the codebase" in out
+    assert "merged_tasks:" in out
+    assert "10" in out
+    assert "acceptance:" in out
+
+
+def test_versions_show_fallback_for_old_versions(mock_api, capsys):
+    """versions show <N> for versions older than the 5-version window uses fallback endpoint."""
+    rc = blueprint.main(["--json", "versions", "show", "5"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["version_number"] == 5
+    assert parsed["phase"] == "build"
+    assert parsed["status"] == "promoted"
+    assert parsed["merged_task_count"] == 7
+    # The fallback endpoint should have been called for version 5
+    assert any("/release-versions/5/summary" in p for _, p, _ in mock_api)
 
 
 def test_tasks_version_flag_emits_notice(mock_api, capsys):
