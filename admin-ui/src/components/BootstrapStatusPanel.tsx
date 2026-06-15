@@ -20,10 +20,11 @@ type RetryOutcome = Pick<BootstrapRetryResponse, 'state' | 'task_id' | 'reason'>
 
 function deriveBootstrapState(project: Project, tasks: Task[]): BootstrapState {
   if (project.is_self_repo) return 'none';
-  if (project.build_config?.repo_is_empty) return 'empty';
 
   const completedAt = project.build_config?.bootstrap_completed_at;
   if (completedAt) return 'completed';
+
+  if (project.build_config?.repo_is_empty) return 'empty';
 
   if (project.build_config?.bootstrap_degraded_reason) return 'degraded';
 

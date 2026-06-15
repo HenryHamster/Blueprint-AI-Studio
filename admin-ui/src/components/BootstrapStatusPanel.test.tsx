@@ -648,4 +648,24 @@ describe('BootstrapStatusPanel', () => {
     // Overview toggle should not appear since there is no overview content.
     expect(screen.queryByRole('button', { name: /repo overview/i })).toBeNull();
   });
+
+  test('shows completed state when bootstrap_completed_at is set even if repo_is_empty is true', () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: {
+            repo_is_empty: true,
+            bootstrap_completed_at: '2026-06-01T12:00:00Z',
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Completed/)).toBeTruthy();
+    expect(screen.getByText(/Jun 1, 12:00:00 PM/)).toBeTruthy();
+    expect(screen.queryByText(/Empty repository/)).toBeNull();
+    expect(screen.getByRole('button', { name: /refresh bootstrap/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /retry bootstrap/i })).toBeNull();
+  });
 });
