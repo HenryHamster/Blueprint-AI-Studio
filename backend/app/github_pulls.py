@@ -383,6 +383,53 @@ async def get_open_pull_requests(
     return response.json()
 
 
+async def get_pull_requests_for_head_branch(
+    token: str,
+    owner: str,
+    repo: str,
+    head_branch: str,
+    base: str | None = None,
+) -> list[dict]:
+    """Fetch closed PRs whose HEAD is ``head_branch``.
+
+    Used by the EVALUATING-timeout recovery sweep to detect a merged rollup PR
+    when the ``rollup_pr_number`` context marker was lost in a crash window.
+
+    Queries GitHub with ``state=closed`` and ``head={owner}:{head_branch}`` so
+    only PRs originating from that branch are returned.  The caller must check
+    ``pr.get("merged")`` (or ``pr.get("merged_at") is not None``) to distinguish
+    merged from force-closed PRs.
+
+    Returns ``[]`` on any non-200 response — callers must treat errors as
+    "not found" and fall back to current behavior.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    params: dict[str, str | int] = {
+        "state": "closed",
+        "head": f"{owner}:{head_branch}",
+        "per_page": 10,
+    }
+    if base is not None:
+        params["base"] = base
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        headers,
+        params=params,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            f"Failed to list closed PRs for head {head_branch!r}: {response.status_code}"
+        )
+        return []
+    data = response.json()
+    return data if isinstance(data, list) else []
+
+
 async def get_pull_request_diff(
     token: str, owner: str, repo: str, pr_number: int
 ) -> str:
@@ -938,5 +985,3 @@ async def get_pr_files(
         if len(batch) < 100:
             break
     return result
-
-

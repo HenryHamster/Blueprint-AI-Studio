@@ -884,6 +884,29 @@ class TestNormalizeAgentFailureCategory:
         )
         assert classify_failure(task) == PROVISION_FAILURE
 
+    def test_github_token_fetch_failed_routes_to_provision_failure(self):
+        """Agent emits github_token_fetch_failed when the startup github/token fetch
+        times out or fails. The backend can legitimately block up to ~120s while
+        _github_request sleeps on a near-empty rate-limit bucket, so a credential
+        fetch failure is infra/transient — must route to PROVISION_FAILURE so the
+        task requeues on a fresh VM without burning the terminal retry budget or
+        cascading the parent plan (incident 2026-06-13/14: task ca3279e1 cascaded
+        parent e9dbc87e because the 30s timeout fired and was classified CODE_ERROR)."""
+        task = _task("GET /api/agent/github/token?task_id=x failed after 5 retries")
+        assert (
+            normalize_agent_failure_category("github_token_fetch_failed", task)
+            == PROVISION_FAILURE
+        )
+
+    def test_github_token_fetch_failed_via_classify_failure_context_fast_path(self):
+        """End-to-end: classify_failure sees github_token_fetch_failed in context and
+        routes to PROVISION_FAILURE without falling through to the text classifier."""
+        task = _task(
+            "Fatal error: GET /api/agent/github/token?task_id=x failed after 5 retries",
+            {"failure_category": "github_token_fetch_failed"},
+        )
+        assert classify_failure(task) == PROVISION_FAILURE
+
     def test_reassigned_routes_to_reassigned_class(self):
         """Agent self-terminates gracefully on a non-transient heartbeat 4xx
         (reassignment/deauth) or cancel/supersede during startup and posts
@@ -2811,6 +2834,284 @@ class TestDeadAuthClassification:
         t.api_call_summary = None
         assert normalize_agent_failure_category("claude_code_failed", t) == DEAD_AUTH
 
+    # ── refresh_token_reused (new pattern, incident 2026-06-13) ────────────
+
+    def test_refresh_token_reused_classifies_dead_auth(self):
+        # Real stderr from Codex CLI when a cached refresh token has been consumed.
+        # Incident: account SavarinCodex stayed healthy (2.9% success rate) because
+        # this phrasing wasn't in _OAUTH_DEAD_AUTH_PATTERNS → bucketed PROVISION_FAILURE
+        # → never auto-disabled → every new task coin-flipped into the dead account.
+        real_stderr = (
+            "ERROR codex_login::auth::manager: Failed to refresh token: "
+            '401 Unauthorized: {"error": {"message": "Your refresh token has '
+            "already been used to generate a new access token. Please log out and "
+            'sign in again."}}'
+        )
+        report = self._openai_oauth_report(stderr_tail=real_stderr)
+        t = self._dead_auth_task(report)
+        from app.failure_classification import DEAD_AUTH
+
+        assert classify_failure(t) == DEAD_AUTH
+        assert (
+            t.context.get("dead_auth_matched_pattern")
+            == "refresh token has already been used"
+        )
+
+    def test_refresh_token_reused_not_classified_when_model_output_seen(self):
+        # If the CLI produced model output before dying, auth was successful —
+        # dead-auth must not fire even if the pattern somehow appears in stderr.
+        real_stderr = "WARNING: refresh token was already used (late error)\n"
+        report = self._openai_oauth_report(
+            stderr_tail=real_stderr,
+            model_output_seen=True,
+        )
+        t = self._dead_auth_task(report)
+        from app.failure_classification import DEAD_AUTH
+
+        assert classify_failure(t) != DEAD_AUTH
+
+    # ── panel_review_lens_failed + dead-auth path (incident 2026-06-13) ────
+
+    def test_panel_review_lens_failed_with_dead_auth_in_logs(self):
+        # panel_review_lens_failed: when the Codex lens dies with a consumed
+        # refresh token, failPanelClosed stores the full error message in
+        # task.latest_status_message (via _sanitize_log_tail(payload.logs, 8000)).
+        # For a startup-death the total output is short (< 4096 chars), so the
+        # dead-auth guard fires and classification returns DEAD_AUTH, not
+        # PROVISION_FAILURE.
+        full_status = (
+            "Panel review fan-out failed: lens 'correctness' agent pass exited 1.\n"
+            "Reading prompt from stdin...\n"
+            "2026-06-13T20:48:11.576087Z ERROR codex_login::auth::manager: "
+            "Failed to refresh token: 401 Unauthorized: "
+            '{"error": {"message": "Your refresh token has already been used '
+            'to generate a new access token."}}\n'
+        )
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+        from app.failure_classification import DEAD_AUTH
+
+        result = classify_failure(t)
+        assert result == DEAD_AUTH
+        assert (
+            t.context.get("dead_auth_matched_pattern")
+            == "refresh token has already been used"
+        )
+
+    def test_panel_review_lens_failed_dead_auth_not_fired_on_long_output(self):
+        # If the lens ran successfully and produced kilobytes of model output
+        # before failing closed (e.g. no usable verdict), latest_status_message
+        # holds the last 8000 chars of that output — which may mention dead-auth
+        # literals if the diff being reviewed touches oauth / test files.
+        # The length guard (>= 4096 chars) must suppress the dead-auth scan
+        # so a healthy account is never falsely disabled.
+        model_output_with_dead_auth_phrase = (
+            # Simulate a lens reviewing a diff that adds the dead-auth pattern
+            # as a test string — the model quotes it in its analysis.
+            "The test file adds 'refresh token has already been used' as a "
+            "fixture string to cover the OAuth error case.  This looks correct "
+            "and necessary for coverage. " * 200  # ~8000 chars of model output
+        )
+        # In production this is _sanitize_log_tail(failLogs, 8000) — the last
+        # 8000 chars of "Panel review fan-out failed: ...\n<model output>".
+        full_status = (
+            "Panel review fan-out failed: lens 'correctness' produced no usable verdict.\n"
+            + model_output_with_dead_auth_phrase
+        )
+        assert len(full_status) >= 4096, "test precondition: status must be long"
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+        from app.failure_classification import DEAD_AUTH
+
+        result = classify_failure(t)
+        assert result != DEAD_AUTH, (
+            "dead-auth must not fire when lens output is long (model output path)"
+        )
+        assert "dead_auth_matched_pattern" not in t.context
+
+    def test_panel_review_lens_failed_rate_limited_classifies_rate_limit(self):
+        # When the lens subprocess is rate-limited (429), the error appears in
+        # latest_status_message.  Classification must return RATE_LIMIT (no-burn
+        # requeue) not PROVISION_FAILURE (which burns attempt_count).
+        # Uses "rate limit reached for" which is in _API_KEY_RATE_LIMIT_PATTERNS.
+        full_status = (
+            "Panel review fan-out failed: lens 'security' agent pass exited 1.\n"
+            "Error: 429 Too Many Requests\nrate limit reached for model gpt-4o\n"
+        )
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+        from app.failure_classification import (
+            RATE_LIMIT,
+            normalize_agent_failure_category,
+        )
+
+        # Drive via the production write-boundary path: normalize_agent_failure_category
+        # persists failure_class to context (agent_status.py:1085-1096), then
+        # classify_failure short-circuits on that persisted value.
+        normalized = normalize_agent_failure_category("panel_review_lens_failed", t)
+        assert normalized == RATE_LIMIT, (
+            f"normalize should return RATE_LIMIT for rate-limited panel_review_lens_failed, got {normalized}"
+        )
+        # Simulate the agent_status.py write boundary persistence
+        new_ctx = dict(t.context or {})
+        new_ctx["failure_category"] = normalized
+        new_ctx["failure_class"] = normalized
+        t.context = new_ctx
+        # classify_failure must short-circuit to the persisted RATE_LIMIT verdict
+        result = classify_failure(t)
+        assert result == RATE_LIMIT, (
+            f"rate-limited panel_review_lens_failed should be RATE_LIMIT after normalize+persist, got {result}"
+        )
+
+    def test_panel_review_lens_failed_without_dead_auth_stays_provision_failure(self):
+        # panel_review_lens_failed without a dead-auth or rate-limit pattern
+        # should stay PROVISION_FAILURE (lens subprocess crashed for a generic
+        # infra reason — no retry budget should be burned).
+        full_status = (
+            "Panel review fan-out failed: lens 'correctness' agent pass exited 1.\n"
+            "Error: ENOENT: no such file or directory, open '/tmp/foo'\n"
+        )
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+
+        result = classify_failure(t)
+        assert result == PROVISION_FAILURE
+        assert "dead_auth_matched_pattern" not in t.context
+
+    def test_model_no_access_is_config_rejection(self):
+        # Acceptance proof: a 'selected model may not exist / no access' failure
+        # from panel_review_lens_failed must classify as EXTERNAL_API
+        # (provider_model_config subtype), NOT PROVISION_FAILURE.
+        # PROVISION_FAILURE burns the retry budget; EXTERNAL_API does not.
+        full_status = (
+            "Panel review fan-out failed: lens 'security' agent pass exited 1.\n"
+            "Error: 404 The model `o3-mini` does not exist or you do not have "
+            "access to it.\n"
+        )
+        ctx = {
+            "failure_category": "panel_review_lens_failed",
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        }
+        t = _task(full_status, ctx)
+        t.api_call_summary = None
+
+        result = classify_failure(t)
+        assert result == EXTERNAL_API, (
+            f"model-no-access panel_review_lens_failed must classify as EXTERNAL_API, got {result!r}"
+        )
+
+        from app.failure_classification import (
+            EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+            classify_external_api_subtype,
+        )
+
+        subtype = classify_external_api_subtype(t)
+        assert subtype == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG, (
+            f"expected provider_model_config subtype, got {subtype!r}"
+        )
+
+    # ── Cross-provider isolation (incident 2026-06-14) ─────────────────────
+
+    def test_stale_dead_auth_verdict_short_circuits_new_attempt(self):
+        """Demonstrate the cross-provider bug: a stale failure_class = 'DEAD_AUTH'
+        in task.context causes _classify_failure_class to short-circuit and return
+        DEAD_AUTH for any subsequent attempt — even on a completely different provider.
+
+        This is the bug that disabled all 6 Anthropic accounts when Codex dead-auths
+        wrote failure_class='DEAD_AUTH' + dead_auth_matched_pattern='token_invalidated'
+        into task context, and the reaper reaped the next attempt (on an Anthropic
+        account) using the short-circuit path.
+        """
+        from app.failure_classification import DEAD_AUTH
+
+        ctx = {
+            "failure_class": "DEAD_AUTH",  # stale verdict from Codex dead-auth
+            "dead_auth_matched_pattern": "token_invalidated",  # OpenAI-only pattern
+            "failure_category": "claude_code_failed",
+            "llm_provider": "anthropic",  # task now runs on Anthropic
+            "llm_auth_mode": "oauth",
+        }
+        t = _task("Some Anthropic failure", ctx)
+        t.api_call_summary = None
+        # The short-circuit fires: returns stale DEAD_AUTH without re-checking
+        # whether token_invalidated is even an Anthropic dead-auth pattern.
+        assert classify_failure(t) == DEAD_AUTH
+
+    def test_cleared_dead_auth_context_classifies_anthropic_task_correctly(self):
+        """After the requeue fix: failure_class and dead_auth_matched_pattern are
+        cleared from context on dead-auth requeue, so the next attempt's
+        classification is done fresh for the new provider.
+
+        Regression test for incident 2026-06-14 — cross-provider dead-auth disable.
+        Codex (openai/oauth) tasks that dead-auth with 'token_invalidated' must
+        not cause Anthropic accounts to be disabled.
+        """
+        from app.failure_classification import DEAD_AUTH
+
+        # Simulate the state AFTER the requeue path clears stale keys:
+        # failure_class and dead_auth_matched_pattern are gone; the task now
+        # carries a new Anthropic account assignment.
+        ctx = {
+            # These were cleared by the fix (popped before task.context = da_ctx):
+            # "failure_class": "DEAD_AUTH",       ← cleared
+            # "dead_auth_matched_pattern": ...,    ← cleared
+            #
+            # New Anthropic account assigned by the orchestrator:
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "failure_category": "claude_code_failed",
+        }
+        t = _task("Anthropic task failed for non-auth reason", ctx)
+        t.api_call_summary = None
+        # Without stale context, classify_failure runs the full heuristic.
+        # An Anthropic task with a generic failure status and no dead-auth
+        # patterns must NOT classify as DEAD_AUTH.
+        result = classify_failure(t)
+        assert result != DEAD_AUTH, (
+            f"Anthropic task must not classify as DEAD_AUTH after Codex dead-auth "
+            f"requeue clears stale context; got {result!r}"
+        )
+
+    def test_openai_dead_auth_pattern_does_not_match_anthropic_task(self):
+        """Provider isolation: 'token_invalidated' is an OpenAI-only dead-auth
+        pattern. An Anthropic task must not match it even if it appears in stderr.
+
+        This validates that _task_dead_auth_patterns() uses the task's own
+        provider patterns (not all providers') — an Anthropic task only triggers
+        DEAD_AUTH on 'oauth_org_not_allowed', never on 'token_invalidated'.
+        """
+        from app.failure_classification import DEAD_AUTH
+
+        report = self._anthropic_oauth_report(
+            stderr_tail="token_invalidated: some error from somewhere"
+        )
+        t = self._dead_auth_task(report)
+        # Anthropic patterns do NOT include "token_invalidated", so this must
+        # fall through to a non-DEAD_AUTH class.
+        assert classify_failure(t) != DEAD_AUTH
+        assert "dead_auth_matched_pattern" not in t.context
+
 
 class TestRedactCredentials:
     """Unit tests for the _redact_credentials helper.
@@ -3138,3 +3439,132 @@ class TestSanitizeReportAppliesRedaction:
         t.api_call_summary = None
         t.context = {**t.context, AGENT_ERROR_REPORT_CONTEXT_KEY: out}
         assert classify_failure(t) == RATE_LIMIT
+
+
+class TestIsRecoverableInfraTerminal:
+    """Unit tests for is_recoverable_infra_terminal — the guard that decides
+    whether the reaper should preserve or close a PR when its fix task hits a
+    terminal infrastructure failure."""
+
+    def _fix_task(self, ctx: dict) -> "Task":
+        t = MagicMock(spec=Task)
+        t.context = ctx
+        return t
+
+    def test_returns_true_for_agent_timeout_with_budget_remaining(self):
+        """An AGENT_TIMEOUT fix task with iterations remaining is recoverable."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 101},
+        })
+        assert is_recoverable_infra_terminal(t) is True
+
+    def test_returns_false_for_code_error(self):
+        """A CODE_ERROR (merit failure) is NOT recoverable — PR should close."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "CODE_ERROR",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 102},
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_returns_false_when_iteration_cap_exhausted(self):
+        """When iteration == max_iterations the review loop has no budget left."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 12, "max_iterations": 12, "pr_number": 103},
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_returns_false_when_iteration_exceeds_cap(self):
+        """iteration > max_iterations is also treated as exhausted."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 13, "max_iterations": 12, "pr_number": 104},
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_returns_true_when_no_review_loop_context(self):
+        """No review_loop in context → iteration budget unknown → preserve PR."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({"failure_category": "AGENT_TIMEOUT"})
+        assert is_recoverable_infra_terminal(t) is True
+
+    def test_returns_false_when_infra_history_at_threshold(self):
+        """Three infra failures in _failure_class_history → budget exhausted."""
+        from datetime import datetime, timedelta
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 105},
+            "_failure_class_history": [
+                {"class": "AGENT_TIMEOUT", "at": recent},
+                {"class": "AGENT_TIMEOUT", "at": recent},
+                {"class": "AGENT_TIMEOUT", "at": recent},
+            ],
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_returns_true_when_infra_history_below_threshold(self):
+        """Two infra entries is below the threshold of 3 — still recoverable."""
+        from datetime import datetime, timedelta
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 106},
+            "_failure_class_history": [
+                {"class": "AGENT_TIMEOUT", "at": recent},
+                {"class": "AGENT_TIMEOUT", "at": recent},
+            ],
+        })
+        assert is_recoverable_infra_terminal(t) is True
+
+    def test_provision_failure_also_recoverable(self):
+        """PROVISION_FAILURE is in INFRA_CLASSES and is also recoverable."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "PROVISION_FAILURE",
+            "review_loop": {"iteration": 1, "max_iterations": 10, "pr_number": 107},
+        })
+        assert is_recoverable_infra_terminal(t) is True
+
+    def test_missing_failure_category_returns_false(self):
+        """No failure_category → not an infra class → False."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 108},
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_stale_history_entries_ignored_by_ttl(self):
+        """Entries older than 48h are dropped by normalize_failure_class_history —
+        stale repeated failures don't count toward the budget threshold."""
+        from datetime import datetime, timedelta
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        old = (datetime.utcnow() - timedelta(hours=72)).isoformat()
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 109},
+            "_failure_class_history": [
+                {"class": "AGENT_TIMEOUT", "at": old},
+                {"class": "AGENT_TIMEOUT", "at": old},
+                {"class": "AGENT_TIMEOUT", "at": old},
+            ],
+        })
+        # All three are expired → infra_count = 0 < 3 → still recoverable.
+        assert is_recoverable_infra_terminal(t) is True

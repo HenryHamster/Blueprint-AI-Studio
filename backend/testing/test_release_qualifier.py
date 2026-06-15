@@ -832,16 +832,18 @@ class TestLoadPolicyProvenance:
         assert error is None
         assert policy["weights"]["audit"] == pytest.approx(0.5)
 
-    def test_hardcoded_defaults_provenance_includes_parse_error(
-        self, mocker, tmp_path
-    ):
+    def test_hardcoded_defaults_provenance_includes_parse_error(self, mocker, tmp_path):
         """A broken YAML file falls back to hardcoded defaults with an error string."""
         _point_policy_at(mocker, tmp_path, "weights: {unterminated: [1, 2")
 
         policy, source, error = rq._resolve_policy_with_provenance()
         assert source == "hardcoded_defaults"
         assert error is not None
-        assert "ScannerError" in error or "ParserError" in error or "while parsing" in error
+        assert (
+            "ScannerError" in error
+            or "ParserError" in error
+            or "while parsing" in error
+        )
         assert policy["weights"] == {
             "audit": 0.40,
             "test_erosion": 0.30,
@@ -3871,6 +3873,72 @@ class TestBindingRecordAndUnboundHoldDistinction:
         )
         assert len(binding) <= cap, (
             f"binding record exceeds cap: {len(binding)} > {cap}"
+        )
+
+
+class TestBindingRecordBindingMethod:
+    """binding_record entries must carry a binding_method field ('indexed' or 'fuzzy').
+
+    'indexed' when the verdict was bound via primary_finding_index; 'fuzzy' when
+    bound via the bipartite fuzzy-matching path.
+    """
+
+    SHA = "cafe1234"
+
+    def _verified(self, severity: str, summary: str, file: str = "") -> dict:
+        entry: dict = {
+            "severity": severity,
+            "summary": summary,
+            "verification_note": "confirmed via full repo scan with supporting evidence",
+        }
+        if file:
+            entry["file"] = file
+        return entry
+
+    def test_binding_method_indexed(self):
+        """When verdict carries primary_finding_index, binding_method is 'indexed'."""
+        finding = self._verified(
+            "high", "SQL injection via unsanitized query parameter"
+        )
+        report = {"findings": [finding]}
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "severity": "high",
+                "summary": "SQL injection via unsanitized query parameter",
+                "primary_finding_index": 1,
+            }
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+        hold, modified, _refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+        assert hold is None, f"unexpected hold: {hold!r}"
+        assert len(binding) == 1
+        assert binding[0]["binding_method"] == "indexed", (
+            f"expected 'indexed', got {binding[0].get('binding_method')!r}"
+        )
+
+    def test_binding_method_fuzzy(self):
+        """When verdict has no primary_finding_index, binding_method is 'fuzzy'."""
+        finding = self._verified("high", "Hardcoded API secret in config file")
+        report = {"findings": [finding]}
+        verdicts = [
+            {
+                "verdict": "confirmed",
+                "severity": "high",
+                "summary": "Hardcoded API secret in config file",
+                # no primary_finding_index
+            }
+        ]
+        envelope = _make_challenge_envelope(self.SHA, verdicts)
+        hold, modified, _refuted, binding = rq._reconcile_audit_with_challenge(
+            report, envelope, self.SHA
+        )
+        assert hold is None, f"unexpected hold: {hold!r}"
+        assert len(binding) == 1
+        assert binding[0]["binding_method"] == "fuzzy", (
+            f"expected 'fuzzy', got {binding[0].get('binding_method')!r}"
         )
 
 
@@ -13471,10 +13539,10 @@ async def test_sweep_commits_each_version_independently(db_session, mocker):
     # them in, A's commit lands and B's raise is isolated + rolled back.
     real_finalize = rq._finalize_qualification
 
-    async def _flaky_finalize(session, version):
+    async def _flaky_finalize(session, version, *, _pre_gates=None):
         if version.id == version_b.id:
             raise RuntimeError("simulated finalize failure for version B")
-        return await real_finalize(session, version)
+        return await real_finalize(session, version, _pre_gates=_pre_gates)
 
     mocker.patch.object(
         rq, "_finalize_qualification", new=AsyncMock(side_effect=_flaky_finalize)
@@ -13920,6 +13988,110 @@ async def test_promote_genuine_merge_block_still_fails(db_session, mocker):
     await db_session.refresh(version)
     assert version.status == "open"
     assert version.phase == "stabilize"
+
+
+# ===========================================================================
+# No-CI repo promotion: managed_check_wait instead of native auto-merge
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_promote_no_ci_repo_does_not_wait_on_native_automerge(db_session, mocker):
+    """promote() on a no-CI repo must NOT hand the PR to GitHub native auto-merge.
+
+    When the promotion PR does not merge immediately (GitHub 405 / merged=False,
+    no conflict), the normal path enables GitHub native auto-merge and waits for
+    CI checks to trigger it.  On a no-CI repo no checks will ever run, so native
+    auto-merge never fires and the version strands indefinitely.
+
+    The fix: when ``requires_ci_checks(project)`` is False, promote() must enter
+    ``managed_check_wait`` (same retryable sub-state as migration-carrying PRs)
+    instead of calling ``enable_auto_merge``.  The reconciler sweep will then
+    retry the merge directly without waiting for non-existent checks.
+    """
+    # Build a no-CI project (build_config.requires_ci_checks=False).
+    project = Project(
+        name="NoCiRepo",
+        user_id="noci-user",
+        github_owner="acme",
+        github_repo="noci",
+        integration_branch="automain",
+        promotion_target="main",
+        build_config={"requires_ci_checks": False},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    candidate = "noci0001" * 5
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_pull_request_merge_state",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 55, "html_url": "http://pr/55"}),
+    )
+    # The merge returns merged=False (no conflict) — GitHub is waiting on checks.
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": False, "conflict": False}),
+    )
+    auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new=AsyncMock(return_value={"enabled": True}),
+    )
+    delete_branch_mock = mocker.patch(
+        "app.github.delete_branch", new=AsyncMock(return_value=True)
+    )
+    # No migrations touched — migration guard is not the trigger.
+    mocker.patch(
+        "app.rollup_migration_validation.pr_touches_migrations",
+        new=AsyncMock(return_value=False),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        candidate,
+        composite={"confidence": 0.91},
+        base_record={"candidate_sha": candidate},
+    )
+    await db_session.commit()
+
+    # Must NOT call enable_auto_merge — checks will never run.
+    auto_merge_mock.assert_not_called()
+    # Release branch kept — the reconciler needs it.
+    delete_branch_mock.assert_not_awaited()
+
+    # Result is a retryable managed_check_wait, NOT pending_auto_merge.
+    assert result["status"] == "pending_managed_check_wait"
+    assert result["managed_check_wait"] is True
+    assert result["pr_number"] == 55
+    assert result["pr_url"] == "http://pr/55"
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["auto_merge_enabled"] is False
+    assert pending["why_not_native_automerge"] == "no_ci_repo"
+    assert pending["pr_number"] == 55
+    # No terminal failure.
+    assert "error" not in version.last_qualification
 
 
 # ===========================================================================
@@ -22492,3 +22664,437 @@ async def test_requalification_no_open_version(db_session):
     out = await rr.compute_requalification_readiness(db_session, project.id)
     assert out["requalification_ready"] is False
     assert out["open_version_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# _recover_confidence_from_ci_unresolved — unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestRecoverConfidenceFromCiUnresolved:
+    """Unit tests for release_promotion._recover_confidence_from_ci_unresolved."""
+
+    def _fn(self, base_record, policy=None):
+        from app.release_promotion import _recover_confidence_from_ci_unresolved
+
+        return _recover_confidence_from_ci_unresolved(base_record, policy=policy)
+
+    def test_non_ci_unresolved_blocker_returns_unchanged(self):
+        """Record with a blocker other than ci_unresolved is returned unchanged."""
+        record = {"blocker": "ci_not_green", "confidence": 0.0}
+        out = self._fn(record)
+        assert out is record
+
+    def test_no_blocker_returns_unchanged(self):
+        """Record with no blocker field is returned unchanged."""
+        record = {"confidence": 0.95}
+        out = self._fn(record)
+        assert out is record
+
+    def test_ci_unresolved_with_valid_sub_scores_recovers_confidence(self):
+        """Core recovery path: ci_unresolved + valid sub_scores → real confidence via compute_composite."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+        }
+        out = self._fn(record)
+        # Recovered confidence should be >0 (all sub_scores perfect)
+        assert out["confidence"] > 0.0
+        assert out.get("confidence_recovered_from_ci_unresolved") is True
+        # blocker should now be absent or None (no remaining hard blocker)
+        assert out.get("blocker") is None or out.get("blocker") == ""
+        # Original fields preserved
+        assert out["sub_scores"] == record["sub_scores"]
+
+    def test_ci_unresolved_recovery_blocker_clears_when_ci_green(self):
+        """After recovery, ci_unresolved blocker is gone (re-ran compute_composite with ci_green=True)."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.95},
+            "smoketest_enabled": True,
+        }
+        out = self._fn(record)
+        assert out.get("blocker") != "ci_unresolved"
+        assert out.get("confidence_recovered_from_ci_unresolved") is True
+
+    def test_ci_unresolved_no_sub_scores_marks_recovery_failed(self):
+        """ci_unresolved with no sub_scores key and confidence=0.0 → confidence_recovery_failed."""
+        record = {"blocker": "ci_unresolved", "confidence": 0.0}
+        out = self._fn(record)
+        assert out.get("confidence_recovery_failed") is True
+        assert "sub_scores absent" in (
+            out.get("confidence_recovery_failure_reason") or ""
+        )
+
+    def test_ci_unresolved_sub_scores_not_dict_marks_recovery_failed(self):
+        """ci_unresolved with sub_scores that is not a dict → confidence_recovery_failed."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": [1.0, 0.9],
+        }
+        out = self._fn(record)
+        assert out.get("confidence_recovery_failed") is True
+        assert "not a dict" in (out.get("confidence_recovery_failure_reason") or "")
+
+    def test_ci_unresolved_malformed_audit_score_marks_recovery_failed(self):
+        """ci_unresolved with non-numeric audit sub_score → confidence_recovery_failed."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": "bad", "test_erosion": 0.9, "smoketest": 0.9},
+        }
+        out = self._fn(record)
+        assert out.get("confidence_recovery_failed") is True
+        assert "audit" in (out.get("confidence_recovery_failure_reason") or "")
+
+    def test_ci_unresolved_malformed_test_erosion_marks_recovery_failed(self):
+        """ci_unresolved with non-numeric test_erosion sub_score → confidence_recovery_failed."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 0.9, "test_erosion": None, "smoketest": 0.9},
+        }
+        out = self._fn(record)
+        assert out.get("confidence_recovery_failed") is True
+        assert "test_erosion" in (out.get("confidence_recovery_failure_reason") or "")
+
+    def test_ci_unresolved_non_zero_confidence_no_sub_scores_returns_unchanged(self):
+        """ci_unresolved but confidence>0.0 with missing sub_scores returns unchanged (not recovery_failed)."""
+        record = {"blocker": "ci_unresolved", "confidence": 0.88}
+        out = self._fn(record)
+        assert out is record
+        assert "confidence_recovery_failed" not in out
+
+    def test_ci_unresolved_smoketest_disabled_recovers_without_smoketest(self):
+        """Recovery works when smoketest_enabled=False (drops smoketest dimension from scoring)."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
+            "smoketest_enabled": False,
+        }
+        out = self._fn(record)
+        assert out.get("confidence_recovered_from_ci_unresolved") is True
+        assert out["confidence"] > 0.0
+
+
+# ===========================================================================
+# SITE B lock-window fix: GitHub-bound gates run BEFORE FOR UPDATE
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_finalize_locked_version_passes_pre_gates_to_finalize_qualification(
+    db_session, mocker
+):
+    """_finalize_locked_version must pass _pre_gates to _finalize_qualification.
+
+    This proves the three GitHub-bound gates (_resolve_ci_at_finalize,
+    _resolve_migration_identity_at_finalize, _resolve_migration_apply_at_finalize)
+    are computed BEFORE the FOR UPDATE row lock is acquired, not inside it.
+    The SITE B lock-window fix hoists these gates to a non-locking pre-peek
+    phase and passes their results as _pre_gates to _finalize_qualification so
+    the function does not re-issue GitHub calls under the lock.
+    """
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 0.9,
+                    "test_erosion": {
+                        "deleted_test_files": [],
+                        "assertion_delta": 2,
+                        "test_count_delta": 1,
+                    },
+                }
+            ),
+        )
+    )
+    db_session.add(
+        Artifact(
+            task_id=smoke_task.id,
+            artifact_type=ArtifactType.SMOKETEST_RESULT,
+            logs=json.dumps(
+                {
+                    "passed": True,
+                    "tests": [{"name": "a", "status": "pass"}],
+                    "suites": {"startup": {"passed": True}},
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    # Track call order: assert all three gates run BEFORE _finalize_qualification
+    # (which is called only after the FOR UPDATE lock is acquired).  A mock that
+    # raises if a gate is called after _finalize_qualification has been entered
+    # provides a direct "no GitHub I/O while lock is held" assertion.
+    call_log: list[str] = []
+    fq_entered = [False]
+
+    orig_ci = rq._resolve_ci_at_finalize
+    orig_mi = rq._resolve_migration_identity_at_finalize
+    orig_apply = rq._resolve_migration_apply_at_finalize
+    orig_fq = rq._finalize_qualification
+
+    async def tracked_ci(session, version, candidate_sha):
+        assert not fq_entered[0], (
+            "_resolve_ci_at_finalize called after lock acquired (inside _finalize_qualification)"
+        )
+        call_log.append("ci_gate")
+        return await orig_ci(session, version, candidate_sha)
+
+    async def tracked_mi(session, version, candidate_sha):
+        assert not fq_entered[0], (
+            "_resolve_migration_identity_at_finalize called after lock acquired"
+        )
+        call_log.append("mi_gate")
+        return await orig_mi(session, version, candidate_sha)
+
+    async def tracked_apply(session, version, candidate_sha):
+        assert not fq_entered[0], (
+            "_resolve_migration_apply_at_finalize called after lock acquired"
+        )
+        call_log.append("apply_gate")
+        return await orig_apply(session, version, candidate_sha)
+
+    async def tracking_fq(session, version, *, _pre_gates=None):
+        fq_entered[0] = True
+        call_log.append("finalize_qualification")
+        return await orig_fq(session, version, _pre_gates=_pre_gates)
+
+    mocker.patch("app.release_qualifier._resolve_ci_at_finalize", side_effect=tracked_ci)
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        side_effect=tracked_mi,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        side_effect=tracked_apply,
+    )
+    mocker.patch(
+        "app.release_qualifier._finalize_qualification",
+        side_effect=tracking_fq,
+    )
+
+    factory = _shared_session_factory(db_session)
+    result = await rq._finalize_in_dedicated_session(
+        version.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    # All three gates must have been called before _finalize_qualification
+    # (i.e. before the FOR UPDATE lock was held), and finalize must have run.
+    assert "ci_gate" in call_log, "CI gate was not called pre-lock"
+    assert "mi_gate" in call_log, "Migration identity gate was not called pre-lock"
+    assert "apply_gate" in call_log, "Migration apply gate was not called pre-lock"
+    assert "finalize_qualification" in call_log, "_finalize_qualification was not called"
+    fq_index = call_log.index("finalize_qualification")
+    for gate in ("ci_gate", "mi_gate", "apply_gate"):
+        assert call_log.index(gate) < fq_index, (
+            f"{gate} appeared at or after _finalize_qualification in call_log: {call_log}"
+        )
+    # Verify outcome is a real finalize result (not None / short-circuit).
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_finalize_locked_version_gates_skip_when_children_non_terminal(
+    db_session, mocker
+):
+    """GitHub-bound gates must NOT run when a required child is still non-terminal.
+
+    Previously the three gates (_resolve_ci_at_finalize etc.) ran unconditionally
+    before the FOR UPDATE lock, causing Nx speculative calls whenever a sibling
+    child completed while other children were still IN_PROGRESS.  The fix gates
+    the pre-lock calls on _required_children_terminal returning True.
+    """
+    project, version = await _make_project_and_version(db_session)
+    # Seed with audit task IN_PROGRESS (non-terminal) — children not all done.
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.IN_PROGRESS,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    # Patch the three gates to raise if called — they must NOT be called.
+    def _gate_must_not_be_called(*args, **kwargs):
+        raise AssertionError(
+            "GitHub-bound gate called speculatively while children non-terminal"
+        )
+
+    mocker.patch(
+        "app.release_qualifier._resolve_ci_at_finalize",
+        side_effect=_gate_must_not_be_called,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        side_effect=_gate_must_not_be_called,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        side_effect=_gate_must_not_be_called,
+    )
+
+    factory = _shared_session_factory(db_session)
+    result = await rq._finalize_in_dedicated_session(
+        version.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    # Must return None — children not terminal, so finalization was skipped.
+    assert result is None, (
+        f"expected None (children non-terminal), got {result!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_locked_version_gates_skip_on_timeout_reaper_path(
+    db_session, mocker
+):
+    """GitHub-bound gates must NOT run on the reaper timeout path.
+
+    When sweep_stuck_qualifications calls _finalize_in_dedicated_session with
+    timeout_now set, the timeout fires for aged versions and returns early before
+    ever reaching _finalize_qualification.  The pre-lock gates must not run on
+    every reaper sweep iteration — only the task-completion path (timeout_now=None
+    with all children terminal) is the correct trigger for pre-lock gate calls.
+    """
+    from datetime import datetime as dt, timezone
+
+    project, version = await _make_project_and_version(db_session)
+    # Seed with children IN_PROGRESS and a very old started_at so the timeout fires.
+    old_started_at = dt(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.IN_PROGRESS,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started_at,
+    )
+
+    # Patch the three gates to raise if called — they must NOT run on timeout path.
+    def _gate_must_not_be_called(*args, **kwargs):
+        raise AssertionError(
+            "GitHub-bound gate called during reaper timeout path"
+        )
+
+    mocker.patch(
+        "app.release_qualifier._resolve_ci_at_finalize",
+        side_effect=_gate_must_not_be_called,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        side_effect=_gate_must_not_be_called,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        side_effect=_gate_must_not_be_called,
+    )
+
+    factory = _shared_session_factory(db_session)
+    result = await rq._finalize_in_dedicated_session(
+        version.id,
+        timeout_now=dt(2026, 6, 15, tzinfo=timezone.utc),
+        session_factory=factory,
+    )
+    await db_session.commit()
+
+    # Reaper should have fired the timeout path (not called gates).
+    assert result is not None
+    assert result.get("blocker") == "qualification_timeout", (
+        f"expected qualification_timeout blocker, got {result!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_locked_version_pre_gate_ci_result_flows_to_outcome(
+    db_session, mocker
+):
+    """Pre-computed CI gate result flows correctly into the finalize outcome.
+
+    When _resolve_ci_at_finalize returns ci_green=False (stubbed), the finalize
+    must record a not-promoted outcome with blocker=ci_not_green — confirming
+    the pre-computed value is actually used inside _finalize_qualification and
+    not silently ignored.
+    """
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "test_erosion": {
+                        "deleted_test_files": [],
+                        "assertion_delta": 0,
+                        "test_count_delta": 0,
+                    },
+                }
+            ),
+        )
+    )
+    db_session.add(
+        Artifact(
+            task_id=smoke_task.id,
+            artifact_type=ArtifactType.SMOKETEST_RESULT,
+            logs=json.dumps(
+                {
+                    "passed": True,
+                    "tests": [{"name": "a", "status": "pass"}],
+                    "suites": {"startup": {"passed": True}},
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    # Override CI gate to return not-green with state=red — produces ci_not_green.
+    mocker.patch(
+        "app.release_qualifier._resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(
+                False,
+                {
+                    "state": "red",
+                    "resolved_sha": None,
+                    "detail": "forced red for test",
+                },
+            )
+        ),
+    )
+
+    factory = _shared_session_factory(db_session)
+    result = await rq._finalize_in_dedicated_session(
+        version.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    assert result is not None
+    assert result.get("status") == "not_promoted"
+    assert result.get("blocker") == "ci_not_green"

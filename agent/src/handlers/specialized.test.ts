@@ -441,6 +441,31 @@ describe('handleInvestigate — report reading and status mapping', () => {
     expect(call.failure_category).toBe('parse_failed');
   });
 
+  it('sanitizes logs field when investigation report cannot be parsed (no GitHub token leak)', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // repairStructuredOutput also returns null: mock two runClaudeCode calls
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'cloning https://x-access-token:ghp_SECRETTOKEN@github.com/owner/repo.git',
+        lastResultText: 'no json here',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: 'still no json',
+      });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('parse_failed');
+    // sanitize() replaces the token value but keeps the scheme prefix — verify
+    // the raw credential is gone, not the entire URL pattern
+    expect(call.logs).not.toContain('ghp_SECRETTOKEN');
+  });
+
   it('recovers investigation JSON from lastResultText when file is missing', async () => {
     const recovered = {
       summary: 'Auth token not invalidated',
@@ -2125,6 +2150,29 @@ describe('handleSmoketest — candidate-SHA pinning', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('clone_failed');
+  });
+
+  it('sanitizes GitHub token embedded in git error message before persisting logs', async () => {
+    const rawToken = 'ghp_realTokenABC123XYZ456789ABCDEF';
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'fetch') {
+        throw new Error(
+          `fatal: unable to access 'https://x-access-token:${rawToken}@github.com/owner/repo.git': Could not resolve host`,
+        );
+      }
+      return Buffer.from('');
+    });
+
+    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('clone_failed');
+    // The raw token must never appear in the persisted log.
+    expect(call.logs).not.toContain(rawToken);
+    // The URL credential pattern must be masked.
+    expect(call.logs).not.toContain('x-access-token:ghp_');
   });
 });
 

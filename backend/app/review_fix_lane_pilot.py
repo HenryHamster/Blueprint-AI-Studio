@@ -40,12 +40,14 @@ import contextlib
 import json
 import logging
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.time_utils import _utcnow
+from app.visual_verification_audit import VisualPilotAggregates, aggregate_visual_pilot
 
 # Canonical keys/constants are OWNED by the measurement subtask — import them
 # verbatim, never re-type the literals (a drifted key silently de-populates the
@@ -520,7 +522,11 @@ async def checkpoint_and_reserve_on_phase_complete(
         checkpoint_lane,
         mark_checkpoint_missing,
     )
-    from app.models import ImprovementLaneStatus
+    from app.models import (
+        ImprovementLaneStatus,
+        get_task_total_llm_totals,
+        get_task_total_vm_cost_usd,
+    )
     from app.payload_schemas import LaneCheckpointPayload
 
     if lane is None:
@@ -532,7 +538,7 @@ async def checkpoint_and_reserve_on_phase_complete(
         return False
 
     current_task_id = getattr(lane, "current_task_id", None)
-    if current_task_id is not None and current_task_id != source_task.id:
+    if current_task_id != source_task.id:
         logger.info(
             "[LANE-PILOT] stale checkpoint skipped for lane %s by non-owner task %s",
             lane.id,
@@ -641,6 +647,8 @@ async def checkpoint_and_reserve_on_phase_complete(
                 )
         return False
 
+    _tokens_in, _tokens_out, _ = get_task_total_llm_totals(source_task)
+    _vm_cost_usd = get_task_total_vm_cost_usd(source_task)
     payload = LaneCheckpointPayload(
         sha=str(sha),
         summary=summary[:1024],
@@ -653,6 +661,9 @@ async def checkpoint_and_reserve_on_phase_complete(
         # state so ImprovementLane.manifest accumulates chain knowledge across
         # phases via the existing bounded merge (never exceeding the 8KB cap).
         manifest_patch=build_lane_manifest_patch(source_task, summary=summary),
+        tokens_in=_tokens_in,
+        tokens_out=_tokens_out,
+        vm_cost_usd=_vm_cost_usd,
     )
     try:
         await checkpoint_lane(
@@ -798,6 +809,15 @@ async def close_lane_checkpoint_exhausted(
         lane.phase_requeues or 0,
         reason,
     )
+    lane_title = getattr(lane, "title", None) or str(lane.id)
+    await emit_lane_event_message(
+        session,
+        lane.project_id,
+        lane.id,
+        "lane_killed_exhausted",
+        f"lane '{lane_title}' KILLED — checkpoint recovery exhausted "
+        f"(phase_requeues={lane.phase_requeues or 0}): {reason}",
+    )
     return True
 
 
@@ -884,6 +904,8 @@ async def rebind_lane_to_recovery(
     """
     from app.models import ImprovementLaneStatus
 
+    from app.models import PoolVm
+
     if lane is None or lane.status != ImprovementLaneStatus.ACTIVE.value:
         return
     lane.current_task_id = task_id
@@ -892,6 +914,23 @@ async def rebind_lane_to_recovery(
         lane, reason=reason, attempt=lane.phase_requeues or 0, exhausted=False
     )
     session.add(lane)
+    reserved = (
+        (
+            await session.execute(
+                select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from app.warm_pool import record_lane_reservation_cause
+
+    for member in reserved:
+        member.reserved_lane_id = None
+        member.reservation_expires_at = None
+        member.reservation_hard_expires_at = None
+        session.add(member)
+        await record_lane_reservation_cause(session, lane.id, "force_expired")
 
 
 # ── Fix-side warm resume wiring ───────────────────────────────────────────────
@@ -911,7 +950,8 @@ async def activate_lane_for_fix(
     left unchanged.
     """
     from app.improvement_lane_ops import LaneCASError, cas_transition
-    from app.models import ImprovementLaneStatus
+    from app.models import ImprovementLaneStatus, PoolVm
+    from app.shared_state import runtime_config as _runtime_config
 
     if lane is None or lane.status != ImprovementLaneStatus.PARKED.value:
         return
@@ -930,6 +970,42 @@ async def activate_lane_for_fix(
         logger.warning(
             "[LANE-PILOT] could not resume lane %s for fix: %s", lane.id, exc
         )
+        return
+
+    # Re-stamp the soft TTL on the reserved PoolVm so the fix task has a full
+    # TTL window to claim it. The Pass 1 sweep only extends while the lane is
+    # PARKED; once we flip to ACTIVE here the sweep stops. Without re-stamping,
+    # a lane that waited a long time in PARKED may have an expired soft TTL,
+    # causing the fix task's warm-claim to fail silently.
+    member = (
+        (
+            await session.execute(
+                select(PoolVm).where(PoolVm.reserved_lane_id == lane.id).limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if member is not None and member.reservation_hard_expires_at is not None:
+        now = _utcnow()
+        hard_anchor = member.reservation_hard_expires_at
+        if hard_anchor > now:
+            soft_ttl = int(
+                _runtime_config.get("warm_pool_lane_reservation_ttl_seconds", 1800)
+                or 1800
+            )
+            member.reservation_expires_at = min(
+                now + timedelta(seconds=soft_ttl), hard_anchor
+            )
+            session.add(member)
+            logger.debug(
+                "[LANE-PILOT] re-stamped reservation soft TTL vm=%s lane=%s -> %s "
+                "(hard ceiling %s)",
+                member.vm_instance_id,
+                lane.id,
+                member.reservation_expires_at,
+                hard_anchor,
+            )
 
 
 def wire_fix_lane_context(ctx: dict, lane: Any) -> None:
@@ -1192,6 +1268,13 @@ async def apply_lane_pilot_kill(
         cleared,
         lanes_killed,
     )
+    await emit_lane_event_message(
+        session,
+        project_id,
+        None,
+        "pilot_auto_disabled",
+        f"lane-pilot auto-disabled for project {project_id}: {reason}",
+    )
     return {
         "flag_disabled": True,
         "reservations_cleared": cleared,
@@ -1247,6 +1330,56 @@ async def apply_lane_pilot_kill_in_transaction(
         except Exception:
             await session.rollback()
             raise
+
+
+async def emit_lane_event_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    lane_id: uuid.UUID | None,
+    event_type: str,
+    detail: str,
+) -> None:
+    """Post a deduplicated WARNING operator message for a lane terminal/degraded event.
+
+    Dedupe key is ``lane_<event_type>_<lane_id>`` for per-lane events and
+    ``pilot_<event_type>_<project_id>`` for project-level pilot events, so each
+    lane emits at most one open message per event type and the board never floods.
+    """
+    from app.models import MessageType, ProjectMessage
+
+    if lane_id is not None:
+        dedupe_key = f"lane_{event_type}_{lane_id}"
+    else:
+        dedupe_key = f"pilot_{event_type}_{project_id}"
+
+    existing = (
+        (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == "open",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    already = any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing)
+    if already:
+        return
+    session.add(
+        ProjectMessage(
+            project_id=project_id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=f"[LANE-PILOT] {detail}",
+            context={
+                "event_type": event_type,
+                "lane_id": str(lane_id) if lane_id is not None else None,
+                "dedupe_key": dedupe_key,
+            },
+        )
+    )
 
 
 async def raise_gate_integrity_alert(
@@ -1376,7 +1509,11 @@ async def compute_lane_arm_time_medians(
     rows = (
         await session.execute(
             select(
-                Task.created_at, Task.started_at, Task.updated_at, Task.context
+                Task.created_at,
+                Task.started_at,
+                Task.updated_at,
+                Task.context,
+                Task.payloads,
             ).where(
                 Task.project_id == project_id,
                 Task.status.in_(
@@ -1387,6 +1524,9 @@ async def compute_lane_arm_time_medians(
         )
     ).all()
 
+    _FIX_TASK_TYPES = frozenset({"fix", "implement"})
+    _REVIEW_TASK_TYPES = frozenset({"review", "audit", "code-review"})
+
     def _strip_tz(dt: Any) -> Any:
         if dt is None:
             return None
@@ -1395,7 +1535,7 @@ async def compute_lane_arm_time_medians(
         )
 
     pr_buckets: dict[str, list[tuple]] = {}
-    for created_at, started_at, updated_at, ctx in rows:
+    for created_at, started_at, updated_at, ctx, payloads in rows:
         if not isinstance(ctx, dict):
             continue
         review_loop = ctx.get("review_loop")
@@ -1404,11 +1544,19 @@ async def compute_lane_arm_time_medians(
         pr_number = review_loop.get("pr_number")
         if pr_number is None:
             continue
+        payload_type = ""
+        if isinstance(payloads, list) and payloads and isinstance(payloads[0], dict):
+            payload_type = str(payloads[0].get("type") or "")
         key = str(pr_number)
         if key not in pr_buckets:
             pr_buckets[key] = []
         pr_buckets[key].append(
-            (_strip_tz(created_at), _strip_tz(started_at), _strip_tz(updated_at))
+            (
+                _strip_tz(created_at),
+                _strip_tz(started_at),
+                _strip_tz(updated_at),
+                payload_type,
+            )
         )
 
     if not pr_buckets:
@@ -1418,6 +1566,8 @@ async def compute_lane_arm_time_medians(
             "gap_seconds": None,
             "task_count": None,
             "pr_count": 0,
+            "fix_active_seconds": None,
+            "review_active_seconds": None,
         }
 
     def _median(vals: list) -> float | None:
@@ -1432,6 +1582,8 @@ async def compute_lane_arm_time_medians(
     active_vals: list[float] = []
     gap_vals: list[float] = []
     count_vals: list[float] = []
+    fix_active_vals: list[float] = []
+    review_active_vals: list[float] = []
 
     for _, tasks in pr_buckets.items():
         created_times = [t[0] for t in tasks if t[0] is not None]
@@ -1444,10 +1596,22 @@ async def compute_lane_arm_time_medians(
             for t in tasks
             if t[1] is not None and t[2] is not None
         )
+        fix_active = sum(
+            max((t[2] - t[1]).total_seconds(), 0.0)
+            for t in tasks
+            if t[1] is not None and t[2] is not None and t[3] in _FIX_TASK_TYPES
+        )
+        review_active = sum(
+            max((t[2] - t[1]).total_seconds(), 0.0)
+            for t in tasks
+            if t[1] is not None and t[2] is not None and t[3] in _REVIEW_TASK_TYPES
+        )
         wc_vals.append(wall_clock)
         active_vals.append(active)
         gap_vals.append(max(wall_clock - active, 0.0))
         count_vals.append(float(len(tasks)))
+        fix_active_vals.append(fix_active)
+        review_active_vals.append(review_active)
 
     return {
         "wall_clock_seconds": _median(wc_vals),
@@ -1455,6 +1619,8 @@ async def compute_lane_arm_time_medians(
         "gap_seconds": _median(gap_vals),
         "task_count": _median(count_vals),
         "pr_count": len(pr_buckets),
+        "fix_active_seconds": _median(fix_active_vals),
+        "review_active_seconds": _median(review_active_vals),
     }
 
 
@@ -1764,6 +1930,58 @@ async def compute_lane_pilot_aggregates(
         else None
     )
 
+    # ── Per-arm visual-verification aggregates ───────────────────────────────
+    # Fetch the context + status columns needed by aggregate_visual_pilot().
+    # A separate query keeps the cost/merge query above unchanged and avoids
+    # fetching large context blobs into the already-complex chain-grouping loop.
+    vis_rows = (
+        await session.execute(
+            select(
+                Task.id, Task.status, Task.context, Task.created_at, _arm_expr
+            ).where(
+                Task.project_id == project_id,
+                Task.status.in_(
+                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                ),
+                _arm_expr.in_(["lane", "control"]),
+            )
+        )
+    ).all()
+
+    lane_vis_tasks: list[dict[str, Any]] = []
+    control_vis_tasks: list[dict[str, Any]] = []
+    for _task_id, status_val, ctx_val, created_at_val, arm_val in vis_rows:
+        arm = str(arm_val) if arm_val is not None else None
+        if arm not in ("lane", "control"):
+            continue
+        task_dict: dict[str, Any] = {
+            "status": str(status_val) if status_val is not None else None,
+            "context": ctx_val if isinstance(ctx_val, dict) else {},
+            "created_at": (
+                created_at_val.isoformat() if created_at_val is not None else None
+            ),
+        }
+        if arm == "lane":
+            lane_vis_tasks.append(task_dict)
+        else:
+            control_vis_tasks.append(task_dict)
+
+    def _vis_agg_to_dict(agg: VisualPilotAggregates) -> dict[str, Any]:
+        return {
+            "admin_task_count": agg.admin_task_count,
+            "entry_count": agg.entry_count,
+            "malformed_count": agg.malformed_count,
+            "pairs_inspected": agg.pairs_inspected,
+            "pairs_changed": agg.pairs_changed,
+            "infra_total": agg.infra_total,
+            "infra_rate": agg.infra_rate,
+            "caught_count": len(agg.caught),
+            "days_elapsed": agg.days_elapsed,
+        }
+
+    lane_visual = _vis_agg_to_dict(aggregate_visual_pilot(lane_vis_tasks))
+    control_visual = _vis_agg_to_dict(aggregate_visual_pilot(control_vis_tasks))
+
     return {
         "n_lane": n_lane,
         "n_control": n_control,
@@ -1783,4 +2001,6 @@ async def compute_lane_pilot_aggregates(
         "warm_resume_fraction": warm_resume_fraction,
         "checkpoint_fraction": checkpoint_fraction,
         "lane_fix_tasks_sampled": lane_fix_tasks_sampled,
+        "lane_visual": lane_visual,
+        "control_visual": control_visual,
     }

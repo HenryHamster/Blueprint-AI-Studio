@@ -4,7 +4,7 @@ import { Activity, Network, Compass, Microscope, BookOpen, Archive, Plus, MoreHo
 import { MetricsBar } from './MetricsBar';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
-import type { AuthMode, CategoryRoutingEntry, DeployState, FailedRollbackInfo, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
+import type { AccountMutationReturn, AccountUpdatePayload, AuthMode, CategoryRoutingEntry, DeployState, FailedRollbackInfo, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig, ProjectResourceEnvelopeResponse, ResourceEnvelopeConfig } from '../types/project';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
@@ -98,9 +98,10 @@ export interface HeaderBarProps {
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
   onToggleAccount: (id: string, enabled: boolean) => void;
-  onRemoveAccount: (id: string) => void;
+  onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
   onResetRateLimits: (id: string) => void;
   onRefreshAccountModels: (id: string) => void;
+  onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
   newAccountProvider: ProviderName;
@@ -283,6 +284,7 @@ export function HeaderBar(props: HeaderBarProps) {
     onRemoveAccount,
     onResetRateLimits,
     onRefreshAccountModels,
+    onUpdateAccount,
     newAccountName,
     setNewAccountName,
     newAccountProvider,
@@ -524,6 +526,7 @@ export function HeaderBar(props: HeaderBarProps) {
           onRemoveAccount={onRemoveAccount}
           onResetRateLimits={onResetRateLimits}
           onRefreshAccountModels={onRefreshAccountModels}
+          onUpdateAccount={onUpdateAccount}
           newAccountName={newAccountName}
           setNewAccountName={setNewAccountName}
           newAccountProvider={newAccountProvider}

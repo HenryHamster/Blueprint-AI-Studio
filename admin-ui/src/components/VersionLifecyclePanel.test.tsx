@@ -772,6 +772,26 @@ describe('VersionLifecyclePanel', () => {
       expect(consequences).toHaveTextContent('No tasks are currently in flight.');
     });
 
+    it('does not assert no tasks in flight when count is unavailable (null)', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 2, in_flight_task_count: null }),
+            staged_directions: [],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+
+      const consequences = screen.getByTestId('cut-consequences');
+      expect(consequences).toHaveTextContent('In-flight task count unavailable.');
+      expect(consequences).not.toHaveTextContent('No tasks are currently in flight.');
+    });
+
     it('folds consequences into the confirm message', async () => {
       const cutVersionMock = vi.fn().mockResolvedValue({
         abandoned_version: { version_number: 6, status: 'abandoned' },
@@ -1382,6 +1402,48 @@ describe('VersionLifecyclePanel', () => {
       );
       expect(screen.queryByText(/^@/)).not.toBeInTheDocument();
       expect(screen.queryByText(/merged since this verdict/)).not.toBeInTheDocument();
+    });
+
+    it('suppresses the merged_since_verdict badge when qualification is already running', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: 3,
+              qualification_state: { state: 'qualifying', summary: 'Audit in flight.' },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByText(/merged since this verdict/)).not.toBeInTheDocument();
+    });
+
+    it('shows the merged_since_verdict badge when qualification is not running', () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: 3,
+              qualification_state: { state: 'not_promoted', summary: 'Did not meet promotion criteria.' },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(
+        screen.getByText(/3 tasks merged since this verdict — re-qualify for current state/)
+      ).toBeInTheDocument();
     });
   });
 

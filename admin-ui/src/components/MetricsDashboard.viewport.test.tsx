@@ -152,6 +152,12 @@ vi.mock('../api', () => ({
       last_snapshot_at: '2026-05-08T00:00:00Z',
     }), { status: 200 });
   }),
+  fetchLaneBaselines: vi.fn(async () => ({
+    project_id: 'test-project-id',
+    count: 0,
+    baselines: [],
+    trend: null,
+  })),
 }));
 
 describe('MetricsDashboard — viewport regression', () => {

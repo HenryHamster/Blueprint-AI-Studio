@@ -217,14 +217,18 @@ async def test_evaluating_timeout_treats_parked_children_as_terminal_for_now(
     accounting, but never cascade-cancelled just because the parent aged out.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
 
     from app.shared_state import runtime_config as _rc
 
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
-    async def _seed_parent(*, ci_waiting: bool) -> tuple[Task, Task, TaskWakeRegistration]:
+    async def _seed_parent(
+        *, ci_waiting: bool
+    ) -> tuple[Task, Task, TaskWakeRegistration]:
         project = Project(name="Parked Timeout Guard", user_id="user1")
         eval_db.add(project)
         await eval_db.commit()
@@ -468,11 +472,7 @@ async def test_evaluating_hard_timeout_broadcasts_terminal_literals_when_expired
         from sqlalchemy import update
 
         kids = (
-            (
-                await session.execute(
-                    select(Task).where(Task.parent_task_id == task.id)
-                )
-            )
+            (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
             .scalars()
             .all()
         )
@@ -485,7 +485,9 @@ async def test_evaluating_hard_timeout_broadcasts_terminal_literals_when_expired
             session.expire(k)
         session.expire(task)
 
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", side_effect=_expire_alert)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", side_effect=_expire_alert
+    )
 
     project = Project(name="Hard Timeout Expired Bcast", user_id="user1")
     eval_db.add(project)
@@ -1288,9 +1290,7 @@ async def test_rollup_live_sibling_keeps_parent_evaluating_unmutated(eval_db, mo
 
 
 @pytest.mark.asyncio
-async def test_rollup_concurrent_terminal_events_respawn_at_most_once(
-    eval_db, mocker
-):
+async def test_rollup_concurrent_terminal_events_respawn_at_most_once(eval_db, mocker):
     """Fix 1 idempotency: two back-to-back rollup invocations (simulating two
     sibling-terminal events firing near-simultaneously) on a stale-unmerged child
     must respawn the review AT MOST once. The parent lock — not the all-children
@@ -1899,11 +1899,7 @@ async def test_spend_hold_first_sweep_fires_created_alert_and_notification(
     rec.assert_not_called()
     # Non-failure WARNING alert created.
     alerts = (
-        (
-            await eval_db.execute(
-                select(Alert).where(Alert.task_id == parent.id)
-            )
-        )
+        (await eval_db.execute(select(Alert).where(Alert.task_id == parent.id)))
         .scalars()
         .all()
     )
@@ -1967,11 +1963,7 @@ async def test_spend_hold_past_window_declines_cleanly_not_failed(eval_db, mocke
     fail_alert.assert_not_called()
     # No failure (ERROR) alert row was created for this task either.
     alerts = (
-        (
-            await eval_db.execute(
-                select(Alert).where(Alert.task_id == parent.id)
-            )
-        )
+        (await eval_db.execute(select(Alert).where(Alert.task_id == parent.id)))
         .scalars()
         .all()
     )
@@ -2261,7 +2253,9 @@ async def test_evaluating_hard_timeout_defers_with_recoverable_failed_child(
     cancelling it would destroy salvageable work. Regression for incident
     2026-04-29 (PRs #3450/#3408 + parents c30701d3/ddd987fc)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     from app.shared_state import runtime_config as _rc
 
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
@@ -2324,7 +2318,9 @@ async def test_evaluating_hard_timeout_kills_when_failed_child_is_code_error(
     """A FAILED child with CODE_ERROR (not infra-recoverable) must NOT trigger
     the defer path — the existing 6h kill path runs as before."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     from app.shared_state import runtime_config as _rc
 
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
@@ -2383,7 +2379,9 @@ async def test_evaluating_defer_window_exhausted_kills(eval_db, mocker):
     children must eventually fall through to the kill path — the defer is
     bounded so a truly stuck operator-intervention case still terminates."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     from app.shared_state import runtime_config as _rc
 
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
@@ -2543,7 +2541,9 @@ async def test_ci_backstop_does_not_clobber_concurrently_resolved_row(eval_db, m
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     from app import services as _services
 
@@ -2635,9 +2635,7 @@ async def test_ci_backstop_does_not_clobber_concurrently_resolved_row(eval_db, m
 
 
 @pytest.mark.asyncio
-async def test_pr_state_check_consumer_respawn_failure_persists_marker(
-    eval_db, mocker
-):
+async def test_pr_state_check_consumer_respawn_failure_persists_marker(eval_db, mocker):
     """C6 rework seam (A): the services ``_check_evaluating_timeouts`` consumer
     that recovers ``_pr_state_check_pending`` must itself NOT be one-shot.
 
@@ -2724,9 +2722,7 @@ async def test_pr_state_check_consumer_respawn_failure_persists_marker(
 
 
 @pytest.mark.asyncio
-async def test_pr_state_check_consumer_respawn_success_clears_marker(
-    eval_db, mocker
-):
+async def test_pr_state_check_consumer_respawn_success_clears_marker(eval_db, mocker):
     """C6 rework guard (A): on a CONFIRMED re-spawn success the consumer must
     clear ``_pr_state_check_pending`` — a childed EVALUATING parent is a
     normally parked parent, and a leftover marker would make the next sweep
@@ -2850,9 +2846,7 @@ async def test_pr_state_check_consumer_merged_promotion_target_alerts_without_pr
     assert (parent.context or {}).get("pr_merged") is None
     assert not (parent.context or {}).get("_pr_state_check_pending")
     alerts = (
-        (
-            await eval_db.execute(select(Alert).where(Alert.task_id == parent.id))
-        )
+        (await eval_db.execute(select(Alert).where(Alert.task_id == parent.id)))
         .scalars()
         .all()
     )
@@ -2935,9 +2929,7 @@ async def test_pr_state_check_consumer_same_branch_merge_sets_pr_merged(
     assert parent.status == TaskStatus.COMPLETED
     assert (parent.context or {}).get("pr_merged") is True
     alerts = (
-        (
-            await eval_db.execute(select(Alert).where(Alert.task_id == parent.id))
-        )
+        (await eval_db.execute(select(Alert).where(Alert.task_id == parent.id)))
         .scalars()
         .all()
     )
@@ -3018,9 +3010,7 @@ async def test_pr_state_check_consumer_intermediate_rollup_stays_evaluating(
     assert not (parent.context or {}).get("_pr_state_check_pending")
     assert "awaiting downstream landing" in (parent.latest_status_message or "")
     alerts = (
-        (
-            await eval_db.execute(select(Alert).where(Alert.task_id == parent.id))
-        )
+        (await eval_db.execute(select(Alert).where(Alert.task_id == parent.id)))
         .scalars()
         .all()
     )
@@ -3979,9 +3969,7 @@ async def test_ci_backstop_fires_after_defer_window_and_exhausted_retries(
     await eval_db.commit()
 
     # The exhausted child must NOT count as unexhausted-optimistic-retry work.
-    assert (
-        await _chain_has_unexhausted_optimistic_retry_work(parent, eval_db) is False
-    )
+    assert await _chain_has_unexhausted_optimistic_retry_work(parent, eval_db) is False
 
     await _check_evaluating_timeouts()
 
@@ -4102,9 +4090,7 @@ async def test_approval_gate_timeout_fails_past_defer_ceiling_even_if_busy(
 
 
 @pytest.mark.asyncio
-async def test_approval_gate_timeout_still_fails_when_chain_quiescent(
-    eval_db, mocker
-):
+async def test_approval_gate_timeout_still_fails_when_chain_quiescent(eval_db, mocker):
     """With NO live chain work (only a terminal fix child), the 2h timeout
     keeps today's behavior exactly: FAILED."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
@@ -4132,9 +4118,7 @@ async def test_approval_gate_timeout_still_fails_when_chain_quiescent(
     await eval_db.commit()
     await eval_db.refresh(parent)
 
-    done_fix = _chain_busy_fix_child(
-        project.id, parent.id, status=TaskStatus.COMPLETED
-    )
+    done_fix = _chain_busy_fix_child(project.id, parent.id, status=TaskStatus.COMPLETED)
     eval_db.add(done_fix)
     await eval_db.commit()
 
@@ -4144,4 +4128,330 @@ async def test_approval_gate_timeout_still_fails_when_chain_quiescent(
     assert parent.status == TaskStatus.FAILED, (
         f"A quiescent chain must keep the 2h FAILED terminalization, got "
         f"{parent.status}: {parent.latest_status_message!r}"
+    )
+
+
+# ── Reaped-owner reconcile (Defects 1 & 2) ──────────────────────────────────
+#
+# Regression coverage for owner tasks that get reaped mid-run with an open PR:
+# the reaper puts them in EVALUATING, sets _pr_state_check_pending, spawns a
+# Review child, then CLEARS the marker on success.  Once the marker is gone the
+# task is invisible to every existing sweep path, so if the PR merges out-of-band
+# or the Review/Fix sub-pipeline completes without another reconcile kick, the
+# owner stays EVALUATING forever.
+
+
+@pytest.mark.asyncio
+async def test_reaped_owner_with_merged_pr_reconciled_on_all_children_terminal(
+    eval_db, mocker
+):
+    """Defect 1: when all Review/Fix children are terminal AND the owner has a
+    PULL_REQUEST artifact for a merged PR, the sweep must reconcile the owner to
+    COMPLETED and stamp pr_merged — NOT fall through to the generic missed-rollup
+    trigger.
+
+    Regression for task 3eb15e9e / 1c286f23: sub-pipeline finished but the owner
+    never received the merged-PR signal because _pr_state_check_pending was
+    cleared by the reaper after successful Review spawn.
+    """
+    from app.models import Artifact, ArtifactType
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "closed",
+                "merged": True,
+                "base": {"ref": "main"},
+            }
+        ),
+    )
+
+    project = Project(
+        name="Reaped Owner Reconcile",
+        user_id="user-reaped-d1",
+        integration_branch="main",
+        promotion_target="main",
+    )
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    owner = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "original work"}],
+        status=TaskStatus.EVALUATING,
+        context={},
+        status_log=[{"t": _naive_utc_ago(hours=2).isoformat(), "msg": "→ EVALUATING"}],
+    )
+    eval_db.add(owner)
+    await eval_db.commit()
+    await eval_db.refresh(owner)
+
+    eval_db.add(
+        Artifact(
+            task_id=owner.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/89",
+        )
+    )
+    review_child = Task(
+        project_id=project.id,
+        parent_task_id=owner.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 89,
+                "original_task_id": str(owner.id),
+                "prompt": "review PR #89",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": {"pr_number": 89}},
+    )
+    fix_child = Task(
+        project_id=project.id,
+        parent_task_id=owner.id,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 89,
+                "original_task_id": str(owner.id),
+                "prompt": "fix CI on PR #89",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": {"pr_number": 89}},
+    )
+    eval_db.add(review_child)
+    eval_db.add(fix_child)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(owner)
+    assert owner.status == TaskStatus.COMPLETED, (
+        f"Reaped owner with merged PR and all-terminal sub-pipeline must be "
+        f"reconciled to COMPLETED, got {owner.status}: "
+        f"{owner.latest_status_message!r}"
+    )
+    assert (owner.context or {}).get("pr_merged") is True, (
+        "Reconciled reaped owner must have pr_merged stamped in context"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaped_owner_with_open_pr_rearms_pr_state_check_pending(
+    eval_db, mocker
+):
+    """Defect 1 (open-PR branch): when all Review/Fix children are terminal but
+    the owner's PR is still OPEN, the sweep must re-arm ``_pr_state_check_pending``
+    and leave the owner EVALUATING — NOT reconcile to COMPLETED and NOT fall
+    through to the generic missed-rollup trigger. The existing consumer then
+    spawns the next Review iteration on a later sweep.
+
+    Regression for task 3eb15e9e / PR #89: the Fix child pushed the final commit
+    and COMPLETED, but no re-review → merge ran, leaving the PR open and the owner
+    orphaned in EVALUATING ~13h with no marker to drive recovery.
+    """
+    from app.models import Artifact, ArtifactType
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    # PR is still OPEN (the Fix child finished but no re-review+merge ran).
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"ref": "main"},
+            }
+        ),
+    )
+
+    project = Project(
+        name="Reaped Owner Open PR Rearm",
+        user_id="user-reaped-d1-open",
+        integration_branch="main",
+        promotion_target="main",
+    )
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    owner = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "original work"}],
+        status=TaskStatus.EVALUATING,
+        context={},
+        status_log=[{"t": _naive_utc_ago(hours=2).isoformat(), "msg": "→ EVALUATING"}],
+    )
+    eval_db.add(owner)
+    await eval_db.commit()
+    await eval_db.refresh(owner)
+
+    eval_db.add(
+        Artifact(
+            task_id=owner.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/89",
+        )
+    )
+    review_child = Task(
+        project_id=project.id,
+        parent_task_id=owner.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 89,
+                "original_task_id": str(owner.id),
+                "prompt": "review PR #89",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": {"pr_number": 89}},
+    )
+    fix_child = Task(
+        project_id=project.id,
+        parent_task_id=owner.id,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 89,
+                "original_task_id": str(owner.id),
+                "prompt": "fix CI on PR #89",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": {"pr_number": 89}},
+    )
+    eval_db.add(review_child)
+    eval_db.add(fix_child)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(owner)
+    assert owner.status == TaskStatus.EVALUATING, (
+        f"Reaped owner with an OPEN PR and all-terminal sub-pipeline must stay "
+        f"EVALUATING (re-armed for the next Review iteration), not reconcile to "
+        f"{owner.status}: {owner.latest_status_message!r}"
+    )
+    assert (owner.context or {}).get("_pr_state_check_pending") is True, (
+        "Open-PR reaped owner must have _pr_state_check_pending re-armed so the "
+        "existing consumer spawns the next Review iteration"
+    )
+    assert not (owner.context or {}).get("pr_merged"), (
+        "An open (unmerged) PR must NOT stamp pr_merged on the owner"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaped_owner_markerless_merged_pr_fallback_reconciles(eval_db, mocker):
+    """Defect 2: an EVALUATING reaped-owner task with no ``review_loop`` or
+    ``_pr_state_check_pending`` must be reconciled to COMPLETED when its PR
+    merges out-of-band while the sub-pipeline is still active, once the 30-min
+    grace period elapses.
+
+    Regression for task 1c286f23: PR #10112 merged at 04:38Z but the owner
+    stayed EVALUATING for 17+ hours because no marker remained to trigger any
+    existing sweep consumer path.
+    """
+    from app.models import Artifact, ArtifactType
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "closed",
+                "merged": True,
+                "base": {"ref": "main"},
+            }
+        ),
+    )
+
+    project = Project(
+        name="Reaped Owner Markerless Fallback",
+        user_id="user-reaped-d2",
+        integration_branch="main",
+        promotion_target="main",
+    )
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    # No review_loop, no _pr_state_check_pending, no pr_merged — the "invisible"
+    # state left after the reaper clears the write-ahead flag.
+    owner = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "original work"}],
+        status=TaskStatus.EVALUATING,
+        context={},
+        vm_instance_id=None,
+        status_log=[{"t": _naive_utc_ago(hours=2).isoformat(), "msg": "→ EVALUATING"}],
+    )
+    eval_db.add(owner)
+    await eval_db.commit()
+    await eval_db.refresh(owner)
+
+    eval_db.add(
+        Artifact(
+            task_id=owner.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/10112",
+        )
+    )
+    # One still-active review child → all_children_terminal=False so only the
+    # marker-less fallback path (Defect 2) can reconcile the owner.
+    active_review = Task(
+        project_id=project.id,
+        parent_task_id=owner.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 10112,
+                "original_task_id": str(owner.id),
+                "prompt": "review PR #10112",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        context={"review_loop": {"pr_number": 10112}},
+        last_heartbeat=_naive_utc_ago(hours=1),
+    )
+    eval_db.add(active_review)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(owner)
+    assert owner.status == TaskStatus.COMPLETED, (
+        f"Reaped owner with out-of-band merged PR must be reconciled to COMPLETED "
+        f"by the marker-less fallback after grace period, got {owner.status}: "
+        f"{owner.latest_status_message!r}"
+    )
+    assert (owner.context or {}).get("pr_merged") is True, (
+        "Reconciled reaped owner must have pr_merged stamped in context"
     )

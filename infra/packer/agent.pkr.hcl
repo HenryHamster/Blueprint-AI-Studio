@@ -105,7 +105,7 @@ build {
       "sudo mkdir -p /opt/agent /tmp/workspace",
       "sudo chown -R packer:packer /opt/agent",
       "# Pre-create workspace and install gcloud/gsutil for faster startup",
-      "sudo apt-get install -y apt-transport-https ca-certificates jq",
+      "sudo apt-get install -y apt-transport-https ca-certificates jq universal-ctags",
       "# Pre-warm CLI installs so the baked image already has first-run caches",
       "claude --version || true",
       "codex --version || true",

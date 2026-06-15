@@ -84,7 +84,7 @@ async def task_lock(
 
     Round 5 W1 (audit CRITICAL): ``populate_existing=True`` is required.
     The orchestrator dispatch loop loads candidate Tasks via
-    ``load_only(<projection>)``; those projection-deferred instances enter
+    ``load_only(<projection>, raiseload=True)``; those projection-deferred instances enter
     the session's identity map. A subsequent ``task_lock`` re-SELECT
     without ``populate_existing`` returns the cached projected instance
     (SQLAlchemy's identity-map default), so reads of non-projected columns

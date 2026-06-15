@@ -2765,9 +2765,10 @@ async def test_confirmed_low_actionability_decay_spawns_memo_with_second_opinion
 
 
 @_pytest.mark.asyncio
-async def test_low_actionability_challenge_indeterminate_redefers(db_session, mocker):
-    """A low-actionability challenge that does not confirm LOW keeps the
-    finding deferred for refinement instead of terminally dropping it."""
+async def test_low_actionability_challenge_non_disagrees_decays(db_session, mocker):
+    """A low-actionability challenge that does not explicitly disagree with a
+    substantive rationale (e.g. agreement='agrees' with a non-LOW verdict)
+    now decays the finding instead of routing to refinement."""
     from test_autonomous_research import _make_finding, _patch_research_externals
 
     mocker.patch.dict(
@@ -2811,25 +2812,120 @@ async def test_low_actionability_challenge_indeterminate_redefers(db_session, mo
     await _handle_research_completion(task, "", db_session)
     await db_session.refresh(task)
 
-    assert (task.context or {}).get("finding_structural_give_up") is None
+    # The finding was decayed, so finding_structural_give_up is set (not None).
+    give_up = (task.context or {}).get("finding_structural_give_up")
+    assert give_up is not None, "decayed finding must set finding_structural_give_up"
+    assert give_up.get("by_reason", {}).get("low_actionability", 0) == 1
+    # With new logic: agreement != "disagrees" → decay, NOT refinement.
     deferred = (task.context or {}).get("deferred_findings", [])
-    kept = next(f for f in deferred if f.get("title") == decayed["title"])
-    assert kept["deferred_reason"] == "low_actionability_refinement"
-    assert kept["finding_challenge"]["second_opinion_verdict"] == "indeterminate"
-    assert "sidecar failed" in kept["low_actionability_refinement_reason"]
-    children = (
-        (
-            await db_session.execute(
-                _select(_Task).where(_Task.parent_task_id == task.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
     assert not any(
-        c.context and c.context.get("memo_drop_reason") == "low_actionability_decay"
-        for c in children
+        f.get("title") == decayed["title"]
+        and f.get("deferred_reason") == "low_actionability_refinement"
+        for f in deferred
     )
+
+
+@_pytest.mark.asyncio
+async def test_finding_challenge_binds_identity_and_indeterminate_low_stays_deferred(
+    db_session, mocker
+):
+    """Identity binding: a challenge record with a mismatched finding_hash is rejected
+    (the finding is re-challenged rather than consuming a stale verdict).
+    Indeterminate low stays deferred: when the record has agreement='indeterminate',
+    the finding is decayed rather than converted to a spawnable refinement."""
+    from app.finding_deduplication import finding_hash as fhash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"research_finding_challenge_enabled": True},
+    )
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-chal-identity"
+    )
+    finding_title = "Retry-budget overflow in challenge loop"
+    finding_desc = "The challenge loop does not cap retry depth."
+    f = _make_finding(finding_title, direction_id=direction["id"])
+    f["description"] = finding_desc
+    f["actionability_grade"] = "LOW"
+    f["deferred_reason"] = "low_actionability"
+    f["deferred_count"] = 3
+
+    correct_hash = fhash(finding_title, finding_desc)
+    wrong_hash = "000000deadbeef00"
+
+    # --- Part 1: hash mismatch → record not consumed → no refinement ---
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [f],
+        FINDING_CHALLENGE_VERDICT_KEY: {
+            "challenged_boundary": CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+            "first_verdict": "LOW",
+            "second_opinion_verdict": "actionable",
+            "agreement": "disagrees",
+            "reason": "finding is specific and actionable",
+            "sidecar_task_id": "sidecar-wrong-hash",
+            "finding_hash": wrong_hash,  # does NOT match the finding's hash
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Sentinel A", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+    # A mismatched hash means _consume returns None → challenge re-spawned → task parked.
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+    # Task should be parked awaiting a new challenge (EVALUATING).
+    from app.models import TaskStatus as _TS
+
+    assert task.status == _TS.EVALUATING
+
+    # --- Part 2: indeterminate agreement with correct hash → decay, NOT refinement ---
+    # Reset task status and install a verdict with indeterminate agreement.
+    task.status = _TS.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [f],
+        "awaiting_finding_challenge": None,
+        FINDING_CHALLENGE_VERDICT_KEY: {
+            "challenged_boundary": CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+            "first_verdict": "LOW",
+            "second_opinion_verdict": "",
+            "agreement": "indeterminate",
+            "reason": "could not reach a conclusion",
+            "sidecar_task_id": "sidecar-indet",
+            "finding_hash": correct_hash,  # matches the finding
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Sentinel B", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert not any(
+        fn.get("title") == finding_title
+        and fn.get("deferred_reason") == "low_actionability_refinement"
+        for fn in deferred
+    ), "indeterminate challenge must not promote to refinement"
 
 
 @_pytest.mark.asyncio
@@ -2914,6 +3010,164 @@ async def test_research_history_records_finding_challenge_summary(db_session):
         },
         "fail_closed_unparseable": 1,
     }
+
+
+@_pytest.mark.asyncio
+async def test_dedup_deadlock_holds_direction_out_of_rotation_and_auto_recovers(
+    db_session, mocker
+):
+    """Detecting a dedup deadlock auto-pauses the direction and auto-recovery restores it.
+
+    Three consecutive dedup-zero research cycles must:
+    - Set direction status to 'paused' with auto_paused=True and a 'dedup_deadlock:' reason
+    - Increment auto_pause_count
+    - Create a WARNING alert and a BUG_REPORT message
+    - Be reversible: _process_direction_lifecycle reactivates the direction once the
+      cooldown (direction_dedup_deadlock_recovery_hours, default 8h) elapses.
+    """
+    from datetime import datetime, timedelta
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.direction_lifecycle import _process_direction_lifecycle
+    from app.models import Alert
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-deadlock-rr"
+    # Two pre-existing dedup-zero history entries (both with hash_dedup activity)
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-old-dl1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 2,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-old-dl2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1,
+                "word_overlap_dedup": 1,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+    ]
+    direction = {
+        **_active_direction(direction_id, "Dedup deadlock direction"),
+        "research_history": old_history,
+    }
+    project = _Project(
+        name="Deadlock Recovery Test",
+        user_id="test-user-dlrr",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Call apply_post_spawn_state with a 3rd dedup-zero cycle (triggers deadlock: 3
+    # consecutive zero-task cycles, >=2 with dedup activity).
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        1,  # hash_dedup_count — dedup activity in this 3rd cycle
+        0,  # word_overlap_count
+        0,  # file_overlap_count
+        0,  # evidence_overlap_count
+        0,  # type_filtered_count
+        0,  # empty_prompt_count
+        "research-branch",
+        "main",
+        0,  # research_depth
+        None,  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", (
+        f"direction should be paused on dedup deadlock, got {d['status']!r}"
+    )
+    assert d.get("auto_paused") is True, "auto_paused must be set"
+    assert (d.get("paused_reason") or "").startswith("dedup_deadlock:"), (
+        f"paused_reason must start with 'dedup_deadlock:', got {d.get('paused_reason')!r}"
+    )
+    assert d.get("auto_pause_count") == 1, (
+        f"auto_pause_count should be 1, got {d.get('auto_pause_count')}"
+    )
+    assert d.get("paused_at") is not None, "paused_at must be stamped"
+
+    # Verify a WARNING alert was created for the deadlock
+    result = await db_session.execute(
+        _select(Alert).where(
+            Alert.project_id == project.id,
+            Alert.title == "Dedup deadlock detected",
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    assert result.scalars().first() is not None, (
+        "expected a 'Dedup deadlock detected' alert"
+    )
+
+    # Simulate 50h elapsed since the pause (past the 8h dedup_deadlock recovery window)
+    dirs = list(project.directions)
+    dirs[0]["paused_at"] = (datetime.utcnow() - timedelta(hours=50)).isoformat()
+    project.directions = dirs
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Run direction lifecycle — should auto-recover the direction past the cooldown
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "active", (
+        f"direction should be active after cooldown, got {d['status']!r}"
+    )
+    assert d.get("auto_recovered_at") is not None, "auto_recovered_at must be stamped"
+    assert not d.get("auto_paused"), "auto_paused should be cleared on recovery"
+    assert not d.get("paused_reason"), "paused_reason should be cleared on recovery"
 
 
 @_pytest.mark.asyncio
@@ -4964,6 +5218,77 @@ async def test_task_prerequisite_rebinds_to_same_batch_design_lineage(
 
 
 @_pytest.mark.asyncio
+async def test_depends_on_indices_wires_edge_when_foundation_description_has_trailing_whitespace(
+    db_session, mocker
+):
+    """depends_on edge must resolve when the foundation finding's description has
+    trailing whitespace (e.g. a trailing newline, common in LLM-emitted findings).
+
+    The bug: missing_hash was computed from the raw unstripped description, but
+    finding_lineage on the spawned foundation task is built from the canonical
+    stripped body. For a description like "Some body\\n" the two hashes diverge,
+    the lineage match fails, no edge is wired, and the dependent enters BLOCKED.
+    The fix: use _canonical_finding_body (which strips) for the missing_hash so
+    both sides agree.
+
+    Also covers the empty-string description case: when description is "" and
+    prompt is non-empty, the canonical body uses prompt (stripped), matching what
+    the lineage stores.
+    """
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-trailing-ws"
+    )
+
+    # Foundation finding whose description has a trailing newline.
+    foundation = _make_finding(
+        title="Build shared event infrastructure",
+        direction_id=direction["id"],
+    )
+    foundation["description"] = "Core pub/sub infrastructure\n"
+
+    dependent = _make_finding(
+        title="Wire domain event handlers",
+        direction_id=direction["id"],
+    )
+    dependent["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[foundation, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    by_title = {c.title: c for c in children}
+    foundation_child = by_title[foundation["title"]]
+    dependent_child = by_title[dependent["title"]]
+
+    assert dependent_child.status != TaskStatus.BLOCKED, (
+        "dependent must not be BLOCKED when foundation description has trailing whitespace"
+    )
+    assert str(foundation_child.id) in (dependent_child.depends_on or []), (
+        "depends_on edge must wire to the foundation task despite trailing newline in description"
+    )
+    assert get_blocker_needs(dependent_child) == [], (
+        "no unresolved need must be persisted when the edge was wired"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_observation_dependency_escalates_instead_of_blocking(db_session, mocker):
     """Observation/non-spawning findings cannot provide a task, so a dependent
     whose only need is that finding escalates instead of entering BLOCKED."""
@@ -5527,6 +5852,94 @@ async def test_batch_cap_does_not_shrink_under_fleet_load(db_session, mocker):
     assert not any(f.get("deferred_reason") == "batch_cap" for f in deferred), (
         "no finding may be deferred by the batch cap below the flat ceiling"
     )
+
+
+@_pytest.mark.asyncio
+async def test_fresh_depends_on_indices_not_corrupted_by_prior_deferred_prepend(
+    db_session, mocker
+):
+    """A fresh finding's depends_on_indices are 0-based into the agent's own
+    (fresh-only) output. When prior-cycle deferred findings are prepended to the
+    combined findings list, each fresh index must be shifted up by the number of
+    prepended findings so it still resolves to the intended fresh sibling — not to
+    a recovered deferred finding that happened to occupy the same raw slot.
+
+    Setup: one prior deferred finding (occupies combined-list index 0); two fresh
+    findings A (combined index 1) and B (combined index 2) where B declares
+    depends_on_indices=[0] — meaning "depends on fresh sibling at position 0" in
+    the agent's view (i.e., finding A). After the rebase the index becomes [1],
+    resolving to A's child task. Without the fix the raw index [0] resolves to the
+    prior deferred finding's child task, wiring the wrong edge."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-prq-rebase"
+    )
+
+    # Prior-cycle deferred finding; will be prepended at combined-list index 0.
+    prior = _make_finding(title="Prior deferred finding", direction_id=direction["id"])
+    prior["deferred_reason"] = "low_actionability"
+    prior["deferred_count"] = 1
+
+    # Fresh findings from the current agent run.
+    # finding_a is at fresh-index 0 → combined-index 1 after prepend.
+    finding_a = _make_finding(title="Foundation fresh A", direction_id=direction["id"])
+    # finding_b depends on fresh-index 0 (finding_a); combined-index 2 after prepend.
+    finding_b = _make_finding(title="Dependent fresh B", direction_id=direction["id"])
+    finding_b["depends_on_indices"] = [0]  # agent's view: sibling at fresh position 0
+
+    # Inject the prior deferred finding so _handle_research_completion will prepend it.
+    task.context = dict(task.context or {})
+    task.context["prior_deferred_findings"] = [prior]
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(task, "context")
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Filter out memo/notification tasks.
+    spawn_children = [
+        c for c in children if (c.first_payload or {}).get("type") != "memo"
+    ]
+
+    child_by_title = {c.title: c for c in spawn_children}
+    assert "Foundation fresh A" in child_by_title, (
+        "finding_a must spawn as a child task"
+    )
+    assert "Dependent fresh B" in child_by_title, "finding_b must spawn as a child task"
+
+    child_a = child_by_title["Foundation fresh A"]
+    child_b = child_by_title["Dependent fresh B"]
+
+    assert str(child_a.id) in (child_b.depends_on or []), (
+        "finding_b's depends_on edge must point at finding_a's child task "
+        "(the intended fresh sibling), not the prior deferred finding"
+    )
+    # Prior deferred finding's child (if any) must NOT be in finding_b's depends_on.
+    prior_children = [c for c in spawn_children if c.title == prior["title"]]
+    for pc in prior_children:
+        assert str(pc.id) not in (child_b.depends_on or []), (
+            "finding_b must not be wired to the prior deferred finding — "
+            "its depends_on_indices was not correctly rebased"
+        )
 
 
 @_pytest.mark.asyncio
@@ -8853,6 +9266,57 @@ def test_adversarial_gate_unresolved_reason_distinguishes_parse_failure_modes():
     assert result["h1"]["passed"] is False
     # h2 was not in the output at all → no_hash_matches
     assert result["h2"]["unresolved_reason"] == "no_hash_matches"
+
+
+def test_adversarial_verdict_binds_by_index_without_hash():
+    """Acceptance test: verdicts with only 'index' (no 'hash') bind correctly.
+
+    A challenger may emit verdicts identified by index/position only (no hash field),
+    especially when the hash transcription is unreliable. The parser must accept
+    index-only arrays and bind them to findings by their manifest position.
+    """
+    h1 = "finding_hash_1111"
+    h2 = "finding_hash_2222"
+    h3 = "finding_hash_3333"
+
+    # Verdicts with explicit 'index' field but no 'hash' — pure index binding.
+    logs_index_only = (
+        "["
+        '{"index": 1, "verdict": "pass", "reason": "well-grounded at HEAD"},'
+        '{"index": 2, "verdict": "fail", "reason": "code was refactored"},'
+        '{"index": 3, "verdict": "pass", "reason": "confirmed stable"}'
+        "]"
+    )
+    result, outcome = parse_adversarial_finding_verdicts(logs_index_only, [h1, h2, h3])
+    assert outcome == "ok", f"index-only binding must succeed; got {outcome!r}"
+    assert result[h1]["passed"] is True
+    assert result[h1]["explicit"] is True
+    assert result[h1]["reason"] == "well-grounded at HEAD"
+    assert result[h2]["passed"] is False
+    assert result[h2]["explicit"] is True
+    assert result[h2]["reason"] == "code was refactored"
+    assert result[h3]["passed"] is True
+    assert result[h3]["explicit"] is True
+    assert result[h3]["reason"] == "confirmed stable"
+
+    # Verdicts by array position alone (no index or hash fields).
+    logs_position_only = (
+        "["
+        '{"verdict": "fail", "reason": "stale"},'
+        '{"verdict": "pass", "reason": "fresh"}'
+        "]"
+    )
+    result2, outcome2 = parse_adversarial_finding_verdicts(
+        logs_position_only, [h1, h2, h3]
+    )
+    assert outcome2 == "ok", f"array-position binding must succeed; got {outcome2!r}"
+    assert result2[h1]["passed"] is False
+    assert result2[h1]["explicit"] is True
+    assert result2[h2]["passed"] is True
+    assert result2[h2]["explicit"] is True
+    # h3 has no verdict at position 2 → fail-closed
+    assert result2[h3]["passed"] is False
+    assert result2[h3]["explicit"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -12763,6 +13227,97 @@ class TestStampNoFindingsRefractory:
         direction = project.directions[0]
         assert direction["consecutive_unproductive_cycles"] == 2
 
+    def _make_saturated_project(self, direction_id="d-test", history=None, agg=None):
+        """Build a project whose direction is already saturated (2 consecutive unproductive cycles)."""
+        project = MagicMock()
+        project.directions = [
+            {
+                "id": direction_id,
+                "status": "active",
+                "research_history": history if history is not None else [],
+                "history_aggregate": agg if agg is not None else {},
+                "consecutive_unproductive_cycles": 2,
+            }
+        ]
+        return project
+
+    def test_auto_complete_requires_verified_merge_count(self):
+        """Auto-completion must use verified merge count, not raw prs_merged.
+
+        A saturated direction with 3 raw prs_merged but 0 verified_prs_merged
+        must NOT be auto-completed.  Only when the same merges carry a non-zero
+        verified_prs_merged should the direction flip to 'completed'.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # --- case 1: 3 raw merges, all unverified (verified_prs_merged=0) ---
+        # Each entry has prs_merged=1 but verified_prs_merged=0 (degraded).
+        unverified_history = [
+            {"prs_merged": 1, "verified_prs_merged": 0},
+            {"prs_merged": 1, "verified_prs_merged": 0},
+            {"prs_merged": 1, "verified_prs_merged": 0},
+        ]
+        task = self._make_task()
+        project = self._make_saturated_project(history=unverified_history)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "Direction with 3 unverified merges must NOT be auto-completed"
+        )
+
+        # --- case 2: same 3 merges, all verified (verified_prs_merged=1) ---
+        verified_history = [
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+        ]
+        task2 = self._make_task()
+        project2 = self._make_saturated_project(history=verified_history)
+        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
+        direction2 = project2.directions[0]
+        assert direction2.get("status") == "completed", (
+            "Direction with 3 verified merges must be auto-completed"
+        )
+        assert "verified" in direction2.get("auto_completed_reason", ""), (
+            "auto_completed_reason must reflect the verified count"
+        )
+
+    def test_auto_complete_aggregate_path_requires_verified_count(self):
+        """Auto-completion via history_aggregate must use total_verified_prs_merged.
+
+        When raw total_prs_merged >= 3 but total_verified_prs_merged == 0, the
+        direction must NOT be auto-completed.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Aggregate path: total raw merges=3, verified=0
+        agg_unverified = {
+            "total_prs_merged": 3,
+            "total_verified_prs_merged": 0,
+            "total_cycles": 5,
+        }
+        task = self._make_task()
+        project = self._make_saturated_project(agg=agg_unverified)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "Direction with only unverified aggregate merges must NOT be auto-completed"
+        )
+
+        # Aggregate path: total raw merges=3, verified=3
+        agg_verified = {
+            "total_prs_merged": 3,
+            "total_verified_prs_merged": 3,
+            "total_cycles": 5,
+        }
+        task2 = self._make_task()
+        project2 = self._make_saturated_project(agg=agg_verified)
+        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
+        direction2 = project2.directions[0]
+        assert direction2.get("status") == "completed", (
+            "Direction with 3 verified aggregate merges must be auto-completed"
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Deferred-memo enrollment: flag-off no-op, flag-on creates row, dedup.
@@ -12986,3 +13541,237 @@ async def test_deferred_memo_enrollment_dedup_on_repeat_drop(db_session, mocker)
         .all()
     )
     assert len(rows_after) == 1, "dedup: still exactly one row after second drop"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-cycle filtered-hash suppression
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_pytest.mark.asyncio
+async def test_recently_filtered_hashes_persisted_after_dedup(db_session, mocker):
+    """When a finding is hash-deduped out (prior COMPLETED+pr_merged task), its hash
+    is persisted into direction.recently_filtered_finding_hashes for the next cycle."""
+    from app.finding_deduplication import finding_hash as _fhash
+    from test_autonomous_research import (
+        _active_direction,
+        _make_finding,
+        _make_research_task,
+        _patch_research_externals,
+    )
+
+    direction_id = "d-fh-persist01"
+    title = "Fix cross-cycle suppression regression"
+    # _make_finding produces description = f"Description: {title}"
+    description = f"Description: {title}"
+    fhash = _fhash(title, description)
+
+    direction = _active_direction(direction_id, "Hash-persist direction")
+    project = _Project(
+        name=f"HashPersist {direction_id}",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A prior COMPLETED task with pr_merged=True carries the same finding_hash,
+    # so build_dedup_state will add it to recent_finding_hashes.
+    prior = _Task(
+        project_id=project.id,
+        title=title,
+        status=TaskStatus.COMPLETED,
+        context={"finding_hash": fhash, "pr_merged": True},
+        created_by="ORCHESTRATOR",
+        vm_instance_id="test-vm-prior-fh01",
+    )
+    db_session.add(prior)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    finding = _make_finding(title=title, direction_id=direction_id)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    updated_dirs = project.directions or []
+    target_dir = next((d for d in updated_dirs if d.get("id") == direction_id), None)
+    assert target_dir is not None, "direction must still be present after completion"
+    persisted = target_dir.get("recently_filtered_finding_hashes") or []
+    assert fhash in persisted, (
+        f"hash-deduped finding hash {fhash!r} must be written to "
+        "direction.recently_filtered_finding_hashes for next-cycle suppression"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_recently_filtered_hashes_suppress_finding_next_cycle(db_session, mocker):
+    """A hash pre-loaded into direction.recently_filtered_finding_hashes (from a
+    prior cycle) suppresses the matching finding without any DB task carrying that
+    hash — pure persisted-state cross-cycle suppression."""
+    from app.finding_deduplication import finding_hash as _fhash
+    from test_autonomous_research import (
+        _active_direction,
+        _make_finding,
+        _make_research_task,
+        _patch_research_externals,
+    )
+
+    direction_id = "d-fh-suppress01"
+    title = "Fix pre-suppressed cross-cycle finding"
+    description = f"Description: {title}"
+    fhash = _fhash(title, description)
+
+    # Pre-populate the direction with the hash from a prior cycle.
+    direction = _active_direction(direction_id, "Suppression direction")
+    direction["recently_filtered_finding_hashes"] = [fhash]
+
+    project = _Project(
+        name=f"HashSuppress {direction_id}",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No prior task in the DB carries this finding_hash — suppression must come
+    # solely from the persisted recently_filtered_finding_hashes field.
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    finding = _make_finding(title=title, direction_id=direction_id)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 0, (
+        f"Finding with hash {fhash!r} pre-loaded in recently_filtered_finding_hashes "
+        "must be suppressed by the persisted state; no child task should be spawned"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canary spawn-gate classification (acceptance gate)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_gate_canary_classifies_real_verdict_vs_fail_closed():
+    """classify_canary_spawn_gate_result correctly distinguishes real verdicts from
+    fail-closed outcomes and pending state.
+
+    This is the acceptance gate for the on-demand canary feature: a real serving
+    agent that returns a parseable verdict must yield status='real_verdict' with
+    explicit_count>0; a grader that fails closed (no parseable verdict) must yield
+    status='fail_closed'; an unresolved canary must yield status='pending'.
+    """
+    from app.routers.admin_debug import (
+        classify_canary_spawn_gate_result,
+        _CANARY_PROBE_HASH,
+    )
+    from app.task_evaluators import (
+        ADVERSARIAL_PARSE_OK,
+        ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+    )
+
+    # 1. Pending — grader has not yet returned
+    result = classify_canary_spawn_gate_result(None)
+    assert result["status"] == "pending"
+    assert result["parse_outcome"] is None
+    assert result["explicit_count"] == 0
+
+    # 2. Real verdict — grader returned an explicit pass for the probe finding
+    gate_real = {
+        "parse_outcome": ADVERSARIAL_PARSE_OK,
+        "finding_verdicts": {
+            _CANARY_PROBE_HASH: {
+                "passed": True,
+                "explicit": True,
+                "reason": "premise holds",
+            }
+        },
+        "grader_task_id": "grader-abc",
+    }
+    result = classify_canary_spawn_gate_result(gate_real)
+    assert result["status"] == "real_verdict", (
+        f"Expected real_verdict for ok parse with explicit verdict; got {result['status']!r}"
+    )
+    assert result["explicit_count"] == 1
+    assert result["parse_outcome"] == ADVERSARIAL_PARSE_OK
+
+    # 3. Real verdict — grader returned an explicit FAIL (still a real verdict; gate is healthy)
+    gate_fail_verdict = {
+        "parse_outcome": ADVERSARIAL_PARSE_OK,
+        "finding_verdicts": {
+            _CANARY_PROBE_HASH: {
+                "passed": False,
+                "explicit": True,
+                "reason": "premise wrong",
+            }
+        },
+        "grader_task_id": "grader-abc",
+    }
+    result = classify_canary_spawn_gate_result(gate_fail_verdict)
+    assert result["status"] == "real_verdict", (
+        "An explicit fail verdict is still a real_verdict — gate is functioning"
+    )
+
+    # 4. Fail-closed — grader returned no JSON array (wholesale non-response)
+    gate_no_json = {
+        "parse_outcome": ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+        "finding_verdicts": {
+            _CANARY_PROBE_HASH: {
+                "passed": False,
+                "explicit": False,
+                "unresolved_reason": ADVERSARIAL_PARSE_NO_JSON_ARRAY,
+            }
+        },
+        "grader_task_id": "grader-def",
+    }
+    result = classify_canary_spawn_gate_result(gate_no_json)
+    assert result["status"] == "fail_closed", (
+        f"Expected fail_closed for no-JSON-array outcome; got {result['status']!r}"
+    )
+    assert result["explicit_count"] == 0
+
+    # 5. Fail-closed — ok parse outcome but zero explicit verdicts (degenerate)
+    gate_ok_no_explicit = {
+        "parse_outcome": ADVERSARIAL_PARSE_OK,
+        "finding_verdicts": {
+            _CANARY_PROBE_HASH: {
+                "passed": False,
+                "explicit": False,
+            }
+        },
+        "grader_task_id": "grader-ghi",
+    }
+    result = classify_canary_spawn_gate_result(gate_ok_no_explicit)
+    assert result["status"] == "fail_closed", (
+        "ok parse with zero explicit verdicts must be fail_closed"
+    )

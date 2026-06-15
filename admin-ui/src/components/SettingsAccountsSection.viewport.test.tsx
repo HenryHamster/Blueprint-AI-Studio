@@ -42,6 +42,7 @@ function renderSection() {
       onRemoveAccount={() => {}}
       onResetRateLimits={() => {}}
       onRefreshAccountModels={() => {}}
+      onUpdateAccount={() => {}}
       onUpdateAccountCaps={() => {}}
       showUserManagement={false}
       onToggleUserManagement={() => {}}
@@ -138,5 +139,33 @@ describe('SettingsAccountsSection — viewport regression', () => {
         screen.getByRole('button', { name: 'Usage limits (optional)' }).click();
       });
     });
+  });
+
+  test('edit dialog renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(renderSection());
+      });
+      await act(async () => {
+        screen.getByRole('button', { name: /Edit account/ }).click();
+      });
+    });
+  });
+
+  test('edit dialog primary action meets 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(renderSection());
+      });
+      await act(async () => {
+        screen.getByRole('button', { name: /Edit account/ }).click();
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

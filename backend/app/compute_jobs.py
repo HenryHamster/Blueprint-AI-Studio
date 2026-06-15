@@ -92,6 +92,14 @@ GPU_PROVISIONING_ALLOWANCE_SECONDS = int(
 # compute_job_terminal wake well before this, so the deadline is only a
 # backstop against a wedged monitor — generous so a healthy run never trips it.
 _COMPUTE_PARK_GRACE_SECONDS = 600
+# Short, independent budget for the provisioning phase (QUEUED/STARTING). A VM
+# that never leaves the provisioning phase will be marked TIMED_OUT after this
+# many seconds rather than after the full runtime budget. GPU jobs add the
+# existing GPU_PROVISIONING_ALLOWANCE_SECONDS on top. Once a job reaches
+# RUNNING the sub-deadline no longer applies; only the runtime deadline governs.
+COMPUTE_PROVISIONING_DEADLINE_SECONDS = int(
+    os.getenv("COMPUTE_PROVISIONING_DEADLINE_SECONDS", "360")
+)
 _COMPUTE_RPC_DIAGNOSTIC_KEY = "compute_rpc_diagnostic"
 _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING = 1000
 
@@ -286,7 +294,21 @@ async def create_compute_job(
     provisioning_allowance = (
         GPU_PROVISIONING_ALLOWANCE_SECONDS if persisted_accelerator is not None else 0
     )
-    deadline_at = _utcnow() + timedelta(seconds=capped_deadline + provisioning_allowance)
+    deadline_at = _utcnow() + timedelta(
+        seconds=capped_deadline + provisioning_allowance
+    )
+    # Short, independent provisioning sub-deadline: fail fast if the VM never
+    # leaves the provisioning phase rather than waiting the full runtime budget.
+    # GPU jobs add GPU_PROVISIONING_ALLOWANCE_SECONDS on top. The sub-deadline
+    # is clamped to wall_clock_deadline so it never extends beyond the job's
+    # overall budget.
+    provisioning_budget_seconds = (
+        COMPUTE_PROVISIONING_DEADLINE_SECONDS + provisioning_allowance
+    )
+    provisioning_deadline_at = min(
+        _utcnow() + timedelta(seconds=provisioning_budget_seconds),
+        deadline_at,
+    )
     # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
     # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
     rate = get_compute_rate_per_second(
@@ -298,7 +320,9 @@ async def create_compute_job(
     # Park deadline: worst-case window (declared runtime + provisioning allowance)
     # plus grace. Stored in polling_metadata so the agent can read it from the
     # job response instead of recomputing from the declared deadline alone.
-    park_deadline_seconds = capped_deadline + provisioning_allowance + _COMPUTE_PARK_GRACE_SECONDS
+    park_deadline_seconds = (
+        capped_deadline + provisioning_allowance + _COMPUTE_PARK_GRACE_SECONDS
+    )
     polling_metadata = {
         "command": command,
         "cwd": cwd,
@@ -325,7 +349,7 @@ async def create_compute_job(
         wall_clock_deadline=deadline_at,
         polling_metadata={
             **polling_metadata,
-            "provisioning_deadline_at": deadline_at.isoformat(),
+            "provisioning_deadline_at": provisioning_deadline_at.isoformat(),
             "runtime_deadline_seconds": capped_deadline,
         },
     )
@@ -404,7 +428,9 @@ async def _resolve_live_release_evidence(
             ReleaseVersion.status == "promoted",
         )
         .options(selectinload(ReleaseVersion.deploy_artifacts))
-        .order_by(ReleaseVersion.promoted_at.desc(), ReleaseVersion.version_number.desc())
+        .order_by(
+            ReleaseVersion.promoted_at.desc(), ReleaseVersion.version_number.desc()
+        )
     )
     version = result.scalars().first()
     if version is None:
@@ -445,9 +471,7 @@ async def _resolve_live_release_evidence(
         "release_version_id": str(version.id),
         "release_version_number": version.version_number,
         "promoted_sha": version.promoted_sha,
-        "promoted_at": version.promoted_at.isoformat()
-        if version.promoted_at
-        else None,
+        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
         "aggregate_serving_status": aggregate.get("serving_status"),
         "aggregate_reason_code": aggregate.get("reason_code"),
         "required_artifacts": required_artifacts,
@@ -484,7 +508,9 @@ async def _check_project_spend_ceiling(
     The check is skipped when no ceiling is configured.
     """
     project = await session.get(Project, project_id)
-    ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd") if project else None
+    ceiling_usd = (
+        (project.build_config or {}).get("daily_spend_ceiling_usd") if project else None
+    )
     if not ceiling_usd:
         return
     ceiling_usd = float(ceiling_usd)
@@ -647,9 +673,7 @@ def _parse_naive_iso_datetime(raw: Any) -> datetime | None:
     if not text:
         return None
     with contextlib.suppress(ValueError):
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(
-            tzinfo=None
-        )
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
     return None
 
 
@@ -668,9 +692,15 @@ def _runtime_deadline_at(job: ComputeJob) -> datetime | None:
 
 
 def _provisioning_timeout_seconds(job: ComputeJob, *, now: datetime) -> float | None:
-    if job.wall_clock_deadline is None:
+    # Use the short provisioning sub-deadline stored at job creation. Fall back
+    # to wall_clock_deadline for legacy rows that predate the sub-deadline field.
+    prov_deadline = _parse_naive_iso_datetime(
+        (job.polling_metadata or {}).get("provisioning_deadline_at")
+    )
+    deadline = prov_deadline if prov_deadline is not None else job.wall_clock_deadline
+    if deadline is None:
         return None
-    return max(0.0, (job.wall_clock_deadline - now).total_seconds())
+    return max(0.0, (deadline - now).total_seconds())
 
 
 def _status_is_runtime_timeout(status: ComputeStatusResult) -> bool:
@@ -1081,7 +1111,8 @@ async def _process_single_compute_job(
                 job.id,
                 now=now,
                 poll_attempt_count=(job.poll_attempt_count or 0) + 1,
-                next_poll_at=now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                next_poll_at=now
+                + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
                 status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
                 accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
                 terminal_status=ComputeJobStatus.TIMED_OUT,
@@ -1139,7 +1170,8 @@ async def _process_single_compute_job(
                 job.id,
                 now=now,
                 poll_attempt_count=(job.poll_attempt_count or 0) + 1,
-                next_poll_at=now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                next_poll_at=now
+                + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
                 status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
                 accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
                 terminal_status=ComputeJobStatus.TIMED_OUT,
@@ -1234,9 +1266,7 @@ async def _process_single_compute_job(
                 + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
             )
             return
-        accrued_cost_usd = max(
-            float(job.accrued_cost_usd or 0.0), cost.total_cost_usd
-        )
+        accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
         timeout_like = _status_is_runtime_timeout(status)
         outcome = (
             ComputeJobOutcome.TIMED_OUT
@@ -1450,9 +1480,7 @@ async def _salvage_poll_status(
 ) -> "ComputeStatusResult | None":
     """Best-effort post-terminate poll — never raises, never hangs the monitor."""
     try:
-        return await asyncio.wait_for(
-            backend.poll_status(job), timeout=timeout_seconds
-        )
+        return await asyncio.wait_for(backend.poll_status(job), timeout=timeout_seconds)
     except Exception as exc:
         logger.warning(
             "[COMPUTE_JOB] salvage poll failed for job=%s (ignored): %s",
@@ -1611,6 +1639,12 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         }
         # Caller-provided env takes precedence over release defaults.
         env = {**release_env, **env}
+    # Use the short provisioning sub-deadline; fall back to wall_clock_deadline
+    # for legacy rows that predate the sub-deadline field.
+    prov_deadline = _parse_naive_iso_datetime(meta.get("provisioning_deadline_at"))
+    effective_provisioning_deadline = (
+        prov_deadline if prov_deadline is not None else job.wall_clock_deadline
+    )
     return ComputeLaunchSpec(
         job_id=job.id,
         external_id=job.external_compute_id,
@@ -1618,7 +1652,7 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         machine_type=job.machine_type or "",
         spend_cap_usd=float(job.spend_cap_usd or 0.0),
         deadline_at=job.wall_clock_deadline,
-        provisioning_deadline_at=job.wall_clock_deadline,
+        provisioning_deadline_at=effective_provisioning_deadline,
         runtime_deadline_seconds=int(meta.get("requested_deadline_seconds") or 0)
         or None,
         cwd=meta.get("cwd"),
@@ -1651,7 +1685,9 @@ def _clear_compute_rpc_diagnostic(job: ComputeJob) -> None:
     job.polling_metadata = meta
 
 
-def _bounded_rpc_string(value: Any, *, limit: int = _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING) -> str:
+def _bounded_rpc_string(
+    value: Any, *, limit: int = _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING
+) -> str:
     text = str(value)
     if len(text) <= limit:
         return text
@@ -1817,7 +1853,11 @@ def _coerce_metric_number(value: Any) -> float | int | None:
     if isinstance(value, int):
         return value
     if isinstance(value, float):
-        return value if value == value and value not in (float("inf"), float("-inf")) else None
+        return (
+            value
+            if value == value and value not in (float("inf"), float("-inf"))
+            else None
+        )
     if isinstance(value, str) and value.strip():
         try:
             num = float(value)
@@ -1941,9 +1981,7 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
                 "backend": reference.backend,
                 "artifact_uri": reference.uri,
                 "file_count": reference.file_count,
-                "outcome": (
-                    job.outcome.value if job.outcome is not None else None
-                ),
+                "outcome": (job.outcome.value if job.outcome is not None else None),
                 "final_cost_usd": job.final_cost_usd,
             }
             command_log = (job.polling_metadata or {}).get("command_log")

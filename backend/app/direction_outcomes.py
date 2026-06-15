@@ -494,6 +494,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
         "consumer": "anomaly_detection.py, direction_lifecycle.py, strategic_spawning.py, digest_direction_progress.py"
     },
     "tasks_cancelled": {"consumer": "direction_metrics.py (terminal-outcome tracking)"},
+    "scope_empty_noop_count": {
+        "consumer": "research_direction_state._detect_already_fixed_deadlock (already-fixed deadlock detection)"
+    },
     "tasks_completed_no_pr": {
         "consumer": "direction_metrics.py, strategic_completion.py (no-PR completions)"
     },
@@ -1097,6 +1100,15 @@ async def _update_direction_research_outcomes(
     entry["tasks_cancelled"] = sum(
         1 for ct in child_tasks_rows if ct.status == TaskStatus.CANCELLED
     )
+    # Count CANCELLED children that resolved as SCOPE_EMPTY no-ops (work already done
+    # on HEAD). Used by _detect_already_fixed_deadlock in research_direction_state.py
+    # to quiesce directions stuck re-discovering already-shipped work.
+    entry["scope_empty_noop_count"] = sum(
+        1
+        for ct in child_tasks_rows
+        if ct.status == TaskStatus.CANCELLED
+        and (ct.context or {}).get("failure_category") == SCOPE_EMPTY
+    )
     # BLOCKED tasks are counted separately from FAILED — they are parked on an
     # absent precondition, not failures, and the auto-unblock sweep is expected
     # to return them to QUEUED.
@@ -1405,7 +1417,8 @@ async def _update_direction_research_outcomes(
                     "scope_calibrated_from": scope_calibrated_from,
                 }
             )
-            if category in INFRA_CLASSES and not _is_review_cap_exhausted(ct):
+            effective_cat = category or _classify_failure(ct)
+            if effective_cat in INFRA_CLASSES and not _is_review_cap_exhausted(ct):
                 infra_failures += 1
     entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
     entry["tasks_failed_infra"] = infra_failures

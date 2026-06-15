@@ -1628,6 +1628,52 @@ class TestApplyOperatorBuildConfigOverrides:
         # Operator-owned requires_ci_checks is still carried forward.
         assert merged["requires_ci_checks"] is False
 
+    def test_has_ci_false_clamps_stale_requires_ci_checks_true(self):
+        """Secondary fix: detection reconcile — has_ci=False + stale
+        requires_ci_checks=True is an impossible-to-satisfy state that strands
+        main-targeting rollup PRs.  Re-detection must clamp requires_ci_checks
+        to False when has_ci=False so the state is self-consistent."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        # Stale existing config claims CI checks are required, but fresh
+        # detection found zero CI workflows.
+        merged = apply_operator_build_config_overrides(
+            {"language": "python", "has_ci": False},
+            {"requires_ci_checks": True},
+        )
+        assert merged["has_ci"] is False
+        # The contradiction is resolved: requires_ci_checks is clamped to False.
+        assert merged["requires_ci_checks"] is False
+
+    def test_has_ci_false_already_ungated_preserved(self):
+        """Clamping is a no-op when existing requires_ci_checks is already False."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        merged = apply_operator_build_config_overrides(
+            {"language": "python", "has_ci": False},
+            {"requires_ci_checks": False},
+        )
+        assert merged["has_ci"] is False
+        assert merged["requires_ci_checks"] is False
+
+    def test_has_ci_none_does_not_clamp_requires_ci_checks(self):
+        """has_ci=None (incomplete detection) must not trigger the clamp — only
+        a definitive False does."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        merged = apply_operator_build_config_overrides(
+            {"language": "python", "has_ci": None},
+            {"requires_ci_checks": True},
+        )
+        # has_ci=None is not authoritative; requires_ci_checks is preserved as-is.
+        assert merged["requires_ci_checks"] is True
+
     def test_has_ci_round_trips_through_schema(self):
         """has_ci survives BuildConfig validation; None is dropped by
         exclude_none=True so legacy/undetected configs round-trip unchanged."""
@@ -2764,6 +2810,79 @@ class TestAutonomousMode:
         assert set(body.keys()) >= {"counts", "counts_by_type", "active_tasks"}
         assert body["counts"].get(direction_id) == 1
         assert body["counts_by_type"][direction_id]["research"] == 1
+
+
+class TestAutonomyDebug:
+    """Tests for GET /api/admin/projects/{project_id}/autonomy-debug."""
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_counts_only_research_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_this_hour in rate_limit block counts only research-type ORCHESTRATOR
+        tasks, not non-research ORCHESTRATOR tasks created in the last hour.
+
+        This exercises the dialect-specific SQL COUNT that replaced the Python-side
+        sum() loop — verifying it filters on payloads[0].type == 'research'.
+        """
+        from datetime import timedelta
+        from app.models import _utcnow
+
+        project = await _make_project(db_session, name="AutonomyDebug Rate Limit")
+        now = _utcnow()
+
+        # Research task within the last hour — should count.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "research"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(minutes=20),
+            )
+        )
+        # Another research task within the last hour — should also count.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "research"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(minutes=10),
+            )
+        )
+        # Non-research ORCHESTRATOR task within the last hour — must NOT count.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(minutes=15),
+            )
+        )
+        # Research task older than one hour — must NOT count.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "research"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(hours=2),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        assert "rate_limit" in data
+        tasks_this_hour = data["rate_limit"]["tasks_this_hour"]
+        assert tasks_this_hour == 2, (
+            f"Expected 2 research tasks this hour, got {tasks_this_hour}. "
+            "Non-research and out-of-window tasks must be excluded."
+        )
 
 
 class TestTaskTypeCostAdherence:
@@ -9020,7 +9139,10 @@ class TestVersionLifecyclePolicyProvenance:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["promotion_policy_source"] == "hardcoded_defaults"
-        assert body["promotion_policy_error"] == "ScannerError: promotion_policy.yaml did not parse"
+        assert (
+            body["promotion_policy_error"]
+            == "ScannerError: promotion_policy.yaml did not parse"
+        )
 
     @pytest.mark.asyncio
     async def test_recent_version_echoes_deploy_confirm_deadline_for_unconfirmed(
@@ -12425,11 +12547,13 @@ class TestModifyTaskApplySeam:
         mocker.patch(
             "app.github.get_pr_files",
             new_callable=AsyncMock,
-            return_value=[{
-                "filename": "backend/alembic/versions/0002_dup.py",
-                "status": "added",
-                "patch": '+revision = "0002"\n+down_revision = "0001"',
-            }],
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0002_dup.py",
+                    "status": "added",
+                    "patch": '+revision = "0002"\n+down_revision = "0001"',
+                }
+            ],
         )
         mocker.patch(
             "app.github.get_pull_request_diff",
@@ -13470,11 +13594,13 @@ class TestTriggerRollup:
         mocker.patch(
             "app.github.get_pr_files",
             new_callable=AsyncMock,
-            return_value=[{
-                "filename": "backend/alembic/versions/0002_dup.py",
-                "status": "added",
-                "patch": '+revision = "0002"\n+down_revision = "0001"',
-            }],
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0002_dup.py",
+                    "status": "added",
+                    "patch": '+revision = "0002"\n+down_revision = "0001"',
+                }
+            ],
         )
         mocker.patch(
             "app.github.get_pull_request_diff",
@@ -15519,3 +15645,163 @@ class TestSpawnGateCensus:
         data = resp.json()
         assert data["cycles_scanned"] == 1
         assert data["graders_attempted_total"] == 2
+
+
+class TestCanaryAdversarialChallenge:
+    """Tests for POST/GET /api/admin/projects/{id}/canary/adversarial-challenge."""
+
+    @pytest.mark.asyncio
+    async def test_post_spawns_canary_and_returns_ids(
+        self, client: AsyncClient, db_session
+    ):
+        """Happy path: POST spawns the canary and grader, returns both task IDs."""
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(db_session)
+        grader_id = uuid.uuid4()
+
+        mock_grader = Task(
+            project_id=project.id,
+            title="[GRADE] canary grader",
+            payloads=[{"type": "investigate", "scope": "small"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        mock_grader.id = grader_id
+
+        with patch(
+            "app.routers.admin_debug.spawn_forward_quality_grader",
+            new_callable=AsyncMock,
+            return_value=mock_grader,
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/canary/adversarial-challenge"
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "canary_task_id" in data
+        assert data["grader_task_id"] == str(grader_id)
+        # canary_task_id is a valid UUID
+        uuid.UUID(data["canary_task_id"])
+
+    @pytest.mark.asyncio
+    async def test_post_returns_409_when_grader_already_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """409 is returned when spawn_forward_quality_grader returns None (already in flight)."""
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(db_session)
+
+        with patch(
+            "app.routers.admin_debug.spawn_forward_quality_grader",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/canary/adversarial-challenge"
+            )
+
+        assert resp.status_code == 409
+        assert "already in flight" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_get_returns_404_when_task_not_found(
+        self, client: AsyncClient, db_session
+    ):
+        """GET returns 404 when the canary_task_id does not exist."""
+        project = await _make_project(db_session)
+        bogus_id = uuid.uuid4()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/canary/adversarial-challenge/{bogus_id}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_returns_404_when_task_is_not_canary(
+        self, client: AsyncClient, db_session
+    ):
+        """GET rejects tasks not flagged as canaries (_is_canary not in context)."""
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        non_canary = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={},  # no _is_canary
+        )
+        db_session.add(non_canary)
+        await db_session.commit()
+        await db_session.refresh(non_canary)
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/canary/adversarial-challenge/{non_canary.id}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_returns_pending_when_no_gate_record(
+        self, client: AsyncClient, db_session
+    ):
+        """GET returns status=pending when the grader has not yet written a verdict."""
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        canary = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            context={"_is_canary": True, "awaiting_adversarial_grader": str(uuid.uuid4())},
+        )
+        db_session.add(canary)
+        await db_session.commit()
+        await db_session.refresh(canary)
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/canary/adversarial-challenge/{canary.id}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "pending"
+        assert data["canary_task_id"] == str(canary.id)
+        assert "grader_task_id" in data
+
+    @pytest.mark.asyncio
+    async def test_get_returns_grader_task_id_from_db(
+        self, client: AsyncClient, db_session
+    ):
+        """GET includes grader_task_id from the canary context in the response."""
+        from app.task_evaluators import ADVERSARIAL_GATE_VERDICT_KEY, ADVERSARIAL_PARSE_OK
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        grader_id = str(uuid.uuid4())
+        gate_record = {
+            "parse_outcome": ADVERSARIAL_PARSE_OK,
+            "finding_verdicts": {
+                "hash-abc": {"explicit": True, "verdict": "pass"}
+            },
+            "grader_task_id": grader_id,
+        }
+        canary = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_is_canary": True,
+                ADVERSARIAL_GATE_VERDICT_KEY: gate_record,
+            },
+        )
+        db_session.add(canary)
+        await db_session.commit()
+        await db_session.refresh(canary)
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/canary/adversarial-challenge/{canary.id}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "real_verdict"
+        assert data["explicit_count"] == 1
+        assert data["grader_task_id"] == grader_id
+        assert data["canary_task_id"] == str(canary.id)

@@ -1518,3 +1518,74 @@ async def test_mark_pool_vm_retiring_cannot_clobber_concurrent_lease(db_session)
     assert retired is not None
     assert retired.state == PoolVmState.RETIRING
     assert retired.leased_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_lease_after_soft_expiry_records_reservation_cause(db_session):
+    """Leasing a member after its reservation soft-expired records the cause."""
+    prev = shared_state.runtime_config.get("improvement_lanes_enabled", False)
+    try:
+        shared_state.runtime_config["improvement_lanes_enabled"] = True
+        project = await _make_project(db_session, name="Soft Expiry Cause")
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="test lane",
+            goal="test goal",
+            branch_name="test-branch",
+            base_branch="main",
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="vm-soft-expired",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        # Verify initial state: no causes recorded
+        assert lane.reservation_claimed_by_fix_count == 0
+        assert lane.reservation_expired_before_fix_count == 0
+        assert lane.reservation_force_expired_count == 0
+
+        # Register a pool VM with a soft-expired reservation for the lane
+        await register_pool_vm(
+            db_session,
+            vm_instance_id="vm-soft-expired",
+            project_id=project.id,
+            account_id="acct-1",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            state=PoolVmState.IDLE,
+        )
+        member = await get_pool_vm(db_session, "vm-soft-expired")
+        member.reserved_lane_id = lane.id
+        member.reservation_expires_at = _utcnow() - timedelta(seconds=5)
+        db_session.add(member)
+        await db_session.commit()
+
+        # Lease the member (after its reservation has soft-expired)
+        leased = await lease_idle_pool_vm(
+            db_session,
+            project_id=project.id,
+            leased_task_id=uuid.uuid4(),
+            account_id="acct-1",
+            provider="anthropic",
+            model="claude-opus-4-8",
+        )
+
+        await db_session.commit()
+
+        # Verify the lease succeeded
+        assert leased is not None
+        assert leased.vm_instance_id == "vm-soft-expired"
+        assert leased.state == PoolVmState.LEASED
+
+        # Verify that exactly one cause was recorded for the lane
+        await db_session.refresh(lane)
+        assert lane.reservation_claimed_by_fix_count == 0
+        assert lane.reservation_expired_before_fix_count == 1
+        assert lane.reservation_force_expired_count == 0
+
+        # Verify that the lane's workspace was cleared
+        assert lane.workspace_state == "COLD"
+        assert lane.workspace_vm_instance_id is None
+    finally:
+        shared_state.runtime_config["improvement_lanes_enabled"] = prev

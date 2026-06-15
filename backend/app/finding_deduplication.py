@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
-from app.capability_registry import compose_capability_markers
+from app.capability_registry import compose_capability_markers, normalize_capability_name
 from app.failure_classification import INFRA_CLASSES, classify_failure
 from app.landed_signal import suppresses_redispatch
 from app.models import Task, TaskStatus
@@ -82,6 +82,7 @@ class _OverlapCandidate:
     direction_id: Optional[str]
     title: str
     task_type: Optional[str] = None
+
 
 # Whitelisted prerequisite kinds for the machine-resolvable {kind, ref} need
 # representation a finding may declare. Conservative by design: only these two
@@ -146,6 +147,16 @@ def _within_code_error_cooldown(task: Task, now: datetime) -> bool:
         return True
     created_at = _coerce_datetime_for_compare(task.created_at, now)
     return created_at + CODE_ERROR_COOLDOWN > now
+
+
+def canonical_finding_body(finding: dict) -> str:
+    """Return the canonical body text for a finding dict.
+
+    Prefers ``description``; falls back to ``prompt`` when description is absent
+    or empty.  Using this helper everywhere keeps hashing, spawning, and deferral
+    consistent regardless of which key the research agent happened to populate.
+    """
+    return str(finding.get("description") or finding.get("prompt") or "").strip()
 
 
 def finding_hash(title: str, description: str) -> str:
@@ -261,7 +272,13 @@ def prerequisite_matches_task(normalized: dict, task: Optional[Task]) -> bool:
             or need_matches_task_lineage({"kind": "task", "ref": canonical_ref}, task)
         )
     if kind == "capability":
-        return ref.lower() in _task_capability_markers(task)
+        markers = _task_capability_markers(task)
+        # Floor markers (task-provider:<uuid>) contain a colon that normalize_capability_name
+        # collapses to a hyphen, so also try a direct lowercase match before normalizing.
+        if ref.strip().lower() in markers:
+            return True
+        normalized_ref = normalize_capability_name(ref)
+        return normalized_ref is not None and normalized_ref in markers
     return False
 
 
@@ -327,9 +344,7 @@ def resolve_prerequisite_task(
     if normalized is None:
         return None
     matches = [
-        task
-        for task in candidate_tasks
-        if prerequisite_matches_task(normalized, task)
+        task for task in candidate_tasks if prerequisite_matches_task(normalized, task)
     ]
     return select_canonical_provider(matches)
 
@@ -476,7 +491,11 @@ def extract_recent_terminal_finding_history(
     for t in terminal_tasks:
         if task_count >= task_cap or len(findings) >= finding_cap:
             break
-        if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        if t.status not in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
             continue
         ctx = _task_context(t)
         if (
@@ -766,7 +785,7 @@ def deduplicate_findings(
 
     for orig_i, finding in indexed_findings:
         title = finding.get("title", f"Research finding #{orig_i + 1}")
-        description = finding.get("description", finding.get("prompt", ""))
+        description = canonical_finding_body(finding)
         fhash = finding_hash(title, description)
         finding_dir_id = finding.get("direction_id") or parent_dir_id
         finding_task_type = _dedup_spawn_task_type(finding)

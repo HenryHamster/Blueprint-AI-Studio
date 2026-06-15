@@ -636,6 +636,7 @@ export default function App() {
         onRemoveAccount={s.removeMaxPlanAccount}
         onResetRateLimits={s.resetAccountRateLimits}
         onRefreshAccountModels={s.refreshAccountModels}
+        onUpdateAccount={s.updateMaxPlanAccount}
         newAccountName={s.newAccountName}
         setNewAccountName={s.setNewAccountName}
         newAccountProvider={s.newAccountProvider}

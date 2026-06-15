@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict
@@ -15,6 +16,8 @@ from app.models import (
     LLMAuthMode,
     LLMProviderName,
     MaxPlanAccount,
+    PoolVm,
+    PoolVmState,
     Project,
     ProjectMember,
     Task,
@@ -268,6 +271,233 @@ async def test_update_max_plan_account_allows_auth_mode_change_with_existing_cla
     await db_session.refresh(acct)
     assert acct.auth_mode == LLMAuthMode.API_KEY
     assert acct.claude_config_json is None
+
+
+async def test_max_plan_accounts_list_is_lightweight_authoritative_and_mutations_invalidate_cached_health(
+    client, db_session, inject_pool, mocker
+):
+    live_id = uuid.uuid4()
+    db_only_id = uuid.uuid4()
+    db_session.add_all(
+        [
+            MaxPlanAccount(
+                id=live_id,
+                user_id="test-user-123",
+                name="Live Account",
+                provider=LLMProviderName.ANTHROPIC,
+                auth_mode=LLMAuthMode.OAUTH,
+                oauth_token="projects/test/secrets/live/versions/1",
+                secret_blob_ref="projects/test/secrets/live/versions/1",
+                provider_metadata={"available_models": ["claude-opus-4-8"]},
+                total_tasks=7,
+                daily_task_cap=20,
+                max_concurrent_tasks=2,
+                claude_config_json='{"secret":"do-not-return"}',
+            ),
+            MaxPlanAccount(
+                id=db_only_id,
+                user_id="test-user-123",
+                name="DB Only Account",
+                provider=LLMProviderName.OPENAI,
+                auth_mode=LLMAuthMode.API_KEY,
+                secret_blob_ref="projects/test/secrets/db-only/versions/1",
+                provider_metadata={"available_models": ["gpt-4.1"]},
+                enabled=False,
+                disabled_reason="manual maintenance",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    inject_pool(
+        "test-user-123",
+        [
+            {
+                "id": str(live_id),
+                "user_id": "test-user-123",
+                "name": "Live Account",
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "runtime_secret": "sk-ant-oat01-secret",
+                "oauth_token": "sk-ant-oat01-secret",
+                "secret_blob_ref": "projects/test/secrets/live/versions/1",
+                "provider_metadata": {
+                    "available_models": ["claude-opus-4-8", "claude-sonnet-4-6"]
+                },
+                "enabled": True,
+                "active_tasks": 3,
+                "total_tasks": 99,
+                "daily_task_count": 4,
+                "daily_task_count_reset_at": datetime.utcnow(),
+                "daily_task_cap": 20,
+                "max_concurrent_tasks": 2,
+                "auto_disable_after_rate_limits": 5,
+                "disabled_reason": "rate limited on opus",
+                "disabled_models": {
+                    "claude-opus-4-8": {
+                        "hits": 2,
+                        "at": datetime.utcnow(),
+                        "kind": "quota_exhausted",
+                    }
+                },
+                "runtime_ready": True,
+            }
+        ],
+    )
+
+    cache = DigestCache(default_ttl=300.0)
+    app.dependency_overrides[get_digest_cache] = lambda: cache
+    health_spy = AsyncMock(
+        return_value={
+            "accounts": [{"account_id": str(live_id)}],
+            "generated_at": _admin_pool_accounts._utcnow().isoformat(),
+        }
+    )
+    breakdown_spy = AsyncMock(
+        return_value={
+            "rows": [{"provider": "anthropic", "model": "opus"}],
+            "generated_at": _admin_pool_accounts._utcnow().isoformat(),
+        }
+    )
+    mocker.patch.object(
+        _admin_pool_accounts, "_compute_account_health_summary", health_spy
+    )
+    mocker.patch.object(
+        _admin_pool_accounts, "_compute_provider_model_breakdown", breakdown_spy
+    )
+
+    try:
+        first_health = await client.get("/api/admin/max-plan-accounts/health")
+        first_breakdown = await client.get(
+            "/api/admin/max-plan-accounts/provider-model-breakdown"
+        )
+        assert first_health.status_code == 200
+        assert first_breakdown.status_code == 200
+        assert health_spy.await_count == 1
+        assert breakdown_spy.await_count == 1
+
+        roster = await client.get("/api/admin/max-plan-accounts")
+        assert roster.status_code == 200, roster.text
+        accounts = {a["id"]: a for a in roster.json()["accounts"]}
+        assert set(accounts) == {str(live_id), str(db_only_id)}
+        assert accounts[str(live_id)]["active_tasks"] == 3
+        assert accounts[str(live_id)]["total_tasks"] == 7
+        assert accounts[str(live_id)]["provider_metadata"]["available_models"] == [
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+        ]
+        assert accounts[str(live_id)]["disabled_models"]["claude-opus-4-8"][
+            "kind"
+        ] == "quota_exhausted"
+        assert accounts[str(db_only_id)]["name"] == "DB Only Account"
+        assert accounts[str(db_only_id)]["enabled"] is False
+        serialized = json.dumps(roster.json())
+        assert "sk-ant-oat01-secret" not in serialized
+        for forbidden in (
+            "oauth_token",
+            "secret_blob_ref",
+            "runtime_secret",
+            "claude_config_json",
+        ):
+            assert forbidden not in serialized
+
+        patch = await client.patch(
+            f"/api/admin/max-plan-accounts/{live_id}",
+            json={"name": "Edited Live Account", "daily_task_cap": 30},
+        )
+        assert patch.status_code == 200, patch.text
+
+        second_health = await client.get("/api/admin/max-plan-accounts/health")
+        second_breakdown = await client.get(
+            "/api/admin/max-plan-accounts/provider-model-breakdown"
+        )
+        assert second_health.status_code == 200
+        assert second_breakdown.status_code == 200
+        assert health_spy.await_count == 2
+        assert breakdown_spy.await_count == 2
+
+        edited = await client.get("/api/admin/max-plan-accounts")
+        edited_accounts = {a["id"]: a for a in edited.json()["accounts"]}
+        assert edited_accounts[str(live_id)]["name"] == "Edited Live Account"
+        assert edited_accounts[str(live_id)]["daily_task_cap"] == 30
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+
+async def test_delete_max_plan_account_conflicts_then_force_removes_db_and_memory(
+    client, db_session, inject_pool, mocker
+):
+    acct_id = uuid.uuid4()
+    project = Project(name="delete-conflict", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+    acct = MaxPlanAccount(
+        id=acct_id,
+        user_id="test-user-123",
+        name="Delete Guard",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/delete/versions/1",
+        secret_blob_ref="projects/test/secrets/delete/versions/1",
+    )
+    active_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        account_id=str(acct_id),
+        context={"llm_account_id": str(acct_id)},
+    )
+    warm_member = PoolVm(
+        vm_instance_id="warm-delete-guard",
+        project_id=project.id,
+        account_id=str(acct_id),
+        state=PoolVmState.IDLE,
+    )
+    db_session.add_all([acct, active_task, warm_member])
+    await db_session.commit()
+    inject_pool(
+        "test-user-123",
+        [
+            {
+                "id": str(acct_id),
+                "user_id": "test-user-123",
+                "name": "Delete Guard",
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "enabled": True,
+                "active_tasks": 1,
+                "total_tasks": 0,
+            }
+        ],
+    )
+    delete_secret = mocker.patch(
+        "app.secrets_manager.delete_user_secret",
+        new=AsyncMock(side_effect=RuntimeError("secret cleanup failed")),
+    )
+
+    conflict = await client.delete(f"/api/admin/max-plan-accounts/{acct_id}")
+    assert conflict.status_code == 409
+    conflict_body = conflict.json()
+    detail = (
+        conflict_body.get("detail")
+        or (conflict_body.get("error") or {}).get("message")
+        or conflict.text
+    )
+    assert "active task(s)" in detail
+    assert "live in-memory reservation(s)" in detail
+    assert "warm-pool VM reference(s)" in detail
+    assert "force=true" in detail
+    delete_secret.assert_not_awaited()
+
+    forced = await client.delete(f"/api/admin/max-plan-accounts/{acct_id}?force=true")
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["message"] == "Account removed"
+    db_session.expunge_all()
+    assert await db_session.get(MaxPlanAccount, acct_id) is None
+    assert str(acct_id) not in _account_by_id
+    assert all(
+        a["id"] != str(acct_id) for a in _max_plan_pools.get("test-user-123", [])
+    )
+    delete_secret.assert_awaited_once_with("projects/test/secrets/delete/versions/1")
 
 
 # ── /max-plan-accounts/health ──────────────────────────────────────────────

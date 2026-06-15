@@ -35,4 +35,31 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
   it('manifest helper is valid python (py_compile)', () => {
     expect(() => execFileSync('python3', ['-m', 'py_compile', MANIFEST_PY])).not.toThrow();
   });
+
+  it('exits 1 when --upload is passed without --task-id', () => {
+    let status = 0;
+    let stderr = '';
+    try {
+      execFileSync('bash', [SNAPSHOT_SH, '--upload'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err: unknown) {
+      const e = err as { status?: number; stderr?: string };
+      status = e.status ?? -1;
+      stderr = e.stderr ?? '';
+    }
+    expect(status).toBe(1);
+    expect(stderr).toContain('--upload requires --task-id');
+  });
+
+  it('wires the Phase 1 upload to the task-scoped signed-PUT endpoint + known manifest path', () => {
+    const src = readFileSync(SNAPSHOT_SH, 'utf-8');
+    // Posts to the screenshot upload-url endpoint with Bearer agent auth.
+    expect(src).toContain('/api/agent/viewport/screenshot-upload-url');
+    expect(src).toContain('X-Agent-Token: ${AGENT_API_TOKEN}');
+    // Body matches ViewportScreenshotUploadUrlRequest {task_id, name, width, phase}.
+    expect(src).toContain('\\"phase\\":\\"${_phase}\\"');
+    // Only changed/new pairs with a known width are uploaded, capped at 12 pairs.
+    expect(src).toContain('select((.status == "changed" or .status == "new") and .width != null))[0:12]');
+    // Publishes the manifest at the path pr-helper.ts reads.
+    expect(src).toContain('/tmp/viewport_manifest_${TASK_ID}.json');
+  });
 });

@@ -3058,6 +3058,57 @@ export interface LaneDiagResponse {
     opened_at: string;
     promoted_at: string | null;
   };
+  checkpoint_recovery_waste?: {
+    by_reason: Record<string, number>;
+    total: number;
+    exhausted_count: number;
+  };
+}
+
+export interface LaneBaselineTrendBlock {
+  latest: number | null;
+  prior: number | null;
+  delta: number | null;
+  classification: 'improving' | 'declining' | 'stable' | null;
+}
+
+export interface LaneBaselineTrend {
+  latest_version: number | null;
+  prior_version: number | null;
+  relay_medians: {
+    wall_clock_seconds: LaneBaselineTrendBlock;
+    active_seconds: LaneBaselineTrendBlock;
+    gap_seconds: LaneBaselineTrendBlock;
+    task_count: LaneBaselineTrendBlock;
+  };
+  lane_iterations: {
+    review: { p50: LaneBaselineTrendBlock; p90: LaneBaselineTrendBlock };
+    fix: { p50: LaneBaselineTrendBlock; p90: LaneBaselineTrendBlock };
+  };
+  waste_taxonomy_shares: Record<string, LaneBaselineTrendBlock>;
+  checkpoint_recovery_waste_total: LaneBaselineTrendBlock;
+}
+
+export interface LaneBaselinesResponse {
+  project_id: string;
+  count: number;
+  baselines: Record<string, unknown>[];
+  trend: LaneBaselineTrend | null;
+}
+
+export async function fetchLaneBaselines(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<LaneBaselinesResponse> {
+  const res = await apiFetch(
+    `/api/admin/lane-baselines?project_id=${encodeURIComponent(projectId)}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch lane baselines: ${res.status}`);
+  return res.json();
 }
 
 export async function fetchLaneDiag(
@@ -3180,4 +3231,47 @@ export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSet
     const msg = data?.detail || `Failed to update evergreen fill settings: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to update evergreen fill settings: ${res.status}`);
   }
+}
+
+export interface VisualPilotCaughtEntry {
+  task_id: string;
+  task_title: string;
+  note: string | null;
+  created_at: string;
+}
+
+export interface VisualPilotStatus {
+  project_id: string;
+  admin_task_count: number;
+  entry_count: number;
+  malformed_count: number;
+  pairs_inspected: number;
+  pairs_changed: number;
+  infra_total: number;
+  infra_rate: number;
+  days_elapsed: number;
+  caught_count: number;
+  caught: VisualPilotCaughtEntry[];
+  thresholds: {
+    target_admin_tasks: number;
+    target_days: number;
+    early_pause_infra_rate: number;
+  };
+  generated_at: string;
+}
+
+export async function fetchVisualPilotStatus(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<VisualPilotStatus> {
+  const params = new URLSearchParams({ project_id: projectId });
+  const res = await apiFetch(
+    `/api/admin/visual-pilot-status?${params.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch visual pilot status: ${res.status}`);
+  return res.json();
 }

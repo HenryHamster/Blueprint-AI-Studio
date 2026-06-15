@@ -107,6 +107,46 @@ describe('CapabilityTrialsPanel', () => {
     expect(screen.getAllByText(/est\. — to threshold/)[0]).toBeTruthy();
   });
 
+  it('renders lane_relay_comparison wall-clock row when present', () => {
+    render(<CapabilityTrialsPanel digest={{ capability_adoption_verdicts: {
+      'review-fix-lane-pilot': {
+        verdict: 'CONTINUE',
+        n_lane: 10,
+        n_control: 10,
+        lane_merge_rate: 0.5,
+        control_merge_rate: 0.4,
+        lane_relay_comparison: {
+          source_version: { version_number: 42, captured_at: null, terminal_status: 'promoted' },
+          relay: { wall_clock_seconds: 3600, active_seconds: 1800, gap_seconds: 1800, task_count: 5, pr_count: 3 },
+          lane: { wall_clock_seconds: 2700, active_seconds: 1500, gap_seconds: 1200, task_count: 4, pr_count: 3 },
+          deltas: { wall_clock_seconds: -900, active_seconds: -300, gap_seconds: -600, task_count: -1, pr_count: 0 },
+        },
+      },
+    } } as never} />);
+    // Desktop summary line includes wall-clock relay comparison
+    expect(screen.getAllByText(/Wall-clock.*lane.*relay/)[0]).toBeTruthy();
+    expect(screen.getAllByText(/2700s.*3600s/)[0]).toBeTruthy();
+    expect(screen.getAllByText(/-900s/)[0]).toBeTruthy();
+    // Version label is shown
+    expect(screen.getAllByText(/v42/)[0]).toBeTruthy();
+  });
+
+  it('renders gracefully when lane_relay_comparison is null', () => {
+    render(<CapabilityTrialsPanel digest={{ capability_adoption_verdicts: {
+      'review-fix-lane-pilot': {
+        verdict: 'CONTINUE',
+        n_lane: 5,
+        n_control: 5,
+        lane_merge_rate: 0.4,
+        control_merge_rate: 0.4,
+        lane_relay_comparison: null,
+      },
+    } } as never} />);
+    expect(screen.getAllByText('review-fix-lane-pilot')[0]).toBeTruthy();
+    // No relay comparison rendered, no crash
+    expect(screen.queryByText(/Wall-clock.*relay/)).toBeNull();
+  });
+
   it('shows the empty state when no trials are running', () => {
     render(<CapabilityTrialsPanel digest={{ capability_adoption_verdicts: {} } as never} />);
     expect(screen.getByText('No capability trials are currently running.')).toBeTruthy();

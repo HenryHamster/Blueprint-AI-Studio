@@ -256,4 +256,65 @@ describe('FleetCapacityCard', () => {
     );
     expect(queryByText('Agent Image')).toBeNull();
   });
+
+  test('renders unknown affordance for null managed_vm_count distinct from zero', () => {
+    const { getAllByText, queryByText } = render(
+      <FleetCapacityCard
+        data={makeSnapshot({ managed_vm_count: null, vm_slots_available: null, vm_saturation: null })}
+        loading={false}
+      />,
+    );
+    // "unknown" should appear for null counts, not a plain "0"
+    const unknownEls = getAllByText('unknown');
+    expect(unknownEls.length).toBeGreaterThanOrEqual(1);
+    // A bare "0" for managed_vm_count should not be rendered
+    expect(queryByText('0')).toBeNull();
+  });
+
+  test('renders unknown affordance for null idle_pool_vms distinct from zero', () => {
+    const { getAllByText } = render(
+      <FleetCapacityCard
+        data={makeSnapshot({ idle_pool_vms: null, vm_slots_available: null, vm_saturation: null })}
+        loading={false}
+      />,
+    );
+    expect(getAllByText('unknown').length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('renders zero explicitly when pool is disabled (idle_pool_vms=0, managed_vm_count known)', () => {
+    const { getByText, queryAllByText } = render(
+      <FleetCapacityCard
+        data={makeSnapshot({ idle_pool_vms: 0, managed_vm_count: 4, vm_slots_available: 6, vm_saturation: 'healthy' })}
+        loading={false}
+      />,
+    );
+    // zero idle pool VMs should show as literal "0", not "unknown"
+    expect(getByText('0')).toBeTruthy();
+    expect(queryAllByText('unknown').length).toBe(0);
+  });
+
+  test('shows measurements-unavailable note when vm_cap is set but vm_saturation is null', () => {
+    const { getByText } = render(
+      <FleetCapacityCard
+        data={makeSnapshot({
+          managed_vm_count: null,
+          idle_pool_vms: null,
+          vm_slots_available: null,
+          vm_saturation: null,
+        })}
+        loading={false}
+      />,
+    );
+    expect(getByText(/VM measurements partially unavailable/)).toBeTruthy();
+  });
+
+  test('does not show measurements-unavailable note when all VM counts are known', () => {
+    const { queryByText } = render(
+      <FleetCapacityCard
+        data={makeSnapshot({ managed_vm_count: 5, idle_pool_vms: 1, vm_slots_available: 4, vm_saturation: 'healthy' })}
+        loading={false}
+      />,
+    );
+    expect(queryByText(/VM measurements partially unavailable/)).toBeNull();
+  });
 });

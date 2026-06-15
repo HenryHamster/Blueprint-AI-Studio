@@ -118,13 +118,6 @@ function resolvePrTitlePrefix(task: Record<string, unknown>): string {
   return typeof prefix === 'string' ? prefix.trim() : '';
 }
 
-function stableTaskHashFraction(taskId: string): number {
-  let h = 5381;
-  for (let i = 0; i < taskId.length; i++) {
-    h = ((h << 5) + h + taskId.charCodeAt(i)) >>> 0;
-  }
-  return h / 0xffffffff;
-}
 
 export interface StandardHandlerOpts {
   taskId: string;
@@ -162,7 +155,7 @@ export interface StandardHandlerOpts {
   };
 }
 
-type CapabilityHoldbackName = 'module_interfaces' | 'related_tests' | 'affected_consumers';
+type CapabilityHoldbackName = 'module_interfaces' | 'related_tests' | 'affected_consumers' | 'repo_map' | 'diagnostics_after_edit';
 
 function holdbackFraction(meta: Record<string, unknown> | undefined, capability: CapabilityHoldbackName): number {
   const value = meta?.[`${capability}_holdback_fraction`];
@@ -389,6 +382,20 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+
+  // Build ctags symbol index for language-aware navigation (./symbols helper).
+  // Graceful fallback: if ctags is unavailable or indexing fails, agents still
+  // work normally and ./symbols reports "index not available".
+  try {
+    try { execFileSync('ctags', ['--version'], { stdio: 'ignore', timeout: 5000 }); } catch {
+      execFileSync('sudo', ['apt-get', 'install', '-y', '-q', 'universal-ctags'], { stdio: 'ignore', timeout: 60000 });
+    }
+    execFileSync('ctags', ['-R', '--output-format=json', '-f', `/tmp/symbols_${taskId}.json`, '.'], {
+      cwd: WORKSPACE,
+      stdio: 'ignore',
+      timeout: 120000,
+    });
+  } catch { /* ctags unavailable or indexing failed — continue without symbol index */ }
   if (stdProjectId) writeFetchHelper(taskId, stdProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 
@@ -472,7 +479,12 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   }
 
   const fileTree = buildFileTree(ws);
-  let repoMap = buildRepoMap(ws);
+  const repoMapRelatedFiles = (
+    (payload.related_files as string[] | undefined) ||
+    ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+    []
+  );
+  let repoMap = buildRepoMap(ws, { taskPrompt: rawPrompt, relatedFiles: repoMapRelatedFiles });
   const providerRunner = getProviderRunner();
 
   // ── Deterministic repo-map holdback arm ──────────────────────────────────
@@ -488,11 +500,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     : 0.0;
   let repoMapArm: boolean | null = null;
   if (holdbackFraction > 0) {
-    // djb2 hash of the taskId string -> stable float in [0, 1)
-    const taskHash = stableTaskHashFraction(taskId);
-    repoMapArm = taskHash >= holdbackFraction; // true = treatment, false = holdback
+    repoMapArm = assignCapabilityHoldbackArm(taskId, 'repo_map', holdbackFraction) ?? true;
     if (!repoMapArm) {
-      sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (hash=${taskHash.toFixed(4)}, fraction=${holdbackFraction}) — suppressing repo map\n`);
+      sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (fraction=${holdbackFraction}) — suppressing repo map\n`);
       repoMap = '';
     }
   }
@@ -508,10 +518,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   let diagnosticsAfterEditArm: boolean | null = null;
   let hadDiagnosticsAfterEdit: boolean | undefined;
   if (diagnosticsEligible && diagnosticsHoldbackFraction > 0) {
-    const taskHash = stableTaskHashFraction(taskId);
-    diagnosticsAfterEditArm = taskHash >= diagnosticsHoldbackFraction;
+    diagnosticsAfterEditArm = assignCapabilityHoldbackArm(taskId, 'diagnostics_after_edit', diagnosticsHoldbackFraction) ?? true;
     if (!diagnosticsAfterEditArm) {
-      sendLog(ws, `[DiagnosticsAfterEdit] holdback arm for task ${taskId} (hash=${taskHash.toFixed(4)}, fraction=${diagnosticsHoldbackFraction}) - not writing Claude hook\n`);
+      sendLog(ws, `[DiagnosticsAfterEdit] holdback arm for task ${taskId} (fraction=${diagnosticsHoldbackFraction}) - not writing Claude hook\n`);
     } else if (diagnosticsEnabled) {
       hadDiagnosticsAfterEdit = writeDiagnosticsAfterEditHook();
       if (!hadDiagnosticsAfterEdit) {

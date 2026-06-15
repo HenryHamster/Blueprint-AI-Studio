@@ -47,10 +47,11 @@ from app.release_promotion import (
     _promotion_pr_landed,
     _record_promotion_failure,
     _record_promotion_success,
+    _recover_confidence_from_ci_unresolved,
     _resolve_github_with_session,
 )
 from app.rollup_migration_validation import _validate_migration_chain_post_merge
-from app.release_scoring import _CI_GREEN, _CI_PENDING, _CI_RED, _classify_check_runs
+from app.release_scoring import _CI_GREEN, _CI_NO_CHECKS, _CI_PENDING, _CI_RED, _classify_check_runs
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -85,6 +86,10 @@ logger = logging.getLogger(__name__)
 _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
 _MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT = 10
 _MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT = 160
+# Number of consecutive sweeps where CI is red due to only transient conclusions
+# (cancelled/timed_out) before the reconciler escalates to the normal terminal
+# path.  Overridable via runtime_config["max_transient_ci_red_sweeps"].
+_TRANSIENT_CI_RED_SWEEP_DEFAULT = 5
 
 
 _TERMINAL_405_SUBSTRINGS = (
@@ -246,6 +251,66 @@ async def _persist_managed_check_wait_snapshot(
         return False
 
 
+async def _increment_pending_transient_red_count(
+    session,
+    version_id: uuid.UUID,
+    *,
+    pr_number: int,
+) -> int:
+    """Increment ``promotion_pending.transient_red_count`` for *version_id*.
+
+    Returns the NEW count after increment, or 0 when the update cannot be
+    applied (version no longer open/pending, PR number mismatch, etc.).
+    """
+    try:
+        session.expire_all()
+        locked: release_version.ReleaseVersion | None = (
+            (
+                await session.execute(
+                    select(release_version.ReleaseVersion)
+                    .where(release_version.ReleaseVersion.id == version_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked is None or locked.status != "open":
+            return 0
+        qual = dict(locked.last_qualification or {})
+        if qual.get("status") != "pending":
+            return 0
+        pending = qual.get("promotion_pending")
+        if not isinstance(pending, dict):
+            return 0
+        if pending.get("pr_number") != pr_number:
+            return 0
+        updated_pending = dict(pending)
+        new_count = (updated_pending.get("transient_red_count") or 0) + 1
+        updated_pending["transient_red_count"] = new_count
+        qual["promotion_pending"] = updated_pending
+        locked.last_qualification = qual
+        flag_modified(locked, "last_qualification")
+        session.add(locked)
+        await session.commit()
+        return new_count
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] transient_red_count: failed to persist for version %s",
+            version_id,
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] transient_red_count: rollback failed for "
+                "version %s",
+                version_id,
+            )
+        return 0
+
+
 async def _refresh_release_artifact_rows(
     session,
     version: release_version.ReleaseVersion,
@@ -402,6 +467,47 @@ def _promotion_pending_timeout_seconds() -> float:
     if value <= 0:
         return _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT
     return value
+
+
+def _max_transient_ci_red_sweeps() -> int:
+    """Resolve the configurable cap on consecutive transient-only-red CI sweeps.
+
+    Read from ``runtime_config['max_transient_ci_red_sweeps']`` when set to a
+    positive integer, else the default.  A non-positive / unparseable value is
+    ignored so a bad config can never disable the escalation backstop.
+    """
+    raw = _runtime_config.get("max_transient_ci_red_sweeps")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _TRANSIENT_CI_RED_SWEEP_DEFAULT
+    if value <= 0:
+        return _TRANSIENT_CI_RED_SWEEP_DEFAULT
+    return value
+
+
+def _check_result_has_genuine_failure(check_result: dict | None) -> bool:
+    """Return True when *check_result* contains at least one genuinely failed check.
+
+    Genuine failure conclusions: ``failure``, ``action_required``.
+    Transient interruption conclusions: ``cancelled``, ``timed_out``.
+
+    When per-check ``details`` are present and non-empty the verdict is derived
+    from individual check conclusions, so a transient-only outcome is correctly
+    excluded.  When details are absent or empty the aggregate ``conclusion``
+    field is used as a fallback — preserving existing behaviour for callers that
+    supply no per-check detail list.
+    """
+    if not isinstance(check_result, dict):
+        return False
+    genuine = {"failure", "action_required"}
+    details = check_result.get("details")
+    if isinstance(details, list) and details:
+        return any(
+            isinstance(d, dict) and d.get("conclusion") in genuine for d in details
+        )
+    # No per-check details — fall back to the aggregate conclusion.
+    return check_result.get("conclusion") in genuine
 
 
 def _pr_number_from_url(pr_url: str | None) -> int | None:
@@ -666,7 +772,7 @@ async def _reconcile_if_not_promoted_but_pr_merged(
             if not candidate_sha:
                 return False
 
-            base_record = dict(qual)
+            base_record = _recover_confidence_from_ci_unresolved(dict(qual))
             project = await session.get(Project, version.project_id)
             if project is None:
                 return False
@@ -1001,6 +1107,39 @@ async def _reconcile_if_pending_auto_merge_landed(
                             )
                             ci_state = _classify_check_runs(check_result)
                             if ci_state == _CI_RED:
+                                if not _check_result_has_genuine_failure(check_result):
+                                    # Only transient conclusions (cancelled /
+                                    # timed_out) — do not tear down the PR.
+                                    new_count = (
+                                        await _increment_pending_transient_red_count(
+                                            session,
+                                            version.id,
+                                            pr_number=int(pr_number),
+                                        )
+                                    )
+                                    max_sweeps = _max_transient_ci_red_sweeps()
+                                    if new_count < max_sweeps:
+                                        logger.warning(
+                                            "[RELEASE_QUALIFIER] reconcile "
+                                            "pending_auto_merge: PR #%s for v%d has "
+                                            "transient-only red CI (cancelled/"
+                                            "timed_out, sweep %d/%d) — leaving "
+                                            "pending",
+                                            pr_number,
+                                            version.version_number,
+                                            new_count,
+                                            max_sweeps,
+                                        )
+                                        return False
+                                    logger.warning(
+                                        "[RELEASE_QUALIFIER] reconcile "
+                                        "pending_auto_merge: PR #%s for v%d reached "
+                                        "transient-red sweep cap (%d) — escalating "
+                                        "to pr_ci_red",
+                                        pr_number,
+                                        version.version_number,
+                                        max_sweeps,
+                                    )
                                 logger.warning(
                                     "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
                                     "PR #%s for v%d has conclusively failed CI — "
@@ -1367,6 +1506,35 @@ async def _reconcile_if_managed_check_wait(
 
             ci_state = _classify_check_runs(check_result)
             if ci_state == _CI_RED:
+                if not _check_result_has_genuine_failure(check_result):
+                    # Only transient conclusions (cancelled / timed_out) — do
+                    # not tear down the PR or release branch.  Increment the
+                    # sweep counter and leave pending until it hits the cap.
+                    new_count = await _increment_pending_transient_red_count(
+                        session,
+                        version.id,
+                        pr_number=int(pr_number),
+                    )
+                    max_sweeps = _max_transient_ci_red_sweeps()
+                    if new_count < max_sweeps:
+                        logger.warning(
+                            "[RELEASE_QUALIFIER] reconcile managed_check_wait: "
+                            "PR #%s for v%d has transient-only red CI "
+                            "(cancelled/timed_out, sweep %d/%d) — leaving pending",
+                            pr_number,
+                            version.version_number,
+                            new_count,
+                            max_sweeps,
+                        )
+                        return False
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] reconcile managed_check_wait: "
+                        "PR #%s for v%d reached transient-red sweep cap (%d) "
+                        "— escalating to required_check_failed",
+                        pr_number,
+                        version.version_number,
+                        max_sweeps,
+                    )
                 blocking_conclusions = {
                     "failure",
                     "cancelled",
@@ -1409,23 +1577,39 @@ async def _reconcile_if_managed_check_wait(
                 return True
 
             if ci_state != _CI_GREEN:
-                # Checks pending or no-checks — leave pending for next sweep.
-                classified_at = _utcnow()
-                await _persist_managed_check_wait_snapshot(
-                    session,
-                    version.id,
-                    pr_number=int(pr_number),
-                    ci_state=ci_state,
-                    snapshot=_managed_check_wait_snapshot(
-                        ci_state=ci_state,
-                        classified_at=classified_at,
-                        head_sha=pr_head_sha,
-                        check_result=check_result,
-                    ),
-                )
-                return False
+                # For a no-CI repo, a definitive no_checks result means CI will
+                # never run — treat it as "proceed" and fall through to the merge
+                # step rather than leaving the version stranded waiting on checks
+                # that cannot run.
+                from app.ci_resolution import requires_ci_checks
 
-            # 4. CI is green — re-run the Alembic dual-head guard before merging.
+                if ci_state == _CI_NO_CHECKS and not requires_ci_checks(project):
+                    logger.info(
+                        "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
+                        "for v%d reports no_checks on a no-CI repo — proceeding "
+                        "to merge attempt",
+                        pr_number,
+                        version.version_number,
+                    )
+                else:
+                    # Checks pending or no-checks on a CI-gated repo — leave
+                    # pending for the next sweep.
+                    classified_at = _utcnow()
+                    await _persist_managed_check_wait_snapshot(
+                        session,
+                        version.id,
+                        pr_number=int(pr_number),
+                        ci_state=ci_state,
+                        snapshot=_managed_check_wait_snapshot(
+                            ci_state=ci_state,
+                            classified_at=classified_at,
+                            head_sha=pr_head_sha,
+                            check_result=check_result,
+                        ),
+                    )
+                    return False
+
+            # 4. CI is green (or no_checks on a no-CI repo) — re-run the Alembic dual-head guard before merging.
             # Use the 3-way verdict so 'defer' (metadata temporarily unavailable)
             # leaves the version pending for the next sweep without cleanup, while
             # 'block' (genuine collision) records the terminal failure.

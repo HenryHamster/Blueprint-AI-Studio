@@ -63,22 +63,70 @@ const mockLaneDiagResponse = {
     chain_limit: 50,
     chains_truncated: false,
   },
+  checkpoint_recovery_waste: {
+    by_reason: { stale_context: 4, branch_reset: 2 },
+    total: 6,
+    exhausted_count: 0,
+  },
 };
 
-const { apiFetch } = vi.hoisted(() => ({
+const mockBaselinesResponse = {
+  project_id: 'project-1',
+  count: 2,
+  baselines: [],
+  trend: {
+    latest_version: 10,
+    prior_version: 9,
+    relay_medians: {
+      wall_clock_seconds: { latest: 3600, prior: 4200, delta: -600, classification: 'improving' },
+      active_seconds: { latest: 2400, prior: 2800, delta: -400, classification: 'improving' },
+      gap_seconds: { latest: 300, prior: 350, delta: -50, classification: 'stable' },
+      task_count: { latest: 3.2, prior: 3.8, delta: -0.6, classification: 'improving' },
+    },
+    lane_iterations: {
+      review: {
+        p50: { latest: 1.5, prior: 2.0, delta: -0.5, classification: 'stable' },
+        p90: { latest: 3.0, prior: 4.0, delta: -1.0, classification: 'improving' },
+      },
+      fix: {
+        p50: { latest: 1.2, prior: 1.5, delta: -0.3, classification: 'stable' },
+        p90: { latest: 2.5, prior: 3.0, delta: -0.5, classification: 'stable' },
+      },
+    },
+    waste_taxonomy_shares: {
+      infra: { latest: 0.1, prior: 0.15, delta: -0.05, classification: 'stable' },
+      merge_conflict: { latest: 0.05, prior: 0.1, delta: -0.05, classification: 'stable' },
+      ci_churn: { latest: 0.2, prior: 0.3, delta: -0.1, classification: 'improving' },
+      review_ambiguity: { latest: 0.1, prior: 0.05, delta: 0.05, classification: 'stable' },
+      lost_reasoning: { latest: 0.05, prior: 0.1, delta: -0.05, classification: 'stable' },
+      unknown: { latest: 0.1, prior: 0.1, delta: 0, classification: 'stable' },
+    },
+    checkpoint_recovery_waste_total: {
+      latest: 6.0,
+      prior: 10.0,
+      delta: -4.0,
+      classification: 'improving',
+    },
+  },
+};
+
+const { apiFetch, fetchLaneBaselines } = vi.hoisted(() => ({
   apiFetch: vi.fn(async () => {
     return new Response(JSON.stringify(mockLaneDiagResponse), { status: 200 });
   }),
+  fetchLaneBaselines: vi.fn(async () => mockBaselinesResponse),
 }));
 
 vi.mock('../api', () => ({
   apiFetch,
+  fetchLaneBaselines,
 }));
 
 describe('LaneDiagPanel', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     apiFetch.mockClear();
+    fetchLaneBaselines.mockClear();
   });
 
   afterEach(() => {
@@ -100,6 +148,75 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('Lost Reasoning')).toBeInTheDocument();
     // total waste tasks footer
     expect(screen.getByText(/Total waste tasks: 7/)).toBeInTheDocument();
+  });
+
+  it('renders checkpoint recovery waste section with by_reason breakdown', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Checkpoint Recovery Waste')).toBeInTheDocument();
+    expect(screen.getByText('stale_context')).toBeInTheDocument();
+    expect(screen.getByText('branch_reset')).toBeInTheDocument();
+    expect(screen.getByText(/Total recovery tasks: 6/)).toBeInTheDocument();
+  });
+
+  it('renders placeholder when checkpoint_recovery_waste is absent', async () => {
+    apiFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ ...mockLaneDiagResponse, checkpoint_recovery_waste: undefined }),
+        { status: 200 },
+      ),
+    );
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getAllByText('No checkpoint-recovery waste recorded.').length).toBeGreaterThan(0);
+  });
+
+  it('renders placeholder when checkpoint_recovery_waste total is zero', async () => {
+    apiFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          ...mockLaneDiagResponse,
+          checkpoint_recovery_waste: { by_reason: {}, total: 0, exhausted_count: 0 },
+        }),
+        { status: 200 },
+      ),
+    );
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getAllByText('No checkpoint-recovery waste recorded.').length).toBeGreaterThan(0);
+  });
+
+  it('renders cross-version trend section when projectId and baselines trend are present', async () => {
+    render(<LaneDiagPanel projectId="project-1" />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Cross-Version Trend')).toBeInTheDocument();
+    expect(screen.getByTestId('cross-version-trend')).toBeInTheDocument();
+    expect(screen.getByText('v9 → v10')).toBeInTheDocument();
+    expect(screen.getByText('Relay Medians')).toBeInTheDocument();
+    expect(screen.getByText('Lane Iterations')).toBeInTheDocument();
+    expect(screen.getByText('Waste Taxonomy Shares')).toBeInTheDocument();
+    // classification labels
+    expect(screen.getAllByText('↓ improving').length).toBeGreaterThan(0);
+  });
+
+  it('does not render cross-version trend when no projectId', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.queryByText('Cross-Version Trend')).not.toBeInTheDocument();
+    expect(fetchLaneBaselines).not.toHaveBeenCalled();
+  });
+
+  it('does not render cross-version trend when trend is null (single version)', async () => {
+    fetchLaneBaselines.mockResolvedValueOnce({ ...mockBaselinesResponse, trend: null });
+    render(<LaneDiagPanel projectId="project-1" />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.queryByText('Cross-Version Trend')).not.toBeInTheDocument();
   });
 
   it('renders relay counts by lane', async () => {

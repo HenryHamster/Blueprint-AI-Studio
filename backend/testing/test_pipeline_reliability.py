@@ -126,10 +126,14 @@ async def orch_db(mocker):
     mocker.patch("app.deploy_health._check_pause_mode", new_callable=AsyncMock)
     mocker.patch("app.autonomous_research._check_idle_research", new_callable=AsyncMock)
     mocker.patch("app.services._recover_orphaned_tasks", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._create_orchestrator_error_alerts", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._create_orchestrator_error_alerts", new_callable=AsyncMock
+    )
     mocker.patch("app.orchestrator._persist_zone_health", new_callable=AsyncMock)
     mocker.patch("app.main._extract_task_model", return_value=None)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     # Advance periodic timers so they don't trigger on the first cycle
     now = _naive_utcnow()
@@ -212,7 +216,9 @@ async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
     mocker.patch("app.autonomous_research._check_idle_research", new_callable=AsyncMock)
     mocker.patch("app.orchestrator._persist_zone_health", new_callable=AsyncMock)
     mocker.patch("app.main.load_max_plan_pool", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._create_orchestrator_error_alerts", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._create_orchestrator_error_alerts", new_callable=AsyncMock
+    )
 
     _orch_module._last_pool_refresh = _naive_utcnow()
     _orch_module._last_zone_health_persist = _naive_utcnow()
@@ -497,7 +503,9 @@ async def test_stale_provisioning_captures_serial_before_vm_delete(orch_db, mock
     )
     # _ensure_vm_deleted is already patched by orch_db fixture; grab its mock
     # so we can assert call ordering relative to capture.
-    delete_mock = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    delete_mock = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+    )
 
     await _run_one_cycle(mocker)
 
@@ -2466,7 +2474,9 @@ async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     project = Project(name="CI Backstop Test", user_id="user1")
     eval_db.add(project)
@@ -2518,7 +2528,9 @@ async def test_ci_waiting_under_backstop_threshold_not_failed(eval_db, mocker):
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     project = Project(name="CI Backstop Under Test", user_id="user1")
     eval_db.add(project)
@@ -2564,7 +2576,9 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     project = Project(name="Backstop Message Test", user_id="user1")
     eval_db.add(project)
@@ -2782,9 +2796,7 @@ class TestGateContinuesRefreshHealth:
         def _body_names(if_node):
             names = set()
             for stmt in if_node.body:  # body only — never orelse
-                names.update(
-                    n.id for n in ast.walk(stmt) if isinstance(n, ast.Name)
-                )
+                names.update(n.id for n in ast.walk(stmt) if isinstance(n, ast.Name))
             return names
 
         branches = []
@@ -2927,3 +2939,173 @@ async def test_ci_polling_mergeable_null_reopen_cap_stops_retrying(orch_db, mock
     assert "manual intervention" in (t.latest_status_message or "").lower()
     # Escalation fires a failure alert (operator visibility).
     assert alert_mock.call_count >= 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test — Rollup lost-marker recovery
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_lost_marker_rollup_parent_converged_on_merged_pr(eval_db, mocker):
+    """A rollup parent stuck in EVALUATING with a staging branch but no
+    rollup_pr_number should be marked COMPLETED when GitHub reports the
+    head-branch PR is merged.
+
+    Scenario (matches the 2026-06-13 production incident):
+      - Parent is in EVALUATING with research_branch in context.
+      - rollup_pr_number was never persisted (crash window during the DB write).
+      - GitHub confirms the staging-branch PR is closed+merged.
+      - Recovery sweep marks the parent COMPLETED and backfills rollup_pr_number.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Lost-marker rollup test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    staging_branch = "research/4bf69c48"
+    target_base = "automain"
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup research task"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": staging_branch,
+            "parent_base": target_base,
+            # rollup_pr_number intentionally absent — lost in the crash window
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # Mark task as having been EVALUATING for 3 hours (past 2h warn, not yet 48h)
+    eval_since = _naive_utc_ago(hours=3)
+    parent.status_log = [
+        {
+            "t": eval_since.isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # GitHub reports: staging-branch PR is closed and merged
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 10070,
+                    "state": "closed",
+                    "merged": True,
+                    "merged_at": "2026-06-13T21:08:00Z",
+                    "html_url": "https://github.com/owner/repo/pull/10070",
+                    "head": {"ref": staging_branch, "sha": "5b41c3a2"},
+                    "base": {"ref": target_base},
+                }
+            ]
+        ),
+    )
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED, (
+        f"Stranded rollup parent should be COMPLETED after lost-marker recovery, "
+        f"got {parent.status!r}. "
+        f"The parent's rollup PR (#10070) merged but the rollup_pr_number marker "
+        f"was never persisted — recovery must converge the parent."
+    )
+    ctx = parent.context or {}
+    assert ctx.get("rollup_pr_number") == 10070, (
+        f"rollup_pr_number should be backfilled to 10070, got {ctx.get('rollup_pr_number')!r}"
+    )
+    assert "10070" in (parent.latest_status_message or ""), (
+        f"Status message should reference PR #10070, got {parent.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lost_marker_rollup_parent_stays_evaluating_when_pr_open(eval_db, mocker):
+    """A rollup parent with staging branch but no rollup_pr_number must stay
+    EVALUATING when the head-branch PR is still open.  The recovery path must
+    NOT complete a task whose PR hasn't merged yet.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Lost-marker open PR test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    staging_branch = "research/open-pr-test"
+    target_base = "automain"
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "open PR parent"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": staging_branch,
+            "parent_base": target_base,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    eval_since = _naive_utc_ago(hours=3)
+    parent.status_log = [
+        {
+            "t": eval_since.isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # GitHub returns no closed PRs (state=closed query returns [] — PR is still
+    # open or not yet created).  Recovery must NOT complete the task.
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new=AsyncMock(return_value=[]),  # no closed PR found
+    )
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Parent should stay EVALUATING when head-branch has no merged PR, "
+        f"got {parent.status!r}"
+    )
+    ctx = parent.context or {}
+    assert ctx.get("rollup_pr_number") is None, (
+        "rollup_pr_number must not be set when no merged PR found"
+    )
+    # Timestamp guard should be set so we back off and re-check after the
+    # interval rather than hitting GitHub every sweep cycle.
+    assert ctx.get("_lost_marker_checked_at") is not None, (
+        "_lost_marker_checked_at timestamp should be set after a no-merge lookup"
+    )

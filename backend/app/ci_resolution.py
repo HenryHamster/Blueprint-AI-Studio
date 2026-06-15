@@ -92,13 +92,21 @@ def proceed_on_no_checks(project, branch: str | None) -> bool:
     the mergeability-gated merge, rather than polled until the backstop FAILs it.
 
     True when the PR targets an internal staging branch (research/plan rollups,
-    where CI is path-filtered out by design), OR when the project declares it has
-    no CI (``requires_ci_checks`` is False). CI-gated repos keep polling — for
-    them a missing check means 'not registered yet', never 'will never run'.
+    where CI is path-filtered out by design), when detection confirmed the repo
+    carries zero CI workflows (``has_ci=False`` — a physical impossibility of
+    checks ever appearing), or when the project explicitly declares no CI
+    (``requires_ci_checks=False``). CI-gated repos keep polling — for them a
+    missing check means 'not registered yet', never 'will never run'.
+
+    ``has_ci=False`` is authoritative over a stale ``requires_ci_checks=True``:
+    a repo with zero workflows cannot produce check-runs on any PR, so polling
+    is guaranteed to strand the parent in EVALUATING forever.
     """
     if project is None:
         return False
     if project.is_staging_branch(branch):
+        return True
+    if (getattr(project, "build_config", None) or {}).get("has_ci") is False:
         return True
     return not requires_ci_checks(project)
 
@@ -343,9 +351,11 @@ def merge_gate_runtime_block(project) -> dict[str, Any] | None:
     # Additive history fields. A legacy four-key-only record (no list, no tally)
     # simply omits these — older consumers keep working unchanged.
     raw_outcomes = raw.get("recent_outcomes")
-    outcomes = [o for o in raw_outcomes if isinstance(o, dict)] if isinstance(
-        raw_outcomes, list
-    ) else []
+    outcomes = (
+        [o for o in raw_outcomes if isinstance(o, dict)]
+        if isinstance(raw_outcomes, list)
+        else []
+    )
     if outcomes:
         block["recent_outcomes"] = outcomes
 
@@ -368,9 +378,9 @@ def merge_gate_runtime_block(project) -> dict[str, Any] | None:
         most_common_reason = None
         if counts:
             # Deterministic tie-break: highest count, then reason key.
-            most_common_reason = sorted(
-                counts.items(), key=lambda kv: (-kv[1], kv[0])
-            )[0][0]
+            most_common_reason = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[
+                0
+            ][0]
         block["summary"] = {
             "window": len(outcomes),
             "verified_runs": verified_runs,
@@ -381,7 +391,9 @@ def merge_gate_runtime_block(project) -> dict[str, Any] | None:
     return block
 
 
-def should_run_no_ci_test_gate(project, branch: str | None, *, gate_enabled: bool) -> bool:
+def should_run_no_ci_test_gate(
+    project, branch: str | None, *, gate_enabled: bool
+) -> bool:
     """Whether a definitive ``no_checks`` PR should be gated on a ``verify_tests``
     verdict (run the repo's detected suite on the PR head) instead of taking the
     legacy immediate-pass.
@@ -697,7 +709,11 @@ def _declared_build_failure_detail(probe: dict[str, Any]) -> str:
         if label
         else "Declared build command failed: "
     )
-    return (prefix + output) if output else (prefix + "the declared build did not succeed.")
+    return (
+        (prefix + output)
+        if output
+        else (prefix + "the declared build did not succeed.")
+    )
 
 
 def _documented_command_is_clear_failure(documented: Any) -> bool:
@@ -1045,7 +1061,9 @@ def classify_unverified_fall_open_reason(
         # excluded from verified-merge accounting.
         acceptance = acceptance_test_block(verdict)
         if acceptance is not None and not acceptance.get("ran"):
-            name = str(acceptance.get("selector") or acceptance.get("descriptor") or "").strip()
+            name = str(
+                acceptance.get("selector") or acceptance.get("descriptor") or ""
+            ).strip()
             phrase = (
                 f"a declared acceptance test could not be confirmed to run ({name})"
                 if name
@@ -1227,7 +1245,9 @@ async def resolve_pr_ci_status(
             "source": "branch_head",
             "state": direct_state,
             "details": direct.get("details", []),
-            "failed_logs": direct.get("failed_logs", "") if direct_state == _CI_RED else "",
+            "failed_logs": direct.get("failed_logs", "")
+            if direct_state == _CI_RED
+            else "",
         }
     if direct_state == _CI_PENDING:
         return {

@@ -1102,3 +1102,165 @@ def test_redetection_preserves_bootstrap_command_memory():
     )
     assert result["bootstrap_command_memory_paths"] == ["backend"]
     assert result["bootstrap_command_memory_updated_at"] == "2026-06-01T12:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: maybe_redetect_missing_test_command
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_ci_gate_redetects_before_unverified_fall_open():
+    """Acceptance proof: re-detection fires for a non-empty, detection-complete
+    project with no test_cmd, returns True when detection finds a test command,
+    and after return has_detectable_tests is True (enabling verify_tests gate).
+    The fall-open reason is no_detectable_test_command only when re-detection
+    still finds nothing."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_redetect_missing_test_command
+    from app.ci_resolution import has_detectable_tests
+
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "directories": [{"path": ".", "type": "python"}],
+        }
+    )
+    project.github_owner = "external-owner"
+    project.github_repo = "external-repo"
+    project.id = "proj-redetect-proof"
+
+    session = AsyncMock()
+    detected = {
+        "directories": [{"path": ".", "type": "python", "test_cmd": "pytest tests/"}]
+    }
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="test-token",
+        ),
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value=detected,
+        ),
+        patch("sqlalchemy.orm.attributes.flag_modified"),
+        patch(
+            "app.shared_state.get_project_integration_branch",
+            return_value="main",
+        ),
+    ):
+        result = await maybe_redetect_missing_test_command(project, session)
+
+    assert result is True
+    # Gate can now run tests — has_detectable_tests uses updated project.build_config
+    assert has_detectable_tests(project) is True
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_maybe_redetect_missing_test_command_skips_when_repo_empty():
+    """Re-detection is skipped when repo_is_empty=True (other path handles it)."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_redetect_missing_test_command
+
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "repo_is_empty": True,
+            "directories": [],
+        }
+    )
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    project.id = "proj-empty"
+
+    session = AsyncMock()
+
+    with patch(
+        "app.routers.admin_onboard._detect_build_config", new_callable=AsyncMock
+    ) as mock_detect:
+        result = await maybe_redetect_missing_test_command(project, session)
+
+    assert result is False
+    mock_detect.assert_not_awaited()
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_redetect_missing_test_command_skips_when_has_tests():
+    """Re-detection is skipped when the project already has a detectable test command."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_redetect_missing_test_command
+
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "directories": [{"path": ".", "type": "python", "test_cmd": "pytest"}],
+        }
+    )
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    project.id = "proj-has-tests"
+
+    session = AsyncMock()
+
+    with patch(
+        "app.routers.admin_onboard._detect_build_config", new_callable=AsyncMock
+    ) as mock_detect:
+        result = await maybe_redetect_missing_test_command(project, session)
+
+    assert result is False
+    mock_detect.assert_not_awaited()
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_redetect_missing_test_command_returns_false_when_detection_finds_no_tests():
+    """Re-detection returns False and leaves config unchanged when detection still finds no tests.
+    The gate fall-open reason (no_detectable_test_command) is truthful in this case."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_redetect_missing_test_command
+
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "directories": [{"path": ".", "type": "python"}],
+        }
+    )
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    project.id = "proj-no-tests"
+    original_dirs = list(project.build_config["directories"])
+
+    session = AsyncMock()
+    detected_no_tests = {"directories": [{"path": ".", "type": "python"}]}
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value=detected_no_tests,
+        ),
+        patch(
+            "app.shared_state.get_project_integration_branch",
+            return_value="main",
+        ),
+    ):
+        result = await maybe_redetect_missing_test_command(project, session)
+
+    assert result is False
+    # Config unchanged — directories still have no test command
+    assert project.build_config["directories"] == original_dirs
+    session.commit.assert_not_awaited()

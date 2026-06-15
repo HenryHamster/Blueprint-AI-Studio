@@ -198,7 +198,7 @@ async def aggregate_rejection_patterns(
             Task.project_id == project_id,
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
+        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True))
         .order_by(Task.created_at.desc())
         .limit(_TASK_SCAN_CAP)
     )

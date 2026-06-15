@@ -133,3 +133,21 @@ async def get_observability(
 ) -> Dict[str, Any]:
     """Bounded in-memory fill-decision counters + recent decisions."""
     return get_fill_observability()
+
+
+@router.get("/structural-health-observability")
+async def get_structural_health(
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Bounded in-memory structural-health audit measurements + decisions.
+
+    Surfaces the recurring resource/scalability audit's view: the largest
+    measured ``task.context`` rows, the most-recent per-cycle decision, and a
+    bounded ring of recent decisions. Structural findings flow into the same
+    evergreen ledger (see the backlog endpoints above), so the audit's
+    observability lives alongside the fill observability here rather than in a
+    parallel surface.
+    """
+    from app.structural_health_audit import get_structural_health_observability
+
+    return get_structural_health_observability()

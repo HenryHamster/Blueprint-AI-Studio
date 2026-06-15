@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -733,7 +733,7 @@ async def _refresh_sr_catch_rate(
                         Task.project_id,
                         Task.strategic_cycle_id,
                         Task.payloads,
-                    )
+                    raiseload=True,)
                 )
                 .where(*_where)
                 .order_by(Task.created_at.desc())
@@ -918,12 +918,24 @@ async def claim_task(
         else:
             response_payloads.append(entry)
 
+    from app.capability_trial_verdict import (
+        get_effective_holdback_fraction,
+        get_trial_verdicts,
+    )
+
+    _project_verdicts = get_trial_verdicts(project) if project else {}
     response = {
         "task_id": str(task.id),
         "title": task.title,
         "description": task.description,
         "payloads": response_payloads,
         "context": safe_context,
+        "repo_map_holdback_fraction": get_effective_holdback_fraction(
+            _project_verdicts, "repo_map", 0.0
+        ),
+        "related_tests_holdback_fraction": get_effective_holdback_fraction(
+            _project_verdicts, "related_tests", 0.0
+        ),
     }
 
     # Add project metadata so agents can adapt to different project structures
@@ -1043,7 +1055,7 @@ async def claim_task(
             Task.payloads,
             Task.context,
             Task.project_id,
-        )
+        raiseload=True,)
         _active_queued_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1113,7 +1125,7 @@ async def claim_task(
             Task.model,
             Task.strategic_cycle_id,
             Task.fix_loop_history,
-        )
+        raiseload=True,)
         _terminal_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1200,7 +1212,7 @@ async def claim_task(
             Task.model,
             Task.strategic_cycle_id,
             Task.fix_loop_history,
-        )
+        raiseload=True,)
         _history_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1505,7 +1517,7 @@ async def claim_task(
                 Task.account_id,
                 Task.provider,
                 Task.model,
-            )
+            raiseload=True,)
             _sibling_ranked = (
                 select(
                     Task.id.label("task_id"),
@@ -2198,7 +2210,7 @@ async def claim_task(
                         await session.execute(
                             select(Task)
                             .where(Task.id.in_(_parsed_ids))
-                            .options(load_only(Task.id, Task.status, Task.context))
+                            .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
                         )
                     ).scalars()
                     for _src_task in _src_rows:
@@ -2876,8 +2888,10 @@ async def claim_task(
             # pivot to direction_update/direction_note findings on stuck directions.
             if task_type == "research":
                 from app.research_completion import _detect_dedup_deadlock
+                from app.research_direction_state import _detect_already_fixed_deadlock
 
                 deadlocked, _ = _detect_dedup_deadlock(history)
+                af_deadlocked, _ = _detect_already_fixed_deadlock(history)
                 research_recent_outcomes = [
                     {
                         "tasks_created": h.get("tasks_created", 0),
@@ -3046,6 +3060,7 @@ async def claim_task(
                         direction.get("possibly_saturated", False)
                     ),
                     "deadlock_detected": bool(deadlocked),
+                    "already_fixed_deadlock_detected": bool(af_deadlocked),
                     "recent_outcomes": research_recent_outcomes,
                     "failure_stage_pattern": research_failure_stage_pattern,
                     "scope_success_rates": research_scope_rates,
@@ -3409,7 +3424,7 @@ async def claim_task(
                     Task.created_at > _utcnow() - timedelta(days=14),
                 )
                 .options(
-                    load_only(Task.id, Task.context, Task.payloads, Task.created_at)
+                    load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True)
                 )
                 .order_by(Task.created_at.desc())
                 .limit(2000)
@@ -3969,6 +3984,88 @@ async def get_viewport_failure_screenshot_upload_url(
 
     ctx = dict(task.context or {})
     ctx["viewport_failure_screenshot_uri"] = storage_uri
+    task.context = ctx
+    flag_modified(task, "context")
+    session.add(task)
+    await session.commit()
+
+    return {"upload_url": upload_url, "storage_uri": storage_uri}
+
+
+class ViewportScreenshotUploadUrlRequest(BaseModel):
+    task_id: uuid.UUID
+    name: str = Field(max_length=200)
+    width: int = Field(ge=1, le=4096)
+    phase: Literal["before", "after"]
+
+
+@router.post("/viewport/screenshot-upload-url")
+@limiter.limit("120/minute")
+async def get_viewport_screenshot_upload_url(
+    request: Request,
+    req: ViewportScreenshotUploadUrlRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Generate a signed upload URL for a task-scoped before/after viewport screenshot.
+
+    The object path (viewport-shots/{project_id}/{task_id}/{safe_name}-{width}-{phase}.png)
+    is task-scoped to avoid collisions across tasks.  The storage_uri is appended to
+    task.context["viewport_screenshots"] (capped at 24 entries) so the PR renderer can
+    later retrieve the list and inject the screenshots into the PR body.
+    """
+    if str(req.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    stmt = select(Task).where(Task.id == req.task_id)
+    task = (await session.execute(stmt)).scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    import datetime as _dt
+    import re as _re
+
+    from google.cloud import storage as _gcs
+
+    from app.storage import ARTIFACT_BUCKET_NAME, GCP_PROJECT_ID
+
+    _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
+    safe_name = _SAFE_NAME_RE.sub("_", req.name)[:100]
+
+    screenshots = list((task.context or {}).get("viewport_screenshots", []))
+    if len(screenshots) >= 24:
+        raise HTTPException(status_code=429, detail="Upload cap reached")
+
+    object_name = f"viewport-shots/{task.project_id}/{task.id}/{safe_name}-{req.width}-{req.phase}.png"
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    def _generate() -> str:
+        blob = (
+            _gcs.Client(project=GCP_PROJECT_ID)
+            .bucket(ARTIFACT_BUCKET_NAME)
+            .blob(object_name)
+        )
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=_dt.timedelta(minutes=15),
+            method="PUT",
+            content_type="image/png",
+        )
+
+    try:
+        upload_url = await asyncio.to_thread(_generate)
+    except Exception as exc:
+        logger.warning(
+            "[VIEWPORT] signed upload URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(
+            status_code=503, detail="Artifact storage unavailable"
+        ) from exc
+
+    ctx = dict(task.context or {})
+    entry_name = f"{safe_name}-{req.width}-{req.phase}"
+    screenshots.append({"name": entry_name, "storage_uri": storage_uri})
+    ctx["viewport_screenshots"] = screenshots
     task.context = ctx
     flag_modified(task, "context")
     session.add(task)

@@ -26,12 +26,33 @@ function loadSrSectionScriptB64(): string {
   }
 }
 
+// Same pattern for the viewport-screenshots renderer: a real, lintable/testable
+// file on disk, base64-embedded into the generated ./pr so the bash layer never
+// has to escape its JS body. Renders the <!-- blueprint:screenshots --> block
+// from the viewport snapshot manifest written by `viewport-snapshot.sh --upload`.
+const _SCREENSHOTS_SECTION_SCRIPT_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  '..',
+  'screenshots-pr-section.js',
+);
+function loadScreenshotsSectionScriptB64(): string {
+  try {
+    return Buffer.from(
+      fs.readFileSync(_SCREENSHOTS_SECTION_SCRIPT_PATH, 'utf8'),
+    ).toString('base64');
+  } catch {
+    return '';
+  }
+}
+
 export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   // Idempotent push + PR creation/update. Gates on ./check first.
   // Writes /tmp/pr_url_<task_id> on success so the wrapper + ./done can
   // pick up the URL without re-querying GitHub.
   const _SR_SECTION_SCRIPT_B64 = loadSrSectionScriptB64();
+  const _SCREENSHOTS_SECTION_SCRIPT_B64 = loadScreenshotsSectionScriptB64();
   const script = `#!/bin/bash
 # ./pr open --title "..." --body "..."  — ship the diff via PR
 #
@@ -158,6 +179,25 @@ fi
 if [ -n "$SR_SECTION" ]; then
   BODY=$(printf '%s' "$BODY" | sed '/<!-- blueprint:self-review -->/,/<!-- \\/blueprint:self-review -->/d')
   BODY=$(printf '%s\\n\\n%s' "$BODY" "$SR_SECTION")
+fi
+
+# ── Viewport screenshots section injection ────────────────────────────────────
+# Renders the <!-- blueprint:screenshots --> block from the snapshot manifest
+# that \`viewport-snapshot.sh --upload --task-id <id>\` copies to this known path
+# after PUTting the changed/new before/after PNGs to GCS. The renderer emits
+# markdown links (NOT inline images) to the admin viewport-shots download
+# endpoint, which mints a fresh signed URL per click. No-op when the manifest is
+# absent or carries no changed/new pairs (renderer prints nothing).
+SHOTS_MANIFEST="/tmp/viewport_manifest_${cfg.taskId}.json"
+SHOTS_SECTION=""
+if [ -f "$SHOTS_MANIFEST" ] && [ -n '${_SCREENSHOTS_SECTION_SCRIPT_B64}' ]; then
+  printf '%s' '${_SCREENSHOTS_SECTION_SCRIPT_B64}' | base64 -d > /tmp/screenshots_section_${cfg.taskId}.js
+  SHOTS_SECTION=$(node /tmp/screenshots_section_${cfg.taskId}.js "$SHOTS_MANIFEST" "\${ORCHESTRATOR_URL:-}" "\${PROJECT_ID:-}" "${cfg.taskId}" 2>/dev/null || true)
+  rm -f /tmp/screenshots_section_${cfg.taskId}.js
+fi
+if [ -n "$SHOTS_SECTION" ]; then
+  BODY=$(printf '%s' "$BODY" | sed '/<!-- blueprint:screenshots -->/,/<!-- \\/blueprint:screenshots -->/d')
+  BODY=$(printf '%s\\n\\n%s' "$BODY" "$SHOTS_SECTION")
 fi
 
 ${(cfg.promotionTarget !== undefined ? cfg.baseBranch === cfg.promotionTarget : cfg.testsOnMainBranch) ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
@@ -347,8 +387,8 @@ ${cfg.existingPrNumber !== undefined ? `
 # the original create task, so we don't need to call the endpoint here.
 PR_URL="https://github.com/${cfg.owner}/${cfg.repo}/pull/${cfg.existingPrNumber}"
 echo "[pr] Pushed updates to existing PR #${cfg.existingPrNumber}"
-# Update existing PR body with fresh SR section (best-effort — log on failure)
-if [ -n "$SR_SECTION" ]; then
+# Update existing PR body with fresh SR + screenshots sections (best-effort).
+if [ -n "$SR_SECTION" ] || [ -n "$SHOTS_SECTION" ]; then
   _PTRESP=$(curl -f -sS --max-time 30 \\
     -H "X-Agent-Token: $TOKEN" \\
     "$API/api/agent/github/token?task_id=$TASK" 2>/dev/null) || _PTRESP=""
@@ -356,23 +396,30 @@ if [ -n "$SR_SECTION" ]; then
   if [ -n "$_PTOKEN" ]; then
     # Fetch current PR body. Use -f so non-2xx GET responses (auth/rate-limit/
     # 5xx/404) fail fast rather than yielding an empty body that would let the
-    # subsequent PATCH wipe the live PR description with just the SR section.
+    # subsequent PATCH wipe the live PR description with just the section(s).
     _GETBODY_FILE=/tmp/pr_get_body_${cfg.taskId}.json
     if curl -f -sS --max-time 30 \\
         "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/pulls/${cfg.existingPrNumber}" \\
         -H "Authorization: token $_PTOKEN" -H "Accept: application/vnd.github+json" \\
         -o "$_GETBODY_FILE" 2>/dev/null; then
       _CURBODY=$(jq -r '.body // ""' "$_GETBODY_FILE" 2>/dev/null || printf '')
+      # Strip any prior blocks (idempotent), then re-append the fresh non-empty ones.
       _UPDBODY=$(printf '%s' "$_CURBODY" | sed '/<!-- blueprint:self-review -->/,/<!-- \\/blueprint:self-review -->/d')
-      _UPDBODY=$(printf '%s\\n\\n%s' "$_UPDBODY" "$SR_SECTION")
+      _UPDBODY=$(printf '%s' "$_UPDBODY" | sed '/<!-- blueprint:screenshots -->/,/<!-- \\/blueprint:screenshots -->/d')
+      if [ -n "$SR_SECTION" ]; then
+        _UPDBODY=$(printf '%s\\n\\n%s' "$_UPDBODY" "$SR_SECTION")
+      fi
+      if [ -n "$SHOTS_SECTION" ]; then
+        _UPDBODY=$(printf '%s\\n\\n%s' "$_UPDBODY" "$SHOTS_SECTION")
+      fi
       _PHTTP=$(jq -n --arg b "$_UPDBODY" '{body: $b}' | curl -sS -o /dev/null -w '%{http_code}' \\
         --max-time 30 -X PATCH \\
         "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/pulls/${cfg.existingPrNumber}" \\
         -H "Authorization: token $_PTOKEN" -H "Accept: application/vnd.github+json" \\
         -H "Content-Type: application/json" --data-binary @- 2>/dev/null) || _PHTTP="000"
-      [ "$_PHTTP" = "200" ] || echo "[pr] Warning: SR body update returned HTTP $_PHTTP — continuing" >&2
+      [ "$_PHTTP" = "200" ] || echo "[pr] Warning: PR body update returned HTTP $_PHTTP — continuing" >&2
     else
-      echo "[pr] Warning: GET PR body failed — skipping SR section update to avoid wiping description" >&2
+      echo "[pr] Warning: GET PR body failed — skipping body section update to avoid wiping description" >&2
     fi
     rm -f "$_GETBODY_FILE"
     unset _PTOKEN

@@ -718,7 +718,9 @@ async def test_local_subprocess_env_does_not_inherit_orchestrator_secrets(
         env={"EXPLICIT_JOB_ENV": "present"},
     )
 
-    with patch("app.compute_backends.subprocess.Popen", return_value=fake_proc) as popen:
+    with patch(
+        "app.compute_backends.subprocess.Popen", return_value=fake_proc
+    ) as popen:
         result = await backend.launch(spec)
 
     try:
@@ -912,7 +914,8 @@ def _make_gpu_failure_provision_monkeypatch(monkeypatch, error_msg: str):
         lambda accel: [(gpu_zone, "agent-sandbox-subnet-us-east4")],
     )
     monkeypatch.setattr(
-        compute, "_active_fallback_zones",
+        compute,
+        "_active_fallback_zones",
         lambda: [(gpu_zone, "agent-sandbox-subnet-us-east4")],
     )
 
@@ -942,9 +945,12 @@ def _make_gpu_failure_provision_monkeypatch(monkeypatch, error_msg: str):
             class _FakeOp:
                 def result(self, timeout=None):
                     return None
+
             return _FakeOp()
 
-    monkeypatch.setattr(compute_v1, "InstancesClient", lambda: _FailingInstancesClient())
+    monkeypatch.setattr(
+        compute_v1, "InstancesClient", lambda: _FailingInstancesClient()
+    )
 
 
 @pytest.mark.asyncio
@@ -976,7 +982,9 @@ async def test_gpu_provision_failure_does_not_block_cpu_fleet(
 
     # CPU zone health must be completely clean.
     assert compute._zone_health == {}, "GPU stockout must not write CPU _zone_health"
-    assert compute._zone_failures == {}, "GPU stockout must not write CPU _zone_failures"
+    assert compute._zone_failures == {}, (
+        "GPU stockout must not write CPU _zone_failures"
+    )
     assert provision_error_scope._global_quota_state == {}, (
         "GPU stockout must not arm CPU global quota cooldown"
     )
@@ -1011,7 +1019,9 @@ async def test_gpu_provision_failure_does_not_block_cpu_fleet(
     assert ok is False
 
     # CPU state must still be clean.
-    assert compute._zone_health == {}, "GPUS_ALL_REGIONS must not write CPU _zone_health"
+    assert compute._zone_health == {}, (
+        "GPUS_ALL_REGIONS must not write CPU _zone_health"
+    )
     assert compute._zone_failures == {}, (
         "GPUS_ALL_REGIONS must not write CPU _zone_failures"
     )
@@ -1023,13 +1033,16 @@ async def test_gpu_provision_failure_does_not_block_cpu_fleet(
     )
 
     # GPU global quota cooldown is armed.
-    assert provision_error_scope._gpu_global_quota_state.get("cooldown_expires_at") is not None, (
-        "GPUS_ALL_REGIONS must arm GPU global quota cooldown"
-    )
+    assert (
+        provision_error_scope._gpu_global_quota_state.get("cooldown_expires_at")
+        is not None
+    ), "GPUS_ALL_REGIONS must arm GPU global quota cooldown"
 
 
 @pytest.mark.asyncio
-async def test_gpu_zone_stockout_does_not_cool_cpu_zones(monkeypatch, clean_zone_health):
+async def test_gpu_zone_stockout_does_not_cool_cpu_zones(
+    monkeypatch, clean_zone_health
+):
     """A GPU zone stockout (ZONE_RESOURCE_POOL_EXHAUSTED) writes only to
     _gpu_zone_health / _gpu_zone_failures, leaving CPU _zone_health untouched."""
     _make_gpu_failure_provision_monkeypatch(
@@ -1045,7 +1058,9 @@ async def test_gpu_zone_stockout_does_not_cool_cpu_zones(monkeypatch, clean_zone
 
     assert compute._zone_health == {}, "GPU stockout wrote to CPU _zone_health"
     assert compute._zone_failures == {}, "GPU stockout wrote to CPU _zone_failures"
-    assert len(compute._gpu_zone_health) > 0, "GPU stockout did not record GPU zone health"
+    assert len(compute._gpu_zone_health) > 0, (
+        "GPU stockout did not record GPU zone health"
+    )
 
 
 @pytest.mark.asyncio
@@ -1069,13 +1084,16 @@ async def test_gpus_all_regions_does_not_arm_cpu_global_cooldown(
     assert provision_error_scope._global_quota_state == {}, (
         "GPUS_ALL_REGIONS armed CPU global quota state"
     )
-    assert provision_error_scope._gpu_global_quota_state.get("cooldown_expires_at") is not None, (
-        "GPUS_ALL_REGIONS did not arm GPU global quota state"
-    )
+    assert (
+        provision_error_scope._gpu_global_quota_state.get("cooldown_expires_at")
+        is not None
+    ), "GPUS_ALL_REGIONS did not arm GPU global quota state"
 
 
 @pytest.mark.asyncio
-async def test_cpu_zone_stockout_does_not_cool_gpu_zones(monkeypatch, clean_zone_health):
+async def test_cpu_zone_stockout_does_not_cool_gpu_zones(
+    monkeypatch, clean_zone_health
+):
     """A CPU zone stockout writes only to CPU _zone_health / _zone_failures,
     leaving _gpu_zone_health untouched."""
     from google.cloud import compute_v1
@@ -1103,9 +1121,12 @@ async def test_cpu_zone_stockout_does_not_cool_gpu_zones(monkeypatch, clean_zone
             class _FakeOp:
                 def result(self, timeout=None):
                     return None
+
             return _FakeOp()
 
-    monkeypatch.setattr(compute_v1, "InstancesClient", lambda: _FailingCPUInstancesClient())
+    monkeypatch.setattr(
+        compute_v1, "InstancesClient", lambda: _FailingCPUInstancesClient()
+    )
     monkeypatch.setattr(
         compute,
         "_active_fallback_zones",
@@ -1119,7 +1140,9 @@ async def test_cpu_zone_stockout_does_not_cool_gpu_zones(monkeypatch, clean_zone
     )
 
     assert compute._gpu_zone_health == {}, "CPU stockout wrote to GPU _gpu_zone_health"
-    assert compute._gpu_zone_failures == {}, "CPU stockout wrote to GPU _gpu_zone_failures"
+    assert compute._gpu_zone_failures == {}, (
+        "CPU stockout wrote to GPU _gpu_zone_failures"
+    )
     assert len(compute._zone_health) > 0, "CPU stockout did not record CPU zone health"
 
 
@@ -1407,7 +1430,9 @@ async def test_local_backend_artifact_dir_survives_subprocess_exit():
 
 
 def test_local_wrapper_command_provisions_and_exports_artifact_dir():
-    artifact_dir = compute_backends_module._local_artifact_dir_for_external_id("local-z")
+    artifact_dir = compute_backends_module._local_artifact_dir_for_external_id(
+        "local-z"
+    )
     wrapper = compute_backends_module._build_local_wrapper_command(
         "echo hi", external_id="local-z"
     )
@@ -1434,13 +1459,16 @@ def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
     )
 
     assert "export BLUEPRINT_ARTIFACT_DIR=" in script
-    assert "mkdir -p" in script and compute_backends_module._GCP_ARTIFACT_DIR_PATH in script
+    assert (
+        "mkdir -p" in script
+        and compute_backends_module._GCP_ARTIFACT_DIR_PATH in script
+    )
     assert "command.log.json" in script
     # Upload targets ONLY this job's bundle object, bounded by a hard timeout, best-effort.
     assert "trap upload_artifacts EXIT HUP INT TERM QUIT" in script
     assert "https://storage.example.com/upload" in script
     assert "curl --fail --silent --show-error" in script
-    assert "python3 - " in script
+    assert "/tmp/blueprint_command_runner.py" in script
     assert "BLUEPRINT_COMPUTE_COMMAND_LOG=" in script
     assert "TTL_SECONDS=330" in script
     assert "runtime_ttl" in script
@@ -1471,7 +1499,15 @@ async def test_gcp_backend_launch_uses_signed_artifact_upload(monkeypatch):
         signed_url_calls.append({"job_id": jid, "expires_at": expires_at})
         return "https://storage.example.com/upload"
 
-    async def fake_provision(vm_id, *, startup_script, machine_type, provisioning_model, accelerator=None, accelerator_count=1):
+    async def fake_provision(
+        vm_id,
+        *,
+        startup_script,
+        machine_type,
+        provisioning_model,
+        accelerator=None,
+        accelerator_count=1,
+    ):
         provision_calls.append(
             {
                 "vm_id": vm_id,
@@ -1831,7 +1867,9 @@ async def test_compute_runtime_deadline_starts_after_launch(db_session, monkeypa
             terminate_reasons.append(reason)
             return True
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -1894,6 +1932,13 @@ async def test_process_compute_jobs_once_times_out_provisioning_before_launch(
         spend_cap_usd=1.0,
         deadline_seconds=60,
     )
+    # Expire both the wall_clock_deadline AND the provisioning_deadline_at
+    # sub-deadline so the monitor detects the provisioning timeout immediately.
+    meta = dict(job.polling_metadata or {})
+    meta["provisioning_deadline_at"] = (
+        datetime.utcnow() + timedelta(milliseconds=200)
+    ).isoformat()
+    job.polling_metadata = meta
     job.wall_clock_deadline = datetime.utcnow() + timedelta(milliseconds=200)
     await db_session.commit()
 
@@ -1918,7 +1963,9 @@ async def test_process_compute_jobs_once_times_out_provisioning_before_launch(
             terminate_reasons.append(reason)
             return True
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -1936,6 +1983,150 @@ async def test_process_compute_jobs_once_times_out_provisioning_before_launch(
     diagnostic = job.polling_metadata["compute_rpc_diagnostic"]
     assert diagnostic["operation"] == "launch"
     assert diagnostic["reason"] == "provisioning_timeout"
+
+
+@pytest.mark.asyncio
+async def test_provisioning_subdeadline_fails_fast(db_session, monkeypatch):
+    """A job stuck in provisioning is TIMED_OUT at the short sub-deadline, not
+    after the full runtime budget. A job that reaches RUNNING is governed only
+    by the full runtime deadline, not the sub-deadline."""
+    project = Project(name="Provisioning Subdeadline Test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # deadline_seconds=3600 (1h) but COMPUTE_PROVISIONING_DEADLINE_SECONDS=360 (6m)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=3600,
+    )
+
+    # Verify the provisioning sub-deadline is much shorter than wall_clock_deadline.
+    prov_deadline_raw = (job.polling_metadata or {}).get("provisioning_deadline_at")
+    assert prov_deadline_raw is not None, (
+        "provisioning_deadline_at must be in polling_metadata"
+    )
+    prov_deadline = datetime.fromisoformat(prov_deadline_raw)
+    # Sub-deadline should be at most COMPUTE_PROVISIONING_DEADLINE_SECONDS after now,
+    # while wall_clock_deadline is 3600s ahead.
+    gap_seconds = (job.wall_clock_deadline - prov_deadline).total_seconds()
+    assert gap_seconds > 100, (
+        f"provisioning sub-deadline {prov_deadline} should be well before "
+        f"wall_clock_deadline {job.wall_clock_deadline} (gap={gap_seconds:.1f}s)"
+    )
+
+    # Push the sub-deadline into the past to simulate a stalled provisioning VM.
+    meta = dict(job.polling_metadata or {})
+    meta["provisioning_deadline_at"] = (
+        datetime.utcnow() - timedelta(seconds=1)
+    ).isoformat()
+    job.polling_metadata = meta
+    # wall_clock_deadline stays far in the future (the full runtime budget).
+    assert (job.wall_clock_deadline - datetime.utcnow()).total_seconds() > 1000
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "never-launched"
+
+        async def launch(self, spec):  # pragma: no cover
+            raise AssertionError(
+                "launch should not be called after sub-deadline expiry"
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    # Must be TIMED_OUT despite the full runtime deadline still being in the future.
+    assert job.status == ComputeJobStatus.TIMED_OUT, (
+        f"expected TIMED_OUT, got {job.status}"
+    )
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert "provisioning" in (job.terminal_reason or "")
+    assert terminate_reasons == ["provisioning"]
+
+    # ------------------------------------------------------------------
+    # Part 2: a job that reaches RUNNING is governed by the runtime deadline,
+    # not the provisioning sub-deadline.
+    # ------------------------------------------------------------------
+    task2 = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    job2 = await compute_jobs.create_compute_job(
+        db_session,
+        task2,
+        command="echo done",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=3600,
+    )
+
+    # Simulate a job that is already RUNNING with the sub-deadline expired.
+    meta2 = dict(job2.polling_metadata or {})
+    meta2["provisioning_deadline_at"] = (
+        datetime.utcnow() - timedelta(seconds=1)
+    ).isoformat()
+    job2.polling_metadata = meta2
+    job2.status = ComputeJobStatus.RUNNING
+    job2.started_at = datetime.utcnow() - timedelta(seconds=5)
+    await db_session.commit()
+
+    poll_calls: list[str] = []
+
+    class FakeRunningBackend:
+        def external_id_for(self, persisted_job):
+            return "running-job"
+
+        async def poll_status(self, persisted_job):
+            poll_calls.append("poll")
+            from app.compute_backends import ComputeStatusResult
+
+            return ComputeStatusResult(
+                status=ComputeJobStatus.RUNNING,
+                message="still running",
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeRunningBackend()
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job2)
+    # Job should still be RUNNING — sub-deadline must not have terminated it.
+    assert job2.status == ComputeJobStatus.RUNNING, (
+        f"expected RUNNING (sub-deadline must not fire once RUNNING), got {job2.status}"
+    )
+    assert poll_calls, "backend.poll_status should have been called for the RUNNING job"
 
 
 @pytest.mark.asyncio
@@ -1981,7 +2172,9 @@ async def test_compute_monitor_records_backend_rpc_failure_without_terminalizing
         async def poll_cost(self, persisted_job, *, as_of):
             raise AssertionError("poll_cost should not run after status failure")
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -2139,7 +2332,9 @@ async def test_process_compute_jobs_once_records_terminate_failure_and_still_ter
             assert reason == "budget"
             raise RuntimeError("delete failed")
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -2193,7 +2388,9 @@ async def test_kill_compute_job_records_terminate_failure_and_returns_active_job
             assert reason == "operator"
             raise RuntimeError("operator delete failed")
 
-    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
 
     killed = await compute_jobs.kill_compute_job(
         db_session,
@@ -2281,9 +2478,7 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
     artifact_dir = compute_backends_module._local_artifact_dir_for_external_id(
         external_id
     )
-    assert not compute_backends_module._is_pid_running(
-        int(job.polling_metadata["pid"])
-    )
+    assert not compute_backends_module._is_pid_running(int(job.polling_metadata["pid"]))
     with open(os.path.join(artifact_dir, "model.ckpt"), encoding="utf-8") as handle:
         assert handle.read() == "checkpoint-bytes"
 
@@ -2435,11 +2630,7 @@ async def test_terminal_job_with_empty_artifact_dir_links_no_artifact(
     assert job.artifact_id is None
     assert job.result_reference is None
     artifacts = (
-        (
-            await db_session.execute(
-                select(Artifact).where(Artifact.task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -2812,9 +3003,7 @@ async def test_create_compute_job_gpu_extends_wall_clock_deadline(
 
 
 @pytest.mark.asyncio
-async def test_create_compute_job_stores_park_deadline_seconds(
-    db_session, monkeypatch
-):
+async def test_create_compute_job_stores_park_deadline_seconds(db_session, monkeypatch):
     """park_deadline_seconds in polling_metadata equals deadline + allowance + grace."""
     monkeypatch.setattr(compute, "LOCAL_MODE", False)
     task_gpu = await _make_compute_task(db_session)
@@ -4618,11 +4807,7 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
     assert job.status == ComputeJobStatus.SUCCEEDED
     assert job.outcome == ComputeJobOutcome.SUCCESS
 
-    regs = (
-        (await db_session.execute(select(TaskWakeRegistration)))
-        .scalars()
-        .all()
-    )
+    regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
     assert len(regs) == 1, "launch must not create duplicate parked registrations"
     assert regs[0].delivery_state == WakeDeliveryState.FIRED
 
@@ -4758,9 +4943,7 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
     assert job.status == ComputeJobStatus.SUCCEEDED
     assert job.outcome == ComputeJobOutcome.SUCCESS
     # The monitor fired nothing — no registration existed when the job finalized.
-    pre_regs = (
-        (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
-    )
+    pre_regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
     assert pre_regs == [], "no registration should exist before the task parks"
 
     # --- NOW park on the already-terminal job (the lost-wakeup window). -------
@@ -4909,9 +5092,7 @@ async def test_compute_wake_delivery_commit_is_durable_and_single(
     )
     async with fresh_factory() as fresh:
         fresh_task = await fresh.get(Task, task.id)
-        fresh_reg = (
-            (await fresh.execute(select(TaskWakeRegistration))).scalars().one()
-        )
+        fresh_reg = (await fresh.execute(select(TaskWakeRegistration))).scalars().one()
         assert fresh_task.status == TaskStatus.COMPLETED
         assert fresh_reg.delivery_state == WakeDeliveryState.DELIVERED
         assert fresh_reg.attempt_count == 1
@@ -4923,9 +5104,7 @@ async def test_compute_wake_delivery_commit_is_durable_and_single(
     again = await sweep_deliver_task_wakes(db_session, _utcnow())
     assert again == 0
     async with fresh_factory() as fresh:
-        fresh_reg = (
-            (await fresh.execute(select(TaskWakeRegistration))).scalars().one()
-        )
+        fresh_reg = (await fresh.execute(select(TaskWakeRegistration))).scalars().one()
         assert fresh_reg.delivery_state == WakeDeliveryState.DELIVERED
         assert fresh_reg.delivered_at == durable_delivered_at
         assert fresh_reg.attempt_count == 1
@@ -4976,7 +5155,9 @@ async def test_park_task_waits_for_terminal_job_commit_before_catch_up(
     )
 
     async with session_factory() as terminal_session:
-        locked_job = await terminal_session.get(ComputeJob, job.id, with_for_update=True)
+        locked_job = await terminal_session.get(
+            ComputeJob, job.id, with_for_update=True
+        )
         assert locked_job is not None
         locked_job.status = ComputeJobStatus.SUCCEEDED
         locked_job.outcome = ComputeJobOutcome.SUCCESS
@@ -5029,9 +5210,7 @@ async def test_park_task_waits_for_terminal_job_commit_before_catch_up(
 
 
 @pytest.mark.asyncio
-async def test_wake_post_commit_side_effects_are_recoverable(
-    db_session, monkeypatch
-):
+async def test_wake_post_commit_side_effects_are_recoverable(db_session, monkeypatch):
     """A transient wake post-commit failure leaves a durable retry marker.
 
     The first sweep delivers the wake and then fails while persisting the
@@ -5049,9 +5228,7 @@ async def test_wake_post_commit_side_effects_are_recoverable(
     from app.task_lifecycle import fire_task_wakes, park_task
     from app.time_utils import _utcnow
 
-    project = Project(
-        name="Compute Wake Recoverable Side Effects", user_id="test-user"
-    )
+    project = Project(name="Compute Wake Recoverable Side Effects", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -5370,9 +5547,7 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
     from app.task_lifecycle import deliver_wake, fire_task_wakes, park_task
     from app.time_utils import _utcnow
 
-    project = Project(
-        name="Compute Wake Retry Starvation", user_id="test-user"
-    )
+    project = Project(name="Compute Wake Retry Starvation", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -5601,9 +5776,7 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
     from app.task_lifecycle import deliver_wake, fire_task_wakes, park_task
     from app.time_utils import _utcnow
 
-    project = Project(
-        name="Compute Wake Retry Starvation Backoff", user_id="test-user"
-    )
+    project = Project(name="Compute Wake Retry Starvation Backoff", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -5825,9 +5998,9 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
         assert _COMPUTE_WAKE_POST_COMMIT_META_KEY in (b_reg.source_metadata or {}), (
             f"Backlog row {reg_id} had its marker cleared (starvation occurred)"
         )
-        assert (b_reg.source_metadata or {}).get(_COMPUTE_WAKE_NEXT_RETRY_KEY) == far_future, (
-            f"Backlog row {reg_id} had its backoff timestamp modified"
-        )
+        assert (b_reg.source_metadata or {}).get(
+            _COMPUTE_WAKE_NEXT_RETRY_KEY
+        ) == far_future, f"Backlog row {reg_id} had its backoff timestamp modified"
 
 
 def test_build_compute_result_logs_shape_metrics_and_disposition():
@@ -6107,6 +6280,7 @@ class TestGpuImageFamilyValidation:
         monkeypatch.setattr(compute, "LOCAL_MODE", False)
         # Set last check to far in the future so recheck interval has NOT elapsed.
         import time
+
         monkeypatch.setattr(compute, "_gpu_image_family_last_check", time.time())
 
         with pytest.raises(RuntimeError, match="GPU"):
@@ -6201,6 +6375,7 @@ class TestGpuImageFamilyValidation:
         monkeypatch.setattr(compute, "_gpu_image_family_valid", False)
         monkeypatch.setattr(compute, "LOCAL_MODE", False)
         import time
+
         monkeypatch.setattr(compute, "_gpu_image_family_last_check", time.time())
 
         # CPU gate passes.
@@ -6255,7 +6430,9 @@ def test_compute_job_artifact_uri_and_prefix_are_per_job():
 
 
 @pytest.mark.asyncio
-async def test_compute_job_artifact_upload_signed_url_targets_bundle_object(monkeypatch):
+async def test_compute_job_artifact_upload_signed_url_targets_bundle_object(
+    monkeypatch,
+):
     job_id = uuid.uuid4()
     expected_object = storage.compute_job_artifact_object_name(job_id)
     expires_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -6348,10 +6525,14 @@ async def test_grant_artifact_writer_replaces_stale_binding_for_same_job(monkeyp
     )
 
     titled = [
-        b for b in bucket._policy.bindings if (b.get("condition") or {}).get("title") == title
+        b
+        for b in bucket._policy.bindings
+        if (b.get("condition") or {}).get("title") == title
     ]
     assert len(titled) == 1
-    assert titled[0]["members"] == {"serviceAccount:new@example.iam.gserviceaccount.com"}
+    assert titled[0]["members"] == {
+        "serviceAccount:new@example.iam.gserviceaccount.com"
+    }
     # Unrelated bindings are preserved.
     assert other in bucket._policy.bindings
 
@@ -6471,7 +6652,9 @@ async def test_wake_delivery_missing_job_is_truthfully_classified(db_session):
         "missing job must land task FAILED, not COMPLETED or PARKED"
     )
     assert task.parked_at is None
-    assert (task.context or {}).get("failure_category") == "compute_job_record_missing", (
+    assert (task.context or {}).get(
+        "failure_category"
+    ) == "compute_job_record_missing", (
         "failure_category must be 'compute_job_record_missing', not a generic gate miss"
     )
     assert (task.context or {}).get("failure_class") == "compute_job_record_missing"
@@ -6490,10 +6673,9 @@ async def test_wake_delivery_missing_job_is_truthfully_classified(db_session):
 # Park/wake safety-net tests and race-contention proof
 # ---------------------------------------------------------------------------
 
-USE_POSTGRES = (
-    os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
-    and os.getenv("DATABASE_URL", "").startswith("postgresql")
-)
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 @pytest.mark.skipif(
@@ -6684,12 +6866,16 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
 
     await db_session.refresh(task1)
     reg1 = (
-        await db_session.execute(
-            select(TaskWakeRegistration)
-            .where(TaskWakeRegistration.task_id == task1.id)
-            .execution_options(populate_existing=True)
+        (
+            await db_session.execute(
+                select(TaskWakeRegistration)
+                .where(TaskWakeRegistration.task_id == task1.id)
+                .execution_options(populate_existing=True)
+            )
         )
-    ).scalars().one()
+        .scalars()
+        .one()
+    )
     assert task1.status == TaskStatus.COMPLETED, (
         f"task must be COMPLETED after ordering-1, got {task1.status!r}"
     )
@@ -6725,12 +6911,16 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
 
     await db_session.refresh(task2)
     reg2_pending = (
-        await db_session.execute(
-            select(TaskWakeRegistration)
-            .where(TaskWakeRegistration.task_id == task2.id)
-            .execution_options(populate_existing=True)
+        (
+            await db_session.execute(
+                select(TaskWakeRegistration)
+                .where(TaskWakeRegistration.task_id == task2.id)
+                .execution_options(populate_existing=True)
+            )
         )
-    ).scalars().one()
+        .scalars()
+        .one()
+    )
     assert task2.status == TaskStatus.PARKED
     assert reg2_pending.delivery_state == WakeDeliveryState.PENDING, (
         "registration must be PENDING when job is not yet terminal at park time"
@@ -6751,12 +6941,16 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
 
     await db_session.refresh(task2)
     reg2_done = (
-        await db_session.execute(
-            select(TaskWakeRegistration)
-            .where(TaskWakeRegistration.task_id == task2.id)
-            .execution_options(populate_existing=True)
+        (
+            await db_session.execute(
+                select(TaskWakeRegistration)
+                .where(TaskWakeRegistration.task_id == task2.id)
+                .execution_options(populate_existing=True)
+            )
         )
-    ).scalars().one()
+        .scalars()
+        .one()
+    )
     assert task2.status == TaskStatus.COMPLETED, (
         f"task must be COMPLETED after ordering-2, got {task2.status!r}"
     )
@@ -7045,9 +7239,9 @@ async def test_park_wake_timeout_disambiguates_compute_job_state(db_session):
     assert (task.context or {}).get("failure_class") == "park_wake_timeout", (
         f"expected failure_class='park_wake_timeout', got {task.context!r}"
     )
-    assert (
-        task.context or {}
-    ).get("failure_detail") == "compute_job_terminal_job_not_terminal_by_deadline"
+    assert (task.context or {}).get(
+        "failure_detail"
+    ) == "compute_job_terminal_job_not_terminal_by_deadline"
     diagnostics = (task.context or {}).get("park_wake_timeout_diagnostics") or {}
     assert diagnostics["job_terminal_by_deadline"] is False
     assert diagnostics["job_status"] == ComputeJobStatus.QUEUED.value
@@ -7160,9 +7354,9 @@ async def test_park_wake_timeout_when_job_finished_but_wake_never_fired(db_sessi
     assert task.status == TaskStatus.FAILED
     assert (task.context or {}).get("failure_category") == "park_wake_timeout"
     assert (task.context or {}).get("failure_class") == "park_wake_timeout"
-    assert (
-        task.context or {}
-    ).get("failure_detail") == "compute_job_terminal_wake_lost_after_job_completed"
+    assert (task.context or {}).get(
+        "failure_detail"
+    ) == "compute_job_terminal_wake_lost_after_job_completed"
     diagnostics = (task.context or {}).get("park_wake_timeout_diagnostics") or {}
     assert diagnostics["job_terminal_by_deadline"] is True
     assert diagnostics["job_status"] == ComputeJobStatus.SUCCEEDED.value
@@ -7576,7 +7770,9 @@ async def test_kill_compute_job_releases_row_lock_across_backend_rpc(
 
 
 @pytest.mark.asyncio
-async def test_kill_compute_job_gracefully_handles_peer_terminal(db_session, monkeypatch):
+async def test_kill_compute_job_gracefully_handles_peer_terminal(
+    db_session, monkeypatch
+):
     """Regression test: if a peer (monitor, deadline/budget teardown, or
     task-terminal cancel) drives the job terminal during the kill's lock-free
     backend RPC window, the kill must detect this on re-acquire and degrade to
@@ -7814,7 +8010,9 @@ async def test_park_wake_timeout_diagnostics_provisioning_vs_runtime_split(db_se
     assert (task_b.context or {}).get("failure_class") == "park_wake_timeout"
     diag_b = (task_b.context or {}).get("park_wake_timeout_diagnostics") or {}
     assert diag_b["job_created_at"] is not None
-    assert diag_b["job_started_at"] is not None, "job_started_at must reflect started_at"
+    assert diag_b["job_started_at"] is not None, (
+        "job_started_at must reflect started_at"
+    )
     assert diag_b["provisioning_seconds"] is not None, (
         "provisioning_seconds must reflect time from creation to start"
     )
@@ -7926,11 +8124,7 @@ async def test_compute_wake_finalization_triggers_daily_cost_ceiling_alert(
 
     db_session.expire_all()
     alerts_b = (
-        (
-            await db_session.execute(
-                select(Alert).where(Alert.project_id == project.id)
-            )
-        )
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
         .scalars()
         .all()
     )
@@ -8048,13 +8242,25 @@ async def test_create_compute_job_respects_project_daily_spend_ceiling(db_sessio
     assert detail["requested_cap_usd"] == pytest.approx(1.0)
 
     # No job row should have been created.
-    jobs = (await db_session.execute(select(ComputeJob).where(
-        ComputeJob.project_id == project.id,
-        ComputeJob.status.in_([
-            ComputeJobStatus.QUEUED, ComputeJobStatus.STARTING,
-            ComputeJobStatus.RUNNING, ComputeJobStatus.POLLING,
-        ]),
-    ))).scalars().all()
+    jobs = (
+        (
+            await db_session.execute(
+                select(ComputeJob).where(
+                    ComputeJob.project_id == project.id,
+                    ComputeJob.status.in_(
+                        [
+                            ComputeJobStatus.QUEUED,
+                            ComputeJobStatus.STARTING,
+                            ComputeJobStatus.RUNNING,
+                            ComputeJobStatus.POLLING,
+                        ]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert jobs == [], "no compute job should be created when ceiling is exceeded"
 
 
@@ -8245,17 +8451,27 @@ async def test_create_compute_job_ceiling_counts_agent_vm_spend(db_session):
 
     # No active compute job row should exist.
     jobs = (
-        await db_session.execute(
-            select(ComputeJob).where(
-                ComputeJob.project_id == project.id,
-                ComputeJob.status.in_([
-                    ComputeJobStatus.QUEUED, ComputeJobStatus.STARTING,
-                    ComputeJobStatus.RUNNING, ComputeJobStatus.POLLING,
-                ]),
+        (
+            await db_session.execute(
+                select(ComputeJob).where(
+                    ComputeJob.project_id == project.id,
+                    ComputeJob.status.in_(
+                        [
+                            ComputeJobStatus.QUEUED,
+                            ComputeJobStatus.STARTING,
+                            ComputeJobStatus.RUNNING,
+                            ComputeJobStatus.POLLING,
+                        ]
+                    ),
+                )
             )
         )
-    ).scalars().all()
-    assert jobs == [], "no compute job should be created when agent-VM spend exceeds ceiling"
+        .scalars()
+        .all()
+    )
+    assert jobs == [], (
+        "no compute job should be created when agent-VM spend exceeds ceiling"
+    )
 
 
 @pytest.mark.asyncio
@@ -8532,11 +8748,16 @@ async def test_build_launch_spec_injects_release_env_vars(db_session, monkeypatc
     assert spec.env is not None
     assert spec.env["BLUEPRINT_RELEASE_SHA"] == "abc123def456"
     assert spec.env["BLUEPRINT_RELEASE_VERSION"] == "9"
-    assert spec.env["BLUEPRINT_RELEASE_VERSION_ID"] == "11111111-0000-0000-0000-000000000001"
+    assert (
+        spec.env["BLUEPRINT_RELEASE_VERSION_ID"]
+        == "11111111-0000-0000-0000-000000000001"
+    )
 
 
 @pytest.mark.asyncio
-async def test_build_launch_spec_no_env_injection_without_evidence(db_session, monkeypatch):
+async def test_build_launch_spec_no_env_injection_without_evidence(
+    db_session, monkeypatch
+):
     """_build_launch_spec does NOT inject BLUEPRINT_RELEASE_* for non-live-proof jobs."""
     monkeypatch.setattr(compute, "LOCAL_MODE", False)
     task = await _make_compute_task(db_session)

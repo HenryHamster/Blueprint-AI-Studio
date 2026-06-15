@@ -34,7 +34,7 @@ export function isBlueprintSelfRepo(owner: string, repo: string): boolean {
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
 // don't get committed into PRs via `git add -A`.
-export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch', 'blocked'];
+export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch', 'blocked', 'symbols'];
 
 export function excludeAgentHelpers(): void {
   const excludePath = `${WORKSPACE}/.git/info/exclude`;

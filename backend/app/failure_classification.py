@@ -408,6 +408,10 @@ _PROVIDER_MODEL_CONFIG_PATTERNS: tuple[str, ...] = (
     "is not supported for generatecontent",
     "unsupported service_tier",
     "unsupported value: 'service_tier'",
+    # OpenAI: model access errors ("the model ... does not exist or you do not have
+    # access to it"; "the selected model may not exist or you may not have access")
+    "does not exist or you do not have access",
+    "may not exist or you may not have access",
 )
 
 
@@ -762,6 +766,13 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # cf28097f): without this label the generic ``fatal`` + init-banner-only tail
     # was reclassified to RATE_LIMIT ("usage exhausted") above.
     "vm_config_missing": PROVISION_FAILURE,
+    # ``github_token_fetch_failed`` — the agent's startup github/token fetch
+    # (get_github_token_for_task) timed out or failed. The backend legitimately
+    # blocks up to ~120s while _github_request sleeps on a near-empty rate-limit
+    # bucket, so a credential-fetch failure is an infra/transient event, not a
+    # code fault. Route to PROVISION_FAILURE so the task requeues on a fresh VM
+    # without burning the terminal retry budget or cascading the parent plan.
+    "github_token_fetch_failed": PROVISION_FAILURE,
     # ``park_wake_timeout`` / ``park_wake_stranded`` — park/wake orchestration
     # outcomes written by the reaper's wake-delivery sweep / expire path (lowercase
     # literals matching the canonical class VALUES). Mapped here so the
@@ -770,6 +781,13 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # classes (see INFRA_CLASSES) so neither burns the retry budget.
     "park_wake_timeout": PARK_WAKE_TIMEOUT,
     "park_wake_stranded": PARK_WAKE_STRANDED,
+    # ``panel_review_lens_failed`` — the panel_review task posted a failure because
+    # a lens subprocess exited non-zero. Normally an infra-level failure (→
+    # PROVISION_FAILURE) but requires a dead-auth text check first: when a Codex
+    # lens dies with a consumed refresh token the dead-auth pattern appears in the
+    # logs (not in a structured error_report), so we must inspect the text before
+    # returning the mapped PROVISION_FAILURE class. See fast-path check below.
+    "panel_review_lens_failed": PROVISION_FAILURE,
 }
 
 
@@ -1657,6 +1675,28 @@ def normalize_agent_failure_category(
         ):
             _persist_correlation_reclassification_context(task)
             return RATE_LIMIT
+        # panel_review_lens_failed maps to PROVISION_FAILURE in the category
+        # table, but the lens subprocess stderr (stored in latest_status_message
+        # via failPanelClosed) may contain dead-auth or rate-limit signals that
+        # must be detected HERE — before the category is persisted as
+        # failure_class — because agent_status.py persists failure_class at the
+        # write boundary and the later classify_failure call short-circuits on
+        # that persisted value, never reaching _classify_failure_class.
+        if label_lower == "panel_review_lens_failed":
+            _prlf_status = (task.latest_status_message or "").lower()
+            # Only scan for dead-auth when the status is short; long output
+            # means the lens authenticated and ran, so any dead-auth phrase
+            # would be from the reviewed diff content, not a real auth death.
+            if len(_prlf_status) < 4096:
+                for _dp in _task_dead_auth_patterns(task):
+                    if _dp and _dp in _prlf_status:
+                        _persist_dead_auth_context(task, _dp)
+                        return DEAD_AUTH
+            _prlf_text = _text_provider_failure_override(task, _prlf_status)
+            if _prlf_text:
+                return _prlf_text
+            if "overloaded" in _prlf_status:
+                return EXTERNAL_API
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
         return label
@@ -2192,6 +2232,36 @@ def _classify_failure_class(
                 ):
                     _persist_correlation_reclassification_context(task)
                     return RATE_LIMIT
+            # panel_review_lens_failed: the task logs contain the raw lens
+            # subprocess stderr (via failPanelClosed's detail string). A dead
+            # OAuth session in a Codex lens runner appears there instead of in a
+            # structured error_report, so we must check text patterns here before
+            # returning the PROVISION_FAILURE fallback.
+            if agent_lower == "panel_review_lens_failed":
+                _prlf_status = (task.latest_status_message or "").lower()
+                # Guard: only scan for dead-auth when the status message is
+                # short.  The backend stores the last 8000 chars of the lens
+                # output in latest_status_message; a startup-auth-death
+                # produces a brief error block (< 4096 chars), while a lens
+                # that authenticated, ran, then failed for another reason
+                # produces kilobytes of model output filling the cap.
+                # Scanning that model output for dead-auth substrings risks a
+                # false positive if the reviewed diff mentions those literals.
+                if len(_prlf_status) < 4096:
+                    for _dp in _task_dead_auth_patterns(task):
+                        if _dp and _dp in _prlf_status:
+                            _persist_dead_auth_context(task, _dp)
+                            return DEAD_AUTH
+                # Check for provider rate-limit / overload signals before
+                # returning PROVISION_FAILURE.  A 429-throttled or 529-
+                # overloaded lens must classify as RATE_LIMIT / EXTERNAL_API
+                # (no-burn cooldown requeue) rather than PROVISION_FAILURE
+                # (which burns attempt_count — the anti-pattern at line 2276).
+                _prlf_text = _text_provider_failure_override(task, _prlf_status)
+                if _prlf_text:
+                    return _prlf_text
+                if "overloaded" in _prlf_status:
+                    return EXTERNAL_API
             return mapped
         if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
             return agent_category
@@ -2848,3 +2918,66 @@ def append_grader_diagnostic_trail(
     trail = [*trail, entry][-_GRADER_DIAGNOSTIC_TRAIL_MAX:]
     ctx[GRADER_DIAGNOSTIC_TRAIL_KEY] = trail
     return entry
+
+
+# ── Infra-recovery policy primitive ─────────────────────────────────────────
+# How many infra-class entries in the per-task _failure_class_history constitute
+# "budget exhausted" for a single fix task.  Mirrors the AGENT_TIMEOUT repeat-
+# count rule in compute_effective_max_requeues: two occurrences reduce the parent
+# requeue budget; three signals structural breakage rather than transient infra.
+_INFRA_BUDGET_THRESHOLD = 3
+
+
+def is_recoverable_infra_terminal(task: "Task") -> bool:
+    """True when a terminally-FAILED fix task's PR should be preserved, not closed.
+
+    A terminal infrastructure failure (AGENT_TIMEOUT, VM preemption, provisioning
+    failure, etc.) does not indicate a code defect — the PR code may be entirely
+    valid and the agent may never have touched it.  The reaper should NOT close
+    the PR in this case; the review pipeline can re-drive the next fix iteration.
+
+    Returns False (PR should be closed / abandoned) when any of:
+    - The failure class is not infrastructure (genuine merit / code failure).
+    - The review-loop per-chain iteration budget is exhausted
+      (``iteration >= max_iterations`` — _spawn_pipeline_task enforces the same
+      guard; this prevents the close-skip from creating an unbounded re-drive loop
+      after the chain cap fires).
+    - The per-task infra-repeat count has reached or exceeded _INFRA_BUDGET_THRESHOLD,
+      mirroring the retry-budget repeat-count rule in
+      ``compute_effective_max_requeues`` (AGENT_TIMEOUT × 3+ on the SAME task
+      signals a structurally broken task, not a transient infrastructure condition).
+
+    Returns True (keep the PR open, allow the review loop to re-drive) otherwise.
+    """
+    ctx = task.context or {}
+    failure_category = ctx.get("failure_category")
+    if failure_category not in INFRA_CLASSES:
+        return False
+
+    # Review-loop iteration budget: the fix task's review_loop carries the current
+    # iteration number and the per-chain cap set at spawn time.  When both are
+    # present and the cap is reached, further re-drives cannot spawn a new
+    # iteration, so the PR should be closed to unblock sibling rollups.
+    review_loop = ctx.get("review_loop") or {}
+    iteration = review_loop.get("iteration")
+    max_iterations = review_loop.get("max_iterations")
+    if iteration is not None and max_iterations is not None:
+        if iteration >= max_iterations:
+            return False
+
+    # Compose with the retry-budget repeat-count rule: inspect the per-task
+    # _failure_class_history (accumulated across prior RETRY cycles for this
+    # task ID).  Three or more infra-class entries indicate the task itself is
+    # structurally broken — the resurrection sweep already capped its own
+    # budget at _resurrection_count=1, so a high repeat count here means the
+    # task kept failing even after being resurrected.  At that point the review
+    # loop should spawn a FRESH fix task rather than continuously re-driving
+    # this broken one, so we return False and let the caller close the PR.
+    from app.retry_budget import failure_class_history_classes
+
+    history = failure_class_history_classes(ctx.get("_failure_class_history"))
+    infra_count = sum(1 for c in history if c in INFRA_CLASSES)
+    if infra_count >= _INFRA_BUDGET_THRESHOLD:
+        return False
+
+    return True

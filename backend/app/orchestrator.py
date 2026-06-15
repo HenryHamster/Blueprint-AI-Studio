@@ -824,6 +824,12 @@ BLOCKED_CONFLICT_LIGHT_COLUMNS = (
     Task.payloads,
 )
 
+# PROJECTION CONTRACT: all load_only() calls in backend/app pass raiseload=True so
+# that any code path accessing an unprojected column raises InvalidRequestError
+# synchronously at test time instead of MissingGreenlet at runtime.  When a new
+# column access fails with InvalidRequestError, fix it by REMOVING the unauthorized
+# column access from the code path — never by widening the projection tuple above.
+
 
 async def _project_resource_dispatch_defer_message(
     session: AsyncSession,
@@ -1672,7 +1678,7 @@ async def orchestrator_worker():
                 # via _is_migration_task -> task.first_payload.
                 # Without them, attribute access triggers a sync lazy-load from an
                 # async context and crashes the whole dispatch cycle.
-                _active_light_cols = load_only(*ACTIVE_TASKS_LIGHT_COLUMNS)
+                _active_light_cols = load_only(*ACTIVE_TASKS_LIGHT_COLUMNS, raiseload=True)
                 active_tasks_result = (
                     (
                         await session.execute(
@@ -1909,7 +1915,9 @@ async def orchestrator_worker():
                 # pinned slots_available at 0 with 0 active tasks — total dispatch
                 # freeze). Gated on the pool being enabled, same as idle_pool_count.
                 orphaned_leased_count = (
-                    await count_orphaned_leased_pool_vms(session) if _pool_enabled else 0
+                    await count_orphaned_leased_pool_vms(session)
+                    if _pool_enabled
+                    else 0
                 )
                 gcp_dispatch_vms = max(
                     0, actual_vm_count - idle_pool_count - orphaned_leased_count
@@ -2300,7 +2308,7 @@ async def orchestrator_worker():
                     # downstream access a sync lazy-load from async context →
                     # MissingGreenlet that crashes the whole dispatch cycle. See the
                     # constant's docstring and reference_load_only_event_listeners.md.
-                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS))
+                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS, raiseload=True))
                     .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
                 )
                 candidate_tasks = (
@@ -2718,7 +2726,7 @@ async def orchestrator_worker():
                                     Task.status == TaskStatus.BLOCKED,
                                     Task.blocker_kind == "file_conflict",
                                 )
-                                .options(load_only(*BLOCKED_CONFLICT_LIGHT_COLUMNS))
+                                .options(load_only(*BLOCKED_CONFLICT_LIGHT_COLUMNS, raiseload=True))
                             )
                         )
                         .scalars()
@@ -2936,7 +2944,8 @@ async def orchestrator_worker():
                                 Task.payloads,
                                 Task.status_log,
                                 Task.latest_status_message,
-                                Task.parent_task_id,  # see candidate_stmt comment above
+                                Task.parent_task_id,  # see candidate_stmt comment above,
+                                raiseload=True
                             )
                         )
                     )
@@ -5964,26 +5973,68 @@ async def orchestrator_worker():
                                             )
                                             _unverified_merge_reason = "kill_switch_off"
                                         else:
-                                            _ci_reason = (
-                                                "the project declares no CI "
-                                                "(requires_ci_checks=False) and no "
-                                                "test command is detectable — merging "
-                                                "UNVERIFIED"
+                                            # Before taking the unverified
+                                            # immediate-pass, attempt a bounded
+                                            # re-detection. A heuristic miss at
+                                            # onboarding time must not permanently
+                                            # disable the gate for this repo.
+                                            from app.build_config_detection import (
+                                                maybe_redetect_missing_test_command,
                                             )
-                                            _unverified_merge_reason = (
-                                                "no_detectable_test_command"
+
+                                            _redetected = await maybe_redetect_missing_test_command(
+                                                _ci_proj,
+                                                session,
+                                                ref=_ci_base_ref,
                                             )
-                                        logger.info(
-                                            f"[CI] PR #{ci_pr_number} has 0 check-runs and "
-                                            f"{_ci_reason} — treating as passed so the "
-                                            f"merge can proceed"
-                                        )
-                                        ci_result = {
-                                            "status": "completed",
-                                            "conclusion": "success",
-                                            "details": _resolved.get("details", []),
-                                            "failed_logs": "",
-                                        }
+                                            if (
+                                                _redetected
+                                                and ci_resolution.should_run_no_ci_test_gate(
+                                                    _ci_proj,
+                                                    _ci_base_ref,
+                                                    gate_enabled=_gate_on,
+                                                )
+                                            ):
+                                                _no_ci_verify_gate = True
+                                                _no_ci_verify_base = _ci_base_ref
+                                                logger.info(
+                                                    f"[CI] PR #{ci_pr_number} has 0 "
+                                                    f"check-runs — re-detection found "
+                                                    f"a test command for external "
+                                                    f"no-CI repo; gating on "
+                                                    f"verify_tests instead of merging "
+                                                    f"UNVERIFIED"
+                                                )
+                                                ci_result = {
+                                                    "status": "pending",
+                                                    "conclusion": None,
+                                                    "details": _resolved.get(
+                                                        "details", []
+                                                    ),
+                                                    "failed_logs": "",
+                                                }
+                                            else:
+                                                _ci_reason = (
+                                                    "the project declares no CI "
+                                                    "(requires_ci_checks=False) and no "
+                                                    "test command is detectable — merging "
+                                                    "UNVERIFIED"
+                                                )
+                                                _unverified_merge_reason = (
+                                                    "no_detectable_test_command"
+                                                )
+                                        if not _no_ci_verify_gate:
+                                            logger.info(
+                                                f"[CI] PR #{ci_pr_number} has 0 check-runs and "
+                                                f"{_ci_reason} — treating as passed so the "
+                                                f"merge can proceed"
+                                            )
+                                            ci_result = {
+                                                "status": "completed",
+                                                "conclusion": "success",
+                                                "details": _resolved.get("details", []),
+                                                "failed_logs": "",
+                                            }
                                 else:
                                     ci_result = {
                                         "status": "pending",

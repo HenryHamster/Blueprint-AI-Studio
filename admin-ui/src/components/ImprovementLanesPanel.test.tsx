@@ -273,6 +273,40 @@ describe('ImprovementLanesPanel', () => {
     expect(expiredSpan).toBeTruthy();
   });
 
+  test('shows expired reservation in amber when expiry is in the past', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    // lane-1 has reservation_expires_at: '2026-06-11T12:00:00Z' which is in the past
+    const expiry = rows[0].querySelector('[data-testid="reservation-expiry"]');
+    expect(expiry).toBeTruthy();
+    expect(expiry?.textContent).toMatch(/^Expired /);
+    expect(expiry?.className).toContain('amber');
+  });
+
+  test('shows live reservation in neutral styling when expiry is in the future', async () => {
+    const futureExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const responseWithFutureReservation = {
+      ...LANE_RESPONSE,
+      lanes: [
+        { ...LANE_RESPONSE.lanes[0], reservation_expires_at: futureExpiry },
+        LANE_RESPONSE.lanes[1],
+      ],
+    };
+    fetchImprovementLanes.mockResolvedValueOnce(responseWithFutureReservation);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    const expiry = rows[0].querySelector('[data-testid="reservation-expiry"]');
+    expect(expiry).toBeTruthy();
+    expect(expiry?.textContent).toMatch(/^Expires /);
+    expect(expiry?.className).toContain('neutral');
+    expect(expiry?.className).not.toContain('amber');
+  });
+
   test('renders cold lane reservation breakdown without failure styling when all counts are zero', async () => {
     fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
 
@@ -333,5 +367,45 @@ describe('ImprovementLanesPanel', () => {
     // KILLED — red failure look
     expect(badges[4]?.className).toContain('text-red-300');
     expect(badges[4]?.textContent).toBe('KILLED');
+  });
+
+  test('shows preflight error indicator when preflight fetch fails', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchLanePilotPreflight.mockRejectedValueOnce(new Error('Network error'));
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    expect(await screen.findByText('Preflight data unavailable')).toBeTruthy();
+    expect(screen.queryByTestId('lane-pilot-preflight')).toBeNull();
+  });
+
+  test('does not show error indicator when preflight returns null (no pilot configured)', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchLanePilotPreflight.mockResolvedValueOnce(null);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    expect(screen.queryByText('Preflight data unavailable')).toBeNull();
+    expect(screen.queryByTestId('lane-pilot-preflight')).toBeNull();
+  });
+
+  test('shows preflight widget when preflight data is available', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchLanePilotPreflight.mockResolvedValueOnce({
+      ready: true,
+      pilot_mode: 'on',
+      durable_verdict: 'MAINTAIN',
+      checks: [
+        { name: 'project_ready', met: true, blocking_value: null, fix_hint: null },
+        { name: 'seed_approved', met: true, blocking_value: null, fix_hint: null },
+      ],
+    });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    expect(await screen.findByTestId('lane-pilot-preflight')).toBeTruthy();
+    expect(screen.getByText('Pilot ready to enable')).toBeTruthy();
+    expect(screen.queryByText('Preflight data unavailable')).toBeNull();
   });
 });

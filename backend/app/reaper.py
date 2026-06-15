@@ -85,9 +85,7 @@ from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 logger = logging.getLogger(__name__)
 
 
-def _normalize_reaper_retry_failure_class(
-    failure_class: str, context: object
-) -> str:
+def _normalize_reaper_retry_failure_class(failure_class: str, context: object) -> str:
     """Match clone retry classification for raw lowercase scope-overflow labels."""
     if failure_class != "CODE_ERROR" or not isinstance(context, dict):
         return failure_class
@@ -1196,7 +1194,7 @@ async def reaper_service():
                             Task.previous_error_fingerprint,
                             Task.requeue_in_flight,
                             Task.description,
-                        )
+                        raiseload=True,)
                     )
                     .where(
                         Task.status.in_(
@@ -2292,8 +2290,17 @@ async def reaper_service():
                             da_ctx.pop("_slot_released", None)
                             task.retry_after_until = None
                             da_ctx.pop("provision_failures", None)
+                            # Clear the stale DEAD_AUTH verdict and matched pattern so
+                            # the next attempt is classified fresh for its own provider.
+                            # Without this, the short-circuit in _classify_failure_class
+                            # (task.context["failure_class"]) fires on the new attempt and
+                            # disables whatever account that attempt runs on — including
+                            # accounts from a different provider — with the stale pattern
+                            # as the reason. (Incident 2026-06-14: Codex dead-auth
+                            # disabled all Anthropic accounts via this leak.)
+                            da_ctx.pop("failure_class", None)
+                            da_ctx.pop("dead_auth_matched_pattern", None)
                             task.context = da_ctx
-                            persist_authoritative_verdict(task, DEAD_AUTH)
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
@@ -3581,6 +3588,28 @@ async def reaper_service():
                                 f"closing would discard the rollup body"
                             )
                             continue
+                        # Infra-recovery guard: do NOT close PRs for fix tasks that
+                        # failed due to transient infrastructure (AGENT_TIMEOUT, VM
+                        # preemption, etc.) while the review-loop still has iteration
+                        # budget.  The code on the PR is valid — the agent may never
+                        # have run.  Leave the PR open so the eval-sweep reaped-owner
+                        # reconcile (recovery_evaluating.py) or the resurrection sweep
+                        # can re-drive the chain.  Only close for genuine merit/code
+                        # failures or when iteration budget is truly exhausted.
+                        # Sibling chokepoints that are failure-class-blind (rollup-wait
+                        # gate in rollup_management.py ~2031, _resolve_terminal_parent_
+                        # verdict in task_lifecycle_requeue.py, review cap handler) are
+                        # tracked as follow-up work — they require broader DB queries
+                        # and separate review to fix safely.
+                        from app.failure_classification import is_recoverable_infra_terminal
+
+                        if is_recoverable_infra_terminal(task):
+                            logger.info(
+                                f"[PIPELINE] Preserving PR #{pr_number} for infra-reaped "
+                                f"fix task {task.id} — review-loop budget remains, "
+                                f"skipping close so eval-sweep can re-drive the chain"
+                            )
+                            continue
                         try:
                             from app.routers.agent import get_github_token_for_task
                             from app.github import close_pull_request, create_pr_comment
@@ -3676,7 +3705,7 @@ async def reaper_service():
                                         Task.status_log,
                                         Task.attempt_count,
                                         Task.created_at,
-                                    )
+                                    raiseload=True,)
                                 )
                                 .where(
                                     Task.status == TaskStatus.EVALUATING,
@@ -3720,7 +3749,7 @@ async def reaper_service():
                                             Task.status_log,
                                             Task.latest_status_message,
                                             Task.payloads,
-                                        )
+                                        raiseload=True,)
                                     )
                                     .where(Task.parent_task_id.in_(_parent_ids))
                                 )
@@ -4237,6 +4266,26 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Duplicate-foundation convergence sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 16b: Structural-health audit — recurring resource/scalability
+                # sweep that detects unbounded JSONB fat-row growth in task.context
+                # (the structural class that caused a Postgres saturation outage) via
+                # a BOUNDED DB-side byte-size aggregate, and enrolls a deduped finding
+                # into the existing evergreen ledger. Mode- and cadence-gated; INERT
+                # until an operator flips structural_health_audit_mode off→observe/
+                # enforce. Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    from app.structural_health_audit import run_structural_health_audit
+
+                    await run_structural_health_audit(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Structural-health audit sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

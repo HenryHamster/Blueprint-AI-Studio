@@ -131,7 +131,7 @@ async def _compute_sr_catch_rate_trends_impl(
                             Task.project_id,
                             Task.strategic_cycle_id,
                             Task.payloads,
-                        )
+                        raiseload=True,)
                     )
                     .where(*cycle_where)
                 )

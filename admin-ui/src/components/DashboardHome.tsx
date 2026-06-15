@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { apiFetch, fetchTask, fetchFleetUtilization, fetchAgentServingShas, type AgentServingShasResponse, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse, type SrReviewerDisagreementsEnvelope } from '../api';
+import { timeAgo } from '../utils/time';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
@@ -644,7 +645,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
           className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs"
         >
           <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-          <span>Digest data may be stale — last fetch failed, showing cached values</span>
+          <span>
+            Digest data may be stale
+            {digest?.generated_at ? ` — last successful computation ${timeAgo(digest.generated_at)}` : ''}
+          </span>
         </div>
       )}
       {/* Header row with time window selector */}
@@ -710,6 +714,15 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
           {/* Section 1: Task Status Overview */}
           <section>
             <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Task Status</h2>
+            {!loading && digest?.tasks_truncated && (
+              <div
+                data-testid="tasks-truncated-banner"
+                className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs mb-2"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>Metrics reflect a partial view — task window exceeded 5 000 rows</span>
+              </div>
+            )}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
               <MetricCard label="Active" value={activeCount} color="emerald" spark={sparkData} dataKey="active" loading={loading} />
               <MetricCard label="Queued" value={queuedCount} color="blue" spark={sparkData} dataKey="queued" loading={loading} />

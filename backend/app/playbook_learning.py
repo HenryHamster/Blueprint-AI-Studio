@@ -611,7 +611,7 @@ async def check_fix_loop_divergence_regression(
                     Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
                     Task.created_at >= now - timedelta(days=14),
                 )
-                .options(load_only(Task.id, Task.fix_loop_history, Task.created_at))
+                .options(load_only(Task.id, Task.fix_loop_history, Task.created_at, raiseload=True))
             )
         )
         .scalars()

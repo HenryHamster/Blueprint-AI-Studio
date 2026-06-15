@@ -15,7 +15,7 @@ import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
   recordLlmTokens, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
-import { writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
+import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper } from '../prompt.js';
 
 export type ProviderName = 'anthropic' | 'openai' | 'gemini';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
@@ -763,6 +763,7 @@ echo ""
   if (taskId) {
     try { writePlaybookHelper(taskId, workspace); } catch { /* best effort */ }
     try { writeMessagesHelper(taskId, workspace); } catch { /* best effort */ }
+    try { writeSymbolsHelper(taskId, workspace); } catch { /* best effort */ }
   }
 }
 
@@ -890,6 +891,22 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       detached: true,
       stdio: [runCommand.promptInput === 'stdin' ? 'pipe' : (promptFd ?? 'ignore'), 'pipe', 'pipe'],
     });
+
+    // Validate stdio BEFORE registering the PID or arming any watchdog timers.
+    // With stdio:'pipe' this should never be null, but guard defensively: if
+    // either stream is absent the child is already running detached and we must
+    // kill its process group, clean up the fd, and bail without leaking anything.
+    if (!child.stdout || !child.stderr) {
+      const spawnedPid = child.pid;
+      if (typeof spawnedPid === 'number') {
+        try { process.kill(-spawnedPid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      if (promptFd !== undefined) fs.closeSync(promptFd);
+      sendLog(ws, '[runtime] spawn returned no stdio streams — aborting run\n');
+      resolve(1);
+      return;
+    }
+
     recordLlmCallStart();
     if (typeof child.pid === 'number') {
       registerChildPid(child.pid);
@@ -912,6 +929,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       && child.pid === originalPid
       && child.exitCode === null
       && child.signalCode === null;
+    const setForceKillTimer = (callback: () => void): void => {
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      forceKillTimer = setTimeout(callback, PROCESS_KILL_GRACE_MS);
+    };
     const resetStallWatchdog = () => {
       if (stallWatchdog) clearTimeout(stallWatchdog);
       stallWatchdog = setTimeout(() => {
@@ -920,10 +941,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         const pid = originalPid;
         if (pid !== undefined) {
           try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-          forceKillTimer = setTimeout(() => {
+          setForceKillTimer(() => {
             if (!processGroupStillOwned()) return;
             try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-          }, PROCESS_KILL_GRACE_MS);
+          });
         }
       }, CLAUDE_STREAM_STALL_MS);
     };
@@ -935,10 +956,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       const pid = originalPid;
       if (pid !== undefined && processGroupStillOwned()) {
         try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-        forceKillTimer = setTimeout(() => {
+        setForceKillTimer(() => {
           if (!processGroupStillOwned()) return;
           try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-        }, PROCESS_KILL_GRACE_MS);
+        });
       }
     }, timeoutMs);
 
@@ -967,10 +988,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         const pid = originalPid;
         if (pid !== undefined) {
           try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-          forceKillTimer = setTimeout(() => {
+          setForceKillTimer(() => {
             if (!processGroupStillOwned()) return;
             try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-          }, PROCESS_KILL_GRACE_MS);
+          });
         }
       }
     }, 60_000);
@@ -1030,10 +1051,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         const pid = originalPid;
         if (pid !== undefined) {
           try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-          forceKillTimer = setTimeout(() => {
+          setForceKillTimer(() => {
             if (!processGroupStillOwned()) return;
             try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-          }, PROCESS_KILL_GRACE_MS);
+          });
         }
       }
     }, 60_000);
@@ -1060,16 +1081,12 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         const pid = originalPid;
         if (pid !== undefined) {
           try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-          forceKillTimer = setTimeout(() => {
+          setForceKillTimer(() => {
             if (!processGroupStillOwned()) return;
             try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-          }, PROCESS_KILL_GRACE_MS);
+          });
         }
       }, 60_000);
-    }
-
-    if (!child.stdout || !child.stderr) {
-      throw new Error('spawn returned no stdio streams');
     }
 
     const pendingJsonChunks: string[] = [];
@@ -1215,10 +1232,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                   const pid = originalPid;
                   if (pid !== undefined) {
                     try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-                    forceKillTimer = setTimeout(() => {
+                    setForceKillTimer(() => {
                       if (!processGroupStillOwned()) return;
                       try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-                    }, PROCESS_KILL_GRACE_MS);
+                    });
                   }
                 }, CLAUDE_RESULT_GRACE_MS);
               }

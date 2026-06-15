@@ -91,7 +91,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0273"
+EXPECTED_SCHEMA_REVISION = "0277"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1235,6 +1235,55 @@ async def get_viewport_failure_screenshot_download_url(
     except StorageUriError as exc:
         # Reconstructed path failed validation — a client/config error, not an
         # outage. Surface as 400 without echoing the object path back.
+        logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid screenshot reference")
+    except Exception as exc:
+        logger.warning(
+            "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(status_code=503, detail="Artifact storage unavailable")
+    return {"url": url}
+
+
+@app.get("/api/admin/viewport-shots/download-url")
+async def get_viewport_screenshot_download_url(
+    project_id: uuid.UUID,
+    task_id: uuid.UUID,
+    name: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Generate a 1-hour signed download URL for a task-scoped viewport screenshot.
+
+    The GCS object path is reconstructed to exactly mirror what the agent uploads via
+    POST /api/agent/viewport/screenshot-upload-url
+    (viewport-shots/{project_id}/{task_id}/{name}.png), so the PR renderer can display
+    the screenshot by passing the stored context name directly.  The name is sanitized
+    with the same rule the upload endpoint applies so the two paths always agree.
+    """
+    import re as _re
+
+    from app.storage import (
+        ARTIFACT_BUCKET_NAME,
+        StorageUriError,
+        generate_download_signed_url,
+    )
+
+    await _get_user_project(project_id, current_user["user_id"], session)
+
+    _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
+    # The `name` param is the stored entry_name: "{sanitize(component)[:100]}-{width}-{phase}".
+    # Truncating the full string to 100 chars would cut the -width-phase suffix for long
+    # component names.  Sanitize the characters but do not re-truncate, since the value
+    # was already bounded and sanitized by the upload endpoint.
+    safe_name = _SAFE_NAME_RE.sub("_", name)
+
+    object_name = f"viewport-shots/{project_id}/{task_id}/{safe_name}.png"
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    try:
+        url = await generate_download_signed_url(storage_uri, expiration_minutes=60)
+    except StorageUriError as exc:
         logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
         raise HTTPException(status_code=400, detail="Invalid screenshot reference")
     except Exception as exc:

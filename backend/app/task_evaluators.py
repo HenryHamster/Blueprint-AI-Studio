@@ -125,9 +125,7 @@ SAFEGUARD_OBSERVE_VERDICT_KEY = "safeguard_observe_verdict"
 CHALLENGE_BOUNDARY_REPRODUCE_ABSENT = "reproduce_absent"
 CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY = "low_actionability_decay"
 # Reserved: an indeterminate reproduce verdict that would dispatch unverified.
-CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH = (
-    "reproduce_indeterminate_dispatch"
-)
+CHALLENGE_BOUNDARY_REPRODUCE_INDETERMINATE_DISPATCH = "reproduce_indeterminate_dispatch"
 
 _CHALLENGE_BOUNDARIES: frozenset[str] = frozenset(
     {
@@ -596,7 +594,9 @@ class ArtifactDeliveryStrategy:
                     f"{criterion['operator']} {criterion['threshold']})"
                 )
             elif criterion["measurable"]:
-                reason += f"; success criterion unmet ({_format_unmet_criterion(criterion)})"
+                reason += (
+                    f"; success criterion unmet ({_format_unmet_criterion(criterion)})"
+                )
             else:
                 reason += (
                     "; success criterion not reported "
@@ -615,7 +615,9 @@ class StructuredVerdictStrategy:
         text = (artifact_text or "").strip()
         if not text:
             return EvaluationVerdict(
-                False, "empty terminal artifact — no structured verdict produced", self.key
+                False,
+                "empty terminal artifact — no structured verdict produced",
+                self.key,
             )
 
         from app.task_completion import _parse_panel_review_output
@@ -668,7 +670,9 @@ def resolve_evaluation_strategy(task_type: str | None) -> EvaluationStrategy:
     return strategy
 
 
-def evaluate_terminal_output(task: Task, artifact_text: str | None) -> EvaluationVerdict:
+def evaluate_terminal_output(
+    task: Task, artifact_text: str | None
+) -> EvaluationVerdict:
     """Resolve ``task``'s strategy from the registry and run the gate on its output."""
     strategy = resolve_evaluation_strategy(_task_type_of(task))
     return strategy.evaluate(task, artifact_text)
@@ -1132,11 +1136,18 @@ def parse_adversarial_finding_verdicts(
     from app.task_completion import _extract_last_json_array
 
     text = logs.strip()
+    # Try extraction with different required-key combinations to support:
+    # - hash+verdict (original: finding identified by hash)
+    # - index+verdict (new: finding identified by 1-based ordinal)
+    # - verdict alone (fallback: position-only binding)
     json_str = _extract_last_json_array(text, "hash", "verdict")
     if not json_str:
+        json_str = _extract_last_json_array(text, "index", "verdict")
+    if not json_str:
+        json_str = _extract_last_json_array(text, "verdict")
+    if not json_str:
         return {
-            h: _default_entry(ADVERSARIAL_PARSE_NO_JSON_ARRAY)
-            for h in finding_hashes
+            h: _default_entry(ADVERSARIAL_PARSE_NO_JSON_ARRAY) for h in finding_hashes
         }, ADVERSARIAL_PARSE_NO_JSON_ARRAY
 
     try:
@@ -1461,9 +1472,7 @@ async def spawn_safeguard_challenge(
 
     challenge = Task(
         project_id=safeguard_task.project_id,
-        title=(
-            f"[CHALLENGE] safeguard gate for {str(safeguard_task.id)[:8]}"
-        ),
+        title=(f"[CHALLENGE] safeguard gate for {str(safeguard_task.id)[:8]}"),
         description=(
             "Independent challenge of a safeguard security-audit finding before "
             "the merge gate is maintained."
@@ -1539,6 +1548,36 @@ def _extract_verdict_object(text: str) -> dict | None:
     return None
 
 
+def _extract_last_verdict_object(text: str) -> dict | None:
+    """Find the LAST balanced JSON object containing a ``verdict`` key.
+
+    Challenge sidecar output often begins with an echoed schema example before
+    the agent's real answer. Scanning to the last verdict object ensures the
+    actual final verdict is used rather than an early schema fragment.
+    """
+    last: dict | None = None
+    idx = text.find("{")
+    while idx != -1:
+        depth = 0
+        for j in range(idx, len(text)):
+            c = text[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[idx : j + 1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict) and "verdict" in obj:
+                            last = obj
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    break
+        idx = text.find("{", idx + 1)
+    return last
+
+
 def parse_grader_verdict(logs: str | None, completed: bool = True) -> EvaluationVerdict:
     """Parse an independent grader's pass/fail verdict from its output.
 
@@ -1592,10 +1631,7 @@ def parse_grader_verdict(logs: str | None, completed: bool = True) -> Evaluation
     )
 
 
-
-def parse_safeguard_challenge_outcome(
-    logs: str | None, completed: bool = True
-) -> dict:
+def parse_safeguard_challenge_outcome(logs: str | None, completed: bool = True) -> dict:
     """Parse an independent safeguard-challenge outcome from its output.
 
     Returns a dict with keys ``outcome`` and ``reasoning``.  FAIL-CLOSED on
@@ -1603,7 +1639,10 @@ def parse_safeguard_challenge_outcome(
     or produced unparseable output yields ``outcome="confirmed"`` so the gate
     is maintained rather than accidentally released on a bad response.
     """
-    _fail_closed = {"outcome": "confirmed", "reasoning": "challenge did not resolve; gate maintained"}
+    _fail_closed = {
+        "outcome": "confirmed",
+        "reasoning": "challenge did not resolve; gate maintained",
+    }
 
     if not completed:
         return _fail_closed
@@ -1680,6 +1719,7 @@ class FindingChallengeRecord:
     schema_version: int = FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
     source_task_id: str | None = None
     produced_by: str = "challenge_sidecar"
+    finding_hash: str | None = None
 
     def to_context(self) -> dict[str, Any]:
         """Plain-dict form for stamping under ``FINDING_CHALLENGE_VERDICT_KEY``."""
@@ -1693,6 +1733,7 @@ class FindingChallengeRecord:
             "schema_version": self.schema_version,
             "source_task_id": self.source_task_id,
             "produced_by": self.produced_by,
+            "finding_hash": self.finding_hash,
         }
 
 
@@ -1796,6 +1837,7 @@ async def spawn_finding_challenge(
     session: AsyncSession,
     *,
     question: str | None = None,
+    finding_hash: str | None = None,
 ) -> Task | None:
     """Spawn a single read-only challenge side-car and park the source EVALUATING.
 
@@ -1856,6 +1898,7 @@ async def spawn_finding_challenge(
             "scope": "small",
             "challenged_boundary": boundary,
             "challenged_first_verdict": first_verdict,
+            **({"challenged_finding_hash": finding_hash} if finding_hash else {}),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -1904,6 +1947,7 @@ def parse_finding_challenge_verdict(
     completed: bool = True,
     *,
     source_task_id: str | None = None,
+    finding_hash: str | None = None,
 ) -> FindingChallengeRecord:
     """Parse a challenge side-car's second opinion into a FindingChallengeRecord.
 
@@ -1925,6 +1969,7 @@ def parse_finding_challenge_verdict(
             reason="challenge side-car did not complete; verdict unchallenged",
             sidecar_task_id=sidecar_task_id,
             source_task_id=source_task_id,
+            finding_hash=finding_hash,
         )
 
     text = (logs or "").strip()
@@ -1937,9 +1982,10 @@ def parse_finding_challenge_verdict(
             reason="challenge side-car produced no output",
             sidecar_task_id=sidecar_task_id,
             source_task_id=source_task_id,
+            finding_hash=finding_hash,
         )
 
-    obj = _extract_verdict_object(text)
+    obj = _extract_last_verdict_object(text)
     if obj is None:
         return FindingChallengeRecord(
             challenged_boundary=boundary,
@@ -1949,12 +1995,17 @@ def parse_finding_challenge_verdict(
             reason="challenge verdict unparseable; failing closed",
             sidecar_task_id=sidecar_task_id,
             source_task_id=source_task_id,
+            finding_hash=finding_hash,
         )
 
     second = str(obj.get("verdict") or "").strip()
     reason = str(obj.get("reasoning") or obj.get("reason") or "")[:480]
     agreement = str(obj.get("agreement") or "").strip().lower()
-    if agreement not in (CHALLENGE_AGREES, CHALLENGE_DISAGREES, CHALLENGE_INDETERMINATE):
+    if agreement not in (
+        CHALLENGE_AGREES,
+        CHALLENGE_DISAGREES,
+        CHALLENGE_INDETERMINATE,
+    ):
         agreement = CHALLENGE_INDETERMINATE
         if not reason:
             reason = "challenge omitted a recognized agreement; failing closed"
@@ -1966,4 +2017,5 @@ def parse_finding_challenge_verdict(
         reason=reason or f"second opinion {agreement} with the {boundary} verdict",
         sidecar_task_id=sidecar_task_id,
         source_task_id=source_task_id,
+        finding_hash=finding_hash,
     )

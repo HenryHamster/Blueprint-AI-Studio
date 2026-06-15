@@ -44,13 +44,16 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-// /tmp scratch-file names mirror agent/src/index.ts ~line 2809 (the
-// shutdown cleanup loop). Keep them in sync if either list grows.
-const TMP_OUTPUT_NAMES = [
+// /tmp scratch-file names for all per-task handler outputs.
+// This is the single source of truth — both resetForNextRole (below) and
+// the role-loop finally block in index.ts import this constant so the two
+// cleanup paths can never diverge.
+//
+// panel_review writes one scratch file per declared lens
+// (panelReviewLensOutputType in handlers/panel-review.ts → PANEL_REVIEW_LENSES);
+// keep those in sync with that lens set.
+export const TMP_OUTPUT_NAMES = [
   'review_verdict',
-  // panel_review writes one scratch file per declared lens
-  // (panelReviewLensOutputType in handlers/panel-review.ts → PANEL_REVIEW_LENSES);
-  // keep these in sync with that lens set.
   'panel_review_lens_correctness',
   'panel_review_lens_security',
   'panel_review_lens_code_quality',
@@ -59,11 +62,20 @@ const TMP_OUTPUT_NAMES = [
   'research_findings',
   'security_findings',
   'smoketest_result',
-  'debug_output',
-  'perf_output',
+  'verify_tests_result',
+  'debug_report',
+  'perf_report',
   'investigation_report',
   'strategic_output',
-  'design_doc_output',
+  'design_document',
+  'bootstrap_overview',
+  'command_memory',
+  'web_research_document',
+  'release_audit_report',
+  'release_audit_challenge',
+  'self_audit_findings',
+  'self_review',
+  'symbols',
 ];
 
 export interface ResetOptions {

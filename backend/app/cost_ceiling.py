@@ -54,7 +54,7 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                     Task.vm_machine_type,
                     Task.vm_runtime_cost_banked_db,
                     Task.context,
-                )
+                raiseload=True,)
             )
             .where(
                 Task.project_id == task.project_id,
@@ -189,7 +189,7 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                             Task.id,
                             Task.context,
                             Task.latest_status_message,
-                        )
+                        raiseload=True,)
                     )
                     .where(
                         Task.project_id == task.project_id,

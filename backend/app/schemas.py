@@ -484,9 +484,7 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
 
     data = ComputeJobResponse.model_validate(job).model_dump(mode="json")
     if data.get("compute_rpc_diagnostic") is None:
-        diagnostic = (data.get("polling_metadata") or {}).get(
-            "compute_rpc_diagnostic"
-        )
+        diagnostic = (data.get("polling_metadata") or {}).get("compute_rpc_diagnostic")
         if isinstance(diagnostic, dict):
             data["compute_rpc_diagnostic"] = diagnostic
     return data
@@ -911,6 +909,18 @@ class BuildConfig(BaseModel):
     bootstrap_overview_refreshed_at: str | None = None
     bootstrap_overview_source_branch: str | None = None
     bootstrap_overview_source_revision: str | None = None
+    # Durable onboarding-proof milestone timestamps stamped idempotently by
+    # recording sites (autonomous_research, agent_github, ci_resolution,
+    # landed_signal).  None means the milestone has not yet occurred.  Preserved
+    # through detect/save/PATCH round-trips so a re-detect never erases evidence.
+    first_task_spawned_at: str | None = None
+    first_pr_opened_at: str | None = None
+    first_merge_gate_verdict_at: str | None = None
+    # Truthful gate-verdict sub-fields: executed_tests is NEVER True when the
+    # gate fell open unverified; unverified_reason carries the fall-open key.
+    first_merge_gate_executed_tests: bool | None = None
+    first_merge_gate_unverified_reason: str | None = None
+    first_pr_merged_at: str | None = None
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"

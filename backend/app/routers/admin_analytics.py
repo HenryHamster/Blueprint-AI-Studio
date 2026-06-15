@@ -42,7 +42,10 @@ from app.review_heuristics import (
     LANE_REVIEW_CONVERGENCE,
     classify_iteration_lane,
 )
-from app.digest_metrics import compute_lane_waste_diagnostics
+from app.digest_metrics import (
+    compute_lane_baseline_trend,
+    compute_lane_waste_diagnostics,
+)
 from app.routers.admin_pipeline_observability import (
     _load_escalation_alerts,
     _load_outer_loop_original_tasks,
@@ -286,7 +289,7 @@ async def get_direction_auto_pause_stats(
             (
                 await session.execute(
                     select(Project)
-                    .options(load_only(Project.id, Project.directions, Project.status))
+                    .options(load_only(Project.id, Project.directions, Project.status, raiseload=True))
                     .limit(500)
                 )
             )
@@ -299,7 +302,7 @@ async def get_direction_auto_pause_stats(
             await session.execute(
                 select(ProjectMessage)
                 .where(*msg_filters)
-                .options(load_only(ProjectMessage.context, ProjectMessage.created_at))
+                .options(load_only(ProjectMessage.context, ProjectMessage.created_at, raiseload=True))
                 .order_by(ProjectMessage.created_at.desc())
                 .limit(10_000)
             )
@@ -505,7 +508,7 @@ async def get_task_cost_breakdown(
                         Task.vm_stopped_at,
                         Task.vm_spot,
                         Task.vm_runtime_cost_banked_db,
-                    )
+                    raiseload=True,)
                 )
                 .where(*filters)
                 .order_by(Task.created_at.desc())
@@ -716,7 +719,7 @@ async def get_lane_diag(
         Task.vm_provisioned_at,
         Task.vm_started_at,
         Task.vm_stopped_at,
-    )
+    raiseload=True,)
 
     # Legacy surface query: COMPLETED-only, original form — the legacy aggregates
     # (lane_iteration_distribution, per_pr_phase_breakdown, task_count, pr_count,
@@ -822,6 +825,11 @@ async def get_lane_diag(
         chain_limit=pr_breakdown_limit,
         escalation_alerts=alerts,
     )
+    from app.lane_baseline_snapshot import _compute_checkpoint_recovery_waste  # noqa: PLC0415
+
+    diag["checkpoint_recovery_waste"] = _compute_checkpoint_recovery_waste(
+        list(all_terminal_tasks)
+    )
     extra: dict = {
         "project_id": str(project_id) if project_id else None,
         "window_start": cutoff.isoformat(),
@@ -903,7 +911,7 @@ async def get_task_duration_stats(
                             Task.vm_provisioned_at,
                             Task.vm_started_at,
                             Task.vm_stopped_at,
-                        )
+                        raiseload=True,)
                     )
                     .where(*filters)
                     .limit(10000)
@@ -1286,7 +1294,7 @@ async def get_open_prs(
                         Task.title,
                         Task.payloads,
                         Task.created_at,
-                    )
+                    raiseload=True,)
                 )
                 .where(
                     Task.project_id == project_id,
@@ -1513,6 +1521,90 @@ async def get_improvement_lanes(
     }
 
 
+@router.get("/visual-pilot-status")
+async def get_visual_pilot_status(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return visual-verification pilot kill-criterion aggregates for a project."""
+    from app.visual_verification_audit import aggregate_visual_pilot  # noqa: PLC0415
+
+    exists = (
+        await session.execute(select(Project.id).where(Project.id == project_id))
+    ).scalar_one_or_none()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.context,
+                        Task.created_at,
+                        Task.title,
+                    raiseload=True,)
+                )
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(300)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    task_dicts = [
+        {
+            "id": str(task.id),
+            "status": task.status.value
+            if hasattr(task.status, "value")
+            else task.status,
+            "context": task.context or {},
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+            "title": task.title or "",
+        }
+        for task in tasks
+    ]
+
+    agg = aggregate_visual_pilot(task_dicts)
+
+    return {
+        "project_id": str(project_id),
+        "admin_task_count": agg.admin_task_count,
+        "entry_count": agg.entry_count,
+        "malformed_count": agg.malformed_count,
+        "pairs_inspected": agg.pairs_inspected,
+        "pairs_changed": agg.pairs_changed,
+        "infra_total": agg.infra_total,
+        "infra_rate": round(agg.infra_rate, 4),
+        "days_elapsed": agg.days_elapsed,
+        "caught_count": len(agg.caught),
+        "caught": [
+            {
+                "task_id": t.get("id"),
+                "task_title": t.get("title", ""),
+                "note": e.get("note"),
+                "created_at": t.get("created_at"),
+            }
+            for t, e in agg.caught
+        ],
+        "thresholds": {
+            "target_admin_tasks": 25,
+            "target_days": 42,
+            "early_pause_infra_rate": 0.50,
+        },
+        "generated_at": _utcnow().isoformat(),
+    }
+
+
 @router.get("/lane-baselines")
 async def get_lane_baselines(
     project_id: uuid.UUID = Query(...),
@@ -1561,10 +1653,12 @@ async def get_lane_baselines(
         reverse=True,
     )
 
+    baseline_values = [v for _, v in sorted_baselines]
     return {
         "project_id": str(project_id),
         "count": len(sorted_baselines),
-        "baselines": [v for _, v in sorted_baselines],
+        "baselines": baseline_values,
+        "trend": compute_lane_baseline_trend(baseline_values),
     }
 
 

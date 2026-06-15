@@ -912,7 +912,7 @@ function stagedActivatedByCut(staged: StagedDirection[], versionNumber: number):
 // work keeps running against the freshly-opened version.
 function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDirection[] }) {
   const activating = stagedActivatedByCut(staged, cv.version_number);
-  const inFlight = cv.in_flight_task_count ?? 0;
+  const inFlight = cv.in_flight_task_count;
   const qualState: QualificationState | null = cv.qualification_state ?? null;
   const promotionFreshness = formatPromotionFreshnessContext(qualState);
   return (
@@ -938,11 +938,15 @@ function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDir
       ) : (
         <p className="text-neutral-500">No staged directions will activate.</p>
       )}
-      <p className={inFlight > 0 ? 'text-neutral-300' : 'text-neutral-500'}>
-        {inFlight > 0
-          ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will NOT be stopped — they keep running and land against the new version.`
-          : 'No tasks are currently in flight.'}
-      </p>
+      {inFlight == null ? (
+        <p className="text-neutral-500">In-flight task count unavailable.</p>
+      ) : (
+        <p className={inFlight > 0 ? 'text-neutral-300' : 'text-neutral-500'}>
+          {inFlight > 0
+            ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will NOT be stopped — they keep running and land against the new version.`
+            : 'No tasks are currently in flight.'}
+        </p>
+      )}
       {qualState?.state === 'promotion_in_flight' && (
         <p className={promotionFreshness?.toneClassName ?? 'text-emerald-300'}>
           Promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging
@@ -1577,7 +1581,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     <span className="text-[10px] text-neutral-600">as of {timeAgo(cv.last_qualification.finalized_at)}</span>
                   )}
                 </div>
-                {(cv.merged_since_verdict ?? 0) > 0 && (
+                {(cv.merged_since_verdict ?? 0) > 0 && cv.qualification_state?.state !== 'qualifying' && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
                     {cv.merged_since_verdict} task{cv.merged_since_verdict === 1 ? '' : 's'} merged since this verdict — re-qualify for current state
                   </span>

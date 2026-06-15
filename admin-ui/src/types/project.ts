@@ -257,6 +257,17 @@ export interface RepoOverview {
   } | null;
 }
 
+export interface OnboardingProof {
+  repo_added_at?: string | null;
+  bootstrap_completed_at?: string | null;
+  first_task_spawned_at?: string | null;
+  first_pr_opened_at?: string | null;
+  first_merge_gate_verdict_at?: string | null;
+  first_merge_gate_executed_tests?: boolean | null;
+  first_merge_gate_unverified_reason?: string | null;
+  first_pr_merged_at?: string | null;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -300,6 +311,10 @@ export interface Project {
    *  structured summary of the repository (tech stack, layout, first steps).
    *  Present on detail endpoint when a bootstrap has completed. */
   design_doc?: { repo_overview?: RepoOverview } | null;
+  /** Durable onboarding-proof milestone timeline for externally-onboarded repos.
+   *  Present on detail endpoint; absent on list endpoint and self-repo projects.
+   *  All milestone fields are nullable — null means the event has not yet occurred. */
+  onboarding_proof?: OnboardingProof | null;
 }
 
 export interface AutoRemediationConfig {

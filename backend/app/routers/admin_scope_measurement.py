@@ -652,7 +652,8 @@ async def get_scope_baselines(
         .where(*filters)
         .options(
             load_only(
-                Task.id, Task.status, Task.context, Task.created_at, Task.project_id
+                Task.id, Task.status, Task.context, Task.created_at, Task.project_id,
+                raiseload=True
             )
         )
         .order_by(Task.created_at.desc(), Task.id.desc())
@@ -701,7 +702,7 @@ async def get_medium_scope_measurement(
                 Task.created_at,
                 Task.updated_at,
                 Task.title,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc(), Task.id.desc())
         .limit(_MAX_AGGREGATION_SCAN + 1)

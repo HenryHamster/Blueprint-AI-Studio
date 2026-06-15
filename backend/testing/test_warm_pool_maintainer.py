@@ -2866,14 +2866,39 @@ async def _make_lane(
     return lane
 
 
+async def _make_task_with_pr(db_session, project, status, *, pr_number=42):
+    """Create a terminal task carrying PR dispatch context (pr_number, branch,
+    base_branch) so sweep_stranded_lanes can spawn a recovery task for it."""
+    task = Task(
+        project_id=project.id,
+        title="pr fix",
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": pr_number,
+                "branch": f"feature/pr-{pr_number}",
+                "base_branch": "automain",
+                "prompt": "fix it",
+                "original_task_id": "orig-task-id",
+            }
+        ],
+        context={"_review_fix_lane_id": "some-lane-id"},
+        status=status,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
 @pytest.mark.asyncio
 async def test_sweep_reconciles_stranded_active_lane_and_ages_stale_proposed(
     db_session, lanes_on
 ):
     """Acceptance seam: the sweep reconciles an ACTIVE lane whose bound task was
-    cancelled externally (requeue-from-checkpoint -> PARKED, stale binding
-    cleared) AND ages a stale PROPOSED lane to KILLED, while leaving a fresh
-    PROPOSED lane untouched — and a re-run (concurrent tick) is a safe no-op."""
+    cancelled externally (no PR context -> KILLED deterministically) AND ages a
+    stale PROPOSED lane to KILLED, while leaving a fresh PROPOSED lane untouched
+    — and a re-run (concurrent tick) is a safe no-op."""
     project = await _make_project(db_session, name="Strand Recon")
 
     cancelled = await _make_task(db_session, project, TaskStatus.CANCELLED)
@@ -2906,10 +2931,10 @@ async def test_sweep_reconciles_stranded_active_lane_and_ages_stale_proposed(
     assert transitioned == 2, "one stranded ACTIVE + one stale PROPOSED"
 
     await db_session.refresh(active_lane)
-    assert active_lane.status == ImprovementLaneStatus.PARKED.value, (
-        "under-budget stranded lane requeues-from-checkpoint (PARKED)"
+    assert active_lane.status == ImprovementLaneStatus.KILLED.value, (
+        "stranded lane with no PR context is killed deterministically (not parked inert)"
     )
-    assert active_lane.current_task_id is None, "stale task binding must be cleared"
+    assert active_lane.retired_at is not None
     assert active_lane.phase_requeues == 1, "mark_checkpoint_missing bumped the counter"
 
     await db_session.refresh(stale_proposed)
@@ -2958,7 +2983,8 @@ async def test_sweep_kills_stranded_active_lane_when_budget_exhausted(
 @pytest.mark.asyncio
 async def test_sweep_reconciles_vanished_and_unbound_active_lanes(db_session, lanes_on):
     """An ACTIVE lane whose current_task_id points at a deleted Task (vanished),
-    and one with no bound task at all, are both reconciled (PARKED under budget)."""
+    and one with no bound task at all, are both killed deterministically —
+    no dispatch context means no recovery task can be created."""
     project = await _make_project(db_session, name="Strand Vanished")
 
     vanished_lane = await _make_lane(
@@ -2983,7 +3009,7 @@ async def test_sweep_reconciles_vanished_and_unbound_active_lanes(db_session, la
 
     for lane in (vanished_lane, unbound_lane):
         await db_session.refresh(lane)
-        assert lane.status == ImprovementLaneStatus.PARKED.value
+        assert lane.status == ImprovementLaneStatus.KILLED.value
         assert lane.current_task_id is None
 
 
@@ -3111,8 +3137,8 @@ async def test_sweep_idle_pool_vms_invokes_stranded_lane_sweep(
 
     assert spy.call_count == 1, "sweep_idle_pool_vms must invoke sweep_stranded_lanes"
     await db_session.refresh(lane)
-    assert lane.status == ImprovementLaneStatus.PARKED.value, (
-        "the wired sweep actually reconciled the stranded lane"
+    assert lane.status == ImprovementLaneStatus.KILLED.value, (
+        "the wired sweep killed the stranded lane (no PR context for recovery)"
     )
 
 
@@ -3187,12 +3213,13 @@ async def test_sweep_stranded_lane_kill_clears_pool_vm_reservation(
 
 
 @pytest.mark.asyncio
-async def test_sweep_stranded_lane_park_does_not_clear_reservation(
+async def test_sweep_stranded_lane_no_context_kills_and_clears_reservation(
     db_session, lanes_on
 ):
-    """sweep_stranded_lanes does NOT clear PoolVm reservation fields when it
-    PARKs an under-budget stranded lane — the lane is still active/requeuing."""
-    project = await _make_project(db_session, name="Stranded Park Res")
+    """sweep_stranded_lanes kills an under-budget stranded lane that has no PR
+    dispatch context and clears the PoolVm reservation — the lane cannot be
+    recovered without a pr_number so it is terminated deterministically."""
+    project = await _make_project(db_session, name="Stranded No-ctx Res")
     cancelled = await _make_task(db_session, project, TaskStatus.CANCELLED)
     lane = await _make_lane(
         db_session,
@@ -3200,9 +3227,11 @@ async def test_sweep_stranded_lane_park_does_not_clear_reservation(
         status=ImprovementLaneStatus.ACTIVE,
         current_task_id=cancelled.id,
         phase_requeues=0,
-        name="stranded-under-budget",
+        name="stranded-no-context",
     )
-    member = await _register(db_session, project, "agent-vm-park-res", PoolVmState.IDLE)
+    member = await _register(
+        db_session, project, "agent-vm-nokill-res", PoolVmState.IDLE
+    )
     member.reserved_lane_id = lane.id
     member.reservation_expires_at = _utcnow() + timedelta(hours=1)
     member.reservation_hard_expires_at = _utcnow() + timedelta(hours=2)
@@ -3215,14 +3244,127 @@ async def test_sweep_stranded_lane_park_does_not_clear_reservation(
     assert transitioned == 1
 
     await db_session.refresh(lane)
-    assert lane.status == ImprovementLaneStatus.PARKED.value
+    assert lane.status == ImprovementLaneStatus.KILLED.value, (
+        "no-context stranded lane must be killed, not parked into a dead state"
+    )
 
     await db_session.refresh(member)
-    assert member.reserved_lane_id == lane.id, (
-        "reservation must NOT be cleared when lane is only PARKed (still requeuing)"
+    assert member.reserved_lane_id is None, (
+        "reservation must be cleared after deterministic kill"
     )
-    assert member.reservation_expires_at is not None
-    assert member.reservation_hard_expires_at is not None
+    assert member.reservation_expires_at is None
+    assert member.reservation_hard_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_creates_recovery_task_when_context_available(
+    db_session, lanes_on
+):
+    """Acceptance proof: a stranded ACTIVE lane whose terminal task carries PR
+    dispatch context (pr_number / branch / base_branch) is re-dispatched with a
+    live QUEUED recovery task rather than parked inert until retirement.
+
+    The lane stays ACTIVE and current_task_id is rebound to the new recovery
+    task, so chain continuity is maintained and the 'requeue-from-checkpoint'
+    promise is real (selector: backend/testing/test_warm_pool_maintainer.py)."""
+    from app.models import Task as _Task
+
+    project = await _make_project(db_session, name="Strand Recovery")
+    cancelled = await _make_task_with_pr(
+        db_session, project, TaskStatus.CANCELLED, pr_number=99
+    )
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=cancelled.id,
+        phase_requeues=0,
+        name="stranded-with-context",
+    )
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 1
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value, (
+        "lane with PR context stays ACTIVE — bound to the recovery task"
+    )
+    assert lane.phase_requeues == 1, "mark_checkpoint_missing bumped the counter"
+    assert lane.current_task_id is not None, "lane must be bound to recovery task"
+    assert lane.current_task_id != cancelled.id, "old stale binding must be replaced"
+
+    # The recovery task must exist and be QUEUED.
+    recovery = await db_session.get(_Task, lane.current_task_id)
+    assert recovery is not None, "recovery task must exist in the DB"
+    assert recovery.status == TaskStatus.QUEUED, "recovery task must be QUEUED"
+    assert recovery.project_id == project.id
+    payload = recovery.first_payload or {}
+    assert payload.get("pr_number") == 99, "recovery payload carries the PR number"
+    assert payload.get("type") == "fix"
+
+    # A second sweep tick must not re-process the lane (now ACTIVE with a live task).
+    second = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert second == 0, "live-task lane is not stranded — re-run is a no-op"
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_continues_after_non_cas_exception(
+    db_session, lanes_on, mocker
+):
+    """sweep_stranded_lanes must not abort when a general (non-LaneCASError)
+    exception is raised while processing the first stranded lane — the second
+    lane must still be processed."""
+    project = await _make_project(db_session, name="Non-CAS Continue")
+
+    cancelled1 = await _make_task(db_session, project, TaskStatus.CANCELLED)
+    cancelled2 = await _make_task(db_session, project, TaskStatus.CANCELLED)
+
+    lane1 = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=cancelled1.id,
+        name="lane-fail",
+    )
+    lane2 = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=cancelled2.id,
+        name="lane-ok",
+    )
+
+    call_count = 0
+    real_mcm = None
+
+    async def _patched_mcm(session, lane_id, **kwargs):
+        nonlocal call_count, real_mcm
+        call_count += 1
+        if lane_id == lane1.id:
+            raise RuntimeError("simulated unexpected error on lane1")
+        return await real_mcm(session, lane_id, **kwargs)
+
+    from app.improvement_lane_ops import mark_checkpoint_missing as _real_mcm
+
+    real_mcm = _real_mcm
+    mocker.patch("app.improvement_lane_ops.mark_checkpoint_missing", new=_patched_mcm)
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+
+    # lane1 errored — not counted; lane2 was processed (KILLED, no PR context).
+    assert transitioned == 1, "second lane must still be processed after non-CAS error"
+    assert call_count == 2, "mark_checkpoint_missing was attempted for both lanes"
+
+    await db_session.refresh(lane2)
+    assert lane2.status == ImprovementLaneStatus.KILLED.value, (
+        "lane2 must be KILLED despite lane1 raising a non-CAS exception"
+    )
 
 
 @pytest.mark.asyncio
@@ -3602,3 +3744,429 @@ async def test_actively_reserved_member_not_idle_ttl_reaped(
             _runtime_config.pop("improvement_lanes_enabled", None)
         else:
             _runtime_config["improvement_lanes_enabled"] = prior_lanes
+
+
+# ---------------------------------------------------------------------------
+# Forced drain: operator drain/disable and global disable retire LEASED members
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_drain_tears_down_leased_member(db_session, warm_pool_on, mocker):
+    """drain_global_warm_pool must retire LEASED members, not silently skip them.
+
+    This is the acceptance-gate test named in the task.  Before the fix the else
+    branch of retire_and_delete_pool_vm excluded PoolVmState.LEASED from the
+    atomic claim predicate, so rowcount==0 and the member was left LEASED -- a
+    true leak because the pool stayed enabled and the orphan cleanup exempted
+    live pool members.  force=True now includes LEASED in the claim predicate.
+    """
+    mock_del = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+    _runtime_config["warm_pool_enabled"] = True
+
+    project = await _make_project(db_session)
+    member = await _register(
+        db_session, project, "agent-vm-leased-drain", PoolVmState.LEASED
+    )
+    member_id = member.id
+
+    retired = await _wpm.drain_global_warm_pool(
+        session_factory=_factory_for(db_session)
+    )
+    assert retired == 1, f"expected 1 retired, got {retired}"
+    mock_del.assert_awaited_once()
+    assert await db_session.get(PoolVm, member_id) is None
+
+
+@pytest.mark.asyncio
+async def test_drain_project_pool_operator_drain_retires_leased_member(
+    db_session, warm_pool_on, mocker
+):
+    """_drain_project_pool with reason='operator_drain' must retire LEASED members."""
+    from app.routers.admin_warm_pool import _drain_project_pool
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+
+    project = await _make_project(db_session)
+    member = await _register(
+        db_session, project, "agent-vm-leased-opdr", PoolVmState.LEASED
+    )
+    member_id = member.id
+
+    drained = await _drain_project_pool(
+        db_session, project.id, "u-test", reason="operator_drain"
+    )
+    assert drained == 1, f"expected 1 drained, got {drained}"
+    assert await db_session.get(PoolVm, member_id) is None
+
+
+@pytest.mark.asyncio
+async def test_drain_project_pool_operator_disable_retires_leased_member(
+    db_session, warm_pool_on, mocker
+):
+    """_drain_project_pool with reason='operator_disable' must retire LEASED members."""
+    from app.routers.admin_warm_pool import _drain_project_pool
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+
+    project = await _make_project(db_session)
+    member = await _register(
+        db_session, project, "agent-vm-leased-opds", PoolVmState.LEASED
+    )
+    member_id = member.id
+
+    drained = await _drain_project_pool(
+        db_session, project.id, "u-test", reason="operator_disable"
+    )
+    assert drained == 1, f"expected 1 drained, got {drained}"
+    assert await db_session.get(PoolVm, member_id) is None
+
+
+@pytest.mark.asyncio
+async def test_routine_over_target_drain_spares_leased_member(
+    db_session, warm_pool_on, mocker
+):
+    """The routine over-target drain path (non-forced) must NOT tear down a LEASED
+    member -- LEASED-protection stays in place for all paths that do not pass
+    force=True (i.e. reconcile_project_pool / sweep_idle_pool_vms).
+
+    This verifies that adding force=True to the forced-drain paths did NOT weaken
+    the protection on the routine reaping path.
+    """
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+    # Target 0, with 1 IDLE + 1 LEASED.  The routine drain triggers (IDLE count 1
+    # > target 0) and removes the IDLE member, but must leave the LEASED member
+    # untouched — reconcile only drains IDLE members, not LEASED ones.
+    _runtime_config["warm_pool_target_size"] = 0
+    project = await _make_project(db_session)
+    idle_member = await _register(
+        db_session, project, "agent-vm-idle-extra", PoolVmState.IDLE
+    )
+    idle_member.idle_since = _utcnow() - timedelta(seconds=300)
+    leased_member = await _register(
+        db_session, project, "agent-vm-leased-safe", PoolVmState.LEASED
+    )
+    db_session.add_all([idle_member, leased_member])
+    await db_session.commit()
+
+    async def _no_provision(session, project_id, **kw):
+        raise AssertionError("must not provision at target 0")
+
+    summary = await reconcile_project_pool(
+        db_session,
+        project.id,
+        runtime_config=_runtime_config,
+        provision_fn=_no_provision,
+        dispatch_slots_remaining=10,
+        pool_budget_remaining=10,
+        stale_vm_ids=set(),
+        suppressed=False,
+    )
+    # The IDLE member is over-target and gets drained; the LEASED member is spared.
+    assert summary["drained"] == 1
+    assert await db_session.get(PoolVm, idle_member.id) is None
+    surviving = await db_session.get(PoolVm, leased_member.id)
+    assert surviving is not None and surviving.state == PoolVmState.LEASED
+
+
+# ---------------------------------------------------------------------------
+# Per-project cost guard: lease-side honor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lease_blocked_when_per_project_cost_guard_engaged(
+    db_session, warm_pool_on, mocker
+):
+    """When the fleet guard is disengaged but one project's per-project cost guard
+    is engaged, try_pool_dispatch must immediately return None and record a
+    'cost_guard' lease-miss for that project — without waiting for the maintainer
+    tick to drain idle members."""
+    from app.warm_backlog_reuse import (
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        get_project_pool_funnel_snapshot,
+        record_pool_lease_miss,
+    )
+
+    _pool_lease_hit_events.clear()
+    _pool_lease_miss_events.clear()
+
+    mocker.patch(
+        "app.efficiency_snapshot._compute_windowed_idle_cost",
+        new_callable=mocker.AsyncMock,
+        side_effect=lambda session, pid, cutoff: {"total": 5.0, "by_account": {}},
+    )
+
+    _runtime_config["warm_pool_cost_guard_min_dispatches"] = 5
+    _runtime_config["warm_pool_cost_guard_min_idle_cost_usd"] = 1.0
+    _runtime_config["warm_pool_cost_guard_min_hit_rate"] = 0.10
+
+    # Fleet guard is disengaged: patch it to return engaged=False.
+    mocker.patch(
+        "app.warm_pool_maintainer.evaluate_pool_cost_guard",
+        new_callable=mocker.AsyncMock,
+        return_value={
+            "engaged": False,
+            "reason": None,
+            "hit_rate": 1.0,
+            "total_dispatches": 10,
+            "idle_cost_usd": 0.0,
+            "min_hit_rate": 0.10,
+            "min_idle_cost_usd": 1.0,
+            "window_hours": 24,
+        },
+    )
+
+    project = await _make_project(db_session, name="Per-Project Guard Lease")
+    # Drive 10 eligible misses so the per-project hit rate is 0% — guard engages.
+    for _ in range(10):
+        record_pool_lease_miss("no_idle_member", project_id=project.id)
+
+    # Register an IDLE member that would otherwise be leaseable.
+    await _register(
+        db_session,
+        project,
+        "agent-vm-per-proj-guard",
+        PoolVmState.IDLE,
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+    )
+
+    task = await _make_task(db_session, project, TaskStatus.QUEUED)
+
+    # Pre-check: the per-project guard evaluates as engaged for this project.
+    per_guard = await evaluate_project_pool_cost_guard(
+        db_session, project.id, runtime_config=_runtime_config
+    )
+    assert per_guard["engaged"], (
+        "pre-condition: per-project guard must be engaged with 10 eligible misses"
+    )
+
+    # Record how many cost_guard misses exist before the dispatch call.
+    snap_before = get_project_pool_funnel_snapshot(project.id, 24)
+    cost_guard_before = snap_before["lease_miss_by_reason"].get("cost_guard", 0)
+
+    result = await try_pool_dispatch(
+        db_session,
+        task,
+        required_provider="anthropic",
+        required_model="claude-opus-4-8",
+        required_account="acct-1",
+    )
+
+    assert result is None, (
+        "try_pool_dispatch must return None when per-project cost guard is engaged"
+    )
+
+    snap_after = get_project_pool_funnel_snapshot(project.id, 24)
+    assert (
+        snap_after["lease_miss_by_reason"].get("cost_guard", 0) > cost_guard_before
+    ), "a cost_guard lease-miss must be recorded for the project"
+
+
+@pytest.mark.asyncio
+async def test_fleet_guard_engaged_skips_per_project_check(
+    db_session, warm_pool_on, mocker
+):
+    """When the fleet guard is already engaged, the per-project guard must NOT be
+    evaluated (short-circuit) — fleet guard acts as a global safety valve."""
+    mocker.patch(
+        "app.efficiency_snapshot._compute_windowed_idle_cost",
+        new_callable=mocker.AsyncMock,
+        return_value={"total": 5.0, "by_account": {}},
+    )
+
+    # Fleet guard engaged.
+    mocker.patch(
+        "app.warm_pool_maintainer.evaluate_pool_cost_guard",
+        new_callable=mocker.AsyncMock,
+        return_value={
+            "engaged": True,
+            "reason": "fleet guard test",
+            "hit_rate": 0.0,
+            "total_dispatches": 100,
+            "idle_cost_usd": 10.0,
+            "min_hit_rate": 0.10,
+            "min_idle_cost_usd": 1.0,
+            "window_hours": 24,
+        },
+    )
+    per_project_spy = mocker.patch(
+        "app.warm_pool_maintainer.evaluate_project_pool_cost_guard",
+        new_callable=mocker.AsyncMock,
+        return_value={"engaged": False},
+    )
+
+    project = await _make_project(db_session, name="Fleet Guard Short-circuit")
+    await _register(
+        db_session,
+        project,
+        "agent-vm-fleet-guard-sc",
+        PoolVmState.IDLE,
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+    )
+
+    task = await _make_task(db_session, project, TaskStatus.QUEUED)
+    result = await try_pool_dispatch(
+        db_session,
+        task,
+        required_provider="anthropic",
+        required_model="claude-opus-4-8",
+        required_account="acct-1",
+    )
+
+    assert result is None, "fleet guard must block the lease"
+    per_project_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Acceptance proof: lane kill emits deduplicated operator message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lane_kill_emits_operator_message(db_session, lanes_on):
+    """Acceptance proof: killing a lane for exhausted checkpoint recovery via
+    sweep_exhausted_lane_budgets emits a deduplicated WARNING ProjectMessage
+    naming the lane and cause, and a second sweep does NOT emit a duplicate."""
+    from sqlmodel import select as sm_select
+
+    from app.models import ProjectMessage
+
+    project = await _make_project(db_session, name="Kill Operator Msg")
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        phase_requeues=_LANE_MAX_PHASE_REQUEUES + 1,
+        name="op-msg-lane",
+    )
+
+    killed = await sweep_exhausted_lane_budgets(db_session)
+    assert killed == 1
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.KILLED.value
+
+    msgs = (
+        (
+            await db_session.execute(
+                sm_select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.status == "open",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    lane_msgs = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "lane_killed_exhausted"
+    ]
+    assert len(lane_msgs) == 1, "exactly one operator message should be emitted"
+    assert str(lane.id) in (lane_msgs[0].context or {}).get("lane_id", ""), (
+        "message context must name the killed lane"
+    )
+    assert "op-msg-lane title" in lane_msgs[0].content, (
+        "message content must name the lane title"
+    )
+
+    # Re-insert a fresh over-budget lane and sweep again — the dedup key is
+    # per-lane so the second lane gets its own message, but the FIRST lane
+    # must NOT produce a duplicate.
+    lane2 = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        phase_requeues=_LANE_MAX_PHASE_REQUEUES + 1,
+        name="op-msg-lane-2",
+    )
+    killed2 = await sweep_exhausted_lane_budgets(db_session)
+    assert killed2 == 1
+
+    msgs_after = (
+        (
+            await db_session.execute(
+                sm_select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.status == "open",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    lane_msgs_after = [
+        m
+        for m in msgs_after
+        if (m.context or {}).get("event_type") == "lane_killed_exhausted"
+    ]
+    assert len(lane_msgs_after) == 2, (
+        "second sweep should emit one new message for the new lane only (no dup for lane 1)"
+    )
+    lane_ids_in_msgs = {(m.context or {}).get("lane_id") for m in lane_msgs_after}
+    assert str(lane.id) in lane_ids_in_msgs
+    assert str(lane2.id) in lane_ids_in_msgs
+
+
+# ── sweep_idle_pool_vms: LIMIT 500 on candidate scan ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sweep_idle_pool_vms_candidate_scan_carries_limit(db_session, mocker):
+    """Pass-2 PoolVm candidate scan must include LIMIT 500 to cap per-cycle cost."""
+    captured_queries: list = []
+    _orig_execute = db_session.execute
+
+    async def _spy_execute(stmt, *a, **kw):
+        captured_queries.append(stmt)
+        return await _orig_execute(stmt, *a, **kw)
+
+    mocker.patch.object(db_session, "execute", side_effect=_spy_execute)
+    mocker.patch(
+        "app.warm_pool_maintainer.is_warm_pool_enabled",
+        return_value=True,
+    )
+    mocker.patch(
+        "app.warm_pool_maintainer.retire_and_delete_pool_vm",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch(
+        "app.warm_pool_maintainer.sweep_stranded_lanes",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+    mocker.patch(
+        "app.warm_pool_maintainer.sweep_exhausted_lane_budgets",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+
+    await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+
+    import sqlalchemy.dialects.sqlite
+
+    dialect = sqlalchemy.dialects.sqlite.dialect()
+    pool_vm_scans = [
+        str(q.compile(dialect=dialect)).upper()
+        for q in captured_queries
+        if hasattr(q, "compile")
+        and "POOLVM" in str(q.compile(dialect=dialect)).upper()
+    ]
+    assert pool_vm_scans, "expected at least one pool_vm scan"
+    assert any("LIMIT" in s for s in pool_vm_scans), (
+        "sweep_idle_pool_vms must apply LIMIT 500 to the PoolVm candidate scan"
+    )

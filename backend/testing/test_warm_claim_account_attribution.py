@@ -184,3 +184,43 @@ async def test_backlog_reuse_attributes_boot_account_and_reserves(
             # Completion release path reads the stamped account and frees it.
             await release_max_plan_account(BOOT_ACCOUNT_ID)
             assert account["active_tasks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_vm_boot_account_identity_skips_unattributed_returns_older(db_session):
+    """When the most recent task on a VM has no account but an older one does,
+    _vm_boot_account_identity returns the older attributed task's account.
+
+    This is the exact regression path the SQL filter (has_account + .limit(1))
+    is designed to cover: without the filter, .limit(1) would return the
+    unattributed latest task and the function would return None, silently
+    under-counting the boot account's active tasks in cap math.
+    """
+    project = await _make_project(db_session, name="Multi-Task Attribution")
+    vm_id = "agent-vm-attr-multi"
+
+    # Older task: has the boot account stamped (cold-dispatched root).
+    await _make_task(
+        db_session,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=vm_id,
+        context=_boot_ctx(),
+    )
+    # Newer task: no account (e.g. a queued backlog task that was reused but
+    # whose context was never attributed — precisely the scenario being guarded).
+    await _make_task(
+        db_session,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=vm_id,
+        context={"scope": "small"},  # no llm_account_id
+    )
+
+    identity = await _vm_boot_account_identity(db_session, vm_id)
+    assert identity is not None, (
+        "_vm_boot_account_identity returned None even though an older task on "
+        "this VM has an account — the SQL has_account filter likely regressed"
+    )
+    assert identity["account_id"] == BOOT_ACCOUNT_ID
+    assert identity["provider"] == "anthropic"

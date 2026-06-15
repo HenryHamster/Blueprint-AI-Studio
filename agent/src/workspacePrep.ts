@@ -206,19 +206,47 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
       // than resetting to origin/<branch>. The checkpoint is the last verified
       // commit; origin/<branch> may be ahead (another phase pushed). Any mismatch
       // (external push, leftover residue, divergent HEAD) is fixed by hard-reset to
-      // the checkpoint SHA. If the SHA is unreachable (force-push or orphaned ref)
-      // the reset throws and the outer catch falls back to a full cold clone.
+      // the checkpoint SHA. Before resetting, verify the checkpoint SHA is still an
+      // ancestor of the remote branch. On a warm workspace, a force-push may have
+      // orphaned the commit, but it could still exist locally as a dangling object,
+      // so reset would succeed even though the commit is no longer reachable. If the
+      // SHA is not an ancestor, fall back to resetting to origin/<branch> instead.
       // allowLaneResume defaults true (env-driven). A reviewer/auditor passes
       // false so lane reset can never engage even if a lane env leaked onto a
       // cold claim — the cold, independent review path is non-negotiable.
       // lanePhase is computed above (before the warm/cold branch).
       const laneCheckpointSha = lanePhase ? (process.env.BLUEPRINT_LANE_CHECKPOINT_SHA ?? '') : '';
-      const checkpointResetApplied = lanePhase && !!laneCheckpointSha;
+      let checkpointResetApplied = false;
       if (lanePhase && laneCheckpointSha) {
-        execFileSync('git', ['-C', workspace, 'reset', '--hard', laneCheckpointSha], {
-          encoding: 'utf-8', timeout: 30_000,
-        });
-        log(`prepareWorkspaceForRole: lane-mode reset to checkpoint ${laneCheckpointSha} (branch=${branch})`);
+        // Verify the checkpoint SHA is still an ancestor of the remote branch.
+        let isAncestor = false;
+        try {
+          execFileSync('git', ['-C', workspace, 'merge-base', '--is-ancestor', laneCheckpointSha, `origin/${branch}`], {
+            encoding: 'utf-8', timeout: 30_000,
+          });
+          isAncestor = true;
+        } catch (err) {
+          // merge-base --is-ancestor exits with status 1 when the first arg is not an
+          // ancestor of the second (empty stderr). That's the normal "not an ancestor"
+          // case and is handled below. Errors (exit > 1) propagate to trigger cold fallback.
+          if ((err as NodeJS.ErrnoException & { status?: number }).status !== 1) {
+            throw err;
+          }
+        }
+        if (isAncestor) {
+          execFileSync('git', ['-C', workspace, 'reset', '--hard', laneCheckpointSha], {
+            encoding: 'utf-8', timeout: 30_000,
+          });
+          log(`prepareWorkspaceForRole: lane-mode reset to checkpoint ${laneCheckpointSha} (branch=${branch})`);
+          checkpointResetApplied = true;
+        } else {
+          // Checkpoint SHA is not an ancestor (force-push / orphaned).
+          // Fall back to resetting to origin/<branch> instead.
+          log(`prepareWorkspaceForRole: checkpoint ${laneCheckpointSha} not ancestor of origin/${branch}; resetting to origin/${branch} instead`);
+          execFileSync('git', ['-C', workspace, 'reset', '--hard', `origin/${branch}`], {
+            encoding: 'utf-8', timeout: 30_000,
+          });
+        }
       } else {
         execFileSync('git', ['-C', workspace, 'reset', '--hard', `origin/${branch}`], {
           encoding: 'utf-8', timeout: 30_000,

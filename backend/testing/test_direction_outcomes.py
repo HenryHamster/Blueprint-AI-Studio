@@ -1141,6 +1141,74 @@ async def test_infra_vs_non_infra_failure_counting(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_infra_failure_without_persisted_category_counts_as_infra(
+    db_session: AsyncSession,
+):
+    """A FAILED child with no failure_category but an infra status message must
+    be counted in tasks_failed_infra via the classifier fallback.  A FAILED child
+    with neither a persisted category nor a classifiable message must NOT be counted.
+    """
+    direction_id = "d-infra-fallback"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # No failure_category; status message classifies as infra (provision failure)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={},
+        title="no-category-infra",
+        latest_status_message="failed to provision vm: quota exceeded",
+    )
+    # No failure_category; status message is a plain code error — NOT infra
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={},
+        title="no-category-code",
+        latest_status_message="AssertionError in test_foo.py",
+    )
+    # Explicit CODE_ERROR persisted — must still NOT count as infra
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+        title="explicit-code-error",
+        latest_status_message="Code error",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Only the provision-failure child (classified via fallback) counts as infra
+    assert entry["tasks_failed_infra"] == 1
+    assert entry["tasks_failed"] == 3
+    # Derived metric: code_failed should be 2 (total_failed - infra), not 3
+    # (This is what the churn/saturation guardrail consumes via strategic_completion)
+    # tasks_failed_infra == 1 so code failures == tasks_failed - tasks_failed_infra == 2
+    assert entry["tasks_failed"] - entry["tasks_failed_infra"] == 2
+
+
+@pytest.mark.asyncio
 async def test_failed_task_details_capped_at_5(db_session: AsyncSession):
     """failed_task_details is capped at 5 entries even when more tasks fail."""
     direction_id = "d-cap"

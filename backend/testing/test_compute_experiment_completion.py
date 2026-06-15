@@ -14,6 +14,7 @@ task* and that an experiment which never reached a terminal, costed state FAILS
 the forward gate rather than completing clean.
 """
 
+import asyncio
 import json
 import os
 import uuid
@@ -24,6 +25,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app import compute
 from app import compute_jobs
 from app.artifact_prerequisites import (
     ARTIFACT_PREREQUISITES_KEY,
@@ -35,9 +37,11 @@ from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
 )
 from app.compute_backends import (
+    LOCAL_BACKEND_NAME,
     ComputeCostResult,
     ComputeLaunchResult,
     ComputeStatusResult,
+    LocalSubprocessComputeBackend,
     TerminalArtifactReference,
 )
 from app.database import resolve_async_engine
@@ -437,10 +441,13 @@ async def test_deliver_artifact_no_partial_commit_on_scan_failure(
 
     first_page = MagicMock()
     first_page.scalars.return_value.all.return_value = [dependent]
-    with patch("app.artifact_prerequisites._DEPENDENT_SCAN_CAP", 1), patch.object(
-        db_session,
-        "execute",
-        new=AsyncMock(side_effect=[first_page, RuntimeError("scan boom")]),
+    with (
+        patch("app.artifact_prerequisites._DEPENDENT_SCAN_CAP", 1),
+        patch.object(
+            db_session,
+            "execute",
+            new=AsyncMock(side_effect=[first_page, RuntimeError("scan boom")]),
+        ),
     ):
         await deliver_artifact_to_dependents(task, artifact, db_session, commit=True)
 
@@ -740,7 +747,10 @@ async def test_late_compute_artifact_dependent_is_hydrated_before_launch(
     assert prereqs[0]["logical_key"] == "experiment-result-bundle"
     assert prereqs[0]["artifact_type"] == ArtifactType.COMPUTE_RESULT.value
     assert prereqs[0]["source_task_id"] == str(producer.id)
-    assert prereqs[0]["storage_uri"] == "gs://blueprint-agent-artifacts/compute-jobs/result.json"
+    assert (
+        prereqs[0]["storage_uri"]
+        == "gs://blueprint-agent-artifacts/compute-jobs/result.json"
+    )
 
 
 @pytest.mark.asyncio
@@ -802,7 +812,9 @@ async def test_backfill_artifact_prerequisites_stays_within_project(
 ):
     """Claim-time backfill must not copy artifact metadata across projects."""
     producer_project = Project(name="BackfillCrossProjectProducer", user_id="test-user")
-    dependent_project = Project(name="BackfillCrossProjectDependent", user_id="test-user")
+    dependent_project = Project(
+        name="BackfillCrossProjectDependent", user_id="test-user"
+    )
     db_session.add_all([producer_project, dependent_project])
     await db_session.commit()
     await db_session.refresh(producer_project)
@@ -877,9 +889,7 @@ async def test_compute_completion_classifies_outcome_after_gate(
     from app.task_outcomes import evaluate_task_outcome
 
     success = await _make_compute_task(db_session)
-    await _handle_compute_experiment_completion(
-        success, _result_artifact(), db_session
-    )
+    await _handle_compute_experiment_completion(success, _result_artifact(), db_session)
     await db_session.refresh(success)
     assert evaluate_task_outcome(success).status == "neutral"
 
@@ -942,9 +952,7 @@ async def test_compute_completion_no_cost_fails_gate(db_session, _quiet_compute_
 
 
 @pytest.mark.asyncio
-async def test_compute_completion_unparseable_fails_gate(
-    db_session, _quiet_compute_io
-):
+async def test_compute_completion_unparseable_fails_gate(db_session, _quiet_compute_io):
     task = await _make_compute_task(db_session)
 
     await _handle_compute_experiment_completion(
@@ -1012,9 +1020,7 @@ async def test_compute_completion_reported_metric_met_records_goal(
     """A command-reported experiment metric (accuracy) flattened to a top-level
     key that MEETS its declared goal PASSES, completes the task, and records the
     met verdict durably on both plan_output and task.context."""
-    task = await _make_compute_task_with_criterion(
-        db_session, "accuracy", ">=", 0.9
-    )
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
 
     await _handle_compute_experiment_completion(
         task, _result_artifact(accuracy=0.93), db_session
@@ -1035,9 +1041,7 @@ async def test_compute_completion_reported_metric_unmet_completes_and_records(
 ):
     """A reported experiment metric that misses its goal completes artifact
     delivery and records the unmet criterion durably."""
-    task = await _make_compute_task_with_criterion(
-        db_session, "accuracy", ">=", 0.9
-    )
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
 
     await _handle_compute_experiment_completion(
         task, _result_artifact(accuracy=0.83), db_session
@@ -1384,7 +1388,9 @@ async def test_compute_knowledge_persistence_db_failure_stamps_plan_output_after
         # in pending-rollback state without rolling back — this is the
         # production-shaped failure a flush/commit error would produce.
         try:
-            await session.execute(text("SELECT 1 FROM table_that_must_not_exist_xyz_abc"))
+            await session.execute(
+                text("SELECT 1 FROM table_that_must_not_exist_xyz_abc")
+            )
         except Exception:
             pass  # intentionally leave session in pending-rollback state
         raise RuntimeError("simulated DB-level persistence failure")
@@ -1573,7 +1579,9 @@ async def test_prerequisite_measured_negative_completes_and_delivers_while_broke
             COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
         ),
     }
-    neg_artifact_uri = "gs://blueprint-agent-artifacts/compute-jobs/negative-result.json"
+    neg_artifact_uri = (
+        "gs://blueprint-agent-artifacts/compute-jobs/negative-result.json"
+    )
     neg_artifact = Artifact(
         task_id=negative.id,
         artifact_type=ArtifactType.COMPUTE_RESULT,
@@ -1677,11 +1685,14 @@ def _result_from_terminal_job(job: ComputeJob, polls: int = 1) -> str:
     Mirrors ``agent/src/handlers/compute-experiment.ts``: outcome is the job's
     terminal outcome, final cost prefers final_cost_usd then accrued_cost_usd.
     """
+
     def _v(x):
         return getattr(x, "value", x)
 
     outcome = _v(job.outcome) if job.outcome is not None else None
-    final_cost = job.final_cost_usd if job.final_cost_usd is not None else job.accrued_cost_usd
+    final_cost = (
+        job.final_cost_usd if job.final_cost_usd is not None else job.accrued_cost_usd
+    )
     return json.dumps(
         {
             "job_id": str(job.id),
@@ -2088,8 +2099,7 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     assert "analysis" in doc.body.lower()
     assert task.plan_output["knowledge_document"]["analysis_mode"] == "llm"
     assert (
-        task.plan_output["knowledge_document"]["knowledge_acceptance_evidence"]
-        is True
+        task.plan_output["knowledge_document"]["knowledge_acceptance_evidence"] is True
     )
     assert (
         task.plan_output["knowledge_document"]["compute_acceptance_grade"]
@@ -2115,7 +2125,9 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     assert index[0]["analysis_fallback_reason"] is None
     substance = await fetch_knowledge_substance_index(db_session, task.project_id)
     assert substance[0].forward_quality_verdict["knowledge_acceptance_evidence"] is True
-    assert substance[0].forward_quality_verdict["compute_acceptance_grade"] == "acceptance"
+    assert (
+        substance[0].forward_quality_verdict["compute_acceptance_grade"] == "acceptance"
+    )
 
     deterministic_task = await _make_compute_task_with_identity(
         db_session, metric="accuracy", op=">=", threshold=0.9
@@ -2146,14 +2158,26 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
     assert deterministic_detail["knowledge_acceptance_evidence"] is False
     assert deterministic_detail["compute_acceptance_grade"] == "measured_only"
     assert deterministic_detail["analysis_fallback_reason"] is None
-    deterministic_index = await build_knowledge_index(db_session, deterministic_task.project_id)
-    assert deterministic_index[0]["compute_acceptance_reason"] == "analysis_mode_not_llm"
+    deterministic_index = await build_knowledge_index(
+        db_session, deterministic_task.project_id
+    )
+    assert (
+        deterministic_index[0]["compute_acceptance_reason"] == "analysis_mode_not_llm"
+    )
     assert deterministic_index[0]["analysis_fallback_reason"] is None
     deterministic_substance = await fetch_knowledge_substance_index(
         db_session, deterministic_task.project_id
     )
-    assert deterministic_substance[0].forward_quality_verdict["knowledge_acceptance_evidence"] is False
-    assert deterministic_substance[0].forward_quality_verdict["compute_acceptance_grade"] == "measured_only"
+    assert (
+        deterministic_substance[0].forward_quality_verdict[
+            "knowledge_acceptance_evidence"
+        ]
+        is False
+    )
+    assert (
+        deterministic_substance[0].forward_quality_verdict["compute_acceptance_grade"]
+        == "measured_only"
+    )
     assert (
         deterministic_task.plan_output["knowledge_document"][
             "knowledge_acceptance_evidence"
@@ -2164,7 +2188,10 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
         deterministic_task.plan_output["knowledge_document"]["compute_acceptance_grade"]
         == "measured_only"
     )
-    assert deterministic_task.plan_output["knowledge_document"]["analysis_fallback_reason"] is None
+    assert (
+        deterministic_task.plan_output["knowledge_document"]["analysis_fallback_reason"]
+        is None
+    )
     non_compute_doc = KnowledgeDocument(
         project_id=task.project_id,
         source_task_id=task.id,
@@ -2175,9 +2202,15 @@ async def test_compute_experiment_knowledge_marks_only_llm_artifact_cited_as_acc
         topic="design",
         tags=[],
         source_citations=[],
-        forward_quality_verdict={"passed": True, "reason": "ok", "strategy": "forward-quality"},
+        forward_quality_verdict={
+            "passed": True,
+            "reason": "ok",
+            "strategy": "forward-quality",
+        },
     )
-    non_compute_detail = serialize_knowledge_document(non_compute_doc, include_body=True)
+    non_compute_detail = serialize_knowledge_document(
+        non_compute_doc, include_body=True
+    )
     assert non_compute_detail["analysis_fallback_reason"] is None
     assert evaluate_task_outcome(deterministic_task).status == "neutral"
 
@@ -2285,7 +2318,10 @@ async def test_live_proof_knowledge_document_carries_release_evidence(
     doc = docs[0]
     evidence = doc.forward_quality_verdict["release_evidence"]
     assert evidence == older_release_evidence
-    assert task.plan_output["knowledge_document"]["release_evidence"] == older_release_evidence
+    assert (
+        task.plan_output["knowledge_document"]["release_evidence"]
+        == older_release_evidence
+    )
 
     detail = serialize_knowledge_document(doc, include_body=True)
     assert detail["release_evidence"] == older_release_evidence
@@ -2444,7 +2480,13 @@ async def test_compute_experiment_knowledge_requires_durable_citations(
             project_id=project.id,
             title=f"compute_experiment: {name}",
             status=TaskStatus.COMPLETED,
-            payloads=[{"type": "compute_experiment", "experiment": name, "base_branch": "main"}],
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "experiment": name,
+                    "base_branch": "main",
+                }
+            ],
         )
 
     # ── Case 1: https:// result_reference → no durable citation stored ───────
@@ -2538,7 +2580,9 @@ async def test_plan_spawned_compute_experiment_carries_downstream_artifact_evide
     from app.plan_completion import _handle_plan_completion
     from testing.factories import make_project, make_task
 
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch("app.plan_completion.broadcast_to_project", new_callable=AsyncMock)
 
     project = make_project(name="PlanComputeEvidenceE2E")
@@ -2596,9 +2640,10 @@ async def test_plan_spawned_compute_experiment_carries_downstream_artifact_evide
     assert compute_child is not None
     payload = compute_child.first_payload or {}
     assert payload["type"] == "compute_experiment"
-    assert payload.get("acceptance_evidence", {}).get("artifact_id") == "plan-result-bundle", (
-        f"acceptance_evidence not in payload after plan_completion spawn: {payload}"
-    )
+    assert (
+        payload.get("acceptance_evidence", {}).get("artifact_id")
+        == "plan-result-bundle"
+    ), f"acceptance_evidence not in payload after plan_completion spawn: {payload}"
 
     # Now wire the child to complete and verify artifact stamp.
     compute_child.status = TaskStatus.IN_PROGRESS
@@ -2615,6 +2660,7 @@ async def test_plan_spawned_compute_experiment_carries_downstream_artifact_evide
         deadline_seconds=600,
     )
     from datetime import datetime as _dt
+
     job.status = ComputeJobStatus.SUCCEEDED
     job.outcome = ComputeJobOutcome.SUCCESS
     job.accrued_cost_usd = 0.25
@@ -2684,7 +2730,9 @@ async def test_compute_knowledge_explicit_analysis_upgrades_deterministic_to_llm
 
     docs_after_first = await _knowledge_docs_for(db_session, task)
     assert len(docs_after_first) == 1
-    assert docs_after_first[0].forward_quality_verdict["analysis_mode"] == "deterministic"
+    assert (
+        docs_after_first[0].forward_quality_verdict["analysis_mode"] == "deterministic"
+    )
     assert (
         docs_after_first[0].forward_quality_verdict["release_evidence"]
         == release_evidence
@@ -2744,8 +2792,7 @@ async def test_compute_knowledge_explicit_analysis_upgrades_deterministic_to_llm
     assert task.plan_output["knowledge_document"]["analysis_mode"] == "llm"
     assert task.plan_output["knowledge_document"]["citation_count"] >= 2
     assert (
-        task.plan_output["knowledge_document"]["release_evidence"]
-        == release_evidence
+        task.plan_output["knowledge_document"]["release_evidence"] == release_evidence
     )
 
     # The LLM was actually invoked on the second pass.
@@ -3008,11 +3055,13 @@ async def test_fallback_grounding_mismatched_result_reference_unresolved(
         project_id=project.id,
         title="compute_experiment: mismatched ref",
         status=TaskStatus.COMPLETED,
-        payloads=[{
-            "type": "compute_experiment",
-            "experiment": "mismatch-test",
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "experiment": "mismatch-test",
+                "base_branch": "main",
+            }
+        ],
     )
     db_session.add(task)
     await db_session.commit()
@@ -3023,10 +3072,12 @@ async def test_fallback_grounding_mismatched_result_reference_unresolved(
         task_id=task.id,
         artifact_type=ArtifactType.COMPUTE_RESULT,
         storage_uri="gs://bucket/jobs/job-a/artifacts/",
-        logs=json.dumps({
-            "artifact_uri": "gs://bucket/jobs/job-a/artifacts/",
-            "file_count": 2,
-        }),
+        logs=json.dumps(
+            {
+                "artifact_uri": "gs://bucket/jobs/job-a/artifacts/",
+                "file_count": 2,
+            }
+        ),
     )
     db_session.add(artifact)
     await db_session.commit()
@@ -3089,11 +3140,13 @@ async def test_real_evidence_rejects_http_artifact_location(
         project_id=project.id,
         title="compute_experiment: http artifact test",
         status=TaskStatus.COMPLETED,
-        payloads=[{
-            "type": "compute_experiment",
-            "experiment": "http-test",
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "experiment": "http-test",
+                "base_branch": "main",
+            }
+        ],
     )
     db_session.add(task)
     await db_session.commit()
@@ -3104,10 +3157,12 @@ async def test_real_evidence_rejects_http_artifact_location(
         task_id=task.id,
         artifact_type=ArtifactType.COMPUTE_RESULT,
         storage_uri="https://signed-download.example.com/result.tar.gz?token=xyz",
-        logs=json.dumps({
-            "artifact_uri": None,
-            "file_count": 2,
-        }),
+        logs=json.dumps(
+            {
+                "artifact_uri": None,
+                "file_count": 2,
+            }
+        ),
     )
     db_session.add(artifact)
     await db_session.commit()
@@ -3951,7 +4006,8 @@ async def test_compute_vm_analysis_routing_is_bounded(
     task.status = TaskStatus.COMPLETED
     task.context = {
         **(task.context or {}),
-        _COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY: _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS - 1,
+        _COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY: _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS
+        - 1,
     }
     db_session.add(task)
     await db_session.commit()
@@ -3969,14 +4025,18 @@ async def test_compute_vm_analysis_routing_is_bounded(
     task.status = TaskStatus.COMPLETED
     db_session.add(task)
     await db_session.commit()
-    routed_again = await _route_compute_analysis_to_vm(task, logs, criterion, db_session)
+    routed_again = await _route_compute_analysis_to_vm(
+        task, logs, criterion, db_session
+    )
     assert routed_again is False
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     docs = await _knowledge_docs_for(db_session, task)
     assert len(docs) == 1
     assert docs[0].forward_quality_verdict["analysis_mode"] == "deterministic"
-    assert docs[0].forward_quality_verdict["compute_acceptance_grade"] == "measured_only"
+    assert (
+        docs[0].forward_quality_verdict["compute_acceptance_grade"] == "measured_only"
+    )
 
 
 @pytest.mark.asyncio
@@ -4357,7 +4417,9 @@ async def test_agent_compute_analysis_endpoint_upgrades_doc_to_llm(
 
     # With no backend key, run_compute_wake_post_commit persists the deterministic
     # doc and routes the analysis onto the VM substrate (task → QUEUED, vm_instance_id=None).
-    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "", "DISABLE_LLM_COMPUTE_ANALYSIS": ""}):
+    with patch.dict(
+        os.environ, {"ANTHROPIC_API_KEY": "", "DISABLE_LLM_COMPUTE_ANALYSIS": ""}
+    ):
         ok = await run_compute_wake_post_commit(db_session, reg)
     assert ok is True
 
@@ -4395,7 +4457,9 @@ async def test_agent_compute_analysis_endpoint_upgrades_doc_to_llm(
     )
 
     # ── (a) Grounded submission → upgrades doc to analysis_mode='llm' ─────────
-    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "", "DISABLE_LLM_COMPUTE_ANALYSIS": ""}):
+    with patch.dict(
+        os.environ, {"ANTHROPIC_API_KEY": "", "DISABLE_LLM_COMPUTE_ANALYSIS": ""}
+    ):
         resp = await client.post(
             "/api/agent/compute-analysis",
             headers=headers,
@@ -4409,7 +4473,9 @@ async def test_agent_compute_analysis_endpoint_upgrades_doc_to_llm(
                 },
             },
         )
-    assert resp.status_code == 200, f"expected 200 OK, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 200, (
+        f"expected 200 OK, got {resp.status_code}: {resp.text}"
+    )
     data = resp.json()
     assert data["status"] == "success"
     assert data["data"]["status"] == "upgraded"
@@ -4696,7 +4762,9 @@ async def test_durable_artifact_criterion_backend_derived_on_timeout(
         db_session, "durable_payload_bytes", ">=", 8192
     )
     # No durable_payload_bytes in polling_metadata — no artifact survived teardown.
-    logs2 = _result_artifact(outcome="TIMED_OUT", status="TIMED_OUT", final_cost_usd=0.10)
+    logs2 = _result_artifact(
+        outcome="TIMED_OUT", status="TIMED_OUT", final_cost_usd=0.10
+    )
     await _handle_compute_experiment_completion(task2, logs2, db_session)
 
     await db_session.refresh(task2)
@@ -4755,9 +4823,7 @@ async def test_compute_durable_payload_bytes_criterion_unmet(
 
 
 @pytest.mark.asyncio
-async def test_compute_durable_file_count_criterion(
-    db_session, _quiet_compute_io
-):
+async def test_compute_durable_file_count_criterion(db_session, _quiet_compute_io):
     """Backend-measured durable_file_count satisfies a declared >= criterion."""
     task = await _make_compute_task_with_criterion(
         db_session, "durable_file_count", ">=", 3
@@ -4989,7 +5055,9 @@ def test_provisioning_death_terminal_diagnostics_includes_cause_and_contract():
     assert diag["machine_type"] == "n1-standard-4"
 
     cause = diag.get("provisioning_cause")
-    assert cause is not None, "provisioning_cause must be populated from compute_rpc_diagnostic"
+    assert cause is not None, (
+        "provisioning_cause must be populated from compute_rpc_diagnostic"
+    )
     assert cause["error_type"] == "GoogleAPIError"
     assert cause["reason"] == "QUOTA_EXCEEDED"
     msg = cause.get("error_message", "")
@@ -4998,7 +5066,9 @@ def test_provisioning_death_terminal_diagnostics_includes_cause_and_contract():
     assert "[redacted]" in msg, "query string must be replaced with [redacted]"
 
     contract = diag.get("launch_contract")
-    assert contract is not None, "launch_contract must be populated from polling_metadata"
+    assert contract is not None, (
+        "launch_contract must be populated from polling_metadata"
+    )
     assert contract["requested_deadline_seconds"] == 3600
     assert contract["provisioning_model"] == "SPOT"
 
@@ -5059,8 +5129,12 @@ def test_provisioning_death_knowledge_document_renders_cause_and_contract():
 
     # verdict_record must carry both new fields
     td = vr.get("terminal_diagnostics", {})
-    assert "provisioning_cause" in td, "verdict_record terminal_diagnostics must have provisioning_cause"
-    assert "launch_contract" in td, "verdict_record terminal_diagnostics must have launch_contract"
+    assert "provisioning_cause" in td, (
+        "verdict_record terminal_diagnostics must have provisioning_cause"
+    )
+    assert "launch_contract" in td, (
+        "verdict_record terminal_diagnostics must have launch_contract"
+    )
     assert td["launch_contract"]["requested_deadline_seconds"] == 7200
     assert td["launch_contract"]["provisioning_model"] == "STANDARD"
 
@@ -5094,4 +5168,122 @@ def test_runtime_phase_terminal_diagnostics_no_provisioning_fields():
     )
     assert "launch_contract" not in diag, (
         "runtime-phase terminal diagnostics must not include launch_contract"
+    )
+
+
+# ── E2E local-backend smoke ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_local_backend_e2e_smoke(db_session, monkeypatch, _quiet_compute_io):
+    """End-to-end smoke: real LocalSubprocessComputeBackend drives create →
+    launch → poll → verdict-persistence without a live GCP VM.
+
+    Uses a measured-NEGATIVE result (accuracy=0.85 misses criterion >=0.90) to
+    confirm that an unmet criterion still persists an honest verdict and
+    delivers it to a queued dependent — the key regression scenario (a broken
+    implementation discards the negative verdict instead of recording it).
+    """
+    # Enable LOCAL_MODE so create_compute_job accepts the local-subprocess backend.
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.90)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    dependent = Task(
+        project_id=task.project_id,
+        title="act on compute result",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "use result", "base_branch": "main"}],
+        depends_on=[str(task.id)],
+    )
+    db_session.add(dependent)
+    await db_session.commit()
+    await db_session.refresh(dependent)
+
+    # Command writes accuracy=0.85 (misses >=0.90) to the result file and produces
+    # stdout so command.log.json lands in $BLUEPRINT_ARTIFACT_DIR — required for
+    # _link_terminal_artifact to detect a non-empty artifact dir and set a file://
+    # result_reference, which in turn makes knowledge_substance_has_durable_compute_grounding
+    # return True so the dependent receives the prerequisite pointer.
+    command = (
+        'printf \'{"accuracy": 0.85}\' > "$BLUEPRINT_RESULT_FILE" && echo computed'
+    )
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command=command,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=60,
+        backend_name=LOCAL_BACKEND_NAME,
+    )
+
+    backend = LocalSubprocessComputeBackend()
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: backend)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Pass 1: STARTING → launch (subprocess starts).
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+
+    # Poll until terminal (command is near-instant; 10 passes x 0.2 s = 2 s max).
+    for _ in range(10):
+        if job.status in (
+            ComputeJobStatus.SUCCEEDED,
+            ComputeJobStatus.FAILED,
+            ComputeJobStatus.TIMED_OUT,
+        ):
+            break
+        await asyncio.sleep(0.2)
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+        await db_session.refresh(job)
+
+    # The command exits 0, so the job must reach SUCCEEDED.
+    assert job.status == ComputeJobStatus.SUCCEEDED, (
+        f"job status is {job.status!r} after polling; "
+        "expected SUCCEEDED (command exits 0)"
+    )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+    # At least one poll attempt was recorded.
+    assert (job.poll_attempt_count or 0) >= 1
+
+    # Build the COMPUTE_RESULT artifact the way the leader-wake worker does.
+    result_logs = compute_jobs.build_compute_result_logs(job)
+
+    # Completion handler persists the verdict.
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        await _handle_compute_experiment_completion(task, result_logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
+
+    # Criterion recorded: accuracy was captured from BLUEPRINT_RESULT_FILE.
+    # If the subprocess env didn't propagate the var, the metric is absent and
+    # measurable=False; either way met must be False (never met on negative run).
+    ctx_criterion = task.context.get("compute_success_criterion", {})
+    assert ctx_criterion.get("met") is False, (
+        "measured-negative result must record met=False, not discard the verdict"
+    )
+
+    # Knowledge document persisted with honest negative verdict.
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1, "negative result must still persist a knowledge document"
+    doc = docs[0]
+    assert doc.source_kind == "compute_experiment"
+    assert doc.forward_quality_verdict["criterion_met"] is False
+
+    # Dependent receives the knowledge prerequisite from the completed producer.
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY)
+    assert prereqs and prereqs[0]["source_task_id"] == str(task.id), (
+        "dependent must receive knowledge prerequisite pointer after task completes"
     )

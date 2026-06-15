@@ -14,7 +14,7 @@ import {
   startEventLoopLagMonitor, traceHeartbeat, installExitMarkers, recordFinalState,
 } from './diagnostics.js';
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
-import { resetForNextRole, clearStaleProviderCredentials } from './reset.js';
+import { resetForNextRole, clearStaleProviderCredentials, TMP_OUTPUT_NAMES } from './reset.js';
 import { isHeartbeatTransient } from './heartbeat-classify.js';
 import {
   type FixLoopEvent,
@@ -37,7 +37,7 @@ import {
   scheduleProactiveTokenRefresh, stopProactiveTokenRefresh,
   computeRefreshDelayMs, isBootstrapToken,
 } from './utils/agent-token.js';
-import { sanitize } from './utils/sanitize.js';
+import { sanitize, sanitizeError } from './utils/sanitize.js';
 import {
   type StaleResultEnvelope,
   createStaleResultEnvelope, parseStaleResultFile,
@@ -82,7 +82,7 @@ export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand,
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api' | 'vm_config_missing';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api' | 'vm_config_missing' | 'github_token_fetch_failed';
 
 // ── Graceful-shutdown signalling (cluster C7) ────────────────────────────────
 // A non-error "shutdown requested" control signal. Thrown from the deep call
@@ -137,6 +137,7 @@ let _inWarmPollWindow = false;
 function setCrashReportTaskId(taskId: string): void { _crashReportTaskId = taskId; }
 export function _getCrashReportTaskIdForTesting(): string { return _crashReportTaskId; }
 export function _setInWarmPollWindowForTesting(value: boolean): void { _inWarmPollWindow = value; }
+export function _crashReportForTesting(label: string, detail: string, exitCode: number): void { _crashReport(label, detail, exitCode); }
 
 // ── OAuth credential rotation + ClaudeTimeoutError ───────────────────────────
 import {
@@ -1100,8 +1101,8 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
   };
 }
 
-export async function apiGet(path: string, retries = API_MAX_RETRIES) {
-  return apiRequest('GET', path, () => ({ headers: apiHeaders }), retries, API_TIMEOUT);
+export async function apiGet(path: string, retries = API_MAX_RETRIES, timeoutMs = API_TIMEOUT) {
+  return apiRequest('GET', path, () => ({ headers: apiHeaders }), retries, timeoutMs);
 }
 
 // ── Task-capability contract (agent permission source of truth) ──────────────
@@ -1116,7 +1117,10 @@ export async function apiGet(path: string, retries = API_MAX_RETRIES) {
 let _taskCapabilityContractLoaded = false;
 
 export async function fetchTaskCapabilityContract(): Promise<TaskCapabilityContract> {
-  const res = await apiGet('/api/agent/task-capabilities') as { task_capabilities?: TaskCapabilityContract };
+  // Use the same 180s timeout as the github/token fetch — both endpoints call
+  // get_github_token_for_task under the hood, which can legitimately block up to
+  // ~120s while _github_request sleeps on a near-empty rate-limit bucket.
+  const res = await apiGet('/api/agent/task-capabilities', API_MAX_RETRIES, 180_000) as { task_capabilities?: TaskCapabilityContract };
   const contract = res.task_capabilities;
   if (!contract || typeof contract !== 'object') {
     throw new Error('GET /api/agent/task-capabilities returned no task_capabilities map');
@@ -1142,7 +1146,7 @@ export function __resetTaskCapabilityContractLoadedForTesting(): void {
 }
 
 export function log(msg: string) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
+  console.log(`[${new Date().toISOString()}] ${sanitize(msg)}`);
 }
 
 // ── Warm-VM continuity polling (Phase 2a) ───────────────────────────────────
@@ -1963,6 +1967,10 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         log(`WARNING: Memory at ${(memPct * 100).toFixed(0)}% of cgroup limit (${metrics.cgroup_mb}MB / ${metrics.cgroup_limit_mb}MB) — OOM kill imminent`);
       }
     }
+    // Low disk warning — git/npm operations fail silently when /tmp is full
+    if (metrics.disk_free_mb !== undefined && metrics.disk_free_mb < 512) {
+      log(`WARNING: Low disk space: ${metrics.disk_free_mb}MB free on /tmp`);
+    }
     const fix_loop_events = collectFixLoopEventsForFlush();
     const statusMessage = getMessage();
     const tool_trace = snapshotToolTrace({ refreshLastEntry: statusMessage.startsWith('Using tool:') });
@@ -2266,7 +2274,7 @@ async function connectLogStream(taskId: string): Promise<WebSocket | null> {
   return null;
 }
 
-export { sanitize };
+export { sanitize, sanitizeError };
 
 export function readHandlerOutput(
   taskId: string,
@@ -2558,7 +2566,7 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
     } catch (e) {
       if (attempt === CLONE_MAX_RETRIES - 1) throw e;
       const delay = CLONE_RETRY_BASE_DELAY * Math.pow(2, attempt);
-      log(`Git clone failed (attempt ${attempt + 1}/3), retrying in ${delay / 1000}s: ${e instanceof Error ? e.message : String(e)}`);
+      log(`Git clone failed (attempt ${attempt + 1}/3), retrying in ${delay / 1000}s: ${sanitize(e instanceof Error ? e.message : String(e))}`);
       try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' }); } catch { /* ignore */ }
       await new Promise(r => setTimeout(r, delay));
     }
@@ -3059,7 +3067,7 @@ export async function main() {
         }
         return;
       }
-      log(`Cannot report pre-claim failure — TASK_ID env not set. Reason: ${reason}`);
+      log(`Cannot report pre-claim failure — TASK_ID env not set. Reason: ${truncated}`);
       return;
     }
     log(`Reporting pre-claim failure for task ${reportTaskId}: ${truncated}`);
@@ -3411,8 +3419,21 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
 
   try {
     // Get GitHub credentials
+    // Timeout must cover the backend's worst case for get_github_token_for_task:
+    // _github_request sleeps up to 120s on a near-empty rate-limit bucket, plus up
+    // to 3 retries each with a 15s httpx timeout. 180s comfortably covers the full
+    // backoff. The same path is already covered at 240s for the PR-create call
+    // (line ~2724); the token-only fetch here uses 180s (no extra GitHub round-trips
+    // beyond token minting). Any failure here is infrastructure, not a code fault.
     statusRef.value = 'Fetching GitHub credentials...';
-    const ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string; owner: string; repo: string } };
+    let ghRes: { data: { token: string; owner: string; repo: string } };
+    try {
+      ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
+      throw err;
+    }
     const { token: ghToken, owner, repo } = ghRes.data;
     log(`GitHub: ${owner}/${repo}`);
 
@@ -3552,7 +3573,7 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // Per-role /tmp scratch cleanup. Workspace teardown happens at process
     // exit (in main()'s outer finally) so warm continuity preserves it.
     try { fs.unlinkSync(`/tmp/agent_prompt_${taskId}.txt`); } catch { /* ignore */ }
-    for (const name of ['review_verdict', 'panel_review_lens_correctness', 'panel_review_lens_security', 'panel_review_lens_code_quality', 'panel_review_lens_test_coverage', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'verify_tests_result', 'debug_output', 'perf_output', 'investigation_report', 'strategic_output', 'design_doc_output']) {
+    for (const name of TMP_OUTPUT_NAMES) {
       try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch { /* ignore */ }
     }
   }
@@ -3566,12 +3587,13 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
 // every failure mode (uncaughtException, SIGTERM, cgroup OOM SIGKILL)
 // looks identical: heartbeats stop, task stays IN_PROGRESS, no evidence.
 function _crashReport(label: string, detail: string, exitCode: number) {
-  console.error(`[FATAL] ${label}: ${detail}`);
+  const safeDetail = sanitize(detail);
+  console.error(`[FATAL] ${label}: ${safeDetail}`);
   // Local file marker before any network attempt — survives even if the
   // sendHeartbeatSync curl times out or the network is partitioned. Combined
   // with serial-console capture (plan task 25075953), we get the agent's
   // last words even when the heartbeat never lands.
-  recordFinalState(`crash:${label}`, detail);
+  recordFinalState(`crash:${label}`, safeDetail);
   // Synchronous curl — fire-and-forget fetch() couldn't guarantee the write
   // flushed before process.exit, so crashes would show up as silent heartbeat
   // timeouts instead of explained failures. 3s timeout in the signal-handler
@@ -3594,7 +3616,7 @@ function _crashReport(label: string, detail: string, exitCode: number) {
   if (taskId) {
     try {
       const metrics = collectMetrics();
-      const msg = `[FATAL:${reportLabel}] ${detail.slice(0, 300)}`;
+      const msg = `[FATAL:${reportLabel}] ${safeDetail.slice(0, 300)}`;
       sendHeartbeatSync(taskId, `[${metrics.heap_used_mb}MB cg:${metrics.cgroup_mb || '?'}MB] ${msg}`, undefined, 3_000);
     } catch { /* best effort — we're dying anyway */ }
   }

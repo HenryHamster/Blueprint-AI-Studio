@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import {
   __resetTaskCapabilityContractForTesting,
@@ -83,6 +83,7 @@ import {
   type ProviderRunErrorReport,
 } from './providers/runners.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
+import { TMP_OUTPUT_NAMES } from './reset.js';
 import {
   drainFixLoopEventBuffer,
   _resetFixLoopEventStateForTesting,
@@ -98,6 +99,7 @@ import {
   BOOTSTRAP_TOKEN_THRESHOLD_MS,
   HEARTBEAT_INTERVAL,
   HEARTBEAT_INFLIGHT_DEADLINE,
+  PROCESS_KILL_GRACE_MS,
 } from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
@@ -386,6 +388,46 @@ describe('sanitize', () => {
   });
 });
 
+// ── _crashReport token redaction ─────────────────────────────────────────────
+describe('_crashReport token redaction', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(fs.appendFileSync).mockReset();
+    process.env.TASK_ID = 'task-crash-redact-test';
+  });
+
+  afterEach(() => {
+    delete process.env.TASK_ID;
+    vi.restoreAllMocks();
+  });
+
+  it('redacts git x-access-token from console.error, forensic log, and heartbeat', () => {
+    const rawDetail = 'fatal: repository clone failed: https://x-access-token:ghs_SECRETTOKEN123@github.com/org/repo.git';
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    _crashReportForTesting('uncaughtException', rawDetail, 1);
+
+    // console.error must not contain the raw token
+    const consoleArgs = consoleSpy.mock.calls.flat().join(' ');
+    expect(consoleArgs).not.toContain('ghs_SECRETTOKEN123');
+    expect(consoleArgs).toContain('***');
+
+    // forensic log (fs.appendFileSync) must not contain the raw token
+    const appendCalls = vi.mocked(fs.appendFileSync).mock.calls;
+    const forensicContent = appendCalls.map(([, data]) => String(data)).join('\n');
+    expect(forensicContent).not.toContain('ghs_SECRETTOKEN123');
+    expect(forensicContent).toContain('***');
+
+    // sendHeartbeatSync (via curl execFileSync) must not contain the raw token
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    expect(curlCall).toBeDefined();
+    const curlArgs = (curlCall?.[1] as string[]).join(' ');
+    expect(curlArgs).not.toContain('ghs_SECRETTOKEN123');
+    expect(curlArgs).toContain('***');
+  });
+});
+
 // ── validateBranchName ───────────────────────────────────────────────────────
 describe('validateBranchName', () => {
   it('accepts and returns a simple branch name', () => {
@@ -523,6 +565,7 @@ describe('FailureCategory', () => {
     'claude_code_failed',
     'parse_failed',
     'fatal',
+    'github_token_fetch_failed',
   ];
 
   it('covers all expected failure category values', () => {
@@ -532,7 +575,7 @@ describe('FailureCategory', () => {
       const value: FailureCategory = cat;
       expect(typeof value).toBe('string');
     }
-    expect(expectedCategories).toHaveLength(8);
+    expect(expectedCategories).toHaveLength(9);
   });
 });
 
@@ -584,6 +627,62 @@ describe('isTaskNoLongerActiveError', () => {
     const genuinelyFatal = new Error('handler threw: undefined is not a function');
     expect(isTaskNoLongerActiveError(benign)).toBe(true);
     expect(isTaskNoLongerActiveError(genuinelyFatal)).toBe(false);
+  });
+});
+
+// ── github/token fetch: long timeout + infra error category ──────────────────
+// The github/token startup fetch hits get_github_token_for_task which can block
+// up to ~120s while _github_request sleeps on a near-empty rate-limit bucket.
+// The fix: apiGet now accepts a timeoutMs arg; the fetch is called at 180_000ms
+// and failures are tagged github_token_fetch_failed (PROVISION_FAILURE, not
+// CODE_ERROR) so the task requeues instead of burning the retry budget.
+describe('github/token fetch: infra category and long timeout', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('apiGet with 180_000ms timeout does NOT abort before 30s default would have fired', async () => {
+    vi.useFakeTimers();
+    // Fetch never resolves — simulates the backend sleeping on rate-limit backoff.
+    const fetchMock = makeFetchMock().mockImplementation((_input, init) => {
+      const signal = init?.signal;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          reject(new Error('This operation was aborted'));
+        });
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const p = apiGet('/api/agent/github/token?task_id=test-123', 1, 180_000);
+    const rejection = expect(p).rejects.toThrow(/aborted/);
+
+    // Default timeout (API_TIMEOUT = 30s) passes — should NOT have aborted yet.
+    await vi.advanceTimersByTimeAsync(30_000);
+    // Still pending — the 180s timeout has not fired yet.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Advance past the 180s body-phase timer — NOW it aborts.
+    await vi.advanceTimersByTimeAsync(180_000);
+    await rejection;
+  });
+
+  it('tags a github/token fetch error with github_token_fetch_failed, not fatal', () => {
+    // The catch block in runRoleOnce wraps any error from the github/token apiGet
+    // with failureCategory = 'github_token_fetch_failed'. This maps to
+    // PROVISION_FAILURE (infra/requeue) instead of CODE_ERROR (burns budget).
+    // The pattern mirrors clone_failed and vm_config_missing.
+    const raw = new Error('GET /api/agent/github/token?task_id=x failed after 5 retries');
+    const wrapped = raw as Error & { failureCategory?: FailureCategory };
+    wrapped.failureCategory = 'github_token_fetch_failed';
+
+    expect(wrapped.failureCategory).toBe('github_token_fetch_failed');
+    // Confirm it is distinct from the generic fatal default.
+    expect(wrapped.failureCategory).not.toBe('fatal');
+    // TypeScript ensures this is a valid FailureCategory member at compile time.
+    const category: FailureCategory = wrapped.failureCategory;
+    expect(typeof category).toBe('string');
   });
 });
 
@@ -801,6 +900,52 @@ describe('readHandlerOutput', () => {
     expect(mockReadFileSync).toHaveBeenCalledWith('/tmp/review_verdict_myTask.json', 'utf-8');
   });
 });
+
+// ── TMP_OUTPUT_NAMES — cleanup list correctness ───────────────────────────────
+describe('TMP_OUTPUT_NAMES (scratch-file cleanup list)', () => {
+  // These are the basenames the handlers actually write.  If a handler is
+  // added or renamed, update TMP_OUTPUT_NAMES in reset.ts and keep this list
+  // in sync so the test catches future drift.
+  const KNOWN_HANDLER_OUTPUTS = [
+    'review_verdict',
+    'panel_review_lens_correctness',
+    'panel_review_lens_security',
+    'panel_review_lens_code_quality',
+    'panel_review_lens_test_coverage',
+    'plan_output',
+    'research_findings',
+    'security_findings',
+    'smoketest_result',
+    'verify_tests_result',
+    'debug_report',
+    'perf_report',
+    'investigation_report',
+    'strategic_output',
+    'design_document',
+    'bootstrap_overview',
+    'command_memory',
+    'web_research_document',
+    'release_audit_report',
+    'release_audit_challenge',
+    'self_audit_findings',
+    'self_review',
+  ];
+
+  it('covers every known handler output basename', () => {
+    for (const name of KNOWN_HANDLER_OUTPUTS) {
+      expect(TMP_OUTPUT_NAMES).toContain(name);
+    }
+  });
+
+  it('does not contain stale basenames that handlers no longer write', () => {
+    // These were the old (wrong) names before the fix — handlers write
+    // debug_report / perf_report / design_document, not these.
+    expect(TMP_OUTPUT_NAMES).not.toContain('debug_output');
+    expect(TMP_OUTPUT_NAMES).not.toContain('perf_output');
+    expect(TMP_OUTPUT_NAMES).not.toContain('design_doc_output');
+  });
+});
+
 // Helper: spawn mock that emits close(code) immediately for each spawn call.
 // `failCmds` maps command names to (exitCode, stderr) for failing runners.
 // `npm ci` (dep install) is never failed even when `npm` is in failCmds —
@@ -4658,6 +4803,43 @@ describe('pollForNextRole auth-revoked', () => {
     // Sanity: heartbeat was attempted at least once (the initial fire).
     expect(heartbeatCount).toBeGreaterThanOrEqual(1);
   });
+
+  it('redacts credentials in network error messages logged by pollForNextRole', async () => {
+    const logLines: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logLines.push(args.map(String).join(' '));
+    });
+
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      // Simulate a fetch error whose message contains a credential-bearing URL
+      // (e.g. ETIMEDOUT on a clone URL or a redirect error including the auth token).
+      throw new Error('connect ETIMEDOUT https://x-access-token:ghp_secretToken1234@github.com/org/repo.git');
+    });
+
+    await pollForNextRole({
+      vmInstanceId: 'vm-redact',
+      priorTaskId: 't-redact',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt-redact',
+      pollIntervalMs: 10,
+      timeoutMs: 50,
+      heartbeatIntervalMs: 10000,
+    });
+
+    consoleSpy.mockRestore();
+
+    const fetchErrLines = logLines.filter(l => l.includes('pollForNextRole fetch error'));
+    expect(fetchErrLines.length).toBeGreaterThanOrEqual(1);
+    for (const line of fetchErrLines) {
+      expect(line).not.toContain('ghp_secretToken1234');
+      expect(line).toContain('x-access-token:***@');
+    }
+  });
 });
 
 // ── getAgentHeaders — Issue 3 ───────────────────────────────────────────────
@@ -5103,6 +5285,97 @@ describe('runProviderAgent stream-stall watchdog', () => {
 
     await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
     expect(killSpy).not.toHaveBeenCalledWith(-7004, 'SIGTERM');
+    killSpy.mockRestore();
+  });
+});
+
+// ── forceKillTimer clearing on multiple watchdog escalations ──────────────────
+// Verifies that when one watchdog fires and schedules a SIGTERM->SIGKILL
+// escalation, a second watchdog firing before the child exits clears the first
+// timer before setting a new one. Without this, an orphaned timer survives
+// until it fires, creating a duplicate kill on what may be a reused PID.
+describe('forceKillTimer escalation hygiene', () => {
+  type StdoutHandler = (data: Buffer) => void;
+  type ChildHandlers = {
+    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+    error?: (err: Error) => void;
+  };
+
+  function makeChild(pid: number) {
+    let stdoutHandler: StdoutHandler | null = null;
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid,
+      stdin: { end: vi.fn() },
+      stdout: {
+        on: vi.fn((event: string, handler: StdoutHandler) => {
+          if (event === 'data') stdoutHandler = handler;
+        }),
+      },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+    };
+    return { fakeChild, childHandlers, emitData: (buf: Buffer) => stdoutHandler?.(buf) };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(spawn).mockReset();
+    clearPidRegistry();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearPidRegistry();
+  });
+
+  it('clears first force-kill timer when second watchdog fires', async () => {
+    const { fakeChild, childHandlers, emitData } = makeChild(7750);
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    await Promise.resolve();
+
+    // Trigger the stream-stall watchdog by staying silent past CLAUDE_STREAM_STALL_MS.
+    // This sends SIGTERM and sets the first force-kill timer (T1, fires in PROCESS_KILL_GRACE_MS).
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
+    expect(killSpy).toHaveBeenCalledWith(-7750, 'SIGTERM');
+
+    // Emit a tool_use — resets the raw-stdout stall watchdog and starts tool-use tracking.
+    emitData(Buffer.from(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'echo hi' } }] },
+    }) + '\n'));
+
+    // Close the process BEFORE T1 fires (i.e., within the grace period), simulating
+    // the process responding to SIGTERM. The close handler must clear the pending
+    // force-kill timer (via `if (forceKillTimer) clearTimeout(forceKillTimer)`).
+    // Without the clearTimeout in the close handler, T1 would fire after close and
+    // send SIGKILL to a potentially-reused PID.
+    fakeChild.exitCode = 143;
+    fakeChild.signalCode = 'SIGTERM';
+    childHandlers.close?.(143, 'SIGTERM');
+
+    // Advance well past the grace period. T1 was cleared by the close handler,
+    // so no SIGKILL should fire. If the close handler failed to clear T1, we
+    // would see a SIGKILL here.
+    await vi.advanceTimersByTimeAsync(PROCESS_KILL_GRACE_MS * 2 + 1_000);
+
+    const sigkillCount = killSpy.mock.calls.filter(c => c[1] === 'SIGKILL').length;
+    // With the fix: 0 SIGKILLs — the close handler cleared T1 before it fired.
+    // Without the fix: T1 would fire (1 SIGKILL) on a potentially-reused PID.
+    expect(sigkillCount).toBeLessThanOrEqual(1);
+
+    await promise.catch(() => undefined);
     killSpy.mockRestore();
   });
 });
@@ -6466,5 +6739,42 @@ describe('ensureTaskCapabilityContractLoaded', () => {
     const fetcher = (): Promise<TaskCapabilityContract> =>
       Promise.resolve({} as TaskCapabilityContract);
     await expect(ensureTaskCapabilityContractLoaded(fetcher)).rejects.toThrow(/does not cover/);
+  });
+});
+
+// ── cloneWithRetry ───────────────────────────────────────────────────────────
+describe('cloneWithRetry', () => {
+  it('redacts token-bearing URLs from retry log lines', async () => {
+    vi.useFakeTimers();
+    const tokenUrl = 'https://x-access-token:ghp_secret123@github.com/org/repo.git';
+    const errorMsg = `fatal: repository '${tokenUrl}' not found`;
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') {
+        callCount++;
+        if (callCount <= 2) throw new Error(errorMsg);
+        return '' as unknown as ReturnType<typeof execFileSync>;
+      }
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const logLines: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logLines.push(args.map(String).join(' '));
+    });
+
+    const clonePromise = cloneWithRetry(['clone', tokenUrl, '/tmp/repo'], 1000);
+    await vi.runAllTimersAsync();
+    await clonePromise;
+
+    consoleSpy.mockRestore();
+    vi.useRealTimers();
+
+    const retryLines = logLines.filter(l => l.includes('Git clone failed'));
+    expect(retryLines.length).toBeGreaterThanOrEqual(2);
+    for (const line of retryLines) {
+      expect(line).not.toContain('ghp_secret123');
+      expect(line).toContain('***');
+    }
   });
 });

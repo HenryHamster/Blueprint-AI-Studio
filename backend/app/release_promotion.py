@@ -42,6 +42,7 @@ from app.release_artifacts import (
     get_or_create_release_deploy_artifact,
 )
 from app.notification_dispatch import post_event_message
+from app.release_scoring import _DEFAULT_POLICY, compute_composite
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     get_project_promotion_target as _get_project_promotion_target,
@@ -230,6 +231,78 @@ def _parse_iso_dt(raw: Any) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _recover_confidence_from_ci_unresolved(
+    base_record: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return base_record with confidence recovered from a ci_unresolved blocker.
+
+    When ci_unresolved forces confidence to 0.0, sub_scores still carry the real
+    per-dimension values (always computed before the early return in
+    compute_composite). This re-runs compute_composite with ci_green=True so
+    durable promotion records carry the real qualified confidence, not 0.00.
+
+    Returns base_record unchanged when the blocker is not ci_unresolved.
+    Adds confidence_recovery_failed=True when sub_scores are absent/malformed.
+    """
+    if base_record.get("blocker") != "ci_unresolved":
+        return base_record
+
+    sub_scores = base_record.get("sub_scores")
+    if not isinstance(sub_scores, dict):
+        if float(base_record.get("confidence") or 0.0) == 0.0:
+            return {
+                **base_record,
+                "confidence_recovery_failed": True,
+                "confidence_recovery_failure_reason": "sub_scores absent or not a dict",
+            }
+        return base_record
+
+    audit_raw = sub_scores.get("audit")
+    test_erosion_raw = sub_scores.get("test_erosion")
+    smoketest_raw = sub_scores.get("smoketest")
+    smoketest_enabled = bool(base_record.get("smoketest_enabled", True))
+
+    if not isinstance(audit_raw, (int, float)) or isinstance(audit_raw, bool):
+        return {
+            **base_record,
+            "confidence_recovery_failed": True,
+            "confidence_recovery_failure_reason": "sub_scores.audit not numeric",
+        }
+    if not isinstance(test_erosion_raw, (int, float)) or isinstance(
+        test_erosion_raw, bool
+    ):
+        return {
+            **base_record,
+            "confidence_recovery_failed": True,
+            "confidence_recovery_failure_reason": "sub_scores.test_erosion not numeric",
+        }
+
+    _policy = policy or _DEFAULT_POLICY
+    smoketest_score = (
+        float(smoketest_raw)
+        if isinstance(smoketest_raw, (int, float))
+        and not isinstance(smoketest_raw, bool)
+        else None
+    )
+
+    recovered = compute_composite(
+        ci_green=True,
+        audit_score=float(audit_raw),
+        test_erosion=float(test_erosion_raw),
+        smoketest_score=smoketest_score,
+        policy=_policy,
+        smoketest_enabled=smoketest_enabled,
+    )
+
+    return {
+        **base_record,
+        "confidence": recovered["confidence"],
+        "blocker": recovered.get("blocker"),
+        "confidence_recovered_from_ci_unresolved": True,
+    }
 
 
 async def _record_qualification_verdict(
@@ -1262,6 +1335,46 @@ async def promote(
                 "pr_url": pr_url,
                 "managed_check_wait": True,
             }
+
+        # No-CI repo guard: if the project declares it has no CI checks, native
+        # auto-merge will never fire (no checks will ever run), so handing the
+        # PR to GitHub native auto-merge leaves the version stranded indefinitely.
+        # Enter managed_check_wait instead so the reconciler retries the merge
+        # directly on the next sweep (which will see no_checks and proceed).
+        from app.ci_resolution import requires_ci_checks
+
+        if not requires_ci_checks(project):
+            logger.info(
+                "[RELEASE_QUALIFIER] promote: promotion PR #%s for v%d pending "
+                "merge on a no-CI repo — entering managed_check_wait instead of "
+                "native auto-merge; reconciler will retry the merge directly",
+                pr_number,
+                version.version_number,
+            )
+            locked = await _relock_version_for_promotion_write(
+                session, version, lock_released=True
+            )
+            if locked is not None and locked.status == "open":
+                q = dict(locked.last_qualification or {})
+                q.update(base_record)
+                q["status"] = "pending"
+                q["promotion_pending"] = {
+                    "pr_number": pr_number,
+                    "pr_url": pr_url,
+                    "auto_merge_enabled": False,
+                    "managed_check_wait": True,
+                    "why_not_native_automerge": "no_ci_repo",
+                    "enabled_at": _utcnow().isoformat(),
+                }
+                locked.last_qualification = q
+                session.add(locked)
+            return {
+                "status": "pending_managed_check_wait",
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "managed_check_wait": True,
+            }
+
         try:
             am_result = await github.enable_auto_merge(
                 token,

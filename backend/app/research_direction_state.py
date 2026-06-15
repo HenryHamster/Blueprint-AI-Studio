@@ -31,6 +31,7 @@ from app.models import (
 )
 from app.broadcast import broadcast_to_project
 from app.direction_metrics import _fold_evicted_into_aggregate
+from app.direction_outcomes import verified_merged_count
 from app.research_context import (
     _build_research_context,
     build_recent_findings_evidence,
@@ -102,12 +103,12 @@ def _merge_finding_challenge_summary(target: dict, source: dict) -> None:
     target["fail_closed_unparseable"] += source.get("fail_closed_unparseable") or 0
     for key in _CHALLENGE_AGREEMENT_BUCKETS:
         target["agreement_distribution"][key] += (
-            (source.get("agreement_distribution") or {}).get(key) or 0
-        )
+            source.get("agreement_distribution") or {}
+        ).get(key) or 0
     for key in _CHALLENGE_BOUNDARY_BUCKETS:
         target["boundary_distribution"][key] += (
-            (source.get("boundary_distribution") or {}).get(key) or 0
-        )
+            source.get("boundary_distribution") or {}
+        ).get(key) or 0
 
 
 def _append_evicted_findings(direction: dict, new_entries: list) -> None:
@@ -155,11 +156,30 @@ def _append_archived_diagnosis(doc: dict, direction: dict, direction_id: str) ->
 
 
 def _compute_saturation(history: list) -> bool:
-    """Return True if last 3 cycles all produced 0 or 1 tasks."""
-    if len(history) < 3:
+    """Return True if last 3 *genuine* cycles all produced 0 or 1 tasks.
+
+    A cycle is dedup-zeroed (not genuine) when tasks_created==0 and dedup
+    filters (hash_dedup or word_overlap_dedup) account for the zero — meaning
+    the agent found real content but it was rejected as already-known. Those
+    cycles do not prove the direction is exhausted, so they are skipped when
+    building the saturation window.
+    """
+    genuine = []
+    for entry in reversed(history):
+        if entry.get("tasks_created", 0) == 0:
+            fb = entry.get("filter_breakdown") or {}
+            dedup_count = (fb.get("hash_dedup") or 0) + (
+                fb.get("word_overlap_dedup") or 0
+            )
+            if dedup_count > 0:
+                # Dedup-zeroed cycle — skip, not genuine exhaustion
+                continue
+        genuine.append(entry)
+        if len(genuine) == 3:
+            break
+    if len(genuine) < 3:
         return False
-    recent = history[-3:]
-    return all(entry.get("tasks_created", 0) <= 1 for entry in recent)
+    return all(entry.get("tasks_created", 0) <= 1 for entry in genuine)
 
 
 def _detect_dedup_deadlock(history: list, window: int = 3) -> tuple[bool, int]:
@@ -197,6 +217,34 @@ def _detect_dedup_deadlock(history: list, window: int = 3) -> tuple[bool, int]:
     return True, consecutive
 
 
+def _detect_already_fixed_deadlock(history: list, window: int = 3) -> tuple[bool, int]:
+    """Detect already-fixed deadlock: last `window` consecutive history entries whose
+    spawned tasks all terminated as SCOPE_EMPTY no-ops.
+
+    Unlike the dedup deadlock (tasks_created==0), this mode DOES create tasks each
+    cycle — the tasks simply terminate as CANCELLED+SCOPE_EMPTY because the work was
+    already done on HEAD. Only entries that have ``scope_empty_noop_count`` populated
+    (written by ``_update_direction_research_outcomes`` after child termination) are
+    eligible. Legacy entries without the key stop the consecutive window.
+
+    Returns (is_deadlocked, consecutive_noop_count).
+    """
+    consecutive = 0
+    for e in reversed(history):
+        if "scope_empty_noop_count" not in e:
+            # Legacy entry without the field — treat as window break.
+            break
+        tasks_created = e.get("tasks_created", 0)
+        scope_empty = e.get("scope_empty_noop_count", 0)
+        if tasks_created >= 1 and scope_empty >= tasks_created:
+            consecutive += 1
+        else:
+            break
+    if consecutive < window:
+        return False, 0
+    return True, consecutive
+
+
 def direction_refractory_minutes() -> float:
     """Refractory window stamped on a direction when its research cycle completes.
 
@@ -223,6 +271,20 @@ def direction_saturation_refractory_minutes() -> float:
     return 2.0 * direction_refractory_minutes()
 
 
+def direction_dedup_deadlock_recovery_hours() -> float:
+    """Cooldown for dedup-deadlocked directions before auto-recovery.
+
+    Shorter than the general ``direction_auto_recovery_hours`` (48h default)
+    because dedup-deadlocks often resolve as soon as in-flight tasks drain —
+    a shorter cooldown lets the direction re-enter rotation sooner.  The
+    general 48h floor applies if this value is not explicitly configured.
+    """
+    value = _runtime_config.get("dedup_deadlock_auto_recovery_hours")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return 8.0
+
+
 async def apply_post_spawn_state(
     session: AsyncSession,
     task: Task,
@@ -244,6 +306,7 @@ async def apply_post_spawn_state(
     parent_research_task_id: str | None,
     batch_cap_applied_count: int = 0,
     filtered_findings: List[Dict[str, Any]] | None = None,
+    type_filtered_by_dir: dict | None = None,
 ) -> None:
     """Apply all direction-state updates after research child tasks have been spawned.
 
@@ -266,6 +329,13 @@ async def apply_post_spawn_state(
         did = (ct.context or {}).get("direction_id")
         if did:
             direction_ids_with_findings.add(did)
+    # Include directions that produced deduplicated (actionable) findings even
+    # when no child tasks were created (e.g. testing, deferred spawn, or task
+    # creation failure) so each such direction still gets a history entry.
+    for _orig_i, _finding, _fhash in deduplicated:
+        _did = _finding.get("direction_id")
+        if _did:
+            direction_ids_with_findings.add(_did)
     # If all findings were deduped OR no findings at all, still put the current
     # direction on cooldown and record a cycle entry. This closes a blind spot
     # where research tasks that completed with zero actionable findings (agent
@@ -464,7 +534,7 @@ async def apply_post_spawn_state(
                             "evidence_overlap_dedup": evidence_overlap_by_dir.get(
                                 did, 0
                             ),
-                            "type_filtered": type_filtered_count,
+                            "type_filtered": (type_filtered_by_dir or {}).get(did, 0),
                             "empty_prompt": empty_prompt_count,
                         },
                     }
@@ -490,9 +560,13 @@ async def apply_post_spawn_state(
                     # is not immediately re-queued on a direction that has no work left.
                     if d.get("possibly_saturated"):
                         _sat_refractory_min = direction_saturation_refractory_minutes()
-                        if isinstance(_sat_refractory_min, (int, float)) and _sat_refractory_min > 0:
+                        if (
+                            isinstance(_sat_refractory_min, (int, float))
+                            and _sat_refractory_min > 0
+                        ):
                             d["refractory_until"] = (
-                                _utcnow() + timedelta(minutes=float(_sat_refractory_min))
+                                _utcnow()
+                                + timedelta(minutes=float(_sat_refractory_min))
                             ).isoformat()
 
                     # Deadlock detection: 3+ consecutive 0-task cycles driven by dedup
@@ -573,6 +647,86 @@ async def apply_post_spawn_state(
                                 f"[RESEARCH] Dedup deadlock: direction {did}, "
                                 f"{_consec} consecutive empty cycles (task {task.id})"
                             )
+                        # Auto-pause the direction to remove it from the research
+                        # rotation. The existing auto-recovery path in
+                        # direction_lifecycle._process_direction_lifecycle reactivates
+                        # it once the cooldown elapses (direction_dedup_deadlock_recovery_hours,
+                        # default 8h), giving in-flight tasks time to drain and HEAD
+                        # to advance so genuinely-new findings become possible.
+                        # needs_manual_intervention is intentionally NOT set here so
+                        # the time-based recovery fires unblocked.
+                        d["status"] = "paused"
+                        d["auto_paused"] = True
+                        d["paused_at"] = now_iso
+                        d["paused_reason"] = (
+                            f"dedup_deadlock: {_consec} consecutive zero-task cycles"
+                        )
+                        d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
+                        logger.info(
+                            f"[RESEARCH] Auto-paused direction {did} (dedup_deadlock, "
+                            f"{_consec} consecutive empty cycles, task {task.id})"
+                        )
+
+                    # Already-fixed deadlock detection: check prior completed cycles
+                    # (exclude the just-added entry — its children haven't resolved yet).
+                    _af_deadlocked, _af_consec = _detect_already_fixed_deadlock(
+                        d["research_history"][:-1]
+                    )
+                    if _af_deadlocked and d.get("status") == "active":
+                        _existing_af_alert = (
+                            (
+                                await session.execute(
+                                    select(Alert).where(
+                                        Alert.project_id == task.project_id,
+                                        Alert.title
+                                        == "Already-fixed deadlock detected",
+                                        Alert.dismissed_at.is_(None),
+                                        Alert.message.contains(did),
+                                    )
+                                )
+                            )
+                            .scalars()
+                            .first()
+                        )
+                        if not _existing_af_alert:
+                            _af_alert = Alert(
+                                project_id=task.project_id,
+                                severity=AlertSeverity.WARNING,
+                                title="Already-fixed deadlock detected",
+                                message=(
+                                    f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
+                                    f"{_af_consec} consecutive research cycles whose spawned "
+                                    f"tasks all terminated as SCOPE_EMPTY (work already done "
+                                    f"on HEAD). The direction is spending compute re-discovering "
+                                    f"already-shipped fixes."
+                                ),
+                                task_id=task.id,
+                            )
+                            session.add(_af_alert)
+                            _af_msg = ProjectMessage(
+                                project_id=task.project_id,
+                                message_type=MessageType.BUG_REPORT,
+                                from_type="agent",
+                                from_task_id=task.id,
+                                content=(
+                                    f"Already-fixed deadlock for direction "
+                                    f"'{d.get('text', did)[:80]}' (id: {did}): "
+                                    f"{_af_consec} consecutive research cycles produced tasks "
+                                    f"that all resolved as SCOPE_EMPTY (the work was already "
+                                    f"done on HEAD). Consider resetting the direction's scope "
+                                    f"or retiring it if the goal is fully achieved."
+                                ),
+                                context={
+                                    "source": "already_fixed_deadlock",
+                                    "direction_id": did,
+                                    "consecutive_noop_cycles": _af_consec,
+                                },
+                            )
+                            session.add(_af_msg)
+                            logger.warning(
+                                f"[RESEARCH] Already-fixed deadlock: direction {did}, "
+                                f"{_af_consec} consecutive scope-empty cycles (task {task.id})"
+                            )
 
                     _evicted_out: list = []
                     d["research_context"] = _build_research_context(
@@ -607,16 +761,21 @@ async def apply_post_spawn_state(
 
                     record_outcome_progress_snapshot(d)
 
-                    # Auto-complete direction if saturated with sufficient merged PRs
-                    if (
-                        d.get("status") == "active"
-                        and d.get("possibly_saturated")
-                        and entry.get("tasks_created", 0) > 0
-                    ):
+                    # Auto-complete direction if saturated with sufficient merged PRs.
+                    # The tasks_created guard is intentionally omitted: a fully-exhausted
+                    # direction (all findings deduped, zero tasks spawned) is exactly the
+                    # case that should trigger auto-completion, not escape it.
+                    if d.get("status") == "active" and d.get("possibly_saturated"):
                         history = d.get("research_history", [])
                         agg = d.get("history_aggregate", {})
-                        total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-                            agg.get("total_prs_merged") or 0
+                        total_merged = sum(
+                            verified_merged_count(e) for e in history
+                        ) + int(
+                            agg.get(
+                                "total_verified_prs_merged",
+                                agg.get("total_prs_merged", 0),
+                            )
+                            or 0
                         )
                         if total_merged >= 3:
                             total_cycles = len(history) + (agg.get("total_cycles") or 0)
@@ -625,7 +784,7 @@ async def apply_post_spawn_state(
                             d["auto_completed"] = True
                             d["auto_completed_reason"] = (
                                 f"Auto-completed: direction saturated with {total_merged} "
-                                f"total PRs merged across {total_cycles} cycles"
+                                f"verified PRs merged across {total_cycles} cycles"
                             )
                             # Capture diagnosis info for deferred design_doc write
                             # inside with_design_doc_locked (after the directions commit).
@@ -636,7 +795,7 @@ async def apply_post_spawn_state(
                                 title="Direction auto-completed",
                                 message=(
                                     f"Direction '{d.get('text', did)[:80]}' was auto-completed: "
-                                    f"saturated with {total_merged} PRs merged across {total_cycles} cycles."
+                                    f"saturated with {total_merged} verified PRs merged across {total_cycles} cycles."
                                 ),
                             )
                             session.add(alert)

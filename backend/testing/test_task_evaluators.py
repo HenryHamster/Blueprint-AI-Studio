@@ -489,10 +489,21 @@ def test_compute_malformed_criterion_is_ignored():
 # ── StructuredVerdictStrategy ───────────────────────────────────────────────
 
 
-def test_structured_verdict_missing_contract_fails():
-    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), '{"verdict":"APPROVE"}')
+def test_structured_verdict_no_verdict_signal_fails():
+    # A payload with no APPROVE/REQUEST_CHANGES signal anywhere — truly absent,
+    # no anchored token, no overall_verdict — must fail the gate.
+    v = StructuredVerdictStrategy().evaluate(
+        _task("panel_review"), '{"analysis":"looks good","confidence":0.9}'
+    )
     assert v.passed is False
     assert "structured verdict" in v.reason.lower()
+
+
+def test_structured_verdict_verdict_field_resolves_via_fallback():
+    # {"verdict":"APPROVE"} uses the wrong field name (not overall_verdict) but
+    # the anchored-prose floor resolves "verdict":"APPROVE" as a clear signal.
+    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), '{"verdict":"APPROVE"}')
+    assert v.passed is True
 
 
 def test_structured_verdict_valid_panel_review_passes():
@@ -526,7 +537,9 @@ def _panel_lenses(*, drop_field: tuple[str, str] | None = None) -> dict:
     return lenses
 
 
-def test_structured_verdict_present_lens_missing_verdict_fails():
+def test_structured_verdict_incomplete_lens_verdict_still_passes():
+    # Lenses are optional telemetry — a lens with a missing verdict field is
+    # skipped, but the overall_verdict still resolves and the gate passes.
     payload = json.dumps(
         {
             "overall_verdict": "APPROVE",
@@ -535,11 +548,12 @@ def test_structured_verdict_present_lens_missing_verdict_fails():
         }
     )
     v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
-    assert v.passed is False
-    assert "structured verdict" in v.reason.lower()
+    assert v.passed is True
+    assert v.strategy == "structured-verdict"
 
 
-def test_structured_verdict_present_lens_missing_summary_fails():
+def test_structured_verdict_incomplete_lens_summary_still_passes():
+    # A lens with a missing summary field is skipped; overall_verdict resolves.
     payload = json.dumps(
         {
             "overall_verdict": "APPROVE",
@@ -548,8 +562,8 @@ def test_structured_verdict_present_lens_missing_summary_fails():
         }
     )
     v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
-    assert v.passed is False
-    assert "structured verdict" in v.reason.lower()
+    assert v.passed is True
+    assert v.strategy == "structured-verdict"
 
 
 def test_structured_verdict_non_json_garbage_fails():
@@ -837,6 +851,7 @@ def test_parse_finding_challenge_disagrees():
         "schema_version": FINDING_CHALLENGE_RECORD_SCHEMA_VERSION,
         "source_task_id": None,
         "produced_by": "challenge_sidecar",
+        "finding_hash": None,
     }
 
 
@@ -1021,6 +1036,79 @@ def test_parse_finding_challenge_backward_compat_no_source_task_id():
     assert rec.schema_version == FINDING_CHALLENGE_RECORD_SCHEMA_VERSION
     assert rec.source_task_id is None
     assert rec.produced_by == "challenge_sidecar"
+
+
+def test_parse_finding_challenge_prefers_last_verdict_object():
+    """When sidecar output contains multiple JSON objects with a ``verdict``
+    key, parse_finding_challenge_verdict picks the LAST one so an echoed
+    schema example at the top does not shadow the agent's real answer."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = (
+        # Echoed schema fragment at the top — should be ignored.
+        'Here is the schema: {"verdict": "<classification>", "agreement": "agrees", '
+        '"reasoning": "<justification>"}\n'
+        "I investigated the codebase and the function moved to utils.py.\n"
+        # Real verdict at the end.
+        '{"verdict": "present", "agreement": "disagrees", "reasoning": "code was relocated"}'
+    )
+    rec = parse_finding_challenge_verdict(
+        logs, "absent", CHALLENGE_BOUNDARY_REPRODUCE_ABSENT, "sc-last"
+    )
+    assert rec.agreement == "disagrees"
+    assert rec.second_opinion_verdict == "present"
+    assert "relocated" in rec.reason
+
+
+def test_parse_finding_challenge_stamps_finding_hash():
+    """finding_hash kwarg is stored on the returned record and exposed via to_context()."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        parse_finding_challenge_verdict,
+    )
+
+    logs = '{"verdict": "actionable", "agreement": "disagrees", "reasoning": "specific bug"}'
+    rec = parse_finding_challenge_verdict(
+        logs,
+        "LOW",
+        CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY,
+        "sc-hash",
+        finding_hash="abc123def456789",
+    )
+    assert rec.finding_hash == "abc123def456789"
+    assert rec.to_context()["finding_hash"] == "abc123def456789"
+
+
+def test_finding_challenge_record_to_context_includes_finding_hash():
+    """to_context() emits finding_hash; defaults to None when not set."""
+    from app.task_evaluators import (
+        CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        FindingChallengeRecord,
+    )
+
+    rec_no_hash = FindingChallengeRecord(
+        challenged_boundary=CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        first_verdict="absent",
+        second_opinion_verdict="present",
+        agreement="disagrees",
+        reason="relocated",
+        sidecar_task_id="sc-1",
+    )
+    assert rec_no_hash.to_context()["finding_hash"] is None
+
+    rec_with_hash = FindingChallengeRecord(
+        challenged_boundary=CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
+        first_verdict="absent",
+        second_opinion_verdict="present",
+        agreement="disagrees",
+        reason="relocated",
+        sidecar_task_id="sc-2",
+        finding_hash="deadbeef12345678",
+    )
+    assert rec_with_hash.to_context()["finding_hash"] == "deadbeef12345678"
 
 
 # ── build_adversarial_challenge_manifest ──────────────────────────────────────

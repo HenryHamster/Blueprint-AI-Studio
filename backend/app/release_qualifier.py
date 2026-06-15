@@ -112,6 +112,7 @@ from app.release_promotion import (
     _record_promotion_failure,  # noqa: F401 — tests access via rq.*
     _record_promotion_success,
     _record_qualification_verdict,
+    _recover_confidence_from_ci_unresolved,
     _relock_version_for_promotion_write,  # noqa: F401 — tests access via rq.*
     _resolve_github_with_session,
     promote,
@@ -506,7 +507,10 @@ def _promotion_in_flight_result(
     qual_state = release_version.summarize_qualification_state(
         version.last_qualification
     )
-    if qual_state and qual_state.get("state") in release_version.PROMOTION_BLOCKING_STATES:
+    if (
+        qual_state
+        and qual_state.get("state") in release_version.PROMOTION_BLOCKING_STATES
+    ):
         result = {
             # Echo the specific blocking sub-state (``promotion_in_flight`` for
             # native auto-merge, ``promotion_check_wait`` for the managed
@@ -1882,7 +1886,7 @@ async def _guard_ci_unresolved_promotion_in_flight(
             session,
             version,
             candidate_sha,
-            base_record,
+            _recover_confidence_from_ci_unresolved(base_record),
             pr_url=_idempotent_pr_url(base_record),
             token=token,
             owner=owner,
@@ -1932,7 +1936,7 @@ async def _guard_ci_unresolved_promotion_in_flight(
         auto_merge_enabled,
     )
     q = dict(version.last_qualification or {})
-    q.update(base_record)
+    q.update(_recover_confidence_from_ci_unresolved(base_record))
     q["status"] = "pending"
     q["promotion_pending"] = {
         "pr_number": pr_number,
@@ -1955,6 +1959,8 @@ async def _guard_ci_unresolved_promotion_in_flight(
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
+    *,
+    _pre_gates: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Finalize qualification once the qualifier children have terminated.
 
@@ -2003,9 +2009,16 @@ async def _finalize_qualification(
     # now-completed green build pass and keeps a still-pending build not-green
     # without a permanent dead-end.  Graceful: a credential / GitHub failure
     # degrades to not-green for this attempt (never crashes the finalize).
-    ci_green, ci_resolution = await _resolve_ci_at_finalize(
-        session, version, candidate_sha
-    )
+    # Pre-computed by _finalize_locked_version before the FOR UPDATE lock was
+    # acquired (SITE B lock-window fix); fall back to calling inline when not
+    # provided (direct test calls, timeout path, etc.).
+    if _pre_gates is not None:
+        ci_green = bool(_pre_gates["ci_green"])
+        ci_resolution = _pre_gates["ci_resolution"]
+    else:
+        ci_green, ci_resolution = await _resolve_ci_at_finalize(
+            session, version, candidate_sha
+        )
 
     policy = _load_policy()
 
@@ -2084,10 +2097,9 @@ async def _finalize_qualification(
                 # on tasks with empty status messages that were never explicitly
                 # classified by the reaper or agent_status.
                 infra_respawn_count = qual.get("audit_infra_respawn_count", 0)
-                _audit_explicit_cat = (
-                    (_audit_task_obj.context or {}).get("failure_category", "")
-                    or (_audit_task_obj.context or {}).get("failure_class", "")
-                )
+                _audit_explicit_cat = (_audit_task_obj.context or {}).get(
+                    "failure_category", ""
+                ) or (_audit_task_obj.context or {}).get("failure_class", "")
                 if (
                     _audit_task_obj.status == TaskStatus.FAILED
                     and _audit_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
@@ -2318,9 +2330,7 @@ async def _finalize_qualification(
         _integration_branch, promotion_target = (
             _lts_branch_names(project) if project is not None else ("", "main")
         )
-        challenge_base_branch = (
-            audit_payload.get("base_branch") or promotion_target
-        )
+        challenge_base_branch = audit_payload.get("base_branch") or promotion_target
         challenge_diff_range = (
             audit_payload.get("diff_range")
             or f"{challenge_base_branch}...{candidate_sha}"
@@ -2415,10 +2425,9 @@ async def _finalize_qualification(
                     challenge_infra_respawn_count = qual.get(
                         "challenge_infra_respawn_count", 0
                     )
-                    _chal_explicit_cat = (
-                        (_challenge_task_obj.context or {}).get("failure_category", "")
-                        or (_challenge_task_obj.context or {}).get("failure_class", "")
-                    )
+                    _chal_explicit_cat = (_challenge_task_obj.context or {}).get(
+                        "failure_category", ""
+                    ) or (_challenge_task_obj.context or {}).get("failure_class", "")
                     if (
                         _challenge_task_obj.status == TaskStatus.FAILED
                         and _chal_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
@@ -2446,8 +2455,8 @@ async def _finalize_qualification(
                             or _audit_payload.get("diff_range")
                             or f"{_chal_base_branch}...{candidate_sha}"
                         )
-                        _chal_primary_findings = (
-                            _primary_findings_for_challenge_retry(audit_report)
+                        _chal_primary_findings = _primary_findings_for_challenge_retry(
+                            audit_report
                         )
                         if _chal_primary_findings:
                             from app.payload_schemas import PayloadTooLargeError
@@ -2658,7 +2667,9 @@ async def _finalize_qualification(
             _audit_report_scored,
             challenger_refuted_audit_findings,
             _challenge_binding_record,
-        ) = _reconcile_audit_with_challenge(audit_report, challenge_verdicts, candidate_sha)
+        ) = _reconcile_audit_with_challenge(
+            audit_report, challenge_verdicts, candidate_sha
+        )
         if _challenge_hold:
             logger.warning(
                 "[RELEASE_QUALIFIER] v%d challenge reconciliation HOLD: %s — "
@@ -2672,8 +2683,7 @@ async def _finalize_qualification(
             primary_findings = _primary_findings_for_challenge_retry(audit_report)
             if (
                 _challenge_hold in _AUDIT_CHALLENGE_BINDING_HOLDS
-                and challenge_respawn_count
-                < _MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
+                and challenge_respawn_count < _MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
                 and _audit_task_matches_candidate(_audit_task_obj, candidate_sha)
                 and primary_findings
             ):
@@ -2685,9 +2695,7 @@ async def _finalize_qualification(
                     else {}
                 )
                 audit_payload = (
-                    _audit_task_obj.first_payload
-                    if _audit_task_obj is not None
-                    else {}
+                    _audit_task_obj.first_payload if _audit_task_obj is not None else {}
                 )
                 project = await session.get(Project, version.project_id)
                 _integration_branch, promotion_target = (
@@ -2733,10 +2741,7 @@ async def _finalize_qualification(
                 # vs what this qualification expected.
                 _sha_mismatch_observed = (
                     str(
-                        (challenge_verdicts or {}).get(
-                            "challenged_candidate_sha"
-                        )
-                        or ""
+                        (challenge_verdicts or {}).get("challenged_candidate_sha") or ""
                     )
                     or None
                     if _challenge_hold == "audit_challenge_sha_mismatch"
@@ -2818,11 +2823,14 @@ async def _finalize_qualification(
     audit_challenge = audit_reconciliation.get("audit_challenge")
     audit_task_candidate_sha = None
     if _audit_task_obj is not None:
-        audit_task_candidate_sha = str(
-            (_audit_task_obj.context or {}).get("candidate_sha")
-            or (_audit_task_obj.first_payload or {}).get("candidate_sha")
-            or ""
-        ).strip() or None
+        audit_task_candidate_sha = (
+            str(
+                (_audit_task_obj.context or {}).get("candidate_sha")
+                or (_audit_task_obj.first_payload or {}).get("candidate_sha")
+                or ""
+            ).strip()
+            or None
+        )
     audit_reconciliation["audit_leg_proof"] = _build_audit_leg_proof(
         candidate_sha=candidate_sha,
         audit_task_id=str(audit_task_id) if audit_task_id else None,
@@ -2845,7 +2853,8 @@ async def _finalize_qualification(
             if isinstance(audit_challenge, dict)
             else None
         ),
-        legacy_advisory_only=bool(audit_challenge_task_id) and not bool(challenge_task_id),
+        legacy_advisory_only=bool(audit_challenge_task_id)
+        and not bool(challenge_task_id),
     )
 
     # --- Deterministic Alembic revision-identity safety gate ----------------
@@ -2858,9 +2867,17 @@ async def _finalize_qualification(
     # through _handle_infra_failure so a persistent inability to verify migration
     # identity surfaces the same way as any other finalize-time infra failure
     # (no verdict recorded, returned to stabilize, retried by the next cycle).
-    migration_verdict, migration_detail = await _resolve_migration_identity_at_finalize(
-        session, version, candidate_sha
-    )
+    # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
+    if _pre_gates is not None:
+        migration_verdict = _pre_gates["migration_verdict"]
+        migration_detail = _pre_gates["migration_detail"]
+    else:
+        (
+            migration_verdict,
+            migration_detail,
+        ) = await _resolve_migration_identity_at_finalize(
+            session, version, candidate_sha
+        )
     if migration_verdict == "defer":
         return await _handle_infra_failure(
             session,
@@ -2881,9 +2898,14 @@ async def _finalize_qualification(
     # the identity gate's defer path — never waved through.
     # Thread the exact SHA snapped into last_qualification through this gate;
     # do not re-derive it from any live checkout state.
-    apply_verdict, apply_detail = await _resolve_migration_apply_at_finalize(
-        session, version, candidate_sha
-    )
+    # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
+    if _pre_gates is not None:
+        apply_verdict = _pre_gates["apply_verdict"]
+        apply_detail = _pre_gates["apply_detail"]
+    else:
+        apply_verdict, apply_detail = await _resolve_migration_apply_at_finalize(
+            session, version, candidate_sha
+        )
     if apply_verdict == "defer":
         return await _handle_infra_failure(
             session,
@@ -3237,9 +3259,7 @@ async def _required_children_terminal(
             else None
         )
         challenge_task_id = (
-            uuid.UUID(str(challenge_task_id_raw))
-            if challenge_required
-            else None
+            uuid.UUID(str(challenge_task_id_raw)) if challenge_required else None
         )
     except (ValueError, TypeError, AttributeError):
         logger.warning(
@@ -3595,7 +3615,88 @@ async def _finalize_locked_version(
     its rollback-on-error contract).  Split out so the locking + decision logic
     reads as a flat sequence.  Commits the dedicated session on every path that
     actually wrote something; returns ``None`` for the read-only no-op paths.
+
+    Lock-window fix (SITE B): the three GitHub-bound finalize gates
+    (_resolve_ci_at_finalize, _resolve_migration_identity_at_finalize,
+    _resolve_migration_apply_at_finalize) issue GitHub API calls that can take
+    10-120 s under rate-limit/retry.  Running them UNDER the ReleaseVersion
+    FOR UPDATE lock caused 22 s+ ShareLock waits on every concurrent qualifier
+    finalize / reconcile call.  Fix: non-locking peek to read the immutable
+    candidate_sha, run the three gates pre-lock, THEN acquire FOR UPDATE for
+    the decision write only — mirroring the _relock_version_for_promotion_write
+    pattern already used on the promote sub-path.
     """
+    # ── Pre-lock peek: read stable fields for the GitHub-bound gate calls ──
+    # A non-locking read suffices here: candidate_sha is immutable once set and
+    # the status/qual-status checks below are re-verified authoritatively under
+    # the FOR UPDATE lock that follows.  This peek exists ONLY to obtain the
+    # candidate_sha so the three gates can run before the lock is held.
+    peek: release_version.ReleaseVersion | None = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion).where(
+                    release_version.ReleaseVersion.id == version_id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    # Fast-path skip for the two cheapest no-ops (status / qual-status).
+    # These are re-checked under the lock below — this only avoids the
+    # expensive gate calls when clearly not warranted.
+    if peek is None or peek.status != "open":
+        return None
+    peek_qual = peek.last_qualification or {}
+    if peek_qual.get("status") != "pending":
+        return None
+    peek_candidate_sha: str | None = peek_qual.get("candidate_sha")
+
+    # ── Run the three GitHub-bound gates BEFORE acquiring the FOR UPDATE ──
+    # Guard: only run when (a) this is not a timeout-only reaper call (timeout_now
+    # is None means task-completion hook — children may be terminal) and (b) all
+    # required children are already terminal according to the non-locking peek.
+    # Without this guard the gates ran speculatively on every qualifier child
+    # completion (Nx amplification) and on every reaper sweep iteration for
+    # versions whose children were still running — a DB/GitHub load regression.
+    #
+    # When _pre_gates is None (children not yet terminal, or timeout path),
+    # _finalize_qualification will either be skipped entirely (Path 2 returns
+    # early) or run with _pre_gates=None and call the gates itself under the
+    # lock — acceptable because that path is rare (race between sibling
+    # completion and this check) and the reaper sweep is infrequent.
+    _pre_gates: dict[str, Any] | None = None
+    if timeout_now is None and await _required_children_terminal(session, peek):
+        # All three are pinned to the immutable candidate_sha and are read-only
+        # against GitHub; their results are valid for the entire finalize attempt.
+        pre_ci_green, pre_ci_resolution = await _resolve_ci_at_finalize(
+            session, peek, peek_candidate_sha
+        )
+        (
+            pre_migration_verdict,
+            pre_migration_detail,
+        ) = await _resolve_migration_identity_at_finalize(
+            session, peek, peek_candidate_sha
+        )
+        pre_apply_verdict, pre_apply_detail = await _resolve_migration_apply_at_finalize(
+            session, peek, peek_candidate_sha
+        )
+        _pre_gates = {
+            "ci_green": pre_ci_green,
+            "ci_resolution": pre_ci_resolution,
+            "migration_verdict": pre_migration_verdict,
+            "migration_detail": pre_migration_detail,
+            "apply_verdict": pre_apply_verdict,
+            "apply_detail": pre_apply_detail,
+        }
+
+    # Expire the peek instance so the FOR UPDATE select below forces a fresh
+    # read from the DB (mirrors _relock_version_for_promotion_write pattern —
+    # populate_existing=True alone is not reliable on async sessions per
+    # concern C1 in release_promotion.py).
+    session.expire(peek)
+
+    # ── Acquire the FOR UPDATE lock — decision write only ──
     # Lock the version row — the single serialization point for the whole
     # finalize→promote critical section (concern d).
     version: release_version.ReleaseVersion | None = (
@@ -3604,6 +3705,7 @@ async def _finalize_locked_version(
                 select(release_version.ReleaseVersion)
                 .where(release_version.ReleaseVersion.id == version_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -3689,8 +3791,9 @@ async def _finalize_locked_version(
 
     # Finalize on the dedicated session.  _finalize_qualification may call
     # promote(), whose intermediate commit + re-lock are now safe: this session
-    # holds only qualifier state.
-    result = await _finalize_qualification(session, version)
+    # holds only qualifier state.  Pass the pre-computed gate results so the
+    # function does NOT re-run the GitHub-bound gates under the row lock.
+    result = await _finalize_qualification(session, version, _pre_gates=_pre_gates)
     await session.commit()
     return result
 

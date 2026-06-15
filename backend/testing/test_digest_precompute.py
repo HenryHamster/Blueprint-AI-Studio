@@ -92,7 +92,9 @@ def test_precompute_cache_worker_only_filters_non_worker_entries():
 
     # A worker entry is a hit under both.
     cache.put(24, None, {"x": 2}, computed_wall_iso="t", source=SOURCE_WORKER)
-    assert cache.get_fresh(24, None, max_age_seconds=300.0, worker_only=True) is not None
+    assert (
+        cache.get_fresh(24, None, max_age_seconds=300.0, worker_only=True) is not None
+    )
 
     # put defaults to the worker source.
     cache.put(48, None, {"y": 3}, computed_wall_iso="t")
@@ -139,7 +141,7 @@ async def test_run_precompute_tick_primes_global_and_projects(monkeypatch):
     # Stub the heavy computes so the test is DB-free and fast; the digest /
     # health bodies are exercised by the integration tests below. The tick
     # primes BOTH kinds (digest first, then health) over the same hot key set.
-    async def _fake_compute(*, hours, project_id, session):
+    async def _fake_compute(*, hours, project_id, session, _statement_timeout_secs=30):
         return {
             "generated_at": "2026-05-31T00:00:00",
             "completed_count": 0,
@@ -154,7 +156,9 @@ async def test_run_precompute_tick_primes_global_and_projects(monkeypatch):
 
     monkeypatch.setattr(_admin_digest, "_compute_digest", _fake_compute)
     monkeypatch.setattr(_admin_health, "_compute_health_overview", _fake_health)
-    monkeypatch.setattr(dp, "_active_project_ids", AsyncMock(return_value=[proj_a, proj_b]))
+    monkeypatch.setattr(
+        dp, "_active_project_ids", AsyncMock(return_value=[proj_a, proj_b])
+    )
 
     @asynccontextmanager
     async def _session_factory():
@@ -187,7 +191,7 @@ async def test_run_precompute_tick_survives_per_key_failure(monkeypatch):
     bad = uuid.uuid4()
     good = uuid.uuid4()
 
-    async def _flaky_compute(*, hours, project_id, session):
+    async def _flaky_compute(*, hours, project_id, session, _statement_timeout_secs=30):
         if project_id == bad:
             raise RuntimeError("boom")
         return {"generated_at": "t", "completed_count": 0}
@@ -314,9 +318,7 @@ async def test_digest_endpoint_falls_back_when_cache_empty_without_priming(
 
     # The fallback path leaves the precompute cache empty — it does NOT prime
     # a non-worker entry that could later be served as fresh-for-300s.
-    assert (
-        get_precompute_cache().get_fresh(24, None, max_age_seconds=300.0) is None
-    )
+    assert get_precompute_cache().get_fresh(24, None, max_age_seconds=300.0) is None
 
 
 @pytest.mark.asyncio
@@ -425,3 +427,130 @@ async def test_digest_endpoint_stale_precompute_triggers_recompute(
     # Recomputed from the (empty) DB window, not the stale 999.
     assert data["completed_count"] == 0
     assert data["precomputed"] is False
+
+
+# ---------------------------------------------------------------------------
+# DB-load reduction regression tests (task #6adb0c88)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_0275_partial_index_ddl():
+    """Migration 0275 registers the partial index used by the split OR query."""
+    import pathlib
+
+    path = (
+        pathlib.Path(__file__).parent.parent
+        / "alembic/versions/0275_task_requires_approval_partial_index.py"
+    )
+    text = path.read_text()
+    assert "ix_task_requires_approval" in text
+    assert "WHERE requires_approval IS TRUE" in text
+    assert "project_id, created_at" in text
+
+
+@pytest.mark.asyncio
+async def test_background_precompute_passes_lower_statement_timeout(monkeypatch):
+    """_precompute_one passes _statement_timeout_secs=5 (not 30) to _compute_digest."""
+    import app.digest_precompute as dp
+    from app.routers import admin_digest as _ad
+
+    captured: list[int] = []
+
+    async def _capturing_compute(
+        *, hours, project_id, session, _statement_timeout_secs=30
+    ):
+        captured.append(_statement_timeout_secs)
+        return {"generated_at": "2026-01-01T00:00:00", "completed_count": 0}
+
+    async def _noop_write_shared(key, result, computed_at, session):
+        pass
+
+    monkeypatch.setattr(_ad, "_compute_digest", _capturing_compute)
+    monkeypatch.setattr(dp, "write_shared", _noop_write_shared)
+
+    from unittest.mock import MagicMock
+
+    await dp._precompute_one(MagicMock(), hours=24, project_id=None)
+
+    assert captured == [dp._BACKGROUND_STATEMENT_TIMEOUT_SECS]
+    assert dp._BACKGROUND_STATEMENT_TIMEOUT_SECS == 5
+
+
+@pytest.mark.asyncio
+async def test_round_robin_slice_advances_offset(monkeypatch):
+    """run_precompute_tick primes only _PROJECTS_PER_TICK_SLICE projects and advances _project_tick_offset."""
+    import uuid
+
+    import app.digest_precompute as dp
+    from app.routers import admin_digest as _ad
+    from app.routers import admin_health as _ah
+
+    monkeypatch.setattr(dp, "_project_tick_offset", 0)
+    projects = [uuid.uuid4() for _ in range(7)]
+    digest_pids: list = []
+
+    async def _capturing_compute(
+        *, hours, project_id, session, _statement_timeout_secs=30
+    ):
+        digest_pids.append(project_id)
+        return {"generated_at": "2026-01-01T00:00:00", "completed_count": 0}
+
+    async def _fake_health(*, project_id, lookback_hours, session):
+        return {"generated_at": "2026-01-01T00:00:00"}
+
+    monkeypatch.setattr(_ad, "_compute_digest", _capturing_compute)
+    monkeypatch.setattr(_ah, "_compute_health_overview", _fake_health)
+    monkeypatch.setattr(dp, "_active_project_ids", AsyncMock(return_value=projects))
+
+    @asynccontextmanager
+    async def _session_factory():
+        yield object()
+
+    get_precompute_cache().clear()
+    get_health_precompute_cache().clear()
+
+    await run_precompute_tick(_session_factory)
+
+    # Global key is primed first (project_id=None), then only 5 out of 7 projects.
+    assert digest_pids[0] is None, "global key must be primed first"
+    project_slice = [p for p in digest_pids if p is not None]
+    assert len(project_slice) == dp._PROJECTS_PER_TICK_SLICE
+    assert project_slice == projects[: dp._PROJECTS_PER_TICK_SLICE]
+
+    # Offset advances by the slice size, wrapping mod n=7.
+    assert dp._project_tick_offset == dp._PROJECTS_PER_TICK_SLICE % len(projects)
+
+
+@pytest.mark.asyncio
+async def test_overlap_guard_skips_tick_when_in_progress(monkeypatch):
+    """digest_precompute_service skips run_precompute_tick when _tick_in_progress is True."""
+    import asyncio
+
+    import app.digest_precompute as dp
+
+    tick_calls: list[bool] = []
+    _call_n = {"n": 0}
+
+    async def _fast_sleep(_t):
+        _call_n["n"] += 1
+        if _call_n["n"] >= 2:
+            raise asyncio.CancelledError
+
+    async def _mock_tick(sf):
+        tick_calls.append(True)
+        return 0
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+    monkeypatch.setattr(dp, "run_precompute_tick", _mock_tick)
+    monkeypatch.setattr(dp, "_tick_in_progress", True)
+
+    try:
+        await dp.digest_precompute_service()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        dp._tick_in_progress = False
+
+    assert tick_calls == [], (
+        "run_precompute_tick must not be called when overlap guard is active"
+    )

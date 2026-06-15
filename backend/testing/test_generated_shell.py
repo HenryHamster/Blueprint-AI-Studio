@@ -29,6 +29,7 @@ import json
 import re
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -36,6 +37,10 @@ from typing import Callable
 import pytest
 
 from app import compute
+from app.compute_backends import (
+    ComputeLaunchSpec,
+    _build_gcp_startup_script,
+)
 from app.compute_startup_script import (
     build_agent_startup_script,
     build_pool_agent_startup_script,
@@ -85,6 +90,24 @@ def _render_pool_startup_script() -> str:
     )
 
 
+def _render_gcp_compute_startup_script() -> str:
+    """Render the GCP compute-job VM startup script with placeholder values."""
+    from datetime import datetime, timedelta, timezone
+
+    spec = ComputeLaunchSpec(
+        job_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        command="echo hello",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        runtime_deadline_seconds=3600,
+    )
+    return _build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload?sig=placeholder",
+    )
+
+
 GENERATORS: list[ShellGenerator] = [
     ShellGenerator(
         name="compute.startup_script",
@@ -93,6 +116,10 @@ GENERATORS: list[ShellGenerator] = [
     ShellGenerator(
         name="compute.pool_startup_script",
         render=_render_pool_startup_script,
+    ),
+    ShellGenerator(
+        name="compute.gcp_startup_script",
+        render=_render_gcp_compute_startup_script,
     ),
     # Future entries: append here. Each renderer returns rendered bash.
 ]
@@ -211,6 +238,58 @@ class TestGeneratedShellContract:
             f"`|| true` inside the command substitution (pipefail + unmatched "
             f"pattern otherwise fires the ERR trap). Offenders:\n"
             + "\n".join(f"  line {i}: {s}" for i, s in offenders)
+        )
+
+    def test_no_unguarded_fallible_cmd_substitution_assignments(
+        self, gen: ShellGenerator
+    ):
+        """Every top-level command-substitution assignment whose inner command
+        is fallible (curl, journalctl, systemctl, grep) MUST be guarded.
+
+        Acceptable guards — at least one must be present:
+          a) `|| guard` AFTER the closing `)` on the same line (e.g. `|| var=$?`,
+             `|| true`, `|| echo ...`) — this is the `_send_beacon` pattern.
+          b) `||` INSIDE the substitution (e.g. `$(cmd || true)`) — the sub
+             always exits 0 so the assignment's exit code is always 0.
+
+        Under `set -e`, a bare `VAR="$(curl ...)"` has the assignment's exit
+        code equal to curl's exit code. When curl returns non-zero (e.g. a
+        503 during Cloud Run saturation), the ERR trap fires and powers off a
+        HEALTHY VM.  This is the root cause of the 2026-06-14 fleet-wide reap
+        events that killed fix task 33cdac3e.
+
+        Regression: the startup-completed heartbeat (step 6b) used plain
+        `_STARTUP_HB_ERR="$(curl ...)"` — all four provisioning beacons were
+        already routed through `_send_beacon` which uses `|| curl_exit=$?`,
+        but this one site was hand-rolled and fell outside that pattern.
+        """
+        script = gen.render()
+        # Join bash line continuations so multi-line assignments collapse to a
+        # single logical line that a single-line regex can inspect.
+        joined = re.sub(r"\\\n\s*", " ", script)
+        offenders = []
+        # Pattern: a line that is JUST an assignment `VAR="$(fallible_cmd ...)"` —
+        # i.e. starts with optional whitespace then `IDENTIFIER="$(` and ends
+        # with `)"` (no `||` after the closing `)`).
+        # The negative lookahead `(?![^)]*\|\|)` rejects the assignment when
+        # the substitution body itself contains `||` (guard-b above).
+        # `\s*$` requires the line to end with `)"` — if `|| guard` follows,
+        # the `$` won't match and the pattern correctly skips it (guard-a above).
+        pattern = re.compile(
+            r'^\s*[A-Za-z_][A-Za-z0-9_]*="\$\((?![^)]*\|\|)'
+            r"[^)]*\b(?:curl|journalctl|grep|systemctl)\b[^)]*\)\"\s*$",
+            re.MULTILINE,
+        )
+        for m in pattern.finditer(joined):
+            line_no = script.count("\n", 0, m.start()) + 1
+            offenders.append((line_no, m.group(0).strip()))
+        assert not offenders, (
+            f"{gen.name}: unguarded top-level command-substitution assignment "
+            f"with a fallible command. Under `set -e` a non-zero exit fires "
+            f"the ERR trap → poweroff on a HEALTHY VM. Fix: add "
+            f"`|| var=$?` after the closing `)` (guard-a) or `|| true/echo` "
+            f"INSIDE the substitution (guard-b), or route through `_send_beacon`. "
+            f"Offenders:\n" + "\n".join(f"  line {i}: {s}" for i, s in offenders)
         )
 
     def test_inline_poweroff_followed_by_exit_or_scope_close(self, gen: ShellGenerator):
@@ -1326,9 +1405,8 @@ class TestPackerSmokeCapabilityContract:
             "reaches configureAgentPermissions, so it must call "
             "loadBakeSmokeCapabilityContract() before handlers.memo()."
         )
-        assert (
-            smoke.index("loadBakeSmokeCapabilityContract")
-            < smoke.index("await handlers.memo(")
+        assert smoke.index("loadBakeSmokeCapabilityContract") < smoke.index(
+            "await handlers.memo("
         ), (
             f"{smoke_name} must load the bake-smoke capability contract "
             "BEFORE invoking handlers.memo(), not after."
@@ -1367,9 +1445,9 @@ class TestPackerSmokeCapabilityContract:
             "bake-smoke-capability-contract.ts must load via the real "
             "loadTaskCapabilityContract so validation is exercised, not bypassed."
         )
-        relative_helper_path = (
-            _BAKE_SMOKE_CONTRACT_HELPER.relative_to(_AGENT_DIR).as_posix()
-        )
+        relative_helper_path = _BAKE_SMOKE_CONTRACT_HELPER.relative_to(
+            _AGENT_DIR
+        ).as_posix()
         assert relative_helper_path.startswith("src/"), (
             "bake-smoke-capability-contract.ts must live under agent/src so the "
             "agent typecheck covers it."
@@ -1430,7 +1508,7 @@ class TestPackerSourceShaBakeContract:
             "agent.pkr.hcl must declare a source_git_sha variable."
         )
         assert 'env("GITHUB_SHA")' in hcl, (
-            "source_git_sha must default to env(\"GITHUB_SHA\") so CI bakes the commit."
+            'source_git_sha must default to env("GITHUB_SHA") so CI bakes the commit.'
         )
 
     def test_image_label_carries_source_git_sha(self):

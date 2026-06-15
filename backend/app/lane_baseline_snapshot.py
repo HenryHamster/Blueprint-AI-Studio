@@ -11,6 +11,7 @@ plus per-PR relay medians for the v10 lane-pilot comparison.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -20,7 +21,8 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.digest_metrics import compute_lane_waste_diagnostics
-from app.models import Project, Task, TaskStatus, _utcnow
+from app.models import ImprovementLane, Project, Task, TaskStatus, _utcnow
+from app.review_fix_lane_pilot import LANE_RECOVERY_MANIFEST_KEY, LANE_RECOVERY_REASON_KEY
 from app.task_locking import with_design_doc_locked
 from app.routers.admin_analytics import (
     _compute_lane_diag,
@@ -38,6 +40,54 @@ BASELINE_DEF_VERSION = "v1"
 _SNAPSHOT_PR_BREAKDOWN_LIMIT = 100
 _MAX_TASKS_PER_SNAPSHOT = 5000
 _MAX_BASELINES_STORED = 20
+# Per-entry byte budget: 20 entries x 10 KB = 200 KB max, well under the 500 KB design-doc ceiling.
+_MAX_BASELINE_ENTRY_BYTES = 10_000
+
+# Fields dropped before persisting: large unread sub-blobs that inflate the entry.
+_SLIM_DROP_TOP_LEVEL = frozenset({"per_pr_phase_breakdown", "relay_counts_by_lane"})
+# Fallback fields to shed one-by-one if the entry still exceeds the byte budget after
+# the primary drops.  Ordered least-to-most critical for downstream readers.
+_SLIM_OVERFLOW_DROPPABLE = (
+    "lane_waste",
+    "lane_iteration_distribution",
+    "checkpoint_recovery_waste",
+)
+
+
+def _slim_baseline(baseline: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of *baseline* with large unread sub-blobs removed.
+
+    Primary drops (no downstream readers):
+    - ``per_pr_phase_breakdown`` — per-PR phase rows (the live UI recomputes from DB)
+    - ``relay_counts_by_lane`` — relay-count breakdown by lane
+    - ``lane_waste["chains"]`` — per-chain/per-task drilldown rows
+
+    After the primary drops an entry should comfortably fit inside
+    ``_MAX_BASELINE_ENTRY_BYTES``.  If it still exceeds the budget (e.g. because a
+    future heavy field was added), fields are shed in ``_SLIM_OVERFLOW_DROPPABLE``
+    order until the entry fits, and a warning is emitted so operators can diagnose.
+    """
+    entry = {k: v for k, v in baseline.items() if k not in _SLIM_DROP_TOP_LEVEL}
+    if "lane_waste" in entry and isinstance(entry["lane_waste"], dict):
+        lw = dict(entry["lane_waste"])
+        lw.pop("chains", None)
+        entry["lane_waste"] = lw
+
+    for field in _SLIM_OVERFLOW_DROPPABLE:
+        raw = json.dumps(entry, default=str)
+        if len(raw.encode()) <= _MAX_BASELINE_ENTRY_BYTES:
+            break
+        if field in entry:
+            logger.warning(
+                "[LANE_BASELINE] entry for v%s still over %d B after slim; dropping %s",
+                entry.get("version_number"),
+                _MAX_BASELINE_ENTRY_BYTES,
+                field,
+            )
+            entry.pop(field)
+
+    return entry
+
 
 _TASK_SNAPSHOT_COLUMNS = (
     Task.id,
@@ -58,6 +108,39 @@ _TASK_SNAPSHOT_COLUMNS = (
 )
 
 
+def _compute_checkpoint_recovery_waste(tasks: List[Task], lanes: List[Any] | None = None) -> Dict[str, Any]:
+    """Count checkpoint-recovery tasks by reason from a version task window.
+
+    Recovery tasks carry ``LANE_RECOVERY_REASON_KEY`` in their context, stamped
+    by the review-spawn path when a checkpoint miss is classified as RECOVER.
+    Groups by the reason string and returns a total count. Exhausted-budget
+    kills are counted from ImprovementLane rows in KILLED status with an
+    exhausted recovery marker in the manifest.
+    """
+    by_reason: Dict[str, int] = {}
+    for task in tasks:
+        ctx = task.context or {}
+        reason = ctx.get(LANE_RECOVERY_REASON_KEY)
+        if reason is not None:
+            key = str(reason)
+            by_reason[key] = by_reason.get(key, 0) + 1
+
+    exhausted_count = 0
+    if lanes:
+        for lane in lanes:
+            if lane.status == "KILLED":
+                manifest = lane.manifest or {}
+                recovery = manifest.get(LANE_RECOVERY_MANIFEST_KEY)
+                if isinstance(recovery, dict) and recovery.get("exhausted") is True:
+                    exhausted_count += 1
+
+    return {
+        "by_reason": by_reason,
+        "total": sum(by_reason.values()),
+        "exhausted_count": exhausted_count,
+    }
+
+
 def _compute_relay_medians(per_pr_breakdown: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Derive per-PR relay-baseline medians from lane-diag phase breakdown rows."""
     if not per_pr_breakdown:
@@ -67,6 +150,8 @@ def _compute_relay_medians(per_pr_breakdown: List[Dict[str, Any]]) -> Dict[str, 
             "gap_seconds": None,
             "task_count": None,
             "pr_count": 0,
+            "fix_active_seconds": None,
+            "review_active_seconds": None,
         }
 
     def _median(vals: List[float]) -> float | None:
@@ -85,6 +170,10 @@ def _compute_relay_medians(per_pr_breakdown: List[Dict[str, Any]]) -> Dict[str, 
         "gap_seconds": _median([r["gap_seconds"] for r in per_pr_breakdown]),
         "task_count": _median([float(r["task_count"]) for r in per_pr_breakdown]),
         "pr_count": len(per_pr_breakdown),
+        "fix_active_seconds": _median([r["fix_seconds"] for r in per_pr_breakdown]),
+        "review_active_seconds": _median(
+            [r["review_seconds"] for r in per_pr_breakdown]
+        ),
     }
 
 
@@ -117,7 +206,7 @@ async def persist_version_lane_baseline(
     t_opened = _strip_tz(opened_at)
     t_closed = _strip_tz(closed_at)
 
-    _opts = load_only(*_TASK_SNAPSHOT_COLUMNS)
+    _opts = load_only(*_TASK_SNAPSHOT_COLUMNS, raiseload=True)
     _proj_filter = [Task.project_id == project_id]
 
     completed_tasks = list(
@@ -160,6 +249,20 @@ async def persist_version_lane_baseline(
         .all()
     )
 
+    version_lanes = list(
+        (
+            await session.execute(
+                select(ImprovementLane).where(
+                    ImprovementLane.project_id == project_id,
+                    ImprovementLane.created_at >= t_opened,
+                    ImprovementLane.created_at < t_closed,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     scoped = [t for t in completed_tasks if _review_loop_pr_number(t)]
     diag = _compute_lane_diag(scoped, _SNAPSHOT_PR_BREAKDOWN_LIMIT)
 
@@ -183,6 +286,9 @@ async def persist_version_lane_baseline(
         escalation_alerts=alerts,
     )
     diag["relay_medians"] = _compute_relay_medians(diag["per_pr_phase_breakdown"])
+    diag["checkpoint_recovery_waste"] = _compute_checkpoint_recovery_waste(
+        all_terminal_tasks, lanes=version_lanes
+    )
 
     now = _utcnow()
     baseline: Dict[str, Any] = {
@@ -204,13 +310,19 @@ async def persist_version_lane_baseline(
             result["skipped"] = True
             result["stored"] = baselines[version_key]
             return
-        baselines[version_key] = baseline
+        # Re-slim all existing entries on every write to self-heal bloated state that
+        # was stored before the byte budget was enforced.
+        for k, v in list(baselines.items()):
+            if isinstance(v, dict):
+                baselines[k] = _slim_baseline(v)
+        slimmed = _slim_baseline(baseline)
+        baselines[version_key] = slimmed
         if len(baselines) > _MAX_BASELINES_STORED:
             sorted_keys = sorted(baselines, key=lambda k: int(k))
             for old_key in sorted_keys[: len(baselines) - _MAX_BASELINES_STORED]:
                 del baselines[old_key]
         doc[DESIGN_DOC_KEY] = baselines
-        result["stored"] = baseline
+        result["stored"] = slimmed
 
     applied = await with_design_doc_locked(session, project_id, _store_baseline)
     if not applied:
@@ -326,7 +438,7 @@ async def backfill_missing_lane_baselines(
                 await _snap_session.commit()
             if result is not None:
                 backfilled.append(version.version_number)
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.warning(
                 "[LANE_BASELINE] backfill: persist failed for project=%s v%d (non-fatal)",
                 project_id,
@@ -338,7 +450,7 @@ async def backfill_missing_lane_baselines(
 
 
 def read_version_lane_baseline(
-    project: "Project",
+    project: Project,
     version_number: int,
 ) -> Dict[str, Any] | None:
     """Return the persisted lane baseline for the given version, or None.

@@ -53,12 +53,20 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # E402: re-exports stale_branch_cleanup helpers from app.branch_cleanup via a
 # deferred mid-module import (load-order) — same intentional pattern as main.py.
 "app/services.py" = ["BLE001", "E402"]
-# recovery_sweeps.py was extracted from services.py and holds the three
-# leader-cycle recovery sweeps (EVALUATING-timeout, post-commit-pending, orphan
-# recovery). It inherits services.py's intentional "log and continue — never
-# crash the background loop" broad-except pattern, so it carries the same
+# recovery_sweeps.py was extracted from services.py and holds the leader-cycle
+# recovery sweeps. It has since been split into recovery_evaluating.py (the
+# EVALUATING-timeout sweep) and recovery_post_commit.py (post-commit-pending,
+# orphan, sidecar, lane-baseline, and bootstrap recovery), leaving
+# recovery_sweeps.py as a thin re-export hub. recovery_evaluating.py was in
+# turn split again: its chain-inspection / CI-backstop / spend-hold helpers
+# moved to recovery_evaluating_helpers.py to stay below the size cap. All of
+# these submodules inherit services.py's intentional "log and continue — never
+# crash the background loop" broad-except pattern, so they carry the same
 # BLE001 ignore.
 "app/recovery_sweeps.py" = ["BLE001"]
+"app/recovery_evaluating.py" = ["BLE001"]
+"app/recovery_evaluating_helpers.py" = ["BLE001"]
+"app/recovery_post_commit.py" = ["BLE001"]
 # lifecycle.py is the FastAPI lifespan that hosts every background service plus the
 # crash-monitor and leader-election loops. BLE001 (broad except) and PERF203
 # (try/except inside a loop) are both the intentional resilient-loop pattern — a

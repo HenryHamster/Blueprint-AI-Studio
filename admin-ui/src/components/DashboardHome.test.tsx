@@ -2772,6 +2772,65 @@ describe('DashboardHome', () => {
       expect(screen.queryByText(/Backend unreachable/)).not.toBeInTheDocument();
     });
 
+    it('shows tasks-truncated banner when digest.tasks_truncated is true', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+          tasks_truncated: true,
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByTestId('tasks-truncated-banner')).toBeInTheDocument();
+      expect(screen.getByTestId('tasks-truncated-banner')).toHaveTextContent(/partial view/);
+    });
+
+    it('does not show tasks-truncated banner when tasks_truncated is false', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+          tasks_truncated: false,
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      expect(screen.queryByTestId('tasks-truncated-banner')).not.toBeInTheDocument();
+    });
+
+    it('does not show tasks-truncated banner when tasks_truncated is absent', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      expect(screen.queryByTestId('tasks-truncated-banner')).not.toBeInTheDocument();
+    });
+
     it('passes degraded=true to PRMonitorSection when open-prs payload is degraded', async () => {
       const validDigest = {
         failed_count: 0,

@@ -95,6 +95,7 @@ function makeProps(activeSection: SectionId): SettingsSectionRouterProps {
     onRemoveAccount: () => {},
     onResetRateLimits: () => {},
     onRefreshAccountModels: () => {},
+    onUpdateAccount: () => {},
     onUpdateAccountCaps: () => {},
     showUserManagement: false,
     onToggleUserManagement: () => {},

@@ -85,8 +85,15 @@ def apply_operator_build_config_overrides(
     # The no-CI merge policy is operator-owned and never emitted by repo
     # detection; carry an explicit choice (including False) forward so manual
     # re-detect and empty-config auto-refresh do not silently re-gate the repo.
+    # Safety clamp: if the freshly detected config has has_ci=False (the repo
+    # has zero CI workflows and can never produce check-runs), override a stale
+    # requires_ci_checks=True from the existing config — that combination is an
+    # impossible-to-satisfy state that would strand main-targeting rollup PRs.
     if "requires_ci_checks" in existing:
-        detected["requires_ci_checks"] = existing["requires_ci_checks"]
+        if detected.get("has_ci") is False and existing.get("requires_ci_checks"):
+            detected["requires_ci_checks"] = False
+        else:
+            detected["requires_ci_checks"] = existing["requires_ci_checks"]
     # Per-project parallelism overrides are operator-owned and never emitted
     # by repo detection; carry them forward so re-detect does not silently
     # lift a deliberate throttle (see schemas.BuildConfig).
@@ -114,6 +121,18 @@ def apply_operator_build_config_overrides(
     ):
         if _cm_key in existing:
             detected[_cm_key] = existing[_cm_key]
+    # Onboarding-proof milestone timestamps are durable event records, not
+    # repo-derived config; carry them forward so re-detect never erases evidence.
+    for _op_key in (
+        "first_task_spawned_at",
+        "first_pr_opened_at",
+        "first_merge_gate_verdict_at",
+        "first_merge_gate_executed_tests",
+        "first_merge_gate_unverified_reason",
+        "first_pr_merged_at",
+    ):
+        if _op_key in existing:
+            detected[_op_key] = existing[_op_key]
 
     # Merge per-directory agent-confirmed command fields back onto re-detected
     # directories.  These are written by the agent write-back endpoint and are
@@ -244,6 +263,105 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
     except Exception:  # noqa: BLE001 — best-effort, must never break landing
         logger.warning(
             "[BUILD_CONFIG] Auto-refresh of empty build_config failed for "
+            "project %s; leaving config unchanged",
+            getattr(project, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 — keep the caller's session usable
+            pass
+        return False
+
+
+async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> bool:
+    """Best-effort re-detection for a non-empty, detection-complete project with no test command.
+
+    When onboarding-time detection completed but found no test command for a
+    non-empty external repo, the no-CI merge gate falls open to UNVERIFIED on
+    every subsequent PR.  This helper attempts a single bounded re-detection
+    using the same detector and operator-override-preserving path as
+    :func:`maybe_refresh_empty_build_config`, but guards on the OPPOSITE
+    condition: fires only when detection was NOT marked incomplete or empty (so
+    it never competes with that path) and the project currently has no
+    detectable test command.
+
+    Returns True iff re-detection found a test command and persisted it.
+    Best-effort: never raises into the caller; logs, rolls back the session on
+    failure, and returns False.
+    """
+    try:
+        existing = project.build_config or {}
+        # Only fire for non-empty, detection-complete projects with no test cmd.
+        # repo_is_empty / detection_incomplete are handled by
+        # maybe_refresh_empty_build_config — do not compete with that path.
+        if existing.get("repo_is_empty") or existing.get("detection_incomplete"):
+            return False
+        if not getattr(project, "github_owner", None) or not getattr(
+            project, "github_repo", None
+        ):
+            return False
+
+        from app import ci_resolution
+
+        if ci_resolution.has_detectable_tests(project):
+            return False
+
+        from pydantic import ValidationError
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.github import get_repo_installation_token
+        from app.routers.admin_onboard import _detect_build_config
+        from app.schemas import BuildConfig as BuildConfigSchema
+        from app.shared_state import get_project_integration_branch
+
+        integration_branch = ref or get_project_integration_branch(project)
+
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
+        if not token:
+            return False
+
+        detected = await _detect_build_config(
+            token,
+            project.github_owner,
+            project.github_repo,
+            ref=integration_branch,
+        )
+        if not detected:
+            return False
+
+        detected = apply_operator_build_config_overrides(detected, existing)
+
+        # Only persist when re-detection actually found a test command.
+        class _Stub:
+            pass
+
+        _stub = _Stub()
+        _stub.build_config = detected
+        if not ci_resolution.has_detectable_tests(_stub):
+            return False
+
+        try:
+            validated = BuildConfigSchema(**detected)
+            project.build_config = validated.model_dump(exclude_none=True)
+        except ValidationError:
+            # Detection produced a shape the schema rejects — store raw so the
+            # operator can fix it in the UI (mirrors the manual re-detect path).
+            project.build_config = detected
+        flag_modified(project, "build_config")
+        await session.commit()
+        logger.info(
+            "[BUILD_CONFIG] Re-detected test command for non-empty project %s "
+            "(integration branch %s) — no-CI gate will now run tests",
+            getattr(project, "id", None),
+            integration_branch,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — best-effort, must never block a merge path
+        logger.warning(
+            "[BUILD_CONFIG] Re-detection of missing test command failed for "
             "project %s; leaving config unchanged",
             getattr(project, "id", None),
             exc_info=True,

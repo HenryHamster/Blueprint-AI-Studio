@@ -23,9 +23,16 @@ from sqlalchemy import delete as sql_delete, select, text
 
 from app.models import (
     Alert,
+    AnomalyFingerprintState,
     Artifact,
     ArtifactType,
     ComputeJob,
+    MessagesLastSeen,
+    MessagesNoisePrefs,
+    MessagesSavedViews,
+    MigrationReservation,
+    PoolIdleCostLedger,
+    PoolVm,
     Project,
     ProjectMember,
     ProjectMessage,
@@ -391,3 +398,97 @@ async def test_delete_nonexistent_project_is_clean(db_session):
     assert (
         await db_session.execute(select(Project).where(Project.id == fake_id))
     ).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_project_delete_cascades_phase2_tables(db_session):
+    """Migration 0274 regression: force-deleting a project that has rows in the
+    previously-uncovered child tables (messageslaatseen, messagesnoiseprefs,
+    messagessavedviews, anomalyfingerprintstate, poolvm, poolidlecostledger,
+    migrationreservation) must not raise an FK violation.
+
+    This guards the fix that adds ON DELETE CASCADE to every project-child FK
+    that lacked it after migration 0058 (which only covered the tables existing
+    at that point in the chain).
+    """
+    project = Project(name="cascade-phase2-test", user_id="user-cascade-p2")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # MessagesLastSeen
+    mls = MessagesLastSeen(user_id="user-cascade-p2", project_id=project.id)
+    db_session.add(mls)
+
+    # MessagesNoisePrefs
+    mnp = MessagesNoisePrefs(user_id="user-cascade-p2", project_id=project.id)
+    db_session.add(mnp)
+
+    # MessagesSavedViews
+    msv = MessagesSavedViews(user_id="user-cascade-p2", project_id=project.id)
+    db_session.add(msv)
+
+    # AnomalyFingerprintState
+    afs = AnomalyFingerprintState(
+        project_id=project.id,
+        fingerprint_key="cascade-p2-fingerprint-" + uuid.uuid4().hex[:8],
+    )
+    db_session.add(afs)
+
+    # PoolVm
+    pvm = PoolVm(
+        vm_instance_id="cascade-p2-vm-" + uuid.uuid4().hex[:8],
+        project_id=project.id,
+    )
+    db_session.add(pvm)
+
+    # PoolIdleCostLedger
+    picl = PoolIdleCostLedger(
+        project_id=project.id,
+        vm_instance_id="cascade-p2-vm-ledger",
+        idle_cost_usd=0.01,
+    )
+    db_session.add(picl)
+
+    # MigrationReservation
+    mr = MigrationReservation(
+        project_id=project.id,
+        provisional_revision="9999",
+        provisional_down_revision="9998",
+    )
+    db_session.add(mr)
+
+    await db_session.commit()
+
+    mls_id = mls.id
+    mnp_id = mnp.id
+    msv_id = msv.id
+    afs_id = afs.id
+    pvm_id = pvm.id
+    picl_id = picl.id
+    mr_id = mr.id
+
+    # Delete the project — must not raise an FK violation.
+    await db_session.delete(project)
+    await db_session.commit()
+
+    # Project is gone.
+    assert (
+        await db_session.execute(select(Project).where(Project.id == project.id))
+    ).scalar_one_or_none() is None
+
+    # All phase-2 child rows must be gone (CASCADE).
+    for model, row_id in [
+        (MessagesLastSeen, mls_id),
+        (MessagesNoisePrefs, mnp_id),
+        (MessagesSavedViews, msv_id),
+        (AnomalyFingerprintState, afs_id),
+        (PoolVm, pvm_id),
+        (PoolIdleCostLedger, picl_id),
+        (MigrationReservation, mr_id),
+    ]:
+        result = await db_session.execute(select(model).where(model.id == row_id))
+        assert result.scalar_one_or_none() is None, (
+            f"{model.__name__}({row_id}) survived project delete — "
+            f"ON DELETE CASCADE missing (migration 0274 may not have applied)"
+        )

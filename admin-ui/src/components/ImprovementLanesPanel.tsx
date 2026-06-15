@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset, XCircle } from 'lucide-react';
 import { drainLanePilot, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type ShadowLaneHealth } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
-import { formatAbsolute, formatDurationSec, parseTimestamp } from '../utils/time';
+import { formatAbsolute, formatDurationSec, parseTimestamp, timeAgo } from '../utils/time';
 import { ConfirmDialog } from './ConfirmDialog';
 
 const STORAGE_KEY = 'blueprint-admin:improvementLanesPanelCollapsed';
@@ -72,15 +72,22 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
   const [drainResult, setDrainResult] = useState<LanePilotDrainReport | null>(null);
   const [drainError, setDrainError] = useState<string | null>(null);
   const [preflight, setPreflight] = useState<LanePilotPreflightResponse | null>(null);
+  const [preflightError, setPreflightError] = useState<string | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     if (!projectId) return;
     setLoading(true);
     setFetchError(null);
+    setPreflightError(null);
     try {
       const [lanesData, preflightData] = await Promise.all([
         fetchImprovementLanes(projectId, 50, 0, signal),
-        fetchLanePilotPreflight(projectId, signal).catch(() => null),
+        fetchLanePilotPreflight(projectId, signal).catch((e) => {
+          if (signal?.aborted) return null;
+          const errorMsg = e instanceof Error ? e.message : 'Failed to fetch preflight data';
+          setPreflightError(errorMsg);
+          return null;
+        }),
       ]);
       if (signal?.aborted) return;
       setLanes(lanesData.lanes ?? []);
@@ -117,6 +124,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
     setShadowHealth(null);
     setFetchError(null);
     setPreflight(null);
+    setPreflightError(null);
     setLoading(Boolean(projectId));
   }, [projectId]);
 
@@ -198,6 +206,12 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
 
       {!collapsed && (
         <div className="mt-1 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-xs">
+          {preflightError && (
+            <div className="mb-3 flex items-start gap-2 rounded border border-amber-500/20 bg-amber-500/10 px-3 py-2">
+              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-amber-400" />
+              <span className="min-w-0 break-words text-amber-300 text-[11px]">Preflight data unavailable</span>
+            </div>
+          )}
           {preflight && (
             <div
               data-testid="lane-pilot-preflight"
@@ -328,6 +342,9 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                 const reservationExpiresAt = lane.reservation_expires_at
                   ? formatAbsolute(parseTimestamp(lane.reservation_expires_at).getTime())
                   : '—';
+                const reservationIsExpired =
+                  lane.reservation_expires_at != null &&
+                  parseTimestamp(lane.reservation_expires_at).getTime() < Date.now();
                 return (
                   <div
                     key={lane.id}
@@ -389,9 +406,15 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                         <div className="mt-0.5 break-words text-neutral-300">
                           {lane.reserved_vm_instance_id ?? '—'}
                         </div>
-                        <div className="mt-0.5 text-neutral-500">
-                          Expires {reservationExpiresAt}
-                        </div>
+                        {reservationIsExpired ? (
+                          <div className="mt-0.5 text-amber-400" data-testid="reservation-expiry">
+                            Expired {timeAgo(lane.reservation_expires_at as string)}
+                          </div>
+                        ) : (
+                          <div className="mt-0.5 text-neutral-500" data-testid="reservation-expiry">
+                            Expires {reservationExpiresAt}
+                          </div>
+                        )}
                         <div className="mt-1 space-y-0.5 text-[10px]" data-testid="reservation-cause-breakdown">
                           <div>
                             <span className="text-neutral-500">Claimed </span>

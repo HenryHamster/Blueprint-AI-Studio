@@ -70,7 +70,7 @@ async def get_retirement_critiques(
                 StrategicCycle.id,
                 StrategicCycle.cycle_metadata,
                 StrategicCycle.created_at,
-            )
+            raiseload=True,)
         )
         .where(StrategicCycle.project_id == project_id)
         .order_by(StrategicCycle.created_at.desc())

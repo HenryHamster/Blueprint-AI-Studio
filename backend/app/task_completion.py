@@ -3195,7 +3195,14 @@ def _extract_json_object(text: str, *required_keys: str) -> Optional[str]:
 
 
 def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Normalize a panel-review verdict and require every declared lens."""
+    """Normalize a panel-review verdict.
+
+    ``overall_verdict`` (APPROVE / REQUEST_CHANGES) is the only required field.
+    ``lenses`` is optional telemetry: when a well-formed lenses object is present
+    it is captured and preserved; when missing or malformed the overall verdict
+    resolution still proceeds so a correctly-decided review is never discarded on
+    a structural check for a field nothing downstream consumes.
+    """
     overall_verdict = str(raw.get("overall_verdict") or "").strip()
     if overall_verdict not in {"APPROVE", "REQUEST_CHANGES"}:
         return None
@@ -3213,20 +3220,17 @@ def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, A
             name = item.get("lens") or item.get("name") or item.get("id")
             if isinstance(name, str):
                 lens_map[name] = item
-    else:
-        return None
 
-    if any(lens not in lens_map for lens in _PANEL_REVIEW_REQUIRED_LENSES):
-        return None
-
+    # Normalize per-lens telemetry where available; skip lenses that are
+    # missing or malformed — never gate the overall verdict on their presence.
     normalized_lenses: Dict[str, Dict[str, Any]] = {}
     for lens in _PANEL_REVIEW_REQUIRED_LENSES:
         payload = lens_map.get(lens)
         if not isinstance(payload, dict):
-            return None
+            continue
         lens_verdict = str(payload.get("verdict") or "").strip()
         if not lens_verdict:
-            return None
+            continue
         summary = str(
             payload.get("summary")
             or payload.get("feedback")
@@ -3234,7 +3238,7 @@ def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, A
             or ""
         ).strip()
         if not summary:
-            return None
+            continue
         issues = payload.get("issues")
         normalized_lenses[lens] = {
             "verdict": lens_verdict,
@@ -3245,8 +3249,9 @@ def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, A
     normalized: Dict[str, Any] = {
         "overall_verdict": overall_verdict,
         "summary": str(raw.get("summary") or raw.get("feedback") or "").strip(),
-        "lenses": normalized_lenses,
     }
+    if normalized_lenses:
+        normalized["lenses"] = normalized_lenses
     overall_issues = raw.get("issues")
     if isinstance(overall_issues, list):
         normalized["issues"] = overall_issues
@@ -3259,7 +3264,18 @@ def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, A
 
 
 def _parse_panel_review_output(text: str | None) -> Optional[Dict[str, Any]]:
-    """Best-effort extract the structured panel-review verdict from agent output."""
+    """Best-effort extract the structured panel-review verdict from agent output.
+
+    Uses the same three-method cascade as the primary review path so the two
+    paths cannot diverge in strictness:
+
+    Method 1 — top-level JSON with ``overall_verdict``.
+    Method 2 — balanced-bracket JSON scan for ``overall_verdict`` or ``lenses``
+               embedded in prose.
+    Method 3 — anchored-prose floor via ``_resolve_fallback_verdict`` (same
+               safety gate as the primary review); returns None only when no
+               APPROVE/REQUEST_CHANGES signal is present anywhere.
+    """
     if not text:
         return None
     snippet = text[:500_000]
@@ -3271,9 +3287,11 @@ def _parse_panel_review_output(text: str | None) -> Optional[Dict[str, Any]]:
     if isinstance(parsed, dict) and "overall_verdict" in parsed:
         candidates.append(snippet)
 
-    candidate = _extract_json_object(snippet, "lenses")
-    if candidate and candidate not in candidates:
-        candidates.append(candidate)
+    # Scan for embedded JSON objects carrying either key.
+    for search_key in ("overall_verdict", "lenses"):
+        candidate = _extract_json_object(snippet, search_key)
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
 
     for candidate_text in candidates:
         try:
@@ -3284,6 +3302,16 @@ def _parse_panel_review_output(text: str | None) -> Optional[Dict[str, Any]]:
             normalized = _normalize_panel_review_verdict(obj)
             if normalized is not None:
                 return normalized
+
+    # Method 3: anchored-prose floor — the same safety floor the primary review
+    # uses. Returns None (→ fail-closed escalation) when no anchored
+    # APPROVE/REQUEST_CHANGES signal is present, so genuinely absent verdicts
+    # still escalate to manual review.
+    from app.task_lifecycle import _resolve_fallback_verdict  # noqa: PLC0415
+
+    verdict = _resolve_fallback_verdict(snippet)
+    if verdict is not None:
+        return {"overall_verdict": verdict, "summary": ""}
     return None
 
 
@@ -3439,7 +3467,7 @@ async def _handle_panel_review_completion(task: Task, logs: str, session: AsyncS
     task.status = TaskStatus.COMPLETED
     task.latest_status_message = (
         f"Panel review verdict recorded ({parsed['overall_verdict']}; "
-        f"{len(parsed['lenses'])} lenses)"
+        f"{len(parsed.get('lenses') or {})} lenses)"
     )
     session.add(task)
     await session.commit()

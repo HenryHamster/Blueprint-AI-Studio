@@ -300,6 +300,7 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
         changed_files=["backend/app/release_promotion.py"],
     )
     producer.project_id = project_id
+    producer.context["provides_capability"] = "release-promotion"
     record_code_acceptance_verdict(producer)
     assert producer.context[CODE_ACCEPTANCE_VERDICT_KEY] == {
         "satisfied": True,
@@ -309,6 +310,7 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
             "downstream_artifact 'release-promotion-record' is reflected in "
             "the shipped changed files"
         ),
+        "proof_ref": "release-promotion-record",
     }
     consumer = _make_code_task(changed_files=["backend/app/consumer.py"])
     consumer.project_id = project_id
@@ -368,6 +370,22 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
     assert verdict["consumed_artifact_id"] == str(artifact.id)
     assert verdict["consumed_by_task_id"] == str(consumer.id)
     assert consumer.context["consumed_artifact_ids"] == [str(artifact.id)]
+
+    # record_capability_proof must have been invoked on the producer's project.
+    from app.models import Project as ProjectModel
+
+    producer_project = await db_session.get(ProjectModel, project_id)
+    assert producer_project is not None
+    proof_records = producer_project.capability_proof_records or {}
+    assert "release-promotion" in proof_records, (
+        f"expected 'release-promotion' key in capability_proof_records; got {list(proof_records.keys())}"
+    )
+    proof_entries = proof_records["release-promotion"]
+    assert len(proof_entries) == 1
+    entry = proof_entries[0]
+    assert entry["task_id"] == str(producer.id)
+    assert entry["proof_kind"] == "downstream_artifact"
+    assert entry["proof_ref"] == artifact_key
 
 
 @pytest.mark.asyncio

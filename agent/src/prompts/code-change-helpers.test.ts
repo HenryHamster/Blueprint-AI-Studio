@@ -284,10 +284,10 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     // SR injection bash is still present (shared with new-PR path)
     expect(prScript).toContain('SR_FILE="/tmp/self_review_fix-task-456.json"');
 
-    // Existing-PR path: PATCH call updates PR body
+    // Existing-PR path: PATCH call updates PR body (SR + screenshots sections)
     expect(prScript).toContain('PATCH');
     expect(prScript).toContain('/pulls/42');
-    expect(prScript).toContain('SR body update');
+    expect(prScript).toContain('PR body update');
   });
   it('generates ./check and ./pr with test gate when promotionTarget matches baseBranch', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');

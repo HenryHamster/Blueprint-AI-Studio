@@ -82,6 +82,7 @@ describe('SettingsDropdown — viewport regression', () => {
             onRemoveAccount={() => {}}
             onResetRateLimits={() => {}}
             onRefreshAccountModels={() => {}}
+            onUpdateAccount={() => {}}
             newAccountName=""
             setNewAccountName={() => {}}
             newAccountProvider="anthropic"
@@ -244,6 +245,7 @@ describe('SettingsDropdown — viewport regression', () => {
             onRemoveAccount={() => {}}
             onResetRateLimits={() => {}}
             onRefreshAccountModels={() => {}}
+            onUpdateAccount={() => {}}
             newAccountName=""
             setNewAccountName={() => {}}
             newAccountProvider="anthropic"
@@ -406,6 +408,7 @@ describe('SettingsDropdown — viewport regression', () => {
             onRemoveAccount={() => {}}
             onResetRateLimits={() => {}}
             onRefreshAccountModels={() => {}}
+            onUpdateAccount={() => {}}
             newAccountName=""
             setNewAccountName={() => {}}
             newAccountProvider="anthropic"

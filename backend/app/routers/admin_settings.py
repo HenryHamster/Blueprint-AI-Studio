@@ -103,6 +103,9 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "evergreen_fill_max_active",
         "evergreen_fill_daily_cap",
         "evergreen_fill_deferred_memo_enrollment",
+        "structural_health_audit_mode",
+        "structural_health_audit_interval_minutes",
+        "structural_health_audit_fat_row_bytes",
         "category_routing",
         "ci_backstop_timeout_minutes",
         "cochange_decomposition_enabled",
@@ -300,8 +303,8 @@ async def get_settings(
     current_user: dict = Depends(require_admin),
 ):
     from app.shared_state import runtime_config as _runtime_config
-    from app.max_plan_pool import _max_plan_pools
     from app.models import UserIntegration
+    from app.routers.admin_pool_accounts import list_authoritative_max_plan_accounts
 
     # Check if the user has a GitHub integration
     github_account = None
@@ -312,7 +315,9 @@ async def get_settings(
     if integration and integration.github_account_name:
         github_account = integration.github_account_name
 
-    user_pool = _max_plan_pools.get(current_user["user_id"], [])
+    max_plan_accounts = await list_authoritative_max_plan_accounts(
+        session, current_user["user_id"]
+    )
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
@@ -343,6 +348,15 @@ async def get_settings(
         ),
         "evergreen_fill_deferred_memo_enrollment": bool(
             _runtime_config.get("evergreen_fill_deferred_memo_enrollment", False)
+        ),
+        "structural_health_audit_mode": str(
+            _runtime_config.get("structural_health_audit_mode", "off")
+        ),
+        "structural_health_audit_interval_minutes": int(
+            _runtime_config.get("structural_health_audit_interval_minutes", 60)
+        ),
+        "structural_health_audit_fat_row_bytes": int(
+            _runtime_config.get("structural_health_audit_fat_row_bytes", 1048576)
         ),
         "max_concurrent_auto_remediations": _runtime_config.get(
             "max_concurrent_auto_remediations", 2
@@ -611,7 +625,7 @@ async def get_settings(
         "using_max_plan": len(
             [
                 a
-                for a in user_pool
+                for a in max_plan_accounts
                 if a.get("enabled", True)
                 and a.get("provider", LLMProviderName.ANTHROPIC.value)
                 == LLMProviderName.ANTHROPIC.value
@@ -620,40 +634,7 @@ async def get_settings(
             ]
         )
         > 0,
-        "max_plan_accounts": [
-            {
-                "id": a["id"],
-                "name": a["name"],
-                "enabled": a.get("enabled", True),
-                "provider": a.get("provider", LLMProviderName.ANTHROPIC.value),
-                "auth_mode": a.get("auth_mode", LLMAuthMode.OAUTH.value),
-                "provider_metadata": a.get("provider_metadata", {}),
-                "active_tasks": a["active_tasks"],
-                "total_tasks": a["total_tasks"],
-                "token_created_at": a.get("token_created_at"),
-                "rl_hit_count": a.get("rl_hit_count", 0),
-                "daily_task_cap": a.get("daily_task_cap"),
-                "max_concurrent_tasks": a.get("max_concurrent_tasks"),
-                "auto_disable_after_rate_limits": a.get(
-                    "auto_disable_after_rate_limits"
-                ),
-                "daily_task_count": int(a.get("daily_task_count") or 0),
-                "daily_task_count_reset_at": (
-                    a["daily_task_count_reset_at"].isoformat()
-                    if a.get("daily_task_count_reset_at")
-                    else None
-                ),
-                "disabled_reason": a.get("disabled_reason"),
-                "disabled_models": {
-                    model: {
-                        "hits": info.get("hits", 0),
-                        "at": info["at"].isoformat() if info.get("at") else None,
-                    }
-                    for model, info in a.get("disabled_models", {}).items()
-                },
-            }
-            for a in user_pool
-        ],
+        "max_plan_accounts": max_plan_accounts,
     }
 
 
@@ -876,6 +857,44 @@ async def _apply_settings(
                 detail="evergreen_fill_deferred_memo_enrollment must be a boolean",
             )
         _runtime_config["evergreen_fill_deferred_memo_enrollment"] = raw
+    if "structural_health_audit_mode" in payload:
+        val = str(payload["structural_health_audit_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["structural_health_audit_mode"] = val
+    if "structural_health_audit_interval_minutes" in payload:
+        try:
+            val = int(payload["structural_health_audit_interval_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_interval_minutes must be a number",
+            )
+        if not (1 <= val <= 1440):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_interval_minutes must be between 1 and 1440",
+            )
+        _runtime_config["structural_health_audit_interval_minutes"] = val
+    if "structural_health_audit_fat_row_bytes" in payload:
+        try:
+            val = int(payload["structural_health_audit_fat_row_bytes"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_fat_row_bytes must be a number",
+            )
+        # Floor at 1 KiB so an operator can't set a pathological near-zero
+        # threshold that flags every row; ceiling well above the worst outage row.
+        if not (1024 <= val <= 1_073_741_824):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_fat_row_bytes must be between 1024 and 1073741824",
+            )
+        _runtime_config["structural_health_audit_fat_row_bytes"] = val
     if "evaluating_pipeline_timeout_minutes" in payload:
         try:
             val = int(payload["evaluating_pipeline_timeout_minutes"])

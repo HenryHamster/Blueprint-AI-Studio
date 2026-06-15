@@ -196,7 +196,7 @@ async def get_provider_cost_summary(
                         Task.vm_provisioned_at,
                         Task.vm_stopped_at,
                         Task.vm_runtime_cost_banked_db,
-                    )
+                    raiseload=True,)
                 )
                 .limit(5000)
             )
@@ -378,7 +378,7 @@ async def get_fix_loop_convergence(
                 Task.status,
                 Task.fix_loop_history,
                 Task.context,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
     )
@@ -520,7 +520,7 @@ async def get_fix_loop_convergence_trend(
                 Task.status,
                 Task.fix_loop_history,
                 Task.created_at,
-            )
+            raiseload=True,)
         )
         .limit(_TREND_LIMIT)
     )
@@ -634,7 +634,7 @@ async def _load_escalation_alerts(
             Alert.created_at >= cutoff,
             Alert.title.like(f"{_OUTER_LOOP_ESCALATION_PREFIX}%"),
         )
-        .options(load_only(Alert.id, Alert.title, Alert.task_id, Alert.created_at))
+        .options(load_only(Alert.id, Alert.title, Alert.task_id, Alert.created_at, raiseload=True))
         .limit(5000)
     )
     if project_id is not None:
@@ -710,7 +710,7 @@ async def _load_outer_loop_original_tasks(
                 Task.status_log,
                 Task.updated_at,
                 Task.archived,
-            )
+            raiseload=True,)
         )
     )
     if project_id is not None:
@@ -772,9 +772,9 @@ async def _fetch_outer_loop_tasks(
         stmt = select(
             Task,
             Task.payloads[0]["type"].as_string().label("_first_payload_type"),
-        ).options(load_only(*_OUTER_LOOP_TASK_COLUMNS))
+        ).options(load_only(*_OUTER_LOOP_TASK_COLUMNS, raiseload=True))
     else:
-        stmt = select(Task).options(load_only(*_OUTER_LOOP_TASK_COLUMNS, Task.payloads))
+        stmt = select(Task).options(load_only(*_OUTER_LOOP_TASK_COLUMNS, Task.payloads, raiseload=True))
     stmt = stmt.where(*where_clauses)
     if order_desc:
         stmt = stmt.order_by(Task.created_at.desc())
@@ -842,7 +842,7 @@ async def _hydrate_outcome_plan_outputs(
     (
         await session.execute(
             select(Task)
-            .options(load_only(Task.id, Task.plan_output))
+            .options(load_only(Task.id, Task.plan_output, raiseload=True))
             .where(Task.id.in_(need))
         )
     ).all()
@@ -1070,7 +1070,7 @@ async def get_outer_loop_chains(
                 Task.status,
                 Task.context,
                 Task.created_at,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
         .limit(_OUTER_LOOP_TASK_CAP)
@@ -1183,7 +1183,7 @@ async def get_fix_loop_diverged_tasks(
                 Task.context,
                 Task.payloads,
                 Task.created_at,
-            )
+            raiseload=True,)
         )
         .order_by(Task.created_at.desc())
         .limit(5000)
@@ -1403,7 +1403,7 @@ async def get_pipeline_regressions(
                         Task.updated_at,
                         Task.latest_status_message,
                         Task.context,
-                    )
+                    raiseload=True,)
                 )
                 .order_by(Task.created_at.desc())
                 .limit(100)
@@ -1653,7 +1653,7 @@ async def get_pipeline_efficiency(
             await session.execute(
                 select(Task)
                 .where(*filters)
-                .options(load_only(Task.id, Task.status, Task.context, Task.created_at))
+                .options(load_only(Task.id, Task.status, Task.context, Task.created_at, raiseload=True))
                 .limit(5000)
             )
         )
@@ -1772,14 +1772,14 @@ async def get_spawn_gate_census(
                 Task.payloads[0]["type"].as_string().label("_first_payload_type"),
             )
             .where(*where_clauses)
-            .options(load_only(Task.id, Task.project_id, Task.context, Task.payloads))
+            .options(load_only(Task.id, Task.project_id, Task.context, Task.payloads, raiseload=True))
             .limit(_SPAWN_GATE_CENSUS_TASK_CAP)
         )
     else:
         stmt = (
             select(Task)
             .where(*where_clauses)
-            .options(load_only(Task.id, Task.project_id, Task.context, Task.payloads))
+            .options(load_only(Task.id, Task.project_id, Task.context, Task.payloads, raiseload=True))
             .limit(_SPAWN_GATE_CENSUS_TASK_CAP)
         )
 

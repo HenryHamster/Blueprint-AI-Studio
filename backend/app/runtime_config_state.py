@@ -121,6 +121,31 @@ runtime_config: Dict = {
         "EVERGREEN_FILL_DEFERRED_MEMO_ENROLLMENT", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # --- Structural-health audit lane (resource/scalability audit) ---
+    # Recurring leader-only audit (reaper sweep) that detects the structural
+    # class that caused a Postgres saturation outage: unbounded JSONB fat-row
+    # growth in task.context. When it trips, it enrolls a DEDUPLICATED finding
+    # into the EXISTING evergreen ledger (same triage as a correctness finding)
+    # — no new queue, no schema change. Mirrors evergreen_fill_mode exactly.
+    #   off     — never act (default; whole feature inert until an operator flips).
+    #   observe — measure + record the would-be finding, enroll nothing.
+    #   enforce — enroll the deduped finding.
+    "structural_health_audit_mode": os.getenv(
+        "STRUCTURAL_HEALTH_AUDIT_MODE", "off"
+    ).lower()
+    if os.getenv("STRUCTURAL_HEALTH_AUDIT_MODE", "off").lower()
+    in ("off", "observe", "enforce")
+    else "off",
+    # Cadence (minutes) between structural-health audit sweeps in the reaper loop.
+    "structural_health_audit_interval_minutes": int(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_INTERVAL_MINUTES", "60")
+    ),
+    # Per-row task.context byte-size threshold at/above which a row is a fat-row
+    # finding. Default 1 MiB — far above a healthy row (low single-digit KiB),
+    # well below the multi-megabyte rows that drove the saturation outage.
+    "structural_health_audit_fat_row_bytes": int(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_FAT_ROW_BYTES", "1048576")
+    ),
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:

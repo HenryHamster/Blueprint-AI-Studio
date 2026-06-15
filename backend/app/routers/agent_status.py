@@ -2098,6 +2098,13 @@ async def update_agent_status(
                     ctx = with_task_attempt_banking(task, ctx)
                     ctx.pop("_slot_released", None)
                     ctx.pop("provision_failures", None)
+                    # Clear the stale DEAD_AUTH verdict and matched pattern so
+                    # the next attempt is classified fresh for its own provider.
+                    # Without this, the short-circuit in _classify_failure_class
+                    # fires on the next attempt and can disable a new account
+                    # (even a different provider's) with the stale pattern.
+                    ctx.pop("failure_class", None)
+                    ctx.pop("dead_auth_matched_pattern", None)
                     task.context = ctx
                     task.status = TaskStatus.QUEUED
                     task.retry_after_until = None

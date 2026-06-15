@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
 from sqlalchemy import and_, case, func, or_
+from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -408,6 +409,28 @@ async def compute_trial_arm_accumulation(
         _assign_flag_expr = (
             case((_primary_expr.is_not(None), 1), else_=0) if _has_assignment else None
         )
+        # Delivered = assignment key set AND receipt key also set (treatment ran).
+        _receipt_expr_for_delivery = func.json_extract(Task.context, f"$.{context_key}")
+        _delivered_flag_expr = (
+            case(
+                (
+                    and_(
+                        _primary_expr.is_not(None),
+                        _receipt_expr_for_delivery.is_not(None),
+                    ),
+                    1,
+                ),
+                else_=0,
+            )
+            if _has_assignment
+            else None
+        )
+        # Receipt truthy: receipt key is explicitly true (SQLite json_extract returns 1 for JSON true).
+        _receipt_truthy_flag_expr = (
+            case((_receipt_expr_for_delivery == 1, 1), else_=0)
+            if _has_assignment
+            else None
+        )
     else:
         _primary_expr = Task.context[_assign_key].astext
         _fallback_expr = Task.context[context_key].astext
@@ -419,6 +442,28 @@ async def compute_trial_arm_accumulation(
         succ_expr = Task.context["_first_attempt_succeeded"].astext
         _assign_flag_expr = (
             case((_primary_expr.is_not(None), 1), else_=0) if _has_assignment else None
+        )
+        # Delivered = assignment key set AND receipt key also set (treatment ran).
+        _receipt_expr_for_delivery = Task.context[context_key].astext
+        _delivered_flag_expr = (
+            case(
+                (
+                    and_(
+                        _primary_expr.is_not(None),
+                        _receipt_expr_for_delivery.is_not(None),
+                    ),
+                    1,
+                ),
+                else_=0,
+            )
+            if _has_assignment
+            else None
+        )
+        # Receipt truthy: receipt key is explicitly "true" (PG astext returns string).
+        _receipt_truthy_flag_expr = (
+            case((_receipt_expr_for_delivery == "true", 1), else_=0)
+            if _has_assignment
+            else None
         )
 
     filters = [
@@ -432,13 +477,34 @@ async def compute_trial_arm_accumulation(
     with_n = with_succ = without_n = without_succ = 0
     if _has_assignment:
         stmt = (
-            select(arm_expr, succ_expr, _assign_flag_expr, func.count())
+            select(
+                arm_expr,
+                succ_expr,
+                _assign_flag_expr,
+                _delivered_flag_expr,
+                _receipt_truthy_flag_expr,
+                func.count(),
+            )
             .where(*filters)
-            .group_by(arm_expr, succ_expr, _assign_flag_expr)
+            .group_by(
+                arm_expr,
+                succ_expr,
+                _assign_flag_expr,
+                _delivered_flag_expr,
+                _receipt_truthy_flag_expr,
+            )
         )
         rows = (await session.execute(stmt)).all()
         with_assigned = with_receipt = without_assigned = without_receipt = 0
-        for arm_val, succ_val, is_assigned_val, cnt in rows:
+        with_assigned_delivered = without_contaminated = 0
+        for (
+            arm_val,
+            succ_val,
+            is_assigned_val,
+            is_delivered_val,
+            receipt_truthy_val,
+            cnt,
+        ) in rows:
             cnt = int(cnt)
             is_assigned = bool(is_assigned_val)
             if _json_truthy(arm_val):
@@ -447,6 +513,8 @@ async def compute_trial_arm_accumulation(
                     with_succ += cnt
                 if is_assigned:
                     with_assigned += cnt
+                    if bool(is_delivered_val):
+                        with_assigned_delivered += cnt
                 else:
                     with_receipt += cnt
             else:
@@ -455,6 +523,8 @@ async def compute_trial_arm_accumulation(
                     without_succ += cnt
                 if is_assigned:
                     without_assigned += cnt
+                    if bool(receipt_truthy_val):
+                        without_contaminated += cnt
                 else:
                     without_receipt += cnt
     else:
@@ -494,9 +564,11 @@ async def compute_trial_arm_accumulation(
     if _has_assignment:
         result["arm_composition"] = {
             "with_assigned": with_assigned,
+            "with_assigned_delivered": with_assigned_delivered,
             "with_receipt": with_receipt,
             "without_assigned": without_assigned,
             "without_receipt": without_receipt,
+            "without_contaminated": without_contaminated,
         }
     return result
 
@@ -1607,6 +1679,160 @@ def compute_lane_waste_diagnostics(
         "chain_limit": chain_limit,
         "chains_truncated": len(chain_rows) > chain_limit,
         "chains": chain_rows[:chain_limit],
+    }
+
+
+def compute_lane_baseline_trend(
+    baselines: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    """Compute per-metric trend between the two most recent persisted lane baselines.
+
+    ``baselines`` must be sorted newest-first (as returned by
+    ``get_lane_baselines``).  Returns ``None`` when fewer than 2 baselines
+    exist.  For each tracked metric the returned block contains ``latest``,
+    ``prior``, ``delta``, and ``classification``
+    (``"improving"`` / ``"declining"`` / ``"stable"`` / ``None``).
+
+    Thresholds:
+    - Relay medians (wall_clock, active, gap seconds): relative ±10%.
+    - Relay medians task_count and lane p50/p90 iterations: absolute ±0.5.
+    - Waste-taxonomy shares (category count / waste_task_count): absolute ±0.05.
+
+    All timing and iteration metrics treat lower as better; waste shares also
+    treat lower as better (less waste = improving).
+    """
+    if len(baselines) < 2:
+        return None
+
+    latest = baselines[0]
+    prior = baselines[1]
+
+    def _block(
+        curr: float | None,
+        prev: float | None,
+        *,
+        threshold_rel: float | None = None,
+        threshold_abs: float | None = None,
+        lower_is_better: bool = True,
+    ) -> Dict[str, Any]:
+        delta = (curr - prev) if (curr is not None and prev is not None) else None
+        if delta is None:
+            classification: str | None = None
+        elif threshold_rel is not None:
+            if prev == 0:
+                classification = None
+            else:
+                rel = delta / abs(prev)
+                if lower_is_better:
+                    classification = (
+                        "improving"
+                        if rel < -threshold_rel
+                        else "declining"
+                        if rel > threshold_rel
+                        else "stable"
+                    )
+                else:
+                    classification = (
+                        "improving"
+                        if rel > threshold_rel
+                        else "declining"
+                        if rel < -threshold_rel
+                        else "stable"
+                    )
+        else:
+            assert threshold_abs is not None
+            if lower_is_better:
+                classification = (
+                    "improving"
+                    if delta < -threshold_abs
+                    else "declining"
+                    if delta > threshold_abs
+                    else "stable"
+                )
+            else:
+                classification = (
+                    "improving"
+                    if delta > threshold_abs
+                    else "declining"
+                    if delta < -threshold_abs
+                    else "stable"
+                )
+        return {
+            "latest": curr,
+            "prior": prev,
+            "delta": delta,
+            "classification": classification,
+        }
+
+    relay_curr = latest.get("relay_medians") or {}
+    relay_prev = prior.get("relay_medians") or {}
+    relay_trend: Dict[str, Any] = {}
+    for key in ("wall_clock_seconds", "active_seconds", "gap_seconds"):
+        relay_trend[key] = _block(
+            relay_curr.get(key),
+            relay_prev.get(key),
+            threshold_rel=0.10,
+            lower_is_better=True,
+        )
+    relay_trend["task_count"] = _block(
+        relay_curr.get("task_count"),
+        relay_prev.get("task_count"),
+        threshold_abs=0.5,
+        lower_is_better=True,
+    )
+
+    diag_curr = latest.get("lane_iteration_distribution") or {}
+    diag_prev = prior.get("lane_iteration_distribution") or {}
+    lane_iter_trend: Dict[str, Any] = {}
+    for lane in ("review", "fix"):
+        lc = diag_curr.get(lane) or {}
+        lp = diag_prev.get(lane) or {}
+        lane_iter_trend[lane] = {
+            "p50": _block(
+                lc.get("p50_iterations"),
+                lp.get("p50_iterations"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+            "p90": _block(
+                lc.get("p90_iterations"),
+                lp.get("p90_iterations"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+        }
+
+    waste_curr = (latest.get("lane_waste") or {}).get("waste_taxonomy") or {}
+    waste_prev = (prior.get("lane_waste") or {}).get("waste_taxonomy") or {}
+    total_curr = (latest.get("lane_waste") or {}).get("waste_task_count") or 0
+    total_prev = (prior.get("lane_waste") or {}).get("waste_task_count") or 0
+    waste_trend: Dict[str, Any] = {}
+    for cat in LANE_WASTE_CATEGORIES:
+        share_curr = (waste_curr.get(cat, 0) / total_curr) if total_curr > 0 else None
+        share_prev = (waste_prev.get(cat, 0) / total_prev) if total_prev > 0 else None
+        waste_trend[cat] = _block(
+            share_curr,
+            share_prev,
+            threshold_abs=0.05,
+            lower_is_better=True,
+        )
+
+    crw_curr = latest.get("checkpoint_recovery_waste") or {}
+    crw_prev = prior.get("checkpoint_recovery_waste") or {}
+    crw_trend = _block(
+        float(crw_curr.get("total", 0)),
+        float(crw_prev.get("total", 0)),
+        threshold_abs=1.0,
+        lower_is_better=True,
+    )
+
+    return {
+        "latest_version": latest.get("version_number"),
+        "prior_version": prior.get("version_number"),
+        "relay_medians": relay_trend,
+        "lane_iterations": lane_iter_trend,
+        "waste_taxonomy_shares": waste_trend,
+        "checkpoint_recovery_waste_total": crw_trend,
     }
 
 
@@ -2984,7 +3210,11 @@ async def compute_merge_gate_fleet_health(
     raise. Returns all-zero counts and ``None`` rates/reason when no project has
     any gate data.
     """
-    stmt = select(Project)
+    # Narrow the projection: only merge_gate_runtime is read in the loop.
+    # raiseload=True catches any future accidental full-ORM attribute access.
+    stmt = select(Project).options(
+        load_only(Project.id, Project.merge_gate_runtime, raiseload=True)
+    )
     if project_id is not None:
         stmt = stmt.where(Project.id == project_id)
     projects = (await session.execute(stmt)).scalars().all()
@@ -4692,7 +4922,7 @@ def compute_llm_rework_cost(
         if not has_landed_signal(t):
             prior = _prior_attempts(t)
             all_attempts = _task_llm_attempts(t)
-            current_only = all_attempts[len(prior):]
+            current_only = all_attempts[len(prior) :]
             c, ui, uo = _price_attempts(current_only)
             failed_cost += c
             failed_ua_input += ui

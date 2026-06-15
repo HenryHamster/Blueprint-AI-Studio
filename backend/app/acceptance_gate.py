@@ -35,6 +35,7 @@ same way the reproduce-on-HEAD verdict does.
 
 from __future__ import annotations
 
+import logging
 import uuid
 import operator
 import re
@@ -51,6 +52,7 @@ from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.artifact_prerequisites import downstream_artifact_logical_key
 from app.models import Artifact
 from app.models import ArtifactConsumption
+from app.models import Project
 from app.models import Task
 from app.models import TaskStatus
 from app.payload_schemas import (
@@ -59,6 +61,8 @@ from app.payload_schemas import (
     read_acceptance_evidence,
 )
 from app.viewport_evidence import resolve_visual_evidence
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared fail-closed numeric comparison core (compute + code share this).
@@ -155,6 +159,7 @@ class AcceptanceGateVerdict:
     kind: str | None
     reason: str
     proven: bool = False
+    proof_ref: str | None = None
 
 
 def _changed_files(task: Task) -> list[str]:
@@ -255,6 +260,7 @@ def _evaluate_named_test(
         f"verified merge, and exercises a changed production seam "
         f"({len(seam_files)} non-test file(s))",
         proven=True,
+        proof_ref=evidence.test_path or declared_path or None,
     )
 
 
@@ -329,6 +335,7 @@ def _evaluate_downstream_artifact(
         evidence.kind,
         f"downstream_artifact {artifact_id!r} is reflected in the shipped "
         "changed files",
+        proof_ref=artifact_id or None,
     )
 
 
@@ -371,6 +378,7 @@ def _evaluate_visual(task: Task, evidence: AcceptanceEvidence) -> AcceptanceGate
         "visual acceptance evidence matches the uploaded viewport screenshot "
         f"{resolved['object_name']}",
         proven=True,
+        proof_ref=f"{evidence.component}@{evidence.viewport_width}",
     )
 
 
@@ -449,6 +457,7 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
         "proven": verdict.proven,
         "kind": verdict.kind,
         "reason": verdict.reason,
+        "proof_ref": verdict.proof_ref,
     }
     task.context = ctx
     return verdict
@@ -617,12 +626,18 @@ def _normalize_consumed_artifact_ids(
         raw = _fallback_consumed_artifact_ids(task)
     else:
         raw = list(consumed_artifact_ids)
-    allowed = _authorized_consumed_artifact_ids(task) if consumed_artifact_ids is not None else set()
+    allowed = (
+        _authorized_consumed_artifact_ids(task)
+        if consumed_artifact_ids is not None
+        else set()
+    )
     ids: list[uuid.UUID] = []
     seen: set[uuid.UUID] = set()
     for value in raw:
         try:
-            artifact_id = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+            artifact_id = (
+                value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+            )
         except (TypeError, ValueError):
             continue
         if consumed_artifact_ids is not None and artifact_id not in allowed:
@@ -646,7 +661,9 @@ async def record_artifact_consumptions_for_task(
     verdicts are left untouched, and existing proven/consumed verdicts are never
     downgraded.
     """
-    ids = _normalize_consumed_artifact_ids(task, consumed_artifact_ids, modern_agent=modern_agent)
+    ids = _normalize_consumed_artifact_ids(
+        task, consumed_artifact_ids, modern_agent=modern_agent
+    )
     if not ids:
         return []
 
@@ -691,10 +708,7 @@ async def record_artifact_consumptions_for_task(
         recorded_id_strings.append(str(artifact.id))
 
         declared_key = downstream_artifact_logical_key(producer)
-        if (
-            not declared_key
-            or artifact.logical_key != declared_key
-        ):
+        if not declared_key or artifact.logical_key != declared_key:
             continue
         producer_ctx = dict(producer.context or {})
         verdict = producer_ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)
@@ -714,6 +728,20 @@ async def record_artifact_consumptions_for_task(
             producer.context = producer_ctx
             flag_modified(producer, "context")
             session.add(producer)
+            try:
+                from app.capability_proof import record_capability_proof
+
+                producer_project = await session.get(Project, producer.project_id)
+                if producer_project is not None:
+                    record_capability_proof(producer, producer_project)
+                    session.add(producer_project)
+            except Exception:  # noqa: BLE001 — proof recording must never block consumption
+                logger.warning(
+                    "[ACCEPTANCE_GATE] capability proof recording failed for producer"
+                    " task %s after downstream_artifact consumption",
+                    getattr(producer, "id", None),
+                    exc_info=True,
+                )
 
     if recorded_id_strings:
         ctx = dict(task.context or {})

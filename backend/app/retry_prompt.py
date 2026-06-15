@@ -9,6 +9,7 @@ preserve existing call sites.
 
 import re
 
+from app.context_bounds import bound_review_history
 from app.failure_classification import (
     _timeout_subtype_from_message,
     TIMEOUT_CASCADE,
@@ -259,12 +260,19 @@ def _append_approve_to_review_history(
     """
     history = list(review_loop.get("review_history") or [])
     iteration = int(review_loop.get("iteration") or 0)
+    # Bound on the way out (both returns) so this APPROVE write path enforces the
+    # same review_history cap as the review_pipeline spawn store: it carries the
+    # existing list forward, which on a pre-fix in-flight row may still hold a
+    # multi-MB log-scraping `feedback` blob — re-bounding here self-heals it. The
+    # APPROVE entry itself stores empty feedback (never a fat source). The
+    # idempotency check below reads only structured `iteration`/`verdict`, so the
+    # bound does not change it.
     if (
         history
         and history[-1].get("iteration") == iteration
         and history[-1].get("verdict") == "APPROVE"
     ):
-        return history
+        return bound_review_history(history)
     history.append(
         {
             "iteration": iteration,
@@ -273,7 +281,7 @@ def _append_approve_to_review_history(
             "changed_files": list(changed_files or [])[:30],
         }
     )
-    return history
+    return bound_review_history(history)
 
 
 def merge_retry_prompt_suffix(

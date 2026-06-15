@@ -19,7 +19,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.admin_helpers import _get_user_project
-from app.auth import get_current_user
+from app.auth import get_current_user, require_admin
 from app.database import get_session, resolve_dialect_name
 from app.digest_cache import DigestCache, get_digest_cache
 from app.digest_precompute import annotate_precompute_metadata
@@ -29,6 +29,8 @@ from app.models import (
     LLMAuthMode,
     LLMProviderName,
     MaxPlanAccount,
+    PoolVm,
+    PoolVmState,
     Task,
     TaskStatus,
     _utcnow,
@@ -37,6 +39,8 @@ from app.providers.registry import get_provider
 from app.shared_state import limiter
 
 logger = logging.getLogger(__name__)
+
+_pool_account_cache_generations: dict[str, int] = {}
 
 router = APIRouter(
     prefix="/api/admin",
@@ -259,6 +263,162 @@ def _annotate_response_freshness(
     return annotated
 
 
+def _pool_account_cache_generation(user_id: str) -> int:
+    return _pool_account_cache_generations.get(user_id, 0)
+
+
+def _invalidate_pool_account_digests(cache: DigestCache, user_id: str) -> None:
+    _pool_account_cache_generations[user_id] = (
+        _pool_account_cache_generation(user_id) + 1
+    )
+    cache.invalidate_matching(
+        lambda key: (
+            isinstance(key, tuple)
+            and len(key) >= 2
+            and key[0] in {"max-plan-accounts-health", "provider-model-breakdown"}
+            and key[1] == user_id
+        )
+    )
+
+
+def _iso_or_none(value: Any) -> str | None:
+    return value.isoformat() if hasattr(value, "isoformat") else None
+
+
+def _serialize_disabled_models(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    serialized: dict[str, dict[str, Any]] = {}
+    for model, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+        entry: dict[str, Any] = {
+            "hits": int(info.get("hits") or 0),
+            "at": _iso_or_none(info.get("at")),
+        }
+        for field in (
+            "kind",
+            "provider",
+            "retry_after_seconds",
+            "cooldown_seconds",
+            "regression_stats",
+        ):
+            if field in info:
+                entry[field] = info[field]
+        serialized[str(model)] = entry
+    return serialized
+
+
+def _disabled_models_from_db(account: MaxPlanAccount) -> dict[str, dict[str, Any]]:
+    raw = (account.rate_limit_state or {}).get("disabled_models")
+    if not isinstance(raw, dict):
+        return {}
+    serialized: dict[str, dict[str, Any]] = {}
+    for model, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+        entry: dict[str, Any] = {
+            "hits": int(info.get("hits") or 0),
+            "at": info.get("at"),
+        }
+        for field in (
+            "kind",
+            "provider",
+            "retry_after_seconds",
+            "cooldown_seconds",
+            "regression_stats",
+        ):
+            if field in info:
+                entry[field] = info[field]
+        serialized[str(model)] = entry
+    return serialized
+
+
+def _serialize_max_plan_account_row(
+    db_account: MaxPlanAccount, mem_account: dict[str, Any] | None
+) -> dict[str, Any]:
+    provider = db_account.provider or LLMProviderName.ANTHROPIC
+    auth_mode = db_account.auth_mode or LLMAuthMode.OAUTH
+    provider_value = (
+        provider.value if isinstance(provider, LLMProviderName) else str(provider)
+    )
+    auth_mode_value = (
+        auth_mode.value if isinstance(auth_mode, LLMAuthMode) else str(auth_mode)
+    )
+    metadata = (
+        dict(mem_account.get("provider_metadata") or {})
+        if mem_account is not None
+        else dict(db_account.provider_metadata or {})
+    )
+    daily_reset_at = (
+        mem_account.get("daily_task_count_reset_at")
+        if mem_account is not None
+        else db_account.daily_task_count_reset_at
+    )
+    disabled_models = (
+        _serialize_disabled_models(mem_account.get("disabled_models"))
+        if mem_account is not None
+        else _disabled_models_from_db(db_account)
+    )
+    return {
+        "id": str(db_account.id),
+        "name": db_account.name,
+        "enabled": bool(db_account.enabled),
+        "provider": provider_value,
+        "auth_mode": auth_mode_value,
+        "provider_metadata": metadata,
+        "active_tasks": int((mem_account or {}).get("active_tasks") or 0),
+        "total_tasks": int(db_account.total_tasks or 0),
+        "token_created_at": _iso_or_none(db_account.token_created_at),
+        "rl_hit_count": int((mem_account or {}).get("rl_hit_count") or 0),
+        "daily_task_cap": db_account.daily_task_cap,
+        "max_concurrent_tasks": db_account.max_concurrent_tasks,
+        "auto_disable_after_rate_limits": db_account.auto_disable_after_rate_limits,
+        "daily_task_count": int(
+            (mem_account or {}).get("daily_task_count", db_account.daily_task_count)
+            or 0
+        ),
+        "daily_task_count_reset_at": _iso_or_none(daily_reset_at),
+        "disabled_reason": (mem_account or {}).get(
+            "disabled_reason", db_account.disabled_reason
+        ),
+        "disabled_at": _iso_or_none(
+            (mem_account or {}).get("disabled_at", db_account.disabled_at)
+        ),
+        "disabled_models": disabled_models,
+        "runtime_ready": bool((mem_account or {}).get("runtime_ready")),
+    }
+
+
+async def list_authoritative_max_plan_accounts(
+    session: AsyncSession, user_id: str
+) -> list[dict[str, Any]]:
+    """Authoritative persisted account roster overlaid with live pool fields."""
+    from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
+
+    rows = (
+        (
+            await session.execute(
+                select(MaxPlanAccount)
+                .where(MaxPlanAccount.user_id == user_id)
+                .order_by(MaxPlanAccount.created_at, MaxPlanAccount.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    async with _max_plan_pool_lock:
+        mem_by_id = {
+            str(account_id): dict(account)
+            for account_id, account in _account_by_id.items()
+            if account.get("user_id") == user_id
+        }
+    return [
+        _serialize_max_plan_account_row(row, mem_by_id.get(str(row.id)))
+        for row in rows
+    ]
+
+
 _HEALTH_FAILURE_CLASSES = (
     "CODE_ERROR",
     "RATE_LIMIT",
@@ -274,6 +434,20 @@ _FAILURE_CLASS_BUCKET_GROUPS: dict[str, list[str]] = {
     "infrastructure": ["PROVISION_FAILURE", "AGENT_TIMEOUT", "SCOPE_OVERFLOW"],
     "code": ["CODE_ERROR", "MIGRATION_ERROR"],
 }
+
+
+@router.get("/max-plan-accounts")
+async def get_max_plan_accounts(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    accounts = await list_authoritative_max_plan_accounts(
+        session, current_user["user_id"]
+    )
+    return {
+        "accounts": accounts,
+        "generated_at": _utcnow().isoformat(),
+    }
 
 
 @router.get("/max-plan-accounts/health")
@@ -292,7 +466,11 @@ async def get_account_health_summary(
     summaries are filtered to the user's accounts. Default TTL 15s.
     """
     user_id = current_user["user_id"]
-    cache_key = ("max-plan-accounts-health", user_id)
+    cache_key = (
+        "max-plan-accounts-health",
+        user_id,
+        _pool_account_cache_generation(user_id),
+    )
     result, served_stale = await cache.get_or_compute_meta(
         cache_key,
         lambda: _compute_account_health_summary(
@@ -362,7 +540,8 @@ async def _compute_account_health_summary(
                             Task.latest_status_message,
                             Task.updated_at,
                             Task.project_id,  # classify_failure → record_residual_fingerprint
-                            Task.payloads,  # classify_failure reads first_payload (L-P2)
+                            Task.payloads,  # classify_failure reads first_payload (L-P2),
+                            raiseload=True
                         )
                     )
                     .where(
@@ -473,6 +652,7 @@ async def get_provider_model_breakdown(
     cache_key = (
         "provider-model-breakdown",
         user_id,
+        _pool_account_cache_generation(user_id),
         str(project_id) if project_id is not None else None,
         expand_accounts,
     )
@@ -510,6 +690,7 @@ async def add_max_plan_account(
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    cache: DigestCache = Depends(get_digest_cache),
 ):
     """Add an LLM account record.
 
@@ -625,6 +806,7 @@ async def add_max_plan_account(
     # just stashes an error string; the admin UI can retry via the explicit
     # refresh endpoint.
     await _best_effort_refresh_availability(entry, db_account.id, normalized_secret)
+    _invalidate_pool_account_digests(cache, current_user["user_id"])
 
     return {
         "id": str(db_account.id),
@@ -686,8 +868,9 @@ async def remove_max_plan_account(
     force: bool = Query(False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    cache: DigestCache = Depends(get_digest_cache),
 ):
-    from app.max_plan_pool import _account_by_id, _max_plan_pools
+    from app.max_plan_pool import _account_by_id, _max_plan_pool_lock, _max_plan_pools
 
     try:
         acct_uuid = uuid.UUID(account_id)
@@ -702,26 +885,64 @@ async def remove_max_plan_account(
         await session.execute(
             select(Task.id, Task.project_id).where(
                 Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]),
-                Task.context["max_plan_account_id"].as_string() == account_id,
+                or_(
+                    Task.account_id == account_id,
+                    Task.context["llm_account_id"].as_string() == account_id,
+                    Task.context["max_plan_account_id"].as_string() == account_id,
+                ),
             )
         )
     ).all()
     active_using = [r[0] for r in active_using_rows]
-    if active_using and not force:
+    warm_refs = (
+        (
+            await session.execute(
+                select(PoolVm.id, PoolVm.state, PoolVm.vm_instance_id).where(
+                    PoolVm.account_id == account_id,
+                    PoolVm.state.in_(
+                        [
+                            PoolVmState.PROVISIONING,
+                            PoolVmState.IDLE,
+                            PoolVmState.LEASED,
+                        ]
+                    ),
+                )
+            )
+        )
+        .all()
+    )
+    async with _max_plan_pool_lock:
+        mem_account = _account_by_id.get(account_id)
+        live_active_count = int((mem_account or {}).get("active_tasks") or 0)
+
+    if (active_using or warm_refs or live_active_count > 0) and not force:
+        blockers: list[str] = []
+        if active_using:
+            blockers.append(f"{len(active_using)} active task(s)")
+        if live_active_count > 0:
+            blockers.append(f"{live_active_count} live in-memory reservation(s)")
+        if warm_refs:
+            blockers.append(f"{len(warm_refs)} warm-pool VM reference(s)")
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Account has {len(active_using)} active task(s). "
-                "Pass ?force=true to remove anyway (tasks will fail on next token refresh)."
+                f"Account cannot be removed safely: {', '.join(blockers)}. "
+                "Pass ?force=true to remove anyway; active tasks or warm VMs may fail "
+                "when they next refresh credentials."
             ),
         )
-    if active_using and force:
+    if (active_using or warm_refs or live_active_count > 0) and force:
         affected_ids_short = ", ".join(str(t)[:8] for t in active_using[:10])
         if len(active_using) > 10:
             affected_ids_short += f" (+{len(active_using) - 10} more)"
         logger.warning(
-            f"[POOL] Force-deleting account {account_id} with {len(active_using)} active tasks — "
-            f"affected: {affected_ids_short}"
+            "[POOL] Force-deleting account %s with %s active tasks, %s live "
+            "in-memory reservations, and %s warm-pool references; affected: %s",
+            account_id,
+            len(active_using),
+            live_active_count,
+            len(warm_refs),
+            affected_ids_short or "none",
         )
         # E5: emit a per-project Alert so operators see which tasks are at risk.
         # Without this, force-delete was a silent secret-revocation that surfaced
@@ -758,8 +979,6 @@ async def remove_max_plan_account(
     await session.delete(db_account)
     await session.commit()
 
-    from app.max_plan_pool import _max_plan_pool_lock
-
     async with _max_plan_pool_lock:
         user_id = current_user["user_id"]
         if user_id in _max_plan_pools:
@@ -767,6 +986,7 @@ async def remove_max_plan_account(
                 a for a in _max_plan_pools[user_id] if a["id"] != account_id
             ]
         _account_by_id.pop(account_id, None)
+    _invalidate_pool_account_digests(cache, current_user["user_id"])
     return {"message": "Account removed"}
 
 
@@ -776,6 +996,7 @@ async def update_max_plan_account(
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    cache: DigestCache = Depends(get_digest_cache),
 ):
     from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
 
@@ -944,6 +1165,7 @@ async def update_max_plan_account(
             db_account.id,
             normalized_secret or mem_account.get("runtime_secret"),
         )
+    _invalidate_pool_account_digests(cache, current_user["user_id"])
 
     return {
         "id": account_id,
@@ -967,6 +1189,7 @@ async def reset_account_rate_limits(
     account_id: str,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    cache: DigestCache = Depends(get_digest_cache),
 ):
     """Clear all rate-limit state (disabled_models) for a Max plan account."""
     from app.max_plan_pool import (
@@ -1009,6 +1232,7 @@ async def reset_account_rate_limits(
     logger.info(
         f"[POOL] Rate-limit state reset for account {db_account.name} ({account_id}) by user {current_user['user_id']}"
     )
+    _invalidate_pool_account_digests(cache, current_user["user_id"])
     return {"message": f"Rate-limit state cleared for account {db_account.name}"}
 
 
@@ -1019,6 +1243,7 @@ async def clear_account_model_regression_quarantine(
     model: str = Query(..., description="exact model name (e.g. claude-opus-4-8)"),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    cache: DigestCache = Depends(get_digest_cache),
 ):
     """Manual override: clear a kind='regression' disabled_models entry for
     (account, model). Only regression entries are touched — rate_limit /
@@ -1063,6 +1288,7 @@ async def clear_account_model_regression_quarantine(
         f"[POOL] Regression-quarantine cleared for account {db_account.name} "
         f"({account_id}) {provider}/{model} by user {current_user['user_id']}"
     )
+    _invalidate_pool_account_digests(cache, current_user["user_id"])
     return {
         "id": account_id,
         "provider": provider,
@@ -1078,6 +1304,7 @@ async def refresh_account_model_availability(
     account_id: str,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    cache: DigestCache = Depends(get_digest_cache),
 ):
     """Probe the provider's list-models endpoint for this account and cache
     the visible-models list on ``provider_metadata``.
@@ -1139,6 +1366,7 @@ async def refresh_account_model_availability(
         if models is not None
         else f"failed ({updated_metadata.get('available_models_error')})",
     )
+    _invalidate_pool_account_digests(cache, current_user["user_id"])
 
     return {
         "id": account_id,

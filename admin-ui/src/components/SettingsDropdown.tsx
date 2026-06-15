@@ -6,7 +6,7 @@ import { Settings, GitBranch, Shield, X, Sliders, ListChecks, Server, User, LogO
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
 export type { MaxPlanAccount } from '../types/settings';
-import type { AuthMode, CategoryRoutingEntry, DeployState, FailedRollbackInfo, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
+import type { AccountMutationReturn, AccountUpdatePayload, AuthMode, CategoryRoutingEntry, DeployState, FailedRollbackInfo, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 
 
 interface SettingsDropdownProps {
@@ -73,9 +73,10 @@ interface SettingsDropdownProps {
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
   onToggleAccount: (id: string, enabled: boolean) => void;
-  onRemoveAccount: (id: string) => void;
+  onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
   onResetRateLimits: (id: string) => void;
   onRefreshAccountModels: (id: string) => void;
+  onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
   newAccountProvider: ProviderName;
@@ -267,6 +268,7 @@ export function SettingsDropdown({
   onRemoveAccount,
   onResetRateLimits,
   onRefreshAccountModels,
+  onUpdateAccount,
   newAccountName,
   setNewAccountName,
   newAccountProvider,
@@ -557,6 +559,7 @@ export function SettingsDropdown({
                   onRemoveAccount={onRemoveAccount}
                   onResetRateLimits={onResetRateLimits}
                   onRefreshAccountModels={onRefreshAccountModels}
+                  onUpdateAccount={onUpdateAccount}
                   onUpdateAccountCaps={onUpdateAccountCaps}
                   showUserManagement={showUserManagement}
                   onToggleUserManagement={onToggleUserManagement}

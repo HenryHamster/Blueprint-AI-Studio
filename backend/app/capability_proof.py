@@ -32,6 +32,7 @@ __all__ = [
     "carry_proof_records_for_consolidation",
     "enrich_problem_model_capability_proofs",
     "record_capability_proof",
+    "record_capability_proof_from_trial",
     "should_record_capability_proof",
 ]
 
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 _PROOF_KIND_NAMED_TEST = "named_test"
 _PROOF_KIND_DOWNSTREAM_ARTIFACT = "downstream_artifact"
+_PROOF_KIND_TRIAL_ADOPTION = "trial_adoption"
 _MAX_PROOF_ENTRIES_PER_CAPABILITY = 10
 
 # Context key where we read the acceptance verdict.
@@ -46,39 +48,26 @@ _CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 
 
 def _extract_proof_ref(verdict: dict) -> str | None:
-    """Return the most specific proof reference from a verdict dict."""
-    # named_test: use test_path (the declared test selector)
-    evidence = verdict.get("evidence") or {}
-    if isinstance(evidence, dict):
-        test_path = evidence.get("test_path") or evidence.get("named_test")
-        if test_path:
-            return str(test_path)
-        artifact_id = evidence.get("artifact_id") or evidence.get("downstream_artifact")
-        if artifact_id:
-            return str(artifact_id)
-    # Fall back to top-level fields some older verdict shapes use.
-    test_path = verdict.get("test_path")
-    if test_path:
-        return str(test_path)
-    artifact_id = verdict.get("artifact_id")
-    if artifact_id:
-        return str(artifact_id)
+    """Return the proof reference from a stored verdict dict.
+
+    The stored verdict (written by acceptance_gate.record_code_acceptance_verdict)
+    carries a top-level ``proof_ref`` key set at evaluation time.
+    """
+    proof_ref = verdict.get("proof_ref")
+    if proof_ref:
+        return str(proof_ref)
     return None
 
 
 def _proof_kind_from_verdict(verdict: dict) -> str:
-    """Derive the proof kind label from a proven verdict dict."""
-    evidence = verdict.get("evidence") or {}
-    if isinstance(evidence, dict):
-        if evidence.get("test_path") or evidence.get("named_test"):
-            return _PROOF_KIND_NAMED_TEST
-        if evidence.get("artifact_id") or evidence.get("downstream_artifact"):
-            return _PROOF_KIND_DOWNSTREAM_ARTIFACT
-    if verdict.get("test_path"):
-        return _PROOF_KIND_NAMED_TEST
-    if verdict.get("artifact_id"):
-        return _PROOF_KIND_DOWNSTREAM_ARTIFACT
-    return _PROOF_KIND_NAMED_TEST  # default when evidence shape is unknown
+    """Derive the proof kind label from a stored verdict dict.
+
+    The stored verdict carries a top-level ``kind`` key set at evaluation time.
+    """
+    kind = verdict.get("kind")
+    if kind:
+        return str(kind)
+    return _PROOF_KIND_NAMED_TEST  # default when kind is absent
 
 
 def should_record_capability_proof(task: Any, verdict: Any) -> bool:
@@ -146,9 +135,7 @@ def enrich_problem_model_capability_proofs(
         )
         entry2["proof_status"] = "proven" if entries else "unproven"
         if entries:
-            entry2["proof_records"] = [
-                dict(proof_entry) for proof_entry in entries
-            ]
+            entry2["proof_records"] = [dict(proof_entry) for proof_entry in entries]
         annotated_caps.append(entry2)
 
     annotated["capabilities"] = annotated_caps
@@ -232,6 +219,67 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
         )
 
     return recorded
+
+
+def record_capability_proof_from_trial(
+    project: Any,
+    cap_name: str,
+    entry: dict[str, Any],
+) -> None:
+    """Record a bounded proof entry when a trial reaches an evidence-grounded ADOPT verdict.
+
+    Called from persist_trial_verdicts_in_transaction after a successful adopt
+    verdict is written. The dedup key ``trial:<normalized_cap_name>`` ensures a
+    standing ADOPT does not produce duplicate proof entries on re-evaluation.
+
+    Non-raising: all errors are logged at WARNING level so they cannot roll back
+    the surrounding session commit.
+    """
+    from app.time_utils import _utcnow
+
+    verdict = entry.get("verdict")
+    if verdict not in ("adopt", "ADOPT"):
+        return
+
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        return
+
+    # Stable dedup key: one proof record per capability trial adoption.
+    dedup_task_id = f"trial:{norm}"
+    proved_at = _utcnow().isoformat()
+
+    proof_entry: dict[str, Any] = {
+        "task_id": dedup_task_id,
+        "proved_at": proved_at,
+        "proof_kind": _PROOF_KIND_TRIAL_ADOPTION,
+        "proof_ref": norm,
+        "lift": entry.get("lift"),
+        "n_with": entry.get("n_with"),
+        "n_without": entry.get("n_without"),
+        "verdict_reason": entry.get("verdict_reason"),
+    }
+
+    if not isinstance(getattr(project, "capability_proof_records", None), dict):
+        project.capability_proof_records = {}
+
+    entries: list[dict] = list(project.capability_proof_records.get(norm) or [])
+    if any(e.get("task_id") == dedup_task_id for e in entries):
+        return
+
+    entries.append(proof_entry)
+    if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+        entries = entries[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+    project.capability_proof_records[norm] = entries
+    flag_modified(project, "capability_proof_records")
+    logger.info(
+        "[CAPABILITY_PROOF] recorded trial-adoption proof for cap=%s lift=%s"
+        " n_with=%s n_without=%s",
+        norm,
+        proof_entry.get("lift"),
+        proof_entry.get("n_with"),
+        proof_entry.get("n_without"),
+    )
 
 
 def carry_proof_records_for_consolidation(

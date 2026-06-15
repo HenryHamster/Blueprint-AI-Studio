@@ -64,7 +64,12 @@ from app.review_pipeline import (
     reconciled_approve_markers,
     should_auto_approve_diff,
 )
-from app.failure_classification import classify_failure
+from app.failure_classification import (
+    classify_failure,
+    classify_external_api_subtype,
+    EXTERNAL_API,
+    EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+)
 from app.branch_resolution import (
     classify_rollup_merge_outcome,
     is_custom_staged_rollup_root,
@@ -313,7 +318,13 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
             await session.execute(
                 select(Task)
                 .options(
-                    load_only(Task.id, Task.status, Task.payloads, Task.project_id)
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.payloads,
+                        Task.project_id,
+                        raiseload=True,
+                    )
                 )
                 .where(
                     Task.project_id == project_id,
@@ -393,7 +404,10 @@ def _resolve_adversarial_challenged_hashes(source: Task, grader: Task) -> list[s
     grader-side copy (for crash/recovery gaps), then the legacy plan_output
     fallback for parked sources that predate the persistence fix.
     """
-    from app.finding_deduplication import finding_hash as _fh
+    from app.finding_deduplication import (
+        canonical_finding_body as _canonical_body,
+        finding_hash as _fh,
+    )
 
     _stored_hashes = (source.context or {}).get("_adversarial_challenged_hashes")
     if isinstance(_stored_hashes, list) and _stored_hashes:
@@ -409,7 +423,7 @@ def _resolve_adversarial_challenged_hashes(source: Task, grader: Task) -> list[s
     return [
         _fh(
             str(f.get("title", "")),
-            str(f.get("description", "") or f.get("prompt", "")),
+            _canonical_body(f),
         )
         for f in stored_findings
         if isinstance(f, dict)
@@ -1008,6 +1022,76 @@ async def _resolve_review_second_opinion(
         )
 
     if panel is None:
+        # Model-config-rejection: the challenger's model is operator-configured but
+        # inaccessible (e.g. "model does not exist or you do not have access").
+        # Silently failing closed would set requires_approval=True on every trunk
+        # APPROVE — converting the gate into an invisible universal merge block.
+        # Instead: degrade visibly, preserve the primary verdict, signal operators.
+        if (
+            not pending_application
+            and payload.status == TaskStatus.FAILED
+            and classify_failure(challenger, logs=payload.logs) == EXTERNAL_API
+            and classify_external_api_subtype(challenger, logs=payload.logs)
+            == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
+        ):
+            logger.warning(
+                "[REVIEW SECOND-OPINION] Challenge %s for review %s: panel model "
+                "unavailable (provider model-config rejection) — degrading gracefully, "
+                "primary verdict %r preserved",
+                challenger.id,
+                review.id,
+                primary_verdict,
+            )
+            _deg_record: dict = {
+                "state": "degraded_model_unavailable",
+                "reconciled_verdict": primary_verdict,
+                "surviving_issues": primary_issues,
+                "challenger_task_id": str(challenger.id),
+                "review_task_id": str(review.id),
+            }
+            _deg_ctx = dict(review.context or {})
+            _deg_ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
+            _deg_ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = _deg_record
+            _set_sidecar_application_pending(
+                _deg_ctx,
+                lane=lane,
+                sidecar_id=challenger.id,
+                verdict_key=REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+            )
+            review.context = _deg_ctx
+            flag_modified(review, "context")
+            review.status = TaskStatus.COMPLETED
+            session.add(review)
+            challenger.latest_status_message = (
+                "Second-opinion panel model unavailable — degraded to primary verdict"
+            )[:500]
+            session.add(challenger)
+            await session.commit()
+            _deg_reconstructed = AgentStatusPayload(
+                task_id=review.id,
+                status=TaskStatus.COMPLETED,
+                verdict_json=json.dumps(
+                    {
+                        "verdict": _deg_record["reconciled_verdict"],
+                        "issues": _deg_record.get("surviving_issues", []),
+                        "feedback": parked.get("feedback", ""),
+                        "investigated_files": parked.get("investigated_files", []),
+                    }
+                ),
+            )
+            await session.commit()
+            await _process_post_commit(review.id, _deg_reconstructed)
+            await session.refresh(review)
+            _deg_ctx2 = dict(review.context or {})
+            _deg_ctx2.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
+            review.context = _deg_ctx2
+            _clear_sidecar_application_pending(
+                review, lane=lane, sidecar_id=challenger.id
+            )
+            session.add(review)
+            await session.commit()
+            return
+
         original_task_id = parked.get("original_task_id") or ""
         ctx = dict(review.context or {})
         ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
@@ -1156,6 +1240,7 @@ async def _resolve_finding_challenge_completion(
     cctx = challenge.context or {}
     boundary = str(cctx.get("challenged_boundary") or "")
     first_verdict = str(cctx.get("challenged_first_verdict") or "")
+    challenged_finding_hash = cctx.get("challenged_finding_hash") or None
     source_id = cctx.get(FINDING_CHALLENGE_SOURCE_KEY)
 
     try:
@@ -1213,6 +1298,7 @@ async def _resolve_finding_challenge_completion(
             str(challenge.id),
             completed=completed,
             source_task_id=str(source_id) if source_id else None,
+            finding_hash=challenged_finding_hash,
         )
         challenge.latest_status_message = (
             f"Finding challenge ({boundary}): {record.agreement} — {record.reason}"
@@ -3218,11 +3304,16 @@ async def _process_post_commit(
                     # will be spawned, so the lane must reach a terminal state here
                     # rather than staying PARKED until the warm-pool hard ceiling.
                     try:
-                        from app.review_fix_lane_pilot import retire_chain_lane as _retire_lane_approve
+                        from app.review_fix_lane_pilot import (
+                            retire_chain_lane as _retire_lane_approve,
+                        )
 
                         await _retire_lane_approve(session, task.context or {})
                     except Exception:  # noqa: BLE001
-                        logger.debug("[PIPELINE] retire_chain_lane (APPROVE) failed (non-critical)", exc_info=True)
+                        logger.debug(
+                            "[PIPELINE] retire_chain_lane (APPROVE) failed (non-critical)",
+                            exc_info=True,
+                        )
                     # Rollup gate handoff: when the original task is parking in CI wait
                     # (rollup-to-main / large rollup path in rollup_management), the parent
                     # owns the merge gate. The review task must NOT merge directly — it
@@ -3268,6 +3359,60 @@ async def _process_post_commit(
                                 else {}
                             )
                             if _orig_peek_loop.get("ci_waiting"):
+                                # ── SITE A lock-window fix ──
+                                # When ci_waiting AND ci_passed are both set the
+                                # rollup-handoff merge fires immediately after
+                                # the lock. The token mint (get_github_token_for_task
+                                # — up to ~120 s under rate-limit) and the pre-merge
+                                # Alembic dual-head guard (enforce_premerge_migration_guard
+                                # — GitHub PR-files + list_versions_at_ref fetches)
+                                # previously ran WHILE the FOR UPDATE on _orig was
+                                # held, blocking concurrent CI/heartbeat writes on
+                                # the rollup parent row.  Both calls are read-only
+                                # against the immutable PR, so hoist them here —
+                                # before _lock_original_task — and pass the results
+                                # in so _attempt_merge_with_retry_and_escalation
+                                # does not repeat the guard under the lock.
+                                _pre_rollup_gh: str | None = None
+                                _pre_rollup_own: str | None = None
+                                _pre_rollup_rep: str | None = None
+                                _pre_rollup_mig_guard: (
+                                    tuple[bool, str | None] | None
+                                ) = None
+                                if _orig_peek_loop.get("ci_passed"):
+                                    _peek_pr_num = _orig_peek_loop.get("pr_number")
+                                    _peek_base = _orig_peek_loop.get("base_branch", "")
+                                    try:
+                                        (
+                                            _pre_rollup_gh,
+                                            _pre_rollup_own,
+                                            _pre_rollup_rep,
+                                        ) = await get_github_token_for_task(
+                                            uuid.UUID(original_task_id), session
+                                        )
+                                        if _peek_pr_num and _peek_base:
+                                            from app.rollup_migration_validation import (
+                                                enforce_premerge_migration_guard as _emg_pre,
+                                            )
+
+                                            _pre_rollup_mig_guard = await _emg_pre(
+                                                _pre_rollup_gh,
+                                                _pre_rollup_own,
+                                                _pre_rollup_rep,
+                                                _peek_pr_num,
+                                                _peek_base,
+                                            )
+                                    except Exception as _pre_exc:
+                                        logger.debug(
+                                            "[REVIEW PIPELINE] Pre-lock token/guard "
+                                            "for rollup parent %s failed: %s "
+                                            "(will fall back to under-lock resolution)",
+                                            original_task_id[:8],
+                                            _pre_exc,
+                                        )
+                                        _pre_rollup_gh = None
+                                        _pre_rollup_mig_guard = None
+
                                 # Phase A1: skip_locked + bounded retry. If the parent
                                 # task row is held by a peer, defer the handoff —
                                 # the parent's own poll will pick up review_approved
@@ -3326,13 +3471,25 @@ async def _process_post_commit(
 
                                     if _orig_loop.get("ci_passed"):
                                         try:
-                                            (
-                                                _gh,
-                                                _own,
-                                                _rep,
-                                            ) = await get_github_token_for_task(
-                                                _orig.id, session
-                                            )
+                                            # Use pre-lock token if resolved; fall
+                                            # back to under-lock resolution when the
+                                            # pre-lock attempt failed.
+                                            if (
+                                                _pre_rollup_gh
+                                                and _pre_rollup_own
+                                                and _pre_rollup_rep
+                                            ):
+                                                _gh = _pre_rollup_gh
+                                                _own = _pre_rollup_own
+                                                _rep = _pre_rollup_rep
+                                            else:
+                                                (
+                                                    _gh,
+                                                    _own,
+                                                    _rep,
+                                                ) = await get_github_token_for_task(
+                                                    _orig.id, session
+                                                )
                                             await _attempt_merge_with_retry_and_escalation(
                                                 _orig,
                                                 _gh,
@@ -3340,6 +3497,7 @@ async def _process_post_commit(
                                                 _rep,
                                                 session,
                                                 source="review_approval",
+                                                precomputed_migration_guard=_pre_rollup_mig_guard,
                                             )
                                         except Exception as _gate_e:
                                             logger.error(

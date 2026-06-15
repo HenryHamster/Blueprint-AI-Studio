@@ -468,13 +468,20 @@ export async function handleReview(
   let prTitle = '';
   let prBody = '';
   try {
-    const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
-      headers: { Authorization: `token ${ghToken}`, Accept: 'application/vnd.github+json' },
-    });
-    if (prRes.ok) {
-      const prData = await prRes.json() as { title?: string; body?: string };
-      prTitle = prData.title || '';
-      prBody = prData.body || '';
+    const prMetaController = new AbortController();
+    const prMetaTimeout = setTimeout(() => { prMetaController.abort(); }, 25_000);
+    try {
+      const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
+        headers: { Authorization: `token ${ghToken}`, Accept: 'application/vnd.github+json' },
+        signal: prMetaController.signal,
+      });
+      if (prRes.ok) {
+        const prData = await prRes.json() as { title?: string; body?: string };
+        prTitle = prData.title || '';
+        prBody = prData.body || '';
+      }
+    } finally {
+      clearTimeout(prMetaTimeout);
     }
   } catch { /* best-effort, continue without PR metadata */ }
 

@@ -1,6 +1,7 @@
 """Focused tests for review-fix lane-pilot cost attribution."""
 
 import pytest
+from datetime import timedelta
 from sqlalchemy import select
 from unittest.mock import AsyncMock
 
@@ -9,6 +10,7 @@ from app.models import ImprovementLane
 from app.review_fix_lane_pilot import (
     LANE_CHAIN_ID_KEY,
     _SHADOW_ARM,
+    compute_lane_arm_time_medians,
     compute_lane_pilot_aggregates,
     is_review_fix_lane_pilot_shadow_mode_active_for_project,
     record_lane_arm_assignment,
@@ -20,6 +22,7 @@ from app.capability_trial_verdict import (
     evaluate_lane_pilot_verdict,
 )
 from app.models import TaskStatus
+from app.time_utils import _utcnow
 from testing.factories import make_project, make_task
 
 
@@ -573,6 +576,9 @@ async def test_checkpoint_skips_warm_reservation_for_shadow_arm_lane(
     db_session.add(source_task)
     await db_session.commit()
     await db_session.refresh(source_task)
+    lane.current_task_id = source_task.id
+    db_session.add(lane)
+    await db_session.commit()
     await db_session.refresh(lane)
 
     result = await checkpoint_and_reserve_on_phase_complete(
@@ -916,3 +922,461 @@ async def test_checkpoint_fraction_from_fix_task_context(db_session):
 
     agg2 = await compute_lane_pilot_aggregates(db_session, project2.id)
     assert agg2["checkpoint_fraction"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_aggregates_include_visual_verification_by_arm(db_session):
+    """lane_visual and control_visual aggregate visual-verification stats per arm.
+
+    A lane-arm task that touches admin-ui and records a visual_verification entry
+    must appear in lane_visual but not control_visual.  A control-arm task without
+    admin-ui files must not inflate either arm's admin_task_count.
+    """
+    import json
+
+    project = await _make_project(db_session, is_self_repo=True)
+
+    # Lane-arm task: touches admin-ui, records a visual_verification block with
+    # one infra failure to exercise the infra_rate signal as well.
+    lane_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "_pr_changed_files": ["admin-ui/src/components/Foo.tsx"],
+            "_self_review_outcome": json.dumps(
+                {
+                    "verdict": "pass",
+                    "visual_verification": {
+                        "passed": True,
+                        "pairs_inspected": 2,
+                        "pairs_changed": 1,
+                        "caught_visual_issue": False,
+                        "infra_failures": [],
+                    },
+                }
+            ),
+        },
+        estimated_cost_usd=1.0,
+    )
+
+    # Control-arm task: does not touch admin-ui, no visual_verification block.
+    control_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "control",
+            "_pr_changed_files": ["backend/app/models.py"],
+        },
+        estimated_cost_usd=0.8,
+    )
+
+    db_session.add_all([lane_task, control_task])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+
+    assert "lane_visual" in agg, "lane_visual key must be present in aggregates"
+    assert "control_visual" in agg, "control_visual key must be present in aggregates"
+
+    # Lane arm: one admin-ui task with a visual_verification entry.
+    assert agg["lane_visual"]["admin_task_count"] == 1
+    assert agg["lane_visual"]["entry_count"] == 1
+    assert agg["lane_visual"]["pairs_inspected"] == 2
+    assert agg["lane_visual"]["pairs_changed"] == 1
+    assert agg["lane_visual"]["caught_count"] == 0
+
+    # Control arm: no admin-ui files touched → zero admin tasks.
+    assert agg["control_visual"]["admin_task_count"] == 0
+    assert agg["control_visual"]["entry_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lane_pilot_aggregates_visual_infra_failure_counted_per_arm(db_session):
+    """infra_total and infra_rate are correctly computed in lane_visual.
+
+    A lane-arm task with VIEWPORT_GATE_INFRA_UNAVAILABLE in its visual_verification
+    entry must show infra_total >= 1 and infra_rate > 0 in lane_visual; control_visual
+    must remain at zero since no control task has a visual_verification block.
+    """
+    import json
+
+    from app.visual_verification_audit import VISUAL_INFRA_SENTINEL
+
+    project = await _make_project(db_session, is_self_repo=True)
+
+    lane_infra_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "_pr_changed_files": ["admin-ui/src/components/Bar.tsx"],
+            "_self_review_outcome": json.dumps(
+                {
+                    "verdict": "pass",
+                    "visual_verification": {
+                        "passed": False,
+                        "pairs_inspected": 0,
+                        "pairs_changed": 0,
+                        "caught_visual_issue": False,
+                        "issue": f"{VISUAL_INFRA_SENTINEL}: chromium missing",
+                    },
+                }
+            ),
+        },
+        estimated_cost_usd=1.2,
+    )
+
+    control_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "control",
+            "_pr_changed_files": ["backend/app/schemas.py"],
+        },
+        estimated_cost_usd=0.9,
+    )
+
+    db_session.add_all([lane_infra_task, control_task])
+    await db_session.commit()
+
+    agg = await compute_lane_pilot_aggregates(db_session, project.id)
+
+    assert agg["lane_visual"]["infra_total"] >= 1
+    assert agg["lane_visual"]["infra_rate"] > 0
+    assert agg["control_visual"]["infra_total"] == 0
+    assert agg["control_visual"]["infra_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_lane_relay_comparison_splits_fix_phase(db_session):
+    """compute_lane_arm_time_medians reports fix_active_seconds and review_active_seconds
+    independently, so review-side noise cannot mask fix-side improvements."""
+    project = await _make_project(db_session, is_self_repo=True)
+    now = _utcnow()
+    pr_number = 42
+
+    # Review task: active for 100s (started_at to updated_at)
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review", "prompt": "review", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "review_loop": {"pr_number": pr_number},
+        },
+        created_at=now - timedelta(seconds=400),
+        started_at=now - timedelta(seconds=300),
+        updated_at=now - timedelta(seconds=200),
+    )
+
+    # Fix task: active for 200s
+    fix_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={
+            LANE_PILOT_ASSIGNMENT_KEY: "lane",
+            "review_loop": {"pr_number": pr_number},
+        },
+        created_at=now - timedelta(seconds=400),
+        started_at=now - timedelta(seconds=195),
+        updated_at=now + timedelta(seconds=5),
+    )
+
+    db_session.add_all([review_task, fix_task])
+    await db_session.commit()
+
+    medians = await compute_lane_arm_time_medians(db_session, project.id)
+
+    assert medians["fix_active_seconds"] == pytest.approx(200.0)
+    assert medians["review_active_seconds"] == pytest.approx(100.0)
+    # Aggregate active equals the sum of phase actives for a single PR
+    assert medians["active_seconds"] == pytest.approx(300.0)
+    assert (
+        medians["fix_active_seconds"] + medians["review_active_seconds"]
+    ) == pytest.approx(medians["active_seconds"])
+
+
+# ---------------------------------------------------------------------------
+# compute_lane_baseline_trend
+# ---------------------------------------------------------------------------
+
+
+def _make_baseline(
+    version_number: int,
+    *,
+    wall_clock: float,
+    active: float,
+    gap: float,
+    task_count: float,
+    fix_p50: float,
+    fix_p90: float,
+    review_p50: float,
+    review_p90: float,
+    waste_taxonomy: dict,
+    waste_task_count: int,
+    terminal_status: str = "promoted",
+) -> dict:
+    return {
+        "version_number": version_number,
+        "terminal_status": terminal_status,
+        "relay_medians": {
+            "wall_clock_seconds": wall_clock,
+            "active_seconds": active,
+            "gap_seconds": gap,
+            "task_count": task_count,
+            "pr_count": 5,
+        },
+        "lane_iteration_distribution": {
+            "fix": {
+                "p50_iterations": fix_p50,
+                "p90_iterations": fix_p90,
+                "max_iterations": fix_p90,
+                "task_count": 10,
+                "pr_count": 5,
+            },
+            "review": {
+                "p50_iterations": review_p50,
+                "p90_iterations": review_p90,
+                "max_iterations": review_p90,
+                "task_count": 10,
+                "pr_count": 5,
+            },
+        },
+        "lane_waste": {
+            "waste_taxonomy": waste_taxonomy,
+            "waste_task_count": waste_task_count,
+        },
+    }
+
+
+def test_lane_baseline_cross_version_trend():
+    """compute_lane_baseline_trend returns correct deltas and classifications."""
+    from app.digest_metrics import compute_lane_baseline_trend
+
+    # Baselines are newest-first (latest = index 0).
+    latest = _make_baseline(
+        version_number=5,
+        wall_clock=1800.0,  # improved by 20% vs prior 2250
+        active=900.0,  # unchanged vs prior 900
+        gap=900.0,  # worsened vs prior 700 (~28%)
+        task_count=2.0,  # improved vs prior 3.0 (delta -1.0 > 0.5 abs)
+        fix_p50=2.0,  # improved vs prior 3.0 (delta -1.0 > 0.5 abs)
+        fix_p90=4.0,  # stable vs prior 4.2 (delta -0.2 < 0.5 abs)
+        review_p50=1.0,  # stable vs prior 1.0
+        review_p90=2.0,  # stable vs prior 2.0
+        waste_taxonomy={
+            "infra": 0,
+            "merge_conflict": 2,
+            "ci_churn": 0,
+            "review_ambiguity": 0,
+            "lost_reasoning": 5,
+            "lost_repo_state": 0,
+            "unknown": 3,
+        },
+        waste_task_count=10,
+    )
+    prior = _make_baseline(
+        version_number=4,
+        wall_clock=2250.0,
+        active=900.0,
+        gap=700.0,
+        task_count=3.0,
+        fix_p50=3.0,
+        fix_p90=4.2,
+        review_p50=1.0,
+        review_p90=2.0,
+        waste_taxonomy={
+            "infra": 0,
+            "merge_conflict": 1,
+            "ci_churn": 0,
+            "review_ambiguity": 0,
+            "lost_reasoning": 2,
+            "lost_repo_state": 0,
+            "unknown": 2,
+        },
+        waste_task_count=5,
+    )
+
+    trend = compute_lane_baseline_trend([latest, prior])
+    assert trend is not None
+    assert trend["latest_version"] == 5
+    assert trend["prior_version"] == 4
+
+    # wall_clock improved by 20% — threshold is ±10%
+    wc = trend["relay_medians"]["wall_clock_seconds"]
+    assert wc["classification"] == "improving"
+    assert wc["delta"] == pytest.approx(1800.0 - 2250.0)
+
+    # active stable (delta = 0)
+    active = trend["relay_medians"]["active_seconds"]
+    assert active["classification"] == "stable"
+    assert active["delta"] == pytest.approx(0.0)
+
+    # gap worsened by ~28%
+    gap = trend["relay_medians"]["gap_seconds"]
+    assert gap["classification"] == "declining"
+    assert gap["delta"] == pytest.approx(200.0)
+
+    # task_count improved: delta = -1.0, threshold abs 0.5
+    tc = trend["relay_medians"]["task_count"]
+    assert tc["classification"] == "improving"
+    assert tc["delta"] == pytest.approx(-1.0)
+
+    # fix p50 improved: delta = -1.0
+    fix_p50 = trend["lane_iterations"]["fix"]["p50"]
+    assert fix_p50["classification"] == "improving"
+
+    # fix p90 stable: delta = -0.2 < 0.5
+    fix_p90 = trend["lane_iterations"]["fix"]["p90"]
+    assert fix_p90["classification"] == "stable"
+
+    # review p50/p90 stable
+    assert trend["lane_iterations"]["review"]["p50"]["classification"] == "stable"
+    assert trend["lane_iterations"]["review"]["p90"]["classification"] == "stable"
+
+    # lost_reasoning: latest share = 5/10 = 0.5; prior = 2/5 = 0.4; delta = +0.1 > 0.05 → declining
+    lr = trend["waste_taxonomy_shares"]["lost_reasoning"]
+    assert lr["classification"] == "declining"
+    assert lr["latest"] == pytest.approx(0.5)
+    assert lr["prior"] == pytest.approx(0.4)
+
+    # merge_conflict: latest = 2/10 = 0.2; prior = 1/5 = 0.2; delta = 0 → stable
+    mc = trend["waste_taxonomy_shares"]["merge_conflict"]
+    assert mc["classification"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_cost_scalars_propagated_to_payload(db_session, mocker):
+    """checkpoint_and_reserve_on_phase_complete propagates LLM + VM cost scalars.
+
+    A bug zeroing or omitting tokens_in, tokens_out, or vm_cost_usd on the
+    LaneCheckpointPayload must cause this test to fail.
+    """
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.models import ImprovementLaneStatus
+    from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    TOKENS_IN = 1234
+    TOKENS_OUT = 5678
+    VM_COST = 0.42
+
+    mocker.patch(
+        "app.models.get_task_total_llm_totals",
+        return_value=(TOKENS_IN, TOKENS_OUT, 0),
+    )
+    mocker.patch(
+        "app.models.get_task_total_vm_cost_usd",
+        return_value=VM_COST,
+    )
+
+    captured_payloads: list = []
+
+    async def _capture_checkpoint(session, lane_id, *, phase, task_id, checkpoint):
+        captured_payloads.append(checkpoint)
+
+    mocker.patch(
+        "app.improvement_lane_ops.checkpoint_lane",
+        side_effect=_capture_checkpoint,
+    )
+
+    project = await _make_project(db_session, is_self_repo=True)
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="cost-scalar-lane",
+        goal="cost-scalar",
+        branch_name="feat/cost-scalar",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    await db_session.flush()
+    await cas_transition(
+        db_session,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=None,
+    )
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        vm_instance_id=None,
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    lane.current_task_id = source_task.id
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
+
+    result = await checkpoint_and_reserve_on_phase_complete(
+        db_session,
+        source_task,
+        lane,
+        sha="abc1234def5678",
+        summary="cost scalar test",
+        reserve_workspace=False,
+    )
+
+    assert result is True, "checkpoint should be written"
+    assert len(captured_payloads) == 1, "checkpoint_lane must be called exactly once"
+    payload = captured_payloads[0]
+    assert payload.tokens_in == TOKENS_IN, (
+        f"tokens_in mismatch: got {payload.tokens_in}, expected {TOKENS_IN}"
+    )
+    assert payload.tokens_out == TOKENS_OUT, (
+        f"tokens_out mismatch: got {payload.tokens_out}, expected {TOKENS_OUT}"
+    )
+    assert payload.vm_cost_usd == pytest.approx(VM_COST), (
+        f"vm_cost_usd mismatch: got {payload.vm_cost_usd}, expected {VM_COST}"
+    )
+
+
+def test_lane_baseline_trend_returns_none_when_fewer_than_two():
+    """compute_lane_baseline_trend returns None for 0 or 1 baselines."""
+    from app.digest_metrics import compute_lane_baseline_trend
+
+    assert compute_lane_baseline_trend([]) is None
+    single = _make_baseline(
+        version_number=1,
+        wall_clock=1000.0,
+        active=500.0,
+        gap=500.0,
+        task_count=2.0,
+        fix_p50=2.0,
+        fix_p90=4.0,
+        review_p50=1.0,
+        review_p90=2.0,
+        waste_taxonomy={
+            "infra": 0,
+            "merge_conflict": 0,
+            "ci_churn": 0,
+            "review_ambiguity": 0,
+            "lost_reasoning": 0,
+            "lost_repo_state": 0,
+            "unknown": 0,
+        },
+        waste_task_count=0,
+    )
+    assert compute_lane_baseline_trend([single]) is None

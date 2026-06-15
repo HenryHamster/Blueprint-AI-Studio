@@ -35,7 +35,9 @@ def _default_no_migration_pr(mocker):
     file list short-circuits the guard to ``ok``. Tests exercising the guard
     itself re-patch ``app.github.get_pr_files`` to override this default.
     """
-    mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+    mocker.patch(
+        "app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}])
+    )
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -914,7 +916,9 @@ async def test_merge_failure_escalates_at_10_failures(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -974,7 +978,9 @@ async def test_merge_failure_escalation_dedups_until_hard_cap(db_session, mocker
         _attempt_merge_with_retry_and_escalation,
     )
 
-    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1034,7 +1040,9 @@ async def test_merge_failure_does_not_double_escalate(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1094,7 +1102,9 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
         _attempt_merge_with_retry_and_escalation,
     )
 
-    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1815,9 +1825,7 @@ async def test_orig_task_gets_pr_merged_flag_on_success(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_self_orig_merge_sets_pr_merged_without_lock_conflict(
-    db_session, mocker
-):
+async def test_self_orig_merge_sets_pr_merged_without_lock_conflict(db_session, mocker):
     """Direct merge where original_task_id == the merge task's OWN id.
 
     This is the common lane (research/plan/create tasks merging their own PR).
@@ -2006,13 +2014,17 @@ async def test_orig_task_with_promotion_target_merge_withholds_pr_merged(
     await db_session.commit()
 
     alert = (
-        await db_session.execute(
-            select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.title == "Blocking branch configuration",
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "Blocking branch configuration",
+                )
             )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     assert alert is not None
     assert "promotion target" in alert.message
 
@@ -2328,7 +2340,9 @@ async def test_merge_repeated_identical_error_triggers_early_exit(db_session, mo
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2383,7 +2397,9 @@ async def test_merge_deterministic_error_triggers_early_exit_on_first_occurrence
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2494,7 +2510,9 @@ async def test_cross_pr_merge_pattern_pauses_retries_and_alerts(db_session, mock
     from app.shared_state import merge_error_occurrences
 
     merge_error_occurrences.clear()
-    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
     spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task", return_value=(None, None)
     )
@@ -2548,7 +2566,9 @@ async def test_cross_pr_merge_pattern_alert_dedups_on_second_hit(db_session, moc
     from app.ci_completion import _normalize_merge_error
 
     merge_error_occurrences.clear()
-    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
     mocker.patch("app.review_pipeline._spawn_pipeline_task", return_value=(None, None))
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
@@ -2980,9 +3000,7 @@ async def test_ci_failure_broadcast_uses_status_snapshot_not_post_commit_read(
         await _real_commit()
         if is_final_broadcast_commit:
             await db_session.execute(
-                update(Task)
-                .where(Task.id == task.id)
-                .values(status=TaskStatus.FAILED)
+                update(Task).where(Task.id == task.id).values(status=TaskStatus.FAILED)
             )
             await _real_commit()
             db_session.expire(task)
@@ -3418,11 +3436,15 @@ async def test_merge_held_on_dual_head_migration(db_session, mocker):
     # chain that already owns revision "0002".
     mocker.patch(
         "app.github.get_pr_files",
-        AsyncMock(return_value=[{
-            "filename": "backend/alembic/versions/0002_dup.py",
-            "status": "added",
-            "patch": '+"""dup migration"""\n+revision = "0002"\n+down_revision = "0001"',
-        }]),
+        AsyncMock(
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0002_dup.py",
+                    "status": "added",
+                    "patch": '+"""dup migration"""\n+revision = "0002"\n+down_revision = "0001"',
+                }
+            ]
+        ),
     )
     mocker.patch(
         "app.github.get_pull_request_diff",
@@ -3527,9 +3549,10 @@ async def test_merge_hold_auto_finalizes_reserved_migration_and_requeues_ci(
     assert finalization["finalized_revision"] == "0152"
     finalization_mock.assert_awaited_once()
     assert finalization_mock.await_args.kwargs["promotion_target"] == "main"
-    assert "auto-finalized provisional alembic migration" in (
-        task.latest_status_message or ""
-    ).lower()
+    assert (
+        "auto-finalized provisional alembic migration"
+        in (task.latest_status_message or "").lower()
+    )
 
 
 @pytest.mark.asyncio
@@ -3584,11 +3607,15 @@ async def test_clean_migration_pr_merges(db_session, mocker):
     )
     mocker.patch(
         "app.github.get_pr_files",
-        AsyncMock(return_value=[{
-            "filename": "backend/alembic/versions/0003_next.py",
-            "status": "added",
-            "patch": '+"""next migration"""\n+revision = "0003"\n+down_revision = "0002"',
-        }]),
+        AsyncMock(
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0003_next.py",
+                    "status": "added",
+                    "patch": '+"""next migration"""\n+revision = "0003"\n+down_revision = "0002"',
+                }
+            ]
+        ),
     )
     mocker.patch(
         "app.github.get_pull_request_diff",
@@ -3627,7 +3654,9 @@ async def test_clean_migration_pr_merges(db_session, mocker):
 # ---------------------------------------------------------------------------
 
 
-def _patch_ancestry_gate_deps(mocker, *, is_ancestor, merge_commit_sha="deadbeefcafe1234"):
+def _patch_ancestry_gate_deps(
+    mocker, *, is_ancestor, merge_commit_sha="deadbeefcafe1234"
+):
     """Patch the GitHub seams the orig ancestry gate consults.
 
     The gate resolves project GitHub creds, fetches the merged PR for its
@@ -3886,3 +3915,176 @@ async def test_ci_failure_comment_never_has_empty_code_block(db_session, mocker)
         assert expected_substring in comment_body, (
             f"Expected {expected_substring!r} in comment for ci_result={ci_result!r}: {comment_body!r}"
         )
+
+
+# ===========================================================================
+# SITE A lock-window fix: precomputed_migration_guard skips inline guard call
+# ===========================================================================
+
+
+def _make_ci_waiting_task(session, project, *, pr_number: int = 1001) -> Task:
+    """Create a minimal EVALUATING task with ci_waiting+ci_passed+review_approved."""
+    task = Task(
+        project_id=project.id,
+        title="test-task",
+        payloads=[{"type": "create", "base_branch": "automain"}],
+        vm_instance_id=f"vm-guard-{pr_number}",
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "pr_number": pr_number,
+                "branch": f"blueprint/t-{pr_number}",
+                "base_branch": "automain",
+                "ci_waiting": True,
+                "ci_passed": True,
+                "review_approved": True,
+            }
+        },
+    )
+    session.add(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_precomputed_migration_guard_skips_inline_enforce_call(
+    db_session, mocker
+):
+    """When precomputed_migration_guard is supplied, enforce_premerge_migration_guard
+    must NOT be called inside _attempt_merge_with_retry_and_escalation.
+
+    This is the SITE A lock-window fix: the rollup-handoff path resolves the
+    guard before acquiring FOR UPDATE on the rollup parent, then passes the
+    result in so the function does not re-issue GitHub calls under the row lock.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    project = Project(
+        name="Guard-precomputed test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        github_installation_id="inst-guard-1",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    task = _make_ci_waiting_task(db_session, project, pr_number=5500)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(project)
+
+    guard_mock = mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new=AsyncMock(return_value=(True, None)),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "sha": "abc123" * 6}),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "state": "open",
+                "mergeable_state": "clean",
+                "head": {"sha": "abc123" * 6, "ref": "blueprint/t-5500"},
+                "base": {"ref": "automain"},
+                "number": 5500,
+                "html_url": "http://pr/5500",
+            }
+        ),
+    )
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "success",
+                "details": [],
+                "failed_logs": "",
+            }
+        ),
+    )
+
+    # Pass a pre-computed guard result — guard must NOT be called inline.
+    await _attempt_merge_with_retry_and_escalation(
+        task,
+        "gh-token",
+        "owner",
+        "repo",
+        db_session,
+        source="review_approval",
+        precomputed_migration_guard=(True, None),
+    )
+
+    guard_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_precomputed_guard_calls_enforce_inline(db_session, mocker):
+    """Without precomputed_migration_guard, enforce_premerge_migration_guard
+    is called inline as before (backwards-compatible behaviour).
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    project = Project(
+        name="Guard-inline test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        github_installation_id="inst-guard-2",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    task = _make_ci_waiting_task(db_session, project, pr_number=5501)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(project)
+
+    guard_mock = mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new=AsyncMock(return_value=(True, None)),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "sha": "abc123" * 6}),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "state": "open",
+                "mergeable_state": "clean",
+                "head": {"sha": "abc123" * 6, "ref": "blueprint/t-5501"},
+                "base": {"ref": "automain"},
+                "number": 5501,
+                "html_url": "http://pr/5501",
+            }
+        ),
+    )
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "success",
+                "details": [],
+                "failed_logs": "",
+            }
+        ),
+    )
+
+    # No precomputed guard — the inline enforce call must fire.
+    await _attempt_merge_with_retry_and_escalation(
+        task,
+        "gh-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+    )
+
+    guard_mock.assert_called_once()

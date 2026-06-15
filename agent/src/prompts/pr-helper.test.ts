@@ -461,4 +461,29 @@ describe('writePrHelper — generated script content', () => {
     expect(script).toContain('classify_push_error()');
     expect(script).toContain('workflow files changed, and this token cannot create or update them without workflows permission');
   });
+
+  it('decodes + invokes the screenshots renderer and idempotently strips its block', () => {
+    writePrHelper({
+      taskId: 'task-shots-1',
+      workBranch: 'blueprint/task-shots-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    // Reads the task-deterministic manifest path the --upload flow publishes.
+    expect(script).toContain('SHOTS_MANIFEST="/tmp/viewport_manifest_task-shots-1.json"');
+    // Decodes the embedded renderer and runs it with PROJECT_ID from the VM env.
+    expect(script).toContain('base64 -d > /tmp/screenshots_section_task-shots-1.js');
+    expect(script).toMatch(
+      /node \/tmp\/screenshots_section_task-shots-1\.js "\$SHOTS_MANIFEST" "\$\{ORCHESTRATOR_URL:-\}" "\$\{PROJECT_ID:-\}" "task-shots-1"/,
+    );
+    // Idempotent strip + re-append of the screenshots marker block.
+    expect(script).toContain(
+      "sed '/<!-- blueprint:screenshots -->/,/<!-- \\/blueprint:screenshots -->/d'",
+    );
+    expect(script).toContain('BODY=$(printf \'%s\\n\\n%s\' "$BODY" "$SHOTS_SECTION")');
+  });
 });

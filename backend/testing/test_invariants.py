@@ -553,6 +553,30 @@ class TestSchemaRevisionSync:
             f"migration is '{latest}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
         )
 
+    def test_task_context_size_constraint_exists_in_migration(self):
+        """Migration 0277 must define the chk_task_context_size CHECK constraint.
+
+        Confirms the defense-in-depth backstop on task.context fat-row growth
+        mirrors the payloads CHECK constraint pattern from migration 0065.
+        """
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        migration_path = os.path.join(
+            migrations_dir, "0277_task_context_size_constraint.py"
+        )
+        assert os.path.exists(migration_path), (
+            "Migration 0277_task_context_size_constraint.py not found. "
+            "The defense-in-depth size guard on task.context is missing."
+        )
+        content = open(migration_path).read()
+        assert "chk_task_context_size" in content, (
+            "Migration 0277 must define constraint 'chk_task_context_size'."
+        )
+        assert "octet_length(context::text)" in content, (
+            "Migration 0277 must use octet_length(context::text) as the size expression."
+        )
+
     def test_agent_helper_exclusions_match_prompt_and_gitignore(self):
         """Agent helper exclusions must stay aligned with prompt.ts and gitignore.
 
@@ -872,11 +896,13 @@ class TestSchemaRevisionSync:
             content = f.read()
 
         # Every github helper the back-merge module is allowed to call directly.
-        # All four are read/merge-only — none writes to a branch:
-        #   create_pull_request  — open (or reuse) the back-merge PR (idempotent)
-        #   merge_pull_request   — land the back-merge through the normal merge API
-        #   get_pull_request     — read PR state / mergeability
+        # All are read/merge-only — none writes to a branch:
+        #   create_pull_request   — open (or reuse) the back-merge PR (idempotent)
+        #   merge_pull_request    — land the back-merge through the normal merge API
+        #   get_pull_request      — read PR state / mergeability
         #   get_check_runs_cached — read CI status before attempting the merge
+        #   get_pr_files          — read per-file list for module-size violation check
+        #   get_file_text_at_ref  — fetch file content at a ref for line-count check
         # A branch-write helper (e.g. github.commit_file_changes, create_branch,
         # merge_branch, update_branch, delete_branch — all real symbols in the
         # app.github namespace) is deliberately absent: inlining the dual-head
@@ -888,6 +914,8 @@ class TestSchemaRevisionSync:
             "merge_pull_request",
             "get_pull_request",
             "get_check_runs_cached",
+            "get_pr_files",
+            "get_file_text_at_ref",
         }
         used = set(re.findall(r"\bgithub\.(\w+)\b", content))
         unexpected = sorted(used - ALLOWED_BACKMERGE_GITHUB_HELPERS)
@@ -907,14 +935,16 @@ class TestSchemaRevisionSync:
 
         # Guard the guard: an accidental "allow everything" (empty-set) regression
         # would make the subset check vacuous. The allowlist must stay exactly the
-        # four documented read/merge helpers.
+        # documented read/merge helpers.
         assert ALLOWED_BACKMERGE_GITHUB_HELPERS == {
             "create_pull_request",
             "merge_pull_request",
             "get_pull_request",
             "get_check_runs_cached",
+            "get_pr_files",
+            "get_file_text_at_ref",
         }, (
-            "The back-merge github-helper allowlist must stay the four read/merge helpers."
+            "The back-merge github-helper allowlist must stay the documented read/merge helpers."
         )
 
         # The block path must still route to the spawned resolver — if this
@@ -4492,6 +4522,22 @@ class TestBackendModuleSizeGuardrails:
         enforce its cap, with no per-file test method to maintain. The backend
         section has no environment skip, so it always enforces."""
         self._check_module(relative_path)
+
+    def test_recovery_sweeps_cap_reflects_decomposed_size(self):
+        """recovery_sweeps.py is a thin re-export hub (~63 lines) after its
+        sweeps were split into recovery_evaluating.py and recovery_post_commit.py.
+        Its cap must stay well below 200 so the guardrail catches any regression
+        where substantial logic is re-added to this file instead of the proper
+        submodule. A cap above 200 indicates stale pre-decomposition headroom
+        crept back in."""
+        cap = MODULE_SIZE_LIMITS["recovery_sweeps.py"]
+        assert cap <= 200, (
+            f"recovery_sweeps.py cap is {cap}, which exceeds 200. "
+            "This file is a thin re-export hub after decomposition; its cap "
+            "should stay well below 200. If the file has genuinely grown, "
+            "consider whether new logic belongs in recovery_evaluating.py or "
+            "recovery_post_commit.py instead."
+        )
 
 
 _AGENT_SRC_ROOT = (
@@ -9115,3 +9161,58 @@ def test_standalone_smoke_modules_importable_as_root():
         )
         assert "ImportError" not in result.stderr
         assert "circular import" not in result.stderr
+
+
+def test_all_load_only_projection_sites_require_raiseload():
+    """Every load_only() and defer() call in backend/app must pass raiseload=True.
+
+    Blueprint adopted a projection contract to eliminate MissingGreenlet 500s:
+    narrow-column reads use load_only(..., raiseload=True) so that accessing an
+    un-projected column raises a synchronous StatementError at test time instead
+    of triggering an async lazy-load that surfaces as a MissingGreenlet in prod.
+
+    This invariant enforces the contract codebase-wide so that a new bare
+    load_only() or defer() call is caught immediately rather than discovered in
+    production.
+    """
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    violations: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                fname = func.id if func.id in ("load_only", "defer") else None
+            elif isinstance(func, ast.Attribute):
+                fname = func.attr if func.attr in ("load_only", "defer") else None
+            else:
+                fname = None
+            if fname is None:
+                continue
+
+            has_raiseload = any(
+                kw.arg == "raiseload"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            )
+            if not has_raiseload:
+                rel = py_file.relative_to(app_dir.parent.parent)
+                violations.append(
+                    f"  {rel}:{node.lineno} — {fname}() missing raiseload=True"
+                )
+
+    assert not violations, (
+        "Projection contract violated: the following load_only()/defer() calls "
+        "omit raiseload=True. Add raiseload=True to each site so that accessing "
+        "an un-projected column raises synchronously at test time instead of "
+        "triggering a MissingGreenlet 500 in production.\n" + "\n".join(violations)
+    )

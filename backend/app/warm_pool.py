@@ -422,7 +422,9 @@ async def count_orphaned_leased_pool_vms(
     return int((await session.execute(stmt)).scalar() or 0)
 
 
-async def is_pool_cost_guard_engaged(session) -> bool:
+async def is_pool_cost_guard_engaged(
+    session, project_id: Optional[uuid.UUID] = None
+) -> bool:
     """True iff the cost-aware auto-drain guard is currently engaged.
 
     Cheap LIVE check — the in-memory dispatch funnel (lease-hit rate) plus a
@@ -433,17 +435,32 @@ async def is_pool_cost_guard_engaged(session) -> bool:
     to ``warm_pool_maintainer.evaluate_pool_cost_guard`` so the lease side (here)
     and the provision side (the maintainer's reconcile) engage on the SAME
     configurable thresholds and disengage together once a healthy hit rate
-    returns. Deferred import avoids a warm_pool <-> warm_pool_maintainer cycle.
+    returns. When ``project_id`` is supplied, also evaluates the per-project
+    guard (mirroring the maintainer's two-level check): if the fleet guard is
+    disengaged but the per-project guard is engaged, leasing is still blocked for
+    that project immediately — without waiting for the next maintainer tick to
+    drain idle members. Deferred import avoids a warm_pool <->
+    warm_pool_maintainer cycle.
 
     Degrades OPEN (returns False) on any evaluation error so a transient signal
     hiccup can never wedge the pool shut — the failure-based circuit breaker and
     the maintainer drain remain as backstops.
     """
     try:
-        from app.warm_pool_maintainer import evaluate_pool_cost_guard
+        from app.warm_pool_maintainer import (
+            evaluate_pool_cost_guard,
+            evaluate_project_pool_cost_guard,
+        )
 
         guard = await evaluate_pool_cost_guard(session, runtime_config=_runtime_config)
-        return bool(guard.get("engaged"))
+        if guard.get("engaged"):
+            return True
+        if project_id is not None:
+            per_guard = await evaluate_project_pool_cost_guard(
+                session, project_id, runtime_config=_runtime_config
+            )
+            return bool(per_guard.get("engaged"))
+        return False
     except Exception:
         logger.debug(
             "[WARM-POOL] cost-guard evaluation failed; treating as disengaged",
@@ -660,6 +677,11 @@ async def lease_idle_pool_vm(
                 expired_reservation_lane_id,
                 member.vm_instance_id,
             )
+            await record_lane_reservation_cause(
+                session,
+                expired_reservation_lane_id,
+                "expired_before_fix",
+            )
     logger.info(
         "[WARM-POOL] leased pool VM vm_instance_id=%s project=%s task=%s "
         "lease_expires_at=%s",
@@ -853,7 +875,7 @@ async def clear_lane_warm_workspace_if_matching_member(
         update(ImprovementLane)
         .where(
             ImprovementLane.id == uuid.UUID(str(lane_id)),
-            ImprovementLane.workspace_state == "WARM_RESERVED",
+            ImprovementLane.workspace_state != "COLD",
             ImprovementLane.workspace_vm_instance_id == workspace_vm_instance_id,
         )
         .values(workspace_state="COLD", workspace_vm_instance_id=None)
@@ -986,7 +1008,9 @@ async def try_pool_dispatch(
     # allowlist ⇒ fleet-wide (is_project_warm_pool_scoped returns True for all),
     # so legacy behavior is byte-identical.
     if not is_project_warm_pool_scoped(task.project_id):
-        record_pool_lease_miss("out_of_scope", account=required_account, project_id=task.project_id)
+        record_pool_lease_miss(
+            "out_of_scope", account=required_account, project_id=task.project_id
+        )
         return None
 
     if is_warm_pool_suppressed():
@@ -998,7 +1022,7 @@ async def try_pool_dispatch(
     # cost-per-PR in the window before the maintainer drains idle members. The
     # guard reverses on its own (here and in the maintainer) once the hit rate
     # recovers above the configured floor.
-    if await is_pool_cost_guard_engaged(session):
+    if await is_pool_cost_guard_engaged(session, project_id=task.project_id):
         record_pool_lease_miss("cost_guard", project_id=task.project_id)
         return None
 
@@ -1065,7 +1089,9 @@ async def try_pool_dispatch(
             session, project_id=task.project_id
         )
         reason = "no_compatible_member" if idle_present else "no_idle_member"
-        record_pool_lease_miss(reason, account=required_account, project_id=task.project_id)
+        record_pool_lease_miss(
+            reason, account=required_account, project_id=task.project_id
+        )
         # Best-effort workspace-state correction: the lane cannot stay
         # WARM_RESERVED when no compatible member is available — its reservation
         # is stale or already gone. Degrade to COLD so the lane's next phase

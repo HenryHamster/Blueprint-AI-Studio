@@ -115,6 +115,7 @@ function makeProps() {
     onRemoveAccount: noop,
     onResetRateLimits: noop,
     onRefreshAccountModels: noop,
+    onUpdateAccount: noop,
     newAccountName: '',
     setNewAccountName: noop,
     newAccountProvider: 'anthropic' as const,

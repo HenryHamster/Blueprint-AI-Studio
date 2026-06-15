@@ -20,7 +20,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.models import (
     Task,
     TaskStatus,
@@ -43,6 +43,54 @@ from app.autonomous_research import project_parallelism_cap
 from app.reaper import _heartbeat_stale_cutoff
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.payload_schemas import _MAX_PAYLOAD_BYTES
+from app.task_evaluators import (
+    ADVERSARIAL_GATE_VERDICT_KEY,
+    ADVERSARIAL_PARSE_OK,
+    build_adversarial_challenge_manifest,
+    spawn_forward_quality_grader,
+)
+from app.finding_deduplication import finding_hash as _finding_hash
+
+# ---------------------------------------------------------------------------
+# Canary spawn-gate probe
+# ---------------------------------------------------------------------------
+
+_CANARY_PROBE_TITLE = "CANARY adversarial gate health probe"
+_CANARY_PROBE_DESC = (
+    "Synthetic probe for spawn-gate health verification. "
+    "Must not spawn implementation work."
+)
+_CANARY_PROBE_HASH: str = _finding_hash(_CANARY_PROBE_TITLE, _CANARY_PROBE_DESC)
+
+
+def classify_canary_spawn_gate_result(gate_record: dict | None) -> dict:
+    """Classify a resolved adversarial gate record as real_verdict or fail_closed.
+
+    Returns a dict with ``status`` ("pending" | "real_verdict" | "fail_closed"),
+    ``parse_outcome`` (the raw parse string from the gate record, or None), and
+    ``explicit_count`` (number of findings with an explicit verdict).
+    """
+    if gate_record is None:
+        return {"status": "pending", "parse_outcome": None, "explicit_count": 0}
+    parse_outcome = gate_record.get("parse_outcome")
+    finding_verdicts: dict = gate_record.get("finding_verdicts") or {}
+    explicit_count = sum(
+        1
+        for v in finding_verdicts.values()
+        if isinstance(v, dict) and v.get("explicit")
+    )
+    if parse_outcome == ADVERSARIAL_PARSE_OK and explicit_count > 0:
+        return {
+            "status": "real_verdict",
+            "parse_outcome": parse_outcome,
+            "explicit_count": explicit_count,
+        }
+    return {
+        "status": "fail_closed",
+        "parse_outcome": parse_outcome,
+        "explicit_count": explicit_count,
+    }
+
 
 logger = logging.getLogger(__name__)
 
@@ -760,19 +808,21 @@ async def get_autonomy_debug(
 
     # Guard 5: rate_limit_exceeded
     one_hour_ago = now - timedelta(hours=1)
-    recent_tasks_result = await session.execute(
-        select(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.created_by == "ORCHESTRATOR",
-            Task.created_at >= one_hour_ago,
+    dialect_name = resolve_dialect_name(session)
+    if dialect_name == "sqlite":
+        type_is_research = func.json_extract(Task.payloads, "$[0].type") == "research"
+    else:
+        type_is_research = Task.payloads[0]["type"].as_string() == "research"
+    tasks_this_hour = (
+        await session.execute(
+            select(func.count()).where(
+                Task.project_id == project_id,
+                Task.created_by == "ORCHESTRATOR",
+                Task.created_at >= one_hour_ago,
+                type_is_research,
+            )
         )
-        .limit(5000)
-    )
-    recent_tasks = recent_tasks_result.scalars().all()
-    tasks_this_hour = sum(
-        1 for t in recent_tasks if (t.first_payload).get("type") == "research"
-    )
+    ).scalar() or 0
     max_per_hour = project_parallelism_cap(
         project, "max_autonomous_tasks_per_hour", "max_autonomous_tasks_per_hour", 5
     )
@@ -1388,7 +1438,7 @@ async def get_global_diagnostics(
                 # payloads is read by classify_failure → _classify_stuck_failure;
                 # omitting it here triggers MissingGreenlet on lazy-load.
                 Task.payloads,
-            )
+            raiseload=True,)
         )
         .where(
             Task.status.in_(active_statuses),
@@ -1433,7 +1483,7 @@ async def get_global_diagnostics(
             func.coalesce(func.jsonb_array_length(Project.directions), 0) > 0,
             Project.not_archived(),
         )
-        .options(load_only(Project.id, Project.directions))
+        .options(load_only(Project.id, Project.directions, raiseload=True))
         .limit(500)
     )
     remediation_by_project: Dict[str, List[DirectionRemediationInfo]] = {}
@@ -1606,7 +1656,7 @@ async def get_recent_findings(
     cutoff = _utcnow() - timedelta(days=7)
     result = await session.execute(
         select(Task)
-        .options(load_only(Task.id, Task.plan_output, Task.created_at, Task.context))
+        .options(load_only(Task.id, Task.plan_output, Task.created_at, Task.context, raiseload=True))
         .where(
             Task.project_id == project_id,
             Task.status == TaskStatus.COMPLETED,
@@ -1746,3 +1796,129 @@ async def get_knowledge_document(
     if doc is None:
         raise HTTPException(status_code=404, detail="Knowledge document not found")
     return serialize_knowledge_document(doc, include_body=True)
+
+
+# ---------------------------------------------------------------------------
+# Adversarial spawn-gate canary endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post("/projects/{project_id}/canary/adversarial-challenge")
+async def spawn_canary_adversarial_challenge(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Spawn a canary adversarial-challenge task to verify the spawn gate is healthy.
+
+    Creates a synthetic source task and probe finding, then calls the real
+    adversarial challenger path (same as high-stakes research findings use).
+    The canary source task never spawns implementation work; its sole purpose is
+    to carry the challenger's verdict so operators can confirm the gate returns
+    real verdicts rather than silently fail-closing.
+
+    Returns ``{canary_task_id, grader_task_id}``.
+    """
+    await _get_user_project(project_id, current_user["user_id"], session)
+
+    probe = {
+        "title": _CANARY_PROBE_TITLE,
+        "description": _CANARY_PROBE_DESC,
+        "risk": "high",
+        "scope": "large",
+        "hash": _CANARY_PROBE_HASH,
+    }
+    manifest_items, manifest_json = build_adversarial_challenge_manifest([probe])
+    if not manifest_items:
+        raise HTTPException(status_code=500, detail="Failed to build canary manifest")
+
+    # The payload type "canary_spawn_gate_probe" has no registered capability, so
+    # task_lifecycle._resolve_quality_grader_completion will write the verdict and
+    # leave the source COMPLETED without dispatching to any spawn handler — ensuring
+    # the canary never produces implementation tasks.
+    source = Task(
+        project_id=project_id,
+        title="[CANARY] adversarial spawn-gate health probe",
+        description=(
+            "On-demand canary to verify the adversarial spawn gate returns real verdicts "
+            "from the currently-serving agent image."
+        ),
+        payloads=[
+            {
+                "type": "canary_spawn_gate_probe",
+                "base_branch": "main",
+                "scope": "small",
+            }
+        ],
+        context={"_is_canary": True},
+        plan_output=[probe],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        priority=5,
+    )
+    session.add(source)
+    await session.commit()
+    await session.refresh(source)
+
+    grader = await spawn_forward_quality_grader(
+        source,
+        manifest_json,
+        session,
+        adversarial_mode=True,
+        finding_hashes=[_CANARY_PROBE_HASH],
+    )
+    if grader is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Canary grader already in flight or verdict already recorded",
+        )
+
+    return {
+        "canary_task_id": str(source.id),
+        "grader_task_id": str(grader.id),
+    }
+
+
+@router.get("/projects/{project_id}/canary/adversarial-challenge/{canary_task_id}")
+async def get_canary_adversarial_challenge_result(
+    project_id: uuid.UUID,
+    canary_task_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the classification of a previously spawned canary challenge.
+
+    ``status`` is one of:
+    - ``"pending"`` — the grader has not yet returned a verdict
+    - ``"real_verdict"`` — the grader returned at least one explicit pass/fail verdict
+    - ``"fail_closed"`` — the grader returned no parseable verdicts (gate is broken)
+
+    Also includes ``parse_outcome`` (the raw parse string) and ``explicit_count``
+    (number of findings with an explicit verdict).
+    """
+    await _get_user_project(project_id, current_user["user_id"], session)
+
+    canary = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.id == canary_task_id, Task.project_id == project_id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if canary is None or not (canary.context or {}).get("_is_canary"):
+        raise HTTPException(status_code=404, detail="Canary task not found")
+
+    gate_record = (canary.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
+    result = classify_canary_spawn_gate_result(gate_record)
+    result["canary_task_id"] = str(canary_task_id)
+    grader_task_id = (canary.context or {}).get("awaiting_adversarial_grader")
+    if isinstance(grader_task_id, str):
+        result["grader_task_id"] = grader_task_id
+    elif gate_record:
+        result["grader_task_id"] = gate_record.get("grader_task_id")
+    return result

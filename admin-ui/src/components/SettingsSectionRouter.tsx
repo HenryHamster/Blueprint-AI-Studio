@@ -27,6 +27,8 @@ import type {
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
 import type {
+  AccountMutationReturn,
+  AccountUpdatePayload,
   AuthMode,
   CategoryRoutingEntry,
   DeployState,
@@ -135,9 +137,10 @@ export interface SettingsSectionRouterProps {
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
   onToggleAccount: (id: string, enabled: boolean) => void;
-  onRemoveAccount: (id: string) => void;
+  onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
   onResetRateLimits: (id: string) => void;
   onRefreshAccountModels: (id: string) => void;
+  onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   onUpdateAccountCaps: (
     id: string,
     caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null },
@@ -366,6 +369,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           onRemoveAccount={props.onRemoveAccount}
           onResetRateLimits={props.onResetRateLimits}
           onRefreshAccountModels={props.onRefreshAccountModels}
+          onUpdateAccount={props.onUpdateAccount}
           onUpdateAccountCaps={props.onUpdateAccountCaps}
           showUserManagement={props.showUserManagement}
           onToggleUserManagement={props.onToggleUserManagement}

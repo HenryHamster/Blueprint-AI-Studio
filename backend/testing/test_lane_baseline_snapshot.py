@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import timedelta
 
@@ -9,13 +10,16 @@ import pytest
 
 from app.lane_baseline_snapshot import (
     DESIGN_DOC_KEY,
+    _MAX_BASELINE_ENTRY_BYTES,
     _MAX_BASELINES_STORED,
+    _compute_checkpoint_recovery_waste,
     _compute_relay_medians,
     backfill_missing_lane_baselines,
     persist_version_lane_baseline,
     read_version_lane_baseline,
 )
 from app.models import ReleaseVersion, TaskStatus
+from app.review_fix_lane_pilot import LANE_RECOVERY_REASON_KEY
 from app.time_utils import _utcnow
 from testing.factories import make_project, make_task
 
@@ -172,10 +176,13 @@ class TestPersistVersionLaneBaseline:
         assert result["version_number"] == 9
         assert result["terminal_status"] == "promoted"
         assert "lane_iteration_distribution" in result
-        assert "relay_counts_by_lane" in result
         assert "lane_waste" in result
         assert "relay_medians" in result
         assert result["pr_count"] == 1
+        # Bloat sub-blobs must not be stored
+        assert "relay_counts_by_lane" not in result
+        assert "per_pr_phase_breakdown" not in result
+        assert "chains" not in result.get("lane_waste", {})
 
         # Verify it landed in design_doc
         await db_session.refresh(project)
@@ -295,6 +302,129 @@ class TestPersistVersionLaneBaseline:
             terminal_status="promoted",
         )
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_persist_bounds_entry_bytes_preserving_readback(self, db_session):
+        """High-volume baseline stays under byte budget with all required fields intact."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        opened = now - timedelta(days=7)
+        closed = now - timedelta(days=1)
+
+        # Create many review-loop tasks across many PRs to produce large
+        # per_pr_phase_breakdown and lane_waste chains before slimming.
+        for pr_num in range(1, 51):
+            for _ in range(3):
+                task = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": "review", "prompt": "x" * 50}],
+                    context={"review_loop": {"pr_number": str(pr_num)}},
+                    created_at=opened + timedelta(hours=pr_num),
+                    started_at=opened + timedelta(hours=pr_num),
+                    status_log=[
+                        {
+                            "s": "COMPLETED",
+                            "t": (
+                                opened + timedelta(hours=pr_num, minutes=30)
+                            ).isoformat(),
+                        }
+                    ],
+                )
+                db_session.add(task)
+        await db_session.commit()
+
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=12,
+            opened_at=opened,
+            closed_at=closed,
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+
+        # (a) per-entry byte budget
+        entry_bytes = len(json.dumps(result, default=str).encode())
+        assert entry_bytes <= _MAX_BASELINE_ENTRY_BYTES, (
+            f"Stored entry is {entry_bytes} bytes, exceeds {_MAX_BASELINE_ENTRY_BYTES}"
+        )
+
+        # (b) full section under 500 KB
+        await db_session.refresh(project)
+        section = project.design_doc.get(DESIGN_DOC_KEY, {})
+        section_bytes = len(json.dumps(section, default=str).encode())
+        assert section_bytes <= 500_000, (
+            f"Full section is {section_bytes} bytes, exceeds 500 KB"
+        )
+
+        # (c) all required readback fields present
+        assert "relay_medians" in result
+        assert "lane_iteration_distribution" in result
+        assert "checkpoint_recovery_waste" in result
+        assert "lane_waste" in result
+        lw = result["lane_waste"]
+        assert "waste_taxonomy" in lw
+        assert "waste_task_count" in lw
+        assert "version_number" in result
+        assert "captured_at" in result
+        assert "terminal_status" in result
+        assert "pr_count" in result
+        assert "task_count" in result
+
+        # (d) bloat sub-blobs dropped
+        assert "per_pr_phase_breakdown" not in result
+        assert "relay_counts_by_lane" not in result
+        assert "chains" not in lw
+
+    @pytest.mark.asyncio
+    async def test_persist_self_heals_existing_bloated_entries(self, db_session):
+        """Writing a new version re-slims existing oversized entries."""
+        project = make_project()
+        # Pre-populate with a bloated entry (simulates state before byte budget)
+        bloated_entry = {
+            "version_number": 8,
+            "captured_at": "2026-01-01T00:00:00",
+            "terminal_status": "promoted",
+            "relay_medians": {"pr_count": 1},
+            "per_pr_phase_breakdown": [{"pr_number": str(i)} for i in range(100)],
+            "relay_counts_by_lane": {"review": 5},
+            "lane_waste": {
+                "waste_taxonomy": {},
+                "waste_task_count": 0,
+                "chains": [{"key": str(i), "tasks": []} for i in range(100)],
+            },
+        }
+        project.design_doc = {DESIGN_DOC_KEY: {"8": bloated_entry}}
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=9,
+            opened_at=now - timedelta(days=7),
+            closed_at=now - timedelta(days=1),
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        await db_session.refresh(project)
+        healed = project.design_doc[DESIGN_DOC_KEY]["8"]
+        assert "per_pr_phase_breakdown" not in healed
+        assert "relay_counts_by_lane" not in healed
+        assert "chains" not in healed.get("lane_waste", {})
+        # Slimmed entry must be within byte budget
+        assert (
+            len(json.dumps(healed, default=str).encode()) <= _MAX_BASELINE_ENTRY_BYTES
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -447,3 +577,257 @@ class TestBackfillMissingLaneBaselines:
         """backfill returns an empty list without error for a nonexistent project."""
         backfilled = await backfill_missing_lane_baselines(project_id=uuid.uuid4())
         assert backfilled == []
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint recovery waste tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeCheckpointRecoveryWaste:
+    def test_no_recovery_tasks_returns_zero_totals(self):
+        """A version with no recovery tasks produces zero counts."""
+        tasks = [make_task(context={"review_loop": {"pr_number": "1"}})]
+        result = _compute_checkpoint_recovery_waste(tasks)
+        assert result == {"by_reason": {}, "total": 0, "exhausted_count": 0}
+
+    def test_single_recovery_task_counted(self):
+        """A single recovery task is counted under its reason."""
+        tasks = [
+            make_task(context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"}),
+        ]
+        result = _compute_checkpoint_recovery_waste(tasks)
+        assert result["total"] == 1
+        assert result["by_reason"] == {"checkpoint_missing": 1}
+        assert result["exhausted_count"] == 0
+
+    def test_multiple_tasks_same_reason_aggregated(self):
+        """Multiple recovery tasks with the same reason are summed."""
+        tasks = [
+            make_task(context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"}),
+            make_task(context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"}),
+            make_task(context={"review_loop": {"pr_number": "99"}}),  # non-recovery
+        ]
+        result = _compute_checkpoint_recovery_waste(tasks)
+        assert result["total"] == 2
+        assert result["by_reason"] == {"checkpoint_missing": 2}
+
+    def test_multiple_reasons_grouped_separately(self):
+        """Tasks with distinct reason values form separate by_reason buckets."""
+        tasks = [
+            make_task(context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"}),
+            make_task(context={LANE_RECOVERY_REASON_KEY: "some_other_reason"}),
+        ]
+        result = _compute_checkpoint_recovery_waste(tasks)
+        assert result["total"] == 2
+        assert result["by_reason"]["checkpoint_missing"] == 1
+        assert result["by_reason"]["some_other_reason"] == 1
+
+    def test_empty_task_list_returns_zero(self):
+        """Empty task list returns all-zero result."""
+        result = _compute_checkpoint_recovery_waste([])
+        assert result == {"by_reason": {}, "total": 0, "exhausted_count": 0}
+
+    def test_task_with_none_context_skipped(self):
+        """Tasks with None context are skipped without error."""
+        task = make_task()
+        task.context = None
+        result = _compute_checkpoint_recovery_waste([task])
+        assert result["total"] == 0
+
+    def test_exhausted_count_from_lane_rows(self):
+        """Exhausted checkpoint-recovery kills are counted from KILLED lane rows."""
+        from app.models import ImprovementLane
+
+        # Create mock lanes in KILLED status with exhausted recovery markers
+        lane_exhausted = ImprovementLane(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            title="exhausted lane",
+            goal="test",
+            branch_name="test-branch",
+            base_branch="main",
+            status="KILLED",
+            manifest={
+                "recovery": {
+                    "reason": "checkpoint_recovery_exhausted",
+                    "attempt": 3,
+                    "exhausted": True,
+                    "at": _utcnow().isoformat(),
+                }
+            },
+        )
+        lane_not_exhausted = ImprovementLane(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            title="active lane",
+            goal="test",
+            branch_name="test-branch",
+            base_branch="main",
+            status="ACTIVE",
+            manifest={
+                "recovery": {
+                    "reason": "checkpoint_missing",
+                    "attempt": 1,
+                    "exhausted": False,
+                    "at": _utcnow().isoformat(),
+                }
+            },
+        )
+        lane_killed_no_recovery = ImprovementLane(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            title="killed lane no recovery",
+            goal="test",
+            branch_name="test-branch",
+            base_branch="main",
+            status="KILLED",
+            manifest={},
+        )
+
+        result = _compute_checkpoint_recovery_waste(
+            [], lanes=[lane_exhausted, lane_not_exhausted, lane_killed_no_recovery]
+        )
+        assert result["exhausted_count"] == 1
+        assert result["total"] == 0
+        assert result["by_reason"] == {}
+
+
+class TestPersistCheckpointRecoveryWasteInBaseline:
+    @pytest.mark.asyncio
+    async def test_persist_includes_checkpoint_recovery_waste(self, db_session):
+        """persist_version_lane_baseline folds checkpoint_recovery_waste into baseline."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        opened = now - timedelta(days=7)
+        closed = now - timedelta(days=1)
+
+        # Two recovery tasks in the version window
+        for _ in range(2):
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "fix", "prompt": "recover"}],
+                context={LANE_RECOVERY_REASON_KEY: "checkpoint_missing"},
+                created_at=opened + timedelta(hours=2),
+                started_at=opened + timedelta(hours=2),
+                status_log=[
+                    {
+                        "s": "COMPLETED",
+                        "t": (opened + timedelta(hours=3)).isoformat(),
+                    }
+                ],
+            )
+            db_session.add(task)
+        await db_session.commit()
+
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=10,
+            opened_at=opened,
+            closed_at=closed,
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+        crw = result.get("checkpoint_recovery_waste")
+        assert crw is not None
+        assert crw["total"] == 2
+        assert crw["by_reason"] == {"checkpoint_missing": 2}
+        assert crw["exhausted_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_persist_no_recovery_tasks_zero_waste(self, db_session):
+        """A version window with no recovery tasks produces a zero-waste block."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=11,
+            opened_at=now - timedelta(days=14),
+            closed_at=now - timedelta(days=7),
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+        crw = result.get("checkpoint_recovery_waste")
+        assert crw is not None
+        assert crw["total"] == 0
+        assert crw["by_reason"] == {}
+        assert crw["exhausted_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_persist_counts_exhausted_lane_kills(self, db_session):
+        """persist_version_lane_baseline counts KILLED lanes with exhausted recovery markers."""
+        from app.models import ImprovementLane
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        opened = now - timedelta(days=7)
+        closed = now - timedelta(days=1)
+
+        # Create a KILLED lane with exhausted recovery marker
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="exhausted lane",
+            goal="test goal",
+            branch_name="test-branch",
+            base_branch="main",
+            status="KILLED",
+            created_at=opened + timedelta(hours=1),
+            manifest={
+                "recovery": {
+                    "reason": "checkpoint_recovery_exhausted",
+                    "attempt": 3,
+                    "exhausted": True,
+                    "at": (opened + timedelta(hours=2)).isoformat(),
+                }
+            },
+        )
+        db_session.add(lane)
+
+        # Create another KILLED lane WITHOUT exhausted marker (should not count)
+        lane_no_exhausted = ImprovementLane(
+            project_id=project.id,
+            title="killed lane no exhausted",
+            goal="test goal",
+            branch_name="other-branch",
+            base_branch="main",
+            status="KILLED",
+            created_at=opened + timedelta(hours=3),
+            manifest={},
+        )
+        db_session.add(lane_no_exhausted)
+        await db_session.commit()
+
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=12,
+            opened_at=opened,
+            closed_at=closed,
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+        crw = result.get("checkpoint_recovery_waste")
+        assert crw is not None
+        assert crw["exhausted_count"] == 1
+        assert crw["total"] == 0  # No recovery tasks, only exhausted kills from lanes
+        assert crw["by_reason"] == {}
