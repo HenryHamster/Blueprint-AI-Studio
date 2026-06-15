@@ -436,6 +436,56 @@ async def test_collect_folds_giveup_cancelled_within_lookback(db_session):
     assert sorted(entry["direction_ids"]) == ["d-dead", "d-live"]
 
 
+@pytest.mark.asyncio
+async def test_collect_bounds_completed_scan_to_recency_window(db_session):
+    """The COMPLETED/terminal candidate scan is recency-bounded so a long-lived
+    project's full history is never loaded in one fat-row select (the digest-path
+    wedge of 2026-06-15). A shipped foundation OLDER than the candidate window is
+    not scanned, so it no longer suppresses a live blocker's demand — while an
+    equivalent foundation INSIDE the window still suppresses it. Without the bound
+    the ancient foundation would be fetched and the first assertion would read 0.
+    """
+    from app.capability_demand import _CANDIDATE_FETCH_LOOKBACK
+
+    project = await _make_project(db_session)
+    now = _utcnow()
+    need = {"kind": "capability", "ref": "auth-subsystem"}
+    dependent = _blocked(project.id, need, direction_id="d-aaa")
+
+    # Shipped foundation, but last touched well before the candidate window opens.
+    old_shipped = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        updated_at=now - _CANDIDATE_FETCH_LOOKBACK - timedelta(days=2),
+        context={"provides_capability": "auth-subsystem", "pr_merged": True},
+    )
+    db_session.add_all([dependent, old_shipped])
+    await db_session.commit()
+
+    # Beyond-window foundation is not scanned → demand is (advisedly) reported.
+    out_of_window = await collect_missing_capability_demand(
+        db_session, project.id, now=now
+    )
+    assert out_of_window["total"] == 1
+    assert out_of_window["demands"][0]["ref"] == "auth-subsystem"
+
+    # An equivalent foundation INSIDE the window suppresses the demand again,
+    # proving the bound excludes only the ancient rows, not recent foundations.
+    recent_shipped = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        updated_at=now - timedelta(hours=1),
+        context={"provides_capability": "auth-subsystem", "pr_merged": True},
+    )
+    db_session.add(recent_shipped)
+    await db_session.commit()
+
+    in_window = await collect_missing_capability_demand(
+        db_session, project.id, now=now
+    )
+    assert in_window["total"] == 0
+
+
 # ── Reaper marker: missing-foundation flag is stamped additively ─────────────
 
 
