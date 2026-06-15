@@ -1,8 +1,15 @@
 """Unified task management CLI.
 
-Usage:
-    python scripts/tasks.py list [--status STATUS] [--limit N] [-v]
-    python scripts/tasks.py show <id_or_title>
+Several subcommands have been superseded by ``python scripts/blueprint.py``
+and are now deprecated stubs that print a pointer and exit non-zero:
+
+    DEPRECATED — use blueprint.py instead:
+        list    → python scripts/blueprint.py tasks list [--status STATUS] [--limit N]
+        show    → python scripts/blueprint.py tasks show <task_id>
+        requeue → python scripts/blueprint.py tasks list (find id), then PATCH via API
+        cancel  → python scripts/blueprint.py tasks list (find id), then PATCH via API
+
+Active subcommands (not covered by blueprint.py):
     python scripts/tasks.py scope <id_or_title> [-v]       — show prompt, research question, payload
     python scripts/tasks.py payload <id_or_title>          — dump full raw payload + context JSON
     python scripts/tasks.py tree <parent_id>
@@ -14,8 +21,6 @@ Usage:
     python scripts/tasks.py autonomy-debug [project_id]    — why autonomy isn't spawning
     python scripts/tasks.py complete <task_id> [--message]
     python scripts/tasks.py set-status <task_id> <status> [--message]
-    python scripts/tasks.py requeue <task_id> [...]
-    python scripts/tasks.py cancel <task_id> [...]
     python scripts/tasks.py cancel-all [--status STATUS]
     python scripts/tasks.py requeue-ci
     python scripts/tasks.py trigger-rollup [<parent_id>]
@@ -49,98 +54,16 @@ def _safe(s, maxlen=60):
     return s[:maxlen].encode("ascii", "replace").decode()
 
 
-def cmd_list(args):
-    """List tasks, optionally filtered by status."""
-    status = args[0] if args and not args[0].startswith("-") else None
-    limit = 50
-    verbose = False
-    for i, a in enumerate(args):
-        if a == "--limit" and i + 1 < len(args):
-            limit = int(args[i + 1])
-        if a == "-v" or a == "--verbose":
-            verbose = True
-        if a == "--status" and i + 1 < len(args):
-            status = args[i + 1]
-
-    statuses = [status] if status else ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "FAILED", "COMPLETED"]
-    for st in statuses:
-        tasks = list_tasks(status=st, limit=limit)
-        if tasks:
-            print(f"\n=== {st} ({len(tasks)}) ===")
-            for t in tasks:
-                print(f"  {fmt_task(t, verbose=verbose)}")
+def cmd_list(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks list"""
+    print("DEPRECATED: use python scripts/blueprint.py tasks list [--status STATUS] [--limit N]")
+    sys.exit(1)
 
 
-def cmd_show(args):
-    """Show full details of a task by ID or title substring.
-
-    Flags:
-      --transitions   Show only status transitions from the full log (not heartbeats)
-      --heartbeats    Show ALL log entries including heartbeats (with optional --since filter)
-      --full-log      Show the entire status_log as JSON (can be very long)
-      --since TIME    Filter entries after this ISO timestamp (e.g. --since 2026-04-03T08:30)
-    """
-    if not args:
-        print("Usage: tasks.py show <id_or_title> [--transitions] [--heartbeats] [--full-log]")
-        return
-    show_transitions = "--transitions" in args
-    show_heartbeats = "--heartbeats" in args
-    show_full_log = "--full-log" in args
-    query = [a for a in args if not a.startswith("--")][0]
-
-    t = _resolve_task(query)
-    if not t:
-        print(f"Task '{query}' not found.")
-        return
-
-    # For --transitions/--heartbeats, fetch full task from admin API to get complete status_log
-    if show_transitions or show_heartbeats or show_full_log:
-        from blueprint_api import api
-        try:
-            full = api("GET", f"/api/admin/tasks/{t['id']}")
-            t = full.get("task", full)
-        except Exception:
-            pass  # Fall back to list_tasks data
-
-    if show_transitions or show_heartbeats:
-        log = t.get("status_log", [])
-        since = None
-        for i, a in enumerate(args):
-            if a == "--since" and i + 1 < len(args):
-                since = args[i + 1]
-        print(f"Task: {_safe(t.get('title', '?'), 80)}")
-        print(f"Total log entries: {len(log)}")
-        print(f"Created: {t.get('created_at', '?')}")
-        print(f"Attempts: {t.get('attempt_count', '?')}")
-        print(f"Error: {_safe((t.get('error_logs') or '')[:300], 300)}")
-        print()
-        label = "All Log Entries" if show_heartbeats else "Status Transitions"
-        print(f"=== {label} ===")
-        for e in log:
-            ts = e.get("t", "")
-            if since and ts < since:
-                continue
-            msg = e.get("msg", "")
-            if show_heartbeats or any(kw in msg for kw in ["Status changed", "Failed", "Reaped", "Fatal"]):
-                print(f"  {ts}  {_safe(msg, 150)}")
-        return
-
-    log_entries = t.get("status_log", [])
-    if not show_full_log:
-        log_entries = log_entries[-10:]
-
-    print(json.dumps({
-        "id": t["id"], "title": t["title"], "status": t["status"],
-        "task_type": t.get("task_type"),
-        "parent_task_id": t.get("parent_task_id"),
-        "vm_instance_id": t.get("vm_instance_id"),
-        "latest_status_message": (t.get("latest_status_message") or "")[:500],
-        "status_log": log_entries,
-        "payloads": t.get("payloads"),
-        "context": {k: v for k, v in (t.get("context") or {}).items() if not k.startswith("max_plan_")},
-        "error_logs": (t.get("error_logs") or "")[:500],
-        "attempt_count": t.get("attempt_count"),
-    }, indent=2, ensure_ascii=True))
+def cmd_show(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks show <task_id>"""
+    print("DEPRECATED: use python scripts/blueprint.py tasks show <task_id>")
+    sys.exit(1)
 
 
 def cmd_tree(args):
@@ -212,38 +135,24 @@ def cmd_children(args):
         print(f"  [{s}] {c['id'][:8]}  [{ptype:8}] {c['status']:13}  merged={str(merged):5}  pr={pr:<4}  {title}")
 
 
-def cmd_requeue(args):
-    """Requeue tasks by ID."""
-    if not args:
-        print("Usage: tasks.py requeue <task_id> [<task_id> ...]")
-        return
-    for tid in args:
-        t = _resolve_task(tid)
-        if not t:
-            print(f"  {tid[:8]}: not found")
-            continue
-        try:
-            resp = patch_task(t["id"], {"status": "QUEUED"})
-            print(f"  {tid[:8]}: {resp.get('status', 'ok')}")
-        except Exception as e:
-            print(f"  {tid[:8]}: FAILED -- {e}")
+def cmd_requeue(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks list to find id, then PATCH via API."""
+    print(
+        "DEPRECATED: tasks.py requeue is superseded.\n"
+        "Use python scripts/blueprint.py tasks list to find the task id,\n"
+        "then PATCH /api/admin/tasks/<id> with {\"status\": \"QUEUED\"} via the admin API."
+    )
+    sys.exit(1)
 
 
-def cmd_cancel(args):
-    """Cancel tasks by ID."""
-    if not args:
-        print("Usage: tasks.py cancel <task_id> [<task_id> ...]")
-        return
-    for tid in args:
-        t = _resolve_task(tid)
-        if not t:
-            print(f"  {tid[:8]}: not found")
-            continue
-        try:
-            resp = patch_task(t["id"], {"status": "CANCELLED"})
-            print(f"  {tid[:8]}: cancelled")
-        except Exception as e:
-            print(f"  {tid[:8]}: FAILED -- {e}")
+def cmd_cancel(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks list to find id, then PATCH via API."""
+    print(
+        "DEPRECATED: tasks.py cancel is superseded.\n"
+        "Use python scripts/blueprint.py tasks list to find the task id,\n"
+        "then PATCH /api/admin/tasks/<id> with {\"status\": \"CANCELLED\"} via the admin API."
+    )
+    sys.exit(1)
 
 
 def cmd_cancel_all(args):
