@@ -2530,6 +2530,229 @@ def _issue(description: str, severity: str = "CRITICAL") -> dict:
 
 
 @pytest.mark.asyncio
+async def test_review_history_feedback_is_bounded(db_session, mocker):
+    """Root-cause regression for the Postgres fat-row saturation outage.
+
+    The review->fix loop stores per-iteration reviewer feedback in
+    review_loop.review_history and carries it forward into every downstream
+    task.context on every spawn. On the log-scraping fallback path that feedback
+    is the agent's ENTIRE run log (multi-MB). Because context is GIN-indexed,
+    persisting that blob produced multi-second single-row PK updates that
+    saturated Postgres.
+
+    Thread an oversized feedback blob through the real _spawn_pipeline_task path
+    — both as the current iteration's feedback AND as a fat blob already sitting
+    in the carried-forward history (a pre-fix in-flight row) — and assert the
+    persisted context stays small: every feedback field is truncated to the cap,
+    and the whole serialized context is kilobytes, not megabytes.
+
+    Exercises backend/app/context_bounds.bound_review_history via the
+    review_pipeline storage chokepoint — a test-only diff cannot make this pass.
+    """
+    from app.context_bounds import (
+        REVIEW_FEEDBACK_MAX_CHARS,
+        _TRUNCATION_MARKER,
+        context_size_bytes,
+    )
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # An oversized blob standing in for the agent's full run log (the fat-row
+    # pathology). ~700 KB — far above REVIEW_FEEDBACK_MAX_CHARS (8 KB) and any
+    # legitimate freeform feedback, but within the 2 MB DB CHECK constraint so the
+    # source_task INSERT succeeds while still exercising the bounding logic.
+    fat_log = "AGENT-RUN-LOG " * 50_000  # 14 chars × 50_000 = 700_000 chars
+    assert len(fat_log) > 500_000  # >> REVIEW_FEEDBACK_MAX_CHARS; below 2 MB DB constraint
+
+    # The carried-forward history already holds a fat entry (models a pre-fix
+    # in-flight row): the bound must self-heal it, not just the new entry.
+    prior_fat_entry = {
+        "iteration": 0,
+        "feedback": fat_log,
+        "verdict": "REQUEST_CHANGES",
+        "issues": [_issue("alpha bravo charlie", "CRITICAL")],
+        "changed_files": ["a.py"],
+    }
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 9501,
+                "branch": "feat/fat",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                # iteration>=2 so the iteration==1 cross-cutting safeguard is
+                # skipped; distinct prior/current issues so stuck-cycle does NOT
+                # fire (it would block the spawn and return None).
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+                "pr_number": 9501,
+                "branch": "feat/fat",
+                "base_branch": "main",
+                "review_history": [prior_fat_entry],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Current iteration's feedback is ALSO the full fat log, with structured
+    # issues distinct from the prior entry (so no stuck-cycle match).
+    current_issues = [_issue("xray yankee zulu", "CRITICAL")]
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9501,
+        branch="feat/fat",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the issues",
+        current_feedback=fat_log,
+        current_issues=current_issues,
+    )
+
+    assert result is not None and created is True, (
+        "Fix should spawn (distinct issues → no stuck-cycle block)"
+    )
+
+    history = (result.context or {})["review_loop"]["review_history"]
+    # Both the carried-forward fat entry and the new fat entry are present...
+    assert len(history) == 2
+    # ...and EVERY feedback field is bounded — the carried-forward blob
+    # self-healed, not just the new one.
+    for entry in history:
+        assert len(entry["feedback"]) <= REVIEW_FEEDBACK_MAX_CHARS, (
+            f"feedback not bounded: {len(entry['feedback'])} chars"
+        )
+    # The fat entries were actually truncated (marker present), proving the bound
+    # fired rather than the blob just happening to be short.
+    assert history[-1]["feedback"].endswith(_TRUNCATION_MARKER)
+    assert history[0]["feedback"].endswith(_TRUNCATION_MARKER)
+
+    # Structured data every other consumer reads is preserved verbatim.
+    assert history[-1]["issues"] == current_issues
+    assert history[-1]["verdict"] == "REQUEST_CHANGES"
+    assert history[0]["issues"] == [_issue("alpha bravo charlie", "CRITICAL")]
+    assert history[0]["changed_files"] == ["a.py"]
+
+    # The whole persisted context is now kilobytes, not the ~4 MB of raw feedback
+    # that went in — the property whose violation saturated Postgres.
+    persisted_bytes = context_size_bytes(result.context)
+    assert persisted_bytes < 100_000, (
+        f"persisted context still fat: {persisted_bytes} bytes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_history_entry_count_is_bounded(db_session, mocker):
+    """The carried-forward review_history entry count is capped (keep-most-recent)
+    so it cannot grow without bound across a long chain. Complements the
+    per-entry feedback truncation in test_review_history_feedback_is_bounded."""
+    from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # A pathologically long carried-forward history (well past the cap). Each
+    # entry carries a DISTINCT CRITICAL description, and the new iteration's issue
+    # is distinct again, so stuck-cycle detection cannot match the most-recent two
+    # and block the spawn.
+    over = REVIEW_HISTORY_MAX_ENTRIES + 40
+    long_history = [
+        {
+            "iteration": i,
+            "feedback": f"iteration {i} feedback",
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue(f"distinct issue number {i}", "CRITICAL")],
+        }
+        for i in range(over)
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 9502,
+                "branch": "feat/long",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+                "pr_number": 9502,
+                "branch": "feat/long",
+                "base_branch": "main",
+                "review_history": long_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9502,
+        branch="feat/long",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the issues",
+        current_feedback="brand new distinct feedback",
+        current_issues=[_issue("brand new distinct critical", "CRITICAL")],
+    )
+
+    assert result is not None and created is True
+    history = (result.context or {})["review_loop"]["review_history"]
+    assert len(history) == REVIEW_HISTORY_MAX_ENTRIES, (
+        f"entry count not capped: {len(history)}"
+    )
+    # Keep-most-recent: the newest entry (the one just appended) survives, the
+    # oldest (iteration 0) is evicted.
+    assert history[-1]["feedback"] == "brand new distinct feedback"
+    assert all(e.get("iteration") != 0 for e in history[:-1])
+
+
+@pytest.mark.asyncio
 async def test_stuck_cycle_detected_at_50pct_blocks_spawn(db_session, mocker):
     """When ≥50% of CRITICAL/MAJOR issues repeat across consecutive iterations,
     _spawn_pipeline_task returns None and marks the original task requires_approval."""
@@ -16608,17 +16831,22 @@ async def test_review_history_feedback_is_size_capped(db_session, mocker):
         "must be created"
     )
 
+    from app.context_bounds import REVIEW_FEEDBACK_MAX_CHARS, _TRUNCATION_MARKER
+
     history = result.context["review_loop"]["review_history"]
     assert len(history) == 13, "12 carried-forward entries + 1 newly appended entry"
 
     # Every stored feedback (carried-forward AND the new full-log entry) is bounded.
+    # The cap is REVIEW_FEEDBACK_MAX_CHARS (8192) from context_bounds, which replaced
+    # the legacy MAX_REVIEW_HISTORY_FEEDBACK_CHARS (4000) as the canonical bound.
     for entry in history:
-        assert len(entry["feedback"]) <= MAX_REVIEW_HISTORY_FEEDBACK_CHARS, (
+        assert len(entry["feedback"]) <= REVIEW_FEEDBACK_MAX_CHARS, (
             f"entry {entry.get('iteration')} feedback is {len(entry['feedback'])} "
-            f"chars — exceeds cap {MAX_REVIEW_HISTORY_FEEDBACK_CHARS}"
+            f"chars — exceeds cap {REVIEW_FEEDBACK_MAX_CHARS}"
         )
-    # The new entry (the 2 MB full-log fallback) is truncated to exactly the cap.
-    assert len(history[-1]["feedback"]) == MAX_REVIEW_HISTORY_FEEDBACK_CHARS
+    # The new entry (the 2 MB full-log fallback) is truncated to exactly the cap with marker.
+    assert len(history[-1]["feedback"]) == REVIEW_FEEDBACK_MAX_CHARS
+    assert history[-1]["feedback"].endswith(_TRUNCATION_MARKER)
 
     # Structured fields (what every non-similarity consumer reads) survive intact.
     assert history[-1]["issues"] == [_issue("a fresh critical issue", "CRITICAL")]
@@ -16703,13 +16931,19 @@ async def test_review_history_carried_forward_feedback_is_recapped(db_session, m
         current_issues=[_issue("a new issue", "CRITICAL")],
     )
 
+    from app.context_bounds import REVIEW_FEEDBACK_MAX_CHARS, _TRUNCATION_MARKER
+
     assert created is True and result is not None
     history = result.context["review_loop"]["review_history"]
     assert len(history) == 2
 
     # The carried-forward pre-deploy fat entry is re-capped, keys preserved.
-    assert len(history[0]["feedback"]) == MAX_REVIEW_HISTORY_FEEDBACK_CHARS
-    assert history[0]["feedback"] == pre_deploy_fat[:MAX_REVIEW_HISTORY_FEEDBACK_CHARS]
+    # Cap is REVIEW_FEEDBACK_MAX_CHARS (8192) from context_bounds (canonical bound).
+    assert len(history[0]["feedback"]) == REVIEW_FEEDBACK_MAX_CHARS
+    assert history[0]["feedback"] == (
+        pre_deploy_fat[: REVIEW_FEEDBACK_MAX_CHARS - len(_TRUNCATION_MARKER)]
+        + _TRUNCATION_MARKER
+    )
     assert history[0]["issues"] == [_issue("legacy issue", "MAJOR")]
 
     # The fresh short feedback is stored verbatim — capping must not mangle it.

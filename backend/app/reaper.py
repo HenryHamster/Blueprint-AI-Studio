@@ -4271,6 +4271,26 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
+                # Step 16b: Structural-health audit — recurring resource/scalability
+                # sweep that detects unbounded JSONB fat-row growth in task.context
+                # (the structural class that caused a Postgres saturation outage) via
+                # a BOUNDED DB-side byte-size aggregate, and enrolls a deduped finding
+                # into the existing evergreen ledger. Mode- and cadence-gated; INERT
+                # until an operator flips structural_health_audit_mode off→observe/
+                # enforce. Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    from app.structural_health_audit import run_structural_health_audit
+
+                    await run_structural_health_audit(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Structural-health audit sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
                 # Step 17: Auto-resolve OPEN owned bug-class messages — resolve an
                 # open system/agent BUG_REPORT/BLOCKER once the outcome that owns
                 # its fix (a direction or a PR, read from creation-time context)

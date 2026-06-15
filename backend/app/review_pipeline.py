@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
+from app.context_bounds import bound_review_history, warn_if_context_oversized
 from app.database import resolve_dialect_name
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
 from app.models import Task, TaskHistory, TaskStatus
@@ -2789,12 +2790,14 @@ async def _spawn_pipeline_task(
     if current_issues:
         new_review_entry["issues"] = current_issues
     # Bound each entry's freeform feedback so the persisted row can never be fat,
-    # no matter how large the underlying agent log is (see
-    # MAX_REVIEW_HISTORY_FEEDBACK_CHARS). Applied to the whole list — the freshly
-    # built entry AND any carried-forward prior entries — and BEFORE the
+    # no matter how large the underlying agent log is. Applied to the whole list —
+    # the freshly built entry AND any carried-forward prior entries — BEFORE the
     # stuck-cycle similarity check below, so the Jaccard compares consistently
-    # bounded prefixes.
-    new_review_history = _cap_review_history_feedback(
+    # bounded prefixes. Uses bound_review_history (REVIEW_FEEDBACK_MAX_CHARS + marker)
+    # rather than the legacy _cap_review_history_feedback so the truncation marker is
+    # present on truncated entries; the bound_review_history call at the persistence
+    # chokepoint below becomes a no-op because the list is already bounded here.
+    new_review_history = bound_review_history(
         [*prev_review_history, new_review_entry]
         if task_type == "fix" and current_feedback
         else prev_review_history
@@ -3471,6 +3474,23 @@ async def _spawn_pipeline_task(
     # cycles. Per-iteration cap of 5 is enforced at write time elsewhere.
     accumulated_responses = (prior_responses + new_responses)[-30:]
 
+    # Bound the carried-forward review history before persisting it into the
+    # child's GIN-indexed context. review_history accumulates one entry per
+    # iteration; on the log-scraping fallback path each entry's `feedback` is the
+    # reviewer agent's ENTIRE run log (observed multi-MB). Unbounded, that blob is
+    # re-serialized into every downstream task.context on every spawn, and because
+    # context is GIN-indexed each write triggers a TOAST rewrite + GIN reindex —
+    # the multi-second single-row PK updates that saturated Postgres (the outage
+    # this fix closes). bound_review_history caps the entry count and truncates
+    # each `feedback` field; it re-bounds the WHOLE list (not just the new entry)
+    # so a fat blob carried over from a pre-fix in-flight row self-heals here on
+    # the next spawn. All structured consumers (churn/drift/stuck-cycle/issue-
+    # ledger) ran above on the unbounded list and read `issues`/`changed_files`,
+    # not `feedback`; the only `feedback` readers are the truncated retry-prompt
+    # preview and the stuck-cycle Jaccard fallback, both unaffected within the cap
+    # for any real-world feedback (truncation is a no-op below it).
+    bounded_review_history = bound_review_history(new_review_history)
+
     propagated_ctx["review_loop"] = {
         "pr_number": pr_number,
         "branch": branch,
@@ -3478,7 +3498,9 @@ async def _spawn_pipeline_task(
         "original_task_id": resolved_original_id,
         "iteration": iteration,
         "max_iterations": per_chain_cap,
-        **({"review_history": new_review_history} if new_review_history else {}),
+        **(
+            {"review_history": bounded_review_history} if bounded_review_history else {}
+        ),
         **({"fix_reason": fix_reason} if fix_reason else {}),
         **({"churn_detections": churn_detections} if churn_detections else {}),
         **({"scope_overflow_warned": True} if overflow_warning else {}),
@@ -3735,6 +3757,12 @@ async def _spawn_pipeline_task(
                 f"target_vm={source_task.vm_instance_id} "
                 f"deadline={propagated_ctx['warm_handoff_deadline']}"
             )
+
+    # Cheap fat-row telemetry on the final persisted context. With review_history
+    # now bounded this should never fire; if it does, a new unbounded context
+    # sub-field has regressed and is visible in logs rather than only post-outage.
+    # Non-raising — never blocks the spawn.
+    warn_if_context_oversized(propagated_ctx, label=f"spawn {task_type} PR#{pr_number}")
 
     new_task = Task(
         project_id=source_task.project_id,

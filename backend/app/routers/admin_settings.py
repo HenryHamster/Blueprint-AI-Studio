@@ -103,6 +103,9 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "evergreen_fill_max_active",
         "evergreen_fill_daily_cap",
         "evergreen_fill_deferred_memo_enrollment",
+        "structural_health_audit_mode",
+        "structural_health_audit_interval_minutes",
+        "structural_health_audit_fat_row_bytes",
         "category_routing",
         "ci_backstop_timeout_minutes",
         "cochange_decomposition_enabled",
@@ -345,6 +348,15 @@ async def get_settings(
         ),
         "evergreen_fill_deferred_memo_enrollment": bool(
             _runtime_config.get("evergreen_fill_deferred_memo_enrollment", False)
+        ),
+        "structural_health_audit_mode": str(
+            _runtime_config.get("structural_health_audit_mode", "off")
+        ),
+        "structural_health_audit_interval_minutes": int(
+            _runtime_config.get("structural_health_audit_interval_minutes", 60)
+        ),
+        "structural_health_audit_fat_row_bytes": int(
+            _runtime_config.get("structural_health_audit_fat_row_bytes", 1048576)
         ),
         "max_concurrent_auto_remediations": _runtime_config.get(
             "max_concurrent_auto_remediations", 2
@@ -845,6 +857,44 @@ async def _apply_settings(
                 detail="evergreen_fill_deferred_memo_enrollment must be a boolean",
             )
         _runtime_config["evergreen_fill_deferred_memo_enrollment"] = raw
+    if "structural_health_audit_mode" in payload:
+        val = str(payload["structural_health_audit_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["structural_health_audit_mode"] = val
+    if "structural_health_audit_interval_minutes" in payload:
+        try:
+            val = int(payload["structural_health_audit_interval_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_interval_minutes must be a number",
+            )
+        if not (1 <= val <= 1440):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_interval_minutes must be between 1 and 1440",
+            )
+        _runtime_config["structural_health_audit_interval_minutes"] = val
+    if "structural_health_audit_fat_row_bytes" in payload:
+        try:
+            val = int(payload["structural_health_audit_fat_row_bytes"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_fat_row_bytes must be a number",
+            )
+        # Floor at 1 KiB so an operator can't set a pathological near-zero
+        # threshold that flags every row; ceiling well above the worst outage row.
+        if not (1024 <= val <= 1_073_741_824):
+            raise HTTPException(
+                status_code=400,
+                detail="structural_health_audit_fat_row_bytes must be between 1024 and 1073741824",
+            )
+        _runtime_config["structural_health_audit_fat_row_bytes"] = val
     if "evaluating_pipeline_timeout_minutes" in payload:
         try:
             val = int(payload["evaluating_pipeline_timeout_minutes"])
