@@ -15981,6 +15981,148 @@ class TestCanaryAdversarialChallenge:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Get Version Summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGetVersionSummary:
+    """Tests for GET /api/admin/projects/{project_id}/release-versions/{version_number}/summary."""
+
+    URL = "/api/admin/projects/{project_id}/release-versions/{version_number}/summary"
+
+    @pytest.mark.asyncio
+    async def test_version_summary_endpoint(self, client: AsyncClient, db_session):
+        """Returns summary fields for an open version."""
+        project = await _make_project(db_session)
+        opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+            opened_at=opened,
+            qualification_attempts=0,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=3),
+            ),
+            patch(
+                "app.release_version.compute_version_acceptance_aggregate",
+                new=AsyncMock(return_value={"proven": 2, "unproven": 1, "total": 3}),
+            ),
+        ):
+            resp = await client.get(
+                self.URL.format(project_id=project.id, version_number=1)
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["version_number"] == 1
+        assert data["phase"] == "build"
+        assert data["status"] == "open"
+        assert data["promoted_sha"] is None
+        assert data["promoted_at"] is None
+        assert data["merged_task_count"] == 3
+        assert data["acceptance_aggregate"]["proven"] == 2
+        assert data["acceptance_aggregate"]["total"] == 3
+        assert data["qualification_attempts"] == 0
+        assert isinstance(data["highlights"], list)
+        assert any("3 tasks merged" in h for h in data["highlights"])
+
+    @pytest.mark.asyncio
+    async def test_version_summary_promoted_version(self, client: AsyncClient, db_session):
+        """Returns promoted_sha and promoted_at for a promoted version."""
+        project = await _make_project(db_session)
+        opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        promoted = datetime(2026, 1, 10, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="promoted",
+            opened_at=opened,
+            promoted_at=promoted,
+            promoted_sha="abc1234def5678",
+            qualification_attempts=1,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=5),
+            ),
+            patch(
+                "app.release_version.compute_version_acceptance_aggregate",
+                new=AsyncMock(return_value={"proven": 4, "unproven": 1, "total": 5}),
+            ),
+        ):
+            resp = await client.get(
+                self.URL.format(project_id=project.id, version_number=2)
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "promoted"
+        assert data["promoted_sha"] == "abc1234def5678"
+        assert data["promoted_at"] is not None
+        assert any("abc1234" in h for h in data["highlights"])
+
+    @pytest.mark.asyncio
+    async def test_version_summary_404_for_nonexistent_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when the version_number does not exist for this project."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            self.URL.format(project_id=project.id, version_number=99)
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_version_summary_404_for_non_member(
+        self, override_get_session, db_session
+    ):
+        """Returns 404 when the user is not a member of the project."""
+        project = await _make_project(db_session, owner_id="owner-user")
+        opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+            opened_at=opened,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        non_member_id = "non-member-999"
+
+        def non_member():
+            return {"user_id": non_member_id, "email": "other@example.com"}
+
+        app.dependency_overrides[get_current_user] = non_member
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    self.URL.format(project_id=project.id, version_number=1)
+                )
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+        # Non-member gets 403 or 404 depending on implementation.
+        assert resp.status_code in (403, 404)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # admin_state.py — GET /api/admin/state
 # ═══════════════════════════════════════════════════════════════════════════════
 

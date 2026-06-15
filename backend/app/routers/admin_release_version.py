@@ -1091,6 +1091,91 @@ async def list_qualification_verdicts(
     }
 
 
+@router.get("/projects/{project_id}/release-versions/{version_number}/summary")
+async def get_version_summary(
+    project_id: uuid.UUID,
+    version_number: int,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return a synthesized 'what's new' summary for a single release version.
+
+    Viewer+ role required.  Keyed by the per-project ``version_number`` that the
+    UI already displays.  Returns 404 when no matching version row exists for this
+    project.
+
+    Path uses ``project_id`` so membership can be enforced; ``/release-versions/{id}``
+    (bare UUID) would carry no project context and cannot gate access.
+
+    Response fields (stable contract for the VersionSummaryPanel):
+    - ``version_number``, ``phase``, ``status``, ``promoted_sha``, ``opened_at``,
+      ``promoted_at``, ``qualification_attempts``: direct version columns.
+    - ``merged_task_count``: tasks merged since the version opened.
+    - ``acceptance_aggregate``: bucket → count dict from the acceptance layer.
+    - ``highlights``: short human-readable strings derived from the above data
+      (no additional DB queries).
+    """
+    from app.release_version import (  # noqa: PLC0415
+        count_merged_since,
+        compute_version_acceptance_aggregate,
+    )
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+
+    version = (
+        (
+            await session.execute(
+                select(ReleaseVersion).where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.version_number == version_number,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Release version {version_number} not found for this project.",
+        )
+
+    merged_count = await count_merged_since(session, project_id, version.opened_at)
+    acceptance_aggregate = await compute_version_acceptance_aggregate(
+        session, project_id, since=version.opened_at
+    )
+
+    # Derive human-readable highlights from already-gathered data (no new queries).
+    highlights: list[str] = []
+    highlights.append(f"{merged_count} task{'s' if merged_count != 1 else ''} merged")
+    highlights.append(f"Phase: {version.phase}")
+    if version.status == "promoted" and version.promoted_sha:
+        highlights.append(f"Promoted at {version.promoted_sha[:8]}")
+    elif version.status == "open":
+        highlights.append("Status: open")
+    elif version.status == "abandoned":
+        highlights.append("Status: abandoned")
+    proven = acceptance_aggregate.get("proven", 0)
+    total = acceptance_aggregate.get("total", 0)
+    if total > 0:
+        highlights.append(f"{proven}/{total} tasks proven")
+
+    return {
+        "version_number": version.version_number,
+        "phase": version.phase,
+        "status": version.status,
+        "promoted_sha": version.promoted_sha,
+        "opened_at": version.opened_at.isoformat(),
+        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
+        "merged_task_count": merged_count,
+        "acceptance_aggregate": acceptance_aggregate,
+        "qualification_attempts": version.qualification_attempts,
+        "highlights": highlights,
+    }
+
+
 class _ClearDeployFailedBody(BaseModel):
     # Operator override: clear a stale deploy_failed even when the live serving
     # SHA is unobservable (the pre-Cloud-Run-API interim). Without it, the clear

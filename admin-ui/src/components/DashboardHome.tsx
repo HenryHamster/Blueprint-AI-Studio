@@ -56,6 +56,7 @@ import { MergeGateFleetHealthCard } from './MergeGateFleetHealthCard';
 import { ParkWakeHealthCard } from './ParkWakeHealthCard';
 import { DependencyHealthCard } from './DependencyHealthCard';
 import { ImprovementLanesPanel } from './ImprovementLanesPanel';
+import { VersionSummaryPanel } from './VersionSummaryPanel';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
 import { type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
@@ -318,6 +319,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
           refreshError={versionLifecycleError}
           lastSuccessfulRefreshAt={versionLifecycleLastSuccessAt}
           refreshing={versionLifecycleRefreshing}
+        />
+      )}
+
+      {/* Version Summary */}
+      {versionLifecycle?.current_version?.tasks_merged && (
+        <VersionSummaryPanel
+          tasksMerged={versionLifecycle.current_version.tasks_merged}
         />
       )}
 
