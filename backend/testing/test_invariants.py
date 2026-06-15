@@ -314,7 +314,12 @@ def test_all_admin_routes_require_auth():
     """Every admin-surface route must resolve an auth dependency somewhere."""
     from fastapi.routing import APIRoute
 
-    from app.auth import get_current_user, get_metrics_reader, require_admin
+    from app.auth import (
+        get_current_user,
+        get_current_user_optional,
+        get_metrics_reader,
+        require_admin,
+    )
     from app.main import app
     from app.routers.agent import verify_agent_token
 
@@ -325,8 +330,17 @@ def test_all_admin_routes_require_auth():
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
     # JWTs; it is a valid auth callable for metrics-only endpoints.
+    # get_current_user_optional is used on endpoints that accept EITHER an admin
+    # bearer token OR an agent JWT via x-agent-token; the endpoint enforces
+    # auth itself when the optional dep returns None.
     auth_callables = frozenset(
-        {get_current_user, require_admin, verify_agent_token, get_metrics_reader}
+        {
+            get_current_user,
+            get_current_user_optional,
+            require_admin,
+            verify_agent_token,
+            get_metrics_reader,
+        }
     )
     scanned_routes: list[str] = []
     offenders: list[str] = []

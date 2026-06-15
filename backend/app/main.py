@@ -20,6 +20,7 @@ from typing import Dict, Any
 from fastapi import (
     FastAPI,
     Depends,
+    Header,
     HTTPException,
     Request,
 )
@@ -39,7 +40,7 @@ from app.models import (
 )
 from app.compute import provision_agent_vm  # noqa: F401  (re-exported for test patches; see main.py:108 docstring)
 from app.deployed_sha import resolve_deployed_sha
-from app.auth import get_current_user
+from app.auth import get_current_user, get_current_user_optional, verify_agent_jwt
 from app.admin_helpers import _get_user_project, _get_user_task
 from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
@@ -1205,9 +1206,16 @@ async def get_viewport_failure_screenshot_download_url(
     component: str,
     width: int,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict | None = Depends(get_current_user_optional),
+    x_agent_token: str | None = Header(None),
 ):
     """Generate a 1-hour signed download URL for a viewport failure screenshot.
+
+    Accepts either an admin/Firebase bearer token (existing path) or an agent
+    JWT via the ``x-agent-token`` header.  Agent tokens are scoped to the
+    uploading task: the reconstructed object URI must match the URI stamped on
+    the task's context (``viewport_failure_screenshot_uri``) and the project
+    must match the token's ``project_id`` claim.
 
     The GCS object path is reconstructed to exactly mirror what the agent
     uploads via POST /api/agent/viewport/failure-screenshot-upload-url
@@ -1227,9 +1235,33 @@ async def get_viewport_failure_screenshot_download_url(
     )
     from app.viewport_evidence import viewport_object_name
 
-    await _get_user_project(project_id, current_user["user_id"], session)
+    if x_agent_token is not None:
+        claims = verify_agent_jwt(x_agent_token)
+        task_id = claims.get("sub")
+        token_project_id = claims.get("project_id")
+        if not task_id:
+            raise HTTPException(status_code=403, detail="Agent token has no task scope")
+        if str(token_project_id) != str(project_id):
+            raise HTTPException(status_code=403, detail="Project mismatch")
+        result = await session.execute(
+            select(Task).where(Task.id == uuid.UUID(task_id))
+        )
+        task = result.scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=403, detail="Task not found")
+        object_name = viewport_object_name(project_id, component, width)
+        stamped_uri = (task.context or {}).get("viewport_failure_screenshot_uri", "")
+        if not stamped_uri or not stamped_uri.endswith(object_name):
+            raise HTTPException(
+                status_code=403,
+                detail="Agent may only download its own uploaded screenshot",
+            )
+    elif current_user is not None:
+        await _get_user_project(project_id, current_user["user_id"], session)
+        object_name = viewport_object_name(project_id, component, width)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
-    object_name = viewport_object_name(project_id, component, width)
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
 
     try:
@@ -1253,9 +1285,15 @@ async def get_viewport_screenshot_download_url(
     task_id: uuid.UUID,
     name: str,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict | None = Depends(get_current_user_optional),
+    x_agent_token: str | None = Header(None),
 ):
     """Generate a 1-hour signed download URL for a task-scoped viewport screenshot.
+
+    Accepts either an admin/Firebase bearer token (existing path) or an agent
+    JWT via the ``x-agent-token`` header.  Agent tokens are scoped to their own
+    task: the ``task_id`` query param must match the token's ``sub`` claim, and
+    ``project_id`` must match the token's ``project_id`` claim.
 
     The GCS object path is reconstructed to exactly mirror what the agent uploads via
     POST /api/agent/viewport/screenshot-upload-url
@@ -1271,7 +1309,20 @@ async def get_viewport_screenshot_download_url(
         generate_download_signed_url,
     )
 
-    await _get_user_project(project_id, current_user["user_id"], session)
+    if x_agent_token is not None:
+        claims = verify_agent_jwt(x_agent_token)
+        token_task_id = claims.get("sub")
+        token_project_id = claims.get("project_id")
+        if not token_task_id:
+            raise HTTPException(status_code=403, detail="Agent token has no task scope")
+        if str(token_task_id) != str(task_id):
+            raise HTTPException(status_code=403, detail="Task mismatch")
+        if str(token_project_id) != str(project_id):
+            raise HTTPException(status_code=403, detail="Project mismatch")
+    elif current_user is not None:
+        await _get_user_project(project_id, current_user["user_id"], session)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
     _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
     # The `name` param is the stored entry_name: "{sanitize(component)[:100]}-{width}-{phase}".
