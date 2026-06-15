@@ -1884,12 +1884,58 @@ async def _compute_digest(
                 _days_to_min_n = None
             else:
                 _days_to_min_n = round(max(_with_remaining, _without_remaining), 1)
+            # Derive total daily throughput to project days-to-threshold at
+            # alternative holdback fractions so operators can see the time-to-verdict
+            # tradeoff before adjusting holdback_fraction.
+            if 0 < _holdback_fraction < 1:
+                _total_daily = _with_daily / (1.0 - _holdback_fraction)
+            elif _holdback_fraction == 0:
+                _total_daily = _with_daily
+            elif _holdback_fraction == 1:
+                _total_daily = _without_daily
+            else:
+                _total_daily = 0.0
+            _alt_fractions = [0.1, 0.3, 0.5]
+            _alternative_projections: "dict[str, float | None]" = {}
+            for _alt_frac in _alt_fractions:
+                if _total_daily <= 0:
+                    _alternative_projections[str(_alt_frac)] = None
+                    continue
+                _alt_with_daily = _total_daily * (1.0 - _alt_frac)
+                _alt_without_daily = _total_daily * _alt_frac
+                _alt_with_days = (
+                    (_min_n - _with_assigned) / _alt_with_daily
+                    if _alt_with_daily > 0
+                    else None
+                )
+                _alt_without_days = (
+                    (_min_n - _without_assigned) / _alt_without_daily
+                    if _alt_without_daily > 0
+                    else None
+                )
+                _alt_with_rem = (
+                    max(_alt_with_days, 0.0) if _alt_with_days is not None else None
+                )
+                _alt_without_rem = (
+                    max(_alt_without_days, 0.0)
+                    if _alt_without_days is not None
+                    else None
+                )
+                if _with_assigned >= _min_n and _without_assigned >= _min_n:
+                    _alternative_projections[str(_alt_frac)] = 0.0
+                elif _alt_with_rem is None or _alt_without_rem is None:
+                    _alternative_projections[str(_alt_frac)] = None
+                else:
+                    _alternative_projections[str(_alt_frac)] = round(
+                        max(_alt_with_rem, _alt_without_rem), 1
+                    )
             _verdict_entry["accrual_projection"] = {
                 "with_7d": _accrual["with_7d"],
                 "without_7d": _accrual["without_7d"],
                 "window_days": _accrual_window_days,
                 "holdback_fraction": _holdback_fraction,
                 "days_to_min_n": _days_to_min_n,
+                "alternative_projections": _alternative_projections,
             }
 
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(

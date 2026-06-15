@@ -7365,6 +7365,98 @@ class TestSrCatchRateTrendsDirectionExamples:
 
 
 # ---------------------------------------------------------------------------
+# Accrual alternative-projection tests
+# ---------------------------------------------------------------------------
+
+
+class TestAccrualAlternativeProjections:
+    """Digest accrual_projection includes alternative_projections at 0.1/0.3/0.5 holdback fractions."""
+
+    @pytest.mark.asyncio
+    async def test_alternative_projections_present_with_nonzero_holdback(
+        self, client: AsyncClient, db_session
+    ):
+        """accrual_projection.alternative_projections maps fraction strings to float|None."""
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(db_session)
+        # Pre-populate a verdict for repo_map so the accrual path activates.
+        verdict_entry = {
+            "verdict": "continue-trial",
+            "lift": None,
+            "n_with": 5,
+            "n_without": 5,
+            "thresholds": {"min_n_per_arm": 30},
+            "arm_composition": {
+                "with_assigned": 5,
+                "without_assigned": 5,
+            },
+        }
+        # Stub persist to return our pre-set verdict (avoids a full session-within-session open).
+        persisted = {"repo_map": dict(verdict_entry)}
+
+        with (
+            patch(
+                "app.routers.admin_digest.persist_trial_verdicts_in_transaction",
+                new=AsyncMock(return_value=persisted),
+            ),
+            patch(
+                "app.routers.admin_digest.compute_trial_arm_accrual",
+                new=AsyncMock(
+                    # with_7d/without_7d proportional to (1-0.3)/0.3 so rates are
+                    # consistent with holdback_fraction=0.3, enabling the
+                    # self-consistency check below.
+                    return_value={"with_7d": 49, "without_7d": 21, "window_days": 7}
+                ),
+            ),
+            patch(
+                "app.routers.admin_digest._runtime_config",
+                {"repo_map_holdback_fraction": 0.3},
+                create=True,
+            ) as _,
+        ):
+            # Inject holdback fraction via shared_state so the digest reads it.
+            import app.shared_state as _shared_state
+
+            orig = dict(_shared_state.runtime_config)
+            _shared_state.runtime_config["repo_map_holdback_fraction"] = 0.3
+            try:
+                resp = await client.get(f"/api/admin/digest?project_id={project.id}")
+            finally:
+                _shared_state.runtime_config.clear()
+                _shared_state.runtime_config.update(orig)
+
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json().get("capability_adoption_verdicts") or {}
+        rm = verdicts.get("repo_map")
+        assert rm is not None, "repo_map verdict missing from digest response"
+        proj = rm.get("accrual_projection")
+        assert proj is not None, "accrual_projection missing from repo_map verdict"
+        alt = proj.get("alternative_projections")
+        assert alt is not None, (
+            "alternative_projections missing from accrual_projection"
+        )
+        # Exactly the three standard fractions must be present.
+        assert set(alt.keys()) == {"0.1", "0.3", "0.5"}
+        for frac_key, days_val in alt.items():
+            assert days_val is None or isinstance(days_val, (int, float)), (
+                f"alternative_projections[{frac_key!r}] must be float|None, got {days_val!r}"
+            )
+        # Self-consistency: alt projection at the CURRENT holdback fraction should
+        # approximately equal days_to_min_n, because mock rates are proportional to
+        # holdback (with_7d/without_7d = 49/21 ≈ 0.7/0.3), so redistributing at the
+        # same fraction reproduces the original arm rates exactly.
+        days_to_min_n = proj.get("days_to_min_n")
+        assert days_to_min_n is not None
+        alt_at_current = alt.get("0.3")
+        assert alt_at_current is not None
+        assert abs(alt_at_current - days_to_min_n) < 0.5, (
+            f"alt_projection at current holdback ({alt_at_current}) should ≈ "
+            f"days_to_min_n ({days_to_min_n})"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Viewport debt endpoint tests
 # ---------------------------------------------------------------------------
 
@@ -16035,7 +16127,9 @@ class TestGetVersionSummary:
         assert any("3 tasks merged" in h for h in data["highlights"])
 
     @pytest.mark.asyncio
-    async def test_version_summary_promoted_version(self, client: AsyncClient, db_session):
+    async def test_version_summary_promoted_version(
+        self, client: AsyncClient, db_session
+    ):
         """Returns promoted_sha and promoted_at for a promoted version."""
         project = await _make_project(db_session)
         opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
