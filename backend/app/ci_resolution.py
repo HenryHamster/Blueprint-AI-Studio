@@ -420,6 +420,46 @@ def should_run_no_ci_test_gate(
     return has_detectable_tests(project)
 
 
+# Action a stranded no-checks escalation should take, decided by
+# :func:`resolve_no_checks_escalation`.
+NoChecksEscalationAction = Literal["keep_polling", "verify_tests", "merge_unverified"]
+
+
+def resolve_no_checks_escalation(
+    project, branch: str | None, *, gate_enabled: bool
+) -> NoChecksEscalationAction:
+    """Decide how the orchestrator's no-checks escalation backstop should resolve
+    a PR that has waited ~600s with no CI checks ever appearing.
+
+    Historically the escalation block raised ONE failure alert and then kept
+    polling forever, so a no-CI repo's PR (and every rollup that targets a real
+    base) had to be hand-merged. This backstop decides whether the strand can be
+    auto-resolved instead — strictly gated on :func:`proceed_on_no_checks` so a
+    CI-gated repo is NEVER auto-merged:
+
+      - ``"keep_polling"`` — :func:`proceed_on_no_checks` is False (the repo is
+        CI-gated: ``has_ci=True``, or ``has_ci=None``/unknown). A missing check
+        means 'not registered yet', never 'will never run', so today's
+        alert-and-wait behavior is preserved EXACTLY — do NOT auto-merge.
+      - ``"verify_tests"`` — the strand can be resolved AND the repo has a
+        detectable test suite (:func:`should_run_no_ci_test_gate` is True): route
+        through the SAME no-CI verify gate the definitive-``no_checks`` branch
+        uses, so the merge is still gated on a ``verify_tests`` verdict.
+      - ``"merge_unverified"`` — the strand can be resolved but the repo is truly
+        test-less (or the gate kill-switch is off, or the base is an internal
+        staging branch): proceed UNVERIFIED, mirroring the definitive-``no_checks``
+        immediate-pass.
+
+    Pure decision function (no I/O), so the orchestrator's inline backstop and its
+    tests call the SAME predicate rather than a hand-copied branch.
+    """
+    if not proceed_on_no_checks(project, branch):
+        return "keep_polling"
+    if should_run_no_ci_test_gate(project, branch, gate_enabled=gate_enabled):
+        return "verify_tests"
+    return "merge_unverified"
+
+
 # Outcome of mapping a MERGE_TEST_RESULT verdict onto the merge gate.
 MergeTestOutcome = Literal["pass", "fail", "undetected"]
 

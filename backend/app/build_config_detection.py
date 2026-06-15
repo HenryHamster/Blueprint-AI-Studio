@@ -373,6 +373,105 @@ async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> 
         return False
 
 
+async def maybe_redetect_ci_presence(project, session, *, ref=None) -> bool:
+    """Best-effort re-detection of CI presence for a project whose stored
+    ``build_config.has_ci`` is None/absent.
+
+    A stale ``has_ci=None`` (onboarding detection was incomplete, or the project
+    predates the ``has_ci`` tri-state) makes :func:`ci_resolution.proceed_on_no_checks`
+    return False, so a project that genuinely has no CI strands every
+    main-targeting PR forever — the no-checks poll never resolves and each rollup
+    must be hand-merged.  This helper attempts a single bounded re-detection using
+    the same detector and operator-override-preserving path as
+    :func:`maybe_redetect_missing_test_command`, then persists the freshly-detected
+    ``has_ci`` so ``proceed_on_no_checks`` can resolve the strand on this or the
+    next poll.  Because it self-backfills stuck projects on the next poll, a
+    separate data-migration backfill is unnecessary.
+
+    Fires ONLY when stored ``has_ci`` is None/absent; a project that already
+    carries a DEFINITIVE ``has_ci`` (True or False) is left untouched.  Persists
+    ONLY when re-detection yields a definitive ``has_ci`` (True or False) — a
+    still-incomplete read (``has_ci`` None) leaves the config unchanged so a
+    guessed value is never recorded and the strand keeps polling.
+
+    Returns True iff re-detection yielded a definitive ``has_ci`` and persisted it.
+    Best-effort: never raises into the caller; logs, rolls back the session on
+    failure, and returns False.
+    """
+    try:
+        existing = project.build_config or {}
+        # Only fire for a stale/absent tri-state; never overwrite a definitive
+        # has_ci (True or False) already on the config.
+        if existing.get("has_ci") is not None:
+            return False
+        if not getattr(project, "github_owner", None) or not getattr(
+            project, "github_repo", None
+        ):
+            return False
+
+        from pydantic import ValidationError
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.github import get_repo_installation_token
+        from app.routers.admin_onboard import _detect_build_config
+        from app.schemas import BuildConfig as BuildConfigSchema
+        from app.shared_state import get_project_integration_branch
+
+        integration_branch = ref or get_project_integration_branch(project)
+
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
+        if not token:
+            return False
+
+        detected = await _detect_build_config(
+            token,
+            project.github_owner,
+            project.github_repo,
+            ref=integration_branch,
+        )
+        if not detected:
+            return False
+
+        detected = apply_operator_build_config_overrides(detected, existing)
+
+        # Only persist when detection produced a DEFINITIVE has_ci. A still
+        # incomplete read (has_ci None) must not overwrite the stored config —
+        # the strand keeps polling rather than recording a guessed value.
+        if detected.get("has_ci") is None:
+            return False
+
+        try:
+            validated = BuildConfigSchema(**detected)
+            project.build_config = validated.model_dump(exclude_none=True)
+        except ValidationError:
+            # Detection produced a shape the schema rejects — store raw so the
+            # operator can fix it in the UI (mirrors the manual re-detect path).
+            project.build_config = detected
+        flag_modified(project, "build_config")
+        await session.commit()
+        logger.info(
+            "[BUILD_CONFIG] Re-detected CI presence for project %s (has_ci=%s) — "
+            "no-CI strand can now resolve",
+            getattr(project, "id", None),
+            detected.get("has_ci"),
+        )
+        return True
+    except Exception:  # noqa: BLE001 — best-effort, must never block a merge path
+        logger.warning(
+            "[BUILD_CONFIG] CI-presence re-detection failed for project %s; "
+            "leaving config unchanged",
+            getattr(project, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 — keep the caller's session usable
+            pass
+        return False
+
+
 _MAX_DISCOVERED_ENTRIES = 50
 _MAX_CMD_LENGTH = 500
 
