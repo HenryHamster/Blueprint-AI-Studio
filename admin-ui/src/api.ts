@@ -1597,6 +1597,12 @@ export interface OutOfBandPromotion {
   promoted_sha: string;
 }
 
+export interface ChangelogEntry {
+  task_type: string | null;
+  title: string;
+  pr_number: number | null;
+}
+
 export interface CurrentVersion {
   version_number: number;
   phase: string;
@@ -1656,6 +1662,10 @@ export interface CurrentVersion {
   // Out-of-band promotion provenance. Non-null only when an operator force-merged
   // this version outside the normal qualification flow.
   out_of_band_promotion?: OutOfBandPromotion | null;
+  /** Per-task changelog for this version window: type, title, and PR number for
+   *  each merged task, newest-first. Allows operators to see what shipped without
+   *  manual release notes. */
+  tasks_merged?: ChangelogEntry[];
 }
 
 export interface RecentVersion {

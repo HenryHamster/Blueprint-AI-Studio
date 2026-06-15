@@ -103,7 +103,9 @@ class VersionCutBlockedByPromotion(RuntimeError):
         # Additive freshness context (age / auto-timeout) so the version-cut 409
         # can surface elapsed age and near/past-timeout state. ``None`` when the
         # promotion_pending record had no usable ``enabled_at``.
-        self.promotion_freshness = dict(promotion_freshness) if promotion_freshness else None
+        self.promotion_freshness = (
+            dict(promotion_freshness) if promotion_freshness else None
+        )
 
 
 async def open_version(
@@ -259,7 +261,6 @@ async def ensure_initial_release_version(
     )
 
 
-
 async def count_merged_since(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -287,6 +288,60 @@ async def count_merged_since(
     )
     rows = (await session.execute(stmt)).scalars().all()
     return sum(1 for task in rows if _task_completed_at(task) >= since)
+
+
+async def list_merged_tasks_for_version(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    since: datetime,
+) -> list[dict[str, Any]]:
+    """List tasks merged in the version window, newest-completion-first.
+
+    Operates over the same predicate as :func:`count_merged_since` —
+    ``COMPLETED`` tasks carrying the canonical landing signal whose stable
+    terminal timestamp is at or after ``since``.
+
+    Returns a list of dicts with ``task_type``, ``title``, and ``pr_number``
+    per landed task.  Empty when no tasks have merged in the window.
+    """
+    stmt = (
+        select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.title,
+                Task.payloads,
+                Task.status_log,
+                Task.created_at,
+                raiseload=True,
+            )
+        )
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            landed_signal_predicate(session),
+            Task.updated_at >= since,
+        )
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    entries: list[tuple[datetime, dict[str, Any]]] = []
+    for task in rows:
+        completed_at = _task_completed_at(task)
+        if completed_at < since:
+            continue
+        payload = task.first_payload
+        entries.append(
+            (
+                completed_at,
+                {
+                    "task_type": payload.get("type"),
+                    "title": task.title,
+                    "pr_number": payload.get("pr_number"),
+                },
+            )
+        )
+    entries.sort(key=lambda pair: pair[0], reverse=True)
+    return [entry for _, entry in entries]
 
 
 async def compute_version_acceptance_aggregate(
@@ -323,7 +378,9 @@ async def compute_version_acceptance_aggregate(
 
     aggregate: dict[str, int] = {bucket: 0 for bucket in ACCEPTANCE_AGGREGATE_BUCKETS}
     for task in rows:
-        bucket = classify_merged_acceptance_context(task.context if isinstance(task.context, dict) else {})
+        bucket = classify_merged_acceptance_context(
+            task.context if isinstance(task.context, dict) else {}
+        )
         aggregate[bucket] += 1
 
     aggregate["total"] = len(rows)
@@ -482,7 +539,9 @@ def _promotion_in_flight_freshness(promo: dict[str, Any]) -> dict[str, Any]:
         "promotion_enabled_at": enabled_at.isoformat(),
         "promotion_age_seconds": age_seconds,
         "promotion_timeout_seconds": cap_seconds,
-        "promotion_timeout_at": (enabled_at + timedelta(seconds=cap_seconds)).isoformat(),
+        "promotion_timeout_at": (
+            enabled_at + timedelta(seconds=cap_seconds)
+        ).isoformat(),
         "promotion_past_timeout": past_timeout,
         "promotion_nearing_timeout": nearing_timeout,
     }
@@ -633,8 +692,7 @@ def summarize_qualification_state(
                     )
                 elif freshness["promotion_nearing_timeout"]:
                     summary += (
-                        " It is NEARING the auto-timeout that reverts it to "
-                        "stabilize."
+                        " It is NEARING the auto-timeout that reverts it to stabilize."
                     )
             result: dict[str, Any] = {
                 "state": "promotion_check_wait",
@@ -672,8 +730,7 @@ def summarize_qualification_state(
                     )
                 elif freshness["promotion_nearing_timeout"]:
                     summary += (
-                        " It is NEARING the auto-timeout that reverts it to "
-                        "stabilize."
+                        " It is NEARING the auto-timeout that reverts it to stabilize."
                     )
             return {
                 "state": "promotion_in_flight",
@@ -758,11 +815,7 @@ def summarize_qualification_state(
             "state": "not_promoted",
             "summary": (
                 "Candidate scored BELOW the promotion threshold"
-                + (
-                    f" (confidence {conf}, threshold {thr})"
-                    if conf is not None
-                    else ""
-                )
+                + (f" (confidence {conf}, threshold {thr})" if conf is not None else "")
                 + ". Resolve the binding blocker, then re-qualify."
             ),
             "blocker": lq.get("blocker"),

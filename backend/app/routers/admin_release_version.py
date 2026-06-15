@@ -70,7 +70,8 @@ async def get_retirement_critiques(
                 StrategicCycle.id,
                 StrategicCycle.cycle_metadata,
                 StrategicCycle.created_at,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .where(StrategicCycle.project_id == project_id)
         .order_by(StrategicCycle.created_at.desc())
@@ -114,27 +115,29 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     from app.release_readiness import format_qualification_for_api  # noqa: PLC0415
 
     out = format_qualification_for_api(qual)
-    out.update({
-        "status": qual.get("status"),
-        "confidence": qual.get("confidence"),
-        "threshold": qual.get("threshold"),
-        "sub_scores": qual.get("sub_scores"),
-        "ci_resolution": qual.get("ci_resolution"),
-        "blocker": qual.get("blocker"),
-        "finalized_at": qual.get("finalized_at"),
-        # The candidate commit this qualification was evaluated against. Lets the
-        # operator UI detect when the latest release_audit's findings were computed
-        # against a different (older) commit than the version's evaluated candidate.
-        "candidate_sha": qual.get("candidate_sha"),
-        # Infra-failure context (populated only when status=infra_failure).
-        "error": qual.get("error"),
-        "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
-        # Audit observability: why the audit sub-score is missing/unscoreable.
-        "audit_missing_reason": qual.get("audit_missing_reason"),
-        # Audit reconciliation: model-reported vs findings-derived score delta
-        # and excluded findings count (populated by _compute_audit_reconciliation).
-        "audit_reconciliation": qual.get("audit_reconciliation"),
-    })
+    out.update(
+        {
+            "status": qual.get("status"),
+            "confidence": qual.get("confidence"),
+            "threshold": qual.get("threshold"),
+            "sub_scores": qual.get("sub_scores"),
+            "ci_resolution": qual.get("ci_resolution"),
+            "blocker": qual.get("blocker"),
+            "finalized_at": qual.get("finalized_at"),
+            # The candidate commit this qualification was evaluated against. Lets the
+            # operator UI detect when the latest release_audit's findings were computed
+            # against a different (older) commit than the version's evaluated candidate.
+            "candidate_sha": qual.get("candidate_sha"),
+            # Infra-failure context (populated only when status=infra_failure).
+            "error": qual.get("error"),
+            "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
+            # Audit observability: why the audit sub-score is missing/unscoreable.
+            "audit_missing_reason": qual.get("audit_missing_reason"),
+            # Audit reconciliation: model-reported vs findings-derived score delta
+            # and excluded findings count (populated by _compute_audit_reconciliation).
+            "audit_reconciliation": qual.get("audit_reconciliation"),
+        }
+    )
     return out
 
 
@@ -157,9 +160,7 @@ def _serialize_version_history_entry(
         "version_number": version.version_number,
         "status": version.status,
         "opened_at": version.opened_at.isoformat(),
-        "promoted_at": version.promoted_at.isoformat()
-        if version.promoted_at
-        else None,
+        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
         "qualification_attempts": version.qualification_attempts,
         "last_qualification": _format_qualification(version.last_qualification)
         if version.last_qualification
@@ -358,6 +359,7 @@ async def get_version_lifecycle(
     from app.release_version import (  # noqa: PLC0415
         count_merged_since,
         count_in_flight_tasks,
+        list_merged_tasks_for_version,
     )
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
@@ -377,7 +379,9 @@ async def get_version_lifecycle(
         project_row = (
             await session.execute(select(Project).where(Project.id == project_id))
         ).scalar_one_or_none()
-        _, promotion_policy_source, promotion_policy_error = _resolve_policy_with_provenance()
+        _, promotion_policy_source, promotion_policy_error = (
+            _resolve_policy_with_provenance()
+        )
 
         open_row = (
             (
@@ -421,10 +425,17 @@ async def get_version_lifecycle(
 
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
-            merged_count = await count_merged_since(session, project_id, open_row.opened_at)
+            merged_count = await count_merged_since(
+                session, project_id, open_row.opened_at
+            )
             in_flight_count = await count_in_flight_tasks(session, project_id)
+            tasks_merged = await list_merged_tasks_for_version(
+                session, project_id, open_row.opened_at
+            )
             qual = open_row.last_qualification or {}
-            aggregate_serving, artifact_evidence = _version_serving_summary(open_row, project_row)
+            aggregate_serving, artifact_evidence = _version_serving_summary(
+                open_row, project_row
+            )
             acceptance_aggregate = None
             if isinstance(qual, dict):
                 acceptance_aggregate = qual.get("acceptance_aggregate")
@@ -554,7 +565,13 @@ async def get_version_lifecycle(
                 # Out-of-band promotion provenance (nullable). Non-null only when an
                 # operator force-merged this version outside normal qualification flow.
                 # Degrades gracefully when the model column is absent on this branch.
-                "out_of_band_promotion": getattr(open_row, "out_of_band_promotion", None),
+                "out_of_band_promotion": getattr(
+                    open_row, "out_of_band_promotion", None
+                ),
+                # Per-task changelog for this version window: type, title, and PR
+                # number for each merged task, newest-first. Allows operators to see
+                # exactly what shipped without manual release notes.
+                "tasks_merged": tasks_merged,
             }
 
         history_rows = (
@@ -587,7 +604,8 @@ async def get_version_lifecycle(
         return {
             "current_version": current_version_out,
             "recent_versions": [
-                _serialize_version_history_entry(version, project_row) for version in history_rows
+                _serialize_version_history_entry(version, project_row)
+                for version in history_rows
             ],
             "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
             # Per-project live-promotion enablement. ``promotion_enabled_effective``
@@ -596,7 +614,9 @@ async def get_version_lifecycle(
             # is the explicit per-project value (None when the project rides the fleet
             # default), and ``promotion_enabled_source`` tells the operator which one
             # is in effect.
-            "promotion_enabled_effective": resolve_project_promotion_enabled(project_id),
+            "promotion_enabled_effective": resolve_project_promotion_enabled(
+                project_id
+            ),
             "promotion_enabled_override": promotion_enabled_by_project_map().get(
                 str(project_id)
             ),
@@ -685,7 +705,10 @@ async def set_version_phase(
     _qual_state = _release_version.summarize_qualification_state(
         open_ver.last_qualification
     )
-    if _qual_state and _qual_state.get("state") in _release_version.PROMOTION_BLOCKING_STATES:
+    if (
+        _qual_state
+        and _qual_state.get("state") in _release_version.PROMOTION_BLOCKING_STATES
+    ):
         if _qual_state.get("state") == "promotion_check_wait":
             detail = (
                 "a migration-carrying promotion PR is open and waiting for "
@@ -776,9 +799,7 @@ async def set_version_goal(
         )
 
     operator_id = current_user.get("email") or current_user["user_id"]
-    _release_version.set_version_goal(
-        open_ver, payload.goal, editor_id=operator_id
-    )
+    _release_version.set_version_goal(open_ver, payload.goal, editor_id=operator_id)
     session.add(open_ver)
     await session.commit()
     await session.refresh(open_ver)
@@ -1149,17 +1170,21 @@ async def clear_deploy_failed(
     version = None
     project_row = await session.get(Project, project_id)
     promoted_versions = (
-        await session.execute(
-            select(ReleaseVersion)
-            .options(selectinload(ReleaseVersion.deploy_artifacts))
-            .where(
-                ReleaseVersion.project_id == project_id,
-                ReleaseVersion.status == "promoted",
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "promoted",
+                )
+                .order_by(ReleaseVersion.promoted_at.desc())
+                .limit(20)
             )
-            .order_by(ReleaseVersion.promoted_at.desc())
-            .limit(20)
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for candidate in promoted_versions:
         aggregate, _ = _version_serving_summary(candidate, project_row)
         if (
