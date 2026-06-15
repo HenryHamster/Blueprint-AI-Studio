@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import type { JSX } from 'react';
+import { VersionSummaryPanel } from './VersionSummaryPanel';
 import {
   clearDeployFailed,
   cutVersion,
@@ -1015,7 +1016,7 @@ interface VersionLifecyclePanelProps {
   refreshing?: boolean;
 }
 
-function VersionSummaryPanel({ versionId }: { versionId: string }) {
+function VersionHistorySummary({ versionId }: { versionId: string }) {
   const [summary, setSummary] = useState<VersionSummaryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   // loading is derived: no data and no error yet
@@ -1045,6 +1046,7 @@ function VersionSummaryPanel({ versionId }: { versionId: string }) {
         {conf && thresh && <span>conf {conf} / thr {thresh}</span>}
         <span className="text-neutral-500">{summary.phase} · {summary.status}</span>
       </div>
+      <VersionSummaryPanel tasksMerged={summary.tasks_merged} />
     </div>
   );
 }
@@ -1676,6 +1678,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 <HistoricalAuditContext audit={cv.stale_audit} activeCandidateSha={cv.active_candidate_sha} />
               </div>
             )}
+            <VersionSummaryPanel tasksMerged={cv.tasks_merged} />
             {projectId && (
               <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
                 {cv.phase === 'build' ? (
@@ -1859,7 +1862,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
                     )}
                     <ArtifactEvidenceList artifacts={v.artifacts} />
-                    {isExpanded && v.id && <VersionSummaryPanel versionId={v.id} />}
+                    {isExpanded && v.id && <VersionHistorySummary versionId={v.id} />}
                   </div>
                 );
               })}

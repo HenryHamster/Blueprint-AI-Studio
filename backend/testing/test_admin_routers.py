@@ -16367,9 +16367,7 @@ class TestGetReleaseVersionSummary:
             "app.release_version.count_merged_since",
             new=AsyncMock(return_value=0),
         ):
-            resp = await client.get(
-                f"/api/admin/release-versions/{version.id}/summary"
-            )
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
 
         assert resp.status_code == 200, resp.text
         data = resp.json()
@@ -16428,9 +16426,7 @@ class TestGetReleaseVersionSummary:
             db_session.add(task)
         await db_session.commit()
 
-        resp = await client.get(
-            f"/api/admin/release-versions/{version.id}/summary"
-        )
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data["merged_count"] == 2
@@ -16466,9 +16462,7 @@ class TestGetReleaseVersionSummary:
             "app.release_version.count_merged_since",
             new=AsyncMock(return_value=5),
         ):
-            resp = await client.get(
-                f"/api/admin/release-versions/{version.id}/summary"
-            )
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
 
         assert resp.status_code == 200, resp.text
         data = resp.json()
@@ -16498,9 +16492,7 @@ class TestGetReleaseVersionSummary:
             "app.release_version.count_merged_since",
             new=AsyncMock(return_value=0),
         ):
-            resp = await client.get(
-                f"/api/admin/release-versions/{version.id}/summary"
-            )
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
 
         assert resp.status_code == 200, resp.text
         data = resp.json()
@@ -16527,9 +16519,7 @@ class TestGetReleaseVersionSummary:
             "app.release_version.count_merged_since",
             new=AsyncMock(return_value=0),
         ):
-            resp = await client.get(
-                f"/api/admin/release-versions/{version.id}/summary"
-            )
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
 
         assert resp.status_code == 200, resp.text
         agg = resp.json()["acceptance_aggregate"]
@@ -16562,9 +16552,7 @@ class TestGetReleaseVersionSummary:
             "app.release_version.count_merged_since",
             new=AsyncMock(return_value=3),
         ):
-            resp = await client.get(
-                f"/api/admin/release-versions/{version.id}/summary"
-            )
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
 
         assert resp.status_code == 200, resp.text
         data = resp.json()
@@ -16573,3 +16561,42 @@ class TestGetReleaseVersionSummary:
         assert "state" in qs
         assert data["highlights"]["qualification_confidence"] == 0.75
         assert data["highlights"]["qualification_threshold"] == 0.8
+
+    @pytest.mark.asyncio
+    async def test_summary_tasks_merged_included(self, client: AsyncClient, db_session):
+        """tasks_merged is a list with task_type, title, pr_number for each merged task."""
+        from app.landed_signal import mark_landed_on_integration
+
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        task = Task(
+            project_id=project.id,
+            title="feat: add changelog surface",
+            payloads=[{"type": "feat", "pr_number": 42}],
+            status=TaskStatus.COMPLETED,
+            context={},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(version)
+        await db_session.refresh(task)
+        mark_landed_on_integration(task)
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "tasks_merged" in data
+        tasks = data["tasks_merged"]
+        assert isinstance(tasks, list)
+        assert len(tasks) == 1
+        assert tasks[0]["title"] == "feat: add changelog surface"
+        assert tasks[0]["task_type"] == "feat"
+        assert tasks[0]["pr_number"] == 42

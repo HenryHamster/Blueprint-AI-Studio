@@ -1885,6 +1885,7 @@ export interface VersionSummaryResponse {
   served_sha: string | null;
   deploy_failure_reason: string | null;
   highlights: VersionSummaryHighlights;
+  tasks_merged?: ChangelogEntry[];
 }
 
 export async function fetchVersionSummary(versionId: string): Promise<VersionSummaryResponse> {

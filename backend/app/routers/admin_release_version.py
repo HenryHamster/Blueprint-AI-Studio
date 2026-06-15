@@ -1455,6 +1455,7 @@ async def get_release_version_summary(
     from app.release_version import (  # noqa: PLC0415
         count_merged_since,
         compute_version_acceptance_aggregate,
+        list_merged_tasks_for_version,
     )
 
     version = (
@@ -1475,6 +1476,9 @@ async def get_release_version_summary(
     # count_merged_since has no upper-bound filter, so for closed versions the
     # window is opened_at → now; acceptable for a summary headline.
     merged_count = await count_merged_since(
+        session, version.project_id, version.opened_at
+    )
+    tasks_merged = await list_merged_tasks_for_version(
         session, version.project_id, version.opened_at
     )
     acceptance_aggregate = await compute_version_acceptance_aggregate(
@@ -1543,4 +1547,7 @@ async def get_release_version_summary(
         "deploy_failure_reason": version.deploy_failure_reason,
         # Human-readable summary for display/CLI
         "highlights": highlights,
+        # Per-task changelog: type, title, and PR number for each merged task,
+        # newest-first. Allows operators and the CLI to see what shipped.
+        "tasks_merged": tasks_merged,
     }
