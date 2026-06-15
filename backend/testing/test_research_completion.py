@@ -3171,6 +3171,205 @@ async def test_dedup_deadlock_holds_direction_out_of_rotation_and_auto_recovers(
 
 
 @_pytest.mark.asyncio
+async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
+    """When a dedup deadlock fires, deadlock_filtered_titles is written on the direction.
+
+    The field collects titles from filtered_findings across the deadlocked history window
+    so the next research cycle's prompt can exclude them explicitly.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-dft-populate"
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-dft-old1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 2, "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
+            },
+            "filtered_findings": [
+                {"title": "Fix null pointer in auth handler", "reason": "hash match"},
+                {"title": "Add retry to payment service", "reason": "word overlap"},
+            ],
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-dft-old2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1, "word_overlap_dedup": 1,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
+            },
+            "filtered_findings": [
+                {"title": "Fix null pointer in auth handler", "reason": "hash match"},
+                {"title": "Remove unused import in models", "reason": "word overlap"},
+            ],
+            "summary": "no findings",
+        },
+    ]
+    direction = {
+        **_active_direction(direction_id, "Deadlock filtered titles test"),
+        "research_history": old_history,
+    }
+    project = _Project(
+        name="DFT Populate Test",
+        user_id="test-user-dft1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Third dedup-zero cycle with filtered findings — triggers deadlock
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        1,   # hash_dedup_count
+        0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+        filtered_findings=[
+            {"title": "Add config validation", "reason": "hash match",
+             "direction_id": direction_id},
+        ],
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", "direction should be paused"
+    dft = d.get("deadlock_filtered_titles")
+    assert dft is not None, "deadlock_filtered_titles must be set on deadlock"
+    assert isinstance(dft, list), "deadlock_filtered_titles must be a list"
+    # Should include titles from the history window (deduplicated)
+    assert "Fix null pointer in auth handler" in dft
+    assert "Add retry to payment service" in dft
+    assert "Remove unused import in models" in dft
+    # No duplicates
+    assert len(dft) == len(set(dft)), "deadlock_filtered_titles must not have duplicates"
+
+
+@_pytest.mark.asyncio
+async def test_dedup_deadlock_filtered_titles_cleared_on_productive_cycle(db_session):
+    """deadlock_filtered_titles is cleared when the next cycle creates tasks.
+
+    After a direction recovers from dedup deadlock and its next research cycle
+    successfully creates child tasks, the deadlock_filtered_titles field is removed.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+    from app.models import Task as _Task
+
+    direction_id = "d-dft-clear"
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-dft-c1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1, "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-dft-c2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1, "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+    ]
+    # Direction already has deadlock_filtered_titles from a prior deadlock
+    direction = {
+        **_active_direction(direction_id, "DFT clear test"),
+        "research_history": old_history,
+        "deadlock_filtered_titles": ["Old rejected title A", "Old rejected title B"],
+    }
+    project = _Project(
+        name="DFT Clear Test",
+        user_id="test-user-dft2",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Productive cycle: spawn a child task for this direction
+    child = _Task(
+        project_id=project.id,
+        task_type="create",
+        status=TaskStatus.QUEUED,
+        payloads=[{"prompt": "fix something", "base_branch": "main"}],
+        context={"direction_id": direction_id},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    from app.finding_deduplication import finding_hash, canonical_finding_body
+
+    finding = {"title": "New real fix", "description": "Actually new work",
+               "direction_id": direction_id, "type": "fix"}
+    fhash = finding_hash(finding["title"], canonical_finding_body(finding))
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [finding],     # findings
+        [child],       # child_tasks — productive cycle
+        [(0, finding, fhash)],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("deadlock_filtered_titles") is None, (
+        "deadlock_filtered_titles should be cleared when tasks are created"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_low_actionability_flag_off_preserves_legacy_drop_without_memo(
     db_session, mocker
 ):

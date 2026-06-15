@@ -1973,6 +1973,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             if agg_compact:
                 summary["history_aggregate"] = agg_compact
             if d.get("id") == current_dir_id:
+                # Inject rejected finding titles from the prior dedup-deadlock window
+                # so the agent does not re-propose them on recovery.
+                _dft = d.get("deadlock_filtered_titles")
+                if _dft:
+                    summary["deadlock_filtered_titles"] = _dft
                 # Current direction: last 3 cycles with numeric fields only
                 compact_history = [
                     {k: entry[k] for k in _HISTORY_NUMERIC_FIELDS if k in entry}

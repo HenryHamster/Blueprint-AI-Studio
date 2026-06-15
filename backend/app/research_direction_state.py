@@ -493,6 +493,10 @@ async def apply_post_spawn_state(
                         for ct in child_tasks
                         if (ct.context or {}).get("direction_id") == did
                     ]
+                    # Clear deadlock_filtered_titles when the cycle is productive so
+                    # we don't keep surfacing stale rejected titles after recovery.
+                    if len(dir_child_tasks) > 0 and d.get("deadlock_filtered_titles"):
+                        del d["deadlock_filtered_titles"]
                     # Compact history entry — just counters and a short summary.
                     # Full details available via task API using task_id.
                     titles = finding_titles_by_dir.get(did, [])[:3]
@@ -666,6 +670,22 @@ async def apply_post_spawn_state(
                             f"[RESEARCH] Auto-paused direction {did} (dedup_deadlock, "
                             f"{_consec} consecutive empty cycles, task {task.id})"
                         )
+                        # Collect rejected finding titles from the deadlocked window so
+                        # the next research cycle's prompt can exclude them explicitly.
+                        _dft_seen: set = set()
+                        _dft: list = []
+                        for _he in d["research_history"][-_consec:]:
+                            for _ff in _he.get("filtered_findings") or []:
+                                _t = (_ff.get("title") or "").strip()
+                                if _t and _t not in _dft_seen:
+                                    _dft_seen.add(_t)
+                                    _dft.append(_t)
+                                    if len(_dft) >= 15:
+                                        break
+                            if len(_dft) >= 15:
+                                break
+                        if _dft:
+                            d["deadlock_filtered_titles"] = _dft
 
                     # Already-fixed deadlock detection: check prior completed cycles
                     # (exclude the just-added entry — its children haven't resolved yet).
@@ -864,6 +884,10 @@ async def apply_post_spawn_state(
                 for fresh_d in dirs:
                     snap = _dir_mutations.get(fresh_d.get("id"))
                     if snap is not None:
+                        # Remove keys deleted in the in-memory snapshot (e.g.
+                        # deadlock_filtered_titles cleared on productive cycles).
+                        for k in [k for k in list(fresh_d) if k not in snap]:
+                            del fresh_d[k]
                         fresh_d.update(snap)
 
             await with_directions_locked(

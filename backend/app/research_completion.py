@@ -2823,6 +2823,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             TaskStatus.IN_PROGRESS,
                             TaskStatus.EVALUATING,
                             TaskStatus.PROVISIONING,
+                            # A BLOCKED task is in-flight work waiting for a precondition
+                            # to be met — dedup against it so we don't re-spawn a
+                            # near-duplicate of work that's waiting on prerequisites.
+                            TaskStatus.BLOCKED,
                             # A PARKED task is in-flight work that deterministically
                             # resumes on its wake — dedup against it so we don't
                             # re-spawn a near-duplicate of work that's merely parked.
