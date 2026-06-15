@@ -37,7 +37,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
-from blueprint_api import api, get_project_id, load_config
+from blueprint_api import APIError, api, get_project_id, load_config
 
 SERVICE_NAME = os.environ.get("BLUEPRINT_GCP_SERVICE", "blueprint-orchestrator")
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "blueprint-orchestrator")
@@ -926,7 +926,8 @@ def cmd_logs(args: argparse.Namespace) -> None:
     """Tail / search / fetch Cloud Run logs (errors, tail, search, task)."""
     sub = getattr(args, "logs_cmd", None)
     if not sub:
-        print("Usage: blueprint logs {tail|errors|search|task} ...", file=sys.stderr)
+        print("Error: a subcommand is required (tail|errors|search|task). "
+              "Run `blueprint logs --help` for options.", file=sys.stderr)
         sys.exit(1)
 
     minutes = getattr(args, "minutes", None)
@@ -997,6 +998,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="blueprint",
         description="Unified Blueprint operator CLI (status/diagnostics/tasks/"
                     "versions/promote-recover/logs).",
+        epilog="Auth: set BLUEPRINT_API_KEY + BLUEPRINT_API_URL env vars, or place "
+               "~/.blueprint-config.json (keys: api_url, api_key), or run "
+               "`gcloud auth login` to auto-bootstrap.",
         parents=[common],
     )
     sub = parser.add_subparsers(dest="command")
@@ -1010,7 +1014,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Stuck tasks, circuit breakers, and grouped failure modes.")
 
     # tasks
-    p_tasks = sub.add_parser("tasks", parents=[common], help="List or show tasks.")
+    p_tasks = sub.add_parser("tasks", parents=[common], help="List or show tasks.",
+                             description="List, filter, show, cancel, or requeue tasks. "
+                                         "Defaults to `list` when no subcommand is given.")
     tasks_sub = p_tasks.add_subparsers(dest="tasks_cmd")
     p_tasks_list = tasks_sub.add_parser("list", parents=[common], help="List/filter tasks.")
     p_tasks_list.add_argument("--status", help="Filter by task status (e.g. IN_PROGRESS).")
@@ -1050,7 +1056,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # versions
     p_versions = sub.add_parser("versions", parents=[common],
-                                help="List release versions or show a summary.")
+                                help="List release versions or show a summary.",
+                                description="List release versions or show a detailed summary "
+                                            "for a specific version.")
     versions_sub = p_versions.add_subparsers(dest="versions_cmd")
     versions_sub.add_parser("list", parents=[common], help="List current + recent versions.")
     p_versions_show = versions_sub.add_parser("show", parents=[common],
@@ -1071,7 +1079,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Force clear-deploy-failed when serving SHA is unobservable.")
 
     # logs
-    p_logs = sub.add_parser("logs", parents=[common], help="Read Cloud Run logs via gcloud.")
+    p_logs = sub.add_parser("logs", parents=[common], help="Read Cloud Run logs via gcloud.",
+                            description="Read Cloud Run logs via gcloud. Requires "
+                                        "`gcloud auth login`. Subcommands: errors (recent errors), "
+                                        "tail (recent logs), search (grep by pattern), "
+                                        "task (grep by task id).")
     logs_sub = p_logs.add_subparsers(dest="logs_cmd")
 
     def _add_log_common(p):
@@ -1118,7 +1130,10 @@ def main(argv: list | None = None) -> int:
         parser.print_help()
         return 1
     handler = _DISPATCH[args.command]
-    handler(args)
+    try:
+        handler(args)
+    except APIError:
+        return 1
     return 0
 
 

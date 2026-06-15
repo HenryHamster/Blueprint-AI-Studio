@@ -4,7 +4,10 @@ Verifies the argparse tree parses (every subcommand exposes --help), that the
 module imports cleanly, and that --json emits valid JSON for a read command —
 all with blueprint_api.api mocked so no network/credentials are needed.
 """
+import io
 import json
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -559,6 +562,115 @@ def test_tasks_tree_no_children(monkeypatch, capsys):
     assert "no children" in out
 
 
+def test_tasks_list_http_404_is_clean(monkeypatch, capsys):
+    """Non-200 API responses print a clean error to stderr and return 1, no traceback."""
+    def fake_urlopen(req, timeout=30):
+        raise urllib.error.HTTPError(
+            url="http://example.com/api/admin/tasks",
+            code=404,
+            msg="Not Found",
+            hdrs={},
+            fp=io.BytesIO(b"tasks not found"),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "http://example.com", "api_key": "test-key"})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["tasks", "list"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "404" in err
+    assert "Traceback" not in err
+
+
+def test_api_401_prints_credential_guidance(monkeypatch, capsys):
+    """401 responses print credential-specific guidance before the generic error line."""
+    def fake_urlopen(req, timeout=30):
+        raise urllib.error.HTTPError(
+            url="http://example.com/api/admin/tasks",
+            code=401,
+            msg="Unauthorized",
+            hdrs={},
+            fp=io.BytesIO(b"unauthorized"),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "http://example.com", "api_key": "test-key"})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["tasks", "list"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "401" in err
+    assert "expired" in err
+
+
+def test_network_error_is_clean(monkeypatch, capsys):
+    """Network failures print a clean 'cannot reach' message and return 1."""
+    def fake_urlopen(req, timeout=30):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "http://example.com", "api_key": "test-key"})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["tasks", "list"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "cannot reach" in err
+    assert "Traceback" not in err
+
+
+def test_api_403_read_only_prints_guidance(monkeypatch, capsys):
+    """403 responses with a read-only config print specific admin-credential guidance."""
+    def fake_urlopen(req, timeout=30):
+        raise urllib.error.HTTPError(
+            url="http://example.com/api/admin/tasks",
+            code=403,
+            msg="Forbidden",
+            hdrs={},
+            fp=io.BytesIO(b"forbidden"),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "http://example.com", "api_key": "agent-token", "read_only": True
+    })
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["tasks", "list"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "403" in err
+    assert "read-only" in err
+
+
+def test_status_degrades_gracefully_on_real_http_error(monkeypatch, capsys):
+    """_safe_read catches APIError from real api() so status degrades gracefully on HTTP errors."""
+    call_count = [0]
+
+    def fake_urlopen(req, timeout=30):
+        call_count[0] += 1
+        if "/admin/state" in req.full_url:
+            raise urllib.error.HTTPError(
+                url=req.full_url,
+                code=500,
+                msg="Internal Server Error",
+                hdrs={},
+                fp=io.BytesIO(b"server error"),
+            )
+        buf = io.BytesIO(b"{}")
+        buf.__enter__ = lambda s: s
+        buf.__exit__ = lambda s, *a: None
+        return buf
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "http://example.com", "api_key": "test-key"})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["--json", "status"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "state" in parsed["errors"]
+    assert "500" in parsed["errors"]["state"]
+
+
 def test_versions_show_current_includes_changelog(mock_api, capsys):
     """versions show for the open version renders the changelog grouped by task type."""
     rc = blueprint.main(["versions", "show"])
@@ -718,3 +830,39 @@ def test_tasks_failures_empty(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "No failed tasks." in out
+
+
+# ── help text and output formatting polish ────────────────────────────────────
+
+def test_tasks_help_has_description():
+    parser = blueprint.build_parser()
+    tasks_parser = next(
+        p for p in parser._subparsers._group_actions[0].choices.values()
+        if p.prog == "blueprint tasks"
+    )
+    assert tasks_parser.description is not None
+    assert "list" in tasks_parser.description.lower()
+
+
+def test_versions_help_has_description():
+    parser = blueprint.build_parser()
+    versions_parser = next(
+        p for p in parser._subparsers._group_actions[0].choices.values()
+        if p.prog == "blueprint versions"
+    )
+    assert versions_parser.description is not None
+    assert "version" in versions_parser.description.lower()
+
+
+def test_logs_no_subcommand_message(capsys):
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["logs"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "--help" in captured.err
+
+
+def test_top_level_help_has_auth_epilog():
+    parser = blueprint.build_parser()
+    assert parser.epilog is not None
+    assert "BLUEPRINT_API_KEY" in parser.epilog
