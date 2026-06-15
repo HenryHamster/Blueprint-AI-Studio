@@ -33,6 +33,14 @@ _BUILD_STALL_MERGED_TASKS = 40
 _STABILIZE_STALL_AGE_DAYS = 14
 _STABILIZE_STALL_MERGED_TASKS = 40
 
+# How long a managed_check_wait promotion PR may be pending before a stall alert
+# fires.  Migration-carrying PRs skip GitHub native auto-merge; the reconciler
+# polls CI instead.  A much shorter threshold (20 min) is appropriate because a
+# green-but-unmerged migration promotion is a hard operator-visible blocker.
+_MANAGED_CHECK_WAIT_STALL_SECONDS = 20 * 60
+_MANAGED_CHECK_WAIT_REALERT_INTERVAL_SECONDS = 20 * 60
+_MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS = 2 * 3600
+
 # How long a promotion PR may await auto-merge before the stall alert fires.
 _AUTO_MERGE_STALL_SECONDS = 4 * 3600
 
@@ -526,6 +534,11 @@ async def _check_version_auto_merge_stall(
     if not pending:
         return False
 
+    # managed_check_wait promotions are handled by _check_version_managed_check_wait_stall
+    # which uses a much shorter threshold appropriate for migration-carrying PRs.
+    if pending.get("managed_check_wait"):
+        return False
+
     enabled_at_str = pending.get("enabled_at")
     if not enabled_at_str:
         return False
@@ -630,6 +643,109 @@ async def _check_version_auto_merge_stall(
         pr_number,
         age_hours,
         "enabled" if auto_merge_enabled else "NOT confirmed enabled",
+    )
+    return True
+
+
+async def _check_version_managed_check_wait_stall(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Alert when a managed_check_wait promotion PR has been pending too long.
+
+    Migration-carrying PRs skip GitHub native auto-merge and instead wait for
+    CI to go green before the reconciler merges them directly.  A green-but-stuck
+    promotion in this sub-state is a hard operator-visible blocker, so we fire
+    much earlier than the native auto-merge stall alert (20 min vs 4 h) and
+    re-fire on the same cadence until resolved.
+    """
+    if version.status != "open":
+        return False
+
+    qual = version.last_qualification or {}
+    if qual.get("status") != "pending":
+        return False
+
+    pending = qual.get("promotion_pending")
+    if not pending or not pending.get("managed_check_wait"):
+        return False
+
+    enabled_at_str = pending.get("enabled_at")
+    if not enabled_at_str:
+        return False
+
+    try:
+        enabled_at = datetime.fromisoformat(enabled_at_str)
+    except (ValueError, TypeError):
+        return False
+
+    now = _utcnow()
+    age_seconds = (now - enabled_at).total_seconds()
+    if age_seconds < _MANAGED_CHECK_WAIT_STALL_SECONDS:
+        return False
+
+    last_alerted_str = pending.get("mcw_last_alerted_at")
+    if last_alerted_str:
+        try:
+            last_alerted = datetime.fromisoformat(last_alerted_str)
+        except (ValueError, TypeError):
+            last_alerted = None
+        if (
+            last_alerted is not None
+            and (now - last_alerted).total_seconds()
+            < _MANAGED_CHECK_WAIT_REALERT_INTERVAL_SECONDS
+        ):
+            return False
+
+    pr_number = pending.get("pr_number")
+    pr_url = pending.get("pr_url") or ""
+    age_minutes = int(age_seconds // 60)
+    ci_state = pending.get("ci_state", "unknown")
+
+    critical = age_seconds >= _MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS
+    severity = AlertSeverity.ERROR if critical else AlertSeverity.WARNING
+    severity_note = (
+        f" This has now exceeded {_MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS // 3600}h"
+        " — manual intervention is likely required."
+        if critical
+        else ""
+    )
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=severity,
+            title=(
+                f"Release v{version.version_number} managed_check_wait promotion stalled"
+            ),
+            message=(
+                f"Release v{version.version_number} migration-carrying promotion PR "
+                f"#{pr_number} has been in managed_check_wait for {age_minutes}m "
+                f"(CI state: {ci_state}). The reconciler merges this PR once CI is "
+                f"green — check the PR for stuck or failing checks: {pr_url}{severity_note}"
+            ),
+        )
+    )
+
+    new_qual = dict(qual)
+    new_pending = dict(pending)
+    now_iso = now.isoformat()
+    new_pending.setdefault("mcw_alerted_at", now_iso)
+    new_pending["mcw_last_alerted_at"] = now_iso
+    new_pending["mcw_alert_count"] = int(new_pending.get("mcw_alert_count") or 0) + 1
+    new_qual["promotion_pending"] = new_pending
+    version.last_qualification = new_qual
+    session.add(version)
+
+    logger.warning(
+        "[RELEASE_QUALIFIER] managed_check_wait stall alert (%s, #%d) for v%d: "
+        "PR #%s pending %dm (ci_state=%s)",
+        "ERROR" if critical else "WARNING",
+        new_pending["mcw_alert_count"],
+        version.version_number,
+        pr_number,
+        age_minutes,
+        ci_state,
     )
     return True
 

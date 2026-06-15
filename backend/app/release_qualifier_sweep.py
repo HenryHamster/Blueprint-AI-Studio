@@ -42,6 +42,7 @@ from app.release_stall_alerts import (
     _check_version_build_stall,
     _check_version_calcification,
     _check_version_ci_unresolved_stall,
+    _check_version_managed_check_wait_stall,
     _check_version_promotion_readiness,
     _check_version_stabilize_stall,
 )
@@ -703,6 +704,10 @@ async def sweep_stuck_qualifications(
                 )
                 alerted = (
                     await _check_version_auto_merge_stall(alert_session, v) or alerted
+                )
+                alerted = (
+                    await _check_version_managed_check_wait_stall(alert_session, v)
+                    or alerted
                 )
                 if alerted:
                     await alert_session.commit()
