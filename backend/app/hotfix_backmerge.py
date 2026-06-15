@@ -71,6 +71,7 @@ from app.broadcast import broadcast_to_project
 # safe — no circular import.  _resolve_github_with_session is the shared
 # credential resolver used by the whole LTS machinery.
 from app.release_qualifier import _lts_branch_names, _resolve_github_with_session
+from app.size_limit_policy import _is_chronic_offender, parse_bump_history
 from app.models import (
     Alert,
     AlertSeverity,
@@ -168,7 +169,7 @@ def _map_pr_file_to_section(filename: str) -> tuple[str, str] | None:
     """
     for prefix, section in _FILE_PREFIX_MAP:
         if filename.startswith(prefix):
-            return section, filename[len(prefix):]
+            return section, filename[len(prefix) :]
     return None
 
 
@@ -206,14 +207,20 @@ async def _check_module_size_violations(
         if cap is None:
             continue
         text = await github.get_file_text_at_ref(
-            filename, token=token, owner=owner, repo=repo, ref=ref,
+            filename,
+            token=token,
+            owner=owner,
+            repo=repo,
+            ref=ref,
             project_id=str(project_id),
         )
         if text is None:
             continue
         count = len(text.splitlines())
         if count > cap:
-            violations.append({"section": section, "rel": rel, "count": count, "cap": cap})
+            violations.append(
+                {"section": section, "rel": rel, "count": count, "cap": cap}
+            )
     return violations
 
 
@@ -226,22 +233,67 @@ async def _emit_size_violation_alerts(
     *,
     project: Project | None = None,
 ) -> None:
-    """Emit a deduped WARNING Alert for each module size violation.
+    """Emit a deduped Alert for each module size violation.
 
-    The alert title encodes the violation in 100-line buckets so the same
-    alert is not re-emitted on every periodic back-merge cycle, but a new
-    alert fires when the module grows into the next 100-line bucket.
+    First-time breaches produce a WARNING.  Modules that have been bumped
+    repeatedly (chronic offenders per ``_is_chronic_offender``) produce an
+    ERROR with a decomposition-required message instead of the advisory WARNING.
+
+    For WARNING alerts the title encodes the violation in 100-line buckets so
+    the same alert is not re-emitted on every periodic back-merge cycle, but a
+    new alert fires when the module grows into the next bucket.  For chronic
+    ERROR alerts the title is stable (no bucket) so the dedup is project-wide
+    and persistent until dismissed.
     """
     for v in violations:
         section = v["section"]
         rel = v["rel"]
         count = v["count"]
         cap = v["cap"]
-        bucket = (count // 100) * 100
-        alert_title = (
-            f"Module size violation in back-merge: {section}/{rel} "
-            f"(~{bucket} lines, cap {cap})"
-        )
+
+        # Advisory bump-history lookup — never blocks the alert path.
+        try:
+            history = parse_bump_history(rel, section)
+            chronic = _is_chronic_offender(history)
+        except Exception:  # noqa: BLE001
+            history = []
+            chronic = False
+
+        trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
+
+        if chronic:
+            bump_count = len(history)
+            first_cap = history[0]["old_cap"] if history else cap
+            growth_pct = (
+                round((cap - first_cap) / first_cap * 100) if first_cap > 0 else 0
+            )
+            alert_title = (
+                f"Chronic size offender: {section}/{rel} (decomposition required)"
+            )
+            alert_message = (
+                f"`{rel}` ({section}) has been bumped {bump_count} times "
+                f"(cap grew from {first_cap} → {cap}, +{growth_pct}%). "
+                f"This module requires DECOMPOSITION, not another cap bump. "
+                f"Back-merge PR #{pr_number}{trigger_clause} detected the latest "
+                f"violation ({count} lines, cap {cap}). "
+                f"Do not bump the cap without operator approval."
+            )
+            severity = AlertSeverity.ERROR
+        else:
+            bucket = (count // 100) * 100
+            alert_title = (
+                f"Module size violation in back-merge: {section}/{rel} "
+                f"(~{bucket} lines, cap {cap})"
+            )
+            alert_message = (
+                f"Back-merge PR #{pr_number}{trigger_clause} includes `{rel}` "
+                f"({section}) at approximately {bucket}+ lines, exceeding its "
+                f"{cap}-line cap. Consider (a) decomposing `{rel}` into smaller "
+                f"modules or (b) bumping the cap in module_size_limits.json with "
+                f"justification. The back-merge proceeded normally."
+            )
+            severity = AlertSeverity.WARNING
+
         existing = (
             (
                 await session.execute(
@@ -262,31 +314,37 @@ async def _emit_size_violation_alerts(
                 rel,
             )
             continue
-        trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
+
         alert = Alert(
             project_id=project_id,
-            severity=AlertSeverity.WARNING,
+            severity=severity,
             title=alert_title,
-            message=(
-                f"Back-merge PR #{pr_number}{trigger_clause} includes `{rel}` "
-                f"({section}) at approximately {bucket}+ lines, exceeding its "
-                f"{cap}-line cap. Consider (a) decomposing `{rel}` into smaller "
-                f"modules or (b) bumping the cap in module_size_limits.json with "
-                f"justification. The back-merge proceeded normally."
-            ),
+            message=alert_message,
         )
         session.add(alert)
         await session.flush()
         await _broadcast_alert(project_id, alert)
-        logger.warning(
-            "[BACKMERGE] size violation: %s/%s has %d lines (cap %d) "
-            "in back-merge PR #%s",
-            section,
-            rel,
-            count,
-            cap,
-            pr_number,
-        )
+        if chronic:
+            logger.warning(
+                "[BACKMERGE] chronic size offender: %s/%s has %d lines (cap %d) "
+                "— bumped %d times; decomposition required (back-merge PR #%s)",
+                section,
+                rel,
+                count,
+                cap,
+                len(history),
+                pr_number,
+            )
+        else:
+            logger.warning(
+                "[BACKMERGE] size violation: %s/%s has %d lines (cap %d) "
+                "in back-merge PR #%s",
+                section,
+                rel,
+                count,
+                cap,
+                pr_number,
+            )
 
 
 async def reconcile_main_into_automain(
@@ -808,11 +866,7 @@ async def _resolution_task_already_open(
     # this list, so — unlike the prior version — terminal rows are NOT pre-
     # filtered at the DB level.
     rows = (
-        (
-            await session.execute(
-                select(Task).where(Task.project_id == project_id)
-            )
-        )
+        (await session.execute(select(Task).where(Task.project_id == project_id)))
         .scalars()
         .all()
     )
@@ -840,9 +894,7 @@ async def _resolution_task_already_open(
         and task.created_at >= cutoff
     ]
     for task in recent_terminal:
-        if await _resolver_pr_still_open(
-            session, task, project_id, token, owner, repo
-        ):
+        if await _resolver_pr_still_open(session, task, project_id, token, owner, repo):
             return True
     return False
 
@@ -872,13 +924,17 @@ async def _resolver_pr_still_open(
         CLOSED-unmerged (a fresh respawn is legitimate).
     """
     artifact = (
-        await session.execute(
-            select(Artifact).where(
-                Artifact.task_id == task.id,
-                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+        (
+            await session.execute(
+                select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
             )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if artifact is None or not artifact.pr_url:
         # No resolution PR recorded — the prior resolver never opened one, so it
         # genuinely failed; a respawn is legitimate.
