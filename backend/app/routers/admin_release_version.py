@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import uuid
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
@@ -26,6 +27,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.release_artifacts import version_serving_summary as _version_serving_summary
+from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
 from app import compute as _compute
 from app.digest_cache import DigestCache
@@ -178,6 +180,31 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
         }
     )
     return out
+
+
+def _closed_version_until(version: ReleaseVersion) -> Optional[datetime]:
+    """Return the upper-bound timestamp for a closed version's merged-task window.
+
+    For promoted versions returns ``promoted_at``.  For abandoned versions
+    returns the ``abandoned_at`` ISO string stored in ``last_qualification``.
+    Returns ``None`` for open versions (unbounded window).
+    """
+    if version.status == "promoted" and version.promoted_at is not None:
+        return version.promoted_at
+    if version.status == "abandoned":
+        lq = version.last_qualification or {}
+        raw = lq.get("abandoned_at")
+        if isinstance(raw, str):
+            try:
+                # _coerce_naive_utc converts any stored offset (including a
+                # 'Z'-suffix from a tz-aware writer) to naive UTC rather than
+                # dropping it, keeping the window bound consistent with the
+                # naive-UTC timestamps the merged-task queries compare against.
+                return _coerce_naive_utc(datetime.fromisoformat(raw))
+            except (ValueError, TypeError):
+                pass
+    return None
+
 
 
 def _serialize_version_history_entry(
@@ -1505,16 +1532,17 @@ async def get_release_version_summary(
         version.project_id, current_user["user_id"], session, min_role="viewer"
     )
 
-    # count_merged_since has no upper-bound filter, so for closed versions the
-    # window is opened_at → now; acceptable for a summary headline.
+    # Bound closed versions to their own span so tasks that merged in a later
+    # version are not counted here.  Open versions have no upper bound (until=None).
+    version_until = _closed_version_until(version)
     merged_count = await count_merged_since(
-        session, version.project_id, version.opened_at
+        session, version.project_id, version.opened_at, until=version_until
     )
     tasks_merged = await list_merged_tasks_for_version(
-        session, version.project_id, version.opened_at
+        session, version.project_id, version.opened_at, until=version_until
     )
     acceptance_aggregate = await compute_version_acceptance_aggregate(
-        session, version.project_id, since=version.opened_at
+        session, version.project_id, since=version.opened_at, until=version_until
     )
 
     aggregate_serving, artifacts = _version_serving_summary(version, project)

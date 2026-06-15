@@ -16767,6 +16767,110 @@ class TestGetReleaseVersionSummary:
         assert data["highlights"]["headline"] == "abandoned"
 
     @pytest.mark.asyncio
+    async def test_summary_promoted_version_excludes_tasks_merged_after_promotion(
+        self, client: AsyncClient, db_session
+    ):
+        """A promoted version's merged_count / tasks_merged / acceptance_aggregate
+        exclude tasks that landed AFTER promoted_at — those belong to the next
+        version and must not be double-counted (until=promoted_at upper bound)."""
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        opened_at = _utcnow() - timedelta(hours=3)
+        promoted_at = _utcnow() - timedelta(hours=1)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=opened_at,
+            promoted_at=promoted_at,
+            promoted_sha="abc1234",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Landed inside the version span (before promotion) — counted.
+        inside = Task(
+            project_id=project.id,
+            title="in-span task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            created_at=promoted_at - timedelta(minutes=30),
+            updated_at=promoted_at - timedelta(minutes=30),
+        )
+        # Landed after promotion (belongs to the next version) — excluded.
+        after = Task(
+            project_id=project.id,
+            title="post-promotion task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            created_at=promoted_at + timedelta(minutes=30),
+            updated_at=promoted_at + timedelta(minutes=30),
+        )
+        db_session.add_all([inside, after])
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["merged_count"] == 1, "post-promotion task must be excluded"
+        assert data["acceptance_aggregate"]["total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_summary_abandoned_version_excludes_tasks_merged_after_abandonment(
+        self, client: AsyncClient, db_session
+    ):
+        """An abandoned version bounds its window by last_qualification.abandoned_at,
+        excluding tasks that landed after the version was abandoned."""
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        opened_at = _utcnow() - timedelta(hours=3)
+        abandoned_at = _utcnow() - timedelta(hours=1)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="abandoned",
+            opened_at=opened_at,
+            last_qualification={"abandoned_at": abandoned_at.isoformat()},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        inside = Task(
+            project_id=project.id,
+            title="in-span task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            created_at=abandoned_at - timedelta(minutes=30),
+            updated_at=abandoned_at - timedelta(minutes=30),
+        )
+        after = Task(
+            project_id=project.id,
+            title="post-abandon task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            created_at=abandoned_at + timedelta(minutes=30),
+            updated_at=abandoned_at + timedelta(minutes=30),
+        )
+        db_session.add_all([inside, after])
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["merged_count"] == 1, "post-abandonment task must be excluded"
+        assert data["acceptance_aggregate"]["total"] == 1
+
+    @pytest.mark.asyncio
     async def test_summary_acceptance_aggregate_buckets_present(
         self, client: AsyncClient, db_session
     ):
@@ -16867,6 +16971,76 @@ class TestGetReleaseVersionSummary:
         assert tasks[0]["title"] == "feat: add changelog surface"
         assert tasks[0]["task_type"] == "feat"
         assert tasks[0]["pr_number"] == 42
+
+    @pytest.mark.asyncio
+    async def test_summary_abandoned_version_malformed_abandoned_at_falls_back_unbounded(
+        self, client: AsyncClient, db_session
+    ):
+        """An abandoned version with a malformed abandoned_at ISO string in
+        last_qualification degrades gracefully to an unbounded window (returns
+        200, not 500).  The except (ValueError, TypeError) branch in
+        _closed_version_until must return None rather than raising."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="abandoned",
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification={"abandoned_at": "not-a-date"},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.asyncio
+    async def test_summary_abandoned_version_missing_abandoned_at_falls_back_unbounded(
+        self, client: AsyncClient, db_session
+    ):
+        """An abandoned version with no abandoned_at key in last_qualification
+        returns 200 and falls back to an unbounded merged-task window."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="abandoned",
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification={},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.asyncio
+    async def test_summary_promoted_version_null_promoted_at_falls_back_unbounded(
+        self, client: AsyncClient, db_session
+    ):
+        """A promoted version with promoted_at=None degrades to an unbounded
+        merged-task window (returns 200, not 500).  _closed_version_until must
+        return None rather than raising when promoted_at is absent."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            promoted_at=None,
+            promoted_sha="abc1234",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
 
     @pytest.mark.asyncio
     async def test_release_version_summary_headline_uses_aggregate_serving(

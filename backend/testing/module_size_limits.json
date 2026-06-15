@@ -98,7 +98,8 @@
     "review_fix_lane_pilot.py": 2100,
     "routers/admin_projects.py": 1750,
     "recovery_evaluating.py": 2950,
-    "recovery_post_commit.py": 1900
+    "recovery_post_commit.py": 1900,
+    "release_version.py": 1750
   },
   "agent": {
     "index.ts": 4600,

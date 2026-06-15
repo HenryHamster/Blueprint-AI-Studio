@@ -22,12 +22,14 @@ Public API:
       resolve the project's configured deploy branch explicitly.
       Idempotent: no-op if any version row already exists.  Caller must commit.
 
-  count_merged_since(session, project_id, since)
+  count_merged_since(session, project_id, since, until=None)
       Count tasks whose PR was merged after ``since`` for a project.
+      Optional ``until`` closes the upper bound (for closed versions).
 
-  compute_version_acceptance_aggregate(session, project_id, *, since)
+  compute_version_acceptance_aggregate(session, project_id, *, since, until=None)
       Classify merged-since tasks by acceptance-evidence outcome
       using the canonical acceptance aggregate buckets.
+      Optional ``until`` closes the upper bound (for closed versions).
 
   recent_closed_versions(session, project_id, limit=5)
       Return the most recently closed/promoted versions for a project,
@@ -265,6 +267,7 @@ async def count_merged_since(
     session: AsyncSession,
     project_id: uuid.UUID,
     since: datetime,
+    until: datetime | None = None,
 ) -> int:
     """Count tasks for ``project_id`` whose PR was merged at or after ``since``.
 
@@ -275,35 +278,54 @@ async def count_merged_since(
     ``status_log`` when available, with ``created_at`` as the legacy fallback.
     That keeps post-terminal writes (for example consumption-proof updates to
     a merged producer task) from re-opening the version window.
+
+    ``until`` (optional) closes the upper bound — tasks whose stable terminal
+    timestamp is strictly after ``until`` are excluded.  Used to bound closed
+    (promoted/abandoned) versions to their own span so tasks that merged in
+    later versions are not double-counted.
     """
+    filters = [
+        Task.project_id == project_id,
+        Task.status == TaskStatus.COMPLETED,
+        landed_signal_predicate(session),
+        Task.updated_at >= since,
+    ]
     stmt = (
         select(Task)
         .options(load_only(Task.id, Task.status_log, Task.created_at, raiseload=True))
-        .where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            landed_signal_predicate(session),
-            Task.updated_at >= since,
-        )
+        .where(*filters)
     )
     rows = (await session.execute(stmt)).scalars().all()
-    return sum(1 for task in rows if _task_completed_at(task) >= since)
+    return sum(
+        1
+        for task in rows
+        if _task_completed_at(task) >= since
+        and (until is None or _task_completed_at(task) <= until)
+    )
 
 
 async def list_merged_tasks_for_version(
     session: AsyncSession,
     project_id: uuid.UUID,
     since: datetime,
+    until: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """List tasks merged in the version window, newest-completion-first.
 
     Operates over the same predicate as :func:`count_merged_since` —
     ``COMPLETED`` tasks carrying the canonical landing signal whose stable
-    terminal timestamp is at or after ``since``.
+    terminal timestamp is at or after ``since`` (and at or before ``until``
+    when supplied).
 
     Returns a list of dicts with ``task_type``, ``title``, and ``pr_number``
     per landed task.  Empty when no tasks have merged in the window.
     """
+    filters = [
+        Task.project_id == project_id,
+        Task.status == TaskStatus.COMPLETED,
+        landed_signal_predicate(session),
+        Task.updated_at >= since,
+    ]
     stmt = (
         select(Task)
         .options(
@@ -316,18 +338,15 @@ async def list_merged_tasks_for_version(
                 raiseload=True,
             )
         )
-        .where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            landed_signal_predicate(session),
-            Task.updated_at >= since,
-        )
+        .where(*filters)
     )
     rows = (await session.execute(stmt)).scalars().all()
     entries: list[tuple[datetime, dict[str, Any]]] = []
     for task in rows:
         completed_at = _task_completed_at(task)
         if completed_at < since:
+            continue
+        if until is not None and completed_at > until:
             continue
         payload = task.first_payload
         entries.append(
@@ -349,13 +368,15 @@ async def compute_version_acceptance_aggregate(
     project_id: uuid.UUID,
     *,
     since: datetime,
+    until: datetime | None = None,
 ) -> dict[str, int]:
     """Classify version-window merged tasks by acceptance-evidence outcome.
 
     Operates over the same merged-since window as :func:`count_merged_since`
     (``COMPLETED`` tasks carrying the canonical landing signal whose stable
-    terminal timestamp is at or after ``since``).  For each landed task it
-    reads the durable ``Task.context`` and delegates to
+    terminal timestamp is at or after ``since``, and at or before ``until``
+    when supplied).  For each landed task it reads the durable ``Task.context``
+    and delegates to
     :func:`app.acceptance_gate.classify_merged_acceptance_context`, so the
     version-window aggregate uses the same bucket vocabulary as the Task-object
     classifier used by final qualification storage.
@@ -364,16 +385,18 @@ async def compute_version_acceptance_aggregate(
     recorded verdict is surfaced as ``malformed`` for visibility, but readiness
     treats it as advisory only.
     """
-    stmt = select(Task).where(
+    filters = [
         Task.project_id == project_id,
         Task.status == TaskStatus.COMPLETED,
         landed_signal_predicate(session),
         Task.updated_at >= since,
-    )
+    ]
+    stmt = select(Task).where(*filters)
     rows = [
         task
         for task in (await session.execute(stmt)).scalars().all()
         if _task_completed_at(task) >= since
+        and (until is None or _task_completed_at(task) <= until)
     ]
 
     aggregate: dict[str, int] = {bucket: 0 for bucket in ACCEPTANCE_AGGREGATE_BUCKETS}
