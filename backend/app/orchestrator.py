@@ -570,6 +570,58 @@ def _mark_orchestrator_progress() -> None:
     _orchestrator_last_progress = _utcnow()
 
 
+# Default per-step budget for the post-cycle monitoring/idle tail. Overridable via
+# env for ops tuning. Kept comfortably below ORCHESTRATOR_HANG_SECONDS so the
+# worst-case gap between two heartbeats (one fully-consumed step) can never by
+# itself trip the liveness watchdog.
+LEADER_STEP_BUDGET_SECONDS = float(os.getenv("LEADER_STEP_BUDGET_SECONDS", "90"))
+
+
+async def _bounded_leader_step(label: str, coro, budget: float | None = None) -> None:
+    """Run one post-cycle monitoring/sweep step bounded by ``budget`` seconds and
+    pump the orchestrator progress heartbeat afterward.
+
+    The monitoring + idle tail (``_check_external_health``, the recovery sweeps,
+    ``_check_idle_research``/``_check_evergreen_fill`` …) runs AFTER the dispatch
+    cycle's last heartbeat and previously had NO heartbeat of its own. A single
+    un-bounded await there — slow GitHub/DB I/O, a pool-starved sweep waiting on a
+    connection — froze ``_orchestrator_last_progress`` even though dispatch was
+    healthy, so ``/health`` flipped unhealthy and Cloud Run liveness-killed a
+    still-progressing leader (incident 2026-06-15: post-commit relock cascade on a
+    single hot task starved the pool; the tail wedged → 503 → instance kill).
+
+    This bounds each step and heartbeats after it, mirroring the per-task heartbeat
+    in the CI-poll loop and the per-tick ``asyncio.timeout`` in
+    ``_evaluating_timeout_service``. Liveness in the tail is therefore decoupled
+    from any single step: a long-but-progressing tail stays alive, and a genuinely
+    hung step is abandoned-and-logged (next cycle retries) instead of wedging.
+
+    Scope: this bounds an *awaitable* hang only. A full event-loop block (e.g. a
+    synchronous CPU stall, or every pool connection checked out so even
+    ``asyncio.timeout``'s own callback can't be scheduled) cannot be interrupted
+    from within the loop and remains the watchdog/Cloud Run backstop's job.
+
+    ``TimeoutError`` is abandon-and-continue. Other exceptions propagate to the
+    caller's existing handler so its consecutive-error backoff is preserved. The
+    heartbeat is pumped in ``finally`` so it fires on success, timeout, or error.
+    """
+    if budget is None:
+        budget = LEADER_STEP_BUDGET_SECONDS
+    try:
+        async with asyncio.timeout(budget):
+            await coro
+    except TimeoutError:
+        logger.warning(
+            "[ORCHESTRATOR] leader monitoring step '%s' exceeded %.0fs budget — "
+            "abandoned this tick (heartbeat pumped; next cycle retries). A step "
+            "that times out every cycle is a stuck dependency, not a slow one.",
+            label,
+            budget,
+        )
+    finally:
+        _mark_orchestrator_progress()
+
+
 class OrchestratorLiveness(NamedTuple):
     """Result of :func:`evaluate_orchestrator_liveness`.
 
@@ -6699,18 +6751,28 @@ async def orchestrator_worker():
                 except Exception:
                     logger.exception("[ORCHESTRATOR] Failed to create error alerts")
 
-        # Monitoring checks run every cycle (not just when idle)
+        # Monitoring checks run every cycle (not just when idle).
+        # Every step below runs through _bounded_leader_step so the tail keeps its
+        # own heartbeat fresh and no single hung await can wedge leader liveness
+        # (incident 2026-06-15). Budgets are safety nets, comfortably under
+        # ORCHESTRATOR_HANG_SECONDS — they should not fire in healthy operation.
         try:
-            await _check_monitoring_window()
-            await _check_external_health()
-            await _check_pause_mode()
+            await _bounded_leader_step(
+                "monitoring_window", _check_monitoring_window(), budget=30
+            )
+            await _bounded_leader_step(
+                "external_health", _check_external_health(), budget=45
+            )
+            await _bounded_leader_step("pause_mode", _check_pause_mode(), budget=30)
             # Orphaned task recovery — every 120s. Stays on the leader cycle but
             # is now bounded (per-cycle row cap + per-GitHub-call asyncio.wait_for
             # + per-row heartbeat in services._recover_orphaned_tasks, C3) so it
             # can no longer saturate the cycle on a large orphan backlog.
             if (_utcnow() - _last_orphan_check).total_seconds() >= 120:
                 _last_orphan_check = _utcnow()
-                await _recover_orphaned_tasks()
+                await _bounded_leader_step(
+                    "recover_orphaned_tasks", _recover_orphaned_tasks(), budget=120
+                )
             # C3: EVALUATING-timeout recovery moved OFF the leader cycle into the
             # dedicated _evaluating_timeout_service background task (lifecycle.py)
             # with its own 300s schedule + per-tick timeout. The dispatch cycle no
@@ -6723,21 +6785,33 @@ async def orchestrator_worker():
             # waiting for the agent to retry (the VM has usually terminated).
             if (_utcnow() - _last_post_commit_sweep).total_seconds() >= 60:
                 _last_post_commit_sweep = _utcnow()
-                await _sweep_post_commit_pending()
+                # Self-heartbeats per task internally; the 120s outer bound only
+                # trips if it stops making progress (e.g. a single relock-starved
+                # hot row — the 2026-06-15 trigger), abandoning the tick instead
+                # of letting it pin the tail.
+                await _bounded_leader_step(
+                    "post_commit_sweep", _sweep_post_commit_pending(), budget=120
+                )
             # Stranded-sidecar sweep — every 120s. Resolves EVALUATING source
             # tasks whose side-car challenger died without posting status (reaper
             # kill, VM death with retries exhausted, cancellation). Calls the
             # lane resolver with a synthetic FAILED payload for fail-closed semantics.
             if (_utcnow() - _last_sidecar_sweep).total_seconds() >= 120:
                 _last_sidecar_sweep = _utcnow()
-                await _sweep_stranded_sidecar_sources()
+                await _bounded_leader_step(
+                    "stranded_sidecar_sweep",
+                    _sweep_stranded_sidecar_sources(),
+                    budget=90,
+                )
             # Bootstrap-recovery sweep — every 300s. Finds external projects with
             # no active bootstrap task and no bootstrap_completed_at, and enqueues
             # one recovery repo_bootstrap each. Idempotent via the spawn helper.
             if (_utcnow() - _last_bootstrap_recovery_sweep).total_seconds() >= 300:
                 _last_bootstrap_recovery_sweep = _utcnow()
                 try:
-                    await _sweep_bootstrap_recovery()
+                    await _bounded_leader_step(
+                        "bootstrap_recovery", _sweep_bootstrap_recovery(), budget=90
+                    )
                 except Exception:
                     logger.exception("[ORCHESTRATOR] Bootstrap recovery sweep error")
             # Lane-baseline backfill sweep — every 600s. Finds closed versions
@@ -6746,7 +6820,11 @@ async def orchestrator_worker():
             if (_utcnow() - _last_lane_baseline_backfill).total_seconds() >= 600:
                 _last_lane_baseline_backfill = _utcnow()
                 try:
-                    await _sweep_lane_baseline_backfill()
+                    await _bounded_leader_step(
+                        "lane_baseline_backfill",
+                        _sweep_lane_baseline_backfill(),
+                        budget=90,
+                    )
                 except Exception:
                     logger.exception(
                         "[ORCHESTRATOR] Lane-baseline backfill sweep error"
@@ -6758,13 +6836,20 @@ async def orchestrator_worker():
             # restarts without re-spamming (one undismissed alert per project
             # column). Guarded so a flush failure never stalls monitoring.
             try:
-                async with AsyncSessionLocal() as _branch_alert_session:
-                    if await _shared_state.flush_pending_branch_alerts(
-                        _branch_alert_session
-                    ):
-                        await _branch_alert_session.commit()
+                async with asyncio.timeout(30):
+                    async with AsyncSessionLocal() as _branch_alert_session:
+                        if await _shared_state.flush_pending_branch_alerts(
+                            _branch_alert_session
+                        ):
+                            await _branch_alert_session.commit()
+            except TimeoutError:
+                logger.warning(
+                    "[ORCHESTRATOR] branch-alert flush exceeded 30s — abandoned this tick"
+                )
             except Exception:
                 logger.exception("[ORCHESTRATOR] Failed to flush pending branch alerts")
+            finally:
+                _mark_orchestrator_progress()
             _orchestrator_consecutive_monitoring_errors = 0
         except Exception as e:
             _orchestrator_consecutive_monitoring_errors += 1
@@ -6794,11 +6879,13 @@ async def orchestrator_worker():
                 await asyncio.sleep(5)
             # Check autonomous research every cycle — interval gate inside handles throttling.
             # Spawns only when VM slots are available (not tied to queue being empty).
-            await _check_idle_research()
+            await _bounded_leader_step("idle_research", _check_idle_research(), budget=60)
             # Utilization-triggered evergreen backlog auto-fill (d-2877ddc7).
             # Defaulted OFF; interval gate + mode gate handled inside. Additive
             # idle-fill parallelism — never competes with the release-critical path.
-            await _check_evergreen_fill()
+            await _bounded_leader_step(
+                "evergreen_fill", _check_evergreen_fill(), budget=60
+            )
         except asyncio.CancelledError:
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break

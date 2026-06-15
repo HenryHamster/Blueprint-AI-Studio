@@ -10,6 +10,7 @@ froze the whole pipeline. The fix gates liveness on an in-cycle progress
 from the live PR head so a missing stored branch can't wedge a poison task.
 """
 
+import asyncio
 from datetime import timedelta
 
 import pytest
@@ -94,6 +95,59 @@ class TestMarkProgress:
         assert _orch._orchestrator_last_progress is not None
         age = (_utcnow() - _orch._orchestrator_last_progress).total_seconds()
         assert age < 5
+
+
+@pytest.mark.asyncio
+class TestBoundedLeaderStep:
+    """The post-cycle monitoring/idle tail runs AFTER the dispatch cycle's last
+    heartbeat and used to have none of its own. ``_bounded_leader_step`` gives
+    every tail step a heartbeat + a hard timeout so no single hung await can
+    freeze ``_orchestrator_last_progress`` and let Cloud Run liveness-kill a
+    still-progressing leader (incident 2026-06-15: a relock-starved post-commit
+    sweep on one hot row wedged the tail → 503 → instance kill)."""
+
+    async def test_normal_step_runs_and_pumps_heartbeat(self, restore_orch_state):
+        _orch._orchestrator_last_progress = _utcnow() - timedelta(seconds=300)
+        ran = False
+
+        async def step():
+            nonlocal ran
+            ran = True
+
+        await _orch._bounded_leader_step("ok", step(), budget=5)
+        assert ran is True
+        # heartbeat refreshed by the step
+        assert (_utcnow() - _orch._orchestrator_last_progress).total_seconds() < 5
+
+    async def test_hung_step_is_abandoned_not_fatal_and_heartbeats(
+        self, restore_orch_state
+    ):
+        """A step that exceeds its budget must be abandoned (no raise) AND must
+        still pump the heartbeat — the whole point is that a hung tail step keeps
+        liveness fresh and lets the next cycle proceed instead of wedging."""
+        _orch._orchestrator_last_progress = _utcnow() - timedelta(seconds=300)
+
+        async def hang():
+            await asyncio.sleep(10)
+
+        # Must not raise.
+        await _orch._bounded_leader_step("hang", hang(), budget=0.05)
+        assert (_utcnow() - _orch._orchestrator_last_progress).total_seconds() < 5
+
+    async def test_raising_step_propagates_but_still_heartbeats(
+        self, restore_orch_state
+    ):
+        """A non-timeout exception propagates to the caller's existing
+        consecutive-error backoff handler, but the heartbeat still fires in
+        ``finally`` so a transient error never strands liveness."""
+        _orch._orchestrator_last_progress = _utcnow() - timedelta(seconds=300)
+
+        async def boom():
+            raise ValueError("kaboom")
+
+        with pytest.raises(ValueError):
+            await _orch._bounded_leader_step("boom", boom(), budget=5)
+        assert (_utcnow() - _orch._orchestrator_last_progress).total_seconds() < 5
 
 
 class TestWatchdogLiveness:
