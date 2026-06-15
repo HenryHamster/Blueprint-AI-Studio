@@ -33,6 +33,11 @@ function formatAgeSeconds(seconds: number | null | undefined): string {
   return `${formatDurationSec(seconds)} ago`;
 }
 
+function formatCheckpointAge(sha: string | null | undefined, seconds: number | null | undefined): string {
+  if (sha == null) return 'none';
+  return formatAgeSeconds(seconds);
+}
+
 function formatUsd(value: number | null | undefined): string {
   if (value == null || Number.isNaN(value)) return '—';
   return `$${value.toFixed(2)}`;
@@ -372,7 +377,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                         </span>
                       </span>
                       <span className="shrink-0 text-[10px] text-neutral-500">
-                        {formatAgeSeconds(lane.last_checkpoint_age_seconds)}
+                        {formatCheckpointAge(lane.last_checkpoint_sha, lane.last_checkpoint_age_seconds)}
                       </span>
                     </div>
 
@@ -387,7 +392,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                           <span className="font-mono">{lane.last_checkpoint_sha ?? '—'}</span>
                         </div>
                         <div className="mt-0.5 text-neutral-500">
-                          Age {formatAgeSeconds(lane.last_checkpoint_age_seconds)}
+                          Age {formatCheckpointAge(lane.last_checkpoint_sha, lane.last_checkpoint_age_seconds)}
                         </div>
                       </div>
 

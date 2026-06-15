@@ -27,6 +27,67 @@ describe('ProjectResourceEnvelopeSection', () => {
     expect(screen.getByRole('button', { name: 'Save Resource Envelope' })).toBeDisabled();
   });
 
+  it('shows Loading… in Configured Limits and Live Usage when data is null and loading', () => {
+    render(
+      <ProjectResourceEnvelopeSection
+        githubOwner="myorg"
+        githubRepo="myrepo"
+        data={null}
+        loading={true}
+        error={null}
+        canSave={false}
+        onSave={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText('Loading…').length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText('Unlimited')).not.toBeInTheDocument();
+    expect(screen.queryByText(/\$0\.00/)).not.toBeInTheDocument();
+  });
+
+  it('shows Unavailable in Configured Limits and Live Usage when data is null and error is set', () => {
+    render(
+      <ProjectResourceEnvelopeSection
+        githubOwner="myorg"
+        githubRepo="myrepo"
+        data={null}
+        loading={false}
+        error="Failed to load resource envelope"
+        canSave={false}
+        onSave={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText('Unavailable').length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText('Unlimited')).not.toBeInTheDocument();
+    expect(screen.queryByText(/\$0\.00/)).not.toBeInTheDocument();
+  });
+
+  it('shows stale data when data is present even if error is set', () => {
+    render(
+      <ProjectResourceEnvelopeSection
+        githubOwner="myorg"
+        githubRepo="myrepo"
+        data={{
+          project_id: 'project-1',
+          max_concurrent_vms: 4,
+          spend_ceiling_usd: 50,
+          spend_window_days: 14,
+          active_vm_count: 2,
+          recent_spend_usd: 7.25,
+        }}
+        loading={false}
+        error="Transient fetch error"
+        canSave={false}
+        onSave={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText('Unavailable')).not.toBeInTheDocument();
+    expect(screen.getByText('4')).toBeInTheDocument();
+    expect(screen.getByText('$50.00')).toBeInTheDocument();
+  });
+
   it('sends the edited resource-envelope fields on save', async () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     render(

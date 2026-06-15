@@ -369,6 +369,30 @@ describe('ImprovementLanesPanel', () => {
     expect(badges[4]?.textContent).toBe('KILLED');
   });
 
+  test('lane with null last_checkpoint_sha displays "none" for checkpoint age', async () => {
+    const noCheckpointResponse = {
+      ...LANE_RESPONSE,
+      lanes: [
+        {
+          ...LANE_RESPONSE.lanes[0],
+          last_checkpoint_sha: null,
+          last_checkpoint_age_seconds: null,
+        },
+      ],
+    };
+    fetchImprovementLanes.mockResolvedValueOnce(noCheckpointResponse);
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    // Header age span shows 'none' (exact text)
+    const noneElements = screen.getAllByText('none');
+    expect(noneElements.length).toBeGreaterThanOrEqual(1);
+    // Detail "Age" line shows 'Age none', not 'Age —'
+    const ageDetail = screen.getByText(/^Age /);
+    expect(ageDetail.textContent).toBe('Age none');
+  });
+
   test('shows preflight error indicator when preflight fetch fails', async () => {
     fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
     fetchLanePilotPreflight.mockRejectedValueOnce(new Error('Network error'));

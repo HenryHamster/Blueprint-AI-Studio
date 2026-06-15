@@ -146,6 +146,16 @@ describe('VisualVerificationPilotPanel — viewport regression', () => {
     await expectNoOverflowAt(375, () => renderWith(STATUS_EMPTY));
   });
 
+  test('renders NOT STARTED badge when entry_count and admin_task_count are zero', async () => {
+    await renderWith(STATUS_EMPTY);
+    const badgeByText = Array.from(host!.querySelectorAll('span')).find(
+      (el) => el.textContent === 'NOT STARTED',
+    );
+    if (!badgeByText) {
+      throw new Error('Expected a "NOT STARTED" badge but none was found');
+    }
+  });
+
   test('renders caught entries at 1024px without overflow', async () => {
     await expectNoOverflowAt(1024, () => renderWith(STATUS_WITH_CAUGHT));
   });

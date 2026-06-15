@@ -8,7 +8,16 @@ interface Props {
 }
 
 function PilotStatusBadge({ status }: { status: VisualPilotStatus }) {
-  const { entry_count, days_elapsed, thresholds, infra_rate } = status;
+  const { entry_count, admin_task_count, days_elapsed, thresholds, infra_rate } = status;
+
+  if (entry_count === 0 && admin_task_count === 0) {
+    return (
+      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold bg-neutral-500/15 text-neutral-400 border border-neutral-500/30">
+        NOT STARTED
+      </span>
+    );
+  }
+
   const isKillWindow =
     entry_count >= thresholds.target_admin_tasks || days_elapsed >= thresholds.target_days;
   const isEarlyPauseRisk = infra_rate >= thresholds.early_pause_infra_rate;

@@ -75,6 +75,10 @@ export function ProjectResourceEnvelopeSection({
     recent_spend_usd: 0,
   };
 
+  const displayLoading = data == null && loading;
+  const displayUnavailable = data == null && !!error;
+  const noDataLabel = displayLoading ? 'Loading…' : displayUnavailable ? 'Unavailable' : null;
+
   const currentCapLabel = formatCount(current.max_concurrent_vms);
   const currentCeilingLabel = formatUsd(current.spend_ceiling_usd);
   const activeOverCap =
@@ -142,19 +146,19 @@ export function ProjectResourceEnvelopeSection({
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500">Concurrent VMs</div>
-            <div className="mt-1 text-sm font-semibold text-neutral-100">{currentCapLabel}</div>
+            <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? currentCapLabel}</div>
           </div>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500">Spend ceiling</div>
-            <div className="mt-1 text-sm font-semibold text-neutral-100">{currentCeilingLabel}</div>
+            <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? currentCeilingLabel}</div>
           </div>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500">Spend window</div>
-            <div className="mt-1 text-sm font-semibold text-neutral-100">{current.spend_window_days} days</div>
+            <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? `${current.spend_window_days} days`}</div>
           </div>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500">Concurrent compute jobs</div>
-            <div className="mt-1 text-sm font-semibold text-neutral-100">{formatCount(current.max_concurrent_compute_jobs)}</div>
+            <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? formatCount(current.max_concurrent_compute_jobs)}</div>
           </div>
         </div>
       </div>
@@ -165,8 +169,8 @@ export function ProjectResourceEnvelopeSection({
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3">
             <div className="flex items-center justify-between gap-3">
               <span className="text-xs text-neutral-300">Active tasks</span>
-              <span className={`text-xs font-mono ${activeOverCap ? 'text-red-400' : 'text-neutral-100'}`}>
-                {current.active_vm_count} / {currentCapLabel}
+              <span className={`text-xs font-mono ${!noDataLabel && activeOverCap ? 'text-red-400' : 'text-neutral-100'}`}>
+                {noDataLabel ?? `${current.active_vm_count} / ${currentCapLabel}`}
               </span>
             </div>
             <p className="text-[11px] text-neutral-600 mt-1">Counts PROVISIONING and IN_PROGRESS tasks.</p>
@@ -174,8 +178,8 @@ export function ProjectResourceEnvelopeSection({
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3">
             <div className="flex items-center justify-between gap-3">
               <span className="text-xs text-neutral-300">Recent spend</span>
-              <span className={`text-xs font-mono ${spendOverCeiling ? 'text-red-400' : 'text-neutral-100'}`}>
-                {formatUsd(current.recent_spend_usd)} / {currentCeilingLabel}
+              <span className={`text-xs font-mono ${!noDataLabel && spendOverCeiling ? 'text-red-400' : 'text-neutral-100'}`}>
+                {noDataLabel ?? `${formatUsd(current.recent_spend_usd)} / ${currentCeilingLabel}`}
               </span>
             </div>
             <p className="text-[11px] text-neutral-600 mt-1">{current.spend_window_days}-day rolling window.</p>
