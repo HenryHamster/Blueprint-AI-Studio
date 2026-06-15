@@ -9,8 +9,9 @@ from sqlmodel import SQLModel
 from alembic import context
 
 # Import your models here so Alembic can read the metadata
-from app.models import *
+from app.models import *  # noqa: F403
 from app.database import DATABASE_URL
+from app.migration_retry import run_migrations_with_retry
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -32,6 +33,7 @@ target_metadata = SQLModel.metadata
 # is symmetric — get_main_option's interpolation pass collapses `%%` back to
 # `%`, so the engine sees the original URL unchanged.
 config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("%", "%%"))
+
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.
@@ -81,6 +83,10 @@ async def run_async_migrations() -> None:
     """In this scenario we need to create an Engine
     and associate a connection with the context.
 
+    Transient lock errors (deadlock 40P01, lock_timeout 55P03) are retried
+    with bounded exponential backoff via run_migrations_with_retry. Non-transient
+    errors surface immediately. lock_timeout is set on each attempt so a waiting
+    migration fails fast rather than blocking indefinitely.
     """
 
     connectable = async_engine_from_config(
@@ -89,10 +95,10 @@ async def run_async_migrations() -> None:
         poolclass=pool.NullPool,
     )
 
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
+    try:
+        await run_migrations_with_retry(connectable, do_run_migrations)
+    finally:
+        await connectable.dispose()
 
 
 def run_migrations_online() -> None:
