@@ -57,11 +57,15 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # recovery sweeps. It has since been split into recovery_evaluating.py (the
 # EVALUATING-timeout sweep) and recovery_post_commit.py (post-commit-pending,
 # orphan, sidecar, lane-baseline, and bootstrap recovery), leaving
-# recovery_sweeps.py as a thin re-export hub. The two submodules inherit
-# services.py's intentional "log and continue — never crash the background loop"
-# broad-except pattern, so they carry the same BLE001 ignore.
+# recovery_sweeps.py as a thin re-export hub. recovery_evaluating.py was in
+# turn split again: its chain-inspection / CI-backstop / spend-hold helpers
+# moved to recovery_evaluating_helpers.py to stay below the size cap. All of
+# these submodules inherit services.py's intentional "log and continue — never
+# crash the background loop" broad-except pattern, so they carry the same
+# BLE001 ignore.
 "app/recovery_sweeps.py" = ["BLE001"]
 "app/recovery_evaluating.py" = ["BLE001"]
+"app/recovery_evaluating_helpers.py" = ["BLE001"]
 "app/recovery_post_commit.py" = ["BLE001"]
 # lifecycle.py is the FastAPI lifespan that hosts every background service plus the
 # crash-monitor and leader-election loops. BLE001 (broad except) and PERF203

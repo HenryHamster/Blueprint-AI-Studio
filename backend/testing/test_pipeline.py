@@ -5792,7 +5792,7 @@ class TestCalibrateFindingScope:
         # Findings spanning 2 top-level dirs (e.g. backend + agent) should NOT
         # escalate — only 3+ modules trigger the cross-module heuristic.
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, direction, cochange: (0.9, {"sig": "healthy"}),
         )
         finding = {
@@ -5817,7 +5817,7 @@ class TestCalibrateFindingScope:
 
     def test_composite_complexity_upgrades_medium_to_large(self, monkeypatch):
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, direction, cochange: (0.3, {"sig": "low"}),
         )
         finding = {"title": "t", "related_files": self._single_module_files(2)}
@@ -5829,7 +5829,7 @@ class TestCalibrateFindingScope:
 
     def test_medium_passthrough_when_no_heuristic_fires(self, monkeypatch):
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, direction, cochange: (0.9, {"sig": "healthy"}),
         )
         finding = {"title": "t", "related_files": self._single_module_files(2)}
@@ -5844,7 +5844,7 @@ class TestCalibrateFindingScope:
         from app.shared_state import runtime_config
 
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, direction, cochange: (0.5, {"sig": "borderline"}),
         )
         monkeypatch.setitem(
@@ -5868,7 +5868,7 @@ class TestCalibrateFindingScope:
         # Use 0.08 (just above MEDIUM_EXPLORATION_FLOOR=0.05) so the
         # unconditional-floor gate does not short-circuit this test.
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, direction, cochange: (0.6, {"sig": "borderline"}),
         )
         monkeypatch.setitem(
@@ -5895,7 +5895,7 @@ class TestCalibrateFindingScope:
             return (0.99, {"sig": "healthy"})
 
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             _unexpected,
         )
         monkeypatch.setitem(
@@ -5918,7 +5918,7 @@ class TestCalibrateFindingScope:
         be upgraded to medium by file-count, then have composite complexity
         scored, and further escalated to large when score is below threshold."""
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, direction, cochange: (0.2, {"sig": "low", "clusters": 2}),
         )
         finding = {"title": "t", "related_files": self._single_module_files(4)}
@@ -5934,7 +5934,7 @@ class TestCalibrateFindingScope:
         """Small finding upgraded to medium, with healthy complexity, should
         receive complexity signals but stay at medium."""
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, direction, cochange: (0.9, {"sig": "healthy"}),
         )
         finding = {"title": "t", "related_files": self._single_module_files(4)}
@@ -5951,7 +5951,7 @@ class TestCalibrateFindingScope:
         from app.shared_state import runtime_config
 
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, direction, cochange: (0.5, {"sig": "borderline"}),
         )
         monkeypatch.setitem(
@@ -5986,7 +5986,7 @@ class TestCalibrateFindingScope:
             ],
         }
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, d, c: (0.48, {"sig": "borderline"}),
         )
         finding = {"title": "t", "related_files": self._single_module_files(2)}
@@ -5995,7 +5995,7 @@ class TestCalibrateFindingScope:
         assert cal == "medium"
 
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, d, c: (0.52, {"sig": "borderline"}),
         )
         finding2 = {"title": "t", "related_files": self._single_module_files(2)}
@@ -6016,7 +6016,7 @@ class TestCalibrateFindingScope:
             ],
         }
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, d, c: (0.50, {"sig": "borderline"}),
         )
         finding = {"title": "t", "related_files": self._single_module_files(2)}
@@ -6047,7 +6047,7 @@ class TestCalibrateFindingScope:
             ],
         }
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score",
+            "app.research_scope_calibration._composite_complexity_score",
             lambda files, d, c: (0.55, {"sig": "borderline"}),
         )
         finding = {"title": "t", "related_files": self._single_module_files(2)}
