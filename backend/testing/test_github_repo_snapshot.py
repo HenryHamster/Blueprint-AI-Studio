@@ -374,3 +374,67 @@ def test_looks_like_file_path_rejects_globs_and_whitespace():
     assert _looks_like_file_path("backend/app/{a,b}.py") is False
     assert _looks_like_file_path("backend/app/has space.py") is False
     assert _looks_like_file_path(" backend/app/models.py") is False
+
+
+# ── behind-detection base-tip cache wiring (GitHub-quota burn fix, 2026-06-15) ─
+
+
+@pytest.mark.asyncio
+async def test_get_branch_sha_allow_cached_serves_from_cache(mocker):
+    """allow_cached=True serves the 2nd read from the shared ~60s branch-tip
+    cache — collapses the repeated identical git/ref reads (the #2 quota
+    consumer after token minting)."""
+    from app.github import get_branch_sha
+
+    calls = _patch_requests(mocker, [_ref_response()])
+    sha1 = await get_branch_sha(
+        "ghs_test", "acme", "widget", "automain", allow_cached=True
+    )
+    sha2 = await get_branch_sha(
+        "ghs_test", "acme", "widget", "automain", allow_cached=True
+    )
+    assert sha1 == sha2 == COMMIT_SHA
+    ref_calls = [c for c in calls if "/git/ref/heads/automain" in c[1]]
+    assert len(ref_calls) == 1
+    assert shared_state.github_cache_hits.get("branch_sha_snapshot", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_get_branch_sha_default_observes_live_tip(mocker):
+    """Default (allow_cached=False) re-fetches every time and never populates
+    the cache — SHA-critical callers (promotion/merge verification, ref
+    updates) must observe the live tip, never a stale cached SHA."""
+    from app.github import get_branch_sha
+
+    calls = _patch_requests(mocker, [_ref_response()])
+    await get_branch_sha("ghs_test", "acme", "widget", "automain")
+    await get_branch_sha("ghs_test", "acme", "widget", "automain")
+    ref_calls = [c for c in calls if "/git/ref/heads/automain" in c[1]]
+    assert len(ref_calls) == 2
+    assert ("acme", "widget", "automain") not in snapshot._branch_sha_cache
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_for_reuses_cached_base_tip(mocker):
+    """Behind-detection wiring: two checks of the same base branch (as happens
+    when many concurrent PRs all check 'am I behind main?') fetch the base tip
+    from GitHub only ONCE."""
+    from unittest.mock import AsyncMock
+
+    from app.github import pr_is_not_behind_for
+
+    calls = _patch_requests(mocker, [_ref_response()])
+    # Isolate the base-tip fetch: stub the actual not-behind comparison so it
+    # makes no further GitHub calls.
+    mocker.patch("app.github.pr_is_not_behind", new=AsyncMock(return_value=True))
+
+    detail = {"head": {"sha": "h" * 40}, "mergeable_state": "clean"}
+    await pr_is_not_behind_for(
+        "ghs_test", "acme", "widget", pr_detail=detail, base_branch="automain"
+    )
+    await pr_is_not_behind_for(
+        "ghs_test", "acme", "widget", pr_detail=detail, base_branch="automain"
+    )
+
+    ref_calls = [c for c in calls if "/git/ref/heads/automain" in c[1]]
+    assert len(ref_calls) == 1

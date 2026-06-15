@@ -4371,3 +4371,79 @@ async def test_get_pr_files_first_page_error_still_raises(mocker):
     )
     with pytest.raises(HTTPException):
         await get_pr_files("tok", "o", "r", 1)
+
+
+# ── installation token minting cache (GitHub-quota burn fix, 2026-06-15) ──────
+
+
+@pytest.mark.asyncio
+async def test_get_repo_installation_token_caches_minted_token(mocker):
+    """A 2nd resolution within the TTL reuses the minted token — the
+    POST /access_tokens mint (the #1 GitHub-quota burner) fires exactly ONCE.
+
+    Regression guard: get_repo_installation_token previously minted a fresh
+    1-hour token on every call, making token minting ~36% of all GitHub calls
+    fleet-wide and draining the shared 5,000/hr installation pool.
+    """
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    gh_auth._repo_installation_token_cache.clear()
+    # Pre-seed the installation_id so the path skips the GET /installation (and
+    # its real JWT mint) and exercises only the access-token cache.
+    gh_auth._installation_id_cache["acme/widget"] = ("555", _t.time())
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+
+    mint_calls = []
+
+    async def _fake_request(method, url, headers, **kwargs):
+        if url.endswith("/access_tokens"):
+            mint_calls.append(url)
+            return MockResponse(201, {"token": "ghs_minted"})
+        return MockResponse(404, {})
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    t1 = await gh_auth.get_repo_installation_token("acme", "widget")
+    t2 = await gh_auth.get_repo_installation_token("acme", "widget")
+
+    assert t1 == t2 == "ghs_minted"
+    assert len(mint_calls) == 1, "token should be minted once and cached, not re-minted"
+
+    gh_auth._repo_installation_token_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_repo_installation_token_forces_remint(mocker):
+    """invalidate_repo_installation_token_cache() drops the cached token so the
+    next resolution re-mints — used by the 401 self-heal path."""
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    gh_auth._repo_installation_token_cache.clear()
+    gh_auth._installation_id_cache["acme/widget"] = ("555", _t.time())
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+
+    mint_calls = []
+
+    async def _fake_request(method, url, headers, **kwargs):
+        if url.endswith("/access_tokens"):
+            mint_calls.append(url)
+            return MockResponse(201, {"token": "ghs_minted"})
+        return MockResponse(404, {})
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    await gh_auth.get_repo_installation_token("acme", "widget")
+    gh_auth.invalidate_repo_installation_token_cache("acme", "widget")
+    await gh_auth.get_repo_installation_token("acme", "widget")
+
+    assert len(mint_calls) == 2, "invalidation must force a re-mint"
+
+    gh_auth._repo_installation_token_cache.clear()
