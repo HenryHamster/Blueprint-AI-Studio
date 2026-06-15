@@ -323,7 +323,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
       )}
 
       {/* Version Summary */}
-      {versionLifecycle?.current_version?.tasks_merged && (
+      {versionLifecycle?.current_version?.tasks_merged !== undefined && (
         <VersionSummaryPanel
           tasksMerged={versionLifecycle.current_version.tasks_merged}
         />

@@ -628,19 +628,6 @@ def cmd_versions(args: argparse.Namespace) -> None:
                    if target is not None else "no open version")
             _emit(args, {"error": msg}, lambda d: print(d["error"]))
             return
-        # For the open version the lifecycle response already includes
-        # tasks_merged; for historical versions fetch from the summary endpoint.
-        if ver is cv:
-            tasks_merged = cv.get("tasks_merged") or []
-        else:
-            ver_id = ver.get("id")
-            if ver_id:
-                ver_summary, _ = _safe_read(
-                    f"/api/admin/release-versions/{ver_id}/summary"
-                )
-                tasks_merged = (ver_summary or {}).get("tasks_merged") or []
-            else:
-                tasks_merged = []
         summary = {
             "version_number": ver.get("version_number"),
             "phase": ver.get("phase"),
@@ -650,8 +637,23 @@ def cmd_versions(args: argparse.Namespace) -> None:
             "qualification_state": ver.get("qualification_state"),
             "acceptance_aggregate": ver.get("acceptance_aggregate"),
             "goal": ver.get("goal"),
-            "tasks_merged": tasks_merged,
         }
+        if ver is cv:
+            # Current (open) version: tasks_merged is already in the lifecycle response.
+            summary["tasks_merged"] = cv.get("tasks_merged") or []
+            summary["aggregate_serving_status"] = cv.get("aggregate_serving_status")
+        else:
+            # Closed version: fetch the rich summary if a UUID is available.
+            ver_id = ver.get("id")
+            if ver_id:
+                ver_summary, _ = _safe_read(
+                    f"/api/admin/release-versions/{ver_id}/summary"
+                )
+                summary["tasks_merged"] = (ver_summary or {}).get("tasks_merged") or []
+                summary["highlights"] = (ver_summary or {}).get("highlights")
+                summary["serving_status"] = (ver_summary or {}).get("serving_status")
+            else:
+                summary["tasks_merged"] = []
         _emit(args, summary, _render_version_summary)
         return
 
@@ -670,7 +672,9 @@ def _version_line(v: dict, marker: str = " ") -> str:
     sha = (v.get("promoted_sha") or v.get("served_sha") or "-")[:12]
     merged = v.get("merged_task_count")
     merged_str = f"  merged={merged}" if merged is not None else ""
-    return f"  {marker} v{num}  [{status:9}] phase={phase:9} sha={sha}{merged_str}"
+    tasks_merged = v.get("tasks_merged") or []
+    tasks_str = f"  tasks={len(tasks_merged)}" if tasks_merged else ""
+    return f"  {marker} v{num}  [{status:9}] phase={phase:9} sha={sha}{merged_str}{tasks_str}"
 
 
 def _render_version_list(data: dict) -> None:
@@ -694,19 +698,32 @@ def _render_version_summary(s: dict) -> None:
     print(f"  sha:          {(s.get('promoted_sha') or '-')[:12]}")
     print(f"  merged_tasks: {s.get('merged_task_count')}")
     print(f"  qual_state:   {s.get('qualification_state')}")
+    serving = s.get("aggregate_serving_status") or s.get("serving_status")
+    if serving:
+        print(f"  serving:      {serving}")
     agg = s.get("acceptance_aggregate")
     if agg:
         print(f"  acceptance:   {json.dumps(agg)}")
     if s.get("goal"):
         print(f"  goal:         {s['goal'][:200]}")
+    highlights = s.get("highlights") or {}
+    headline = highlights.get("headline") if isinstance(highlights, dict) else None
+    if headline:
+        print(f"\n  Summary: {headline}")
     tasks_merged = s.get("tasks_merged") or []
     if tasks_merged:
-        print(f"  changelog ({len(tasks_merged)} tasks):")
+        print(f"\n  Changelog ({len(tasks_merged)} tasks):")
+        by_type: dict = {}
         for t in tasks_merged:
-            pr = t.get("pr_number")
-            title = t.get("title", "?")
-            pr_str = f" [#{pr}]" if pr else ""
-            print(f"    {title}{pr_str}")
+            ttype = t.get("task_type") or "other"
+            by_type.setdefault(ttype, []).append(t)
+        for ttype in sorted(by_type):
+            print(f"    [{ttype}]")
+            for item in by_type[ttype]:
+                pr = item.get("pr_number")
+                title = (item.get("title") or "")[:70]
+                pr_str = f"  #{pr}" if pr else ""
+                print(f"      {title}{pr_str}")
 
 
 # ── promote-recover ──────────────────────────────────────────────────────────

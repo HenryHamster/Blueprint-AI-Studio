@@ -125,24 +125,28 @@ def mock_api(monkeypatch):
                     "qualification_state": "qualifying", "merged_task_count": 3,
                     "active_candidate_sha": "abc123",
                     "tasks_merged": [
-                        {"title": "demo task", "pr_number": 42,
-                         "task_type": "create"},
+                        {"task_type": "create", "title": "Add widget feature", "pr_number": 101},
+                        {"task_type": "fix", "title": "Fix null pointer", "pr_number": 102},
+                        {"task_type": "create", "title": "New dashboard panel", "pr_number": 103},
                     ],
+                    "aggregate_serving_status": "SERVING",
                 },
                 "recent_versions": [
-                    {"id": "ver-11-id", "version_number": 11, "phase": "stabilize",
+                    {"id": "uuid-v11", "version_number": 11, "phase": "stabilize",
                      "status": "promoted", "promoted_sha": "deadbeef",
                      "merged_task_count": 10},
                 ],
                 "promotion_enabled_effective": True,
                 "promotion_enabled_source": "fleet",
             }
-        if "/release-versions/" in path and "/summary" in path:
+        if "/release-versions/uuid-v11/summary" in path:
             return {
                 "tasks_merged": [
-                    {"title": "historical task", "pr_number": 7,
-                     "task_type": "fix"},
+                    {"task_type": "create", "title": "Shipped feature A", "pr_number": 90},
+                    {"task_type": "refactor", "title": "Clean up module", "pr_number": 91},
                 ],
+                "highlights": {"headline": "10 tasks merged; focus on stability"},
+                "serving_status": "SERVING",
             }
         if "/tasks/" in path:
             return {"id": "task-123", "title": "demo", "task_type": "create",
@@ -352,8 +356,8 @@ def test_versions_show_json(mock_api, capsys):
     assert parsed["version_number"] == 12
     assert parsed["phase"] == "build"
     assert isinstance(parsed["tasks_merged"], list)
-    assert len(parsed["tasks_merged"]) == 1
-    assert parsed["tasks_merged"][0]["pr_number"] == 42
+    assert len(parsed["tasks_merged"]) == 3
+    assert parsed["tasks_merged"][0]["pr_number"] == 101
 
 
 def test_versions_show_changelog_human_render(mock_api, capsys):
@@ -361,8 +365,8 @@ def test_versions_show_changelog_human_render(mock_api, capsys):
     rc = blueprint.main(["versions", "show"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "#42" in out
-    assert "demo task" in out
+    assert "#101" in out
+    assert "Add widget feature" in out
 
 
 def test_versions_show_historical_fetches_summary(mock_api, capsys):
@@ -372,8 +376,8 @@ def test_versions_show_historical_fetches_summary(mock_api, capsys):
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["version_number"] == 11
     assert isinstance(parsed["tasks_merged"], list)
-    # historical fixture returns one task via the /summary endpoint
-    assert parsed["tasks_merged"][0]["pr_number"] == 7
+    # historical fixture returns tasks via the /summary endpoint
+    assert parsed["tasks_merged"][0]["pr_number"] == 90
     # the /summary endpoint must have been called
     assert any("/release-versions/" in p and "/summary" in p
                for _, p, _ in mock_api)
@@ -553,6 +557,87 @@ def test_tasks_tree_no_children(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "no children" in out
+
+
+def test_versions_show_current_includes_changelog(mock_api, capsys):
+    """versions show for the open version renders the changelog grouped by task type."""
+    rc = blueprint.main(["versions", "show"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Changelog" in out
+    assert "[create]" in out
+    assert "[fix]" in out
+    assert "Add widget feature" in out
+    assert "#101" in out
+    assert "Fix null pointer" in out
+    # serving status should appear
+    assert "SERVING" in out
+    # no extra API calls for the current version
+    assert not any("release-versions" in p for _, p, _ in mock_api)
+
+
+def test_versions_show_recent_calls_summary_endpoint(mock_api, capsys):
+    """versions show N for a closed version fetches the summary endpoint and renders changelog."""
+    rc = blueprint.main(["versions", "show", "11"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # summary endpoint must have been called
+    assert any("release-versions/uuid-v11/summary" in p for _, p, _ in mock_api)
+    # changelog from summary response should be rendered
+    assert "Changelog" in out
+    assert "[create]" in out
+    assert "[refactor]" in out
+    assert "Shipped feature A" in out
+    assert "#90" in out
+    # headline from highlights
+    assert "10 tasks merged" in out
+    # serving status
+    assert "SERVING" in out
+
+
+def test_versions_show_json_unchanged(mock_api, capsys):
+    """--json for versions show still returns the base summary fields unchanged."""
+    rc = blueprint.main(["--json", "versions", "show"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["version_number"] == 12
+    assert parsed["phase"] == "build"
+    # tasks_merged and aggregate_serving_status are present in JSON
+    assert "tasks_merged" in parsed
+    assert len(parsed["tasks_merged"]) == 3
+
+
+def test_versions_list_shows_task_count(mock_api, capsys):
+    """versions list shows tasks=N for the current version when tasks_merged is populated."""
+    rc = blueprint.main(["versions", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "tasks=3" in out
+
+
+def test_versions_show_recent_no_id_graceful(monkeypatch, capsys):
+    """versions show N for a closed version without an id skips the summary call gracefully."""
+    def fake_api(method, path, body=None, timeout=30):
+        if "version-lifecycle" in path:
+            return {
+                "current_version": {"version_number": 12, "phase": "build"},
+                "recent_versions": [
+                    {"version_number": 11, "phase": "stabilize", "status": "promoted",
+                     "merged_task_count": 5},
+                ],
+                "promotion_enabled_effective": True,
+            }
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["versions", "show", "11"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "VERSION v11" in out
+    # no crash; empty changelog is silently omitted
+    assert "Changelog" not in out
 
 
 def test_tasks_cancel_requeue_guards(mock_api, monkeypatch, capsys):

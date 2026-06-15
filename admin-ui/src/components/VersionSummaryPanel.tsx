@@ -55,7 +55,18 @@ export function VersionSummaryPanel({
 }: {
   tasksMerged: ChangelogEntry[] | undefined;
 }): JSX.Element | null {
-  if (!tasksMerged || tasksMerged.length === 0) return null;
+  if (tasksMerged === undefined) return null;
+
+  if (tasksMerged.length === 0) {
+    return (
+      <div
+        data-testid="version-summary-panel-empty"
+        className="mt-3 rounded border border-slate-700/60 bg-slate-800/40 px-3 py-2"
+      >
+        <div className="text-[11px] text-slate-500 italic">No tasks merged into this version yet.</div>
+      </div>
+    );
+  }
 
   const groups = groupByType(tasksMerged);
 

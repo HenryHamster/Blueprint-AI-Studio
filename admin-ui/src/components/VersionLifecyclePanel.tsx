@@ -1567,6 +1567,15 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     deployFailureReason={cv.serving?.failure_reason ?? cv.qualification_state?.deploy_failure_reason}
                     deployConfirmDeadline={cv.deploy_confirm_deadline}
                   />
+                  {cv.aggregate_serving_status != null && cv.serving_status != null && cv.aggregate_serving_status !== cv.serving_status && (
+                    <span
+                      data-testid="serving-disagree-badge"
+                      title={`Artifact consensus (aggregate_serving_status: ${cv.aggregate_serving_status}) differs from backend scalar (serving_status: ${cv.serving_status}) — artifact value takes precedence.`}
+                      className="text-amber-500 text-[10px] cursor-help"
+                    >
+                      ⚠
+                    </span>
+                  )}
                 </div>
                 {cv.qualification_state.state === 'promotion_in_flight' && promotionFreshness && (
                   <p
@@ -1840,6 +1849,15 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                         deployFailureReason={v.serving?.failure_reason ?? v.qualification_state?.deploy_failure_reason}
                         deployConfirmDeadline={v.deploy_confirm_deadline}
                       />
+                      {v.aggregate_serving_status != null && v.serving_status != null && v.aggregate_serving_status !== v.serving_status && (
+                        <span
+                          data-testid="serving-disagree-badge"
+                          title={`Artifact consensus (aggregate_serving_status: ${v.aggregate_serving_status}) differs from backend scalar (serving_status: ${v.serving_status}) — artifact value takes precedence.`}
+                          className="text-amber-500 text-[10px] cursor-help"
+                        >
+                          ⚠
+                        </span>
+                      )}
                       <QualSummary q={v.last_qualification} />
                       {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
                         <span className="text-neutral-400">

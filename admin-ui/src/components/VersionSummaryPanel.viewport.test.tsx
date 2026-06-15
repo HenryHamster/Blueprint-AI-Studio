@@ -35,6 +35,38 @@ describe('VersionSummaryPanel — viewport regression', () => {
     }
   });
 
+  test('renders null when tasksMerged is undefined', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={undefined} />);
+    });
+    const panel = host.querySelector('[data-testid="version-summary-panel"]');
+    const emptyPanel = host.querySelector('[data-testid="version-summary-panel-empty"]');
+    if (panel !== null || emptyPanel !== null) {
+      throw new Error('Expected no panel rendered when tasksMerged is undefined');
+    }
+  });
+
+  test('renders empty-state placeholder when tasksMerged is an empty array', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={[]} />);
+    });
+    const emptyPanel = host.querySelector('[data-testid="version-summary-panel-empty"]');
+    if (emptyPanel === null) {
+      throw new Error('Expected empty-state panel when tasksMerged is []');
+    }
+    if (!emptyPanel.textContent?.includes('No tasks merged into this version yet.')) {
+      throw new Error('Expected placeholder text in empty-state panel');
+    }
+  });
+
   test('renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');

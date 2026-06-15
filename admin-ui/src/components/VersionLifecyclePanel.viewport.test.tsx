@@ -282,6 +282,45 @@ const HISTORICAL_VERDICT_DATA: VersionLifecycleResponse = {
   staged_directions: [],
 };
 
+const SERVING_DISAGREE_DATA: VersionLifecycleResponse = {
+  current_version: {
+    version_number: 12,
+    phase: 'stabilize',
+    phase_changed_at: '2026-06-14T08:00:00Z',
+    phase_reasoning: null,
+    goal: null,
+    opened_at: '2026-06-14T00:00:00Z',
+    qualification_attempts: 1,
+    merged_task_count: 5,
+    in_flight_task_count: 0,
+    active_candidate_sha: 'abc1234def5678901234567890123456789012ab',
+    qualification_state: {
+      state: 'qualifying',
+      summary: 'Qualification in progress',
+      serving_status: 'unconfirmed',
+    },
+    last_qualification: null,
+    latest_audit: null,
+    audit_evidence_state: 'none',
+    serving_status: 'serving_confirmed',
+    aggregate_serving_status: 'deploy_failed',
+  },
+  recent_versions: [
+    {
+      version_number: 11,
+      status: 'promoted',
+      opened_at: '2026-06-01T00:00:00Z',
+      promoted_at: '2026-06-13T12:00:00Z',
+      qualification_attempts: 2,
+      last_qualification: null,
+      serving_status: 'serving_confirmed',
+      aggregate_serving_status: 'deploy_failed',
+    },
+  ],
+  promotion_enabled: false,
+  staged_directions: [],
+};
+
 describe('VersionLifecyclePanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -374,5 +413,15 @@ describe('VersionLifecyclePanel — viewport regression', () => {
 
   test('historical verdict with durable evidence — touch targets at 375px', async () => {
     await expectMinTouchTargetAt(375, makeRender(HISTORICAL_VERDICT_DATA), { selector: 'button, a[href]' });
+  });
+
+  test('serving disagree — badge renders when aggregate_serving_status differs from serving_status', async () => {
+    await makeRender(SERVING_DISAGREE_DATA)();
+    const container = host;
+    if (!container) throw new Error('host not initialized');
+    const badges = container.querySelectorAll('[data-testid="serving-disagree-badge"]');
+    if (badges.length === 0) {
+      throw new Error('Expected at least one serving-disagree-badge when aggregate and scalar serving statuses differ');
+    }
   });
 });
