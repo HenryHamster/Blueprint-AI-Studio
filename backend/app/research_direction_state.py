@@ -271,19 +271,6 @@ def direction_saturation_refractory_minutes() -> float:
     return 2.0 * direction_refractory_minutes()
 
 
-def direction_dedup_deadlock_recovery_hours() -> float:
-    """Cooldown for dedup-deadlocked directions before auto-recovery.
-
-    Shorter than the general ``direction_auto_recovery_hours`` (48h default)
-    because dedup-deadlocks often resolve as soon as in-flight tasks drain —
-    a shorter cooldown lets the direction re-enter rotation sooner.  The
-    general 48h floor applies if this value is not explicitly configured.
-    """
-    value = _runtime_config.get("dedup_deadlock_auto_recovery_hours")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    return 8.0
-
 
 async def apply_post_spawn_state(
     session: AsyncSession,
@@ -748,6 +735,7 @@ async def apply_post_spawn_state(
                                 f"{_af_consec} consecutive scope-empty cycles (task {task.id})"
                             )
 
+
                     _evicted_out: list = []
                     d["research_context"] = _build_research_context(
                         prior_context=d.get("research_context"),
@@ -781,10 +769,9 @@ async def apply_post_spawn_state(
 
                     record_outcome_progress_snapshot(d)
 
-                    # Auto-complete direction if saturated with sufficient merged PRs.
-                    # The tasks_created guard is intentionally omitted: a fully-exhausted
-                    # direction (all findings deduped, zero tasks spawned) is exactly the
-                    # case that should trigger auto-completion, not escape it.
+                    # Auto-complete if saturated and proven by merged PRs.
+                    # Require >= 3 merged PRs to avoid retiring directions that
+                    # became saturated before accumulating meaningful output.
                     if d.get("status") == "active" and d.get("possibly_saturated"):
                         history = d.get("research_history", [])
                         agg = d.get("history_aggregate", {})

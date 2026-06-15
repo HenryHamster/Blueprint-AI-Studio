@@ -1073,7 +1073,12 @@ async def claim_task(
                 Task.project_id == task.project_id,
                 Task.id != task.id,
                 Task.status.in_(
-                    [TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING, TaskStatus.QUEUED]
+                    [
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                        TaskStatus.QUEUED,
+                        TaskStatus.BLOCKED,
+                    ]
                 ),
             )
             .cte("active_queued_ranked")
@@ -1296,6 +1301,7 @@ async def claim_task(
                     if hasattr(t.status, "value")
                     else str(t.status),
                     "pr_url": pr_url,
+                    "landed_on_head": is_merged_completion(t),
                     "research_findings_summary": research_findings_summary,
                     "failure_reason": (t.latest_status_message or "")[:500]
                     if is_failed and t.latest_status_message
@@ -1344,6 +1350,7 @@ async def claim_task(
                     if hasattr(t.status, "value")
                     else str(t.status),
                     "pr_url": pr_url,
+                    "landed_on_head": False,
                     "research_findings_summary": research_findings_summary,
                     "failure_reason": (t.latest_status_message or "")[:500]
                     if t.latest_status_message

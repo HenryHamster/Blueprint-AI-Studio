@@ -22814,3 +22814,102 @@ async def test_agent_claim_diagnostics_after_edit_reject_returns_holdback_one(
     assert resp.status_code == 200
     data = resp.json()
     assert data["project_metadata"]["diagnostics_after_edit_holdback_fraction"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_research_grounding_surfaces_landed_and_blocked(
+    client: AsyncClient, db_session
+):
+    """Research agent grounding surfaces landed_on_head and BLOCKED in-flight tasks.
+
+    Asserts:
+    - recently_completed_tasks carries landed_on_head=True for a task with the
+      integration-branch landing signal, and False for one without it.
+    - A BLOCKED task appears in active_tasks so research agents see it and don't
+      propose findings for work it already addresses.
+    """
+    from app.landed_signal import mark_landed_on_integration
+
+    project = Project(name="Research Grounding Test", user_id="test-user-grounding")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Completed task that truly landed on the integration branch
+    landed_task = Task(
+        project_id=project.id,
+        title="Landed completed task",
+        payloads=[{"type": "fix", "prompt": "Fix the bug"}],
+        vm_instance_id="agent-vm-grounding-landed",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(landed_task)
+    await db_session.commit()
+    await db_session.refresh(landed_task)
+    mark_landed_on_integration(landed_task)
+    await db_session.commit()
+
+    # Completed task that did NOT land on HEAD (no landing signal)
+    non_landed_task = Task(
+        project_id=project.id,
+        title="Non-landed completed task",
+        payloads=[{"type": "fix", "prompt": "Fix something else"}],
+        vm_instance_id="agent-vm-grounding-non-landed",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(non_landed_task)
+    await db_session.commit()
+
+    # BLOCKED in-flight task — must surface in active_tasks
+    blocked_task = Task(
+        project_id=project.id,
+        title="Blocked in-flight task",
+        payloads=[{"type": "create", "prompt": "Implement the feature"}],
+        vm_instance_id="agent-vm-grounding-blocked",
+        status=TaskStatus.BLOCKED,
+    )
+    db_session.add(blocked_task)
+    await db_session.commit()
+
+    # Research task to claim (research type triggers project_context assembly)
+    claim_task = Task(
+        project_id=project.id,
+        title="Research claim task",
+        payloads=[{"type": "research", "prompt": "Investigate the codebase"}],
+        vm_instance_id="agent-vm-grounding-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-grounding-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    project_context = data.get("project_context", {})
+
+    # Verify landed_on_head signal in recently_completed_tasks
+    recent_tasks = project_context.get("recently_completed_tasks", [])
+    by_title = {t["title"]: t for t in recent_tasks}
+
+    assert "Landed completed task" in by_title, (
+        "Landed completed task must appear in recently_completed_tasks"
+    )
+    assert by_title["Landed completed task"]["landed_on_head"] is True, (
+        "landed_on_head must be True for a task with the integration-branch landing signal"
+    )
+
+    assert "Non-landed completed task" in by_title, (
+        "Non-landed completed task must appear in recently_completed_tasks"
+    )
+    assert by_title["Non-landed completed task"]["landed_on_head"] is False, (
+        "landed_on_head must be False for a completed task without a landing signal"
+    )
+
+    # Verify BLOCKED task appears in active_tasks
+    active_tasks = project_context.get("active_tasks", [])
+    blocked_titles = [t["title"] for t in active_tasks if t.get("status") == "BLOCKED"]
+    assert "Blocked in-flight task" in blocked_titles, (
+        "BLOCKED tasks must appear in active_tasks so research agents don't regenerate their work"
+    )

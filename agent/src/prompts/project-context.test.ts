@@ -533,3 +533,110 @@ describe('formatProjectContext — Persistent Self-Review Blind Spots', () => {
     expect(persistentIdx).toBeGreaterThan(failureModeIdx);
   });
 });
+
+describe('formatProjectContext — landed on HEAD marker', () => {
+  it('renders [landed on HEAD] for completed tasks with landed_on_head=true', () => {
+    const ctx = {
+      recently_completed_tasks: [
+        {
+          id: 'task-1',
+          title: 'Fix the auth bug',
+          task_type: 'fix',
+          status: 'COMPLETED',
+          landed_on_head: true,
+          pr_url: 'https://github.com/org/repo/pull/42',
+        },
+      ],
+    };
+    const result = formatProjectContext(ctx, 'research');
+    expect(result).toContain('[landed on HEAD]');
+    expect(result).toContain('Fix the auth bug');
+  });
+
+  it('does NOT render [landed on HEAD] for completed tasks with landed_on_head=false', () => {
+    const ctx = {
+      recently_completed_tasks: [
+        {
+          id: 'task-2',
+          title: 'Add feature X',
+          task_type: 'create',
+          status: 'COMPLETED',
+          landed_on_head: false,
+        },
+      ],
+    };
+    const result = formatProjectContext(ctx, 'research');
+    expect(result).not.toContain('[landed on HEAD]');
+    expect(result).toContain('Add feature X');
+  });
+
+  it('does NOT render [landed on HEAD] when landed_on_head is absent', () => {
+    const ctx = {
+      recently_completed_tasks: [
+        {
+          id: 'task-3',
+          title: 'Old task without field',
+          task_type: 'fix',
+          status: 'COMPLETED',
+        },
+      ],
+    };
+    const result = formatProjectContext(ctx, 'research');
+    expect(result).not.toContain('[landed on HEAD]');
+  });
+});
+
+describe('formatProjectContext — BLOCKED active tasks', () => {
+  it('renders BLOCKED tasks in active tasks section', () => {
+    const ctx = {
+      active_tasks: [
+        {
+          id: 'task-b1',
+          title: 'Implement feature Y',
+          task_type: 'create',
+          status: 'BLOCKED',
+          prompt: 'Implement the Y feature for users',
+          related_files: [],
+        },
+      ],
+    };
+    const result = formatProjectContext(ctx, 'research');
+    expect(result).toContain('Implement feature Y');
+    expect(result).toContain('BLOCKED');
+  });
+
+  it('adds BLOCKED framing note when BLOCKED tasks are present', () => {
+    const ctx = {
+      active_tasks: [
+        {
+          id: 'task-b2',
+          title: 'Stalled fix task',
+          task_type: 'fix',
+          status: 'BLOCKED',
+          prompt: 'Fix the stalled thing',
+          related_files: [],
+        },
+      ],
+    };
+    const result = formatProjectContext(ctx, 'research');
+    expect(result).toContain('NOTE: Tasks marked BLOCKED');
+    expect(result).toContain('do NOT propose findings');
+  });
+
+  it('does NOT add BLOCKED framing note when no BLOCKED tasks are present', () => {
+    const ctx = {
+      active_tasks: [
+        {
+          id: 'task-a1',
+          title: 'Active in-progress task',
+          task_type: 'create',
+          status: 'IN_PROGRESS',
+          prompt: 'Do active work',
+          related_files: [],
+        },
+      ],
+    };
+    const result = formatProjectContext(ctx, 'research');
+    expect(result).not.toContain('NOTE: Tasks marked BLOCKED');
+  });
+});

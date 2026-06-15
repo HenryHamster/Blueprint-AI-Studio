@@ -19,7 +19,6 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.direction_refractory import get_direction_refractory_info
-from app.research_direction_state import direction_dedup_deadlock_recovery_hours
 from app.strategic_completion import _is_code_failure_pause_reason
 from app.time_utils import _utcnow
 
@@ -436,11 +435,7 @@ async def _process_direction_lifecycle_locked(
             or not d.get("paused_at")
         ):
             continue
-        paused_reason = d.get("paused_reason", "")
-        if isinstance(paused_reason, str) and paused_reason.startswith("dedup_deadlock:"):
-            recovery_hours = direction_dedup_deadlock_recovery_hours()
-        else:
-            recovery_hours = default_recovery_hours
+        recovery_hours = default_recovery_hours
         hours = (
             _utcnow() - datetime.fromisoformat(d["paused_at"])
         ).total_seconds() / 3600

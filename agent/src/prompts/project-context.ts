@@ -82,6 +82,10 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   const activeTasks = ctx.active_tasks as Array<Record<string, unknown>> | undefined;
   if (activeTasks && activeTasks.length > 0) {
     activeLines.push('### Active Tasks');
+    const hasBlocked = activeTasks.some((t) => strVal(t.status) === 'BLOCKED');
+    if (hasBlocked) {
+      activeLines.push('NOTE: Tasks marked BLOCKED are stalled in-flight but not done — do NOT propose findings for problems they already address.');
+    }
     for (const t of activeTasks) {
       const files = (t.related_files as string[] | undefined);
       const filesSuffix = files && files.length > 0 ? ` (files: ${files.join(', ')})` : '';
@@ -224,7 +228,8 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
         promptSuffix = `\n  prompt: ${excerpt}`;
       }
     }
-    return `- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${summary}${failureSuffix}${reviewSuffix}${metaSuffix}${promptSuffix}`;
+    const landedMarker = t.landed_on_head === true ? ' [landed on HEAD]' : '';
+    return `- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${landedMarker}${summary}${failureSuffix}${reviewSuffix}${metaSuffix}${promptSuffix}`;
   };
 
   // Build direction-filtered recent tasks section — prioritized, shown before general recent
