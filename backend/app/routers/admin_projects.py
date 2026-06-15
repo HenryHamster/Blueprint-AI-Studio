@@ -1106,7 +1106,8 @@ async def get_direction_task_counts(
                 Task.context,
                 Task.title,
                 Task.latest_status_message,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .limit(5000)
     )
@@ -1287,7 +1288,8 @@ async def get_task_type_cost_adherence(
                 Task.vm_spot,
                 Task.vm_machine_type,
                 Task.vm_runtime_cost_banked_db,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .limit(10000)
     )
@@ -1369,13 +1371,17 @@ async def get_autonomous_status(
     ).all()
     tasks_per_project: dict = {row.project_id: row.cnt for row in orch_count_rows}
 
-    # Batch query: most recent autonomous task per project
+    # Batch query: most recent autonomous task per project (30-day lookback to
+    # avoid a full-table scan as task history grows; sufficient for rate display)
     last_research_subq = (
         select(
             Task.project_id,
             func.max(Task.created_at).label("max_created_at"),
         )
-        .where(Task.created_by == "ORCHESTRATOR")
+        .where(
+            Task.created_by == "ORCHESTRATOR",
+            Task.created_at >= _utcnow() - timedelta(days=30),
+        )
         .group_by(Task.project_id)
         .subquery()
     )

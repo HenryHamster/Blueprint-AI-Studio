@@ -77,6 +77,10 @@ _LANE_PILOT_KILL_COST_CEILING = 0.10  # cost-per-merged-PR >= +10% vs control
 _LANE_PILOT_KILL_GATE_VIOLATIONS_MAX = 3  # >= this → KILL + immediate operator alert
 _LANE_PILOT_KILL_CHECKPOINT_LOSS_CEILING = 0.05  # checkpoint-loss rate > this
 _LANE_PILOT_FUTILITY_N = 90  # n per arm without reaching adopt → KILL
+# Control-arm contamination guard: any control-arm task carrying a warm-resume
+# receipt means warm context leaked into the control arm.  Even one such task
+# invalidates the control baseline and triggers an immediate KILL + alert.
+_LANE_PILOT_KILL_CONTROL_WARM_RESUME_MAX = 0
 # ADOPT conditions
 _LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR = (
     -0.01
@@ -128,6 +132,10 @@ class LanePilotAggregates(TypedDict, total=False):
     # n_lane/n_control and from min_n threshold checks so they never influence
     # KILL/ADOPT verdict decisions — they are observational only.
     n_shadow: int
+    # Control-arm contamination: count of control-arm fix tasks that actually
+    # received a warm-resume receipt.  Under correct operation this is always 0;
+    # any non-zero value means warm context leaked into the control baseline.
+    control_warm_resume_count: int
 
 
 def is_lane_pilot_arm_member(context: dict[str, Any]) -> str | None:
@@ -180,6 +188,7 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
     warm_resume_fraction = aggregates.get("warm_resume_fraction")
     checkpoint_fraction = aggregates.get("checkpoint_fraction")
     lane_fix_tasks_sampled = int(aggregates.get("lane_fix_tasks_sampled") or 0)
+    control_warm_resume_count = int(aggregates.get("control_warm_resume_count") or 0)
 
     thresholds = {
         "min_n": _LANE_PILOT_MIN_N,
@@ -187,6 +196,7 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
         "kill_cost_ceiling": _LANE_PILOT_KILL_COST_CEILING,
         "kill_gate_violations_max": _LANE_PILOT_KILL_GATE_VIOLATIONS_MAX,
         "kill_checkpoint_loss_ceiling": _LANE_PILOT_KILL_CHECKPOINT_LOSS_CEILING,
+        "kill_control_warm_resume_max": _LANE_PILOT_KILL_CONTROL_WARM_RESUME_MAX,
         "futility_n": _LANE_PILOT_FUTILITY_N,
         "adopt_merge_lift_floor": _LANE_PILOT_ADOPT_MERGE_LIFT_FLOOR,
         "adopt_cost_improvement": _LANE_PILOT_ADOPT_COST_IMPROVEMENT,
@@ -209,6 +219,7 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
         "warm_resume_fraction": warm_resume_fraction,
         "checkpoint_fraction": checkpoint_fraction,
         "lane_fix_tasks_sampled": lane_fix_tasks_sampled,
+        "control_warm_resume_count": control_warm_resume_count,
         "thresholds": thresholds,
     }
 
@@ -221,6 +232,17 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
             **base,
             "verdict": "KILL",
             "verdict_reason": "gate_integrity_violations_exceeded",
+            "immediate_alert": True,
+        }
+
+    # Control-arm contamination: warm context must never reach control tasks.
+    # Any non-zero count means the comparison baseline is invalid — KILL + alert
+    # regardless of sample size, identical to gate_integrity_violations priority.
+    if control_warm_resume_count > _LANE_PILOT_KILL_CONTROL_WARM_RESUME_MAX:
+        return {
+            **base,
+            "verdict": "KILL",
+            "verdict_reason": "control_arm_warm_resume_contamination",
             "immediate_alert": True,
         }
 

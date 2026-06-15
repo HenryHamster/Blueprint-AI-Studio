@@ -1868,6 +1868,32 @@ async def compute_lane_pilot_aggregates(
         )
     gate_integrity_violations = int((await session.execute(_gate_stmt)).scalar() or 0)
 
+    # ── Control-arm contamination: warm-resume receipts on control fix tasks ──
+    # Under correct operation control-arm fix tasks NEVER carry a warm-resume
+    # receipt — they always run cold.  Any non-zero count means the gate that
+    # guards confirm_lane_warm_resume was bypassed and the control baseline is
+    # contaminated.  Even one such task invalidates the comparison.
+    if is_sqlite:
+        _ctrl_warm_stmt = select(func.count(Task.id)).where(
+            Task.project_id == project_id,
+            func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}")
+            == "control",
+            func.json_extract(
+                Task.context, f"$.{LANE_PILOT_WARM_RESUME_RECEIPT_KEY}"
+            ).isnot(None),
+            func.json_extract(Task.payloads, "$[0].type").in_(["fix", "implement"]),
+        )
+    else:
+        _ctrl_warm_stmt = select(func.count(Task.id)).where(
+            Task.project_id == project_id,
+            Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext == "control",
+            Task.context[LANE_PILOT_WARM_RESUME_RECEIPT_KEY].isnot(None),
+            Task.payloads[0]["type"].as_string().in_(["fix", "implement"]),
+        )
+    control_warm_resume_count = int(
+        (await session.execute(_ctrl_warm_stmt)).scalar() or 0
+    )
+
     # ── Treatment-engagement receipts (warm-resume + checkpoint) ─────────────
     # Among terminal lane-arm fix-phase tasks, count chains where at least one
     # fix task in the chain carried each durable receipt.  Grouping by chain
@@ -1995,6 +2021,7 @@ async def compute_lane_pilot_aggregates(
         "lane_reserved_idle_cost_per_merged": lane_reserved_idle_cost_per_merged,
         "control_reserved_idle_cost_per_merged": control_reserved_idle_cost_per_merged,
         "gate_integrity_violations": gate_integrity_violations,
+        "control_warm_resume_count": control_warm_resume_count,
         "checkpoint_loss_rate": checkpoint_loss_rate,
         "checkpoint_attempts_total": checkpoint_attempts_total,
         "checkpoint_requeues_total": checkpoint_requeues_total,

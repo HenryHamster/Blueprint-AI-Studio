@@ -2011,7 +2011,7 @@ class PoolVm(SQLModel, table=True):
     # id so the lane's next phase can reclaim its warm workspace. Plain GUID — no
     # FK, mirrors leased_task_id — so a lane row can be archived independently.
     reserved_lane_id: uuid.UUID | None = Field(
-        default=None, sa_column=Column(GUID(), nullable=True)
+        default=None, sa_column=Column(GUID(), nullable=True, index=True)
     )
     # SOFT reservation expiry. The maintainer's liveness-aware sweep may RE-STAMP
     # this forward (extend) while the owning lane is still awaiting its fix, so it

@@ -15980,6 +15980,12 @@ class TestImprovementLaneSettings:
         assert "improvement_lanes_enabled" in data
         assert "review_fix_lane_pilot_enabled" in data
 
+        # warm_pool_enabled is required; enable it first.
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_pool_enabled": True}
+        )
+        assert resp.status_code == 200
+
         # Enable improvement_lanes_enabled.
         resp = await client.patch(
             "/api/admin/settings", json={"improvement_lanes_enabled": True}
@@ -16032,6 +16038,50 @@ class TestImprovementLaneSettings:
             "unknown settings key" in resp.text.lower()
             or "improvement_lanes_enabld" in resp.text
         )
+
+    @pytest.mark.asyncio
+    async def test_improvement_lanes_enforces_warm_pool_enabled(
+        self, client: AsyncClient
+    ):
+        """Enabling improvement_lanes_enabled fails if warm_pool_enabled is false."""
+        # First disable warm_pool_enabled.
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_pool_enabled": False}
+        )
+        assert resp.status_code == 200
+
+        # Attempt to enable improvement_lanes_enabled should fail with 422.
+        resp = await client.patch(
+            "/api/admin/settings", json={"improvement_lanes_enabled": True}
+        )
+        assert resp.status_code == 422
+        data = resp.json()
+        error_msg = data.get("error", {}).get("message", {})
+        assert isinstance(error_msg, dict)
+        assert error_msg.get("warm_pool_enabled") == "not met"
+        assert "warm_pool_enabled=true" in error_msg.get("fix_hint", "")
+
+    @pytest.mark.asyncio
+    async def test_review_fix_lane_pilot_enforces_warm_pool_enabled(
+        self, client: AsyncClient
+    ):
+        """Enabling review_fix_lane_pilot_enabled fails if warm_pool_enabled is false."""
+        # First disable warm_pool_enabled.
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_pool_enabled": False}
+        )
+        assert resp.status_code == 200
+
+        # Attempt to enable review_fix_lane_pilot_enabled should fail with 422.
+        resp = await client.patch(
+            "/api/admin/settings", json={"review_fix_lane_pilot_enabled": True}
+        )
+        assert resp.status_code == 422
+        data = resp.json()
+        error_msg = data.get("error", {}).get("message", {})
+        assert isinstance(error_msg, dict)
+        assert error_msg.get("warm_pool_enabled") == "not met"
+        assert "warm_pool_enabled=true" in error_msg.get("fix_hint", "")
 
 
 # ---------------------------------------------------------------------------

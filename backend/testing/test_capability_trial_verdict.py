@@ -2441,6 +2441,55 @@ class TestEvaluateLanePilotVerdictEngagement:
         assert "futility_min_engagement" in result["thresholds"]
 
 
+class TestEvaluateLanePilotVerdictControlWarmResume:
+    """Control-arm contamination guard: any control fix task with a warm-resume
+    receipt means the baseline is invalid — KILL + immediate alert, regardless
+    of sample size."""
+
+    def test_control_warm_resume_kills_immediately(self):
+        """Acceptance: control_warm_resume_count=1 triggers KILL with immediate_alert
+        and verdict_reason=control_arm_warm_resume_contamination."""
+        aggs = _good_aggs()  # ADOPT-territory data
+        aggs["control_warm_resume_count"] = 1
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "control_arm_warm_resume_contamination"
+        assert result["immediate_alert"] is True
+
+    def test_control_warm_resume_zero_does_not_kill(self):
+        """control_warm_resume_count=0 must not trigger the contamination branch;
+        an otherwise-healthy trial should still CONTINUE or ADOPT."""
+        aggs = _good_aggs()
+        aggs["control_warm_resume_count"] = 0
+        result = evaluate_lane_pilot_verdict(aggs)
+        # ADOPT-territory: must NOT be KILL from the contamination path
+        assert result["verdict"] in ("ADOPT", "CONTINUE")
+        assert result.get("verdict_reason") != "control_arm_warm_resume_contamination"
+
+    def test_control_warm_resume_kills_below_min_n(self):
+        """Contamination fires even before minimum sample size is reached."""
+        aggs = _good_aggs(n=5)  # well below min_n=30
+        aggs["control_warm_resume_count"] = 2
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["verdict"] == "KILL"
+        assert result["verdict_reason"] == "control_arm_warm_resume_contamination"
+        assert result["immediate_alert"] is True
+
+    def test_control_warm_resume_count_propagated_in_snapshot(self):
+        """control_warm_resume_count appears in the returned verdict dict."""
+        aggs = _good_aggs(n=10)
+        aggs["control_warm_resume_count"] = 3
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert result["control_warm_resume_count"] == 3
+
+    def test_control_warm_resume_max_threshold_in_thresholds_snapshot(self):
+        """thresholds dict includes kill_control_warm_resume_max."""
+        aggs = _good_aggs(n=10)
+        result = evaluate_lane_pilot_verdict(aggs)
+        assert "kill_control_warm_resume_max" in result["thresholds"]
+        assert result["thresholds"]["kill_control_warm_resume_max"] == 0
+
+
 # ── Lane relay comparison structure ──────────────────────────────────────────
 
 
