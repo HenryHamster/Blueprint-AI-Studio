@@ -19099,6 +19099,205 @@ async def test_viewport_shots_download_url_non_member_rejected(
 
 
 # ---------------------------------------------------------------------------
+# Agent-token viewport download endpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_failure_screenshot_download_url(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent with matching project_id gets a signed download URL for a failure screenshot."""
+    project = Project(name="Agent VP Fail DL Test", user_id="user-agent-vpdl-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp"}],
+        vm_instance_id="vm-agent-vpdl-001",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/vp-fail-dl?X-Goog-Signature=abc"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(
+        str(task.id), "vm-agent-vpdl-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/agent/viewport/failure-screenshot-download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "ChatPanel",
+            "width": 375,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_failure_screenshot_download_url_cross_project_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT scoped to a different project is denied with 403."""
+    project_a = Project(name="Agent VP Fail DL Proj A", user_id="user-agent-vpdl-002")
+    project_b = Project(name="Agent VP Fail DL Proj B", user_id="user-agent-vpdl-003")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task = Task(
+        project_id=project_a.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp cross"}],
+        vm_instance_id="vm-agent-vpdl-002",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Token is for project_a's task but request asks for project_b
+    token = create_agent_token(str(task.id), "vm-agent-vpdl-002")
+    resp = await client.get(
+        "/api/agent/viewport/failure-screenshot-download-url",
+        params={
+            "project_id": str(project_b.id),
+            "component": "ChatPanel",
+            "width": 375,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_viewport_shots_download_url_agent_cross_task_denied(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT scoped to task_a cannot download screenshots for task_b."""
+    project = Project(name="Agent VP Shot DL Test", user_id="user-agent-vpshot-dl-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-agent-vpshot-dl-001",
+    )
+    task_b = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-agent-vpshot-dl-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # Token is for task_a; request asks for task_b's screenshots
+    token = create_agent_token(str(task_a.id), "vm-agent-vpshot-dl-001")
+    resp = await client.get(
+        "/api/agent/viewport/screenshot-download-url",
+        params={
+            "task_id": str(task_b.id),
+            "name": "TaskCard-375-before",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_screenshot_download_url(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent with matching task_id gets a signed download URL for a task screenshot."""
+    project = Project(name="Agent VP Shot DL OK", user_id="user-agent-vpshot-dl-002")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp shot"}],
+        vm_instance_id="vm-agent-vpshot-dl-003",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/vp-shot-dl?X-Goog-Signature=xyz"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(str(task.id), "vm-agent-vpshot-dl-003")
+    resp = await client.get(
+        "/api/agent/viewport/screenshot-download-url",
+        params={
+            "task_id": str(task.id),
+            "name": "TaskCard-375-before",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_screenshot_download_url_storage_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """GCS failure from the agent download path surfaces as 503."""
+    project = Project(name="Agent VP Shot DL Fail", user_id="user-agent-vpshot-dl-003")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp shot fail"}],
+        vm_instance_id="vm-agent-vpshot-dl-004",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("gcs unavailable")),
+    )
+
+    token = create_agent_token(str(task.id), "vm-agent-vpshot-dl-004")
+    resp = await client.get(
+        "/api/agent/viewport/screenshot-download-url",
+        params={
+            "task_id": str(task.id),
+            "name": "TaskCard-375-before",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
 # Account-state-correlated RATE_LIMIT requeue tests (cluster 2/4)
 # ---------------------------------------------------------------------------
 

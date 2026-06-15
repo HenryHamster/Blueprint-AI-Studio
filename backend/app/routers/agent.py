@@ -733,7 +733,8 @@ async def _refresh_sr_catch_rate(
                         Task.project_id,
                         Task.strategic_cycle_id,
                         Task.payloads,
-                    raiseload=True,)
+                        raiseload=True,
+                    )
                 )
                 .where(*_where)
                 .order_by(Task.created_at.desc())
@@ -1055,7 +1056,8 @@ async def claim_task(
             Task.payloads,
             Task.context,
             Task.project_id,
-        raiseload=True,)
+            raiseload=True,
+        )
         _active_queued_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1125,7 +1127,8 @@ async def claim_task(
             Task.model,
             Task.strategic_cycle_id,
             Task.fix_loop_history,
-        raiseload=True,)
+            raiseload=True,
+        )
         _terminal_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1212,7 +1215,8 @@ async def claim_task(
             Task.model,
             Task.strategic_cycle_id,
             Task.fix_loop_history,
-        raiseload=True,)
+            raiseload=True,
+        )
         _history_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1517,7 +1521,8 @@ async def claim_task(
                 Task.account_id,
                 Task.provider,
                 Task.model,
-            raiseload=True,)
+                raiseload=True,
+            )
             _sibling_ranked = (
                 select(
                     Task.id.label("task_id"),
@@ -2210,7 +2215,11 @@ async def claim_task(
                         await session.execute(
                             select(Task)
                             .where(Task.id.in_(_parsed_ids))
-                            .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
+                            .options(
+                                load_only(
+                                    Task.id, Task.status, Task.context, raiseload=True
+                                )
+                            )
                         )
                     ).scalars()
                     for _src_task in _src_rows:
@@ -3424,7 +3433,13 @@ async def claim_task(
                     Task.created_at > _utcnow() - timedelta(days=14),
                 )
                 .options(
-                    load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True)
+                    load_only(
+                        Task.id,
+                        Task.context,
+                        Task.payloads,
+                        Task.created_at,
+                        raiseload=True,
+                    )
                 )
                 .order_by(Task.created_at.desc())
                 .limit(2000)
@@ -4072,6 +4087,99 @@ async def get_viewport_screenshot_upload_url(
     await session.commit()
 
     return {"upload_url": upload_url, "storage_uri": storage_uri}
+
+
+@router.get("/viewport/failure-screenshot-download-url")
+@limiter.limit("120/minute")
+async def get_viewport_failure_screenshot_download_url_agent(
+    request: Request,
+    project_id: uuid.UUID,
+    component: str,
+    width: int,
+    token: dict = Depends(verify_agent_token),
+):
+    """Generate a signed download URL for a viewport failure screenshot (agent-token path).
+
+    Scoped to the agent's own project_id claim — cross-project reads are denied.
+    The GCS path mirrors the upload endpoint exactly so agents can read back what
+    they uploaded without a separate admin-auth round-trip.
+    """
+    if str(project_id) != token.get("project_id"):
+        raise HTTPException(status_code=403, detail="Project ID mismatch")
+
+    from app.storage import (
+        ARTIFACT_BUCKET_NAME,
+        StorageUriError,
+        generate_download_signed_url,
+    )
+    from app.viewport_evidence import viewport_object_name
+
+    object_name = viewport_object_name(project_id, component, width)
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    try:
+        url = await generate_download_signed_url(storage_uri, expiration_minutes=60)
+    except StorageUriError as exc:
+        logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
+        raise HTTPException(
+            status_code=400, detail="Invalid screenshot reference"
+        ) from exc  # noqa: B904
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(
+            status_code=503, detail="Artifact storage unavailable"
+        ) from exc  # noqa: B904
+    return {"url": url}
+
+
+@router.get("/viewport/screenshot-download-url")
+@limiter.limit("120/minute")
+async def get_viewport_screenshot_download_url_agent(
+    request: Request,
+    task_id: uuid.UUID,
+    name: str,
+    token: dict = Depends(verify_agent_token),
+):
+    """Generate a signed download URL for a task-scoped viewport screenshot (agent-token path).
+
+    Scoped to the agent's own task (sub claim) — cross-task reads are denied.
+    The GCS path mirrors the upload endpoint exactly.
+    """
+    import re as _re
+
+    if str(task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    from app.storage import (
+        ARTIFACT_BUCKET_NAME,
+        StorageUriError,
+        generate_download_signed_url,
+    )
+
+    _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
+    safe_name = _SAFE_NAME_RE.sub("_", name)
+
+    project_id = token.get("project_id")
+    object_name = f"viewport-shots/{project_id}/{task_id}/{safe_name}.png"
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    try:
+        url = await generate_download_signed_url(storage_uri, expiration_minutes=60)
+    except StorageUriError as exc:
+        logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
+        raise HTTPException(
+            status_code=400, detail="Invalid screenshot reference"
+        ) from exc  # noqa: B904
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(
+            status_code=503, detail="Artifact storage unavailable"
+        ) from exc  # noqa: B904
+    return {"url": url}
 
 
 # Beacon prefix → _cold_start_stages key mapping for per-stage breakdown.
