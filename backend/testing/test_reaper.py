@@ -11421,6 +11421,18 @@ def _no_broadcast(mocker):
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_fleet_scan_cadence_globals():
+    """Reset fleet-scan cadence globals before each test so earlier tests that invoke
+    the reaper sweep train (which sets these module-level timestamps) cannot gate
+    functional unit tests that call the sweeps directly within the 15-min window."""
+    _rs._last_converge_duplicate_scan = None
+    _rs._last_merge_gate_degradation_scan = None
+    yield
+    _rs._last_converge_duplicate_scan = None
+    _rs._last_merge_gate_degradation_scan = None
+
+
 @pytest.mark.asyncio
 async def test_converge_genuine_cross_parent_duplicate_wires_edge(
     reaper_db, _no_broadcast
@@ -13730,3 +13742,193 @@ async def test_wake_delivery_stall_raises_operator_alert(reaper_db, mocker):
     assert dismissed[0].dismissed_at is not None
 
     reset_wake_delivery_stall_state()
+
+
+# ── Fleet-scan cadence gates and limits (Part A) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sweep_converge_duplicate_foundations_cadence_gate(mocker):
+    """Second call within _FLEET_SCAN_INTERVAL_SECONDS is a no-op (returns 0)."""
+    _rs._last_converge_duplicate_scan = None  # ensure first call is allowed
+    mocker.patch(
+        "app.digest_metrics.compute_foundation_convergence_actions",
+        return_value=[],
+    )
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(
+        return_value=AsyncMock(scalars=lambda: AsyncMock(all=lambda: []))
+    )
+    first = await _rs.sweep_converge_duplicate_foundations(mock_session)
+    second = await _rs.sweep_converge_duplicate_foundations(mock_session)
+    assert first == 0, "first call returns 0 when no convergence actions"
+    assert second == 0, "cadence gate must suppress second call within 15 min"
+    # Confirm it was actually gated: execute was only called once (first pass).
+    assert mock_session.execute.await_count == 1, (
+        "second call must not hit the DB at all"
+    )
+    _rs._last_converge_duplicate_scan = None  # restore for test isolation
+
+
+@pytest.mark.asyncio
+async def test_sweep_converge_duplicate_foundations_scan_carries_limit(mocker):
+    """The active-task scan must include LIMIT 500 so it cannot read the full fleet."""
+    _rs._last_converge_duplicate_scan = None
+    mocker.patch(
+        "app.digest_metrics.compute_foundation_convergence_actions",
+        return_value=[],
+    )
+    captured_queries: list = []
+
+    class _CapturingResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    async def _execute(stmt, *a, **kw):
+        captured_queries.append(stmt)
+        return _CapturingResult()
+
+    mock_session = AsyncMock()
+    mock_session.execute = _execute
+    await _rs.sweep_converge_duplicate_foundations(mock_session)
+
+    assert captured_queries, "expected at least one SELECT"
+    import sqlalchemy.dialects.sqlite
+
+    dialect = sqlalchemy.dialects.sqlite.dialect()
+    compiled = str(captured_queries[0].compile(dialect=dialect)).upper()
+    assert "LIMIT" in compiled, (
+        "sweep_converge_duplicate_foundations must apply LIMIT to active-task scan"
+    )
+    _rs._last_converge_duplicate_scan = None
+
+
+@pytest.mark.asyncio
+async def test_sweep_merge_gate_degradation_cadence_gate(mocker):
+    """Second call within _FLEET_SCAN_INTERVAL_SECONDS is a no-op (returns 0)."""
+    _rs._last_merge_gate_degradation_scan = None
+    # Return a below-minimum-sample result so the function returns 0 cleanly on the
+    # first call without needing to mock the alert-dispatch path.
+    fleet_health_mock = mocker.patch(
+        "app.digest_metrics.compute_merge_gate_fleet_health",
+        new_callable=AsyncMock,
+        return_value={
+            "verified_count": 0,
+            "fell_open_count": 0,
+            "verification_rate": None,
+            "degraded_project_count": 0,
+            "project_count": 0,
+            "most_common_reason": None,
+        },
+    )
+    mock_session = AsyncMock()
+    await _rs.sweep_merge_gate_verification_degradation(mock_session)
+    second = await _rs.sweep_merge_gate_verification_degradation(mock_session)
+    assert second == 0, "cadence gate must suppress second call within 15 min"
+    fleet_health_mock.assert_awaited_once()  # only called on first pass; gate suppresses second
+    _rs._last_merge_gate_degradation_scan = None
+
+
+# ── run_infra_recovery_and_hold_maintenance LIMIT 200 ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_infra_recovery_query_carries_limit(reaper_db, mocker):
+    """_infra_query must cap at 200 rows so large FAILED backlogs don't stall."""
+    from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
+
+    captured_queries: list = []
+    _orig_execute = reaper_db.execute
+
+    async def _spy_execute(stmt, *a, **kw):
+        captured_queries.append(stmt)
+        return await _orig_execute(stmt, *a, **kw)
+
+    mocker.patch.object(reaper_db, "execute", side_effect=_spy_execute)
+    mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+    )
+
+    now = _utcnow()
+    await run_infra_recovery_and_hold_maintenance(reaper_db, now)
+
+    import sqlalchemy.dialects.sqlite
+
+    dialect = sqlalchemy.dialects.sqlite.dialect()
+    failed_scans = [
+        str(q.compile(dialect=dialect)).upper()
+        for q in captured_queries
+        if hasattr(q, "compile")
+        and "TASK" in str(q.compile(dialect=dialect)).upper()
+        and "FAILED" in str(q.compile(dialect=dialect)).upper()
+    ]
+    assert failed_scans, "expected at least one FAILED task scan"
+    assert any("LIMIT" in s for s in failed_scans), (
+        "run_infra_recovery_and_hold_maintenance must apply LIMIT 200 to the FAILED task scan"
+    )
+
+
+# ── sweep_unblock_blocked_tasks: per-row lock (no batch lock during GitHub) ──
+
+
+@pytest.mark.asyncio
+async def test_sweep_unblock_per_row_commit_releases_lock_between_tasks(
+    reaper_db, mocker
+):
+    """Each task must be committed (lock released) before the next task is processed.
+
+    The lock-across-network anti-pattern held a batch FOR UPDATE across 200 rows
+    for the entire GitHub-call window.  The fix: lock-free pre-scan collects IDs,
+    then per-row FOR UPDATE is acquired and released (committed) per task.
+
+    Verify the per-row commit property: for 2 due BLOCKED tasks, the session must
+    commit once per task (>= 2 commits), proving each row's lock is released before
+    the next iteration begins rather than being held for the whole batch.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+
+    # Two BLOCKED tasks due now, escalated transient blockers — both flow through
+    # the full iteration body and each exit via _commit_task_row().
+    common = dict(
+        project_id=project.id,
+        title="unblock-locktest",
+        description="x",
+        status=TaskStatus.BLOCKED,
+        created_by="test-user",
+        requires_approval=False,
+        payloads=[{"type": "fix"}],
+        status_log=[],
+        blocker_kind="pending_rollup",
+        blocked_reason="Waiting: pending rollup",
+        blocked_at=_utcnow(),
+        recheck_after=_utcnow() - timedelta(minutes=1),
+        context={"_blocked_escalated": True},
+        depends_on=[],
+    )
+    t1 = Task(**common)
+    t2 = Task(**{**common, "title": "unblock-locktest-2"})
+    reaper_db.add(t1)
+    reaper_db.add(t2)
+    await reaper_db.commit()
+
+    commit_count = [0]
+    _orig_commit = reaper_db.commit
+
+    async def _counting_commit():
+        commit_count[0] += 1
+        return await _orig_commit()
+
+    mocker.patch.object(reaper_db, "commit", side_effect=_counting_commit)
+
+    await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    # Each of the 2 tasks must produce its own commit so the FOR UPDATE lock
+    # is released before the next task's processing begins.
+    assert commit_count[0] >= 2, (
+        f"expected at least 2 per-row commits for 2 tasks, got {commit_count[0]}; "
+        "the per-row lock is not being released between tasks"
+    )

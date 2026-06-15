@@ -62,7 +62,9 @@ async def _sweep_orphan_direction_holds(session) -> int:
     projects = (
         (
             await session.execute(
-                select(Project).options(load_only(Project.id, Project.directions, raiseload=True))
+                select(Project).options(
+                    load_only(Project.id, Project.directions, raiseload=True)
+                )
             )
         )
         .scalars()
@@ -239,17 +241,18 @@ async def run_infra_recovery_and_hold_maintenance(
         # per-task reap crash rolls back + expires every orphaned_tasks
         # object, so reading t.id here would raise MissingGreenlet.
         _just_reaped_ids = set(just_reaped_ids or [])
-        _infra_query = select(Task).where(
-            Task.status == TaskStatus.FAILED,
-            Task.updated_at >= _infra_lookback,
+        _infra_query = (
+            select(Task)
+            .where(
+                Task.status == TaskStatus.FAILED,
+                Task.updated_at >= _infra_lookback,
+            )
+            .order_by(Task.updated_at.desc())
+            .limit(200)
         )
         if _just_reaped_ids:
-            _infra_query = _infra_query.where(
-                Task.id.notin_(_just_reaped_ids)
-            )
-        _infra_failed = (
-            (await session.execute(_infra_query)).scalars().all()
-        )
+            _infra_query = _infra_query.where(Task.id.notin_(_just_reaped_ids))
+        _infra_failed = (await session.execute(_infra_query)).scalars().all()
 
         # Parent tasks (those with children) must not be resurrected as leaf
         # dispatches — they only fail via _requeue_parent_task after exhausting
@@ -272,9 +275,7 @@ async def run_infra_recovery_and_hold_maintenance(
                 .scalars()
                 .all()
             )
-            _parent_ids_with_children = {
-                pid for pid in _child_rows if pid is not None
-            }
+            _parent_ids_with_children = {pid for pid in _child_rows if pid is not None}
 
         # Pre-compute idempotency_keys already held by an ACTIVE task.
         # Resurrection flips FAILED→QUEUED, which enters the partial unique
@@ -370,9 +371,9 @@ async def run_infra_recovery_and_hold_maintenance(
                 _task_model = _extract_task_model(_t)
                 _task_type = (_t.first_payload or {}).get("type", "create")
                 if not _task_model:
-                    _task_model = _runtime_config.get(
-                        "task_type_models", {}
-                    ).get(_task_type)
+                    _task_model = _runtime_config.get("task_type_models", {}).get(
+                        _task_type
+                    )
                 _blacklisted = set(_ctx.get("blacklisted_accounts") or [])
                 _accounts = _all_accounts()
                 _infra_ready = any(
@@ -404,9 +405,7 @@ async def run_infra_recovery_and_hold_maintenance(
                 f"(failure_category={_fail_cat}) — infrastructure recovered"
             )
             _new_ctx = dict(_ctx)
-            _new_ctx["_resurrection_count"] = (
-                _ctx.get("_resurrection_count", 0) + 1
-            )
+            _new_ctx["_resurrection_count"] = _ctx.get("_resurrection_count", 0) + 1
             _new_ctx["_resurrected_from"] = _fail_cat
             # Clear all infra retry state so the task runs like a fresh dispatch.
             _new_ctx.pop("provision_failures", None)
@@ -431,16 +430,13 @@ async def run_infra_recovery_and_hold_maintenance(
             _t.last_heartbeat = None
             _t.started_at = None
             _t.latest_status_message = (
-                f"Auto-resurrected after infrastructure recovery "
-                f"(was: {_fail_cat})"
+                f"Auto-resurrected after infrastructure recovery (was: {_fail_cat})"
             )
             session.add(_t)
 
             # INFO alert so the user knows recovery happened.
             try:
-                _task_type_label = (_t.first_payload or {}).get(
-                    "type", "unknown"
-                )
+                _task_type_label = (_t.first_payload or {}).get("type", "unknown")
                 _res_alert = Alert(
                     project_id=_t.project_id,
                     severity=AlertSeverity.INFO,
@@ -471,14 +467,10 @@ async def run_infra_recovery_and_hold_maintenance(
 
         if _resurrected:
             await session.commit()
-            logger.info(
-                f"[REAPER] Resurrected {_resurrected} infra-failed task(s)"
-            )
+            logger.info(f"[REAPER] Resurrected {_resurrected} infra-failed task(s)")
 
     except Exception as e:
-        logger.error(
-            f"[REAPER] Infra recovery sweep error: {e}", exc_info=True
-        )
+        logger.error(f"[REAPER] Infra recovery sweep error: {e}", exc_info=True)
         await _safe_rollback(session)
 
     # Step 5a: Clear infra holds on directions whose root-cause signal has recovered.
@@ -497,10 +489,7 @@ async def run_infra_recovery_and_hold_maintenance(
 
         _cleared_holds = 0
         for _did, _streak in list(direction_failure_streaks.items()):
-            if (
-                not _streak.get("held")
-                or _streak.get("held_reason") != "infra"
-            ):
+            if not _streak.get("held") or _streak.get("held_reason") != "infra":
                 continue
             _fc = (
                 _streak.get("held_failure_class")
@@ -516,8 +505,7 @@ async def run_infra_recovery_and_hold_maintenance(
                 _ready = any_zone_available()
             elif _fc == "RATE_LIMIT":
                 _ready = any(
-                    _account_available_for_model(acct, None)
-                    for acct in _all_accounts()
+                    _account_available_for_model(acct, None) for acct in _all_accounts()
                 )
             elif _fc == "EXTERNAL_API":
                 _ready = _external_health.get(
@@ -531,9 +519,7 @@ async def run_infra_recovery_and_hold_maintenance(
                     f"(signal {_fc} recovered)"
                 )
         if _cleared_holds:
-            logger.info(
-                f"[REAPER] Cleared {_cleared_holds} infra direction hold(s)"
-            )
+            logger.info(f"[REAPER] Cleared {_cleared_holds} infra direction hold(s)")
     except Exception as e:
         logger.error(
             f"[REAPER] Infra direction hold recovery error: {e}",
@@ -568,13 +554,9 @@ async def run_infra_recovery_and_hold_maintenance(
 
         _mem_pruned = sweep_stale_in_memory_state()
         if any(_mem_pruned.values()):
-            logger.info(
-                f"[REAPER] Pruned idle in-memory state: {_mem_pruned}"
-            )
+            logger.info(f"[REAPER] Pruned idle in-memory state: {_mem_pruned}")
     except Exception as e:
-        logger.error(
-            f"[REAPER] In-memory state sweep error: {e}", exc_info=True
-        )
+        logger.error(f"[REAPER] In-memory state sweep error: {e}", exc_info=True)
 
     # Step 5b: Clear stale or malformed retry_after on QUEUED tasks.
     # A far-future or unparseable value permanently blocks dispatch
@@ -703,13 +685,9 @@ async def run_infra_recovery_and_hold_maintenance(
             _cleared += 1
         if _cleared:
             await session.commit()
-            logger.info(
-                f"[REAPER] Cleared stale retry_after on {_cleared} task(s)"
-            )
+            logger.info(f"[REAPER] Cleared stale retry_after on {_cleared} task(s)")
     except Exception as e:
-        logger.error(
-            f"[REAPER] Stale retry_after sweep error: {e}", exc_info=True
-        )
+        logger.error(f"[REAPER] Stale retry_after sweep error: {e}", exc_info=True)
         await _safe_rollback(session)
 
     # Step 5e: Close ACTIVE ResidualRemediationCase rows whose fingerprint
@@ -720,7 +698,5 @@ async def run_infra_recovery_and_hold_maintenance(
     try:
         await _sweep_stale_residual_cases(session)
     except Exception as e:
-        logger.error(
-            f"[REAPER] Stale residual case sweep error: {e}", exc_info=True
-        )
+        logger.error(f"[REAPER] Stale residual case sweep error: {e}", exc_info=True)
         await _safe_rollback(session)

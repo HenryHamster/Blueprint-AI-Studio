@@ -35,6 +35,12 @@ _PRECONDITION_DEFER_PREFIX = "Waiting:"
 _REGRESSION_SCAN_INTERVAL_SECONDS = 15 * 60
 _last_regression_scan: datetime | None = None
 
+# Cadence gate for fleet-wide scans that are expensive but need not run every
+# reaper tick (60s).  900s = 15 min matches the regression-scan interval.
+_FLEET_SCAN_INTERVAL_SECONDS = 15 * 60
+_last_converge_duplicate_scan: datetime | None = None
+_last_merge_gate_degradation_scan: datetime | None = None
+
 
 async def _run_regression_scan_and_notify(session) -> int:
     """Run the (provider, model) regression scan and fan out alerts per fired event.
@@ -1017,9 +1023,19 @@ async def sweep_converge_duplicate_foundations(session, now=None) -> int:
         compute_foundation_convergence_actions,
     )
 
+    global _last_converge_duplicate_scan
+    _now = now or _utcnow()
+    if (
+        _last_converge_duplicate_scan is not None
+        and (_now - _last_converge_duplicate_scan).total_seconds()
+        < _FLEET_SCAN_INTERVAL_SECONDS
+    ):
+        return 0
+    _last_converge_duplicate_scan = _now
+
     active = [TaskStatus(s) for s in ACTIVE_CANDIDATE_STATUSES]
     rows = (
-        (await session.execute(select(Task).where(Task.status.in_(active))))
+        (await session.execute(select(Task).where(Task.status.in_(active)).limit(500)))
         .scalars()
         .all()
     )
@@ -1530,23 +1546,28 @@ async def sweep_unblock_blocked_tasks(
 
         verify_pr_merged = _verify_pr_merged
 
-    due_stmt = (
-        select(Task)
+    # Lock-free pre-scan: collect IDs without holding a batch of row locks across
+    # the per-task GitHub calls (_blocked_precondition_state → verify_pr_merged,
+    # up to 120s each). A batch FOR UPDATE on 200 rows held that entire window —
+    # a lock-across-network anti-pattern that starved agent heartbeats and drove
+    # idle_in_transaction_session_timeout kills. Instead: scan IDs advisory-only,
+    # re-acquire a single-row FOR UPDATE SKIP LOCKED at the top of each iteration,
+    # and commit (releasing that lock) before moving to the next task's I/O.
+    due_id_stmt = (
+        select(Task.id)
         .where(
             Task.status == TaskStatus.BLOCKED,
             (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
         )
         .order_by(Task.recheck_after.asc().nullsfirst())
         .limit(batch_size)
-        .with_for_update(skip_locked=True)
     )
-    due = (await session.execute(due_stmt)).scalars().all()
-    if not due:
+    due_ids = (await session.execute(due_id_stmt)).scalars().all()
+    if not due_ids:
         return 0
 
     requeued = 0
-    changed = False
-    # task_updated broadcasts are deferred until after the batch commit so the
+    # task_updated broadcasts are deferred until after the per-row commit so the
     # admin UI (which refetches task/digest data on these events) never observes
     # a stale BLOCKED row — or, on rollback, a transition that never persisted.
     pending_broadcasts: list[tuple[str, dict]] = []
@@ -1607,7 +1628,48 @@ async def sweep_unblock_blocked_tasks(
         )
         session.add(task)
 
-    for task in due:
+    async def _commit_task_row(bc_start: int) -> None:
+        """Commit this task's mutations and emit its deferred broadcasts.
+
+        Called at every loop-exit point (explicit ``continue`` or fall-through)
+        so the per-row FOR UPDATE lock is released before the NEXT task's
+        GitHub call starts.  Broadcast emission is deferred until after commit
+        so the UI never refetches a stale row.
+        """
+        task_bc = pending_broadcasts[bc_start:]
+        del pending_broadcasts[bc_start:]
+        await session.commit()
+        for _pid, _payload in task_bc:
+            try:
+                await _bcast(_pid, "task_updated", _payload)
+            except Exception:
+                logger.debug(
+                    "[REAPER] Failed to broadcast %s for %s",
+                    _payload.get("status"),
+                    _payload.get("task_id"),
+                    exc_info=True,
+                )
+
+    for task_id in due_ids:
+        # Per-row FOR UPDATE SKIP LOCKED: held for exactly this one task's
+        # processing window, then released by _commit_task_row before the
+        # next iteration's GitHub call begins.  populate_existing=True forces
+        # a fresh DB read even if this id is already in the session identity map
+        # (stale after a prior iteration's commit with expire_on_commit=False).
+        task = await session.scalar(
+            select(Task)
+            .where(
+                Task.id == task_id,
+                Task.status == TaskStatus.BLOCKED,
+                (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
+            )
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        if task is None:
+            continue  # peer holds the lock, or task is no longer due/BLOCKED
+
+        _bc_start = len(pending_broadcasts)
         ctx = task.context or {}
         # Multi-need classification (shared by the parked and live paths): a
         # blocked dependent can wait on MORE THAN ONE prerequisite. Classify EVERY
@@ -1649,10 +1711,10 @@ async def sweep_unblock_blocked_tasks(
                 )
                 if outcome == "resumed":
                     requeued += 1
-                    changed = True
+                    await _commit_task_row(_bc_start)
                     continue
                 if outcome in ("cancelled", "held"):
-                    changed = True
+                    await _commit_task_row(_bc_start)
                     continue
             # Need-less parked blocker — handle transient vs durable separately.
             # Transient blockers (file_conflict, pending_rollup) clear when the
@@ -1675,7 +1737,6 @@ async def sweep_unblock_blocked_tasks(
                     flag_modified(task, "context")
                     session.add(task)
                     requeued += 1
-                    changed = True
                     pending_broadcasts.append(
                         (
                             str(task.project_id),
@@ -1689,12 +1750,12 @@ async def sweep_unblock_blocked_tasks(
                 else:
                     task.recheck_after = now + _BLOCKED_PARKED_REEVAL_INTERVAL
                     session.add(task)
-                    changed = True
+                await _commit_task_row(_bc_start)
                 continue
             if task.recheck_after is None or task.recheck_after <= now:
                 task.recheck_after = now + _BLOCKED_ESCALATED_PARK
                 session.add(task)
-                changed = True
+            await _commit_task_row(_bc_start)
             continue
 
         # Cross-task RESOLUTION (runs BEFORE the optimistic-retry / escalate path):
@@ -1718,10 +1779,10 @@ async def sweep_unblock_blocked_tasks(
             )
             if outcome == "resumed":
                 requeued += 1
-                changed = True
+                await _commit_task_row(_bc_start)
                 continue
             if outcome in ("cancelled", "held"):
-                changed = True
+                await _commit_task_row(_bc_start)
                 continue
             if outcome == "escalate":
                 await _escalate_blocked_task(
@@ -1734,7 +1795,7 @@ async def sweep_unblock_blocked_tasks(
                         "(re-scope, re-point the need, or recreate the foundation)."
                     ),
                 )
-                changed = True
+                await _commit_task_row(_bc_start)
                 continue
             # outcome == "none": fall through to the precondition state machine.
 
@@ -1775,7 +1836,7 @@ async def sweep_unblock_blocked_tasks(
                         f"without clearing: {task.blocked_reason or task.latest_status_message or ''}"
                     ),
                 )
-                changed = True
+                await _commit_task_row(_bc_start)
                 continue
             # A conflict/rollup blocker is requeued optimistically and must
             # preserve its first-blocked onset across the requeue (so the next
@@ -1788,7 +1849,6 @@ async def sweep_unblock_blocked_tasks(
             flag_modified(task, "context")
             session.add(task)
             requeued += 1
-            changed = True
             pending_broadcasts.append(
                 (
                     str(task.project_id),
@@ -1805,7 +1865,6 @@ async def sweep_unblock_blocked_tasks(
             task.latest_status_message = "Unblocked — awaiting rollup re-evaluation"
             flag_modified(task, "context")
             session.add(task)
-            changed = True
             pending_broadcasts.append(
                 (
                     str(task.project_id),
@@ -1827,7 +1886,6 @@ async def sweep_unblock_blocked_tasks(
                     "(re-scope, re-point dependency, or cancel)."
                 ),
             )
-            changed = True
         else:  # "retry" or "waiting"
             past_deadline = (
                 task.blocked_at is not None
@@ -1858,7 +1916,6 @@ async def sweep_unblock_blocked_tasks(
                 flag_modified(task, "context")
                 session.add(task)
                 requeued += 1
-                changed = True
                 pending_broadcasts.append(
                     (
                         str(task.project_id),
@@ -1869,6 +1926,7 @@ async def sweep_unblock_blocked_tasks(
                         },
                     )
                 )
+                await _commit_task_row(_bc_start)
                 continue
             # "waiting" (or a retry that exhausted its budget): re-arm a later
             # recheck with backoff. Deadline escalation stays active for blockers
@@ -1883,7 +1941,7 @@ async def sweep_unblock_blocked_tasks(
                         f"without clearing: {task.blocked_reason or task.latest_status_message or ''}"
                     ),
                 )
-                changed = True
+                await _commit_task_row(_bc_start)
                 continue
             attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
             ctx["_blocked_recheck_attempts"] = attempts
@@ -1891,22 +1949,11 @@ async def sweep_unblock_blocked_tasks(
             flag_modified(task, "context")
             task.recheck_after = now + _next_recheck_delay(attempts)
             session.add(task)
-            changed = True
 
-    if changed:
-        await session.commit()
-    # Emit task_updated only after the batch commit succeeds, so a rollback
-    # never publishes a transition the DB didn't keep. Per-broadcast failures
-    # are swallowed so one bad emit can't break the sweep or skip the rest.
-    for project_id, payload in pending_broadcasts:
-        try:
-            await _bcast(project_id, "task_updated", payload)
-        except Exception:
-            logger.debug(
-                f"[REAPER] Failed to broadcast {payload.get('status')} "
-                f"for {payload.get('task_id')}",
-                exc_info=True,
-            )
+        # Per-row commit for paths that fall through (re_evaluate, dead,
+        # state==clear-requeue, waiting→recheck-armed).
+        await _commit_task_row(_bc_start)
+
     if requeued:
         logger.info(f"[REAPER] Step 12: unblocked {requeued} task(s) → QUEUED")
     return requeued
@@ -2317,6 +2364,16 @@ async def sweep_merge_gate_verification_degradation(session) -> int:
     environment/setup failure (reusing ``_severity_for_unverified_reason``), else
     WARNING. Returns the number of NEW alerts created across the fleet.
     """
+    global _last_merge_gate_degradation_scan
+    _now_scan = _utcnow()
+    if (
+        _last_merge_gate_degradation_scan is not None
+        and (_now_scan - _last_merge_gate_degradation_scan).total_seconds()
+        < _FLEET_SCAN_INTERVAL_SECONDS
+    ):
+        return 0
+    _last_merge_gate_degradation_scan = _now_scan
+
     from app.alert_dispatch import (
         _maybe_create_merge_gate_degradation_alerts,
         _severity_for_unverified_reason,

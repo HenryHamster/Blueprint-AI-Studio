@@ -3209,7 +3209,11 @@ async def compute_merge_gate_fleet_health(
     raise. Returns all-zero counts and ``None`` rates/reason when no project has
     any gate data.
     """
-    stmt = select(Project)
+    from sqlalchemy.orm import load_only
+
+    stmt = select(Project).options(
+        load_only(Project.id, Project.merge_gate_runtime, raiseload=True)
+    )
     if project_id is not None:
         stmt = stmt.where(Project.id == project_id)
     projects = (await session.execute(stmt)).scalars().all()

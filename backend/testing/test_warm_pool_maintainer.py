@@ -4119,3 +4119,54 @@ async def test_lane_kill_emits_operator_message(db_session, lanes_on):
     lane_ids_in_msgs = {(m.context or {}).get("lane_id") for m in lane_msgs_after}
     assert str(lane.id) in lane_ids_in_msgs
     assert str(lane2.id) in lane_ids_in_msgs
+
+
+# ── sweep_idle_pool_vms: LIMIT 500 on candidate scan ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sweep_idle_pool_vms_candidate_scan_carries_limit(db_session, mocker):
+    """Pass-2 PoolVm candidate scan must include LIMIT 500 to cap per-cycle cost."""
+    captured_queries: list = []
+    _orig_execute = db_session.execute
+
+    async def _spy_execute(stmt, *a, **kw):
+        captured_queries.append(stmt)
+        return await _orig_execute(stmt, *a, **kw)
+
+    mocker.patch.object(db_session, "execute", side_effect=_spy_execute)
+    mocker.patch(
+        "app.warm_pool_maintainer.is_warm_pool_enabled",
+        return_value=True,
+    )
+    mocker.patch(
+        "app.warm_pool_maintainer.retire_and_delete_pool_vm",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch(
+        "app.warm_pool_maintainer.sweep_stranded_lanes",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+    mocker.patch(
+        "app.warm_pool_maintainer.sweep_exhausted_lane_budgets",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+
+    await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
+
+    import sqlalchemy.dialects.sqlite
+
+    dialect = sqlalchemy.dialects.sqlite.dialect()
+    pool_vm_scans = [
+        str(q.compile(dialect=dialect)).upper()
+        for q in captured_queries
+        if hasattr(q, "compile")
+        and "POOLVM" in str(q.compile(dialect=dialect)).upper()
+    ]
+    assert pool_vm_scans, "expected at least one pool_vm scan"
+    assert any("LIMIT" in s for s in pool_vm_scans), (
+        "sweep_idle_pool_vms must apply LIMIT 500 to the PoolVm candidate scan"
+    )

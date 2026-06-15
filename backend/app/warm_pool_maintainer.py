@@ -1981,6 +1981,7 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                     )
                 )
                 .order_by(PoolVm.created_at.asc())
+                .limit(500)
             )
         )
         .scalars()
