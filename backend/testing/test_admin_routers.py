@@ -8782,6 +8782,73 @@ class TestClearDeployFailed:
         await db_session.refresh(version)
         assert version.serving_status == "deploy_failed"
 
+    @pytest.mark.asyncio
+    async def test_version_lock_released_before_provider_check(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """The version row lock must be released before provider.check (network I/O).
+
+        clear_deploy_failed previously held with_for_update() across the entire
+        _refresh_release_artifact_rows call, which calls provider.check() — a GitHub
+        or Cloud Run network operation.  The fix commits (releasing the lock) before
+        the network I/O, matching the reconcile pattern.
+
+        This test patches _refresh_release_artifact_rows so that, during the call, it
+        attempts a nowait FOR UPDATE lock on the version row from a separate DB session.
+        If the endpoint already committed (releasing its lock), the probe succeeds.
+        If the endpoint still holds the lock, the probe raises an OperationalError.
+        """
+        from sqlalchemy import select as sa_select
+        from sqlalchemy.exc import OperationalError
+
+        from app.database import AsyncSessionLocal
+        from app.models import ReleaseVersion as RVModel
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        version_id = version.id
+
+        lock_probe_results: list[bool] = []
+
+        async def _probe_then_return(session, ver, now, **kwargs):
+            # Attempt a no-wait lock on the version row from a SEPARATE session.
+            # Succeeds only if clear_deploy_failed already committed its initial lock.
+            async with AsyncSessionLocal() as probe_session:
+                try:
+                    await probe_session.execute(
+                        sa_select(RVModel)
+                        .where(RVModel.id == version_id)
+                        .with_for_update(nowait=True)
+                    )
+                    lock_probe_results.append(True)
+                except OperationalError:
+                    lock_probe_results.append(False)
+                await probe_session.rollback()
+            # Return empty provider_rows and no backend artifact so the endpoint
+            # proceeds to the force-check branch (payload.force=False → 409).
+            return [], False, False, None
+
+        mocker.patch(
+            "app.release_reconciliation._refresh_release_artifact_rows",
+            side_effect=_probe_then_return,
+        )
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        # 409 is expected: empty provider_rows → non_backend_status serving_confirmed,
+        # backend_artifact=None → serving_sha_unobservable path → force=False → 409.
+        assert resp.status_code == 409, resp.text
+        assert lock_probe_results == [True], (
+            "Version row lock must be released (committed) before "
+            "_refresh_release_artifact_rows is called; probe could not acquire lock"
+        )
+
 
 class TestAgentServingShas:
     """GET /agent-serving-shas exposes read-only agent image provenance."""

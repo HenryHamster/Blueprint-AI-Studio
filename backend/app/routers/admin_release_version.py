@@ -1173,6 +1173,13 @@ async def clear_deploy_failed(
             detail="No promoted version in deploy_failed state for this project.",
         )
 
+    version_id = version.id
+
+    # Release the row lock before network I/O, following the established reconcile
+    # pattern in release_reconciliation.py.  The session uses expire_on_commit=False
+    # so version attrs remain accessible after the commit.
+    await session.commit()
+
     now = _utcnow()
     (
         provider_rows,
@@ -1205,16 +1212,11 @@ async def clear_deploy_failed(
         and backend_artifact.serving_status == "serving_confirmed"
         and backend_artifact.served_identifier is not None
     ):
-        # Independently confirmed serving — clear with the OBSERVED served SHA.
-        await _recover_serving_confirmed(
-            session,
-            version,
-            backend_artifact.served_identifier,
-            backend_artifact.served_at,
-            now,
-        )
         clear_mode = "verified"
         attestation_reason = None
+        # Capture before expire_all() invalidates the identity-map entry.
+        verified_served_identifier = backend_artifact.served_identifier
+        verified_served_at = backend_artifact.served_at
     else:
         # Force override is ONLY valid when the failure reason is
         # serving_sha_unobservable: a revision went STABLE but the live SHA
@@ -1260,6 +1262,41 @@ async def clear_deploy_failed(
                 status_code=400,
                 detail="A force clear requires a non-empty operator reason.",
             )
+        clear_mode = "operator_attested"
+
+    # Re-acquire the row lock for the write phase.  All validation is complete;
+    # _recover_serving_confirmed requires an already-locked session.
+    # Expire the identity-map copy before re-locking so we evaluate current DB
+    # state, not the cached pre-I/O instance (matches reconcile pattern in
+    # release_reconciliation.py lines 208-224).
+    session.expire_all()
+    version = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(ReleaseVersion.id == version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    if version is None:
+        raise HTTPException(status_code=404, detail="Release version not found.")
+
+    if clear_mode == "verified":
+        # Independently confirmed serving — clear with the OBSERVED served SHA.
+        # Use pre-captured locals: backend_artifact was expired by expire_all().
+        await _recover_serving_confirmed(
+            session,
+            version,
+            verified_served_identifier,
+            verified_served_at,
+            now,
+        )
+    else:
         # Operator attestation: clear using the promoted SHA as the served SHA and
         # record the provenance in the durable audit trail.
         await _recover_serving_confirmed(
@@ -1268,7 +1305,6 @@ async def clear_deploy_failed(
         _record_deploy_failed_clear_attestation(
             version, operator_id, attestation_reason, now
         )
-        clear_mode = "operator_attested"
 
     await session.commit()
     await session.refresh(version)
