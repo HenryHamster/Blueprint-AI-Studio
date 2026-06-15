@@ -434,6 +434,42 @@ async def get_compute_job_artifact_total_bytes(job_id) -> int:
         )
         return 0
 
+
+async def download_compute_job_artifact_bundle(job_id) -> bytes | None:
+    """Best-effort download of a compute job's durable artifact bundle bytes.
+
+    Returns the raw ``.tar.gz`` bytes of the per-job bundle object
+    (``<root>/<job_id>/artifacts/bundle.tar.gz``), or ``None`` when the object
+    does not exist. Used by the GCP backend to recover a terminal job's durable
+    ``terminal.json`` when the serial-console marker was lost to the
+    poweroff-vs-serial-read race.
+
+    Best-effort by contract: returns ``None`` on a missing object OR on ANY
+    error (network, credentials, decode) instead of raising — the caller treats
+    a ``None`` as 'no durable record' and falls back to its blind-FAILURE path,
+    so reconciliation must never crash the compute-job monitor.
+    """
+    object_name = compute_job_artifact_object_name(job_id)
+
+    def _download() -> bytes | None:
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        blob = bucket.blob(object_name)
+        if not blob.exists():
+            return None
+        return blob.download_as_bytes()
+
+    try:
+        return await asyncio.to_thread(_download)
+    except Exception:
+        logger.warning(
+            "Failed to download durable artifact bundle for compute job %s",
+            job_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
     """
     Uploads a JSON payload to GCS and returns the gs:// URI.

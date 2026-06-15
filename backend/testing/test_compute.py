@@ -8,7 +8,9 @@ Covers:
 
 import asyncio
 import base64
+import io
 import json
+import tarfile
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -1242,6 +1244,308 @@ def test_decode_result_metrics_filters_non_numeric_and_bounds():
     # Empty / None markers are absent.
     assert compute_backends_module._decode_result_metrics(None) is None
     assert compute_backends_module._decode_result_metrics("") is None
+
+
+# ── Durable terminal record (terminal.json) — closes the poweroff-vs-serial
+# race where a fast successful GCP job powers off before its serial SUCCEEDED
+# marker is captured and is misclassified FAILURE. ──────────────────────────
+
+
+def _b64_text(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _terminal_record_bytes(
+    *,
+    status: str = "SUCCEEDED",
+    exit_code=0,
+    reason: str = "completed",
+    metrics: dict | None = None,
+    command_log: dict | None = None,
+    release_sha: str = "",
+    schema_version: int = 1,
+) -> bytes:
+    """terminal.json bytes exactly as the on-VM terminal_record.py would write."""
+    record = {
+        "schema_version": schema_version,
+        "status": status,
+        "exit_code": exit_code,
+        "reason": reason,
+        "metrics_b64": _b64_text(json.dumps(metrics)) if metrics is not None else "",
+        "command_log_b64": (
+            _b64_text(json.dumps(command_log)) if command_log is not None else ""
+        ),
+        "release_echo_b64": _b64_text(release_sha) if release_sha else "",
+    }
+    return json.dumps(record).encode("utf-8")
+
+
+def _make_tar_gz_bundle(members: dict[str, bytes]) -> bytes:
+    """Build a gzip tar bundle mirroring the on-VM ``tar -C dir -czf - .`` layout."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def test_gcp_startup_script_writes_durable_terminal_record():
+    """The startup script must decode terminal_record.py and invoke it before
+    poweroff in the success/failure, runtime-TTL, and repo-clone-fail branches —
+    so a lost serial marker can always be reconciled from the durable bundle."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "o", "repo": "r", "ref": "main"},
+        repo_token="tok",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # The embedded script is decoded to disk alongside the other helpers.
+    assert "base64 -d > /tmp/blueprint_terminal_record.py" in script, (
+        "terminal_record.py must be base64-decoded onto the VM"
+    )
+    # Main success/failure branch threads the computed STATUS/EXIT/REASON through.
+    assert (
+        "python3 /tmp/blueprint_terminal_record.py" in script
+        and '"$STATUS" "$EXIT_CODE" "$REASON"' in script
+    )
+    # The record is written BEFORE the bundle is uploaded so it lands in the GCS
+    # bundle the reconcile path reads.
+    record_idx = script.index('"$STATUS" "$EXIT_CODE" "$REASON"')
+    # The final upload_artifacts call follows the terminal-record write.
+    assert "upload_artifacts" in script[record_idx:]
+    # Runtime-TTL and repo-clone-fail branches each write their own record.
+    assert "FAILED 124 runtime_ttl" in script
+    assert "FAILED 1 repo_clone_failed" in script
+    # The write must never block poweroff — every invocation is guarded `|| true`.
+    assert "/tmp/blueprint_terminal_record.py" in script
+    assert "|| true" in script
+
+
+def test_extract_terminal_record_from_bundle_roundtrips_and_failsoft():
+    extract = compute_backends_module._extract_terminal_record_from_bundle
+    # A faithful multi-file bundle: terminal.json is picked out by basename even
+    # with the production ``./`` prefix and a sibling command.log.json present.
+    bundle = _make_tar_gz_bundle(
+        {
+            "./command.log.json": b'{"text":"hi","truncated":false,"byte_count":2}',
+            "./terminal.json": _terminal_record_bytes(reason="completed"),
+        }
+    )
+    record = extract(bundle)
+    assert record is not None
+    assert record["status"] == "SUCCEEDED"
+    assert record["reason"] == "completed"
+    # A bundle with no terminal.json → None (not an error).
+    no_terminal = _make_tar_gz_bundle({"./other.txt": b"x"})
+    assert extract(no_terminal) is None
+    # Non-tar / garbage bytes degrade to None, never raise.
+    assert extract(b"not-a-tar-gz") is None
+    assert extract(b"") is None
+    # A terminal.json that isn't a JSON object → None.
+    bad = _make_tar_gz_bundle({"./terminal.json": b"[1,2,3]"})
+    assert extract(bad) is None
+
+
+def test_reconcile_terminal_record_to_status_succeeded_and_failed():
+    reconcile = compute_backends_module._reconcile_terminal_record_to_status
+    # SUCCEEDED record carries exit code + decoded metrics + command log.
+    record = json.loads(
+        _terminal_record_bytes(
+            status="SUCCEEDED",
+            exit_code=0,
+            reason="completed",
+            metrics={"mean_act_gain": 0.16, "ok": True},
+            command_log={"text": "done\n", "truncated": False, "byte_count": 5},
+        ).decode("utf-8")
+    )
+    status = reconcile(record)
+    assert status is not None
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.exit_code == 0
+    assert status.metrics == {"mean_act_gain": 0.16, "ok": 1.0}
+    assert status.command_log == {
+        "text": "done\n",
+        "truncated": False,
+        "byte_count": 5,
+    }
+    # FAILED record preserves the non-zero exit code and reason.
+    failed = json.loads(
+        _terminal_record_bytes(
+            status="FAILED", exit_code=3, reason="command_failed"
+        ).decode("utf-8")
+    )
+    fstatus = reconcile(failed)
+    assert fstatus is not None
+    assert fstatus.status == ComputeJobStatus.FAILED
+    assert fstatus.exit_code == 3
+    assert fstatus.message == "command_failed"
+    # A record without a recognized status is treated as no durable record.
+    assert reconcile({"reason": "completed"}) is None
+    assert reconcile({"status": "RUNNING"}) is None
+    # A boolean exit_code must NOT be read as 1 (bool is an int subclass).
+    boolish = reconcile({"status": "SUCCEEDED", "exit_code": True})
+    assert boolish is not None
+    assert boolish.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
+    monkeypatch,
+):
+    """The bug: a fast successful job powers off before its serial SUCCEEDED
+    marker is captured; the VM reads TERMINATED with no marker. poll_status must
+    reconcile to SUCCEEDED from the durable terminal.json, NOT report FAILURE."""
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id="compute-job-vm-fast0001",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"zone": "us-central1-f"},
+    )
+
+    # Serial output carries NO terminal marker (lost to the poweroff race).
+    monkeypatch.setattr(
+        compute, "get_vm_serial_output", lambda *_a, **_k: "boot noise only"
+    )
+    monkeypatch.setattr(compute, "get_vm_status", lambda *_a, **_k: "TERMINATED")
+
+    bundle = _make_tar_gz_bundle(
+        {
+            "./terminal.json": _terminal_record_bytes(
+                status="SUCCEEDED",
+                exit_code=0,
+                reason="completed",
+                metrics={"mean_act_gain": 0.16},
+            )
+        }
+    )
+    download_calls: list = []
+
+    async def fake_download(job_id):
+        download_calls.append(job_id)
+        return bundle
+
+    monkeypatch.setattr(storage, "download_compute_job_artifact_bundle", fake_download)
+
+    status = await backend.poll_status(job)
+
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.exit_code == 0
+    assert status.metrics == {"mean_act_gain": 0.16}
+    assert download_calls == [job.id]
+
+
+@pytest.mark.asyncio
+async def test_gcp_poll_status_terminated_without_durable_record_still_fails(
+    monkeypatch,
+):
+    """Fallback preserved: a TERMINATED VM with neither a serial marker nor a
+    durable terminal record is still a blind FAILURE."""
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id="compute-job-vm-nodurable",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"zone": "us-central1-f"},
+    )
+    monkeypatch.setattr(compute, "get_vm_serial_output", lambda *_a, **_k: "")
+    monkeypatch.setattr(compute, "get_vm_status", lambda *_a, **_k: "TERMINATED")
+
+    async def fake_download(_job_id):
+        return None
+
+    monkeypatch.setattr(storage, "download_compute_job_artifact_bundle", fake_download)
+
+    status = await backend.poll_status(job)
+    assert status.status == ComputeJobStatus.FAILED
+    assert status.message == "compute-job VM stopped without a terminal marker"
+
+
+@pytest.mark.asyncio
+async def test_gcp_poll_status_reconciles_terminated_vm_to_failure(monkeypatch):
+    """A genuinely-failed job whose serial marker was also lost reconciles to
+    FAILED (with its real exit code), not to a vague 'no terminal marker'."""
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id="compute-job-vm-failrec",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"zone": "us-central1-f"},
+    )
+    monkeypatch.setattr(compute, "get_vm_serial_output", lambda *_a, **_k: "noise")
+    monkeypatch.setattr(compute, "get_vm_status", lambda *_a, **_k: "TERMINATED")
+
+    bundle = _make_tar_gz_bundle(
+        {
+            "./terminal.json": _terminal_record_bytes(
+                status="FAILED", exit_code=2, reason="command_failed"
+            )
+        }
+    )
+
+    async def fake_download(_job_id):
+        return bundle
+
+    monkeypatch.setattr(storage, "download_compute_job_artifact_bundle", fake_download)
+
+    status = await backend.poll_status(job)
+    assert status.status == ComputeJobStatus.FAILED
+    assert status.exit_code == 2
+    assert status.message == "command_failed"
+
+
+@pytest.mark.asyncio
+async def test_gcp_poll_status_serial_marker_skips_durable_reconcile(monkeypatch):
+    """The serial fast-path still wins: when the serial SUCCEEDED marker IS
+    present, poll_status finalizes from it and never downloads the bundle."""
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id="compute-job-vm-serialwin",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"zone": "us-central1-f"},
+    )
+    monkeypatch.setattr(
+        compute,
+        "get_vm_serial_output",
+        lambda *_a, **_k: "\n".join(
+            [
+                "BLUEPRINT_COMPUTE_REASON=completed",
+                "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+                "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+            ]
+        ),
+    )
+
+    async def forbid_download(_job_id):
+        raise AssertionError(
+            "durable reconcile must not run when serial marker present"
+        )
+
+    monkeypatch.setattr(
+        storage, "download_compute_job_artifact_bundle", forbid_download
+    )
+
+    status = await backend.poll_status(job)
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.exit_code == 0
 
 
 @pytest.mark.asyncio
