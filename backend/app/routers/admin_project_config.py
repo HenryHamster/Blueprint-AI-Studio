@@ -23,6 +23,7 @@ from pydantic import ValidationError
 
 from app.database import get_session
 from app.models import (
+    DeploymentState,
     Task,
     TaskStatus,
     _utcnow,
@@ -35,6 +36,10 @@ from app.resource_envelope import (
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
     resolve_project_vm_cap,
+)
+from app.runtime_config_state import (
+    resolve_project_compute_job_concurrency_cap,
+    runtime_config as _runtime_config,
 )
 from app.schemas import ResourceEnvelope as ResourceEnvelopeSchema
 from app.task_locking import lock_project_or_429, with_design_doc_locked
@@ -78,7 +83,8 @@ async def cost_summary(
                         Task.vm_provisioned_at,
                         Task.vm_stopped_at,
                         Task.created_at,
-                    raiseload=True,)
+                        raiseload=True,
+                    )
                 )
                 .where(
                     Task.created_at >= cutoff,
@@ -172,8 +178,12 @@ async def get_auto_remediation_config(
                 )
                 .options(
                     load_only(
-                        Task.id, Task.status, Task.title, Task.context, Task.created_at,
-                        raiseload=True
+                        Task.id,
+                        Task.status,
+                        Task.title,
+                        Task.context,
+                        Task.created_at,
+                        raiseload=True,
                     )
                 )
                 .order_by(Task.created_at.desc())
@@ -800,14 +810,21 @@ def _resource_envelope_response(
         "max_concurrent_vms": resolve_project_vm_cap(project),
         "spend_ceiling_usd": resolve_project_spend_ceiling(project),
         "spend_window_days": resolve_project_spend_window_days(project),
+        "max_concurrent_compute_jobs": resolve_project_compute_job_concurrency_cap(
+            project.id
+        ),
         "active_vm_count": active_vm_count,
         "recent_spend_usd": float(recent_spend_usd),
     }
 
 
-async def _get_project_active_vm_count(session: AsyncSession, project_id: uuid.UUID) -> int:
+async def _get_project_active_vm_count(
+    session: AsyncSession, project_id: uuid.UUID
+) -> int:
     result = await session.execute(
-        select(func.count()).select_from(Task).where(
+        select(func.count())
+        .select_from(Task)
+        .where(
             Task.project_id == project_id,
             Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
         )
@@ -1081,7 +1098,12 @@ async def update_resource_envelope_config(
         project_id, current_user["user_id"], session, "owner"
     )
 
-    allowed = {"max_concurrent_vms", "spend_ceiling_usd", "spend_window_days"}
+    allowed = {
+        "max_concurrent_vms",
+        "spend_ceiling_usd",
+        "spend_window_days",
+        "max_concurrent_compute_jobs",
+    }
     if not body:
         raise HTTPException(
             status_code=422,
@@ -1106,10 +1128,44 @@ async def update_resource_envelope_config(
     try:
         validated = ResourceEnvelopeSchema(**merged)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail="Invalid resource envelope") from exc
+        raise HTTPException(
+            status_code=422, detail="Invalid resource envelope"
+        ) from exc
+
+    # max_concurrent_compute_jobs lives in runtime_config, not build_config.
+    # Update in-memory and persist to DeploymentState.runtime_config_json.
+    if "max_concurrent_compute_jobs" in body:
+        job_cap = validated.max_concurrent_compute_jobs
+        job_caps = dict(
+            _runtime_config.get("max_concurrent_compute_jobs_by_project") or {}
+        )
+        sid = str(project_id)
+        if job_cap is None:
+            job_caps.pop(sid, None)
+        else:
+            job_caps[sid] = job_cap
+        _runtime_config["max_concurrent_compute_jobs_by_project"] = job_caps
+        # Persist so the cap survives restarts.
+        state_result = await session.execute(
+            select(DeploymentState).where(DeploymentState.id == 1)
+        )
+        state = state_result.scalar_one_or_none()
+        if state is not None:
+            existing_json = dict(state.runtime_config_json or {})
+            existing_json["max_concurrent_compute_jobs_by_project"] = {
+                k: v for k, v in job_caps.items() if v and int(v) > 0
+            }
+            state.runtime_config_json = existing_json
+            flag_modified(state, "runtime_config_json")
+            session.add(state)
+
+    # Strip max_concurrent_compute_jobs from the build_config envelope —
+    # it is stored in runtime_config, not build_config.
+    envelope_dump = validated.model_dump(exclude_none=True)
+    envelope_dump.pop("max_concurrent_compute_jobs", None)
 
     build_config = dict(project.build_config or {})
-    build_config["resource_envelope"] = validated.model_dump(exclude_none=True)
+    build_config["resource_envelope"] = envelope_dump
     project.build_config = build_config
     flag_modified(project, "build_config")
     session.add(project)

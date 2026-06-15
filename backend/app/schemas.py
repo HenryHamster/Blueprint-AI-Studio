@@ -766,6 +766,8 @@ class ResourceEnvelope(BaseModel):
     spend_ceiling_usd: float | None = Field(None, gt=0)
     # Rolling window length in days for spend aggregation. Default 30.
     spend_window_days: int = Field(30, ge=1)
+    # Maximum concurrent compute jobs allowed for this project (stored in runtime_config).
+    max_concurrent_compute_jobs: int | None = Field(None, ge=1)
 
 
 class BuildConfig(BaseModel):

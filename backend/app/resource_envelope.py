@@ -78,7 +78,7 @@ async def get_project_recent_spend_usd(
 ) -> float:
     """Return total project spend (USD) over a rolling window.
 
-    Combines two spend sources:
+    Combines three spend sources:
 
     1. **Settled compute-job spend** — ``final_cost_usd`` over terminal
        ``ComputeJob`` rows whose ``completed_at`` falls within
@@ -91,12 +91,18 @@ async def get_project_recent_spend_usd(
        and terminal tasks; tasks that were provisioned before but still running
        (or finished) during the window are captured.
 
-    Both figures use settled/banked values — in-flight compute jobs without a
-    ``final_cost_usd`` are excluded (consistent with
-    ``get_recent_terminal_compute_spend_usd``), while task VM cost includes
-    banked retry spend via ``vm_runtime_cost_banked``.
+    3. **Warm-pool idle cost** — attributed idle cost for this project's pool
+       VMs over the same rolling window, via
+       ``efficiency_snapshot._compute_windowed_idle_cost``.  Includes both
+       settled ``PoolIdleSpan`` rows (``settled_at >= since``) and the
+       in-progress idle portion of any currently-IDLE pool VMs.
+
+    All three components use the same ``[now - window_days, now)`` window so
+    the total is consistent across dispatch-gate, spawn-gate, and operator
+    display callers.
     """
     from app.compute_jobs import get_recent_terminal_compute_spend_usd
+    from app.efficiency_snapshot import _compute_windowed_idle_cost
     from app.models import Task, get_task_total_vm_cost_usd
 
     now = _utcnow()
@@ -118,4 +124,7 @@ async def get_project_recent_spend_usd(
     tasks = result.scalars().all()
     task_vm_spend = sum(get_task_total_vm_cost_usd(t) for t in tasks)
 
-    return float(compute_spend) + float(task_vm_spend)
+    idle_cost_result = await _compute_windowed_idle_cost(session, project_id, since)
+    idle_spend = idle_cost_result["total"]
+
+    return float(compute_spend) + float(task_vm_spend) + float(idle_spend)

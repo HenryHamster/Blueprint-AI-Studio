@@ -35,6 +35,7 @@ export interface ResourceEnvelopeConfig {
   max_concurrent_vms?: number | null;
   spend_ceiling_usd?: number | null;
   spend_window_days?: number;
+  max_concurrent_compute_jobs?: number | null;
 }
 
 export interface BuildConfig {

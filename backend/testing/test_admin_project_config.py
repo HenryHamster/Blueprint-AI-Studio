@@ -1096,9 +1096,7 @@ async def test_get_approval_gate_config_defaults_empty(
 ):
     """GET /approval-gate-config returns empty lists and is_default when unset."""
     project = project_owner
-    resp = await client.get(
-        f"/api/admin/projects/{project.id}/approval-gate-config"
-    )
+    resp = await client.get(f"/api/admin/projects/{project.id}/approval-gate-config")
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["project_id"] == str(project.id)
@@ -1465,3 +1463,105 @@ async def test_patch_resource_envelope_rejects_invalid_values(
         json={"max_concurrent_vms": 0},
     )
     assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_resource_envelope_includes_compute_job_cap(
+    client: AsyncClient, project_viewer
+):
+    """GET includes max_concurrent_compute_jobs in the response (None when no cap set)."""
+    project = project_viewer
+    resp = await client.get(f"/api/admin/projects/{project.id}/resource-envelope")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "max_concurrent_compute_jobs" in data
+    assert data["max_concurrent_compute_jobs"] is None
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_resource_envelope_persists_compute_job_cap(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH with max_concurrent_compute_jobs updates runtime_config and GET reflects the new cap."""
+    project = project_owner
+    original_caps = dict(
+        runtime_config.get("max_concurrent_compute_jobs_by_project") or {}
+    )
+    try:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/resource-envelope",
+            json={"max_concurrent_compute_jobs": 5},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["max_concurrent_compute_jobs"] == 5
+
+        # Verify runtime_config was updated in-memory so the enforcer sees the cap.
+        from app.runtime_config_state import resolve_project_compute_job_concurrency_cap
+
+        assert resolve_project_compute_job_concurrency_cap(project.id) == 5
+
+        # Verify GET returns the updated cap.
+        resp2 = await client.get(f"/api/admin/projects/{project.id}/resource-envelope")
+        assert resp2.status_code == 200, resp2.text
+        assert resp2.json()["max_concurrent_compute_jobs"] == 5
+
+        # Verify the cap is NOT stored in build_config (it lives in runtime_config only).
+        await db_session.refresh(project)
+        envelope = (project.build_config or {}).get("resource_envelope", {})
+        assert "max_concurrent_compute_jobs" not in envelope
+    finally:
+        # Restore runtime_config to avoid bleeding into other tests.
+        caps = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        caps.pop(str(project.id), None)
+        runtime_config["max_concurrent_compute_jobs_by_project"] = caps
+        if original_caps:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = original_caps
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_resource_envelope_clears_compute_job_cap(
+    client: AsyncClient, project_owner
+):
+    """PATCH with max_concurrent_compute_jobs=None clears an existing cap."""
+    project = project_owner
+    # Set a cap first.
+    caps = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+    caps[str(project.id)] = 3
+    runtime_config["max_concurrent_compute_jobs_by_project"] = caps
+    try:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/resource-envelope",
+            json={"max_concurrent_compute_jobs": None},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["max_concurrent_compute_jobs"] is None
+
+        from app.runtime_config_state import resolve_project_compute_job_concurrency_cap
+
+        assert resolve_project_compute_job_concurrency_cap(project.id) is None
+    finally:
+        caps = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        caps.pop(str(project.id), None)
+        runtime_config["max_concurrent_compute_jobs_by_project"] = caps
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_resource_envelope_rejects_invalid_compute_job_cap(
+    client: AsyncClient, project_owner
+):
+    """PATCH rejects compute-job cap values below 1."""
+    project = project_owner
+    for bad_val in [0, -1]:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/resource-envelope",
+            json={"max_concurrent_compute_jobs": bad_val},
+        )
+        assert resp.status_code == 422, (
+            f"Expected 422 for value {bad_val}, got {resp.status_code}"
+        )

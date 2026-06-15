@@ -57,6 +57,7 @@ describe('ProjectResourceEnvelopeSection', () => {
       max_concurrent_vms: 8,
       spend_ceiling_usd: null,
       spend_window_days: 21,
+      max_concurrent_compute_jobs: null,
     });
   });
 });

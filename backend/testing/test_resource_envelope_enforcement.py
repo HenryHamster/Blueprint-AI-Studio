@@ -437,3 +437,47 @@ async def test_filter_no_broadcast_when_message_unchanged(db_session, mocker):
 
     # task2 is deferred but message is unchanged — no broadcast
     broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_defers_when_idle_cost_pushes_over_ceiling(db_session):
+    """Task/compute spend alone is below ceiling, but pool idle cost pushes total over — task must defer."""
+    from app.models import PoolIdleSpan
+    from datetime import timedelta
+
+    # Ceiling: $10. Task/compute spend will be $0 (no tasks or jobs seeded).
+    # Pool idle span: $12 — this alone pushes the total over the ceiling.
+    project = make_project(
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 30,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed a PoolIdleSpan within the window for this project.
+    from app.time_utils import _utcnow as _now
+
+    now = _now()
+    span = PoolIdleSpan(
+        project_id=project.id,
+        vm_instance_id="idle-vm-over-ceiling",
+        started_at=now - timedelta(days=2, hours=1),
+        settled_at=now - timedelta(days=2),
+        cost_usd=12.0,
+    )
+    db_session.add(span)
+    await db_session.commit()
+
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+
+    msg = await _project_resource_dispatch_defer_message(db_session, task, {})
+
+    assert msg is not None
+    assert "spend budget" in msg
