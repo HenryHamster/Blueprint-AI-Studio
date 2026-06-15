@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
-import { fetchComputeJobs, resolveArtifactDownloadUrl, resolveViewportFailureDownloadUrl } from '../api';
+import { fetchComputeJobs, resolveArtifactDownloadUrl, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl } from '../api';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -20,6 +20,7 @@ vi.mock('../api', () => ({
   fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
   resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
   resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),
+  resolveViewportShotDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport-shots/shot.png'),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
 
@@ -1732,6 +1733,93 @@ describe('DetailsTab — Acceptance Evidence', () => {
     fireEvent.click(screen.getByText('View screenshot'));
     await screen.findByRole('img', { name: /viewport screenshot/i });
     fireEvent.click(screen.getByText('Hide screenshot'));
+    expect(screen.queryByRole('img')).toBeNull();
+  });
+});
+
+describe('DetailsTab — ViewportScreenshotsPanel', () => {
+  afterEach(() => cleanup());
+
+  it('renders nothing when viewport_screenshots is absent', () => {
+    const task = makeTask({ context: {} });
+    render(<DetailsTab task={task} />);
+    expect(screen.queryByText('Viewport Screenshots')).toBeNull();
+  });
+
+  it('renders nothing when viewport_screenshots is empty', () => {
+    const task = makeTask({ context: { viewport_screenshots: [] } });
+    render(<DetailsTab task={task} />);
+    expect(screen.queryByText('Viewport Screenshots')).toBeNull();
+  });
+
+  it('shows collapsed toggle with screenshot count', () => {
+    const task = makeTask({
+      context: {
+        viewport_screenshots: [
+          { name: 'taskcard-default-375-before', storage_uri: 'gs://bucket/a.png' },
+          { name: 'taskcard-default-375-after', storage_uri: 'gs://bucket/b.png' },
+        ],
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Viewport Screenshots')).toBeInTheDocument();
+    expect(screen.getByText(/View 2 screenshots/)).toBeInTheDocument();
+  });
+
+  it('fetches and displays before/after images side-by-side on expand', async () => {
+    vi.mocked(resolveViewportShotDownloadUrl)
+      .mockResolvedValueOnce('https://cdn.example.com/before.png')
+      .mockResolvedValueOnce('https://cdn.example.com/after.png');
+    const task = makeTask({
+      id: 'task-vs-1',
+      project_id: 'proj-vs' as unknown as Task['project_id'],
+      context: {
+        viewport_screenshots: [
+          { name: 'taskcard-default-375-before', storage_uri: 'gs://bucket/a.png' },
+          { name: 'taskcard-default-375-after', storage_uri: 'gs://bucket/b.png' },
+        ],
+      },
+    });
+    render(<DetailsTab task={task} />);
+    fireEvent.click(screen.getByText(/View 2 screenshots/));
+    expect(screen.getByText('Before')).toBeInTheDocument();
+    expect(screen.getByText('After')).toBeInTheDocument();
+    expect(resolveViewportShotDownloadUrl).toHaveBeenCalledWith('proj-vs', 'task-vs-1', 'taskcard-default-375-before', expect.anything());
+    expect(resolveViewportShotDownloadUrl).toHaveBeenCalledWith('proj-vs', 'task-vs-1', 'taskcard-default-375-after', expect.anything());
+    const imgs = await screen.findAllByRole('img');
+    expect(imgs.some(img => img.getAttribute('src') === 'https://cdn.example.com/before.png')).toBe(true);
+    expect(imgs.some(img => img.getAttribute('src') === 'https://cdn.example.com/after.png')).toBe(true);
+  });
+
+  it('collapses on second click and cleans up images', async () => {
+    vi.mocked(resolveViewportShotDownloadUrl).mockResolvedValue('https://cdn.example.com/shot.png');
+    const task = makeTask({
+      context: {
+        viewport_screenshots: [
+          { name: 'component-375-before', storage_uri: 'gs://bucket/a.png' },
+        ],
+      },
+    });
+    render(<DetailsTab task={task} />);
+    fireEvent.click(screen.getByText(/View 1 screenshot/));
+    await screen.findByRole('img');
+    fireEvent.click(screen.getByText('Hide screenshots'));
+    expect(screen.queryByRole('img')).toBeNull();
+  });
+
+  it('shows error text when URL resolution fails', async () => {
+    vi.mocked(resolveViewportShotDownloadUrl).mockRejectedValueOnce(new Error('Storage unavailable'));
+    const task = makeTask({
+      project_id: 'proj-err' as unknown as Task['project_id'],
+      context: {
+        viewport_screenshots: [
+          { name: 'comp-375-before', storage_uri: 'gs://bucket/a.png' },
+        ],
+      },
+    });
+    render(<DetailsTab task={task} />);
+    fireEvent.click(screen.getByText(/View 1 screenshot/));
+    await waitFor(() => expect(screen.getByText('Storage unavailable')).toBeInTheDocument());
     expect(screen.queryByRole('img')).toBeNull();
   });
 });

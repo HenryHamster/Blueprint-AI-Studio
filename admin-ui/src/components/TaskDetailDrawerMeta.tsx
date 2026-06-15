@@ -5,7 +5,7 @@ import { MarkdownContent } from './MarkdownContent';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import { hasTransitiveCycle } from '../utils/taskGraph';
-import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, resolveViewportFailureDownloadUrl, type ComputeJob, type LiveReleaseEvidence } from '../api';
+import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl, type ComputeJob, type LiveReleaseEvidence } from '../api';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.utils';
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
@@ -776,6 +776,103 @@ function PanelReviewVerdictSection({ verdict }: { verdict: PanelReviewVerdict })
             </div>
           ))}
         </div>
+      </div>
+    </>
+  );
+}
+
+interface ViewportShotEntry {
+  name: string;
+  storage_uri: string;
+}
+
+interface ViewportShotPair {
+  key: string;
+  before?: ViewportShotEntry;
+  after?: ViewportShotEntry;
+}
+
+function ViewportShotImage({ projectId, taskId, entry }: { projectId: string; taskId: string; entry: ViewportShotEntry }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    resolveViewportShotDownloadUrl(projectId, taskId, entry.name, controller.signal)
+      .then(u => { if (!cancelled) setUrl(u); })
+      .catch(e => { if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; controller.abort(); };
+  }, [projectId, taskId, entry.name]);
+
+  if (loading) return <p className="text-xs text-neutral-500">Loading…</p>;
+  if (error) return <p className="text-xs text-red-400 break-words">{error}</p>;
+  if (!url) return null;
+  return <img src={url} alt={entry.name} className="max-w-full rounded border border-neutral-700" />;
+}
+
+function ViewportScreenshotsPanel({ task }: { task: Task }) {
+  const [expanded, setExpanded] = useState(false);
+  const raw = task.context?.viewport_screenshots as ViewportShotEntry[] | undefined;
+  if (!raw || raw.length === 0) return null;
+
+  const pairsMap = new Map<string, ViewportShotPair>();
+  for (const entry of raw) {
+    let key: string;
+    let phase: 'before' | 'after' | null = null;
+    if (entry.name.endsWith('-before')) {
+      key = entry.name.slice(0, -'-before'.length);
+      phase = 'before';
+    } else if (entry.name.endsWith('-after')) {
+      key = entry.name.slice(0, -'-after'.length);
+      phase = 'after';
+    } else {
+      key = entry.name;
+    }
+    if (!pairsMap.has(key)) pairsMap.set(key, { key });
+    const pair = pairsMap.get(key) ?? { key };
+    if (phase === 'before') pair.before = entry;
+    else if (phase === 'after') pair.after = entry;
+  }
+  const pairs = Array.from(pairsMap.values());
+
+  return (
+    <>
+      <SectionHeader>Viewport Screenshots</SectionHeader>
+      <div className="space-y-3">
+        <button
+          data-viewport-allow-small-target
+          className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300 transition-colors"
+          onClick={() => setExpanded(v => !v)}
+        >
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          {expanded ? 'Hide screenshots' : `View ${raw.length} screenshot${raw.length !== 1 ? 's' : ''}`}
+        </button>
+        {expanded && pairs.map(pair => (
+          <div key={pair.key} className="rounded-lg border border-neutral-800 bg-neutral-900/50 p-3 space-y-2">
+            <p className="text-xs font-mono text-neutral-400 truncate">{pair.key}</p>
+            {pair.before && pair.after ? (
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <p className="text-xs text-neutral-500 mb-1">Before</p>
+                  <ViewportShotImage projectId={task.project_id as string} taskId={task.id} entry={pair.before} />
+                </div>
+                <div>
+                  <p className="text-xs text-neutral-500 mb-1">After</p>
+                  <ViewportShotImage projectId={task.project_id as string} taskId={task.id} entry={pair.after} />
+                </div>
+              </div>
+            ) : pair.before || pair.after ? (
+              <ViewportShotImage
+                projectId={task.project_id as string}
+                taskId={task.id}
+                entry={(pair.before ?? pair.after) as ViewportShotEntry}
+              />
+            ) : null}
+          </div>
+        ))}
       </div>
     </>
   );
@@ -1720,6 +1817,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           </>
         );
       })()}
+
+      <ViewportScreenshotsPanel task={task} />
 
       <AcceptanceEvidenceSection task={task} />
 

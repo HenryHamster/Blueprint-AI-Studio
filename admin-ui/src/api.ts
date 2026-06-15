@@ -388,6 +388,32 @@ export async function resolveViewportFailureDownloadUrl(
   return data.url;
 }
 
+export async function resolveViewportShotDownloadUrl(
+  projectId: string,
+  taskId: string,
+  name: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const query = new URLSearchParams({ project_id: projectId, task_id: taskId, name });
+  const res = await apiFetch(
+    `/api/admin/viewport-shots/download-url?${query.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to resolve viewport shot: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to resolve viewport shot: ${res.status}`);
+  }
+  const data = await res.json().catch(() => ({})) as Partial<ViewportFailureDownloadUrlResponse>;
+  if (typeof data.url !== 'string' || data.url.length === 0) {
+    throw new Error('Viewport shot resolver returned an empty URL');
+  }
+  return data.url;
+}
+
 export async function fetchTaskSerialConsole(taskId: string): Promise<import('./types/task').SerialConsoleResponse> {
   const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}/serial-console`);
   if (!res.ok) throw new Error(`Failed to fetch serial console: ${res.status}`);

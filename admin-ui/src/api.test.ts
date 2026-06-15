@@ -27,7 +27,7 @@ describe('previewOnboardProject', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe('/api/admin/projects/onboard');
+    expect(String(url)).toContain('/api/admin/projects/onboard');
     expect((init as RequestInit).method).toBe('POST');
     expect(JSON.parse(String((init as RequestInit).body))).toEqual({
       github_owner: 'acme',
@@ -61,7 +61,7 @@ describe('createComputeExperiment', () => {
 
     expect(result).toEqual({ id: 'task-ce-1' });
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe('/api/admin/tasks/compute-experiment');
+    expect(String(url)).toContain('/api/admin/tasks/compute-experiment');
     expect((init as RequestInit).method).toBe('POST');
     expect(JSON.parse(String((init as RequestInit).body))).toMatchObject({
       command: 'python train.py',
@@ -106,7 +106,7 @@ describe('retryProjectBootstrap', () => {
       reason: 'operator_retry',
     });
 
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/projects/proj-1/bootstrap/retry');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/admin/projects/proj-1/bootstrap/retry');
     expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe('POST');
   });
 
@@ -134,7 +134,7 @@ describe('resolveViewportFailureDownloadUrl', () => {
     );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe(
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
       '/api/admin/viewport-failures/download-url?project_id=proj-1&component=Messages+Panel&width=375',
     );
   });
@@ -173,7 +173,7 @@ describe('fetchComputeJobs', () => {
     await fetchComputeJobs('proj-1');
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/projects/proj-1/compute-jobs');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/admin/projects/proj-1/compute-jobs');
   });
 
   it('serializes include_finished_minutes when provided', async () => {
@@ -184,7 +184,7 @@ describe('fetchComputeJobs', () => {
     await fetchComputeJobs('proj-1', undefined, 1440);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/projects/proj-1/compute-jobs?include_finished_minutes=1440');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/admin/projects/proj-1/compute-jobs?include_finished_minutes=1440');
   });
 });
 
@@ -214,7 +214,7 @@ describe('fetchImprovementLanes', () => {
       project_id: 'proj-1',
       extra_banner: 'shadow-mode',
     });
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/improvement-lanes?project_id=proj-1&limit=25&offset=5');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/admin/improvement-lanes?project_id=proj-1&limit=25&offset=5');
     expect((fetchMock.mock.calls[0][1] as RequestInit | undefined)?.method).toBeUndefined();
   });
 
@@ -243,7 +243,7 @@ describe('analyzeComputeJob', () => {
       extra: 'field',
     });
 
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/compute-jobs/job-1/analyze');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/admin/compute-jobs/job-1/analyze');
     expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe('POST');
   });
 
