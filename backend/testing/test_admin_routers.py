@@ -17040,6 +17040,88 @@ class TestGetReleaseVersionSummary:
         assert tasks[0]["pr_number"] == 42
 
     @pytest.mark.asyncio
+    async def test_summary_headline_reflects_aggregate_not_scalar_serving(
+        self, client: AsyncClient, db_session
+    ):
+        """Headline uses aggregate serving status, not scalar version.serving_status.
+
+        A promoted version with scalar serving_status='serving_confirmed' but an
+        artifact row reporting 'deploy_failed' must produce headline='promoted'
+        (not 'promoted & serving') and a qualification_state consistent with the
+        deploy_failed aggregate.
+        """
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import PROMOTION_MERGE_ARTIFACT_KIND
+        from app.time_utils import _utcnow
+
+        # Project with GitHub credentials so the promotion_merge artifact provider
+        # is observable, making the artifact row participate in the aggregate.
+        project = Project(
+            name="External Project",
+            user_id=TEST_USER_ID,
+            github_owner="test-owner",
+            github_repo="test-repo",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        member = ProjectMember(
+            project_id=project.id, user_id=TEST_USER_ID, role="owner"
+        )
+        db_session.add(member)
+        await db_session.commit()
+
+        now = _utcnow()
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=now,
+            promoted_sha="abc1234",
+            # Scalar says serving_confirmed — the bug would use this for the headline.
+            serving_status="serving_confirmed",
+            served_sha="abc1234",
+            served_at=now,
+            last_qualification={"status": "promoted", "confidence": 0.95},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Artifact row for the promotion_merge provider reports deploy_failed —
+        # aggregate diverges from the scalar.
+        artifact = ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND,
+            serving_status="deploy_failed",
+            reason_code="merge_not_detected",
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=3),
+        ):
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        # Headline must NOT claim serving when the aggregate says deploy_failed.
+        assert data["highlights"]["headline"] == "promoted", (
+            f"Expected 'promoted' but got {data['highlights']['headline']!r} — "
+            "headline should use aggregate serving_status, not the scalar"
+        )
+        # qualification_state must be consistent with deploy_failed aggregate.
+        qs = data["qualification_state"]
+        assert qs is not None
+        assert qs["state"] == "promotion_deploy_failed", (
+            f"Expected 'promotion_deploy_failed' but got {qs['state']!r} — "
+            "qualification_state must reflect the deploy_failed aggregate"
+        )
+
+    @pytest.mark.asyncio
     async def test_summary_abandoned_version_malformed_abandoned_at_falls_back_unbounded(
         self, client: AsyncClient, db_session
     ):
