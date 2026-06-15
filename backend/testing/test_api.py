@@ -459,9 +459,7 @@ async def _make_project_with_member(db_session):
 
 
 @pytest.mark.asyncio
-async def test_admin_task_artifacts_expose_storage_uri(
-    client: AsyncClient, db_session
-):
+async def test_admin_task_artifacts_expose_storage_uri(client: AsyncClient, db_session):
     """Storage-backed artifacts surface their gs:// URI additively in both the
     task-list and task-detail serializers, so operator surfaces can resolve a
     signed download. The field is always present (null for non-storage
@@ -487,9 +485,7 @@ async def test_admin_task_artifacts_expose_storage_uri(
 
     list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
     assert list_resp.status_code == 200
-    listed = next(
-        t for t in list_resp.json()["tasks"] if t["id"] == str(task.id)
-    )
+    listed = next(t for t in list_resp.json()["tasks"] if t["id"] == str(task.id))
     list_arts = listed["artifacts"]
     assert len(list_arts) == 1
     assert list_arts[0]["storage_uri"] == storage_uri
@@ -608,10 +604,7 @@ async def test_admin_tasks_expose_unverified_merge_reason(
 
     detail_resp = await client.get(f"/api/admin/tasks/{unverified_task.id}")
     assert detail_resp.status_code == 200
-    assert (
-        detail_resp.json()["unverified_merge_reason"]
-        == "no_detectable_test_command"
-    )
+    assert detail_resp.json()["unverified_merge_reason"] == "no_detectable_test_command"
 
     detail_normal = await client.get(f"/api/admin/tasks/{normal_task.id}")
     assert detail_normal.status_code == 200
@@ -619,9 +612,7 @@ async def test_admin_tasks_expose_unverified_merge_reason(
 
 
 @pytest.mark.asyncio
-async def test_admin_tasks_expose_evaluation_summary(
-    client: AsyncClient, db_session
-):
+async def test_admin_tasks_expose_evaluation_summary(client: AsyncClient, db_session):
     """Both admin task endpoints expose normalized evaluation summaries for
     merge-gate, memo, self-audit, and audit-style task outputs."""
     project = await _make_project_with_member(db_session)
@@ -772,7 +763,10 @@ async def test_admin_tasks_expose_evaluation_summary(
 
     detail_memo = await client.get(f"/api/admin/tasks/{memo_task.id}")
     assert detail_memo.status_code == 200
-    assert detail_memo.json()["evaluation_summary"]["highlights"][0]["label"] == "Citations"
+    assert (
+        detail_memo.json()["evaluation_summary"]["highlights"][0]["label"]
+        == "Citations"
+    )
 
 
 @pytest.mark.asyncio
@@ -1072,12 +1066,16 @@ async def test_get_project_tasks_banked_retry_cost(client: AsyncClient, db_sessi
     """Retried tasks: banked retry VM spend must appear in estimated_cost_usd, not be
     silently dropped by reading only the current-attempt vm_provisioned_at window."""
     project = Project(
-        name="BankedRetryProject", user_id="test-user-123", status=ProjectStatus.DEPLOYING
+        name="BankedRetryProject",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
     task = Task(
         project_id=project.id,
         title="Retried",
@@ -1181,18 +1179,32 @@ async def test_admin_tasks_project_id_filter_returns_scoped_counts(
     scoped_evaluating_count, and scoped_queued_count reflecting only that
     project, while active_count remains the global fleet total."""
     # Project A — the scoped project
-    project_a = Project(name="Project A", user_id="test-user-123", status=ProjectStatus.DEPLOYING, payloads=[{"type": "create"}])
+    project_a = Project(
+        name="Project A",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+        payloads=[{"type": "create"}],
+    )
     db_session.add(project_a)
     await db_session.commit()
     await db_session.refresh(project_a)
-    db_session.add(ProjectMember(project_id=project_a.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project_a.id, user_id="test-user-123", role="owner")
+    )
 
     # Project B — a second project owned by the same user
-    project_b = Project(name="Project B", user_id="test-user-123", status=ProjectStatus.DEPLOYING, payloads=[{"type": "create"}])
+    project_b = Project(
+        name="Project B",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+        payloads=[{"type": "create"}],
+    )
     db_session.add(project_b)
     await db_session.commit()
     await db_session.refresh(project_b)
-    db_session.add(ProjectMember(project_id=project_b.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project_b.id, user_id="test-user-123", role="owner")
+    )
 
     # Tasks in project A
     task_a_active = Task(
@@ -1217,12 +1229,17 @@ async def test_admin_tasks_project_id_filter_returns_scoped_counts(
     db_session.add_all([task_a_active, task_a_evaluating, task_b_active])
     await db_session.commit()
 
-    resp = await client.get("/api/admin/tasks", params={"project_id": str(project_a.id), "archived": "false"})
+    resp = await client.get(
+        "/api/admin/tasks",
+        params={"project_id": str(project_a.id), "archived": "false"},
+    )
     assert resp.status_code == 200
     data = resp.json()
 
     # Global counts include tasks from both member projects
-    assert data["active_count"] >= 2, "global active_count should include both member projects"
+    assert data["active_count"] >= 2, (
+        "global active_count should include both member projects"
+    )
 
     # Scoped counts are present and only reflect project A
     assert "scoped_active_count" in data
@@ -1290,12 +1307,14 @@ async def test_admin_tasks_no_project_id_omits_scoped_counts(
     """GET /api/admin/tasks without project_id must NOT include
     scoped_*_count fields — they are only present when a project is scoped."""
     project = await _make_project_with_member(db_session)
-    db_session.add(Task(
-        project_id=project.id,
-        title="task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-    ))
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+        )
+    )
     await db_session.commit()
 
     resp = await client.get("/api/admin/tasks", params={"archived": "false"})
@@ -1309,9 +1328,7 @@ async def test_admin_tasks_no_project_id_omits_scoped_counts(
 
 
 @pytest.mark.asyncio
-async def test_task_counts_scoped_to_member_projects(
-    client: AsyncClient, db_session
-):
+async def test_task_counts_scoped_to_member_projects(client: AsyncClient, db_session):
     """Global counts only aggregate projects the caller is a member of.
     A non-member project's tasks must not appear in active_count or
     scoped counts, even when that project_id is passed as a filter."""
@@ -1326,7 +1343,9 @@ async def test_task_counts_scoped_to_member_projects(
     await db_session.commit()
     await db_session.refresh(member_project)
     db_session.add(
-        ProjectMember(project_id=member_project.id, user_id="test-user-123", role="owner")
+        ProjectMember(
+            project_id=member_project.id, user_id="test-user-123", role="owner"
+        )
     )
 
     # A foreign project — a different user owns it, caller is NOT a member
@@ -1340,7 +1359,9 @@ async def test_task_counts_scoped_to_member_projects(
     await db_session.commit()
     await db_session.refresh(foreign_project)
     db_session.add(
-        ProjectMember(project_id=foreign_project.id, user_id="other-user-999", role="owner")
+        ProjectMember(
+            project_id=foreign_project.id, user_id="other-user-999", role="owner"
+        )
     )
 
     # One active task in the caller's project
@@ -1368,7 +1389,9 @@ async def test_task_counts_scoped_to_member_projects(
     assert data["active_count"] >= 1, "member project tasks should be counted"
     # Verify foreign task is excluded by checking the task list excludes it
     task_ids = [t["id"] for t in data["tasks"]]
-    assert str(foreign_task.id) not in task_ids, "foreign task must not appear in task list"
+    assert str(foreign_task.id) not in task_ids, (
+        "foreign task must not appear in task list"
+    )
 
     # 2. Scoped counts for foreign project_id: non-member gets zero scoped counts
     resp2 = await client.get(
@@ -1377,6 +1400,67 @@ async def test_task_counts_scoped_to_member_projects(
     )
     assert resp2.status_code == 200
     data2 = resp2.json()
-    assert data2["scoped_active_count"] == 0, "non-member must see zero scoped_active_count"
+    assert data2["scoped_active_count"] == 0, (
+        "non-member must see zero scoped_active_count"
+    )
     assert data2["scoped_evaluating_count"] == 0
     assert data2["scoped_queued_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_project_task_context_filters_llm_runtime_keys(
+    client: AsyncClient, db_session
+):
+    """User-facing task listing must not expose llm_* or max_plan_* context keys."""
+    project = Project(
+        name="ContextFilterTest",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+
+    task = Task(
+        project_id=project.id,
+        title="RuntimeCtxTask",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        context={
+            "direction_id": "d-abc",
+            "llm_account_id": "acct-secret-uuid",
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "llm_model": "claude-sonnet-4-6",
+            "llm_execution_mode": "max",
+            "max_plan_account_id": "pool-acct-uuid",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/projects/{project.id}/tasks")
+    assert resp.status_code == 200
+    tasks = resp.json()["tasks"]
+    match = [t for t in tasks if t["title"] == "RuntimeCtxTask"]
+    assert len(match) == 1
+    ctx = match[0]["context"]
+
+    # Safe key must pass through
+    assert ctx.get("direction_id") == "d-abc"
+
+    # Runtime account/provider keys must be filtered out
+    for key in (
+        "llm_account_id",
+        "llm_provider",
+        "llm_auth_mode",
+        "llm_model",
+        "llm_execution_mode",
+        "max_plan_account_id",
+    ):
+        assert key not in ctx, (
+            f"context key '{key}' must be filtered from user-facing response"
+        )

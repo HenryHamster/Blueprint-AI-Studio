@@ -122,6 +122,15 @@ def clear_task_llm_runtime_context(context: Mapping[str, Any] | None) -> dict[st
     return new_ctx
 
 
+def filter_user_task_context(context: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Strip runtime account/provider keys from task context before user-facing serialization."""
+    return {
+        k: v
+        for k, v in (context or {}).items()
+        if not k.startswith("max_plan_") and not k.startswith("llm_")
+    }
+
+
 def apply_task_llm_runtime_context(
     context: Mapping[str, Any] | None,
     *,
@@ -653,7 +662,9 @@ _LATENCY_MIN_SAMPLES = 3
 # not zone-sick. These constants gate the per-account cooldown.
 _STARTUP_FAILURE_WINDOW_SECONDS = 2 * 3600  # 2h rolling window for event collection
 _STARTUP_FAILURE_THRESHOLD = 5  # consecutive failures to trip the cooldown
-_STARTUP_FAILURE_MIN_ZONES = 2  # multi-zone signature required (single-zone = zone fault)
+_STARTUP_FAILURE_MIN_ZONES = (
+    2  # multi-zone signature required (single-zone = zone fault)
+)
 _STARTUP_FAILURE_COOLDOWN_SECONDS = 30 * 60  # flat 30min cooldown after tripping
 
 
@@ -1005,12 +1016,20 @@ async def load_max_plan_pool():
                         # Restore the reason text from the blob; if the cap-persist
                         # hadn't flushed disabled_reason before the restart, reconstruct
                         # it so the admin health UI always shows why the account is benched.
-                        sf_reason = rl_state.get("startup_failure_disabled_reason") or ""
+                        sf_reason = (
+                            rl_state.get("startup_failure_disabled_reason") or ""
+                        )
                         if sf_reason.startswith("startup-failure cooldown"):
-                            if not (entry.get("disabled_reason") or "").startswith("startup-failure cooldown"):
+                            if not (entry.get("disabled_reason") or "").startswith(
+                                "startup-failure cooldown"
+                            ):
                                 entry["disabled_reason"] = sf_reason
-                        elif not (entry.get("disabled_reason") or "").startswith("startup-failure cooldown"):
-                            entry["disabled_reason"] = "startup-failure cooldown: agent-startup failures detected"
+                        elif not (entry.get("disabled_reason") or "").startswith(
+                            "startup-failure cooldown"
+                        ):
+                            entry["disabled_reason"] = (
+                                "startup-failure cooldown: agent-startup failures detected"
+                            )
                         logger.info(
                             f"[STARTUP] Restored startup-failure cooldown for {acct.name}: "
                             f"{(_STARTUP_FAILURE_COOLDOWN_SECONDS - elapsed):.0f}s remaining"
@@ -1073,7 +1092,9 @@ _QUARANTINE_COOLDOWN_SECONDS = (
 _REGRESSION_COOLDOWN_SECONDS = 6 * 60 * 60  # flat 6h reprobe for regression quarantine
 QUARANTINE_CONSECUTIVE_N = 3  # consecutive qualifying failures to trip the quarantine
 QUARANTINE_CONFIDENCE_THRESHOLD = 0.8  # minimum per-record confidence to count
-_QUARANTINE_ELIGIBLE_CLASSES = frozenset({"RATE_LIMIT", "PROVISION_FAILURE", "DEAD_AUTH"})
+_QUARANTINE_ELIGIBLE_CLASSES = frozenset(
+    {"RATE_LIMIT", "PROVISION_FAILURE", "DEAD_AUTH"}
+)
 
 
 def _serialize_disabled_model_info(info: dict) -> dict:
@@ -1944,7 +1965,11 @@ def _usage_headroom_settings(
     Tolerant of malformed values — any bad field degrades to the conservative
     default rather than raising in the hot path.
     """
-    cfg = runtime_config if isinstance(runtime_config, Mapping) else _runtime_config_snapshot()
+    cfg = (
+        runtime_config
+        if isinstance(runtime_config, Mapping)
+        else _runtime_config_snapshot()
+    )
     enabled = bool(cfg.get("usage_headroom_gate_enabled", False))
     raw_threshold = cfg.get("usage_headroom_threshold_pct", 90)
     try:
@@ -1953,17 +1978,13 @@ def _usage_headroom_settings(
         threshold = 90.0
     raw_types = cfg.get("usage_headroom_long_running_task_types")
     if isinstance(raw_types, (list, tuple, set)):
-        long_types = frozenset(
-            str(t).strip() for t in raw_types if str(t).strip()
-        )
+        long_types = frozenset(str(t).strip() for t in raw_types if str(t).strip())
     else:
         long_types = frozenset(_DEFAULT_LONG_RUNNING_TASK_TYPES)
     return enabled, threshold, long_types
 
 
-def _cached_usage_snapshot(
-    acct: Dict[str, Any], now: datetime
-) -> UsageSnapshot | None:
+def _cached_usage_snapshot(acct: Dict[str, Any], now: datetime) -> UsageSnapshot | None:
     """Return the account's cached snapshot iff fresh, else None (→ unknown).
 
     None is returned for a missing OR a stale (TTL-expired) snapshot. Callers
@@ -2091,9 +2112,7 @@ def _apply_usage_gate(
     return not_exhausted if not_exhausted else candidates
 
 
-def _usage_snapshot_summary(
-    acct: Dict[str, Any], now: datetime
-) -> Dict[str, Any]:
+def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     """JSON-safe per-account usage snapshot for the admin health endpoint.
 
     Always returns a dict (additive field). ``known=False`` covers the
@@ -2496,7 +2515,9 @@ async def select_llm_runtime_for_task(
     # The intended routing is the most-preferred provider and its tier/explicit
     # model. Captured here (after provider_preference is finalized) so every
     # selection outcome below can be compared against it to detect a fallback.
-    intended_provider = provider_preference[0] if provider_preference else explicit_provider
+    intended_provider = (
+        provider_preference[0] if provider_preference else explicit_provider
+    )
     intended_model = explicit_model
     if intended_model is None and intended_provider:
         intended_model = get_provider(intended_provider).tier_to_model(
@@ -3020,7 +3041,11 @@ async def record_account_startup_failure(acct_id: str, zone: str) -> None:
 
         # Already in cooldown — record the event but don't reset the timer
         sf_cooldown_at = acct.get("startup_failure_cooldown_at")
-        if sf_cooldown_at and (now - sf_cooldown_at).total_seconds() < _STARTUP_FAILURE_COOLDOWN_SECONDS:
+        if (
+            sf_cooldown_at
+            and (now - sf_cooldown_at).total_seconds()
+            < _STARTUP_FAILURE_COOLDOWN_SECONDS
+        ):
             return
 
         # Not enough failures to consider tripping
@@ -3284,7 +3309,11 @@ async def recheck_disabled_accounts():
         for acct in _account_by_id.values():
             # Clear expired startup-failure cooldowns
             sf_cooldown_at = acct.get("startup_failure_cooldown_at")
-            if sf_cooldown_at and (now - sf_cooldown_at).total_seconds() >= _STARTUP_FAILURE_COOLDOWN_SECONDS:
+            if (
+                sf_cooldown_at
+                and (now - sf_cooldown_at).total_seconds()
+                >= _STARTUP_FAILURE_COOLDOWN_SECONDS
+            ):
                 acct.pop("startup_failure_cooldown_at", None)
                 reason = acct.get("disabled_reason") or ""
                 if reason.startswith("startup-failure cooldown"):
@@ -3335,9 +3364,11 @@ async def recheck_disabled_accounts():
                             # cooldown is still active — that reason is visible in the UI
                             # and managed by the cap-persist path, not this rl-persist path.
                             sf_cooldown_at = acct.get("startup_failure_cooldown_at")
-                            has_active_sf_cooldown = sf_cooldown_at is not None and (
-                                _utcnow() - sf_cooldown_at
-                            ).total_seconds() < _STARTUP_FAILURE_COOLDOWN_SECONDS
+                            has_active_sf_cooldown = (
+                                sf_cooldown_at is not None
+                                and (_utcnow() - sf_cooldown_at).total_seconds()
+                                < _STARTUP_FAILURE_COOLDOWN_SECONDS
+                            )
                             if not has_active_sf_cooldown:
                                 db_acct.disabled_reason = None
                                 acct["disabled_reason"] = None
