@@ -9121,3 +9121,58 @@ def test_standalone_smoke_modules_importable_as_root():
         )
         assert "ImportError" not in result.stderr
         assert "circular import" not in result.stderr
+
+
+def test_all_load_only_projection_sites_require_raiseload():
+    """Every load_only() and defer() call in backend/app must pass raiseload=True.
+
+    Blueprint adopted a projection contract to eliminate MissingGreenlet 500s:
+    narrow-column reads use load_only(..., raiseload=True) so that accessing an
+    un-projected column raises a synchronous StatementError at test time instead
+    of triggering an async lazy-load that surfaces as a MissingGreenlet in prod.
+
+    This invariant enforces the contract codebase-wide so that a new bare
+    load_only() or defer() call is caught immediately rather than discovered in
+    production.
+    """
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    violations: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                fname = func.id if func.id in ("load_only", "defer") else None
+            elif isinstance(func, ast.Attribute):
+                fname = func.attr if func.attr in ("load_only", "defer") else None
+            else:
+                fname = None
+            if fname is None:
+                continue
+
+            has_raiseload = any(
+                kw.arg == "raiseload"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            )
+            if not has_raiseload:
+                rel = py_file.relative_to(app_dir.parent.parent)
+                violations.append(
+                    f"  {rel}:{node.lineno} — {fname}() missing raiseload=True"
+                )
+
+    assert not violations, (
+        "Projection contract violated: the following load_only()/defer() calls "
+        "omit raiseload=True. Add raiseload=True to each site so that accessing "
+        "an un-projected column raises synchronously at test time instead of "
+        "triggering a MissingGreenlet 500 in production.\n" + "\n".join(violations)
+    )
