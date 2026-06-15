@@ -2150,8 +2150,12 @@ ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (u
     perf claim to confirm (throughput/latency), a before-vs-after comparison, an accuracy or
     cost measurement. Do NOT use it for questions a code read settles, or for open-ended
     exploration. The finding must carry a launch contract describing how to run it:
-    \`command\` (a single, self-contained shell command that runs the experiment end-to-end on
-    a fresh VM), \`spend_cap_usd\` (a positive USD cap — keep it conservative), and
+    \`command\` (a single shell command that runs the experiment end-to-end. It executes inside a
+    fresh, shallow clone of THIS repository at the current working directory — the repo root is
+    also on PYTHONPATH — so import the project's code directly: \`from <pkg> import ...\`,
+    \`python3 -m <pkg>.<module>\`, \`./run.sh\`. Do NOT clone the repo yourself or assume network
+    git access; the checkout is throwaway scratch on a torn-down VM and writes are not persisted),
+    \`spend_cap_usd\` (a positive USD cap — keep it conservative), and
     \`deadline_seconds\` (a positive wall-clock timeout). Optionally add \`success_criterion\`
     — a numeric goal of {"metric": "<name read from the result>", "operator": ">=|<=|>|<|==|!=",
     "threshold": <number>} — to make the result machine-checkable (the gate fails the experiment
@@ -2209,7 +2213,7 @@ implementation findings. Add metadata alongside them when relevant.
   "provides_capability": null,
   "direction_id": "d-xxx or null",
   "effort": "high|medium|low|null",
-  "compute_experiment": {"command": "self-contained shell command to run the experiment", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}, "accelerator": "T4"},
+  "compute_experiment": {"command": "command run inside a clone of this repo at cwd, e.g. 'python3 -m pkg.eval --episodes 1000'", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}, "accelerator": "T4"},
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
   "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.py or pr#123 or msg_id", "excerpt": "optional short quote"}],
   "acceptance_evidence": {"kind": "test", "descriptor": "named test exercising the new seam end-to-end", "selector": "testing/test_foo.py::test_bar"}

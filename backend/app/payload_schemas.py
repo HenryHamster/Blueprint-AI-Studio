@@ -692,6 +692,13 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     BasePayload, so new benchmark/evaluation fields can be added without a schema
     bump (backward-compatible extra-field tolerance).
 
+    The ``command`` runs on the compute VM inside a fresh, shallow clone of the
+    project repo at the current working directory, with the repo root on
+    PYTHONPATH (see ``compute_jobs._attach_repo_clone`` /
+    ``compute_backends._build_gcp_startup_script``). Commands import the project's
+    packages directly (``from pkg ...`` / ``python3 -m pkg``); they must not rely
+    on cloning the repo themselves or on writes persisting past teardown.
+
     All fields are optional + system-populated; the *agent* handler validates the
     launch requirements (command + a positive spend cap + a positive deadline)
     and fails loudly on misconfiguration rather than silently spending. The

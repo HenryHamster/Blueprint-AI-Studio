@@ -113,7 +113,18 @@ async def pr_is_not_behind_for(
     mergeable_state = detail.get("mergeable_state") or ""
     if base_tip_sha is None and head_sha and base_branch:
         try:
-            base_tip_sha = await _gh.get_branch_sha(token, owner, repo, base_branch)
+            # Behind-detection base tip — staleness-tolerant, so serve from the
+            # shared ~60s branch-tip cache. Many concurrent PRs check the same
+            # base (main/automain) every poll; this collapses those repeated
+            # git/ref reads to one per base per TTL window.
+            base_tip_sha = await _gh.get_branch_sha(
+                token,
+                owner,
+                repo,
+                base_branch,
+                project_id=project_id,
+                allow_cached=True,
+            )
         except Exception as exc:  # noqa: BLE001 — mirrors caller-site behavior: any get_branch_sha failure (network, 404, auth) must fall through to pr_is_not_behind with base_tip_sha=None so it can decide based on mergeable_state alone.
             logger.warning(
                 f"[PR_IS_NOT_BEHIND] get_branch_sha({base_branch}) failed for "

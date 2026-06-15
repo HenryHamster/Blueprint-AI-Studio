@@ -800,7 +800,16 @@ async def _nudge_sibling_rollup_prs(
     # get_branch_sha per sibling. On failure each check falls back internally.
     base_tip_sha = None
     try:
-        base_tip_sha = await get_branch_sha(gh_token, owner, repo, target_branch)
+        # Behind-detection base tip — staleness-tolerant, serve from the shared
+        # ~60s branch-tip cache (same target_branch is read by every sweep).
+        base_tip_sha = await get_branch_sha(
+            gh_token,
+            owner,
+            repo,
+            target_branch,
+            project_id=project_id_str,
+            allow_cached=True,
+        )
     except Exception as tip_exc:
         # Tip fetch is an optimization; per-sibling checks degrade gracefully
         # without it (pr_is_not_behind_for fetches per-call).

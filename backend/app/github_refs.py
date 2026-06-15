@@ -4,6 +4,7 @@ Extracted from ``app.github``; all symbols are re-exported from there so
 existing imports keep working.
 """
 
+import time
 from datetime import datetime
 from urllib.parse import quote
 
@@ -264,8 +265,37 @@ async def get_branch_sha(
     repo: str,
     branch: str,
     project_id: str | None = None,
+    *,
+    allow_cached: bool = False,
 ) -> str:
-    """Gets the latest commit SHA of a branch."""
+    """Gets the latest commit SHA of a branch.
+
+    ``allow_cached`` (default False) serves from / populates the short-TTL
+    branch-tip cache shared with the repo-snapshot layer
+    (``github_repo_snapshot._branch_sha_cache``, ~60s). It is ONLY safe for
+    STALENESS-TOLERANT reads — behind-detection ("is this PR behind its
+    base?"), where a ≤60s-old base tip is fine because GitHub still enforces
+    mergeability at merge time. NEVER pass ``allow_cached`` for SHA-CRITICAL
+    reads (promotion / merge-SHA verification, ref updates): those must observe
+    the live tip. A cache MISS still does the live request and raises on
+    failure, preserving the str-or-raise contract.
+
+    Wiring behind-detection through this cache removes the repeated identical
+    ``git/ref/heads/{base}`` reads (every concurrent PR checks the same base
+    tip) that were the #2 GitHub-quota consumer after token minting.
+    """
+    if allow_cached:
+        from app.github_repo_snapshot import (
+            _BRANCH_SHA_TTL_S,
+            _branch_sha_cache,
+            _bump_cache_stat,
+        )
+
+        _hit = _branch_sha_cache.get((owner, repo, branch))
+        if _hit is not None and (time.monotonic() - _hit[1]) < _BRANCH_SHA_TTL_S:
+            _bump_cache_stat("branch_sha_snapshot")
+            return _hit[0]
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -291,7 +321,12 @@ async def get_branch_sha(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"GitHub API error getting branch '{branch}' SHA (HTTP {response.status_code}).",
         )
-    return response.json()["object"]["sha"]
+    sha = response.json()["object"]["sha"]
+    if allow_cached:
+        from app.github_repo_snapshot import _branch_sha_cache
+
+        _branch_sha_cache[(owner, repo, branch)] = (sha, time.monotonic())
+    return sha
 
 
 async def get_repo_default_branch(token: str, owner: str, repo: str) -> str:

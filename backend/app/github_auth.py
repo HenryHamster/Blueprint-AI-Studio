@@ -6,6 +6,7 @@ re-exported from ``app.github`` so existing ``from app.github import ...``
 call sites continue to work unchanged.
 """
 
+import asyncio
 import time
 
 import httpx
@@ -66,6 +67,37 @@ def generate_github_app_jwt() -> str:
 _INSTALLATION_ID_TTL_SECONDS = 24 * 60 * 60  # 24 hours
 _installation_id_cache: dict[str, tuple[str, float]] = {}
 
+# Cache of (owner, repo) → (installation access token, minted_at_monotonic).
+# Installation access tokens are valid for 60 min, so we serve a cached token
+# for 50 min then re-mint — mirroring github_token_resolver._github_token_cache
+# (which caches per-project for the agent/CI path).
+#
+# WHY THIS EXISTS: get_repo_installation_token used to mint a FRESH token on
+# EVERY call (POST /app/installations/{id}/access_tokens). That endpoint was the
+# single largest consumer of the shared 5,000/hr installation rate-limit pool
+# (~36% of all GitHub calls fleet-wide, measured 2026-06-15) because the
+# background callers — auto_remediation, branch_cleanup, build_config_detection,
+# issue_implementation, release_promotion — hit it in loops/sweeps. Caching the
+# minted token collapses that to ~1 mint/repo per 50 min.
+_INSTALLATION_TOKEN_TTL_SECONDS = 50 * 60  # 50 min (tokens expire after 60)
+_repo_installation_token_cache: dict[str, tuple[str, float]] = {}
+# Single global mint lock: serialize concurrent cache-miss minting so a burst of
+# callers doesn't fire N simultaneous POST /access_tokens for the same repo.
+# Only contended on a cache miss (rare once warm), matching the existing
+# _github_token_cache_lock pattern in github_token_resolver.
+_repo_installation_token_lock = asyncio.Lock()
+
+
+def invalidate_repo_installation_token_cache(owner: str, repo: str) -> None:
+    """Drop a repo's cached installation token, forcing a re-mint on next use.
+
+    Called when a request authenticated with an install token returns 401 (the
+    token may have been revoked/rotated). Safe no-op if nothing is cached.
+    """
+    removed = _repo_installation_token_cache.pop(f"{owner}/{repo}", None)
+    if removed:
+        logger.info(f"[GITHUB] Invalidated cached install token for {owner}/{repo}")
+
 
 async def get_repo_installation_token(owner: str, repo: str) -> str | None:
     """
@@ -73,8 +105,10 @@ async def get_repo_installation_token(owner: str, repo: str) -> str | None:
     Used as a fallback when no UserIntegration exists (e.g., admin-created tasks).
     Returns None if the App is not installed on the repo.
 
-    Two API calls on cold cache (GET installation, POST access_tokens).
-    One API call on warm cache (installation_id cached, POST access_tokens only).
+    The minted access token is cached per (owner, repo) for
+    ``_INSTALLATION_TOKEN_TTL_SECONDS`` and reused, so a warm repo costs ZERO
+    GitHub calls. Cold cache costs two calls (GET installation, POST
+    access_tokens) or one if the installation_id is still cached.
     """
     if not GITHUB_APP_ID or not GITHUB_PRIVATE_KEY:
         return None
@@ -82,33 +116,58 @@ async def get_repo_installation_token(owner: str, repo: str) -> str | None:
     from app import github as _gh
 
     cache_key = f"{owner}/{repo}"
-    cached = _installation_id_cache.get(cache_key)
-    installation_id: str | None = None
-    if cached and time.time() - cached[1] < _INSTALLATION_ID_TTL_SECONDS:
-        installation_id = cached[0]
 
-    if installation_id is None:
-        app_jwt = _gh.generate_github_app_jwt()
-        headers = {
-            "Authorization": f"Bearer {app_jwt}",
-            "Accept": "application/vnd.github.v3+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        resp = await _github_request(
-            "GET", f"https://api.github.com/repos/{owner}/{repo}/installation", headers
-        )
-        if resp.status_code != 200:
-            logger.warning(
-                f"No GitHub App installation found for {owner}/{repo}: {resp.status_code}"
+    # Fast path: a freshly-minted token is valid for ~50 min — reuse it without
+    # touching GitHub. This is the change that removes minting from the hot path.
+    cached_token = _repo_installation_token_cache.get(cache_key)
+    if (
+        cached_token
+        and (time.monotonic() - cached_token[1]) < _INSTALLATION_TOKEN_TTL_SECONDS
+    ):
+        return cached_token[0]
+
+    async with _repo_installation_token_lock:
+        # Re-check under the lock — another coroutine may have minted while we
+        # waited, in which case we must NOT mint again.
+        cached_token = _repo_installation_token_cache.get(cache_key)
+        if (
+            cached_token
+            and (time.monotonic() - cached_token[1]) < _INSTALLATION_TOKEN_TTL_SECONDS
+        ):
+            return cached_token[0]
+
+        cached = _installation_id_cache.get(cache_key)
+        installation_id: str | None = None
+        if cached and time.time() - cached[1] < _INSTALLATION_ID_TTL_SECONDS:
+            installation_id = cached[0]
+
+        if installation_id is None:
+            app_jwt = _gh.generate_github_app_jwt()
+            headers = {
+                "Authorization": f"Bearer {app_jwt}",
+                "Accept": "application/vnd.github.v3+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+            resp = await _github_request(
+                "GET",
+                f"https://api.github.com/repos/{owner}/{repo}/installation",
+                headers,
             )
-            _installation_id_cache.pop(cache_key, None)
-            return None
-        installation_id = str(resp.json()["id"])
-        _installation_id_cache[cache_key] = (installation_id, time.time())
+            if resp.status_code != 200:
+                logger.warning(
+                    f"No GitHub App installation found for {owner}/{repo}: {resp.status_code}"
+                )
+                _installation_id_cache.pop(cache_key, None)
+                return None
+            installation_id = str(resp.json()["id"])
+            _installation_id_cache[cache_key] = (installation_id, time.time())
 
-    return await _gh.generate_installation_access_token(
-        installation_id, repositories=[repo]
-    )
+        token = await _gh.generate_installation_access_token(
+            installation_id, repositories=[repo]
+        )
+        if token:
+            _repo_installation_token_cache[cache_key] = (token, time.monotonic())
+        return token
 
 
 async def exchange_oauth_code(code: str, redirect_uri: str | None = None) -> dict:

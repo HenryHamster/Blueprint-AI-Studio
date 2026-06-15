@@ -359,6 +359,21 @@ async def _github_request(
                     logger.info(
                         f"[GITHUB] Invalidated token cache for project {project_id} after 401"
                     )
+                # Also drop any repo-scoped install token cached by
+                # get_repo_installation_token (that path has no project_id).
+                # Parse owner/repo from the repo API URL so a revoked token
+                # self-heals on the next call instead of 401-ing for ~50 min.
+                _repo_m = _re.search(
+                    r"api\.github\.com/repos/([^/?#]+)/([^/?#]+)", url
+                )
+                if _repo_m:
+                    from app.github_auth import (
+                        invalidate_repo_installation_token_cache,
+                    )
+
+                    invalidate_repo_installation_token_cache(
+                        _repo_m.group(1), _repo_m.group(2)
+                    )
             if response.status_code < 500 or attempt == max_retries - 1:
                 if attempt > 0 and response.status_code >= 500:
                     logger.error(

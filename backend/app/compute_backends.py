@@ -124,6 +124,14 @@ class ComputeLaunchSpec:
     # Single-GPU accelerator (canonical short name, e.g. "T4"); None for CPU jobs.
     accelerator: str | None = None
     accelerator_count: int = 1
+    # Optional repo checkout. When both are set, the startup script clones this
+    # repository at ``repo_clone["ref"]`` into a scratch dir, cds there, and puts
+    # the repo root on PYTHONPATH BEFORE the command runs — so the command can
+    # ``import`` the project's packages (``from pkg ...`` / ``python3 -m pkg``).
+    # ``repo_token`` is a short-lived installation token minted at LAUNCH time and
+    # is never persisted on the job row. Absent ⇒ no checkout (legacy behavior).
+    repo_clone: dict[str, str] | None = None
+    repo_token: str | None = None
 
 
 @dataclass(slots=True)
@@ -951,6 +959,37 @@ def _build_gcp_startup_script(
         env_lines.append(f"export {key}={shlex.quote(value)}")
     env_block = "\n".join(env_lines)
     cwd_line = f"cd {shlex.quote(spec.cwd)}" if spec.cwd else ""
+    # Optional repo checkout: clone the project repo at the requested ref into a
+    # scratch dir, cd into it, and put it on PYTHONPATH so the command can import
+    # the project's packages. Runs BEFORE cwd_line (an explicit cwd still wins).
+    # A clone failure terminates the job LOUDLY with a parseable reason instead of
+    # letting the command die on ModuleNotFound and leaving "no terminal marker".
+    # The clone is silenced (>/dev/null 2>&1) so the install token never reaches
+    # the serial console.
+    repo_setup_block = ""
+    if spec.repo_clone and spec.repo_token:
+        _repo_dir_q = shlex.quote("/tmp/blueprint_repo")
+        _ref = str(spec.repo_clone.get("ref") or "main")
+        _owner = str(spec.repo_clone.get("owner") or "")
+        _repo = str(spec.repo_clone.get("repo") or "")
+        _clone_url = (
+            f"https://x-access-token:{spec.repo_token}@github.com/{_owner}/{_repo}.git"
+        )
+        repo_setup_block = (
+            f"rm -rf {_repo_dir_q}\n"
+            f"if ! git clone --depth 1 --branch {shlex.quote(_ref)} "
+            f"{shlex.quote(_clone_url)} {_repo_dir_q} >/dev/null 2>&1; then\n"
+            f'  echo "{_SERIAL_REASON_PREFIX}repo_clone_failed"\n'
+            f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
+            f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
+            f"  upload_artifacts\n"
+            f'  kill "$TTL_PID" 2>/dev/null || true\n'
+            f"  poweroff || shutdown -h now || true\n"
+            f"  exit 1\n"
+            f"fi\n"
+            f"cd {_repo_dir_q}\n"
+            f"export PYTHONPATH={_repo_dir_q}:${{PYTHONPATH:-}}"
+        )
     if spec.runtime_deadline_seconds is not None:
         deadline_seconds = max(60, int(spec.runtime_deadline_seconds) + 30)
     elif spec.deadline_at is not None:
@@ -1023,6 +1062,7 @@ export {ARTIFACT_DIR_ENV}={artifact_dir}
 rm -f {result_file}
 rm -f {command_log_path}
 mkdir -p {artifact_dir}
+{repo_setup_block}
 {cwd_line}
 EXIT_CODE=0
 if python3 /tmp/blueprint_command_runner.py \
