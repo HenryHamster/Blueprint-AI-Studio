@@ -8843,6 +8843,160 @@ def test_gcp_startup_script_release_echo_block_is_no_op_without_sha():
     assert "BLUEPRINT_RELEASE_SHA" in script
 
 
+def test_gcp_startup_script_clones_repo_when_repo_clone_present():
+    """repo_clone+repo_token ⇒ script clones the repo, cds in, sets PYTHONPATH."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 -m pkg.eval",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "octo", "repo": "demo", "ref": "release-x"},
+        repo_token="ghs_FAKETOKEN123",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "git clone --depth 1 --branch release-x" in script
+    assert (
+        "https://x-access-token:ghs_FAKETOKEN123@github.com/octo/demo.git" in script
+    )
+    assert "cd /tmp/blueprint_repo" in script
+    assert "export PYTHONPATH=/tmp/blueprint_repo:${PYTHONPATH:-}" in script
+    # A clone failure must terminate the job LOUDLY (parseable markers), not leave
+    # the command to die on ModuleNotFound with "no terminal marker".
+    assert "repo_clone_failed" in script
+    assert f"{compute_backends_module._SERIAL_STATUS_PREFIX}FAILED" in script
+
+
+def test_gcp_startup_script_no_clone_without_repo_clone():
+    """No repo_clone ⇒ no git clone block (legacy bare-VM behavior preserved)."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "git clone" not in script
+    assert "/tmp/blueprint_repo" not in script
+
+
+def test_gcp_startup_script_no_clone_without_token():
+    """repo_clone present but no token ⇒ no clone (both are required)."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "octo", "repo": "demo", "ref": "main"},
+        repo_token=None,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "git clone" not in script
+
+
+async def test_attach_repo_clone_sets_repo_and_token(db_session, monkeypatch):
+    """_attach_repo_clone resolves owner/repo + ref (from base_branch) + a token."""
+    project = Project(
+        name="repo-clone", user_id="u", github_owner="octo", github_repo="demo"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "release-x"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 -m pkg.eval",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    async def fake_token(_project, _session):
+        return "ghs_FAKE"
+
+    monkeypatch.setattr("app.branch_cleanup._get_project_github_token", fake_token)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    spec = await compute_jobs._attach_repo_clone(
+        session_factory, job, compute_jobs._build_launch_spec(job)
+    )
+    assert spec.repo_clone == {"owner": "octo", "repo": "demo", "ref": "release-x"}
+    assert spec.repo_token == "ghs_FAKE"
+
+
+async def test_attach_repo_clone_skips_when_project_has_no_repo(db_session, monkeypatch):
+    """A repo-less project ⇒ no checkout and the token path is never touched."""
+    project = Project(name="no-repo", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    calls = {"n": 0}
+
+    async def fake_token(_project, _session):
+        calls["n"] += 1
+        return "ghs_FAKE"
+
+    monkeypatch.setattr("app.branch_cleanup._get_project_github_token", fake_token)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    spec = await compute_jobs._attach_repo_clone(
+        session_factory, job, compute_jobs._build_launch_spec(job)
+    )
+    assert spec.repo_clone is None
+    assert spec.repo_token is None
+    assert calls["n"] == 0
+
+
 def test_parse_serial_status_extracts_release_echo():
     """_parse_serial_status decodes BLUEPRINT_COMPUTE_RELEASE_ECHO into echoed_release_sha."""
     sha = "abc123def456"

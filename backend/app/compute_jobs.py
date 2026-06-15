@@ -1133,7 +1133,10 @@ async def _process_single_compute_job(
             return
         started_at = _utcnow()
         try:
-            launch_coro = backend.launch(_build_launch_spec(reserved))
+            spec = await _attach_repo_clone(
+                session_factory, reserved, _build_launch_spec(reserved)
+            )
+            launch_coro = backend.launch(spec)
             if provisioning_timeout_seconds is not None:
                 result = await asyncio.wait_for(
                     launch_coro, timeout=provisioning_timeout_seconds
@@ -1661,6 +1664,72 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         accelerator=job.accelerator_type,
         accelerator_count=int(job.accelerator_count or 1),
     )
+
+
+async def _attach_repo_clone(
+    session_factory, job: ComputeJob, spec: ComputeLaunchSpec
+) -> ComputeLaunchSpec:
+    """Best-effort: give the compute VM a checked-out clone of the project repo.
+
+    Compute commands routinely import the project's package (``from pkg ...`` /
+    ``python3 -m pkg``); on a bare VM with no repo they die with ModuleNotFound
+    before reporting any metric, which surfaces as a silent "no terminal marker"
+    FAILURE. We resolve the project's repo + a FRESH installation token at launch
+    (never persisted) and stamp them onto the spec so the startup script clones
+    the repo, cds into it, and puts it on PYTHONPATH before the command runs.
+
+    The ref is the branch the experiment targets: the task's ``base_branch`` (set
+    by research/plan/operator authoring) → ``context.original_base`` → the
+    project's promotion target → ``main``.
+
+    Defensive by contract: a project with no repo, a token-mint failure, or any
+    other error degrades to NO checkout (legacy behavior) — it NEVER blocks the
+    launch. A genuinely repo-dependent command then fails the same way it does
+    today, no worse.
+    """
+    if not job.project_id:
+        return spec
+    try:
+        async with session_factory() as session:
+            project = await session.get(Project, job.project_id)
+            if project is None or not project.github_owner or not project.github_repo:
+                return spec
+            ref: str | None = None
+            if job.task_id:
+                task = await session.get(Task, job.task_id)
+                if task is not None:
+                    payload = task.first_payload if isinstance(task.first_payload, dict) else {}
+                    ctx = task.context if isinstance(task.context, dict) else {}
+                    ref = payload.get("base_branch") or ctx.get("original_base")
+            ref = ref or getattr(project, "promotion_target", None) or "main"
+            # Reuses the shared, cached install-token path (50-min TTL) so launches
+            # don't drain the App-JWT bucket.
+            from app.branch_cleanup import _get_project_github_token
+
+            token = await _get_project_github_token(project, session)
+            if not token:
+                logger.warning(
+                    "[COMPUTE_JOB] no GitHub token for project=%s; launching job=%s "
+                    "without a repo checkout",
+                    job.project_id,
+                    job.id,
+                )
+                return spec
+            spec.repo_clone = {
+                "owner": str(project.github_owner),
+                "repo": str(project.github_repo),
+                "ref": str(ref),
+            }
+            spec.repo_token = token
+            return spec
+    except Exception:  # noqa: BLE001 — repo checkout is best-effort, never fatal
+        logger.warning(
+            "[COMPUTE_JOB] repo-clone attach failed for job=%s; launching without a "
+            "repo checkout",
+            job.id,
+            exc_info=True,
+        )
+        return spec
 
 
 def _meta_message(job: ComputeJob) -> str | None:
