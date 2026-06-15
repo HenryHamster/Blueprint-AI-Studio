@@ -15163,6 +15163,69 @@ class TestComputeExperimentTaskLaunch:
         payload = task.payloads[0]
         assert "require_durable_artifact" not in payload
 
+    @pytest.mark.asyncio
+    async def test_auto_created_project_is_dispatchable(
+        self, client: AsyncClient, db_session
+    ):
+        """A compute_experiment on a fresh repo auto-creates a project that is
+        immediately dispatchable: autonomous_enabled=False (no autonomous
+        research cycles) and bootstrap_completed_at set (bootstrap-recovery
+        sweep will not spawn a competing repo_bootstrap task).
+        """
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                # Use a repo that has no pre-existing project so the endpoint
+                # auto-creates one.
+                json=self._valid_payload(repo="fresh-repo-no-project"),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        # Retrieve the auto-created project.
+        project = (
+            await db_session.execute(
+                select(Project).where(
+                    Project.github_owner == "acme",
+                    Project.github_repo == "fresh-repo-no-project",
+                )
+            )
+        ).scalar_one()
+
+        # The task must be QUEUED and not held for approval.
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        assert task.status == TaskStatus.QUEUED
+        assert task.requires_approval is False
+
+        # The auto-created project must be marked non-autonomous so the
+        # orchestrator does not try to run research cycles on it.
+        assert project.autonomous_enabled is False, (
+            "auto-created compute-experiment project must have autonomous_enabled=False "
+            "so autonomous research cycles do not compete for dispatch slots"
+        )
+
+        # bootstrap_completed_at must be set so the bootstrap-recovery sweep
+        # does not spawn a competing repo_bootstrap task.
+        build_cfg = project.build_config or {}
+        assert build_cfg.get("bootstrap_completed_at"), (
+            "auto-created compute-experiment project must have bootstrap_completed_at "
+            "set so the bootstrap-recovery sweep skips it"
+        )
+
 
 class TestBugReportCitationGate:
     """Reproduce-on-HEAD citation grounding for free-text bug reports.

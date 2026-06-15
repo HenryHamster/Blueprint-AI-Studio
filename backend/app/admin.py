@@ -86,6 +86,7 @@ from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
     router as _operator_triggers_router,
 )
+
 # Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts
 # (MAX_LINT_FIX_ATTEMPTS=5, MAX_TEST_FIX_ATTEMPTS=3); "check" has no
 # agent-side constant — 5 is a heuristic default used only for the
@@ -288,7 +289,8 @@ async def get_all_tasks(
                     Artifact.storage_uri,
                     Artifact.iteration,
                     Artifact.created_at,
-                raiseload=True,)
+                    raiseload=True,
+                )
             )
             .where(Artifact.task_id.in_(task_ids))
             .order_by(Artifact.created_at.asc())
@@ -321,7 +323,14 @@ async def get_all_tasks(
         # Fetch logs columns separately to avoid loading large blobs in the main query
         logs_stmt = (
             select(Artifact)
-            .options(load_only(Artifact.task_id, Artifact.artifact_type, Artifact.logs, raiseload=True))
+            .options(
+                load_only(
+                    Artifact.task_id,
+                    Artifact.artifact_type,
+                    Artifact.logs,
+                    raiseload=True,
+                )
+            )
             .where(
                 Artifact.task_id.in_(task_ids),
                 Artifact.artifact_type.in_(
@@ -817,12 +826,16 @@ async def bulk_action_tasks(
         ]
         if _parent_type_ids:
             _child_parent_rows = (
-                await session.execute(
-                    select(Task.parent_task_id)
-                    .where(Task.parent_task_id.in_(_parent_type_ids))
-                    .distinct()
+                (
+                    await session.execute(
+                        select(Task.parent_task_id)
+                        .where(Task.parent_task_id.in_(_parent_type_ids))
+                        .distinct()
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             _parents_with_children = set(_child_parent_rows)
             for _pid in _parent_type_ids:
                 _retry_parent_has_children[_pid] = _pid in _parents_with_children
@@ -1695,7 +1708,9 @@ async def create_task_manually(
     try:
         task_payload = validate_task_payload(task_payload)
     except ValueError as exc:
-        logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+        logger.warning(
+            "Validation error in task payload: %s: %s", type(exc).__name__, exc
+        )
         raise HTTPException(status_code=422, detail="Invalid request")
 
     # Guard: cap active tasks per project to prevent queue explosion
@@ -1860,11 +1875,21 @@ async def create_compute_experiment_task(
     project = (await session.execute(stmt)).scalars().first()
 
     if not project:
+        # Mark the auto-created project as bootstrap-complete and non-autonomous:
+        # compute_experiment is a one-off operator job and does not need repo
+        # bootstrapping or autonomous research cycles.  Without these flags the
+        # bootstrap-recovery sweep would spawn a competing repo_bootstrap task
+        # and the autonomous-research gate (_bootstrap_pending) would defer
+        # spawning for the project, both of which can starve the dispatch slot
+        # that the compute_experiment task is waiting for.
+        _now_iso = _utcnow().isoformat()
         project = Project(
             name=payload.github_repo,
             user_id=current_user.get("user_id", "admin"),
             github_owner=github_owner,
             github_repo=github_repo,
+            autonomous_enabled=False,
+            build_config={"bootstrap_completed_at": _now_iso},
         )
         session.add(project)
         await session.commit()
@@ -1960,7 +1985,9 @@ async def create_compute_experiment_task(
     try:
         task_payload = validate_task_payload(task_payload_raw)
     except ValueError as exc:
-        logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+        logger.warning(
+            "Validation error in task payload: %s: %s", type(exc).__name__, exc
+        )
         raise HTTPException(status_code=422, detail="Invalid request")
 
     active_count = (

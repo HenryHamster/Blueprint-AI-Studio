@@ -149,7 +149,9 @@ class TestReaperService:
         A task whose last heartbeat is >5 min old AND has reached max_retries
         must be marked FAILED and its VM deleted.
         """
-        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch(
+            "app.vm_lifecycle.delete_agent_vm", return_value=None
+        )
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -189,7 +191,9 @@ class TestReaperService:
         A task whose last heartbeat is within the 5-minute window must
         be left alone by the reaper.
         """
-        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch(
+            "app.vm_lifecycle.delete_agent_vm", return_value=None
+        )
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -270,7 +274,9 @@ class TestReaperService:
         Logical/parent tasks that have no VM assigned (vm_instance_id=None)
         must be skipped — the reaper only acts on tasks with real VMs.
         """
-        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch(
+            "app.vm_lifecycle.delete_agent_vm", return_value=None
+        )
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -318,7 +324,9 @@ class TestReaperService:
         even if two reaper instances select the same task, the second one
         detects the status change during re-validation and does nothing.
         """
-        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch(
+            "app.vm_lifecycle.delete_agent_vm", return_value=None
+        )
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         StopLoop = self._stop_after_one_cycle(mocker)
 
@@ -386,7 +394,9 @@ class TestReaperService:
         A task that is already FAILED must never be picked up — this is the
         database-level guarantee that prevents double-reaping after the first pass.
         """
-        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch(
+            "app.vm_lifecycle.delete_agent_vm", return_value=None
+        )
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -524,7 +534,9 @@ class TestReaperService:
         no heartbeat yet must NOT be reaped — the agent is still within its
         boot + auth + claim budget.
         """
-        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch(
+            "app.vm_lifecycle.delete_agent_vm", return_value=None
+        )
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -2210,7 +2222,6 @@ class TestHealthAwareDispatch:
         assert reordered == ids
 
 
-
 class TestPipelineSlotCap:
     """Pipeline-slot cap defers review/fix tasks past the budget while
     create/research dispatch normally."""
@@ -2937,6 +2948,116 @@ class TestProjectConcurrencyCap:
             f"Previously-deferred task must dispatch once active count drops; got {row.status}"
         )
 
+    @pytest.mark.asyncio
+    async def test_compute_experiment_on_fresh_project_dispatches_to_provisioning(
+        self, orch_cap_db, mocker
+    ):
+        """Regression guard: a compute_experiment task on an auto-created project
+        (autonomous_enabled=False, bootstrap_completed_at set) must dispatch to
+        PROVISIONING in a single orchestrator cycle without being starved by the
+        bootstrap-recovery sweep or autonomous-research gating.
+
+        Before the fix the auto-created project had autonomous_enabled=True and
+        no bootstrap_completed_at, which caused _sweep_bootstrap_recovery to
+        spawn a competing repo_bootstrap task and _bootstrap_pending() to defer
+        autonomous-research spawning — both could hold the dispatch slot and
+        leave the compute_experiment task QUEUED indefinitely.
+        """
+        from sqlmodel import select as _select
+        from app.max_plan_pool import LLMSelectionResult
+        from app.time_utils import _utcnow as _now
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": "acct-compute-exp",
+                    "name": "Compute Exp Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        import app.orchestrator as _orch_module
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 5
+        _orch_module._runtime_config["warm_pool_enabled"] = False
+
+        task_id = None
+
+        async with orch_cap_db() as session:
+            # Mirror what create_compute_experiment_task sets on auto-created
+            # projects: non-autonomous, bootstrap already complete.
+            project = make_project(
+                name="FreshComputeProject",
+                user_id=_TEST_USER,
+                autonomous_enabled=False,
+                build_config={"bootstrap_completed_at": _now().isoformat()},
+            )
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                requires_approval=False,
+                payloads=[
+                    {
+                        "type": "compute_experiment",
+                        "command": "echo hello",
+                        "github_repo": "acme/fresh-repo",
+                    }
+                ],
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_cap_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+        assert row is not None
+        assert row.status == TaskStatus.PROVISIONING, (
+            f"compute_experiment on fresh auto-created project must dispatch to "
+            f"PROVISIONING; got {row.status}. "
+            "Check that autonomous_enabled=False and bootstrap_completed_at are "
+            "set on auto-created projects (admin.py create_compute_experiment_task)."
+        )
+
 
 class TestComputeJobVMDispatchHeadroom:
     """Compute-job VMs must not consume agent dispatch slots (direction d-9d6c2c94).
@@ -2976,7 +3097,9 @@ class TestComputeJobVMDispatchHeadroom:
         # Force cache expiry by patching the globals so they're restored post-test
         mocker.patch.object(_vm_lifecycle_mod, "_last_gcp_vm_check", 0.0)
         mocker.patch.object(
-            _vm_lifecycle_mod, "_last_gcp_vm_count", _vm_lifecycle_mod._last_gcp_vm_count
+            _vm_lifecycle_mod,
+            "_last_gcp_vm_count",
+            _vm_lifecycle_mod._last_gcp_vm_count,
         )
 
         count = await _vm_lifecycle_mod._get_actual_gcp_vm_count()
@@ -3065,7 +3188,9 @@ class TestBatchedDepRowsSurviveCommit:
         detached_dep = dep_by_id[dep.id]
         assert detached_dep.status == TaskStatus.COMPLETED
         assert detached_dep.first_payload.get("type") == "research"
-        assert isinstance(detached_dep.context, dict)  # accessible without DetachedInstanceError
+        assert isinstance(
+            detached_dep.context, dict
+        )  # accessible without DetachedInstanceError
 
         async def _noop_verify(_task, _session):
             return True
@@ -3179,9 +3304,7 @@ class TestPersistDepsSatisfied:
     (GitHub-aware) dep resolution on the hot path."""
 
     @pytest.mark.asyncio
-    async def test_persist_deps_satisfied_stamps_and_persists(
-        self, db_session, mocker
-    ):
+    async def test_persist_deps_satisfied_stamps_and_persists(self, db_session, mocker):
         from app.orchestrator import _persist_deps_satisfied
 
         project = make_project(name="Deps Satisfied", user_id="u1")
@@ -3218,9 +3341,7 @@ class TestPersistDepsSatisfied:
         assert task.context.get("scope") == "small"
 
     @pytest.mark.asyncio
-    async def test_persist_deps_satisfied_is_idempotent_noop(
-        self, db_session, mocker
-    ):
+    async def test_persist_deps_satisfied_is_idempotent_noop(self, db_session, mocker):
         """A task already carrying the marker is left untouched (no redundant
         write), so repeated eligible cycles don't thrash the row."""
         from app.orchestrator import _persist_deps_satisfied
@@ -3559,9 +3680,7 @@ class TestMarkUnblockedDependents:
         assert not (dependent.context or {}).get("_deps_satisfied")
 
     @pytest.mark.asyncio
-    async def test_does_not_mark_dependent_when_recut_errors(
-        self, db_session, mocker
-    ):
+    async def test_does_not_mark_dependent_when_recut_errors(self, db_session, mocker):
         """Completion-side warm-claim path: transient re-cut errors (GitHub API
         failures, credential issues) hold the dependent for retry next cycle
         instead of stamping it as warm-claimable against an un-recut base.
@@ -3761,12 +3880,15 @@ class TestWarmVMSkipProvision:
             )
             mocker.patch("app.services._recover_orphaned_tasks", new_callable=AsyncMock)
             mocker.patch(
-                "app.alert_dispatch._create_orchestrator_error_alerts", new_callable=AsyncMock
+                "app.alert_dispatch._create_orchestrator_error_alerts",
+                new_callable=AsyncMock,
             )
             mocker.patch(
                 "app.orchestrator._persist_zone_health", new_callable=AsyncMock
             )
-            mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+            mocker.patch(
+                "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+            )
             # The provision wrapper reaches Secret Manager and GCS via
             # asyncio.gather BEFORE the (separately mocked) provision_agent_vm
             # call. Both need real Google credentials: present on GCE agent
@@ -4244,9 +4366,7 @@ class TestWarmVMSkipProvision:
         )
 
     @pytest.mark.asyncio
-    async def test_cascade_cancel_raises_single_dedup_alert(
-        self, orch_warm_db, mocker
-    ):
+    async def test_cascade_cancel_raises_single_dedup_alert(self, orch_warm_db, mocker):
         """A failed prerequisite that cascade-cancels multiple dependents in
         one dispatch pass raises exactly ONE operator alert naming the root
         failure (not one-per-dependent), and a later pass does not duplicate it
@@ -4261,9 +4381,7 @@ class TestWarmVMSkipProvision:
         )
         # The cascade-cancel helper binds broadcast_to_project at module load;
         # patch it on alert_dispatch so the real WS/notify path is not exercised.
-        mocker.patch(
-            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
-        )
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
 
         async with orch_warm_db() as session:
             project = make_project(name="Cascade Dedup", user_id=_TEST_USER)
@@ -4359,9 +4477,7 @@ class TestWarmVMSkipProvision:
             new_callable=AsyncMock,
             return_value=True,
         )
-        mocker.patch(
-            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
-        )
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
 
         async with orch_warm_db() as session:
             project = make_project(name="Cascade Children", user_id=_TEST_USER)
@@ -4487,13 +4603,17 @@ class TestWarmVMSkipProvision:
         await db_session.commit()
 
         alert = (
-            await db_session.execute(
-                _select(Alert).where(
-                    Alert.project_id == project.id,
-                    Alert.title == "Blocking branch configuration",
+            (
+                await db_session.execute(
+                    _select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.title == "Blocking branch configuration",
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         assert alert is not None
         assert "promotion target" in alert.message
 
@@ -4549,9 +4669,7 @@ class TestWarmVMSkipProvision:
         pool_fail_spy = mocker.patch(
             "app.orchestrator._shared_state.record_pool_claim_failure"
         )
-        clear_spy = mocker.patch(
-            "app.orchestrator._shared_state.record_warm_pin_clear"
-        )
+        clear_spy = mocker.patch("app.orchestrator._shared_state.record_warm_pin_clear")
 
         # Ensure the pool breaker is NOT tripped by residue from other tests, so
         # the unresponsive-VM clear takes the vm_unresponsive path (not circuit_breaker).
@@ -4566,9 +4684,7 @@ class TestWarmVMSkipProvision:
                 await session.refresh(project)
 
                 target_vm = "agent-vm-pool-target-1"
-                deadline = (
-                    datetime.utcnow() + timedelta(seconds=240)
-                ).isoformat()
+                deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
                 task = make_task(
                     project_id=project.id,
                     # _pin_task_to_pool_vm stamps the pool VM's id onto the task;
@@ -4637,7 +4753,9 @@ class TestWarmVMSkipProvision:
         )
 
         async with orch_warm_db() as session:
-            project = make_project(name="Park-Retarget-Unresponsive", user_id=_TEST_USER)
+            project = make_project(
+                name="Park-Retarget-Unresponsive", user_id=_TEST_USER
+            )
             session.add(project)
             await session.commit()
             await session.refresh(project)
@@ -4795,12 +4913,8 @@ class TestWarmVMSkipProvision:
             new_callable=AsyncMock,
             return_value=_Member(),
         )
-        lease_hit_spy = mocker.patch(
-            "app.warm_backlog_reuse.record_pool_lease_hit"
-        )
-        cold_spy = mocker.patch(
-            "app.warm_backlog_reuse.record_pool_cold_dispatch"
-        )
+        lease_hit_spy = mocker.patch("app.warm_backlog_reuse.record_pool_lease_hit")
+        cold_spy = mocker.patch("app.warm_backlog_reuse.record_pool_cold_dispatch")
 
         _shared_state.runtime_config["warm_pool_enabled"] = True
         try:
@@ -5169,9 +5283,7 @@ class TestWarmVMSkipProvision:
             assert open_row.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
-    async def test_project_spend_ceiling_defers_dispatch(
-        self, orch_warm_db, mocker
-    ):
+    async def test_project_spend_ceiling_defers_dispatch(self, orch_warm_db, mocker):
         """A project over its spend ceiling keeps queued work undispatched."""
         from sqlmodel import select as _select
         import app.orchestrator as _orch_module
@@ -5337,12 +5449,8 @@ class TestWarmVMSkipProvision:
             new_callable=AsyncMock,
             return_value=None,
         )
-        lease_hit_spy = mocker.patch(
-            "app.warm_backlog_reuse.record_pool_lease_hit"
-        )
-        cold_spy = mocker.patch(
-            "app.warm_backlog_reuse.record_pool_cold_dispatch"
-        )
+        lease_hit_spy = mocker.patch("app.warm_backlog_reuse.record_pool_lease_hit")
+        cold_spy = mocker.patch("app.warm_backlog_reuse.record_pool_cold_dispatch")
 
         _shared_state.runtime_config["warm_pool_enabled"] = True
         try:
@@ -5433,9 +5541,7 @@ class TestWarmVMSkipProvision:
         pool_fail_spy = mocker.patch(
             "app.orchestrator._shared_state.record_pool_claim_failure"
         )
-        lease_hit_spy = mocker.patch(
-            "app.warm_backlog_reuse.record_pool_lease_hit"
-        )
+        lease_hit_spy = mocker.patch("app.warm_backlog_reuse.record_pool_lease_hit")
         # The slot pre-reserved during runtime selection must be released on
         # this early-exit (mirroring the cold-provision commit-failure path).
         release_spy = mocker.patch(
@@ -5640,9 +5746,7 @@ class TestWarmVMSkipProvision:
         )
         # And the cancel did not leak an orphan-cleanup background task.
         _leaked = set(_pipeline_state.background_tasks) - _bg_before
-        assert not _leaked, (
-            f"cycle cleanup leaked background task(s): {_leaked}"
-        )
+        assert not _leaked, f"cycle cleanup leaked background task(s): {_leaked}"
 
 
 class TestClassifyStuckTasksSharedPolicy:
@@ -5780,9 +5884,7 @@ class TestClassifyStuckTasksSharedPolicy:
         # Edge is a recognized structural prerequisite before the remap.
         assert _has_edge_prerequisite_provenance(dependent, old_dep_id)
 
-        remapped = await _persist_requeue_dep_remap(
-            dependent, {old_dep_id: new_dep_id}
-        )
+        remapped = await _persist_requeue_dep_remap(dependent, {old_dep_id: new_dep_id})
         assert remapped is True
 
         # In-memory task updated on BOTH axes.
@@ -5987,7 +6089,9 @@ async def test_blocked_task_excluded_from_dispatch_candidates(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    queued = make_task(project_id=project.id, status=TaskStatus.QUEUED, title="runnable")
+    queued = make_task(
+        project_id=project.id, status=TaskStatus.QUEUED, title="runnable"
+    )
     blocked = make_task(
         project_id=project.id,
         status=TaskStatus.BLOCKED,
@@ -6037,7 +6141,9 @@ class TestCrossBaseCodeDependencyPolicy:
         from app.orchestrator_health import is_genuine_code_dependency
 
         dep = self._dep("create", ["backend/app/foo.py"])
-        dependent = self._dependent("create", ["backend/app/foo.py", "backend/app/bar.py"])
+        dependent = self._dependent(
+            "create", ["backend/app/foo.py", "backend/app/bar.py"]
+        )
         assert is_genuine_code_dependency(dependent, dep) is True
 
     def test_no_overlap_non_transforming_is_ordering_only(self):
@@ -6111,7 +6217,9 @@ class TestCrossBaseCodeDependencyPolicy:
         dependent = self._dependent("modify", [])  # no files declared
         assert is_genuine_code_dependency(dependent, dep) is True
 
-    def test_transforming_dependent_fix_with_dependency_having_no_files_is_genuine(self):
+    def test_transforming_dependent_fix_with_dependency_having_no_files_is_genuine(
+        self,
+    ):
         from app.orchestrator_health import is_genuine_code_dependency
 
         # When the dependency declares no files, we cannot disprove overlap, so the
@@ -6312,9 +6420,7 @@ class TestCrossBaseBaseRecut:
         from app.orchestrator_health import ensure_dependent_base_recut
         from app.landed_signal import mark_landed_on_integration
 
-        merge_mock = mocker.patch(
-            "app.github.merge_branch", new_callable=AsyncMock
-        )
+        merge_mock = mocker.patch("app.github.merge_branch", new_callable=AsyncMock)
         project = make_project(
             name="RecutNoop", user_id="u1", integration_branch="main"
         )
@@ -6693,9 +6799,7 @@ class TestCrossBaseRecutBounding:
         assert await self._open_escalation_alerts(db_session, dependent) == []
 
     @pytest.mark.asyncio
-    async def test_persistent_conflict_escalates_exactly_once(
-        self, db_session, mocker
-    ):
+    async def test_persistent_conflict_escalates_exactly_once(self, db_session, mocker):
         """After the bound is reached a persistent conflict escalates EXACTLY ONCE
         (deduplicated); the task carries the status message + context marker, and
         running the path again does not create a second alert."""
@@ -6728,7 +6832,9 @@ class TestCrossBaseRecutBounding:
 
         # Drive consecutive conflicts up to (and past) the escalation bound.
         for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
-            assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+            assert (
+                await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+            )
 
         assert dependent.context.get("_recut_escalated") is True
         assert "persistent merge conflict" in (dependent.latest_status_message or "")
@@ -6778,7 +6884,9 @@ class TestCrossBaseRecutBounding:
         # Far more attempts than the conflict bound — a transient class must never
         # escalate.
         for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD + 2):
-            assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+            assert (
+                await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+            )
 
         assert dependent.context.get("_recut_conflict_attempts") == 0
         assert dependent.context.get("_recut_last_outcome") == "error"
@@ -6841,9 +6949,7 @@ class TestCrossBaseRecutBounding:
         ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
         assert ok is True
         # Accounting fully cleared.
-        assert not any(
-            str(k).startswith("_recut_") for k in (dependent.context or {})
-        )
+        assert not any(str(k).startswith("_recut_") for k in (dependent.context or {}))
         # Open escalation reconciled (dismissed).
         assert await self._open_escalation_alerts(db_session, dependent) == []
 
@@ -6898,9 +7004,7 @@ class TestCrossBaseRecutBounding:
         assert len(await self._open_escalation_alerts(db_session, dependent)) == 1
 
     @pytest.mark.asyncio
-    async def test_recut_classifies_missing_branch_distinctly(
-        self, db_session, mocker
-    ):
+    async def test_recut_classifies_missing_branch_distinctly(self, db_session, mocker):
         """``recut_dependent_base_from_integration`` maps a 404 merge result to the
         distinct ``"missing"`` outcome rather than folding it into ``"error"``."""
         from app.branch_resolution import recut_dependent_base_from_integration
@@ -6941,7 +7045,9 @@ class TestFinishBeforeStartPriority:
     """
 
     @staticmethod
-    def _apply(eligible, types_by_id, parent_id_by_id, active_task_ids, rollup_parent_ids):
+    def _apply(
+        eligible, types_by_id, parent_id_by_id, active_task_ids, rollup_parent_ids
+    ):
         from app.orchestrator_filters import apply_completion_priority
 
         return apply_completion_priority(
@@ -6979,7 +7085,7 @@ class TestFinishBeforeStartPriority:
         parents = {
             "new_research": None,
             "plan_child": "running-plan",
-            "ordinary_rv": "other-parent",   # parent not a rollup
+            "ordinary_rv": "other-parent",  # parent not a rollup
             "rollup_rv": "rollup-plan",
         }
         active = {"running-plan"}
@@ -7002,7 +7108,11 @@ class TestFinishBeforeStartPriority:
         """Result is always a permutation — same length and membership."""
         eligible = ["r1", "rv1", "c1", "f1", "r2"]
         types = {
-            "r1": "research", "rv1": "review", "c1": "create", "f1": "fix", "r2": "research"
+            "r1": "research",
+            "rv1": "review",
+            "c1": "create",
+            "f1": "fix",
+            "r2": "research",
         }
         parents = {"r1": None, "rv1": "p1", "c1": "active-plan", "f1": None, "r2": None}
         active = {"active-plan"}
@@ -7026,7 +7136,14 @@ class TestFinishBeforeStartPriority:
 
         # 6 eligible tasks: 1 rollup review, 1 ordinary fix, 1 plan-child create,
         # 2 new research tasks, 1 new standalone create.
-        eligible = ["research1", "rollup_rv", "research2", "ord_fix", "new_create", "plan_child"]
+        eligible = [
+            "research1",
+            "rollup_rv",
+            "research2",
+            "ord_fix",
+            "new_create",
+            "plan_child",
+        ]
         slots_available = 3
 
         # Simulate types_by_id, parent_id_by_id
@@ -7081,7 +7198,9 @@ class TestFinishBeforeStartPriority:
             f"rollup review must be dispatched; dispatched={dispatched}"
         )
         # Anti-starvation floor: at least one research or create must also get in
-        new_work_dispatched = [t for t in dispatched if types[t] in ("create", "research")]
+        new_work_dispatched = [
+            t for t in dispatched if types[t] in ("create", "research")
+        ]
         assert len(new_work_dispatched) >= 1, (
             f"reserved floor must admit at least one create/research; dispatched={dispatched}"
         )
