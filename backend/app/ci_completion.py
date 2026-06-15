@@ -86,6 +86,7 @@ async def _attempt_merge_with_retry_and_escalation(
     session: AsyncSession,
     *,
     source: str,
+    precomputed_migration_guard: tuple[bool, str | None] | None = None,
 ) -> bool:
     """Both gates are open — try to merge. Mutates ``task`` in place; caller commits.
 
@@ -189,13 +190,20 @@ async def _attempt_merge_with_retry_and_escalation(
             enforce_premerge_migration_guard,
         )
 
-        _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
-            gh_token, owner, repo, ci_pr_number, ci_base
-        )
-        if not _ok_to_merge:
-            reservation_task_id = (
-                uuid.UUID(ci_orig_id) if ci_orig_id else task.id
+        # Use caller-supplied pre-computed guard result when available (SITE A
+        # lock-window fix: the rollup-handoff path runs the guard before
+        # acquiring FOR UPDATE on the rollup parent so GitHub I/O does not hold
+        # the row lock).  Fall back to running the guard inline for all other
+        # callers (CI-completion, promotion, hotfix back-merge) where the guard
+        # already runs outside the critical lock window.
+        if precomputed_migration_guard is not None:
+            _ok_to_merge, _hold_reason = precomputed_migration_guard
+        else:
+            _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
+                gh_token, owner, repo, ci_pr_number, ci_base
             )
+        if not _ok_to_merge:
+            reservation_task_id = uuid.UUID(ci_orig_id) if ci_orig_id else task.id
             reservation = await get_migration_reservation_for_task(
                 session, task_id=reservation_task_id
             )
@@ -643,9 +651,8 @@ async def _attempt_merge_with_retry_and_escalation(
         # integration branch, refresh an empty build_config so verification
         # commands exist without a manual step. Keep this isolated from the
         # merge-task session because the helper swallows failures via rollback.
-        if (
-            _merge_project is not None
-            and ci_base == get_project_integration_branch(_merge_project)
+        if _merge_project is not None and ci_base == get_project_integration_branch(
+            _merge_project
         ):
             await _refresh_empty_build_config_after_integration_landing(
                 _merge_project.id,
@@ -660,6 +667,7 @@ async def _attempt_merge_with_retry_and_escalation(
         if _unverified_reason:
             try:
                 from app.alert_dispatch import _severity_for_unverified_reason
+
                 await _maybe_create_unverified_merge_alert(
                     task,
                     session,
@@ -918,7 +926,8 @@ async def _attempt_merge_with_retry_and_escalation(
                                 Task.payloads,
                                 Task.project_id,
                                 Task.status_log,
-                            raiseload=True,)
+                                raiseload=True,
+                            )
                         )
                         .where(
                             Task.project_id == task.project_id,
@@ -1039,7 +1048,8 @@ async def _attempt_merge_with_retry_and_escalation(
                                 Task.payloads,
                                 Task.project_id,
                                 Task.status_log,
-                            raiseload=True,)
+                                raiseload=True,
+                            )
                         )
                         .where(
                             Task.project_id == task.project_id,
@@ -1279,7 +1289,8 @@ async def _attempt_merge_with_retry_and_escalation(
                                     Task.payloads,
                                     Task.project_id,
                                     Task.status_log,
-                                raiseload=True,)
+                                    raiseload=True,
+                                )
                             )
                             .where(
                                 Task.project_id == task.project_id,
@@ -1615,7 +1626,8 @@ async def handle_ci_completion(
                             Task.payloads,
                             Task.project_id,
                             Task.status_log,
-                        raiseload=True,)
+                            raiseload=True,
+                        )
                     )
                     .where(
                         Task.project_id == task.project_id,
@@ -1882,9 +1894,7 @@ async def handle_ci_completion(
         _bcast_status = task.__dict__.get("status")
     if _bcast_status is None:
         _bcast_status = (
-            await session.execute(
-                select(Task.status).where(Task.id == _bcast_task_id)
-            )
+            await session.execute(select(Task.status).where(Task.id == _bcast_task_id))
         ).scalar_one_or_none()
     await session.commit()
     await broadcast_to_project(

@@ -1959,6 +1959,8 @@ async def _guard_ci_unresolved_promotion_in_flight(
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
+    *,
+    _pre_gates: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Finalize qualification once the qualifier children have terminated.
 
@@ -2007,9 +2009,16 @@ async def _finalize_qualification(
     # now-completed green build pass and keeps a still-pending build not-green
     # without a permanent dead-end.  Graceful: a credential / GitHub failure
     # degrades to not-green for this attempt (never crashes the finalize).
-    ci_green, ci_resolution = await _resolve_ci_at_finalize(
-        session, version, candidate_sha
-    )
+    # Pre-computed by _finalize_locked_version before the FOR UPDATE lock was
+    # acquired (SITE B lock-window fix); fall back to calling inline when not
+    # provided (direct test calls, timeout path, etc.).
+    if _pre_gates is not None:
+        ci_green = bool(_pre_gates["ci_green"])
+        ci_resolution = _pre_gates["ci_resolution"]
+    else:
+        ci_green, ci_resolution = await _resolve_ci_at_finalize(
+            session, version, candidate_sha
+        )
 
     policy = _load_policy()
 
@@ -2858,9 +2867,17 @@ async def _finalize_qualification(
     # through _handle_infra_failure so a persistent inability to verify migration
     # identity surfaces the same way as any other finalize-time infra failure
     # (no verdict recorded, returned to stabilize, retried by the next cycle).
-    migration_verdict, migration_detail = await _resolve_migration_identity_at_finalize(
-        session, version, candidate_sha
-    )
+    # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
+    if _pre_gates is not None:
+        migration_verdict = _pre_gates["migration_verdict"]
+        migration_detail = _pre_gates["migration_detail"]
+    else:
+        (
+            migration_verdict,
+            migration_detail,
+        ) = await _resolve_migration_identity_at_finalize(
+            session, version, candidate_sha
+        )
     if migration_verdict == "defer":
         return await _handle_infra_failure(
             session,
@@ -2881,9 +2898,14 @@ async def _finalize_qualification(
     # the identity gate's defer path — never waved through.
     # Thread the exact SHA snapped into last_qualification through this gate;
     # do not re-derive it from any live checkout state.
-    apply_verdict, apply_detail = await _resolve_migration_apply_at_finalize(
-        session, version, candidate_sha
-    )
+    # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
+    if _pre_gates is not None:
+        apply_verdict = _pre_gates["apply_verdict"]
+        apply_detail = _pre_gates["apply_detail"]
+    else:
+        apply_verdict, apply_detail = await _resolve_migration_apply_at_finalize(
+            session, version, candidate_sha
+        )
     if apply_verdict == "defer":
         return await _handle_infra_failure(
             session,
@@ -3593,7 +3615,88 @@ async def _finalize_locked_version(
     its rollback-on-error contract).  Split out so the locking + decision logic
     reads as a flat sequence.  Commits the dedicated session on every path that
     actually wrote something; returns ``None`` for the read-only no-op paths.
+
+    Lock-window fix (SITE B): the three GitHub-bound finalize gates
+    (_resolve_ci_at_finalize, _resolve_migration_identity_at_finalize,
+    _resolve_migration_apply_at_finalize) issue GitHub API calls that can take
+    10-120 s under rate-limit/retry.  Running them UNDER the ReleaseVersion
+    FOR UPDATE lock caused 22 s+ ShareLock waits on every concurrent qualifier
+    finalize / reconcile call.  Fix: non-locking peek to read the immutable
+    candidate_sha, run the three gates pre-lock, THEN acquire FOR UPDATE for
+    the decision write only — mirroring the _relock_version_for_promotion_write
+    pattern already used on the promote sub-path.
     """
+    # ── Pre-lock peek: read stable fields for the GitHub-bound gate calls ──
+    # A non-locking read suffices here: candidate_sha is immutable once set and
+    # the status/qual-status checks below are re-verified authoritatively under
+    # the FOR UPDATE lock that follows.  This peek exists ONLY to obtain the
+    # candidate_sha so the three gates can run before the lock is held.
+    peek: release_version.ReleaseVersion | None = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion).where(
+                    release_version.ReleaseVersion.id == version_id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    # Fast-path skip for the two cheapest no-ops (status / qual-status).
+    # These are re-checked under the lock below — this only avoids the
+    # expensive gate calls when clearly not warranted.
+    if peek is None or peek.status != "open":
+        return None
+    peek_qual = peek.last_qualification or {}
+    if peek_qual.get("status") != "pending":
+        return None
+    peek_candidate_sha: str | None = peek_qual.get("candidate_sha")
+
+    # ── Run the three GitHub-bound gates BEFORE acquiring the FOR UPDATE ──
+    # Guard: only run when (a) this is not a timeout-only reaper call (timeout_now
+    # is None means task-completion hook — children may be terminal) and (b) all
+    # required children are already terminal according to the non-locking peek.
+    # Without this guard the gates ran speculatively on every qualifier child
+    # completion (Nx amplification) and on every reaper sweep iteration for
+    # versions whose children were still running — a DB/GitHub load regression.
+    #
+    # When _pre_gates is None (children not yet terminal, or timeout path),
+    # _finalize_qualification will either be skipped entirely (Path 2 returns
+    # early) or run with _pre_gates=None and call the gates itself under the
+    # lock — acceptable because that path is rare (race between sibling
+    # completion and this check) and the reaper sweep is infrequent.
+    _pre_gates: dict[str, Any] | None = None
+    if timeout_now is None and await _required_children_terminal(session, peek):
+        # All three are pinned to the immutable candidate_sha and are read-only
+        # against GitHub; their results are valid for the entire finalize attempt.
+        pre_ci_green, pre_ci_resolution = await _resolve_ci_at_finalize(
+            session, peek, peek_candidate_sha
+        )
+        (
+            pre_migration_verdict,
+            pre_migration_detail,
+        ) = await _resolve_migration_identity_at_finalize(
+            session, peek, peek_candidate_sha
+        )
+        pre_apply_verdict, pre_apply_detail = await _resolve_migration_apply_at_finalize(
+            session, peek, peek_candidate_sha
+        )
+        _pre_gates = {
+            "ci_green": pre_ci_green,
+            "ci_resolution": pre_ci_resolution,
+            "migration_verdict": pre_migration_verdict,
+            "migration_detail": pre_migration_detail,
+            "apply_verdict": pre_apply_verdict,
+            "apply_detail": pre_apply_detail,
+        }
+
+    # Expire the peek instance so the FOR UPDATE select below forces a fresh
+    # read from the DB (mirrors _relock_version_for_promotion_write pattern —
+    # populate_existing=True alone is not reliable on async sessions per
+    # concern C1 in release_promotion.py).
+    session.expire(peek)
+
+    # ── Acquire the FOR UPDATE lock — decision write only ──
     # Lock the version row — the single serialization point for the whole
     # finalize→promote critical section (concern d).
     version: release_version.ReleaseVersion | None = (
@@ -3602,6 +3705,7 @@ async def _finalize_locked_version(
                 select(release_version.ReleaseVersion)
                 .where(release_version.ReleaseVersion.id == version_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -3687,8 +3791,9 @@ async def _finalize_locked_version(
 
     # Finalize on the dedicated session.  _finalize_qualification may call
     # promote(), whose intermediate commit + re-lock are now safe: this session
-    # holds only qualifier state.
-    result = await _finalize_qualification(session, version)
+    # holds only qualifier state.  Pass the pre-computed gate results so the
+    # function does NOT re-run the GitHub-bound gates under the row lock.
+    result = await _finalize_qualification(session, version, _pre_gates=_pre_gates)
     await session.commit()
     return result
 

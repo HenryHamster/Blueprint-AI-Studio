@@ -318,7 +318,13 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
             await session.execute(
                 select(Task)
                 .options(
-                    load_only(Task.id, Task.status, Task.payloads, Task.project_id, raiseload=True)
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.payloads,
+                        Task.project_id,
+                        raiseload=True,
+                    )
                 )
                 .where(
                     Task.project_id == project_id,
@@ -3353,6 +3359,60 @@ async def _process_post_commit(
                                 else {}
                             )
                             if _orig_peek_loop.get("ci_waiting"):
+                                # ── SITE A lock-window fix ──
+                                # When ci_waiting AND ci_passed are both set the
+                                # rollup-handoff merge fires immediately after
+                                # the lock. The token mint (get_github_token_for_task
+                                # — up to ~120 s under rate-limit) and the pre-merge
+                                # Alembic dual-head guard (enforce_premerge_migration_guard
+                                # — GitHub PR-files + list_versions_at_ref fetches)
+                                # previously ran WHILE the FOR UPDATE on _orig was
+                                # held, blocking concurrent CI/heartbeat writes on
+                                # the rollup parent row.  Both calls are read-only
+                                # against the immutable PR, so hoist them here —
+                                # before _lock_original_task — and pass the results
+                                # in so _attempt_merge_with_retry_and_escalation
+                                # does not repeat the guard under the lock.
+                                _pre_rollup_gh: str | None = None
+                                _pre_rollup_own: str | None = None
+                                _pre_rollup_rep: str | None = None
+                                _pre_rollup_mig_guard: (
+                                    tuple[bool, str | None] | None
+                                ) = None
+                                if _orig_peek_loop.get("ci_passed"):
+                                    _peek_pr_num = _orig_peek_loop.get("pr_number")
+                                    _peek_base = _orig_peek_loop.get("base_branch", "")
+                                    try:
+                                        (
+                                            _pre_rollup_gh,
+                                            _pre_rollup_own,
+                                            _pre_rollup_rep,
+                                        ) = await get_github_token_for_task(
+                                            uuid.UUID(original_task_id), session
+                                        )
+                                        if _peek_pr_num and _peek_base:
+                                            from app.rollup_migration_validation import (
+                                                enforce_premerge_migration_guard as _emg_pre,
+                                            )
+
+                                            _pre_rollup_mig_guard = await _emg_pre(
+                                                _pre_rollup_gh,
+                                                _pre_rollup_own,
+                                                _pre_rollup_rep,
+                                                _peek_pr_num,
+                                                _peek_base,
+                                            )
+                                    except Exception as _pre_exc:
+                                        logger.debug(
+                                            "[REVIEW PIPELINE] Pre-lock token/guard "
+                                            "for rollup parent %s failed: %s "
+                                            "(will fall back to under-lock resolution)",
+                                            original_task_id[:8],
+                                            _pre_exc,
+                                        )
+                                        _pre_rollup_gh = None
+                                        _pre_rollup_mig_guard = None
+
                                 # Phase A1: skip_locked + bounded retry. If the parent
                                 # task row is held by a peer, defer the handoff —
                                 # the parent's own poll will pick up review_approved
@@ -3411,13 +3471,25 @@ async def _process_post_commit(
 
                                     if _orig_loop.get("ci_passed"):
                                         try:
-                                            (
-                                                _gh,
-                                                _own,
-                                                _rep,
-                                            ) = await get_github_token_for_task(
-                                                _orig.id, session
-                                            )
+                                            # Use pre-lock token if resolved; fall
+                                            # back to under-lock resolution when the
+                                            # pre-lock attempt failed.
+                                            if (
+                                                _pre_rollup_gh
+                                                and _pre_rollup_own
+                                                and _pre_rollup_rep
+                                            ):
+                                                _gh = _pre_rollup_gh
+                                                _own = _pre_rollup_own
+                                                _rep = _pre_rollup_rep
+                                            else:
+                                                (
+                                                    _gh,
+                                                    _own,
+                                                    _rep,
+                                                ) = await get_github_token_for_task(
+                                                    _orig.id, session
+                                                )
                                             await _attempt_merge_with_retry_and_escalation(
                                                 _orig,
                                                 _gh,
@@ -3425,6 +3497,7 @@ async def _process_post_commit(
                                                 _rep,
                                                 session,
                                                 source="review_approval",
+                                                precomputed_migration_guard=_pre_rollup_mig_guard,
                                             )
                                         except Exception as _gate_e:
                                             logger.error(
