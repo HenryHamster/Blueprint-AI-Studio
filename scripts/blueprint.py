@@ -37,13 +37,6 @@ from datetime import datetime, timedelta, timezone
 
 from blueprint_api import api, get_project_id, load_config
 
-# A canonical GET /api/admin/state endpoint is being built in a separate lane
-# (v12 truthful-state-layer). It does not exist yet, so `status` composes the
-# existing reads below.
-# TODO(v12-state-layer): migrate cmd_status to a single GET /api/admin/state
-# read once that endpoint lands, replacing the deploy-state + settings +
-# version-lifecycle composition.
-
 SERVICE_NAME = os.environ.get("BLUEPRINT_GCP_SERVICE", "blueprint-orchestrator")
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "blueprint-orchestrator")
 
@@ -90,57 +83,41 @@ def first_payload(task: dict) -> dict:
 # ── status ───────────────────────────────────────────────────────────────────
 
 def cmd_status(args: argparse.Namespace) -> None:
-    """Compose deploy-state + settings + version-lifecycle into one status view."""
+    """Fetch canonical system state from GET /api/admin/state."""
     pid = get_project_id(getattr(args, "project_id", None))
-    deploy, deploy_err = _safe_read("/api/admin/deploy-state")
-    settings, settings_err = _safe_read("/api/admin/settings")
-    lifecycle, lifecycle_err = _safe_read(
-        f"/api/admin/projects/{pid}/version-lifecycle"
-    )
-    deploy = deploy or {}
-    settings = settings or {}
-    lifecycle = lifecycle or {}
-    cv = lifecycle.get("current_version") or {}
-    readiness = lifecycle.get("promotion_readiness") or {}
+    state, state_err = _safe_read(f"/api/admin/state?project_id={pid}")
+    state = state or {}
+    deploy = state.get("deploy") or {}
+    version = state.get("version")
 
     data = {
         "project_id": pid,
         "deploy_state": {
             "status": deploy.get("status"),
             "current_revision": deploy.get("current_revision"),
-            "max_concurrent_vms": deploy.get("max_concurrent_vms"),
             "pause_reason": deploy.get("pause_reason"),
             "rollback_reason": deploy.get("rollback_reason"),
         },
-        "settings": {
-            "max_concurrent_vms": settings.get("max_concurrent_vms"),
-            "promotion_enabled": settings.get("promotion_enabled"),
-        },
         "current_version": (
             {
-                "version_number": cv.get("version_number"),
-                "phase": cv.get("phase"),
-                "qualification_state": cv.get("qualification_state"),
-                "merged_task_count": cv.get("merged_task_count"),
-                "active_candidate_sha": cv.get("active_candidate_sha"),
-                "last_qualification": cv.get("last_qualification"),
+                "version_number": version.get("version_number"),
+                "phase": version.get("phase"),
+                "qualification_state": version.get("qualification_state"),
+                "merged_task_count": version.get("merged_task_count"),
+                "active_candidate_sha": (version.get("serving") or {}).get("sha"),
             }
-            if cv
+            if version
             else None
         ),
         "promotion": {
-            "enabled_effective": lifecycle.get("promotion_enabled_effective"),
-            "enabled_source": lifecycle.get("promotion_enabled_source"),
-            "ready": readiness.get("ready"),
-            "reason": readiness.get("reason"),
+            "enabled_effective": None,
+            "enabled_source": None,
+            "ready": None,
+            "reason": None,
         },
         "errors": {
             k: v
-            for k, v in (
-                ("deploy_state", deploy_err),
-                ("settings", settings_err),
-                ("version_lifecycle", lifecycle_err),
-            )
+            for k, v in (("state", state_err),)
             if v
         },
     }
@@ -152,7 +129,6 @@ def _render_status(data: dict) -> None:
     print("=== DEPLOY STATE ===")
     print(f"  Status:    {ds.get('status', '?')}")
     print(f"  Revision:  {ds.get('current_revision', '?')}")
-    print(f"  Max VMs:   {ds.get('max_concurrent_vms', '?')}")
     if ds.get("pause_reason"):
         print(f"  Paused:    {ds['pause_reason']}")
     if ds.get("rollback_reason"):
@@ -163,22 +139,11 @@ def _render_status(data: dict) -> None:
     if not cv:
         print("  (no open version)")
     else:
-        lq = cv.get("last_qualification") or {}
+        qs = cv.get("qualification_state")
         print(f"  v{cv.get('version_number')}  phase={cv.get('phase')}  "
-              f"state={cv.get('qualification_state')}")
+              f"state={qs}")
         print(f"  merged_tasks={cv.get('merged_task_count')}  "
               f"candidate={(cv.get('active_candidate_sha') or '-')[:12]}")
-        if lq:
-            print(f"  last_verdict: status={lq.get('status')} "
-                  f"confidence={lq.get('confidence')} threshold={lq.get('threshold')}")
-
-    promo = data["promotion"]
-    print("\n=== PROMOTION ===")
-    print(f"  enabled:   {promo.get('enabled_effective')} "
-          f"(source={promo.get('enabled_source')})")
-    print(f"  ready:     {promo.get('ready')}")
-    if promo.get("reason"):
-        print(f"  reason:    {promo['reason']}")
 
     errors = data.get("errors") or {}
     if errors:

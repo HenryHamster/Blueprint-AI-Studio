@@ -138,16 +138,21 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _version_serving_summary(version: ReleaseVersion) -> tuple[dict[str, Any], list[dict]]:
+def _version_serving_summary(
+    version: ReleaseVersion, project: Optional[Any] = None
+) -> tuple[dict[str, Any], list[dict]]:
     aggregate, artifacts = summarize_release_artifacts(
         version,
         getattr(version, "deploy_artifacts", None),
+        project=project,
     )
     return aggregate, artifacts
 
 
-def _serialize_version_history_entry(version: ReleaseVersion) -> dict[str, Any]:
-    aggregate, artifacts = _version_serving_summary(version)
+def _serialize_version_history_entry(
+    version: ReleaseVersion, project: Optional[Any] = None
+) -> dict[str, Any]:
+    aggregate, artifacts = _version_serving_summary(version, project)
     return {
         "version_number": version.version_number,
         "status": version.status,
@@ -419,7 +424,7 @@ async def get_version_lifecycle(
             merged_count = await count_merged_since(session, project_id, open_row.opened_at)
             in_flight_count = await count_in_flight_tasks(session, project_id)
             qual = open_row.last_qualification or {}
-            aggregate_serving, artifact_evidence = _version_serving_summary(open_row)
+            aggregate_serving, artifact_evidence = _version_serving_summary(open_row, project_row)
             acceptance_aggregate = None
             if isinstance(qual, dict):
                 acceptance_aggregate = qual.get("acceptance_aggregate")
@@ -582,7 +587,7 @@ async def get_version_lifecycle(
         return {
             "current_version": current_version_out,
             "recent_versions": [
-                _serialize_version_history_entry(version) for version in history_rows
+                _serialize_version_history_entry(version, project_row) for version in history_rows
             ],
             "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
             # Per-project live-promotion enablement. ``promotion_enabled_effective``
@@ -1142,6 +1147,7 @@ async def clear_deploy_failed(
     from app.time_utils import _utcnow  # noqa: PLC0415
 
     version = None
+    project_row = await session.get(Project, project_id)
     promoted_versions = (
         await session.execute(
             select(ReleaseVersion)
@@ -1155,7 +1161,7 @@ async def clear_deploy_failed(
         )
     ).scalars().all()
     for candidate in promoted_versions:
-        aggregate, _ = _version_serving_summary(candidate)
+        aggregate, _ = _version_serving_summary(candidate, project_row)
         if (
             candidate.serving_status == "deploy_failed"
             or aggregate["serving_status"] == "deploy_failed"

@@ -485,6 +485,70 @@ async def test_to_dict_json_serializable(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cross_surface_external_project_serving_agreement(db_session):
+    """External-project: promotion_merge confirmed + no backend_revision row → serving_confirmed.
+
+    Without project= threading, backend_revision scalar-projects the version's
+    serving_status ("unconfirmed") and holds the aggregate back to "unconfirmed".
+    With project= threaded, backend_revision is non-observable (deploy identity
+    does not match this project), so only the promotion_merge artifact contributes
+    to the aggregate, yielding "serving_confirmed".
+    """
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    # Armed promotion: version scalar says "unconfirmed" (as it would be after
+    # _record_promotion_success set it but before backend confirmation).
+    version = await _make_version(db_session, project.id, serving_status="unconfirmed")
+
+    # Promotion-merge artifact confirmed (the GitHub merge completed).
+    await _make_artifact(
+        db_session,
+        version.id,
+        artifact_kind=ra.PROMOTION_MERGE_ARTIFACT_KIND,
+        serving_status="serving_confirmed",
+        served_identifier="abc123",
+        served_at=_utcnow(),
+    )
+    # Deliberately NO backend_revision artifact row — external project.
+
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+
+    # The aggregate (project-aware) should be serving_confirmed because only
+    # the observable promotion_merge artifact contributes, and it is confirmed.
+    assert snap.version.serving.status == "serving_confirmed"
+
+    # Verify by comparing directly with the project-aware summarize call.
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+    from app.models import ReleaseVersion
+
+    stmt = (
+        select(ReleaseVersion)
+        .where(ReleaseVersion.id == version.id)
+        .options(selectinload(ReleaseVersion.deploy_artifacts))
+    )
+    row = (await db_session.execute(stmt)).scalar_one()
+    agg_dict, evidence_list = ra.summarize_release_artifacts(
+        row, row.deploy_artifacts, project=project
+    )
+    assert agg_dict["serving_status"] == "serving_confirmed"
+    assert snap.version.serving.status == agg_dict["serving_status"]
+
+    # No backend_revision entry with a non-None serving_status should appear —
+    # the vacuous path must run for non-observable providers.
+    backend_entry = next(
+        (
+            e
+            for e in evidence_list
+            if e["artifact_kind"] == ra.BACKEND_REVISION_ARTIFACT_KIND
+        ),
+        None,
+    )
+    assert backend_entry is None or backend_entry["serving_status"] is None
+
+
+@pytest.mark.asyncio
 async def test_to_dict_datetime_fields_are_strings(db_session):
     """Datetime fields in to_dict are ISO strings, not datetime objects."""
     await _make_deploy_state(db_session)

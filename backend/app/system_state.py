@@ -16,7 +16,7 @@ import uuid
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import DeploymentState, Task, TaskStatus
+from app.models import DeploymentState, Project, Task, TaskStatus
 
 _STALE_HEARTBEAT_MINUTES = 5
 
@@ -146,13 +146,14 @@ async def compute_system_state(
     # --- Version block (only when project_id is given) ---
     version_snap: VersionSnapshot | None = None
     if project_id is not None:
+        project = await session.get(Project, project_id)
         version = await rv.current_open_version(
             session, project_id, include_artifacts=include_artifacts
         )
         if version is not None:
             artifact_list = version.deploy_artifacts if include_artifacts else None
             agg_dict, evidence_list = release_artifacts.summarize_release_artifacts(
-                version, artifact_list
+                version, artifact_list, project=project
             )
             aggregate_serving_status: str | None = agg_dict.get("serving_status")
             aggregate_reason: str | None = agg_dict.get("reason_code")

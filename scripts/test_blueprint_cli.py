@@ -55,25 +55,55 @@ def mock_api(monkeypatch):
 
     def fake_api(method, path, body=None, timeout=30):
         calls.append((method, path, body))
-        if "deploy-state" in path:
-            return {"status": "RUNNING", "current_revision": "rev-1",
-                    "max_concurrent_vms": 5}
-        if "settings" in path:
-            return {"max_concurrent_vms": 5, "promotion_enabled": True}
+        if "/admin/state" in path:
+            return {
+                "deploy": {
+                    "status": "RUNNING",
+                    "current_sha": "abc",
+                    "current_revision": "rev-1",
+                    "deployed_at": None,
+                    "pause_reason": None,
+                    "rollback_reason": None,
+                    "rollback_count": 0,
+                    "last_known_good_sha": "",
+                    "halted": False,
+                },
+                "version": {
+                    "version_number": 12,
+                    "phase": "build",
+                    "status": "open",
+                    "opened_at": None,
+                    "phase_changed_at": None,
+                    "goal": None,
+                    "merged_task_count": 3,
+                    "in_flight_task_count": 0,
+                    "qualification_state": {"state": "qualifying"},
+                    "serving": {
+                        "status": None,
+                        "sha": "abc123",
+                        "confirmed_at": None,
+                        "failure_reason": None,
+                        "artifacts": [],
+                    },
+                },
+                "fleet": {
+                    "active": 0, "queued": 0, "evaluating": 0,
+                    "parked": 0, "stale_heartbeat_count": 0,
+                },
+                "generated_at": "2026-06-15T00:00:00Z",
+            }
         if "version-lifecycle" in path:
             return {
                 "current_version": {
                     "version_number": 12, "phase": "build",
                     "qualification_state": "qualifying", "merged_task_count": 3,
                     "active_candidate_sha": "abc123",
-                    "last_qualification": {"status": "pass"},
                 },
                 "recent_versions": [
                     {"version_number": 11, "phase": "stabilize",
                      "status": "promoted", "promoted_sha": "deadbeef",
                      "merged_task_count": 10},
                 ],
-                "promotion_readiness": {"ready": False, "reason": "audit pending"},
                 "promotion_enabled_effective": True,
                 "promotion_enabled_source": "fleet",
             }
@@ -99,7 +129,13 @@ def test_status_json_is_valid_json(mock_api, capsys):
     parsed = json.loads(out)
     assert parsed["project_id"] == "proj-1"
     assert parsed["current_version"]["version_number"] == 12
-    assert parsed["promotion"]["enabled_effective"] is True
+    assert parsed["current_version"]["active_candidate_sha"] == "abc123"
+    # promotion fields have no equivalent in /api/admin/state — emitted as None
+    assert parsed["promotion"]["enabled_effective"] is None
+    # single /api/admin/state call — no deploy-state or settings calls
+    assert any("/admin/state" in path for _, path, _ in mock_api)
+    assert not any("deploy-state" in path for _, path, _ in mock_api)
+    assert not any("settings" in path for _, path, _ in mock_api)
 
 
 def test_status_json_flag_after_subcommand(mock_api, capsys):
@@ -108,6 +144,27 @@ def test_status_json_flag_after_subcommand(mock_api, capsys):
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["deploy_state"]["status"] == "RUNNING"
+
+
+def test_status_error_path(monkeypatch, capsys):
+    """When /api/admin/state fails, errors dict is populated and no crash occurs."""
+    calls = []
+
+    def fail_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if "/admin/state" in path:
+            raise RuntimeError("connection refused")
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fail_api)
+    monkeypatch.setattr(blueprint, "api", fail_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["--json", "status"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "state" in parsed["errors"]
+    assert "connection refused" in parsed["errors"]["state"]
+    assert parsed["current_version"] is None
 
 
 def test_tasks_list_json(mock_api, capsys):
