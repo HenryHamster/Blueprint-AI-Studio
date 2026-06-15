@@ -37,6 +37,8 @@
     "DirectionsList": "Directions list sub-component rendered exclusively inside DirectionsPanel; viewport coverage is provided by DirectionsPanel.viewport.test.tsx (including the dense stress fixture) which exercises it inline.",
     "FleetCapacityCard": "Fleet capacity stat card rendered exclusively inside DashboardHome; viewport coverage is provided by DashboardHome.viewport.test.tsx which exercises it inline.",
     "StrategicChallengeChip": "Compact verdict chip rendered exclusively inside SystemStatusCard and MessagesPanel; viewport coverage is provided by SystemStatusCard.viewport.test.tsx and MessagesPanel.viewport.test.tsx which exercise it inline.",
-    "BootstrapStatusPanel": "Bootstrap-status sub-panel rendered exclusively inside ProjectDashboard; viewport coverage is provided by ProjectDashboard.viewport.test.tsx which exercises it inline."
+    "BootstrapStatusPanel": "Bootstrap-status sub-panel rendered exclusively inside ProjectDashboard; viewport coverage is provided by ProjectDashboard.viewport.test.tsx which exercises it inline.",
+    "TaskDetailDrawerPrimitives": "Dependency-free presentational primitives (CopyableId, SectionHeader, DetailRow, Sparkline, DependencyItem, DirectionsSection) rendered exclusively inside DetailsTab in TaskDetailDrawerMeta; never standalone, overflow handled by the composing parent; viewport coverage is provided by TaskDetailDrawerMeta.viewport.test.tsx which exercises them inline.",
+    "TaskDetailDrawerSections": "Domain section sub-components (compute jobs, research origin, adversarial gate, blocked need, knowledge document, evaluation summary, panel review verdict, acceptance evidence) rendered exclusively inside DetailsTab in TaskDetailDrawerMeta; viewport coverage is provided by TaskDetailDrawerMeta.viewport.test.tsx which exercises them inline."
   }
 }

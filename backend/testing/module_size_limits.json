@@ -185,8 +185,9 @@
     "components/srTrendBreakdown/types.ts": 350,
     "components/SrMissedRetrospectivesPanel.tsx": 900,
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
-    "components/TaskDetailDrawerMeta.tsx": 2250,
+    "components/TaskDetailDrawerMeta.tsx": 400,
     "api.ts": 3650,
-    "components/WarmVmPanel.tsx": 1800
+    "components/WarmVmPanel.tsx": 1800,
+    "components/TaskDetailDrawerSections.tsx": 1950
   }
 }

@@ -8,11 +8,9 @@ import pytest
 from app.models import (
     TaskStatus,
     ReleaseVersion,
-    StrategicCycle,
 )
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
-    compute_problem_model_gc_health,
     _compute_first_attempt_breakdowns,
     _compute_first_review_approval_breakdowns,
     _compute_non_code_outcomes,
@@ -31,7 +29,6 @@ from app.digest_metrics import (
     compute_recurring_error_clusters,
     compute_release_qualifier_infra_metrics,
     compute_retry_analytics,
-    compute_research_output_quality,
     compute_scope_mismatch_summary,
     compute_task_type_cost_adherence,
     compute_trial_arm_accumulation,
@@ -2787,6 +2784,50 @@ class TestDigestMetricsModuleSeams:
             is digest_direction_progress.compute_direction_progress
         )
 
+    def test_trial_arms_canonical_home_and_reexport(self):
+        import app.digest_metrics as digest_metrics
+        import app.digest_trial_arms as digest_trial_arms
+
+        for name in (
+            "compute_trial_arm_accumulation",
+            "compute_trial_arm_accrual",
+            "_json_truthy",
+        ):
+            assert hasattr(digest_trial_arms, name)
+            assert getattr(digest_metrics, name) is getattr(digest_trial_arms, name)
+
+    def test_outer_loop_canonical_home_and_reexport(self):
+        import app.digest_metrics as digest_metrics
+        import app.digest_outer_loop as digest_outer_loop
+
+        for name in (
+            "_outer_loop_pct",
+            "_outer_loop_chain_key",
+            "_outer_loop_terminal_outcome",
+            "_group_outer_loop_chains",
+            "_scan_escalation_alerts",
+            "_resolve_chain_outcome",
+            "_outer_loop_chain_observation",
+            "_resolve_outer_loop_chains",
+            "_ESCALATION_OUTCOME_KEYS",
+        ):
+            assert hasattr(digest_outer_loop, name)
+            assert getattr(digest_metrics, name) is getattr(digest_outer_loop, name)
+
+    def test_lane_waste_canonical_home_and_reexport(self):
+        import app.digest_metrics as digest_metrics
+        import app.digest_lane_waste as digest_lane_waste
+
+        for name in (
+            "LANE_WASTE_CATEGORIES",
+            "classify_lane_waste_category",
+            "_lane_waste_task_row",
+            "compute_lane_waste_diagnostics",
+            "compute_lane_baseline_trend",
+        ):
+            assert hasattr(digest_lane_waste, name)
+            assert getattr(digest_metrics, name) is getattr(digest_lane_waste, name)
+
     def test_extracted_modules_do_not_import_digest_metrics_at_load_time(self):
         """The new sibling modules must not import ``digest_metrics`` at module
         load time — that would create a circular import (digest_metrics imports
@@ -2795,7 +2836,13 @@ class TestDigestMetricsModuleSeams:
         import os
 
         app_dir = os.path.join(os.path.dirname(__file__), "..", "app")
-        for module_file in ("digest_remediation.py", "digest_direction_progress.py"):
+        for module_file in (
+            "digest_remediation.py",
+            "digest_direction_progress.py",
+            "digest_trial_arms.py",
+            "digest_outer_loop.py",
+            "digest_lane_waste.py",
+        ):
             path = os.path.normpath(os.path.join(app_dir, module_file))
             with open(path, encoding="utf-8") as fh:
                 tree = ast.parse(fh.read())
@@ -5969,256 +6016,6 @@ async def test_park_wake_health_timeout_by_cause_breakdown(db_session):
     assert total == 3, f"expected 3 total timeout tasks; got {total} in {by_cause}"
 
 
-# ---------------------------------------------------------------------------
-# compute_research_output_quality
-# ---------------------------------------------------------------------------
-
-
-def _make_research_task(
-    surviving: int | None = None,
-    findings: list | None = None,
-    challenge_records: list | None = None,
-) -> object:
-    """Build a minimal research Task fixture for output-quality tests."""
-    ctx = {}
-    if surviving is not None:
-        ctx["research_surviving_findings"] = surviving
-    if challenge_records is not None:
-        ctx["finding_challenge_records"] = challenge_records
-    return make_task(
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context=ctx,
-        plan_output=findings,
-    )
-
-
-def test_compute_research_output_quality_returns_none_no_research_tasks():
-    """No research tasks → None."""
-    tasks = [
-        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}]),
-        make_task(status=TaskStatus.FAILED, payloads=[{"type": "fix"}]),
-    ]
-    assert compute_research_output_quality(tasks) is None
-
-
-def test_compute_research_output_quality_returns_none_missing_survival_key():
-    """Research tasks without research_surviving_findings in context are skipped."""
-    tasks = [
-        make_task(
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={},
-            plan_output=[{"title": "F1", "verification_basis": "deduced"}],
-        )
-    ]
-    assert compute_research_output_quality(tasks) is None
-
-
-def test_compute_research_output_quality_returns_none_empty_plan_output():
-    """Research tasks with empty plan_output are skipped."""
-    tasks = [
-        make_task(
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={"research_surviving_findings": 2},
-            plan_output=[],
-        )
-    ]
-    assert compute_research_output_quality(tasks) is None
-
-
-def test_compute_research_output_quality_surviving_rate():
-    """surviving_rate is the mean of per-task (surviving / total_findings) ratios."""
-    # task1: 2 surviving out of 4 findings → ratio 0.5
-    task1 = _make_research_task(
-        surviving=2,
-        findings=[
-            {"title": f"F{i}", "verification_basis": "deduced"} for i in range(4)
-        ],
-    )
-    # task2: 3 surviving out of 3 findings → ratio 1.0
-    task2 = _make_research_task(
-        surviving=3,
-        findings=[
-            {"title": f"G{i}", "verification_basis": "deduced"} for i in range(3)
-        ],
-    )
-    result = compute_research_output_quality([task1, task2])
-    assert result is not None
-    assert result["qualifying_task_count"] == 2
-    # mean(0.5, 1.0) = 0.75
-    assert result["surviving_rate"] == 0.75
-
-
-def test_compute_research_output_quality_challenge_agreement_rate():
-    """challenge_agreement_rate = agrees / (agrees + disagrees + indeterminate)."""
-    records = [
-        {"agreement": "agrees"},
-        {"agreement": "agrees"},
-        {"agreement": "disagrees"},
-        {"agreement": "indeterminate"},
-    ]
-    task = _make_research_task(
-        surviving=1,
-        findings=[{"title": "F1", "verification_basis": "deduced"}],
-        challenge_records=records,
-    )
-    result = compute_research_output_quality([task])
-    assert result is not None
-    assert result["challenge_agrees"] == 2
-    assert result["challenge_disagrees"] == 1
-    assert result["challenge_indeterminate"] == 1
-    assert result["challenge_total"] == 4
-    assert result["challenge_agreement_rate"] == round(2 / 4, 3)
-
-
-def test_compute_research_output_quality_challenge_agreement_rate_none_when_no_records():
-    """challenge_agreement_rate is None when no challenge records exist."""
-    task = _make_research_task(
-        surviving=1,
-        findings=[{"title": "F1", "verification_basis": "deduced"}],
-        challenge_records=[],
-    )
-    result = compute_research_output_quality([task])
-    assert result is not None
-    assert result["challenge_agreement_rate"] is None
-    assert result["challenge_total"] == 0
-
-
-def test_compute_research_output_quality_verification_basis_distribution():
-    """verification_basis_distribution counts each tier across all dispatched findings."""
-    findings = [
-        {"title": "A", "verification_basis": "code_verified"},
-        {"title": "B", "verification_basis": "path_verified"},
-        {"title": "C", "verification_basis": "pattern_inferred"},
-        {"title": "D", "verification_basis": "deduced"},
-        {"title": "E", "verification_basis": "deduced"},
-    ]
-    task = _make_research_task(surviving=3, findings=findings)
-    result = compute_research_output_quality([task])
-    assert result is not None
-    dist = result["verification_basis_distribution"]
-    assert dist["code_verified"] == 1
-    assert dist["path_verified"] == 1
-    assert dist["pattern_inferred"] == 1
-    assert dist["deduced"] == 2
-
-
-def test_compute_research_output_quality_skips_non_dict_findings_and_unknown_basis():
-    """Non-dict findings are skipped; unknown basis values don't appear in distribution."""
-    findings = [
-        "not-a-dict",
-        {"title": "X", "verification_basis": "unknown_tier"},
-        {"title": "Y", "verification_basis": "code_verified"},
-    ]
-    task = _make_research_task(surviving=1, findings=findings)
-    result = compute_research_output_quality([task])
-    assert result is not None
-    dist = result["verification_basis_distribution"]
-    assert dist["code_verified"] == 1
-    assert "unknown_tier" not in dist
-    # Only the one dict finding counts toward total
-    assert result["qualifying_task_count"] == 1
-
-
-def test_compute_research_output_quality_map_takes_precedence_over_attribute():
-    """An explicit plan_output_by_task_id map is the findings source — the
-    task.plan_output attribute is never read (it may be unloaded on projected
-    DB rows, where the read would lazy-load → MissingGreenlet)."""
-    task = _make_research_task(
-        surviving=1,
-        findings=[
-            {"title": f"attr{i}", "verification_basis": "deduced"} for i in range(4)
-        ],
-    )
-    by_id = {task.id: [{"title": "map", "verification_basis": "code_verified"}]}
-    result = compute_research_output_quality([task], by_id)
-    assert result is not None
-    # 1 surviving / 1 map finding — NOT 1/4 from the attribute
-    assert result["surviving_rate"] == 1.0
-    assert result["verification_basis_distribution"]["code_verified"] == 1
-    assert result["verification_basis_distribution"]["deduced"] == 0
-
-
-def test_compute_research_output_quality_map_missing_entry_skips_task():
-    """With a map supplied, a task absent from it counts as no findings."""
-    task = _make_research_task(
-        surviving=1,
-        findings=[{"title": "attr", "verification_basis": "deduced"}],
-    )
-    assert compute_research_output_quality([task], {}) is None
-
-
-@pytest.mark.asyncio
-async def test_research_output_quality_for_digest_with_projected_rows(db_session):
-    """Regression for the prod digest 500 storm (2026-06-11, rev 00429): the
-    digest loads its task rows with a load_only projection that omits
-    plan_output, and reading that attribute on a projected instance triggers a
-    sync lazy-load inside async context → MissingGreenlet. The digest wrapper
-    must fetch findings through its own narrow SELECT instead."""
-    from sqlalchemy.orm import load_only
-    from sqlmodel import select
-
-    from app.digest_metrics import compute_research_output_quality_for_digest
-    from app.models import Task
-
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"research_surviving_findings": 2},
-        plan_output=[
-            {"title": f"F{i}", "verification_basis": "deduced"} for i in range(4)
-        ],
-    )
-    db_session.add(task)
-    await db_session.commit()
-    db_session.expunge_all()  # force a fresh load below
-
-    rows = await db_session.execute(
-        select(Task)
-        .options(
-            load_only(
-                Task.id,
-                Task.status,
-                Task.project_id,
-                Task.payloads,
-                Task.context,
-            )
-        )
-        .where(Task.project_id == project.id)
-    )
-    projected = list(rows.scalars().all())
-    assert "plan_output" not in projected[0].__dict__  # column really unloaded
-
-    result = await compute_research_output_quality_for_digest(db_session, projected)
-    assert result is not None
-    assert result["qualifying_task_count"] == 1
-    assert result["surviving_rate"] == 0.5  # 2 surviving / 4 findings
-
-
-@pytest.mark.asyncio
-async def test_research_output_quality_for_digest_no_candidates_skips_query(db_session):
-    """No qualifying research tasks → None without issuing the findings SELECT."""
-    from app.digest_metrics import compute_research_output_quality_for_digest
-
-    tasks = [
-        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}]),
-        make_task(
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={},
-        ),
-    ]
-    assert await compute_research_output_quality_for_digest(db_session, tasks) is None
-
-
 # ── compute_trial_arm_accumulation: arm_composition basis tracking ────────────
 
 
@@ -6568,305 +6365,65 @@ async def test_trial_accumulation_reports_with_assigned_delivered(db_session):
     assert comp["with_assigned_delivered"] < comp["with_assigned"]
 
 
-# ── compute_problem_model_gc_health ──────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Guard: every digest payload key must have a named admin-ui consumer
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_problem_model_gc_health_with_mixed_cycles(db_session):
-    """Aggregates correctly: 2 cycles with telemetry, 1 old cycle without."""
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
+def test_digest_payload_keys_have_named_consumer():
+    """Every key the /api/admin/digest payload emits must have a named admin-ui
+    consumer in DIGEST_PAYLOAD_METRIC_MANIFEST (i.e. a ``consumer`` entry, not
+    just a ``status: pending`` or ``status: retired`` annotation).
 
-    import uuid as _uuid
-    from datetime import datetime, timezone
+    This is the enforcement layer that prevents consumerless compute functions
+    from re-accumulating in the payload silently: adding a new key to
+    ``_compute_digest`` without declaring a ``consumer`` in the manifest causes
+    this test to fail immediately, blocking the PR before the metric ships.
 
-    def _naive_utc():
-        return datetime.now(timezone.utc).replace(tzinfo=None)
+    The test is DB-free and standalone-smoke compatible — it AST-parses
+    admin_digest.py to extract the emitted keys and compares them against
+    the manifest.
+    """
+    import ast
 
-    # Newest cycle: has telemetry with gap memory trim
-    cycle1 = StrategicCycle(
-        id=str(_uuid.uuid4()),
-        project_id=project.id,
-        outcome="completed",
-        phase1_started_at=_naive_utc(),
-        cycle_metadata={
-            "model_gc_telemetry": {
-                "model_bytes": 50000,
-                "capability_count": 12,
-                "gap_count": 8,
-                "model_size_status": "healthy",
-                "directions_dropped_count": 0,
-                "problem_model_truncated": False,
-                "gap_memory_trimmed_count": 2,
-                "gap_memory_hidden_entries": 10,
-            }
-        },
+    from app.routers import admin_digest
+    from app.routers.admin_digest import DIGEST_PAYLOAD_METRIC_MANIFEST
+
+    source = open(admin_digest.__file__, encoding="utf-8").read()
+    tree = ast.parse(source)
+    fn = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_compute_digest"
+        ),
+        None,
     )
-    # Second cycle: has telemetry with truncation
-    cycle2 = StrategicCycle(
-        id=str(_uuid.uuid4()),
-        project_id=project.id,
-        outcome="completed",
-        phase1_started_at=_naive_utc(),
-        cycle_metadata={
-            "model_gc_telemetry": {
-                "model_bytes": 90000,
-                "capability_count": 20,
-                "gap_count": 14,
-                "model_size_status": "oversized",
-                "directions_dropped_count": 1,
-                "problem_model_truncated": True,
-                "gap_memory_trimmed_count": 0,
-                "gap_memory_hidden_entries": 0,
-            }
-        },
-    )
-    # Third cycle: old cycle without any telemetry
-    cycle3 = StrategicCycle(
-        id=str(_uuid.uuid4()),
-        project_id=project.id,
-        outcome="completed",
-        phase1_started_at=_naive_utc(),
-        cycle_metadata={},
-    )
-    db_session.add_all([cycle1, cycle2, cycle3])
-    await db_session.commit()
+    assert fn is not None, "could not find _compute_digest in admin_digest.py"
 
-    result = await compute_problem_model_gc_health(db_session, project.id, limit=10)
+    emitted: set[str] = set()
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Return):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            continue
+        for k in node.value.keys:
+            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                emitted.add(k.value)
 
-    assert result["cycles_sampled"] == 3
-    assert result["cycles_with_telemetry"] == 2
-    # latest fields come from the first row returned (newest first); since all have
-    # the same phase1_started_at the DB may return any order — check both options
-    assert result["latest_model_bytes"] in (50000, 90000)
-    assert result["latest_model_size_status"] in ("healthy", "oversized")
-    assert result["latest_capability_count"] in (12, 20)
-    assert result["latest_gap_count"] in (8, 14)
-    assert result["problem_model_truncated_cycles"] == 1
-    assert result["directions_dropped_cycles"] == 1
-    assert result["gap_memory_trimmed_cycles"] == 1
-    assert result["trend"] == "degraded"
-
-
-@pytest.mark.asyncio
-async def test_problem_model_gc_health_no_cycles(db_session):
-    """Returns valid zero dict when project has no terminal cycles."""
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    result = await compute_problem_model_gc_health(db_session, project.id, limit=10)
-
-    assert result["cycles_sampled"] == 0
-    assert result["cycles_with_telemetry"] == 0
-    assert result["latest_model_bytes"] is None
-    assert result["latest_model_size_status"] is None
-    assert result["latest_capability_count"] is None
-    assert result["latest_gap_count"] is None
-    assert result["problem_model_truncated_cycles"] == 0
-    assert result["directions_dropped_cycles"] == 0
-    assert result["gap_memory_trimmed_cycles"] == 0
-    assert result["trend"] == "healthy"
-
-
-# ── compute_llm_rework_cost ────────────────────────────────────────────────────
-
-
-def _rw_task(
-    *,
-    status=None,
-    provider="anthropic",
-    model="claude-sonnet-4-6",
-    input_tokens=0,
-    output_tokens=0,
-    attempt_number=1,
-    attempt_history=None,
-    context=None,
-    latest_status_message=None,
-):
-    """Build a task for llm_rework_cost tests."""
-    from app.models import TaskStatus
-
-    if status is None:
-        status = TaskStatus.FAILED
-    ctx = dict(context or {})
-    if attempt_number > 1:
-        ctx["_attempt_number"] = attempt_number
-    kwargs = {}
-    if attempt_history is not None:
-        kwargs["attempt_history_db"] = attempt_history
-    return make_task(
-        status=status,
-        provider=provider,
-        model=model,
-        api_call_summary={
-            "total_input_tokens": input_tokens,
-            "total_output_tokens": output_tokens,
-            "llm_call_count": 1,
-        },
-        context=ctx,
-        latest_status_message=latest_status_message,
-        **kwargs,
+    assert emitted, (
+        "AST extraction found no top-level string keys in the _compute_digest "
+        "return dict — the extractor is broken"
     )
 
-
-def test_llm_rework_cost_rollup_prices_retries_and_admin_cancels():
-    """Core acceptance test: retry-attempt tokens and admin-cancel tokens are
-    priced using LLM_TOKEN_PRICING; the rollup keys are non-zero and correct."""
-    from app.models import TaskStatus
-    from app.digest_metrics import compute_llm_rework_cost
-
-    now = _utcnow()
-    window_start = now - timedelta(hours=24)
-
-    # Retried task: prior attempt banked 1000 in / 500 out at sonnet rates.
-    # sonnet-4-6: $3e-6 input, $15e-6 output → 1000*3e-6 + 500*15e-6 = 0.0105
-    retried = _rw_task(
-        status=TaskStatus.FAILED,
-        provider="anthropic",
-        model="claude-sonnet-4-6",
-        input_tokens=200,
-        output_tokens=100,
-        attempt_number=2,
-        attempt_history=[
-            {
-                "provider": "anthropic",
-                "model": "claude-sonnet-4-6",
-                "llm_input_tokens": 1000,
-                "llm_output_tokens": 500,
-                "llm_call_count": 3,
-            }
-        ],
+    consumerless = [
+        key
+        for key in sorted(emitted)
+        if "consumer" not in DIGEST_PAYLOAD_METRIC_MANIFEST.get(key, {})
+    ]
+    assert not consumerless, (
+        "These /api/admin/digest keys are emitted but lack a named 'consumer' "
+        "in DIGEST_PAYLOAD_METRIC_MANIFEST. Each emitted key must declare which "
+        "admin-ui component reads it (not just a pending/retired annotation): "
+        f"{consumerless}"
     )
-
-    # Admin-cancelled task: superseded by fix, 2000 in / 1000 out at sonnet rates.
-    # 2000*3e-6 + 1000*15e-6 = 0.021
-    admin_cancel = _rw_task(
-        status=TaskStatus.CANCELLED,
-        provider="anthropic",
-        model="claude-sonnet-4-6",
-        input_tokens=2000,
-        output_tokens=1000,
-        latest_status_message="Superseded by fix #123",
-    )
-
-    result = compute_llm_rework_cost(
-        failed_tasks=[retried],
-        cancelled_tasks=[admin_cancel],
-        completed_tasks=[],
-        window_start=window_start,
-    )
-
-    # Bucket (a): 1000 in * 3e-6 + 500 out * 15e-6 = 0.0105
-    assert result["retry_overhead_llm_usd"] == pytest.approx(0.0105, rel=1e-4)
-    # Bucket (b): 2000 in * 3e-6 + 1000 out * 15e-6 = 0.021
-    assert result["admin_cancel_llm_usd"] == pytest.approx(0.021, rel=1e-4)
-    # Bucket (c): retried task's current attempt only (prior attempts already in
-    # bucket a) — 200 in * 3e-6 + 100 out * 15e-6 = 0.0006 + 0.0015 = 0.0021
-    assert result["terminal_failed_llm_usd"] == pytest.approx(0.0021, rel=1e-4)
-    # Total must be disjoint: 0.0105 + 0.021 + 0.0021 = 0.0336 (no double-counting)
-    assert result["total_attributed_llm_usd"] == pytest.approx(0.0336, rel=1e-4)
-    assert result["unattributed_input_tokens"] == 0
-    assert result["unattributed_output_tokens"] == 0
-
-
-def test_llm_rework_cost_retry_bucket_prices_only_prior_attempts():
-    """Bucket (a) uses attempt_history entries only, not the current attempt."""
-    from app.models import TaskStatus
-    from app.digest_metrics import compute_llm_rework_cost
-
-    now = _utcnow()
-    window_start = now - timedelta(hours=24)
-
-    # Prior attempt: 500 in / 200 out → 500*3e-6 + 200*15e-6 = 0.0045
-    # Current attempt: 1000 in / 400 out — must NOT be counted in retry bucket
-    task = _rw_task(
-        status=TaskStatus.FAILED,
-        provider="anthropic",
-        model="claude-sonnet-4-6",
-        input_tokens=1000,
-        output_tokens=400,
-        attempt_number=2,
-        attempt_history=[
-            {
-                "provider": "anthropic",
-                "model": "claude-sonnet-4-6",
-                "llm_input_tokens": 500,
-                "llm_output_tokens": 200,
-                "llm_call_count": 2,
-            }
-        ],
-    )
-
-    result = compute_llm_rework_cost(
-        failed_tasks=[task],
-        cancelled_tasks=[],
-        completed_tasks=[],
-        window_start=window_start,
-    )
-
-    # Only prior attempt: 500*3e-6 + 200*15e-6 = 0.0045
-    assert result["retry_overhead_llm_usd"] == pytest.approx(0.0045, rel=1e-4)
-
-
-def test_llm_rework_cost_terminal_failed_bucket():
-    """Bucket (c) prices all attempts on tasks that failed and never merged."""
-    from app.models import TaskStatus
-    from app.digest_metrics import compute_llm_rework_cost
-
-    now = _utcnow()
-    window_start = now - timedelta(hours=24)
-
-    # Failed task: 3000 in / 1500 out → 3000*3e-6 + 1500*15e-6 = 0.031500
-    failed = _rw_task(
-        status=TaskStatus.FAILED,
-        provider="anthropic",
-        model="claude-sonnet-4-6",
-        input_tokens=3000,
-        output_tokens=1500,
-    )
-
-    result = compute_llm_rework_cost(
-        failed_tasks=[failed],
-        cancelled_tasks=[],
-        completed_tasks=[],
-        window_start=window_start,
-    )
-
-    assert result["terminal_failed_llm_usd"] == pytest.approx(0.0315, rel=1e-4)
-    assert result["retry_overhead_llm_usd"] == 0.0
-    assert result["admin_cancel_llm_usd"] == 0.0
-
-
-def test_llm_rework_cost_unattributed_remainder_for_unpriced_model():
-    """Attempts with an unknown (provider, model) key accumulate to unattributed
-    token counts, never silently dropped and never attributed as $0 cost."""
-    from app.models import TaskStatus
-    from app.digest_metrics import compute_llm_rework_cost
-
-    now = _utcnow()
-    window_start = now - timedelta(hours=24)
-
-    # Unpriced model — not in LLM_TOKEN_PRICING
-    failed = _rw_task(
-        status=TaskStatus.FAILED,
-        provider="anthropic",
-        model="claude-unknown-model-99",
-        input_tokens=5000,
-        output_tokens=2000,
-    )
-
-    result = compute_llm_rework_cost(
-        failed_tasks=[failed],
-        cancelled_tasks=[],
-        completed_tasks=[],
-        window_start=window_start,
-    )
-
-    assert result["terminal_failed_llm_usd"] == 0.0
-    assert result["unattributed_input_tokens"] == 5000
-    assert result["unattributed_output_tokens"] == 2000
-    assert result["total_attributed_llm_usd"] == 0.0
