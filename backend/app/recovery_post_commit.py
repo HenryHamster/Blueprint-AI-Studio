@@ -77,6 +77,58 @@ _POST_COMMIT_TRANSIENT_SUBSTRINGS = (
 )
 
 
+async def _claim_and_bump_total_attempts(task_id, pending_meta) -> dict | None:
+    """Try to claim the task row and advance total_attempts atomically.
+
+    Opens an isolated session, dialect-gates SET LOCAL lock_timeout, and issues
+    SELECT ... FOR UPDATE SKIP LOCKED on the task row. Returns None if the row
+    is held by another writer (caller should defer this marker without doing any
+    work — zero lock_timeout burned, zero DB connections wasted). Returns a dict
+    with the bumped ``total_attempts`` value when the lock is acquired; the commit
+    releases the row lock in milliseconds so _process_post_commit's own
+    skip_locked attempt succeeds immediately after.
+
+    Write-ahead durability: the claim-commit advances total_attempts BEFORE work
+    starts. A hard kill after this commit but before _process_post_commit means
+    the next sweep sees total_attempts already incremented — correct; the ceiling
+    fires in bounded cycles regardless of whether the work ran.
+    """
+    async with services.AsyncSessionLocal() as claim_session:
+        if resolve_dialect_name(claim_session) == "postgresql":
+            await claim_session.execute(text("SET LOCAL lock_timeout = '5s'"))
+        locked = (
+            (
+                await claim_session.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked is None:
+            return None  # Row held by peer — defer this cycle
+
+        new_ctx = dict(locked.context or {})
+        new_meta = dict(new_ctx.get("_post_commit_pending_meta") or pending_meta)
+        # Seed from on-disk value; fall back to attempts for pre-rework markers
+        # that have no total_attempts field yet.
+        _current_ta = int(
+            new_meta.get("total_attempts") or new_meta.get("attempts", 0) or 0
+        )
+        new_ta = _current_ta + 1
+        new_meta["total_attempts"] = new_ta
+        new_ctx["_post_commit_pending_meta"] = new_meta
+        locked.context = new_ctx
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(locked, "context")
+        claim_session.add(locked)
+        await claim_session.commit()
+        return {"total_attempts": new_ta}
+
+
 def _post_commit_retry_is_transient(exc: BaseException) -> bool:
     """Classify a post-commit retry exception as transient (retriable without
     counting against the cap) vs persistent (counts toward giving up).
@@ -489,9 +541,73 @@ async def _sweep_post_commit_pending():
                     )
                     continue
 
+                # Claim-time attempt accounting: advance total_attempts BEFORE
+                # doing any work. This decouples the ceiling from the contended
+                # row — if the row is held by a dead connection or a peer, we
+                # defer cleanly (zero lock_timeout burned) rather than churning.
+                # total_attempts reaching MAX_TOTAL_ATTEMPTS terminalizes the
+                # marker in a bounded number of CLAIMABLE cycles regardless of
+                # whether any work ever succeeded. The age backstop remains as
+                # belt-and-suspenders for the permanently-unholdable case.
+                _task_id_short = str(task.id)[:8]
+                try:
+                    claimed = await _claim_and_bump_total_attempts(
+                        task.id, pending_meta
+                    )
+                except Exception as claim_exc:
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Task {_task_id_short} claim-time "
+                        f"bump raised {type(claim_exc).__name__}: {claim_exc} — "
+                        f"deferring (batch continues)"
+                    )
+                    continue
+
+                if claimed is None:
+                    logger.info(
+                        f"[POST_COMMIT SWEEP] Task {_task_id_short} row held at "
+                        f"claim time (total_attempts={total_attempts}, "
+                        f"age={int(_pending_age_s or 0)}s) — deferring"
+                    )
+                    continue
+
+                # Reload total_attempts from the claim-commit result; re-check
+                # the ceiling with the freshly-bumped value. This handles the
+                # "one-under" case: a task at total_attempts == MAX_TOTAL_ATTEMPTS-1
+                # is claimed, bumped to MAX_TOTAL_ATTEMPTS, and terminalized here
+                # without invoking _process_post_commit.
+                total_attempts = claimed["total_attempts"]
+                if total_attempts >= services.MAX_TOTAL_ATTEMPTS:
+                    _cap_label = "total_attempts"
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Task {_task_id_short} reached "
+                        f"{services.MAX_TOTAL_ATTEMPTS} {_cap_label} after claim-time "
+                        f"bump (attempts={attempts}) — marking post_commit_abandoned"
+                    )
+                    async with services.AsyncSessionLocal() as ceiling_session:
+                        refreshed = await ceiling_session.get(Task, task.id)
+                        if refreshed and refreshed.post_commit_pending:
+                            _new_ctx = dict(refreshed.context or {})
+                            _new_ctx["_post_commit_abandoned"] = {
+                                "at": _utcnow().isoformat(),
+                                "after_attempts": attempts,
+                                "after_total_attempts": total_attempts,
+                                "last_reason": pending_meta.get("reason"),
+                            }
+                            _new_ctx.pop("_post_commit_pending_meta", None)
+                            refreshed.context = _new_ctx
+                            refreshed.post_commit_pending = False
+                            refreshed.post_commit_failed = True
+                            from sqlalchemy.orm.attributes import flag_modified
+
+                            flag_modified(refreshed, "context")
+                            ceiling_session.add(refreshed)
+                            await ceiling_session.commit()
+                    continue
+
                 logger.info(
-                    f"[POST_COMMIT SWEEP] Retrying post-commit for task {str(task.id)[:8]} "
-                    f"(attempt {attempts + 1}/{MAX_ATTEMPTS}, reason={pending_meta.get('reason')})"
+                    f"[POST_COMMIT SWEEP] Retrying post-commit for task {_task_id_short} "
+                    f"(attempt {attempts + 1}/{MAX_ATTEMPTS}, total_attempts={total_attempts}/{services.MAX_TOTAL_ATTEMPTS}, "
+                    f"reason={pending_meta.get('reason')})"
                 )
                 try:
                     # C3: hard outer ceiling so a wedged inline pass (e.g. a
@@ -502,7 +618,7 @@ async def _sweep_post_commit_pending():
                     await services._bounded(
                         _process_post_commit(task.id, _payload),
                         services._POST_COMMIT_CALL_TIMEOUT_S,
-                        what=f"post-commit {str(task.id)[:8]}",
+                        what=f"post-commit {_task_id_short}",
                     )
                     # Success — clear the flag on a fresh read (post_commit may
                     # have mutated context in other ways we want to keep).
@@ -518,9 +634,7 @@ async def _sweep_post_commit_pending():
                             flag_modified(refreshed, "context")
                             clear_session.add(refreshed)
                             await clear_session.commit()
-                    logger.info(
-                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} recovered"
-                    )
+                    logger.info(f"[POST_COMMIT SWEEP] Task {_task_id_short} recovered")
                 except Exception as e:
                     # C6 fix: transient failures (PostCommitLocked / rate-limit /
                     # lock contention) must NOT count against the 5-attempt cap.
@@ -531,73 +645,27 @@ async def _sweep_post_commit_pending():
                     # side effects. The cap is reserved for persistent defects.
                     if _post_commit_retry_is_transient(e):
                         logger.info(
-                            f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} retry hit a "
+                            f"[POST_COMMIT SWEEP] Task {_task_id_short} retry hit a "
                             f"transient failure ({type(e).__name__}) — NOT counting "
                             f"against the {MAX_ATTEMPTS}-attempt cap; will retry next sweep "
                             f"(total_attempts {total_attempts}/{services.MAX_TOTAL_ATTEMPTS})"
                         )
-                        # C6 rework (C): still advance the HARD outer bound. A
-                        # persistent failure that string-matches as transient
-                        # lands here every sweep; without bumping total_attempts
-                        # it would loop forever and the marker would never clear.
-                        # Bump in its own session/try so a bump failure on one
-                        # task doesn't poison the batch (mirrors the persistent
-                        # path below). Short lock_timeout to fail fast on
-                        # contention rather than burn cycle time.
-                        try:
-                            async with services.AsyncSessionLocal() as t_session:
-                                if resolve_dialect_name(t_session) == "postgresql":
-                                    await t_session.execute(
-                                        text("SET LOCAL lock_timeout = '5s'")
-                                    )
-                                refreshed = await t_session.get(Task, task.id)
-                                if refreshed:
-                                    new_ctx = dict(refreshed.context or {})
-                                    new_meta = dict(
-                                        new_ctx.get("_post_commit_pending_meta")
-                                        or pending_meta
-                                    )
-                                    new_meta["total_attempts"] = (
-                                        int(
-                                            new_meta.get(
-                                                "total_attempts", total_attempts
-                                            )
-                                        )
-                                        + 1
-                                    )
-                                    new_meta["last_transient_at"] = (
-                                        _utcnow().isoformat()
-                                    )
-                                    new_ctx["_post_commit_pending_meta"] = new_meta
-                                    refreshed.context = new_ctx
-                                    from sqlalchemy.orm.attributes import (
-                                        flag_modified,
-                                    )
-
-                                    flag_modified(refreshed, "context")
-                                    t_session.add(refreshed)
-                                    await t_session.commit()
-                        except Exception as t_exc:
-                            logger.warning(
-                                f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} "
-                                f"transient total_attempts bump failed (likely "
-                                f"row-lock contention): {type(t_exc).__name__}: {t_exc}"
-                            )
+                        # total_attempts already bumped at claim time — no
+                        # additional bump needed here. The ceiling fires on the
+                        # next sweep where the row is claimable.
                         continue
                     # Persistent failure — bump attempts so we eventually give up.
-                    # The retry path in _process_post_commit's exception handler
-                    # already bumps attempts itself if it got to set the
-                    # flag again; this covers cases where it didn't.
+                    # total_attempts was already advanced at claim time, so only
+                    # attempts needs bumping here. The retry path in
+                    # _process_post_commit's exception handler may have already
+                    # bumped attempts; this covers cases where it didn't.
                     logger.warning(
-                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} retry failed: {e}"
+                        f"[POST_COMMIT SWEEP] Task {_task_id_short} retry failed: {e}"
                     )
                     # Bump in its own try/except so a bump failure on one task
-                    # doesn't poison the entire sweep batch (which would let
-                    # the outer except at the bottom abort the loop, leaving
-                    # all subsequent pending tasks unprocessed). Short
-                    # lock_timeout (5s) so we fail fast on row contention
-                    # instead of burning 30s of orchestrator-cycle time per
-                    # task — the next sweep will try again.
+                    # doesn't poison the entire sweep batch. Short lock_timeout
+                    # (5s) so we fail fast on row contention instead of burning
+                    # 30s of orchestrator-cycle time per task.
                     try:
                         async with services.AsyncSessionLocal() as bump_session:
                             # Postgres-only fast-fail on row contention; on
@@ -617,18 +685,8 @@ async def _sweep_post_commit_pending():
                                 new_pending["attempts"] = (
                                     int(new_pending.get("attempts", attempts)) + 1
                                 )
-                                # C6 rework (C): persistent failures advance BOTH
-                                # the 5-attempt cap and the hard outer bound, so
-                                # the give-up check above fires on whichever
-                                # ceiling is hit first.
-                                new_pending["total_attempts"] = (
-                                    int(
-                                        new_pending.get(
-                                            "total_attempts", total_attempts
-                                        )
-                                    )
-                                    + 1
-                                )
+                                # total_attempts was already bumped at claim time
+                                # — do NOT bump again here.
                                 new_pending["last_retry_at"] = _utcnow().isoformat()
                                 new_ctx["_post_commit_pending_meta"] = new_pending
                                 refreshed.context = new_ctx
@@ -639,7 +697,7 @@ async def _sweep_post_commit_pending():
                                 await bump_session.commit()
                     except Exception as bump_exc:
                         logger.warning(
-                            f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} "
+                            f"[POST_COMMIT SWEEP] Task {_task_id_short} "
                             f"attempt-bump failed (likely row-lock contention): "
                             f"{type(bump_exc).__name__}: {bump_exc}"
                         )

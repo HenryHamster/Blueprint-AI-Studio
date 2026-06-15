@@ -2744,13 +2744,18 @@ async def test_clear_post_commit_pending_clears_write_ahead_marker(svc_db):
 
 @pytest.mark.asyncio
 async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mocker):
-    """When the attempt-bump fails on one task (e.g. row-lock contention →
-    Postgres LockNotAvailableError on the bump UPDATE), the sweep must
-    continue and bump the OTHER tasks in the batch instead of aborting.
-    Regression for 2026-05-07 incident: a single stuck task's bump failure
-    propagated to the outer try/except, leaving subsequent pending tasks
-    unprocessed AND letting the same bad task burn ~30s of orchestrator
-    cycle time per sweep (lock_timeout) → /health 503 → instance kill loop.
+    """A claim-time bump failure on one task must not poison the rest of the batch.
+
+    Under the claim-time accounting pattern, _claim_and_bump_total_attempts is
+    called BEFORE _process_post_commit. If the claim raises (e.g. row-lock
+    contention → LockNotAvailableError on the bump commit), the bad task is
+    deferred WITHOUT reaching _process_post_commit, and the sweep continues to
+    process the good task. The good task's claim-time bump and subsequent
+    attempt-bump must both succeed.
+
+    Regression for 2026-05-07 incident (structurally updated for the claim-time
+    pattern): a single stuck task's failure must not abort the loop and leave
+    subsequent pending tasks unprocessed.
     """
     import uuid as _uuid
 
@@ -2800,9 +2805,8 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
     svc_db.add_all([bad_task, good_task])
     await svc_db.commit()
 
-    # _process_post_commit raises for BOTH tasks → bump path runs for both.
-    # This isolates the test from sweep iteration order: the regression is
-    # about whether one task's bump failure blocks the others' bumps.
+    # _process_post_commit raises for the good task (persistent error) so
+    # the post-failure attempts-bump path runs for it.
     call_log: list[str] = []
 
     async def fake_process(task_id, _payload):
@@ -2813,40 +2817,43 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
         "app.routers.agent_status._process_post_commit", side_effect=fake_process
     )
 
-    # Make ONLY the bad task's bump raise. flag_modified is called inside
-    # the bump block before commit; raising there mimics the production
-    # LockNotAvailableError on bump_session.commit() (single-point injection
-    # since patching commit() across multiple async sessions is awkward).
+    # Make ONLY the bad task's claim-time bump raise (mimics the production
+    # LockNotAvailableError that hits during commit when the row is held).
+    # flag_modified is the last write before commit inside _claim_and_bump_total_attempts,
+    # so raising there aborts the claim-session without committing.
     from sqlalchemy.orm import attributes as _sa_attrs
 
     real_flag_modified = _sa_attrs.flag_modified
 
     def fake_flag_modified(obj, key):
         if isinstance(obj, Task) and str(obj.id) == str(bad_id) and key == "context":
-            raise RuntimeError("simulated bump lock_timeout")
+            raise RuntimeError("simulated claim-time bump lock_timeout")
         return real_flag_modified(obj, key)
 
     mocker.patch("sqlalchemy.orm.attributes.flag_modified", fake_flag_modified)
 
     await _sweep_post_commit_pending()
 
-    # Both tasks reached _process_post_commit (the regression was that the
-    # outer except aborted the loop after the first failure).
-    assert str(bad_id) in call_log
-    assert str(good_id) in call_log
+    # bad_task: claim raised → deferred without reaching _process_post_commit.
+    assert str(bad_id) not in call_log, (
+        "bad_task claim-time raise must defer the task, not forward it to _process_post_commit"
+    )
+    # good_task: claim succeeded → reached _process_post_commit.
+    assert str(good_id) in call_log, (
+        "bad_task deferral must not poison the batch — good_task must still be processed"
+    )
 
-    # Good task: bump succeeded → attempts advanced 1 → 2.
+    # Good task: persistent failure → attempts bumped 1 → 2.
     await svc_db.refresh(good_task)
     good_attempts = (
         (good_task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
     )
     assert good_attempts == 2, (
         f"good task's bump should have advanced attempts to 2, got {good_attempts}. "
-        f"This means the bad task's bump failure poisoned the batch — the regression is back."
+        f"This means the bad task's claim failure poisoned the batch — the regression is back."
     )
 
-    # Bad task: bump failed → attempts stays at 4. The sweep must NOT have
-    # raised (otherwise the good task wouldn't have been processed).
+    # Bad task: deferred → attempts stays at 4.
     await svc_db.refresh(bad_task)
     bad_attempts = (
         (bad_task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
@@ -2928,6 +2935,232 @@ async def test_post_commit_sweep_abandons_lock_starved_marker_by_age(svc_db, moc
     abandoned = ctx.get("_post_commit_abandoned") or {}
     assert abandoned.get("reason") == "max_pending_age_exceeded"
     assert abandoned.get("after_pending_age_s", 0) >= POST_COMMIT_MAX_PENDING_AGE_S
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Claim-time attempt accounting: structural root-fix for post-commit lock churn
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_defers_cleanly_when_row_held(svc_db, mocker):
+    """When _claim_and_bump_total_attempts returns None (row held by another
+    writer), the sweep must defer the task — no _process_post_commit call,
+    no total_attempts change, post_commit_pending stays True — and continue
+    processing other tasks in the batch (no batch poisoning).
+
+    This is the structural root-fix invariant: a persistently-held row causes
+    clean defers, never the lock_timeout churn that triggered the 2026-06-14
+    stuck-task incident.
+    """
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    stuck_id = _uuid.uuid4()
+    other_id = _uuid.uuid4()
+    stuck = Task(
+        id=stuck_id,
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "stuck"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": str(stuck_id),
+                    "status": "COMPLETED",
+                    "logs": "{}",
+                },
+                "attempts": 1,
+                "total_attempts": 3,
+            }
+        },
+    )
+    other = Task(
+        id=other_id,
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "other"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": str(other_id),
+                    "status": "COMPLETED",
+                    "logs": "{}",
+                },
+                "attempts": 0,
+                "total_attempts": 0,
+            }
+        },
+    )
+    svc_db.add_all([stuck, other])
+    await svc_db.commit()
+
+    process_calls: list[str] = []
+
+    async def fake_process(task_id, _payload):
+        process_calls.append(str(task_id))
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit", side_effect=fake_process
+    )
+
+    # Capture real function BEFORE patching to avoid recursive call via the mock.
+    from app.recovery_post_commit import _claim_and_bump_total_attempts as _real_claim
+
+    # Return None for stuck task (row held), let other task claim normally.
+    async def fake_claim(task_id, pending_meta):
+        if str(task_id) == str(stuck_id):
+            return None  # simulate row held by peer
+        return await _real_claim(task_id, pending_meta)
+
+    mocker.patch(
+        "app.recovery_post_commit._claim_and_bump_total_attempts",
+        side_effect=fake_claim,
+    )
+
+    await _sweep_post_commit_pending()
+
+    # stuck task: row held → deferred, _process_post_commit NOT called.
+    assert str(stuck_id) not in process_calls, (
+        "stuck task must be deferred when claim returns None — "
+        "_process_post_commit must not be called"
+    )
+
+    # stuck task: total_attempts unchanged (defer, not bump).
+    await svc_db.refresh(stuck)
+    stuck_meta = (stuck.context or {}).get("_post_commit_pending_meta", {})
+    assert stuck_meta.get("total_attempts") == 3, (
+        f"deferred task must not have total_attempts changed; got {stuck_meta.get('total_attempts')}"
+    )
+    assert stuck.post_commit_pending is True, (
+        "deferred task must keep post_commit_pending=True"
+    )
+
+    # other task: claim succeeded → _process_post_commit called (batch not poisoned).
+    assert str(other_id) in process_calls, (
+        "other task must still be processed despite stuck task deferral"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_claim_bumps_total_attempts_before_process(
+    svc_db, mocker
+):
+    """total_attempts must be advanced in the DB BEFORE _process_post_commit runs.
+
+    This is the core write-ahead durability guarantee of the claim-time pattern:
+    if the instance is killed after the claim commit but before _process_post_commit
+    starts, the next sweep sees total_attempts already incremented and will
+    eventually terminalize at MAX_TOTAL_ATTEMPTS — even if no work ever ran.
+
+    Verified by: mock _process_post_commit to raise a transient error, then assert
+    that total_attempts advanced despite the failure (claim commit already happened).
+    """
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    task = _make_pending_task(project.id, task_id=task_id, attempts=1, total_attempts=5)
+    svc_db.add(task)
+    await svc_db.commit()
+
+    # Track the DB value of total_attempts at the moment _process_post_commit is called.
+    ta_at_process_time: list[int] = []
+
+    async def probe_process(tid, _payload):
+        # Read the live DB value under a fresh session to see what was committed.
+        from app.services import AsyncSessionLocal
+        from app.models import Task as _Task
+
+        async with AsyncSessionLocal() as probe:
+            row = await probe.get(_Task, tid)
+            meta = (row.context or {}).get("_post_commit_pending_meta", {})
+            ta_at_process_time.append(int(meta.get("total_attempts", 0)))
+        raise RuntimeError("secondary rate limit — transient error")
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit", side_effect=probe_process
+    )
+
+    await _sweep_post_commit_pending()
+
+    # The claim-time bump must have committed BEFORE probe_process ran.
+    assert ta_at_process_time, "_process_post_commit was never called"
+    assert ta_at_process_time[0] == 6, (
+        f"total_attempts must be 6 (5+1 from claim) when _process_post_commit runs; "
+        f"got {ta_at_process_time[0]}"
+    )
+
+    # After transient failure, total_attempts stays at 6 (already bumped).
+    await svc_db.refresh(task)
+    meta = (task.context or {}).get("_post_commit_pending_meta", {})
+    assert meta.get("total_attempts") == 6
+    assert meta.get("attempts") == 1, "transient failure must not advance attempts"
+    assert task.post_commit_pending is True
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_ceiling_fires_via_claim_bump_no_process(
+    svc_db, mocker
+):
+    """When total_attempts is one-under the ceiling (MAX_TOTAL_ATTEMPTS - 1),
+    the claim-time bump pushes it over, and the sweep must terminalize the task
+    WITHOUT calling _process_post_commit.
+
+    This validates the post-claim ceiling re-check: the task reaches a terminal
+    state by attempt-count, independent of age.
+    """
+    import uuid as _uuid
+    from app.services import MAX_TOTAL_ATTEMPTS
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    # One-under the ceiling: claim-time bump will push it to MAX_TOTAL_ATTEMPTS.
+    task = _make_pending_task(
+        project.id,
+        task_id=task_id,
+        attempts=1,
+        total_attempts=MAX_TOTAL_ATTEMPTS - 1,
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    process_calls: list[str] = []
+
+    async def fake_process(tid, _payload):
+        process_calls.append(str(tid))
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit", side_effect=fake_process
+    )
+
+    await _sweep_post_commit_pending()
+
+    # post-claim ceiling re-check must terminalize WITHOUT doing work.
+    assert process_calls == [], (
+        "_process_post_commit must NOT be called when post-claim ceiling fires"
+    )
+
+    await svc_db.refresh(task)
+    assert task.post_commit_pending is False, (
+        "marker must be cleared on ceiling termination"
+    )
+    assert task.post_commit_failed is True, "task must be marked post_commit_failed"
+    ctx = task.context or {}
+    assert "_post_commit_pending_meta" not in ctx, "retry meta must be cleared"
+    abandoned = ctx.get("_post_commit_abandoned") or {}
+    assert abandoned.get("after_total_attempts") == MAX_TOTAL_ATTEMPTS, (
+        f"abandoned record must show total_attempts={MAX_TOTAL_ATTEMPTS}; "
+        f"got {abandoned.get('after_total_attempts')}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
