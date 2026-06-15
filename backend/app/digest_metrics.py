@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
 from sqlalchemy import and_, case, func, or_
+from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -3209,8 +3210,8 @@ async def compute_merge_gate_fleet_health(
     raise. Returns all-zero counts and ``None`` rates/reason when no project has
     any gate data.
     """
-    from sqlalchemy.orm import load_only
-
+    # Narrow the projection: only merge_gate_runtime is read in the loop.
+    # raiseload=True catches any future accidental full-ORM attribute access.
     stmt = select(Project).options(
         load_only(Project.id, Project.merge_gate_runtime, raiseload=True)
     )
