@@ -19041,16 +19041,11 @@ async def test_viewport_screenshot_upload_url_cap_enforced(
 
 @pytest.mark.asyncio
 async def test_viewport_shots_download_url(client: AsyncClient, db_session, mocker):
-    """Admin download endpoint reconstructs the correct GCS path and returns a signed URL."""
+    """Admin download endpoint redirects to a signed GCS URL (unauthenticated, 302)."""
     project = Project(name="VP Shot Download Test", user_id="user-vpshot-dl-001")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    member = ProjectMember(
-        project_id=project.id, user_id="test-user-123", role="member"
-    )
-    db_session.add(member)
-    await db_session.commit()
 
     import uuid as _uuid
 
@@ -19070,22 +19065,27 @@ async def test_viewport_shots_download_url(client: AsyncClient, db_session, mock
             "name": "TaskCard-375-before",
         },
     )
-    assert resp.status_code == 200
-    assert resp.json()["url"] == fake_url
+    assert resp.status_code == 302
+    assert resp.headers["location"] == fake_url
 
 
 @pytest.mark.asyncio
-async def test_viewport_shots_download_url_non_member_rejected(
+async def test_viewport_shots_download_url_unauthenticated_succeeds(
     client: AsyncClient, db_session, mocker
 ):
-    """Non-member cannot download viewport screenshots from a project they don't belong to."""
+    """Endpoint is public: no auth token required to follow a PR-body view link."""
     project = Project(name="VP Shot Download Auth Test", user_id="user-vpshot-dl-002")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    # Intentionally do NOT add test-user-123 as a project member
 
     import uuid as _uuid
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/public?X-Goog-Signature=pub"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
 
     resp = await client.get(
         "/api/admin/viewport-shots/download-url",
@@ -19095,7 +19095,8 @@ async def test_viewport_shots_download_url_non_member_rejected(
             "name": "TaskCard-375-before",
         },
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 302
+    assert resp.headers["location"] == fake_url
 
 
 # ---------------------------------------------------------------------------

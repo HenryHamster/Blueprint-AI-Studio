@@ -24,7 +24,7 @@ from fastapi import (
     HTTPException,
     Request,
 )
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -1284,22 +1284,20 @@ async def get_viewport_screenshot_download_url(
     project_id: uuid.UUID,
     task_id: uuid.UUID,
     name: str,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict | None = Depends(get_current_user_optional),
     x_agent_token: str | None = Header(None),
 ):
-    """Generate a 1-hour signed download URL for a task-scoped viewport screenshot.
+    """Signed download URL for a task-scoped viewport screenshot.
 
-    Accepts either an admin/Firebase bearer token (existing path) or an agent
-    JWT via the ``x-agent-token`` header.  Agent tokens are scoped to their own
-    task: the ``task_id`` query param must match the token's ``sub`` claim, and
-    ``project_id`` must match the token's ``project_id`` claim.
+    Two access paths:
+    - Agent JWT (x-agent-token header): validates that the token's sub (task_id)
+      and project_id claims match the query parameters, then returns JSON {"url": ...}.
+    - No token: returns a 302 redirect to the signed URL so operators can click
+      links from GitHub PR bodies without a bearer token. The signed URL itself
+      is the security boundary.
 
-    The GCS object path is reconstructed to exactly mirror what the agent uploads via
+    The GCS object path mirrors what the agent uploads via
     POST /api/agent/viewport/screenshot-upload-url
-    (viewport-shots/{project_id}/{task_id}/{name}.png), so the PR renderer can display
-    the screenshot by passing the stored context name directly.  The name is sanitized
-    with the same rule the upload endpoint applies so the two paths always agree.
+    (viewport-shots/{project_id}/{task_id}/{name}.png).
     """
     import re as _re
 
@@ -1319,16 +1317,8 @@ async def get_viewport_screenshot_download_url(
             raise HTTPException(status_code=403, detail="Task mismatch")
         if str(token_project_id) != str(project_id):
             raise HTTPException(status_code=403, detail="Project mismatch")
-    elif current_user is not None:
-        await _get_user_project(project_id, current_user["user_id"], session)
-    else:
-        raise HTTPException(status_code=401, detail="Authentication required")
 
     _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
-    # The `name` param is the stored entry_name: "{sanitize(component)[:100]}-{width}-{phase}".
-    # Truncating the full string to 100 chars would cut the -width-phase suffix for long
-    # component names.  Sanitize the characters but do not re-truncate, since the value
-    # was already bounded and sanitized by the upload endpoint.
     safe_name = _SAFE_NAME_RE.sub("_", name)
 
     object_name = f"viewport-shots/{project_id}/{task_id}/{safe_name}.png"
@@ -1344,7 +1334,10 @@ async def get_viewport_screenshot_download_url(
             "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
         )
         raise HTTPException(status_code=503, detail="Artifact storage unavailable")
-    return {"url": url}
+
+    if x_agent_token is not None:
+        return {"url": url}
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.get(

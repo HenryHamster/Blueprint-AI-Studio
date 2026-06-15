@@ -326,7 +326,13 @@ def test_all_admin_routes_require_auth():
     # Intentional exceptions — should stay empty. If a route is intentionally
     # public (for example, a monitored liveness probe), add its path here with
     # a short comment explaining why the public surface is deliberate.
-    public_allowlist: dict[str, str] = {}
+    public_allowlist: dict[str, str] = {
+        "/api/admin/viewport-shots/download-url": (
+            "Intentionally unauthenticated: endpoint returns a 302 redirect to a "
+            "time-limited GCS signed URL. Operators click these links from GitHub PR "
+            "bodies without a bearer token; the signed URL itself is the security boundary."
+        ),
+    }
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
     # JWTs; it is a valid auth callable for metrics-only endpoints.

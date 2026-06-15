@@ -222,7 +222,12 @@ function buildViewportUploadBlock(taskId: string): string {
               echo "[check] WARN: viewport upload — PUT failed for $_vp_comp@\${_vp_width}px"
               continue
             }
-            echo "[check] viewport screenshot uploaded: $_vp_uri ($_vp_comp@\${_vp_width}px)"
+            # Save a local copy for the fixing agent to read before making changes.
+            # The agent cannot open gs:// URIs, so a local path makes the screenshot
+            # accessible via its file-reading tool.
+            _vp_local_path="/tmp/viewport_failure_${taskId}_\${_vp_comp}_\${_vp_width}.png"
+            cp "$_vp_png" "$_vp_local_path" 2>/dev/null || true
+            echo "[check] viewport screenshot uploaded: $_vp_uri ($_vp_comp@\${_vp_width}px) — local copy: $_vp_local_path"
           done < <(
             jq -r '
               .testResults[]
