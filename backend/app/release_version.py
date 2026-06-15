@@ -62,7 +62,7 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
 )
 from app.landed_signal import landed_signal_predicate
-from app.models import Project, ReleaseVersion, Task, TaskStatus
+from app.models import Artifact, ArtifactType, Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _coerce_naive_utc, _utcnow
 
 logger = logging.getLogger(__name__)
@@ -341,13 +341,32 @@ async def list_merged_tasks_for_version(
         .where(*filters)
     )
     rows = (await session.execute(stmt)).scalars().all()
-    entries: list[tuple[datetime, dict[str, Any]]] = []
+
+    # Filter to the version window first so the artifact query is scoped to
+    # only the tasks that will appear in the changelog.
+    windowed: list[tuple[datetime, Task]] = []
     for task in rows:
         completed_at = _task_completed_at(task)
         if completed_at < since:
             continue
         if until is not None and completed_at > until:
             continue
+        windowed.append((completed_at, task))
+
+    # Batch-fetch PULL_REQUEST artifacts for the windowed task set so each
+    # changelog entry can carry a clickable pr_url without N+1 queries.
+    pr_url_by_task: dict = {}
+    if windowed:
+        task_ids = [task.id for _, task in windowed]
+        artifact_stmt = select(Artifact.task_id, Artifact.pr_url).where(
+            Artifact.task_id.in_(task_ids),
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+        )
+        artifact_rows = (await session.execute(artifact_stmt)).all()
+        pr_url_by_task = {row.task_id: row.pr_url for row in artifact_rows}
+
+    entries: list[tuple[datetime, dict[str, Any]]] = []
+    for completed_at, task in windowed:
         payload = task.first_payload
         entries.append(
             (
@@ -356,6 +375,7 @@ async def list_merged_tasks_for_version(
                     "task_type": payload.get("type"),
                     "title": task.title,
                     "pr_number": payload.get("pr_number"),
+                    "pr_url": pr_url_by_task.get(task.id),
                 },
             )
         )

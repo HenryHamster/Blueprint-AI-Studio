@@ -1,4 +1,4 @@
-import { afterEach, describe, test } from 'vitest';
+import { afterEach, describe, expect, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { VersionSummaryPanel } from './VersionSummaryPanel';
@@ -10,11 +10,11 @@ import {
 import type { ChangelogEntry } from '../api';
 
 const SAMPLE_TASKS: ChangelogEntry[] = [
-  { task_type: 'create', title: 'Add VersionSummaryPanel component with changelog grouping by task type', pr_number: 10255 },
-  { task_type: 'create', title: 'Expose tasks_merged on CurrentVersion via backend release_version module', pr_number: 10254 },
-  { task_type: 'fix', title: 'Fix viewport test coverage for new operator components', pr_number: 10260 },
-  { task_type: 'fix', title: 'Resolve mock-signature drift in VersionLifecyclePanel unit tests after API extension', pr_number: 10261 },
-  { task_type: 'research', title: 'Truthful state layer: canonical backend module for system/version/deploy state', pr_number: null },
+  { task_type: 'create', title: 'Add VersionSummaryPanel component with changelog grouping by task type', pr_number: 10255, pr_url: 'https://github.com/org/repo/pull/10255' },
+  { task_type: 'create', title: 'Expose tasks_merged on CurrentVersion via backend release_version module', pr_number: 10254, pr_url: 'https://github.com/org/repo/pull/10254' },
+  { task_type: 'fix', title: 'Fix viewport test coverage for new operator components', pr_number: 10260, pr_url: null },
+  { task_type: 'fix', title: 'Resolve mock-signature drift in VersionLifecyclePanel unit tests after API extension', pr_number: 10261, pr_url: null },
+  { task_type: 'research', title: 'Truthful state layer: canonical backend module for system/version/deploy state', pr_number: null, pr_url: null },
 ];
 
 describe('VersionSummaryPanel — viewport regression', () => {
@@ -109,5 +109,34 @@ describe('VersionSummaryPanel — viewport regression', () => {
       },
       { selector: 'none' },
     );
+  });
+
+  test('changelog entry with pr_url renders a clickable anchor to the PR', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const anchors = host.querySelectorAll('a[href="https://github.com/org/repo/pull/10255"]');
+    expect(anchors.length).toBe(1);
+    expect(anchors[0].textContent).toBe('#10255');
+    expect(anchors[0].getAttribute('target')).toBe('_blank');
+  });
+
+  test('changelog entry with null pr_url renders plain text PR number', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    // pr_number=10260 has pr_url=null — should be a <span>, not an <a>
+    const spans = Array.from(host.querySelectorAll('span')).filter(
+      (el) => el.textContent === '#10260',
+    );
+    expect(spans.length).toBe(1);
   });
 });

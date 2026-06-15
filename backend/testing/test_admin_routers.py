@@ -10559,6 +10559,73 @@ class TestVersionLifecycleTasksMerged:
         assert tasks[0]["task_type"] == "fix"
         assert tasks[0]["title"] == "fix: resolve race condition in deploy"
         assert tasks[0]["pr_number"] == 42
+        assert tasks[0]["pr_url"] is None  # no Artifact row created
+
+    @pytest.mark.asyncio
+    async def test_tasks_merged_includes_pr_url_from_artifact(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_merged includes pr_url when a PULL_REQUEST artifact exists."""
+        from app.landed_signal import mark_landed_on_integration
+
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        task = Task(
+            project_id=project.id,
+            title="fix: add feature",
+            payloads=[{"type": "fix", "pr_number": 99}],
+            status=TaskStatus.COMPLETED,
+            context={},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        mark_landed_on_integration(task)
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/org/repo/pull/99",
+        )
+        db_session.add(artifact)
+        db_session.add(task)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=1),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        tasks = current["tasks_merged"]
+        assert len(tasks) == 1
+        assert tasks[0]["pr_number"] == 99
+        assert tasks[0]["pr_url"] == "https://github.com/org/repo/pull/99"
 
     @pytest.mark.asyncio
     async def test_tasks_merged_empty_when_no_landed_tasks(

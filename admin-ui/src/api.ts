@@ -1639,6 +1639,7 @@ export interface ChangelogEntry {
   task_type: string | null;
   title: string;
   pr_number: number | null;
+  pr_url?: string | null;
 }
 
 export interface CurrentVersion {

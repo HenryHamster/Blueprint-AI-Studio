@@ -1,5 +1,6 @@
 import type { JSX } from 'react';
 import type { ChangelogEntry } from '../api';
+import { isSafeUrl } from './TaskCard';
 
 // Group changelog entries by task_type, preserving newest-first order within each group.
 function groupByType(entries: ChangelogEntry[]): Map<string, ChangelogEntry[]> {
@@ -17,13 +18,26 @@ function groupByType(entries: ChangelogEntry[]): Map<string, ChangelogEntry[]> {
 }
 
 function TaskRow({ entry }: { entry: ChangelogEntry }): JSX.Element {
+  const prRef = entry.pr_number != null ? (
+    entry.pr_url && isSafeUrl(entry.pr_url) ? (
+      <a
+        href={entry.pr_url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="font-mono text-[10px] text-slate-500 hover:text-slate-300 shrink-0 pt-px"
+      >
+        #{entry.pr_number}
+      </a>
+    ) : (
+      <span className="font-mono text-[10px] text-slate-500 shrink-0 pt-px">
+        #{entry.pr_number}
+      </span>
+    )
+  ) : null;
+
   return (
     <li className="flex items-start gap-2 py-0.5">
-      {entry.pr_number != null && (
-        <span className="font-mono text-[10px] text-slate-500 shrink-0 pt-px">
-          #{entry.pr_number}
-        </span>
-      )}
+      {prRef}
       <span className="text-xs text-slate-300 break-words min-w-0">{entry.title}</span>
     </li>
   );
