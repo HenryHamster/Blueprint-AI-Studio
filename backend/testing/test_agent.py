@@ -22965,3 +22965,209 @@ async def test_research_grounding_surfaces_landed_and_blocked(
     assert "Blocked in-flight task" in blocked_titles, (
         "BLOCKED tasks must appear in active_tasks so research agents don't regenerate their work"
     )
+
+
+# ---------------------------------------------------------------------------
+# Agent-token path through ADMIN viewport download endpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_failure_download_url_agent_token(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT can download its own failure screenshot via the ADMIN endpoint.
+
+    The admin endpoint accepts x-agent-token and validates that the task's
+    context URI matches the reconstructed object path for (project_id, component, width).
+    """
+    project = Project(
+        name="Admin VP Fail DL Agent JWT", user_id="user-admin-vp-fail-jwt-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp"}],
+        vm_instance_id="vm-admin-vp-fail-jwt-001",
+        context={
+            "viewport_failure_screenshot_uri": f"gs://bucket/viewport-failures/{project.id}/NavBar-768.png"
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = (
+        "https://storage.googleapis.com/bucket/admin-vp-fail-dl?X-Goog-Signature=abc"
+    )
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(
+        str(task.id), "vm-admin-vp-fail-jwt-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-failures/download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "NavBar",
+            "width": 768,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_failure_download_url_agent_token_cross_task_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT is denied when the task's context URI does not match the requested screenshot.
+
+    task_b has no viewport_failure_screenshot_uri for NavBar-768, so its token
+    must not be able to download that path even though the project_id matches.
+    """
+    project = Project(
+        name="Admin VP Fail DL Agent JWT Cross", user_id="user-admin-vp-fail-jwt-002"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # task_a uploaded; task_b has no matching context entry
+    task_a = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-admin-vp-fail-jwt-cross-001",
+        context={
+            "viewport_failure_screenshot_uri": f"gs://bucket/viewport-failures/{project.id}/NavBar-768.png"
+        },
+    )
+    task_b = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-admin-vp-fail-jwt-cross-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # task_b's token — no matching context URI
+    token = create_agent_token(
+        str(task_b.id), "vm-admin-vp-fail-jwt-cross-002", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-failures/download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "NavBar",
+            "width": 768,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_agent_token(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT can download its own task-scoped screenshot via the ADMIN endpoint.
+
+    The admin endpoint validates that the token's sub (task_id) and project_id
+    claims match the query parameters before issuing a signed URL.
+    """
+    project = Project(
+        name="Admin VP Shot DL Agent JWT", user_id="user-admin-vp-shot-jwt-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp shot"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-001",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = (
+        "https://storage.googleapis.com/bucket/admin-vp-shot-dl?X-Goog-Signature=xyz"
+    )
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(
+        str(task.id), "vm-admin-vp-shot-jwt-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project.id),
+            "task_id": str(task.id),
+            "name": "HeroSection-1280-after",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT scoped to task_a cannot download screenshots for task_b via the ADMIN endpoint."""
+    project = Project(
+        name="Admin VP Shot DL Agent JWT Cross", user_id="user-admin-vp-shot-jwt-002"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-cross-001",
+    )
+    task_b = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-cross-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # Token is for task_a; request asks for task_b's screenshots
+    token = create_agent_token(
+        str(task_a.id), "vm-admin-vp-shot-jwt-cross-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project.id),
+            "task_id": str(task_b.id),
+            "name": "HeroSection-1280-after",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
