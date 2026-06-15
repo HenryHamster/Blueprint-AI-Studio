@@ -20,6 +20,8 @@ HELP_INVOCATIONS = [
     ["tasks"],
     ["tasks", "list"],
     ["tasks", "show"],
+    ["tasks", "cancel"],
+    ["tasks", "requeue"],
     ["versions"],
     ["versions", "list"],
     ["versions", "show"],
@@ -138,12 +140,40 @@ def test_status_json_is_valid_json(mock_api, capsys):
     assert not any("settings" in path for _, path, _ in mock_api)
 
 
+def test_status_surfaces_fleet_and_serving(mock_api, capsys):
+    """status --json exposes fleet block and version serving truth from state snapshot."""
+    rc = blueprint.main(["--json", "status"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    # fleet block is present at the top level
+    assert "fleet" in parsed
+    assert parsed["fleet"]["active"] == 0
+    assert parsed["fleet"]["queued"] == 0
+    assert parsed["fleet"]["stale_heartbeat_count"] == 0
+    # halted is surfaced from deploy
+    assert parsed["deploy_state"]["halted"] is False
+    # in-flight and serving fields are surfaced from version
+    cv = parsed["current_version"]
+    assert cv["in_flight_task_count"] == 0
+    assert cv["serving_status"] is None  # fixture has serving.status=None
+    assert cv["serving_confirmed_at"] is None
+
+
 def test_status_json_flag_after_subcommand(mock_api, capsys):
     """--json is accepted both before and after the subcommand."""
     rc = blueprint.main(["status", "--json"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["deploy_state"]["status"] == "RUNNING"
+
+
+def test_status_human_render_includes_fleet(mock_api, capsys):
+    """Human-readable status output includes a FLEET section with active count."""
+    rc = blueprint.main(["status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "FLEET" in out
+    assert "active=0" in out
 
 
 def test_status_error_path(monkeypatch, capsys):
@@ -165,6 +195,8 @@ def test_status_error_path(monkeypatch, capsys):
     assert "state" in parsed["errors"]
     assert "connection refused" in parsed["errors"]["state"]
     assert parsed["current_version"] is None
+    # fleet key is present even on error (with None values from empty state)
+    assert "fleet" in parsed
 
 
 def test_tasks_list_json(mock_api, capsys):
@@ -248,3 +280,37 @@ def test_logs_graceful_when_gcloud_missing(monkeypatch, capsys):
     assert rc == 0
     err = capsys.readouterr().err
     assert "gcloud not found" in err
+
+
+def test_tasks_cancel_requeue_guards(mock_api, monkeypatch, capsys):
+    """tasks cancel and tasks requeue each send the correct PATCH status and honor
+    the confirmation + read-only guards."""
+    # read-only guard refuses cancel
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "cancel", "task-123", "--yes"])
+    assert exc.value.code == 1
+
+    # read-only guard refuses requeue
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "requeue", "task-123", "--yes"])
+    assert exc.value.code == 1
+
+    # with admin key, cancel sends PATCH {"status": "CANCELLED"}
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    mock_api.clear()
+    blueprint.main(["tasks", "cancel", "task-123", "--yes"])
+    assert any(
+        m == "PATCH" and "/tasks/task-123" in p and b == {"status": "CANCELLED"}
+        for m, p, b in mock_api
+    )
+
+    # requeue sends PATCH {"status": "QUEUED"}
+    mock_api.clear()
+    blueprint.main(["tasks", "requeue", "task-123", "--yes"])
+    assert any(
+        m == "PATCH" and "/tasks/task-123" in p and b == {"status": "QUEUED"}
+        for m, p, b in mock_api
+    )

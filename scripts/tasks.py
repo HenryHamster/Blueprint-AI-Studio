@@ -136,21 +136,19 @@ def cmd_children(args):
 
 
 def cmd_requeue(_args):
-    """DEPRECATED — use: python scripts/blueprint.py tasks list to find id, then PATCH via API."""
+    """DEPRECATED — use: python scripts/blueprint.py tasks requeue <task_id>"""
     print(
         "DEPRECATED: tasks.py requeue is superseded.\n"
-        "Use python scripts/blueprint.py tasks list to find the task id,\n"
-        "then PATCH /api/admin/tasks/<id> with {\"status\": \"QUEUED\"} via the admin API."
+        "Use: python scripts/blueprint.py tasks requeue <task_id>"
     )
     sys.exit(1)
 
 
 def cmd_cancel(_args):
-    """DEPRECATED — use: python scripts/blueprint.py tasks list to find id, then PATCH via API."""
+    """DEPRECATED — use: python scripts/blueprint.py tasks cancel <task_id>"""
     print(
         "DEPRECATED: tasks.py cancel is superseded.\n"
-        "Use python scripts/blueprint.py tasks list to find the task id,\n"
-        "then PATCH /api/admin/tasks/<id> with {\"status\": \"CANCELLED\"} via the admin API."
+        "Use: python scripts/blueprint.py tasks cancel <task_id>"
     )
     sys.exit(1)
 

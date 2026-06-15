@@ -89,6 +89,9 @@ def cmd_status(args: argparse.Namespace) -> None:
     state = state or {}
     deploy = state.get("deploy") or {}
     version = state.get("version")
+    fleet_raw = state.get("fleet") or {}
+
+    serving = (version.get("serving") or {}) if version else {}
 
     data = {
         "project_id": pid,
@@ -97,6 +100,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             "current_revision": deploy.get("current_revision"),
             "pause_reason": deploy.get("pause_reason"),
             "rollback_reason": deploy.get("rollback_reason"),
+            "halted": deploy.get("halted"),
         },
         "current_version": (
             {
@@ -104,11 +108,21 @@ def cmd_status(args: argparse.Namespace) -> None:
                 "phase": version.get("phase"),
                 "qualification_state": version.get("qualification_state"),
                 "merged_task_count": version.get("merged_task_count"),
-                "active_candidate_sha": (version.get("serving") or {}).get("sha"),
+                "in_flight_task_count": version.get("in_flight_task_count"),
+                "active_candidate_sha": serving.get("sha"),
+                "serving_status": serving.get("status"),
+                "serving_confirmed_at": serving.get("confirmed_at"),
             }
             if version
             else None
         ),
+        "fleet": {
+            "active": fleet_raw.get("active"),
+            "queued": fleet_raw.get("queued"),
+            "evaluating": fleet_raw.get("evaluating"),
+            "parked": fleet_raw.get("parked"),
+            "stale_heartbeat_count": fleet_raw.get("stale_heartbeat_count"),
+        },
         "promotion": {
             "enabled_effective": None,
             "enabled_source": None,
@@ -129,6 +143,8 @@ def _render_status(data: dict) -> None:
     print("=== DEPLOY STATE ===")
     print(f"  Status:    {ds.get('status', '?')}")
     print(f"  Revision:  {ds.get('current_revision', '?')}")
+    if ds.get("halted"):
+        print(f"  Halted:    yes")
     if ds.get("pause_reason"):
         print(f"  Paused:    {ds['pause_reason']}")
     if ds.get("rollback_reason"):
@@ -143,7 +159,18 @@ def _render_status(data: dict) -> None:
         print(f"  v{cv.get('version_number')}  phase={cv.get('phase')}  "
               f"state={qs}")
         print(f"  merged_tasks={cv.get('merged_task_count')}  "
+              f"in_flight={cv.get('in_flight_task_count')}  "
               f"candidate={(cv.get('active_candidate_sha') or '-')[:12]}")
+        srv_status = cv.get("serving_status")
+        srv_confirmed = cv.get("serving_confirmed_at")
+        if srv_status is not None or srv_confirmed is not None:
+            print(f"  serving_status={srv_status}  confirmed_at={srv_confirmed}")
+
+    fleet = data.get("fleet") or {}
+    print("\n=== FLEET ===")
+    print(f"  active={fleet.get('active')}  queued={fleet.get('queued')}  "
+          f"evaluating={fleet.get('evaluating')}  parked={fleet.get('parked')}  "
+          f"stale_hb={fleet.get('stale_heartbeat_count')}")
 
     errors = data.get("errors") or {}
     if errors:
@@ -155,10 +182,14 @@ def _render_status(data: dict) -> None:
 # ── tasks ──────────────────────────────────────────────────────────────────--
 
 def cmd_tasks(args: argparse.Namespace) -> None:
-    """Dispatch ``tasks list`` / ``tasks show`` (defaults to list)."""
+    """Dispatch ``tasks list`` / ``tasks show`` / ``tasks cancel`` / ``tasks requeue``."""
     sub = getattr(args, "tasks_cmd", None) or "list"
     if sub == "show":
         _tasks_show(args)
+    elif sub == "cancel":
+        _tasks_cancel(args)
+    elif sub == "requeue":
+        _tasks_requeue(args)
     else:
         _tasks_list(args)
 
@@ -213,6 +244,40 @@ def _render_task_list(data: dict) -> None:
         if msg:
             line += f"  | {msg}"
         print(line)
+
+
+def _tasks_cancel(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'cancel' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not _confirm(f"Cancel task {args.task_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", {"status": "CANCELLED"})
+    _emit(args, result, lambda d: print(f"  {args.task_id}: {d.get('status', 'ok')}"))
+
+
+def _tasks_requeue(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'requeue' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not _confirm(f"Requeue task {args.task_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", {"status": "QUEUED"})
+    _emit(args, result, lambda d: print(f"  {args.task_id}: {d.get('status', 'ok')}"))
 
 
 def _tasks_show(args: argparse.Namespace) -> None:
@@ -618,6 +683,16 @@ def build_parser() -> argparse.ArgumentParser:
                                                 "(Task has no release-version linkage).")
     p_tasks_show = tasks_sub.add_parser("show", parents=[common], help="Show one task by id.")
     p_tasks_show.add_argument("task_id", help="Task id (full uuid).")
+    p_tasks_cancel = tasks_sub.add_parser("cancel", parents=[common],
+                                          help="Cancel a task by id (confirms before mutating).")
+    p_tasks_cancel.add_argument("task_id", help="Task id (full uuid).")
+    p_tasks_cancel.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt (for scripting).")
+    p_tasks_requeue = tasks_sub.add_parser("requeue", parents=[common],
+                                           help="Requeue a task by id (confirms before mutating).")
+    p_tasks_requeue.add_argument("task_id", help="Task id (full uuid).")
+    p_tasks_requeue.add_argument("--yes", action="store_true",
+                                 help="Skip the confirmation prompt (for scripting).")
 
     # versions
     p_versions = sub.add_parser("versions", parents=[common],
