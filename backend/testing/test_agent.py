@@ -23172,3 +23172,67 @@ async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_no_auth_redirect(
+    client: AsyncClient, db_session, mocker
+):
+    """Admin viewport-shots endpoint has two intentionally different response shapes.
+
+    Without authentication (operator navigating via browser/PR body link):
+      - Returns 302 redirect to the signed GCS URL for the browser to fetch directly.
+
+    With agent JWT (agent reading screenshots programmatically):
+      - Returns JSON {"url": ...} with the signed URL so the agent can parse it.
+    """
+    project = Project(
+        name="Admin VP Shot No-Auth Test", user_id="user-admin-vp-shot-no-auth-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix"}],
+        vm_instance_id="vm-admin-vp-shot-no-auth-001",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/test?X-Goog-Signature=fake"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    # Test 1: No authentication => 302 redirect
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project.id),
+            "task_id": str(task.id),
+            "name": "TestPanel-375-before",
+        },
+    )
+    assert resp.status_code == 302
+    assert resp.headers["location"] == fake_url
+
+    # Test 2: With JWT => JSON response
+    token = create_agent_token(
+        str(task.id), "vm-admin-vp-shot-no-auth-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project.id),
+            "task_id": str(task.id),
+            "name": "TestPanel-375-before",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
