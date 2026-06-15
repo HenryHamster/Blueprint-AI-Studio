@@ -25,6 +25,7 @@ HELP_INVOCATIONS = [
     ["tasks", "requeue"],
     ["tasks", "scope"],
     ["tasks", "tree"],
+    ["tasks", "failures"],
     ["versions"],
     ["versions", "list"],
     ["versions", "show"],
@@ -123,18 +124,53 @@ def mock_api(monkeypatch):
                     "version_number": 12, "phase": "build",
                     "qualification_state": "qualifying", "merged_task_count": 3,
                     "active_candidate_sha": "abc123",
+                    "tasks_merged": [
+                        {"title": "demo task", "pr_number": 42,
+                         "task_type": "create"},
+                    ],
                 },
                 "recent_versions": [
-                    {"version_number": 11, "phase": "stabilize",
+                    {"id": "ver-11-id", "version_number": 11, "phase": "stabilize",
                      "status": "promoted", "promoted_sha": "deadbeef",
                      "merged_task_count": 10},
                 ],
                 "promotion_enabled_effective": True,
                 "promotion_enabled_source": "fleet",
             }
+        if "/release-versions/" in path and "/summary" in path:
+            return {
+                "tasks_merged": [
+                    {"title": "historical task", "pr_number": 7,
+                     "task_type": "fix"},
+                ],
+            }
         if "/tasks/" in path:
             return {"id": "task-123", "title": "demo", "task_type": "create",
                     "status": "IN_PROGRESS", "created_at": "2026-06-15T00:00:00Z"}
+        if "/tasks" in path and "status=FAILED" in path:
+            return {
+                "tasks": [
+                    {"id": "fail-aaa0-0000-0000-000000000000",
+                     "task_type": "create", "title": "failed create task",
+                     "status": "FAILED", "attempt_count": 2,
+                     "parent_task_id": None,
+                     "latest_status_message": "API usage exhausted (acct: abc123)",
+                     "error_logs": ""},
+                    {"id": "fail-bbb0-0000-0000-000000000000",
+                     "task_type": "fix", "title": "failed fix task",
+                     "status": "FAILED", "attempt_count": 1,
+                     "parent_task_id": "parent-0000-0000-0000-000000000000",
+                     "latest_status_message": "spawn E2BIG: arg list too long",
+                     "error_logs": "spawn E2BIG: arg list too long"},
+                    {"id": "fail-ccc0-0000-0000-000000000000",
+                     "task_type": "create", "title": "another api exhausted",
+                     "status": "FAILED", "attempt_count": 3,
+                     "parent_task_id": None,
+                     "latest_status_message": "API usage exhausted (acct: xyz789)",
+                     "error_logs": ""},
+                ],
+                "total": 3,
+            }
         if "/tasks" in path:
             return {"tasks": [{"id": "task-123", "task_type": "create",
                                "status": "IN_PROGRESS", "title": "demo"}],
@@ -315,6 +351,32 @@ def test_versions_show_json(mock_api, capsys):
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["version_number"] == 12
     assert parsed["phase"] == "build"
+    assert isinstance(parsed["tasks_merged"], list)
+    assert len(parsed["tasks_merged"]) == 1
+    assert parsed["tasks_merged"][0]["pr_number"] == 42
+
+
+def test_versions_show_changelog_human_render(mock_api, capsys):
+    """Human-readable versions show includes task titles and PR numbers."""
+    rc = blueprint.main(["versions", "show"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "#42" in out
+    assert "demo task" in out
+
+
+def test_versions_show_historical_fetches_summary(mock_api, capsys):
+    """versions show <N> for a historical version fetches the per-version summary."""
+    rc = blueprint.main(["--json", "versions", "show", "11"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["version_number"] == 11
+    assert isinstance(parsed["tasks_merged"], list)
+    # historical fixture returns one task via the /summary endpoint
+    assert parsed["tasks_merged"][0]["pr_number"] == 7
+    # the /summary endpoint must have been called
+    assert any("/release-versions/" in p and "/summary" in p
+               for _, p, _ in mock_api)
 
 
 def test_tasks_version_flag_emits_notice(mock_api, capsys):
@@ -525,3 +587,49 @@ def test_tasks_cancel_requeue_guards(mock_api, monkeypatch, capsys):
         m == "PATCH" and "/tasks/task-123" in p and b == {"status": "QUEUED"}
         for m, p, b in mock_api
     )
+
+
+def test_tasks_failures_json(mock_api, capsys):
+    """tasks failures --json groups by cause bucket with correct counts."""
+    rc = blueprint.main(["--json", "tasks", "failures"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["total"] == 3
+    buckets = parsed["buckets"]
+    # Two tasks share API_EXHAUSTED cause, one is SPAWN_E2BIG
+    assert "API_EXHAUSTED" in buckets
+    assert len(buckets["API_EXHAUSTED"]) == 2
+    assert "SPAWN_E2BIG" in buckets
+    assert len(buckets["SPAWN_E2BIG"]) == 1
+    # Each task entry has expected fields
+    task_entry = buckets["API_EXHAUSTED"][0]
+    assert "id" in task_entry
+    assert "title" in task_entry
+    assert "attempt_count" in task_entry
+    # the API call must include status=FAILED
+    assert any("status=FAILED" in path for _, path, _ in mock_api)
+
+
+def test_tasks_failures_human_render(mock_api, capsys):
+    """Human-readable failures output includes cause bucket headers and task ids."""
+    rc = blueprint.main(["tasks", "failures"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "FAILED TASKS" in out
+    assert "API_EXHAUSTED" in out
+    assert "SPAWN_E2BIG" in out
+    assert "SUMMARY" in out
+
+
+def test_tasks_failures_empty(monkeypatch, capsys):
+    """tasks failures with no failed tasks emits a graceful message."""
+    def fake_api(method, path, body=None, timeout=30):
+        return {"tasks": [], "total": 0}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["tasks", "failures"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "No failed tasks." in out

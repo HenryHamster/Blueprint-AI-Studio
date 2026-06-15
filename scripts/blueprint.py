@@ -265,7 +265,7 @@ def _render_diagnostics(data: dict) -> None:
 # ── tasks ──────────────────────────────────────────────────────────────────--
 
 def cmd_tasks(args: argparse.Namespace) -> None:
-    """Dispatch task subcommands: list / show / cancel / requeue / scope / tree."""
+    """Dispatch task subcommands: list / show / cancel / requeue / scope / tree / failures."""
     sub = getattr(args, "tasks_cmd", None) or "list"
     if sub == "show":
         _tasks_show(args)
@@ -277,6 +277,8 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_scope(args)
     elif sub == "tree":
         _tasks_tree(args)
+    elif sub == "failures":
+        _tasks_failures(args)
     else:
         _tasks_list(args)
 
@@ -456,6 +458,129 @@ def _render_task_tree(data: dict) -> None:
         print(f"    [{icon}] {cid}  merged={str(merged):<5}  pr={pr:<4}  {title}")
 
 
+def _tasks_failures(args: argparse.Namespace) -> None:
+    """Fetch FAILED tasks, group by root cause, and emit triage-ready output."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    limit = getattr(args, "limit", 50)
+
+    tasks: list = []
+    offset = 0
+    while len(tasks) < limit:
+        path = (f"/api/admin/tasks?project_id={pid}&status=FAILED"
+                f"&limit={min(500, limit - len(tasks))}&offset={offset}")
+        resp = api("GET", path)
+        batch = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+        if not batch:
+            break
+        tasks.extend(batch)
+        offset += len(batch)
+        if len(batch) < 500:
+            break
+
+    buckets: dict = {}
+    for t in tasks:
+        msg = t.get("latest_status_message") or ""
+        error = t.get("error_logs") or ""
+        ctx = t.get("context") or {}
+        fc = ctx.get("failure_class", "")
+
+        cause = "UNKNOWN"
+        if "API usage exhausted" in error or "API usage exhausted" in msg:
+            cause = "API_EXHAUSTED"
+        elif "spawn E2BIG" in error or "spawn E2BIG" in msg:
+            cause = "SPAWN_E2BIG"
+        elif "ZONE_RESOURCE_POOL_EXHAUSTED" in msg or "ZONE_RES" in msg:
+            cause = "ZONE_EXHAUSTED"
+        elif "VM provisioning failed" in msg and "400" in msg:
+            cause = "VM_PROVISION_ERROR"
+        elif "rollup PR creation failed" in msg:
+            cause = "ROLLUP_PR_FAILED"
+        elif "review not spawned (iteration cap)" in msg:
+            cause = "ITERATION_CAP"
+        elif "SCOPE_EMPTY" in msg or "SCOPE_EMPTY" in error:
+            cause = "SCOPE_EMPTY"
+        elif "subtask(s) failed" in msg:
+            cause = "SUBTASK_FAILURES"
+        elif "Evaluation timeout" in msg or "did not complete within" in msg:
+            cause = "EVALUATION_TIMEOUT"
+        elif "Agent startup failed" in msg:
+            cause = "AGENT_STARTUP_FAILURE"
+        elif "No heartbeat" in msg and "since prov" in msg:
+            cause = "HEARTBEAT_NEVER_STARTED"
+        elif "Provision failed" in msg and "no GCP error" in msg:
+            cause = "AGENT_STARTUP_FAILURE"
+        elif "Provision failed" in msg or "No heartbeat" in msg:
+            cause = "HEARTBEAT_STARVATION"
+        elif "git clone" in error or "git clone" in msg:
+            cause = "GIT_CLONE_FAILED"
+        elif "Secret Manager" in error or "secret" in error.lower():
+            cause = "SECRET_MANAGER_ERROR"
+        elif "RATE_LIMIT" in fc or "rate" in error.lower():
+            cause = "RATE_LIMIT"
+        elif "CODE_ERROR" in fc:
+            cause = "CODE_ERROR"
+        elif "AGENT_TIMEOUT" in fc:
+            cause = "AGENT_TIMEOUT"
+        elif fc:
+            cause = fc
+
+        buckets.setdefault(cause, []).append(t)
+
+    data = {
+        "total": len(tasks),
+        "buckets": {
+            cause: [
+                {
+                    "id": t.get("id"),
+                    "task_type": t.get("task_type"),
+                    "title": t.get("title"),
+                    "attempt_count": t.get("attempt_count", 0),
+                    "parent_task_id": t.get("parent_task_id"),
+                    "latest_status_message": t.get("latest_status_message"),
+                    "error_logs": t.get("error_logs"),
+                }
+                for t in group
+            ]
+            for cause, group in sorted(buckets.items(), key=lambda kv: -len(kv[1]))
+        },
+    }
+    _emit(args, data, _render_failures)
+
+
+def _safe_trunc(s: str, n: int) -> str:
+    return (s or "")[:n].encode("ascii", "replace").decode()
+
+
+def _render_failures(data: dict) -> None:
+    total = data.get("total", 0)
+    buckets = data.get("buckets") or {}
+    if not total:
+        print("No failed tasks.")
+        return
+    print(f"\n=== FAILED TASKS ({total}) ===\n")
+    for cause, group in buckets.items():
+        print(f"--- {cause} ({len(group)} tasks) ---")
+        for t in group:
+            tid = (t.get("id") or "?")[:8]
+            ttype = t.get("task_type") or "?"
+            title = _safe_trunc(t.get("title") or "", 55)
+            attempts = t.get("attempt_count", 0)
+            parent = (t.get("parent_task_id") or "")[:8]
+            msg = _safe_trunc(t.get("latest_status_message") or "", 100)
+            error = _safe_trunc((t.get("error_logs") or "").split("\n")[0], 120)
+            print(f"  {tid}  [{ttype:8}]  att={attempts}  parent={parent or '-':>8}  {title}")
+            if error:
+                print(f"    ERR: {error}")
+            elif msg:
+                print(f"    MSG: {msg}")
+        print()
+    print("=== SUMMARY ===")
+    for cause, group in buckets.items():
+        requeueable = [t for t in group if cause not in ("CODE_ERROR",)]
+        suffix = f" ({len(requeueable)} requeueable)" if requeueable else ""
+        print(f"  {cause}: {len(group)} tasks{suffix}")
+
+
 def _render_task_detail(t: dict) -> None:
     print(f"=== TASK {t.get('id', '?')} ===")
     print(f"  Title:    {t.get('title', '?')}")
@@ -503,6 +628,19 @@ def cmd_versions(args: argparse.Namespace) -> None:
                    if target is not None else "no open version")
             _emit(args, {"error": msg}, lambda d: print(d["error"]))
             return
+        # For the open version the lifecycle response already includes
+        # tasks_merged; for historical versions fetch from the summary endpoint.
+        if ver is cv:
+            tasks_merged = cv.get("tasks_merged") or []
+        else:
+            ver_id = ver.get("id")
+            if ver_id:
+                ver_summary, _ = _safe_read(
+                    f"/api/admin/release-versions/{ver_id}/summary"
+                )
+                tasks_merged = (ver_summary or {}).get("tasks_merged") or []
+            else:
+                tasks_merged = []
         summary = {
             "version_number": ver.get("version_number"),
             "phase": ver.get("phase"),
@@ -512,6 +650,7 @@ def cmd_versions(args: argparse.Namespace) -> None:
             "qualification_state": ver.get("qualification_state"),
             "acceptance_aggregate": ver.get("acceptance_aggregate"),
             "goal": ver.get("goal"),
+            "tasks_merged": tasks_merged,
         }
         _emit(args, summary, _render_version_summary)
         return
@@ -560,6 +699,14 @@ def _render_version_summary(s: dict) -> None:
         print(f"  acceptance:   {json.dumps(agg)}")
     if s.get("goal"):
         print(f"  goal:         {s['goal'][:200]}")
+    tasks_merged = s.get("tasks_merged") or []
+    if tasks_merged:
+        print(f"  changelog ({len(tasks_merged)} tasks):")
+        for t in tasks_merged:
+            pr = t.get("pr_number")
+            title = t.get("title", "?")
+            pr_str = f" [#{pr}]" if pr else ""
+            print(f"    {title}{pr_str}")
 
 
 # ── promote-recover ──────────────────────────────────────────────────────────
@@ -878,6 +1025,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_tasks_tree.add_argument("parent_id", help="Parent task id (full uuid).")
     p_tasks_tree.add_argument("--all", action="store_true",
                               help="Include review/fix/debug children (hidden by default).")
+    p_tasks_failures = tasks_sub.add_parser(
+        "failures", parents=[common],
+        help="Show recent FAILED tasks grouped by root cause for incident triage.")
+    p_tasks_failures.add_argument("--limit", type=int, default=50,
+                                  help="Max failed tasks to fetch (default 50).")
 
     # versions
     p_versions = sub.add_parser("versions", parents=[common],

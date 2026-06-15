@@ -417,7 +417,16 @@ def cmd_scope(_args):
     sys.exit(1)
 
 
-def cmd_failures(args):
+def cmd_failures(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks failures"""
+    print(
+        "DEPRECATED: tasks.py failures is superseded.\n"
+        "Use: python scripts/blueprint.py tasks failures [--limit N]"
+    )
+    sys.exit(1)
+
+
+def _cmd_failures_impl(args):
     """Analyze failed tasks — group by root cause, show actionable details."""
     from blueprint_api import api
     limit = 50
