@@ -123,6 +123,54 @@ _REVIEW_SUPERSEDE_CHURN_LIMIT = max(
 )
 
 
+# Per-entry feedback in review_loop.review_history is freeform reviewer text. On
+# the verdict-parse fallback path it is the agent's ENTIRE log (task_lifecycle
+# sets ``feedback = payload.logs`` when no structured verdict is parsed), so a
+# SINGLE history entry can be multiple MB. task.context is GIN-indexed: every
+# write of a fat row pays a TOAST rewrite plus a GIN reindex, producing the
+# multi-second single-row PK updates that saturated Postgres and tripped Cloud
+# Run liveness probes. A count cap on the number of entries is necessary but not
+# sufficient (N entries each holding a full log is still a multi-MB row), so we
+# also bound the SIZE of each entry's stored feedback. This is safe for every
+# consumer: the freeform feedback is read only by the inter-iteration
+# string-similarity comparison (``_feedback_jaccard``); the structured
+# issues / changed_files / verdict / iteration fields every other consumer reads
+# are untouched, and the feedback is independently truncated again where it is
+# surfaced to GitHub (routers/agent.py). 4000 chars is generous relative to real
+# reviewer feedback yet keeps even an uncapped run's history to a few KB.
+# Precedent: task_evaluators.py caps a sibling feedback field at ``[:5000]``.
+MAX_REVIEW_HISTORY_FEEDBACK_CHARS = max(
+    500, int(os.getenv("MAX_REVIEW_HISTORY_FEEDBACK_CHARS", "4000"))
+)
+
+
+def _cap_review_history_feedback(
+    history: list | None,
+    max_chars: int = MAX_REVIEW_HISTORY_FEEDBACK_CHARS,
+) -> list:
+    """Return a copy of ``history`` with every entry's ``feedback`` truncated to
+    ``max_chars`` characters.
+
+    Pure / side-effect-free: the input list and its entries are never mutated.
+    Entries already within bounds (or lacking a string ``feedback``) are passed
+    through by reference; oversized ones are shallow-copied with a truncated
+    ``feedback`` so all other keys (iteration / verdict / changed_files /
+    issues) are preserved verbatim. Applied to BOTH the freshly built entry and
+    any carried-forward prior entries so the persisted row can never be fat,
+    even from history written before this cap was deployed.
+    """
+    if not history:
+        return list(history or [])
+    capped: list = []
+    for entry in history:
+        feedback = entry.get("feedback") if isinstance(entry, dict) else None
+        if isinstance(feedback, str) and len(feedback) > max_chars:
+            capped.append({**entry, "feedback": feedback[:max_chars]})
+        else:
+            capped.append(entry)
+    return capped
+
+
 # Goal framing for review-fix tasks: the cited issues are necessary
 # changes, but the goal is shipping the PR cleanly. Without this framing,
 # fix agents narrowly edit the cited line and silently drop adjacent
@@ -2740,7 +2788,13 @@ async def _spawn_pipeline_task(
     }
     if current_issues:
         new_review_entry["issues"] = current_issues
-    new_review_history = (
+    # Bound each entry's freeform feedback so the persisted row can never be fat,
+    # no matter how large the underlying agent log is (see
+    # MAX_REVIEW_HISTORY_FEEDBACK_CHARS). Applied to the whole list — the freshly
+    # built entry AND any carried-forward prior entries — and BEFORE the
+    # stuck-cycle similarity check below, so the Jaccard compares consistently
+    # bounded prefixes.
+    new_review_history = _cap_review_history_feedback(
         [*prev_review_history, new_review_entry]
         if task_type == "fix" and current_feedback
         else prev_review_history

@@ -553,6 +553,30 @@ class TestSchemaRevisionSync:
             f"migration is '{latest}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
         )
 
+    def test_task_context_size_constraint_exists_in_migration(self):
+        """Migration 0277 must define the chk_task_context_size CHECK constraint.
+
+        Confirms the defense-in-depth backstop on task.context fat-row growth
+        mirrors the payloads CHECK constraint pattern from migration 0065.
+        """
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        migration_path = os.path.join(
+            migrations_dir, "0277_task_context_size_constraint.py"
+        )
+        assert os.path.exists(migration_path), (
+            "Migration 0277_task_context_size_constraint.py not found. "
+            "The defense-in-depth size guard on task.context is missing."
+        )
+        content = open(migration_path).read()
+        assert "chk_task_context_size" in content, (
+            "Migration 0277 must define constraint 'chk_task_context_size'."
+        )
+        assert "octet_length(context::text)" in content, (
+            "Migration 0277 must use octet_length(context::text) as the size expression."
+        )
+
     def test_agent_helper_exclusions_match_prompt_and_gitignore(self):
         """Agent helper exclusions must stay aligned with prompt.ts and gitignore.
 

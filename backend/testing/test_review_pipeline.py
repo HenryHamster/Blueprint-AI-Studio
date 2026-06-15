@@ -9,6 +9,7 @@ Covers:
      zero issues in current iteration.
 """
 
+import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,7 @@ from sqlalchemy import select
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
+    MAX_REVIEW_HISTORY_FEEDBACK_CHARS,
     PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
     PIPELINE_TASK_STALE_MINUTES,
     SPAWN_REASON_BLOCKED_REPEAT,
@@ -37,6 +39,7 @@ from app.review_pipeline import (
     STUCK_CYCLE_THRESHOLD_REFACTOR,
     EARLY_NONCONVERGENCE_ESCALATE_AT,
     SPAWN_REASON_NONCONVERGENCE,
+    _cap_review_history_feedback,
     _compute_scope_budget_utilization,
     _detect_issue_churn,
     _failure_fingerprint_msg,
@@ -16456,3 +16459,344 @@ async def test_persistent_conflict_escalation_below_global_cap(db_session, mocke
         f"Persistent-conflict threshold ({PERSISTENT_CONFLICT_ESCALATION_THRESHOLD}) "
         f"must be well below the global cap ({MAX_REVIEW_FIX_ITERATIONS})"
     )
+
+
+# ── review_history per-entry feedback size cap ────────────────────────────────
+#
+# A Postgres saturation outage was traced to task.context JSONB growing to
+# multiple MB because review_loop.review_history appends one entry per fix
+# iteration and each entry stores the reviewer's freeform feedback verbatim. On
+# the verdict-parse fallback path that feedback is the agent's ENTIRE log, so a
+# SINGLE entry can be multi-MB. task.context is GIN-indexed, so every such write
+# pays a TOAST rewrite + GIN reindex → the multi-second single-row PK updates
+# that saturated Postgres. A count cap on entries is necessary but NOT
+# sufficient; each entry's feedback SIZE must also be bounded. The freeform
+# feedback is read only by the inter-iteration similarity comparison
+# (_feedback_jaccard); structured issues/changed_files/verdict are untouched.
+
+
+def test_cap_review_history_feedback_helper():
+    """_cap_review_history_feedback truncates oversized feedback to the cap,
+    passes through short / boundary / non-string entries unchanged, preserves all
+    other keys, and never mutates its input (pure)."""
+    big = "z" * (MAX_REVIEW_HISTORY_FEEDBACK_CHARS + 500)
+    history = [
+        {
+            "iteration": 0,
+            "feedback": big,
+            "issues": [{"description": "x", "severity": "CRITICAL"}],
+            "verdict": "REQUEST_CHANGES",
+            "changed_files": ["a.py"],
+        },
+        {"iteration": 1, "feedback": "short"},
+        {"iteration": 2, "feedback": None},  # non-string feedback left alone
+        {"iteration": 3},  # no feedback key at all
+        {"iteration": 4, "feedback": "x" * MAX_REVIEW_HISTORY_FEEDBACK_CHARS},  # at cap
+    ]
+    capped = _cap_review_history_feedback(history)
+
+    # Oversized entry truncated to EXACTLY the cap; every other key preserved.
+    assert len(capped[0]["feedback"]) == MAX_REVIEW_HISTORY_FEEDBACK_CHARS
+    assert capped[0]["feedback"] == big[:MAX_REVIEW_HISTORY_FEEDBACK_CHARS]
+    assert capped[0]["issues"] == [{"description": "x", "severity": "CRITICAL"}]
+    assert capped[0]["verdict"] == "REQUEST_CHANGES"
+    assert capped[0]["changed_files"] == ["a.py"]
+    assert capped[0]["iteration"] == 0
+
+    # Short / non-string / missing / exactly-at-cap entries pass through unchanged
+    # (the condition is len > cap, so a string of exactly cap length is verbatim —
+    # this guards the off-by-one boundary).
+    assert capped[1]["feedback"] == "short"
+    assert capped[2]["feedback"] is None
+    assert "feedback" not in capped[3]
+    assert len(capped[4]["feedback"]) == MAX_REVIEW_HISTORY_FEEDBACK_CHARS
+
+    # Purity: the input list and its entries are never mutated.
+    assert len(history[0]["feedback"]) == MAX_REVIEW_HISTORY_FEEDBACK_CHARS + 500
+    assert history[0] is not capped[0]  # oversized entry was shallow-copied
+    assert history[1] is capped[1]  # within-bounds entry passed by reference
+
+    # Custom max_chars honored; empty / None history returns a fresh list.
+    custom = _cap_review_history_feedback([{"feedback": "abcdef"}], max_chars=3)
+    assert custom[0]["feedback"] == "abc"
+    assert _cap_review_history_feedback([]) == []
+    assert _cap_review_history_feedback(None) == []
+
+
+@pytest.mark.asyncio
+async def test_review_history_feedback_is_size_capped(db_session, mocker):
+    """Acceptance: after many fix iterations each carrying a multi-MB fallback
+    feedback log, every stored review_history entry's feedback is byte-bounded
+    and the serialized task.context stays small (no fat row).
+
+    The count cap alone (N entries) cannot prevent a fat row when each entry is
+    multi-MB — the per-entry size cap must. Spawn iteration is 1 (source
+    iteration=0), which skips stuck-cycle and early-nonconvergence detection so
+    the fix task is actually created and we can inspect what gets persisted.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # 12 prior iterations (>10), each carrying an oversized feedback blob (5x the
+    # cap) plus a DISTINCT critical issue (distinct issues keep churn/stuck
+    # detectors quiet — not that they run at iteration 1).
+    oversized = MAX_REVIEW_HISTORY_FEEDBACK_CHARS * 5
+    prior_history = [
+        {
+            "iteration": i,
+            "feedback": f"iter{i} " + ("F" * oversized),
+            "issues": [_issue(f"distinct critical issue number {i}", "CRITICAL")],
+            "verdict": "REQUEST_CHANGES",
+        }
+        for i in range(12)
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 720,
+                "branch": "b-cap",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": str(original_task.id),
+                "pr_number": 720,
+                "branch": "b-cap",
+                "base_branch": "main",
+                "review_history": prior_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # The verdict-parse fallback: current_feedback IS the agent's entire log (~2 MB).
+    huge_log = "L" * 2_000_000
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=720,
+        branch="b-cap",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the review feedback",
+        current_feedback=huge_log,
+        current_issues=[_issue("a fresh critical issue", "CRITICAL")],
+    )
+
+    assert created is True and result is not None, (
+        "iteration-1 spawn skips stuck/nonconvergence detection — the fix task "
+        "must be created"
+    )
+
+    history = result.context["review_loop"]["review_history"]
+    assert len(history) == 13, "12 carried-forward entries + 1 newly appended entry"
+
+    # Every stored feedback (carried-forward AND the new full-log entry) is bounded.
+    for entry in history:
+        assert len(entry["feedback"]) <= MAX_REVIEW_HISTORY_FEEDBACK_CHARS, (
+            f"entry {entry.get('iteration')} feedback is {len(entry['feedback'])} "
+            f"chars — exceeds cap {MAX_REVIEW_HISTORY_FEEDBACK_CHARS}"
+        )
+    # The new entry (the 2 MB full-log fallback) is truncated to exactly the cap.
+    assert len(history[-1]["feedback"]) == MAX_REVIEW_HISTORY_FEEDBACK_CHARS
+
+    # Structured fields (what every non-similarity consumer reads) survive intact.
+    assert history[-1]["issues"] == [_issue("a fresh critical issue", "CRITICAL")]
+    assert history[0]["issues"] == [
+        _issue("distinct critical issue number 0", "CRITICAL")
+    ]
+
+    # The persisted row stays small: >2 MB of input feedback collapses to a
+    # serialized context that is a tiny fraction of the multi-MB fat-row regime
+    # that produced the >500ms single-row PK updates.
+    serialized = json.dumps(result.context)
+    assert len(serialized) < 200_000, (
+        f"serialized context is {len(serialized)} bytes — must stay well under "
+        "the multi-MB fat-row regime that saturated Postgres"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_history_carried_forward_feedback_is_recapped(db_session, mocker):
+    """A pre-existing oversized carried-forward entry (written before this cap was
+    deployed) is re-capped when the next fix spawns, while a fresh short feedback
+    is stored verbatim (no off-by-one truncation)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    pre_deploy_fat = "P" * (MAX_REVIEW_HISTORY_FEEDBACK_CHARS + 12_345)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 721,
+                "branch": "b-recap",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": str(original_task.id),
+                "pr_number": 721,
+                "branch": "b-recap",
+                "base_branch": "main",
+                "review_history": [
+                    {
+                        "iteration": 0,
+                        "feedback": pre_deploy_fat,
+                        "issues": [_issue("legacy issue", "MAJOR")],
+                        "verdict": "REQUEST_CHANGES",
+                    }
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    short_feedback = "Short reviewer note that is well under the cap."
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=721,
+        branch="b-recap",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Fix the legacy issue",
+        current_feedback=short_feedback,
+        current_issues=[_issue("a new issue", "CRITICAL")],
+    )
+
+    assert created is True and result is not None
+    history = result.context["review_loop"]["review_history"]
+    assert len(history) == 2
+
+    # The carried-forward pre-deploy fat entry is re-capped, keys preserved.
+    assert len(history[0]["feedback"]) == MAX_REVIEW_HISTORY_FEEDBACK_CHARS
+    assert history[0]["feedback"] == pre_deploy_fat[:MAX_REVIEW_HISTORY_FEEDBACK_CHARS]
+    assert history[0]["issues"] == [_issue("legacy issue", "MAJOR")]
+
+    # The fresh short feedback is stored verbatim — capping must not mangle it.
+    assert history[1]["feedback"] == short_feedback
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_still_detected_after_feedback_cap(db_session, mocker):
+    """Capping feedback must not break stuck-cycle detection. Two oversized,
+    near-identical feedback logs (the verdict-parse fallback shape, no structured
+    issues on either side) are both truncated to the cap BEFORE the Jaccard
+    comparison runs, so the bounded prefixes still register as a stuck cycle."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # A shared body that exceeds the cap, so the first MAX_..._CHARS of both the
+    # prior and current feedback are identical. Real word tokens (≥3 chars) so the
+    # token-set Jaccard has signal.
+    shared_body = (
+        "the retry backoff in pipeline health exceeds the configured timeout "
+        "window and the integration tests keep failing on every iteration "
+    ) * 60
+    assert len(shared_body) > MAX_REVIEW_HISTORY_FEEDBACK_CHARS
+    prior_feedback = shared_body + (" previousuniquetail " * 3000)
+    current_feedback = shared_body + (" currentuniquetail " * 3000)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 722,
+                "branch": "b-stuck",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,  # spawn iteration becomes 2 → stuck check runs
+                "original_task_id": str(original_task.id),
+                "pr_number": 722,
+                "branch": "b-stuck",
+                "base_branch": "main",
+                "review_history": [
+                    # No `issues` key → forces the feedback-text fallback path.
+                    {"iteration": 0, "feedback": prior_feedback},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=722,
+        branch="b-stuck",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Same failure again",
+        current_feedback=current_feedback,
+        current_issues=None,  # no structured issues this iteration either
+    )
+
+    assert result is None, (
+        "Oversized near-identical feedback must still trip stuck-cycle detection "
+        "after capping — the cap is applied before the Jaccard read"
+    )
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True
+    assert "stuck" in (original_task.latest_status_message or "").lower()
