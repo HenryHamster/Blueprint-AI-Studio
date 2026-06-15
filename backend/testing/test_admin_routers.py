@@ -15752,7 +15752,10 @@ class TestCanaryAdversarialChallenge:
         canary = make_task(
             project_id=project.id,
             status=TaskStatus.EVALUATING,
-            context={"_is_canary": True, "awaiting_adversarial_grader": str(uuid.uuid4())},
+            context={
+                "_is_canary": True,
+                "awaiting_adversarial_grader": str(uuid.uuid4()),
+            },
         )
         db_session.add(canary)
         await db_session.commit()
@@ -15772,16 +15775,17 @@ class TestCanaryAdversarialChallenge:
         self, client: AsyncClient, db_session
     ):
         """GET includes grader_task_id from the canary context in the response."""
-        from app.task_evaluators import ADVERSARIAL_GATE_VERDICT_KEY, ADVERSARIAL_PARSE_OK
+        from app.task_evaluators import (
+            ADVERSARIAL_GATE_VERDICT_KEY,
+            ADVERSARIAL_PARSE_OK,
+        )
         from testing.factories import make_task
 
         project = await _make_project(db_session)
         grader_id = str(uuid.uuid4())
         gate_record = {
             "parse_outcome": ADVERSARIAL_PARSE_OK,
-            "finding_verdicts": {
-                "hash-abc": {"explicit": True, "verdict": "pass"}
-            },
+            "finding_verdicts": {"hash-abc": {"explicit": True, "verdict": "pass"}},
             "grader_task_id": grader_id,
         }
         canary = make_task(
@@ -15805,3 +15809,210 @@ class TestCanaryAdversarialChallenge:
         assert data["explicit_count"] == 1
         assert data["grader_task_id"] == grader_id
         assert data["canary_task_id"] == str(canary.id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_state.py — GET /api/admin/state
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGetSystemState:
+    @pytest.mark.asyncio
+    async def test_fleet_wide_returns_deploy_fleet_no_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Admin GET /api/admin/state (no project_id) returns deploy+fleet, version=None."""
+        from app.models import DeploymentState, DeploymentStatus
+
+        db_session.add(
+            DeploymentState(
+                id=1,
+                status=DeploymentStatus.STABLE,
+                current_sha="abc1234",
+                current_revision="rev-1",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/state")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "deploy" in data
+        assert "fleet" in data
+        assert "generated_at" in data
+        assert data["version"] is None
+        assert data["deploy"]["current_sha"] == "abc1234"
+        assert isinstance(data["fleet"]["active"], int)
+        assert isinstance(data["fleet"]["queued"], int)
+
+    @pytest.mark.asyncio
+    async def test_project_scoped_returns_version_block(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /api/admin/state?project_id=<id> returns a version block for open version."""
+        from unittest.mock import AsyncMock, patch
+        from app.system_state import (
+            SystemStateSnapshot,
+            DeployStateSnapshot,
+            FleetSnapshot,
+            VersionSnapshot,
+            ServingSnapshot,
+        )
+        from datetime import datetime, timezone
+
+        project = await _make_project(db_session)
+
+        fake_snap = SystemStateSnapshot(
+            deploy=DeployStateSnapshot(
+                status="active",
+                current_sha="abc",
+                current_revision="r1",
+                deployed_at=None,
+                pause_reason=None,
+                rollback_reason=None,
+                rollback_count=0,
+                last_known_good_sha="",
+                halted=False,
+            ),
+            version=VersionSnapshot(
+                version_number=12,
+                phase="BUILD",
+                status="open",
+                opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                phase_changed_at=None,
+                goal="EXPERIENCE",
+                merged_task_count=5,
+                in_flight_task_count=2,
+                qualification_state=None,
+                serving=ServingSnapshot(
+                    status="serving_confirmed",
+                    sha="abc",
+                    confirmed_at=None,
+                    failure_reason=None,
+                    artifacts=[],
+                ),
+            ),
+            fleet=FleetSnapshot(
+                active=3,
+                queued=1,
+                evaluating=0,
+                parked=0,
+                stale_heartbeat_count=0,
+            ),
+            generated_at="2026-01-01T00:00:00Z",
+        )
+
+        with patch(
+            "app.routers.admin_state.compute_system_state",
+            new_callable=AsyncMock,
+            return_value=fake_snap,
+        ):
+            resp = await client.get(f"/api/admin/state?project_id={project.id}")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["version"] is not None
+        assert data["version"]["version_number"] == 12
+        assert data["version"]["phase"] == "BUILD"
+        assert data["version"]["serving"]["status"] == "serving_confirmed"
+        assert data["fleet"]["active"] == 3
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_returns_403(self, override_get_session, db_session):
+        """Unauthenticated request returns 403 (no valid user)."""
+        from fastapi import HTTPException
+
+        async def no_user():
+            raise HTTPException(status_code=403, detail="Not authenticated")
+
+        app.dependency_overrides[get_current_user] = no_user
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get("/api/admin/state")
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    @pytest.mark.asyncio
+    async def test_non_admin_fleet_wide_returns_403(
+        self, override_get_session, db_session
+    ):
+        """Non-admin user requesting fleet-wide state (no project_id) gets 403."""
+
+        async def non_admin():
+            return {
+                "user_id": "viewer-user",
+                "email": "viewer@example.com",
+                "role": "user",
+            }
+
+        app.dependency_overrides[get_current_user] = non_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get("/api/admin/state")
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_on_second_call(self, client: AsyncClient, db_session):
+        """compute_system_state is only called once when called twice (cache hit)."""
+        from unittest.mock import AsyncMock, patch
+        from app.system_state import (
+            SystemStateSnapshot,
+            DeployStateSnapshot,
+            FleetSnapshot,
+        )
+
+        fake_snap = SystemStateSnapshot(
+            deploy=DeployStateSnapshot(
+                status="active",
+                current_sha="sha123",
+                current_revision="rev-1",
+                deployed_at=None,
+                pause_reason=None,
+                rollback_reason=None,
+                rollback_count=0,
+                last_known_good_sha="",
+                halted=False,
+            ),
+            version=None,
+            fleet=FleetSnapshot(
+                active=0,
+                queued=0,
+                evaluating=0,
+                parked=0,
+                stale_heartbeat_count=0,
+            ),
+            generated_at="2026-01-01T00:00:00Z",
+        )
+
+        with patch(
+            "app.routers.admin_state.compute_system_state",
+            new_callable=AsyncMock,
+            return_value=fake_snap,
+        ) as mock_compute:
+            r1 = await client.get("/api/admin/state")
+            r2 = await client.get("/api/admin/state")
+
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        # Should only compute once; second call hits cache
+        mock_compute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_generated_at_is_iso_string(self, client: AsyncClient, db_session):
+        """generated_at field in the response is a string (ISO-formatted datetime)."""
+        resp = await client.get("/api/admin/state")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data["generated_at"], str)
+        # Must parse as a valid datetime
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(data["generated_at"].rstrip("Z"))
+        assert parsed is not None

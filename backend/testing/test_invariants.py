@@ -9216,3 +9216,73 @@ def test_all_load_only_projection_sites_require_raiseload():
         "an un-projected column raises synchronously at test time instead of "
         "triggering a MissingGreenlet 500 in production.\n" + "\n".join(violations)
     )
+
+
+def test_stall_alert_functions_reachable_from_canonical_import_path():
+    """Every _check_/_alert_/_resolve_ function in release_stall_alerts.py must be
+    reachable via at least one canonical import path.
+
+    When a new stall-alert function is extracted into release_stall_alerts.py it
+    must be either (a) directly imported in test_release_stall_alerts.py, or (b)
+    re-exported from release_qualifier.py via a ``from app.release_stall_alerts
+    import ...`` block.  A function that is neither tested directly nor re-exported
+    is silently unreachable — callers who import from the old location
+    (release_qualifier) won't see it, and the test suite won't exercise it.
+    """
+    testing_dir = Path(__file__).resolve().parent
+    backend_dir = testing_dir.parent
+    app_dir = backend_dir / "app"
+
+    stall_alerts_path = app_dir / "release_stall_alerts.py"
+    qualifier_path = app_dir / "release_qualifier.py"
+    test_path = testing_dir / "test_release_stall_alerts.py"
+
+    stall_source = stall_alerts_path.read_text(encoding="utf-8")
+    qualifier_source = qualifier_path.read_text(encoding="utf-8")
+    test_source = test_path.read_text(encoding="utf-8")
+
+    stall_tree = ast.parse(stall_source, filename=str(stall_alerts_path))
+    qualifier_tree = ast.parse(qualifier_source, filename=str(qualifier_path))
+    test_tree = ast.parse(test_source, filename=str(test_path))
+
+    # Collect all top-level function names matching the _check_/_alert_/_resolve_ prefix
+    import re as _re
+
+    _STALL_FUNC_PATTERN = _re.compile(r"^(_check_|_alert_|_resolve_)")
+    stall_functions: set[str] = set()
+    for node in ast.walk(stall_tree):
+        if isinstance(node, ast.FunctionDef) and _STALL_FUNC_PATTERN.match(node.name):
+            stall_functions.add(node.name)
+
+    def _collect_imports_from(tree: ast.Module, module_name: str) -> set[str]:
+        """Collect names imported via 'from <module_name> import ...' in tree."""
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == module_name:
+                for alias in node.names:
+                    names.add(alias.name)
+        return names
+
+    # Names directly imported in the test file
+    test_imports = _collect_imports_from(test_tree, "app.release_stall_alerts")
+
+    # Names re-exported from release_qualifier.py
+    qualifier_reexports = _collect_imports_from(
+        qualifier_tree, "app.release_stall_alerts"
+    )
+
+    reachable = test_imports | qualifier_reexports
+    unreachable = sorted(stall_functions - reachable)
+
+    assert not unreachable, (
+        "The following functions in release_stall_alerts.py are not reachable "
+        "from any canonical import path — they are neither directly imported in "
+        "test_release_stall_alerts.py nor re-exported from release_qualifier.py.\n"
+        "Fix by adding them to one of:\n"
+        "  (a) the 'from app.release_stall_alerts import ...' block in "
+        "test_release_stall_alerts.py (for alert/resolve functions that need "
+        "direct test coverage), OR\n"
+        "  (b) the 'from app.release_stall_alerts import ...' block in "
+        "release_qualifier.py (for check functions re-exported for callers).\n\n"
+        "Unreachable functions:\n" + "\n".join(f"  {f}" for f in unreachable)
+    )

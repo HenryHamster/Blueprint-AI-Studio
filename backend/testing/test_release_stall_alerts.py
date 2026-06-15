@@ -1,4 +1,4 @@
-"""Tests for release_stall_alerts — managed_check_wait and auto-merge stall checks.
+"""Tests for release_stall_alerts — managed_check_wait, auto-merge, and deploy-failed checks.
 
 Covers:
   * _check_version_managed_check_wait_stall — threshold gate (no fire before 20 min),
@@ -6,6 +6,8 @@ Covers:
     20-min re-alert interval.
   * _check_version_auto_merge_stall — SKIPS versions in managed_check_wait sub-state
     (those are handled by the dedicated MCW checker with a much shorter threshold).
+  * _alert_promotion_deploy_failed — first-fire creates ERROR alert, reason codes, idempotency.
+  * _resolve_promotion_deploy_failed_alert — no-op when none open, dismisses open alert, idempotent.
 """
 
 from __future__ import annotations
@@ -21,8 +23,11 @@ from app.release_stall_alerts import (
     _MANAGED_CHECK_WAIT_REALERT_INTERVAL_SECONDS,
     _MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS,
     _MANAGED_CHECK_WAIT_STALL_SECONDS,
+    _alert_promotion_deploy_failed,
     _check_version_auto_merge_stall,
     _check_version_managed_check_wait_stall,
+    _deploy_failed_alert_title,
+    _resolve_promotion_deploy_failed_alert,
 )
 from app.time_utils import _utcnow
 from sqlalchemy import select
@@ -49,7 +54,9 @@ async def _make_project_and_version(db_session):
     return project, version
 
 
-def _mcw_qual(*, enabled_seconds_ago: float, last_alerted_seconds_ago: float | None = None):
+def _mcw_qual(
+    *, enabled_seconds_ago: float, last_alerted_seconds_ago: float | None = None
+):
     """Build a managed_check_wait pending qualification dict."""
     enabled_at = (_utcnow() - timedelta(seconds=enabled_seconds_ago)).isoformat()
     pending: dict = {
@@ -94,7 +101,11 @@ async def test_mcw_stall_does_not_fire_before_threshold(db_session):
     assert fired is False
 
     alerts = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == version.project_id)))
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -117,7 +128,11 @@ async def test_mcw_stall_fires_warning_at_threshold(db_session):
     assert fired is True
 
     alerts = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == version.project_id)))
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -147,7 +162,11 @@ async def test_mcw_stall_escalates_to_error_after_critical_threshold(db_session)
     assert fired is True
 
     alerts = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == version.project_id)))
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -171,7 +190,11 @@ async def test_mcw_stall_suppressed_within_realert_interval(db_session):
     assert fired is False
 
     alerts = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == version.project_id)))
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -229,8 +252,222 @@ async def test_auto_merge_stall_skips_managed_check_wait(db_session, mocker):
     assert fired is False
 
     alerts = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == version.project_id)))
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
         .scalars()
         .all()
     )
     assert len(alerts) == 0
+
+
+# ---------------------------------------------------------------------------
+# _alert_promotion_deploy_failed / _resolve_promotion_deploy_failed_alert
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deploy_failed_alert_first_fire(db_session, mocker):
+    """First call creates an ERROR alert and stamps deploy_confirm_alerted_at."""
+    mocker.patch(
+        "app.release_stall_alerts._release_qualifier_module",
+        return_value=rq,
+    )
+    # Silence the _notify_operator call so the test stays self-contained.
+    mocker.patch(
+        "app.release_promotion._notify_operator",
+        return_value=None,
+        create=True,
+    )
+    _project, version = await _make_project_and_version(db_session)
+    version.serving_status = "deploy_failed"
+    version.deploy_failure_reason = "rolled_back"
+    version.promoted_sha = "abc123" * 3
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await _alert_promotion_deploy_failed(db_session, version)
+    await db_session.commit()
+    assert fired is True
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert _deploy_failed_alert_title(version.version_number) == alerts[0].title
+
+    await db_session.refresh(version)
+    assert version.deploy_confirm_alerted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_deploy_failed_alert_reason_codes(db_session, mocker):
+    """Known reason codes appear verbatim in the alert message."""
+    mocker.patch(
+        "app.release_stall_alerts._release_qualifier_module",
+        return_value=rq,
+    )
+    mocker.patch(
+        "app.release_promotion._notify_operator",
+        return_value=None,
+        create=True,
+    )
+    _project, version = await _make_project_and_version(db_session)
+    version.serving_status = "deploy_failed"
+    version.deploy_failure_reason = "sha_mismatch"
+    version.promoted_sha = "deadbeef1234"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _alert_promotion_deploy_failed(db_session, version)
+    await db_session.commit()
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any("sha_mismatch" in a.message for a in alerts)
+
+
+@pytest.mark.asyncio
+async def test_deploy_failed_alert_idempotent(db_session, mocker):
+    """Calling _alert_promotion_deploy_failed twice does not create a second alert."""
+    mocker.patch(
+        "app.release_stall_alerts._release_qualifier_module",
+        return_value=rq,
+    )
+    mocker.patch(
+        "app.release_promotion._notify_operator",
+        return_value=None,
+        create=True,
+    )
+    _project, version = await _make_project_and_version(db_session)
+    version.serving_status = "deploy_failed"
+    version.deploy_failure_reason = "halted"
+    version.promoted_sha = "cafebabe1234"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    first = await _alert_promotion_deploy_failed(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    second = await _alert_promotion_deploy_failed(db_session, version)
+    await db_session.commit()
+
+    assert first is True
+    assert second is False
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_deploy_failed_alert_noop_when_none(db_session):
+    """_resolve_promotion_deploy_failed_alert returns 0 when no open alert exists."""
+    _project, version = await _make_project_and_version(db_session)
+
+    count = await _resolve_promotion_deploy_failed_alert(db_session, version)
+    await db_session.commit()
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_deploy_failed_alert_dismisses_open(db_session, mocker):
+    """_resolve_promotion_deploy_failed_alert dismisses an open deploy-failed alert."""
+    mocker.patch(
+        "app.release_stall_alerts._release_qualifier_module",
+        return_value=rq,
+    )
+    mocker.patch(
+        "app.release_promotion._notify_operator",
+        return_value=None,
+        create=True,
+    )
+    _project, version = await _make_project_and_version(db_session)
+    version.serving_status = "deploy_failed"
+    version.deploy_failure_reason = "no_new_revision"
+    version.promoted_sha = "001122334455"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _alert_promotion_deploy_failed(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    count = await _resolve_promotion_deploy_failed_alert(db_session, version)
+    await db_session.commit()
+    assert count == 1
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == version.project_id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_deploy_failed_alert_idempotent(db_session, mocker):
+    """Calling _resolve_promotion_deploy_failed_alert twice returns 0 on the second call."""
+    mocker.patch(
+        "app.release_stall_alerts._release_qualifier_module",
+        return_value=rq,
+    )
+    mocker.patch(
+        "app.release_promotion._notify_operator",
+        return_value=None,
+        create=True,
+    )
+    _project, version = await _make_project_and_version(db_session)
+    version.serving_status = "deploy_failed"
+    version.deploy_failure_reason = "rolled_back"
+    version.promoted_sha = "aabbccddeeff"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _alert_promotion_deploy_failed(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    first = await _resolve_promotion_deploy_failed_alert(db_session, version)
+    await db_session.commit()
+    second = await _resolve_promotion_deploy_failed_alert(db_session, version)
+    await db_session.commit()
+
+    assert first == 1
+    assert second == 0

@@ -1,0 +1,499 @@
+"""Tests for system_state.compute_system_state().
+
+Covers the declared acceptance evidence:
+1. Serving-version resolution is aggregate-first (aggregate beats scalar).
+2. deploy_failed detection surfaces through ServingSnapshot.
+3. PAUSED/HALTED DeploymentState is reflected in DeployStateSnapshot.
+4. FleetSnapshot counts map task statuses correctly.
+5. Cross-surface agreement: compute_system_state().version.serving.status
+   equals the aggregate_serving_status that summarize_release_artifacts
+   would produce for the same version.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import timedelta
+
+import pytest
+
+from app import release_artifacts as ra
+from app import release_version as rv
+from app.models import (
+    DeploymentState,
+    DeploymentStatus,
+    Project,
+    ReleaseDeployArtifact,
+    Task,
+    TaskStatus,
+)
+from app.system_state import (
+    compute_system_state,
+)
+from app.time_utils import _utcnow
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _make_deploy_state(
+    session,
+    *,
+    status: str = DeploymentStatus.STABLE,
+    halted: bool = False,
+    pause_reason: str | None = None,
+):
+    ds = DeploymentState(
+        id=1,
+        status=status,
+        pause_reason=pause_reason or ("paused_test" if status == DeploymentStatus.PAUSED else None),
+        halted_at=_utcnow() if halted else None,
+    )
+    session.add(ds)
+    await session.commit()
+    await session.refresh(ds)
+    return ds
+
+
+async def _make_project(session):
+    project = Project(
+        name="State-Test",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    return project
+
+
+async def _make_version(
+    session,
+    project_id,
+    *,
+    serving_status: str | None = None,
+    served_sha: str | None = None,
+    last_qualification: dict | None = None,
+):
+    version = await rv.open_version(session, project_id, version_number=1)
+    if serving_status is not None:
+        version.serving_status = serving_status
+    if served_sha is not None:
+        version.served_sha = served_sha
+    if last_qualification is not None:
+        version.last_qualification = last_qualification
+    session.add(version)
+    await session.commit()
+    await session.refresh(version)
+    return version
+
+
+async def _make_artifact(
+    session,
+    version_id,
+    *,
+    artifact_kind: str = ra.BACKEND_REVISION_ARTIFACT_KIND,
+    serving_status: str,
+    reason_code: str | None = None,
+    served_identifier: str | None = None,
+    served_at=None,
+):
+    artifact = ReleaseDeployArtifact(
+        version_id=version_id,
+        artifact_kind=artifact_kind,
+        serving_status=serving_status,
+        reason_code=reason_code,
+        served_identifier=served_identifier,
+        served_at=served_at,
+    )
+    session.add(artifact)
+    await session.commit()
+    return artifact
+
+
+async def _make_task(session, project_id, *, status: TaskStatus, last_heartbeat=None):
+    task = Task(
+        project_id=project_id,
+        status=status,
+        last_heartbeat=last_heartbeat,
+    )
+    session.add(task)
+    await session.commit()
+    return task
+
+
+# ---------------------------------------------------------------------------
+# DeployStateSnapshot — status/halted/paused
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deploy_state_stable(db_session):
+    """DeployStateSnapshot reflects STABLE status and halted=False."""
+    await _make_deploy_state(db_session, status=DeploymentStatus.STABLE)
+    snap = await compute_system_state(db_session)
+    assert snap.deploy.status == DeploymentStatus.STABLE
+    assert snap.deploy.halted is False
+    assert snap.deploy.pause_reason is None
+
+
+@pytest.mark.asyncio
+async def test_deploy_state_paused(db_session):
+    """DeployStateSnapshot reflects PAUSED status and pause_reason."""
+    await _make_deploy_state(
+        db_session, status=DeploymentStatus.PAUSED, pause_reason="dep_down"
+    )
+    snap = await compute_system_state(db_session)
+    assert snap.deploy.status == DeploymentStatus.PAUSED
+    assert snap.deploy.pause_reason == "dep_down"
+    assert snap.deploy.halted is False
+
+
+@pytest.mark.asyncio
+async def test_deploy_state_halted(db_session):
+    """DeployStateSnapshot.halted is True when halted_at is set."""
+    await _make_deploy_state(
+        db_session, status=DeploymentStatus.HALTED, halted=True
+    )
+    snap = await compute_system_state(db_session)
+    assert snap.deploy.status == DeploymentStatus.HALTED
+    assert snap.deploy.halted is True
+
+
+@pytest.mark.asyncio
+async def test_deploy_state_missing_singleton(db_session):
+    """compute_system_state succeeds with status=unknown when no DeploymentState row."""
+    snap = await compute_system_state(db_session)
+    assert snap.deploy.status == "unknown"
+    assert snap.deploy.halted is False
+    assert snap.version is None
+
+
+# ---------------------------------------------------------------------------
+# Version block — no project_id / no open version
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_project_id_returns_version_none(db_session):
+    """compute_system_state with no project_id returns version=None."""
+    await _make_deploy_state(db_session)
+    snap = await compute_system_state(db_session)
+    assert snap.version is None
+    assert snap.fleet is not None
+
+
+@pytest.mark.asyncio
+async def test_no_open_version_returns_version_none(db_session):
+    """When no open version exists for the project, version=None but snap succeeds."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is None
+    assert snap.deploy.status == DeploymentStatus.STABLE
+
+
+# ---------------------------------------------------------------------------
+# Serving-version resolution: aggregate-first (acceptance criterion 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_serving_status_aggregate_beats_scalar(db_session):
+    """ServingSnapshot.status is aggregate-first: deploy_failed artifact beats scalar."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    # Version scalar says serving_confirmed, but artifact says deploy_failed.
+    version = await _make_version(
+        db_session, project.id, serving_status="serving_confirmed", served_sha="abc"
+    )
+    await _make_artifact(
+        db_session,
+        version.id,
+        serving_status="deploy_failed",
+        reason_code="rolled_back",
+    )
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    # Aggregate must dominate: deploy_failed > serving_confirmed
+    assert snap.version.serving.status == "deploy_failed"
+    assert snap.version.serving.failure_reason == "rolled_back"
+
+
+@pytest.mark.asyncio
+async def test_serving_unconfirmed_artifact_beats_confirmed_scalar(db_session):
+    """Unconfirmed artifact beats a serving_confirmed scalar in aggregate-first logic."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    version = await _make_version(
+        db_session, project.id, serving_status="serving_confirmed"
+    )
+    await _make_artifact(
+        db_session,
+        version.id,
+        serving_status="unconfirmed",
+    )
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    assert snap.version.serving.status == "unconfirmed"
+    assert snap.version.serving.failure_reason is None
+
+
+# ---------------------------------------------------------------------------
+# deploy_failed detection (acceptance criterion 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deploy_failed_detection_via_artifact(db_session):
+    """deploy_failed artifact surfaces through ServingSnapshot.failure_reason."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project.id)
+    await _make_artifact(
+        db_session,
+        version.id,
+        serving_status="deploy_failed",
+        reason_code="sha_mismatch",
+    )
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    assert snap.version.serving.status == "deploy_failed"
+    assert snap.version.serving.failure_reason == "sha_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_deploy_failed_failure_reason_none_for_non_failure(db_session):
+    """failure_reason is None when serving_status is not deploy_failed."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project.id)
+    await _make_artifact(
+        db_session,
+        version.id,
+        serving_status="serving_confirmed",
+        served_identifier="rev-1",
+        served_at=_utcnow(),
+    )
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    assert snap.version.serving.status == "serving_confirmed"
+    assert snap.version.serving.failure_reason is None
+
+
+# ---------------------------------------------------------------------------
+# FleetSnapshot counts (acceptance criterion 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fleet_counts_active_queued_evaluating_parked(db_session):
+    """FleetSnapshot correctly maps task statuses to fleet slots."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+
+    await _make_task(db_session, project.id, status=TaskStatus.IN_PROGRESS)
+    await _make_task(db_session, project.id, status=TaskStatus.IN_PROGRESS)
+    await _make_task(db_session, project.id, status=TaskStatus.QUEUED)
+    await _make_task(db_session, project.id, status=TaskStatus.PROVISIONING)
+    await _make_task(db_session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(db_session, project.id, status=TaskStatus.PARKED)
+    # Terminal statuses must not be counted
+    await _make_task(db_session, project.id, status=TaskStatus.COMPLETED)
+    await _make_task(db_session, project.id, status=TaskStatus.FAILED)
+
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.fleet.active == 2
+    assert snap.fleet.queued == 2  # QUEUED + PROVISIONING
+    assert snap.fleet.evaluating == 1
+    assert snap.fleet.parked == 1
+
+
+@pytest.mark.asyncio
+async def test_fleet_stale_heartbeat_count(db_session):
+    """Stale heartbeat count identifies IN_PROGRESS tasks with last_heartbeat > 5 min ago."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+
+    stale_time = _utcnow() - timedelta(minutes=10)
+    fresh_time = _utcnow() - timedelta(minutes=1)
+
+    # One stale, one fresh, one with no heartbeat (not counted as stale)
+    await _make_task(
+        db_session, project.id,
+        status=TaskStatus.IN_PROGRESS, last_heartbeat=stale_time,
+    )
+    await _make_task(
+        db_session, project.id,
+        status=TaskStatus.IN_PROGRESS, last_heartbeat=fresh_time,
+    )
+    await _make_task(
+        db_session, project.id,
+        status=TaskStatus.IN_PROGRESS, last_heartbeat=None,
+    )
+
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.fleet.stale_heartbeat_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fleet_scoped_to_project(db_session):
+    """Fleet counts are scoped to project_id when provided; fleet-wide when None."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    other_project = await _make_project(db_session)
+
+    await _make_task(db_session, project.id, status=TaskStatus.IN_PROGRESS)
+    await _make_task(db_session, other_project.id, status=TaskStatus.IN_PROGRESS)
+
+    snap_project = await compute_system_state(db_session, project.id)
+    assert snap_project.fleet.active == 1
+
+    snap_global = await compute_system_state(db_session)
+    assert snap_global.fleet.active == 2
+
+
+# ---------------------------------------------------------------------------
+# Cross-surface agreement (acceptance criterion 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cross_surface_serving_status_agreement(db_session):
+    """compute_system_state().version.serving.status equals aggregate from summarize_release_artifacts."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project.id)
+
+    await _make_artifact(
+        db_session,
+        version.id,
+        serving_status="serving_confirmed",
+        served_identifier="rev-abc",
+        served_at=_utcnow(),
+    )
+
+    # Compute the aggregate directly from summarize_release_artifacts
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+    from app.models import ReleaseVersion
+
+    stmt = (
+        select(ReleaseVersion)
+        .where(ReleaseVersion.id == version.id)
+        .options(selectinload(ReleaseVersion.deploy_artifacts))
+    )
+    row = (await db_session.execute(stmt)).scalar_one()
+    agg_dict, _ = ra.summarize_release_artifacts(row, row.deploy_artifacts)
+    expected_status = agg_dict["serving_status"]
+
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    assert snap.version.serving.status == expected_status
+    assert snap.version.serving.status == "serving_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_cross_surface_deploy_failed_agreement(db_session):
+    """compute_system_state deploy_failed status agrees with summarize_release_artifacts."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    version = await _make_version(
+        db_session, project.id, serving_status="serving_confirmed"
+    )
+    await _make_artifact(
+        db_session,
+        version.id,
+        serving_status="deploy_failed",
+        reason_code="halted",
+    )
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+    from app.models import ReleaseVersion
+
+    stmt = (
+        select(ReleaseVersion)
+        .where(ReleaseVersion.id == version.id)
+        .options(selectinload(ReleaseVersion.deploy_artifacts))
+    )
+    row = (await db_session.execute(stmt)).scalar_one()
+    agg_dict, _ = ra.summarize_release_artifacts(row, row.deploy_artifacts)
+    expected_status = agg_dict["serving_status"]
+
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    assert snap.version.serving.status == expected_status
+    assert snap.version.serving.status == "deploy_failed"
+
+
+# ---------------------------------------------------------------------------
+# Artifact evidence in ServingSnapshot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_evidence_included_in_serving_snapshot(db_session):
+    """Per-artifact evidence is captured in serving.artifacts."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project.id)
+    await _make_artifact(
+        db_session,
+        version.id,
+        artifact_kind=ra.BACKEND_REVISION_ARTIFACT_KIND,
+        serving_status="deploy_failed",
+        reason_code="no_new_revision",
+    )
+
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    artifacts = snap.version.serving.artifacts
+    assert len(artifacts) >= 1
+    backend_a = next(
+        (a for a in artifacts if a.artifact_kind == ra.BACKEND_REVISION_ARTIFACT_KIND),
+        None,
+    )
+    assert backend_a is not None
+    assert backend_a.serving_status == "deploy_failed"
+    assert backend_a.reason_code == "no_new_revision"
+
+
+# ---------------------------------------------------------------------------
+# Serialization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_to_dict_json_serializable(db_session):
+    """to_dict() returns a plain dict with no unserializable types (e.g. datetime)."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    snap = await compute_system_state(db_session, project.id)
+    d = snap.to_dict()
+    # Must not raise TypeError
+    json.dumps(d)
+    assert isinstance(d, dict)
+    assert isinstance(d["deploy"], dict)
+    assert isinstance(d["fleet"], dict)
+    assert d["version"] is None
+
+
+@pytest.mark.asyncio
+async def test_to_dict_datetime_fields_are_strings(db_session):
+    """Datetime fields in to_dict are ISO strings, not datetime objects."""
+    await _make_deploy_state(db_session)
+    snap = await compute_system_state(db_session)
+    d = snap.to_dict()
+    # deploy.deployed_at should be an ISO string
+    deployed_at = d["deploy"]["deployed_at"]
+    assert isinstance(deployed_at, str)
+    # Must be parseable as an ISO datetime
+    from datetime import datetime
+    parsed = datetime.fromisoformat(deployed_at.rstrip("Z"))
+    assert parsed is not None
