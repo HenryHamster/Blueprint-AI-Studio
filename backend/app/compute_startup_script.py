@@ -301,21 +301,20 @@ def build_agent_startup_script(
       fi
     fi
     if [ "$_AGENT_STILL_HEALTHY" = "1" ]; then
-      # Capture curl's stderr so a failed startup-completed heartbeat is at
-      # least visible in the systemd journal. Previously this curl used `-sf`
-      # with no redirect — when the orchestrator was briefly unreachable the
-      # heartbeat silently dropped and the only signal was a missing
-      # status_log entry on the orchestrator side. Logged failures land in
-      # the journal and therefore in any AGENT_DIED_EARLY capture if the
-      # agent later dies before claiming.
+      # Route the startup-completed heartbeat through the same trap-safe
+      # pattern as _send_beacon: `err="$(curl ...)" || curl_exit=$?`. A plain
+      # top-level `VAR="$(curl ...)"` has its exit status set to curl's exit
+      # code; under `set -e` a non-zero curl (e.g. 503 during Cloud Run
+      # saturation) fires the ERR trap and powers off a HEALTHY VM whose agent
+      # service just passed the 45s health gate. The `|| _STARTUP_HB_EXIT=$?`
+      # guard absorbs the non-zero exit so the trap never fires.
       _STARTUP_HB_ERR=""
       _STARTUP_HB_EXIT=0
       _STARTUP_HB_ERR="$(curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
         -H "Content-Type: application/json" \
         -H "X-Agent-Token: $AGENT_TOKEN" \
         -d '{{"task_id": "{task_id}", "status_message": "Startup script completed, agent service started"}}' \
-        --connect-timeout 10 --max-time 15 2>&1 >/dev/null)"
-      _STARTUP_HB_EXIT=$?
+        --connect-timeout 10 --max-time 15 2>&1 >/dev/null)" || _STARTUP_HB_EXIT=$?
       if [ "$_STARTUP_HB_EXIT" -ne 0 ]; then
         echo "PROVISION_HEALTH_FAILED: startup heartbeat curl failed :: ${{_STARTUP_HB_ERR:-curl exit $_STARTUP_HB_EXIT}}" >&2
       else

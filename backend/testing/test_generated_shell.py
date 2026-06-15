@@ -240,6 +240,58 @@ class TestGeneratedShellContract:
             + "\n".join(f"  line {i}: {s}" for i, s in offenders)
         )
 
+    def test_no_unguarded_fallible_cmd_substitution_assignments(
+        self, gen: ShellGenerator
+    ):
+        """Every top-level command-substitution assignment whose inner command
+        is fallible (curl, journalctl, systemctl, grep) MUST be guarded.
+
+        Acceptable guards — at least one must be present:
+          a) `|| guard` AFTER the closing `)` on the same line (e.g. `|| var=$?`,
+             `|| true`, `|| echo ...`) — this is the `_send_beacon` pattern.
+          b) `||` INSIDE the substitution (e.g. `$(cmd || true)`) — the sub
+             always exits 0 so the assignment's exit code is always 0.
+
+        Under `set -e`, a bare `VAR="$(curl ...)"` has the assignment's exit
+        code equal to curl's exit code. When curl returns non-zero (e.g. a
+        503 during Cloud Run saturation), the ERR trap fires and powers off a
+        HEALTHY VM.  This is the root cause of the 2026-06-14 fleet-wide reap
+        events that killed fix task 33cdac3e.
+
+        Regression: the startup-completed heartbeat (step 6b) used plain
+        `_STARTUP_HB_ERR="$(curl ...)"` — all four provisioning beacons were
+        already routed through `_send_beacon` which uses `|| curl_exit=$?`,
+        but this one site was hand-rolled and fell outside that pattern.
+        """
+        script = gen.render()
+        # Join bash line continuations so multi-line assignments collapse to a
+        # single logical line that a single-line regex can inspect.
+        joined = re.sub(r"\\\n\s*", " ", script)
+        offenders = []
+        # Pattern: a line that is JUST an assignment `VAR="$(fallible_cmd ...)"` —
+        # i.e. starts with optional whitespace then `IDENTIFIER="$(` and ends
+        # with `)"` (no `||` after the closing `)`).
+        # The negative lookahead `(?![^)]*\|\|)` rejects the assignment when
+        # the substitution body itself contains `||` (guard-b above).
+        # `\s*$` requires the line to end with `)"` — if `|| guard` follows,
+        # the `$` won't match and the pattern correctly skips it (guard-a above).
+        pattern = re.compile(
+            r'^\s*[A-Za-z_][A-Za-z0-9_]*="\$\((?![^)]*\|\|)'
+            r"[^)]*\b(?:curl|journalctl|grep|systemctl)\b[^)]*\)\"\s*$",
+            re.MULTILINE,
+        )
+        for m in pattern.finditer(joined):
+            line_no = script.count("\n", 0, m.start()) + 1
+            offenders.append((line_no, m.group(0).strip()))
+        assert not offenders, (
+            f"{gen.name}: unguarded top-level command-substitution assignment "
+            f"with a fallible command. Under `set -e` a non-zero exit fires "
+            f"the ERR trap → poweroff on a HEALTHY VM. Fix: add "
+            f"`|| var=$?` after the closing `)` (guard-a) or `|| true/echo` "
+            f"INSIDE the substitution (guard-b), or route through `_send_beacon`. "
+            f"Offenders:\n" + "\n".join(f"  line {i}: {s}" for i, s in offenders)
+        )
+
     def test_inline_poweroff_followed_by_exit_or_scope_close(self, gen: ShellGenerator):
         """``poweroff`` is async — the kernel schedules shutdown but bash
         keeps running until SIGTERM arrives (seconds later). Without a
