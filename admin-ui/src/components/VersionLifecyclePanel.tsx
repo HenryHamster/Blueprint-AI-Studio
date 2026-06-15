@@ -4,6 +4,7 @@ import {
   clearDeployFailed,
   cutVersion,
   fetchQualificationVerdicts,
+  fetchVersionSummary,
   patchAdminSettings,
   setProjectPromotionEnabled,
   setVersionPhase,
@@ -18,9 +19,11 @@ import {
   type OutOfBandPromotion,
   type QualificationVerdictRecord,
   type ReleaseArtifactEvidence,
+  type RecentVersion,
   type StagedDirection,
   type VersionLifecycleResponse,
   type VersionQualification,
+  type VersionSummaryResponse,
   type PromotionPolicySource,
   type PromotionReadiness,
   type QualificationState,
@@ -1012,6 +1015,40 @@ interface VersionLifecyclePanelProps {
   refreshing?: boolean;
 }
 
+function VersionSummaryPanel({ versionId }: { versionId: string }) {
+  const [summary, setSummary] = useState<VersionSummaryResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // loading is derived: no data and no error yet
+  const loading = summary === null && error === null;
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchVersionSummary(versionId)
+      .then(data => { if (!cancelled) setSummary(data); })
+      .catch(err => { if (!cancelled) setError(String(err)); });
+    return () => { cancelled = true; };
+  }, [versionId]);
+
+  if (loading) return <p className="text-[10px] text-neutral-500 pl-2">Loading…</p>;
+  if (error || !summary) return <p className="text-[10px] text-red-400 pl-2">Failed to load summary</p>;
+
+  const h = summary.highlights;
+  const conf = h.qualification_confidence != null ? `${Math.round(h.qualification_confidence * 100)}%` : null;
+  const thresh = h.qualification_threshold != null ? `${Math.round(h.qualification_threshold * 100)}%` : null;
+
+  return (
+    <div className="mt-1 pl-2 border-l-2 border-neutral-700/40 space-y-0.5 text-[10px]">
+      <p className="text-neutral-300 italic">{h.headline}</p>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-400">
+        <span>{h.merged_count} merged</span>
+        <span>{h.proven}/{h.total_merged_for_acceptance} proven</span>
+        {conf && thresh && <span>conf {conf} / thr {thresh}</span>}
+        <span className="text-neutral-500">{summary.phase} · {summary.status}</span>
+      </div>
+    </div>
+  );
+}
+
 function VersionLifecycleRefreshBanner({
   kind,
   message,
@@ -1069,6 +1106,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
   const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
   const [cutReason, setCutReason] = useState<string>('');
+  const [expandedVersionId, setExpandedVersionId] = useState<string | null>(null);
   // One idempotency key per confirmed cut: generated on confirm, reused across
   // a lost-response retry, cleared on success so the next cut gets a fresh key.
   const cutIdempotencyKeyRef = useRef<string | null>(null);
@@ -1784,34 +1822,47 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         {recent.length > 0 && (
           <div>
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
-            <div className="space-y-0.5">
-              {recent.slice(0, 4).map(v => (
-                <div key={v.version_number} className="space-y-0.5">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
-                    <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
-                    <span className="text-neutral-500">{v.status}</span>
-                    <ServingStatusBadge
-                      servingStatus={v.aggregate_serving_status ?? v.serving_status ?? v.qualification_state?.serving_status}
-                      servedSha={v.served_sha}
-                      servedAt={v.served_at}
-                      deployFailureReason={v.aggregate_deploy_failure_reason ?? v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
-                      deployConfirmDeadline={v.deploy_confirm_deadline}
-                    />
-                    <QualSummary q={v.last_qualification} />
-                    {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
-                      <span className="text-neutral-400">
-                        cut by {v.abandoned_by ?? 'unknown'}
-                        {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
-                        {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
-                      </span>
+            <div className="space-y-1">
+              {recent.slice(0, 4).map((v: RecentVersion) => {
+                const isExpanded = !!v.id && expandedVersionId === v.id;
+                return (
+                  <div key={v.version_number} className="space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
+                      <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
+                      <span className="text-neutral-500">{v.status}</span>
+                      <ServingStatusBadge
+                        servingStatus={v.aggregate_serving_status ?? v.serving_status ?? v.qualification_state?.serving_status}
+                        servedSha={v.served_sha}
+                        servedAt={v.served_at}
+                        deployFailureReason={v.aggregate_deploy_failure_reason ?? v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
+                        deployConfirmDeadline={v.deploy_confirm_deadline}
+                      />
+                      <QualSummary q={v.last_qualification} />
+                      {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
+                        <span className="text-neutral-400">
+                          cut by {v.abandoned_by ?? 'unknown'}
+                          {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
+                          {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
+                        </span>
+                      )}
+                      {v.id && (
+                        <button
+                          onClick={() => setExpandedVersionId(isExpanded ? null : v.id!)}
+                          className="text-neutral-600 hover:text-neutral-300 transition-colors"
+                          title={isExpanded ? 'Hide summary' : "What's new"}
+                        >
+                          {isExpanded ? '▲' : '▼'}
+                        </button>
+                      )}
+                    </div>
+                    {v.out_of_band_promotion && (
+                      <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
                     )}
+                    <ArtifactEvidenceList artifacts={v.artifacts} />
+                    {isExpanded && v.id && <VersionSummaryPanel versionId={v.id} />}
                   </div>
-                  {v.out_of_band_promotion && (
-                    <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
-                  )}
-                  <ArtifactEvidenceList artifacts={v.artifacts} />
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}

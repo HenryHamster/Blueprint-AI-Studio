@@ -1669,6 +1669,7 @@ export interface CurrentVersion {
 }
 
 export interface RecentVersion {
+  id?: string;
   version_number: number;
   status: string;
   opened_at: string;
@@ -1856,6 +1857,39 @@ export async function setProjectPromotionEnabled(
 export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {
   const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-lifecycle`);
   if (!res.ok) throw new Error(`Failed to fetch version lifecycle: ${res.status}`);
+  return res.json();
+}
+
+export interface VersionSummaryHighlights {
+  headline: string;
+  merged_count: number;
+  proven: number;
+  total_merged_for_acceptance: number;
+  qualification_confidence: number | null;
+  qualification_threshold: number | null;
+}
+
+export interface VersionSummaryResponse {
+  version_number: number;
+  phase: string;
+  status: string;
+  goal: string | null;
+  opened_at: string | null;
+  promoted_at: string | null;
+  served_at: string | null;
+  phase_changed_at: string | null;
+  merged_count: number;
+  acceptance_aggregate: Record<string, number>;
+  qualification_state: QualificationState | null;
+  serving_status: string | null;
+  served_sha: string | null;
+  deploy_failure_reason: string | null;
+  highlights: VersionSummaryHighlights;
+}
+
+export async function fetchVersionSummary(versionId: string): Promise<VersionSummaryResponse> {
+  const res = await apiFetch(`/api/admin/release-versions/${encodeURIComponent(versionId)}/summary`);
+  if (!res.ok) throw new Error(`Failed to fetch version summary: ${res.status}`);
   return res.json();
 }
 

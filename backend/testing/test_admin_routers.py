@@ -16185,3 +16185,249 @@ class TestGetSystemState:
 
         parsed = datetime.fromisoformat(data["generated_at"].rstrip("Z"))
         assert parsed is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GET /api/admin/release-versions/{version_id}/summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGetReleaseVersionSummary:
+    """Tests for the per-version what's-new summary endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_summary_404_on_unknown_version_id(
+        self, client: AsyncClient, db_session
+    ):
+        """Unknown version id returns 404."""
+        unknown_id = uuid.uuid4()
+        resp = await client.get(f"/api/admin/release-versions/{unknown_id}/summary")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_summary_returns_200_with_required_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """Happy-path open version returns 200 with all required top-level keys."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+            goal="ship the widget",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=0),
+        ):
+            resp = await client.get(
+                f"/api/admin/release-versions/{version.id}/summary"
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        for key in (
+            "version_number",
+            "phase",
+            "status",
+            "goal",
+            "opened_at",
+            "promoted_at",
+            "served_at",
+            "phase_changed_at",
+            "merged_count",
+            "acceptance_aggregate",
+            "qualification_state",
+            "serving_status",
+            "served_sha",
+            "deploy_failure_reason",
+            "highlights",
+        ):
+            assert key in data, f"missing key: {key}"
+        assert data["version_number"] == 1
+        assert data["phase"] == "build"
+        assert data["status"] == "open"
+        assert data["goal"] == "ship the widget"
+        assert data["highlights"]["headline"] == "open in build with no merged work yet"
+
+    @pytest.mark.asyncio
+    async def test_summary_merged_count_reflects_landed_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """merged_count reflects tasks that landed since the version opened."""
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Create 2 merged tasks
+        for _ in range(2):
+            task = Task(
+                project_id=project.id,
+                title="merged task",
+                prompt="do stuff",
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                updated_at=_utcnow(),
+            )
+            db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/release-versions/{version.id}/summary"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["merged_count"] == 2
+        assert data["highlights"]["merged_count"] == 2
+        assert "2 merged" in data["highlights"]["headline"]
+
+    @pytest.mark.asyncio
+    async def test_summary_promoted_version_returns_200(
+        self, client: AsyncClient, db_session
+    ):
+        """Promoted version (non-open) returns 200 with promoted status fields."""
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        now = _utcnow()
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=now,
+            promoted_sha="abc1234",
+            serving_status="serving_confirmed",
+            served_sha="abc1234",
+            served_at=now,
+            last_qualification={"status": "promoted", "confidence": 0.9},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=5),
+        ):
+            resp = await client.get(
+                f"/api/admin/release-versions/{version.id}/summary"
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "promoted"
+        assert data["serving_status"] == "serving_confirmed"
+        assert data["promoted_at"] is not None
+        assert data["served_at"] is not None
+        assert data["highlights"]["headline"] == "promoted & serving"
+
+    @pytest.mark.asyncio
+    async def test_summary_abandoned_version_returns_200(
+        self, client: AsyncClient, db_session
+    ):
+        """Abandoned version returns 200 with abandoned headline."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="abandoned",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=0),
+        ):
+            resp = await client.get(
+                f"/api/admin/release-versions/{version.id}/summary"
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "abandoned"
+        assert data["highlights"]["headline"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_summary_acceptance_aggregate_buckets_present(
+        self, client: AsyncClient, db_session
+    ):
+        """acceptance_aggregate includes the standard six buckets plus total."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=0),
+        ):
+            resp = await client.get(
+                f"/api/admin/release-versions/{version.id}/summary"
+            )
+
+        assert resp.status_code == 200, resp.text
+        agg = resp.json()["acceptance_aggregate"]
+        assert "total" in agg
+        assert isinstance(agg["total"], int)
+
+    @pytest.mark.asyncio
+    async def test_summary_qualification_state_included(
+        self, client: AsyncClient, db_session
+    ):
+        """qualification_state is non-null when a qualification verdict exists."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "pending",
+                "candidate_sha": "abc1234",
+                "confidence": 0.75,
+                "threshold": 0.8,
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=3),
+        ):
+            resp = await client.get(
+                f"/api/admin/release-versions/{version.id}/summary"
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["qualification_state"] is not None
+        qs = data["qualification_state"]
+        assert "state" in qs
+        assert data["highlights"]["qualification_confidence"] == 0.75
+        assert data["highlights"]["qualification_threshold"] == 0.8

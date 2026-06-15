@@ -16,6 +16,7 @@ vi.mock('../api', () => ({
   authGet: vi.fn(async () => new Response('{}', { status: 200 })),
   API_BASE_URL: 'http://localhost:8000',
   fetchQualificationVerdicts: vi.fn(async () => ({ verdicts: [], total: 0 })),
+  fetchVersionSummary: vi.fn(async () => ({})),
   cutVersion: vi.fn(),
   triggerQualify: vi.fn(),
   setVersionPhase: vi.fn(),

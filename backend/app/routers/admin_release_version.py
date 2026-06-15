@@ -157,6 +157,7 @@ def _serialize_version_history_entry(
 ) -> dict[str, Any]:
     aggregate, artifacts = _version_serving_summary(version, project)
     return {
+        "id": str(version.id),
         "version_number": version.version_number,
         "status": version.status,
         "opened_at": version.opened_at.isoformat(),
@@ -1348,4 +1349,113 @@ async def clear_deploy_failed(
         "clear_mode": clear_mode,
         "operator_attested": clear_mode == "operator_attested",
         "attestation_reason": attestation_reason,
+    }
+
+
+@router.get("/release-versions/{version_id}/summary")
+async def get_release_version_summary(
+    version_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return a structured 'what's new' summary for a single release version.
+
+    Works for any version status (open, promoted, or abandoned). Synthesizes
+    merged-work count, acceptance quality, qualification state, and a human-
+    readable headline into a single response — no need to stitch several
+    existing endpoints together.
+
+    Access is enforced per the owning project (viewer role or above).
+    """
+    from app.release_version import (  # noqa: PLC0415
+        count_merged_since,
+        compute_version_acceptance_aggregate,
+    )
+
+    version = (
+        await session.execute(
+            select(ReleaseVersion)
+            .options(selectinload(ReleaseVersion.deploy_artifacts))
+            .where(ReleaseVersion.id == version_id)
+        )
+    ).scalar_one_or_none()
+
+    if version is None:
+        raise HTTPException(status_code=404, detail="Release version not found.")
+
+    project = await _get_user_project_with_role(
+        version.project_id, current_user["user_id"], session, min_role="viewer"
+    )
+
+    # count_merged_since has no upper-bound filter, so for closed versions the
+    # window is opened_at → now; acceptable for a summary headline.
+    merged_count = await count_merged_since(
+        session, version.project_id, version.opened_at
+    )
+    acceptance_aggregate = await compute_version_acceptance_aggregate(
+        session, version.project_id, since=version.opened_at
+    )
+
+    aggregate_serving, artifacts = _version_serving_summary(version, project)
+
+    qualification_state = _release_version.summarize_qualification_state(
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate_serving["serving_status"],
+        aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
+        artifact_evidence=artifacts,
+    )
+
+    # Derive highlights from the data above — no extra I/O.
+    proven = acceptance_aggregate.get("proven", 0)
+    total_merged = acceptance_aggregate.get("total", 0)
+    qual = version.last_qualification or {}
+    confidence = qual.get("confidence")
+    threshold = qual.get("threshold")
+
+    if version.status == "promoted" and version.serving_status == "serving_confirmed":
+        headline = "promoted & serving"
+    elif version.status == "promoted":
+        headline = "promoted"
+    elif version.status == "abandoned":
+        headline = "abandoned"
+    elif merged_count == 0:
+        headline = f"open in {version.phase} with no merged work yet"
+    else:
+        headline = f"open in {version.phase} with {merged_count} merged"
+
+    highlights: Dict[str, Any] = {
+        "merged_count": merged_count,
+        "proven": proven,
+        "total_merged_for_acceptance": total_merged,
+        "qualification_confidence": confidence,
+        "qualification_threshold": threshold,
+        "headline": headline,
+    }
+
+    return {
+        # Version identity
+        "version_number": version.version_number,
+        "phase": version.phase,
+        "status": version.status,
+        "goal": version.goal,
+        # Timestamps (isoformat, null-safe)
+        "opened_at": version.opened_at.isoformat() if version.opened_at else None,
+        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "phase_changed_at": version.phase_changed_at.isoformat()
+        if version.phase_changed_at
+        else None,
+        # Merged work
+        "merged_count": merged_count,
+        "acceptance_aggregate": acceptance_aggregate,
+        # Qualification state
+        "qualification_state": qualification_state,
+        # Serving fields
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "deploy_failure_reason": version.deploy_failure_reason,
+        # Human-readable summary for display/CLI
+        "highlights": highlights,
     }

@@ -248,6 +248,11 @@ def get_project_id(project_id: str | None = None) -> str:
     return _project_id_cache
 
 
+def get_version_summary(version_id: str) -> dict:
+    """Fetch the what's-new summary for a single release version by id."""
+    return api("GET", f"/api/admin/release-versions/{version_id}/summary")
+
+
 def fmt_task(t: dict, verbose: bool = False) -> str:
     """Format a task as a one-line summary."""
     tid = t["id"][:8]

@@ -377,6 +377,7 @@ vi.mock('../api', () => ({
   })),
   fetchImprovementLanes: vi.fn(async () => ({ total: 0, lanes: [] })),
   fetchLanePilotPreflight: vi.fn(async () => null),
+  fetchVersionSummary: vi.fn(async () => ({})),
 }));
 
 describe('DashboardHome — viewport regression', () => {
