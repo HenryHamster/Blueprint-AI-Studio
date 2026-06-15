@@ -11,6 +11,7 @@
 # Usage:
 #   bash scripts/viewport-snapshot.sh                 # auto-scope vs origin/<base>
 #   bash scripts/viewport-snapshot.sh --base main     # explicit base ref
+#   bash scripts/viewport-snapshot.sh --current [ComponentName ...]  # AFTER only, no worktree
 #   bash scripts/viewport-snapshot.sh TaskCard Kanban # explicit component names
 #   bash scripts/viewport-snapshot.sh --upload --task-id <id>  # capture, then
 #       PUT changed/new before/after PNGs to GCS and publish the manifest at
@@ -33,6 +34,7 @@ cd "$REPO_ROOT" || { echo "viewport-snapshot: cannot cd to repo root" >&2; exit 
 BASE="automain"
 UPLOAD=0
 TASK_ID=""
+CURRENT=0
 COMPONENTS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,7 +43,8 @@ while [ $# -gt 0 ]; do
     --upload) UPLOAD=1; shift ;;
     --task-id) TASK_ID="${2:-}"; shift 2 ;;
     --task-id=*) TASK_ID="${1#*=}"; shift ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    --current) CURRENT=1; shift ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) COMPONENTS+=("$1"); shift ;;
   esac
 done
@@ -176,7 +179,10 @@ fi
 # The capture config + maybeCapture hook only exist on this branch, so overlay
 # them onto the base worktree: we hold the test harness constant and vary only
 # the component/page source, yielding a true before/after of the COMPONENT.
-if [ -n "$BASE_REF" ]; then
+# --current skips this entirely: AFTER only, no worktree, no npm ci on base.
+if [ "$CURRENT" = "1" ]; then
+  echo "viewport-snapshot: --current mode — skipping BEFORE pass"
+elif [ -n "$BASE_REF" ]; then
   echo "viewport-snapshot: BEFORE pass (base worktree at $BASE_REF)..."
   git worktree remove --force "$WT" >/dev/null 2>&1 || true
   if git worktree add --detach "$WT" "$BASE_REF" >/tmp/viewport_snap_wt.log 2>&1; then
