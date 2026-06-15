@@ -48,7 +48,8 @@ async def _make_deploy_state(
     ds = DeploymentState(
         id=1,
         status=status,
-        pause_reason=pause_reason or ("paused_test" if status == DeploymentStatus.PAUSED else None),
+        pause_reason=pause_reason
+        or ("paused_test" if status == DeploymentStatus.PAUSED else None),
         halted_at=_utcnow() if halted else None,
     )
     session.add(ds)
@@ -157,9 +158,7 @@ async def test_deploy_state_paused(db_session):
 @pytest.mark.asyncio
 async def test_deploy_state_halted(db_session):
     """DeployStateSnapshot.halted is True when halted_at is set."""
-    await _make_deploy_state(
-        db_session, status=DeploymentStatus.HALTED, halted=True
-    )
+    await _make_deploy_state(db_session, status=DeploymentStatus.HALTED, halted=True)
     snap = await compute_system_state(db_session)
     assert snap.deploy.status == DeploymentStatus.HALTED
     assert snap.deploy.halted is True
@@ -325,16 +324,22 @@ async def test_fleet_stale_heartbeat_count(db_session):
 
     # One stale, one fresh, one with no heartbeat (not counted as stale)
     await _make_task(
-        db_session, project.id,
-        status=TaskStatus.IN_PROGRESS, last_heartbeat=stale_time,
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=stale_time,
     )
     await _make_task(
-        db_session, project.id,
-        status=TaskStatus.IN_PROGRESS, last_heartbeat=fresh_time,
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=fresh_time,
     )
     await _make_task(
-        db_session, project.id,
-        status=TaskStatus.IN_PROGRESS, last_heartbeat=None,
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
     )
 
     snap = await compute_system_state(db_session, project.id)
@@ -559,5 +564,129 @@ async def test_to_dict_datetime_fields_are_strings(db_session):
     assert isinstance(deployed_at, str)
     # Must be parseable as an ISO datetime
     from datetime import datetime
+
     parsed = datetime.fromisoformat(deployed_at.rstrip("Z"))
     assert parsed is not None
+
+
+# ---------------------------------------------------------------------------
+# Three-surface cross-surface agreement (acceptance criterion for truthful state)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_serving_sha_uses_confirmed_artifact_identifier(db_session):
+    """External-project: serving.sha comes from confirmed artifact, not the stale scalar.
+
+    Acceptance evidence: version with a confirmed promotion_merge artifact
+    (served_identifier="abc123"), no backend_revision row, and unset served_sha
+    scalar yields snapshot serving.sha equal to the artifact's served_identifier.
+    """
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    # served_sha scalar is None — as it would be for an external project that
+    # never syncs the backend_revision serving confirmation.
+    version = await _make_version(db_session, project.id, serving_status="unconfirmed")
+
+    await _make_artifact(
+        db_session,
+        version.id,
+        artifact_kind=ra.PROMOTION_MERGE_ARTIFACT_KIND,
+        serving_status="serving_confirmed",
+        served_identifier="abc123",
+        served_at=_utcnow(),
+    )
+
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    assert snap.version.serving.status == "serving_confirmed"
+    # Must use the artifact's served_identifier, not the stale/blank scalar.
+    assert snap.version.serving.sha == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_serving_sha_falls_back_when_no_evidence(db_session):
+    """Fallback: version with no confirmed artifacts uses version.served_sha."""
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    await _make_version(
+        db_session,
+        project.id,
+        serving_status="serving_confirmed",
+        served_sha="legacy-sha",
+    )
+    # No artifact rows — aggregate falls back to scalar.
+
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    assert snap.version.serving.sha == "legacy-sha"
+
+
+@pytest.mark.asyncio
+async def test_all_surfaces_agree_serving_status(db_session):
+    """All three surfaces agree on serving_confirmed for an external-project version.
+
+    External-project shape: one promotion_merge artifact (serving_confirmed),
+    no backend_revision artifact.  Without project= threading, the legacy scalar
+    fallback would synthesize an "unconfirmed" backend_revision contribution and
+    hold the aggregate back.  With project= threaded, backend_revision is
+    non-observable and vacuous, so only the promotion_merge artifact contributes,
+    yielding "serving_confirmed" across all three read surfaces.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from app.models import ReleaseVersion
+    from app.routers.admin_release_version import _serialize_version_history_entry
+    from app.strategic_spawning import _strategic_recent_version_entry
+
+    await _make_deploy_state(db_session)
+    project = await _make_project(db_session)
+    # Version scalar starts as "unconfirmed" (as set by _record_promotion_success
+    # before backend confirmation arrives).
+    version = await _make_version(db_session, project.id, serving_status="unconfirmed")
+
+    # Promotion-merge artifact confirmed (GitHub merge completed).
+    await _make_artifact(
+        db_session,
+        version.id,
+        artifact_kind=ra.PROMOTION_MERGE_ARTIFACT_KIND,
+        serving_status="serving_confirmed",
+        served_identifier="sha-abc123",
+        served_at=_utcnow(),
+    )
+    # Deliberately NO backend_revision artifact — external-project shape.
+
+    # Reload version with its artifacts relationship eagerly loaded so the
+    # admin/strategic helper functions can access version.deploy_artifacts.
+    stmt = (
+        select(ReleaseVersion)
+        .where(ReleaseVersion.id == version.id)
+        .options(selectinload(ReleaseVersion.deploy_artifacts))
+    )
+    version_row = (await db_session.execute(stmt)).scalar_one()
+
+    # Surface 1: compute_system_state canonical read.
+    snap = await compute_system_state(db_session, project.id)
+    assert snap.version is not None
+    surface1_status = snap.version.serving.status
+
+    # Surface 2: admin release-version serialization.
+    surface2_entry = _serialize_version_history_entry(version_row, project)
+    surface2_status = surface2_entry["aggregate_serving_status"]
+
+    # Surface 3: strategic-spawning version entry.
+    surface3_entry = _strategic_recent_version_entry(version_row, project)
+    surface3_status = surface3_entry["serving_status"]
+
+    # All three must agree and all must be "serving_confirmed".
+    assert surface1_status == "serving_confirmed", (
+        f"compute_system_state returned {surface1_status!r}"
+    )
+    assert surface2_status == "serving_confirmed", (
+        f"_serialize_version_history_entry returned {surface2_status!r}"
+    )
+    assert surface3_status == "serving_confirmed", (
+        f"_strategic_recent_version_entry returned {surface3_status!r}"
+    )
+    assert surface1_status == surface2_status == surface3_status

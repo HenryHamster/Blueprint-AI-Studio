@@ -176,16 +176,30 @@ async def compute_system_state(
 
             confirmed_at: datetime | None = None
             for e in evidence_list:
-                if e.get("serving_status") == "serving_confirmed" and e.get("served_at"):
+                if e.get("serving_status") == "serving_confirmed" and e.get(
+                    "served_at"
+                ):
                     try:
                         confirmed_at = datetime.fromisoformat(e["served_at"])
                     except (ValueError, TypeError):
                         pass
                     break
 
+            # Derive serving SHA from confirmed artifact evidence rather than
+            # the legacy scalar (version.served_sha), which is only synced from
+            # backend_revision and stays blank/stale for external projects.
+            serving_sha: str | None = next(
+                (
+                    e["served_identifier"]
+                    for e in evidence_list
+                    if e.get("serving_status") == "serving_confirmed"
+                    and e.get("served_identifier") is not None
+                ),
+                version.served_sha,
+            )
             serving_snap = ServingSnapshot(
                 status=aggregate_serving_status,
-                sha=version.served_sha,
+                sha=serving_sha,
                 confirmed_at=confirmed_at,
                 failure_reason=(
                     aggregate_reason
@@ -246,9 +260,7 @@ async def compute_system_state(
     evaluating = int(
         (await session.execute(_count_stmt(TaskStatus.EVALUATING))).scalar() or 0
     )
-    parked = int(
-        (await session.execute(_count_stmt(TaskStatus.PARKED))).scalar() or 0
-    )
+    parked = int((await session.execute(_count_stmt(TaskStatus.PARKED))).scalar() or 0)
 
     stale_stmt = (
         select(func.count())
@@ -260,9 +272,7 @@ async def compute_system_state(
     )
     if project_id is not None:
         stale_stmt = stale_stmt.where(Task.project_id == project_id)
-    stale_heartbeat_count = int(
-        (await session.execute(stale_stmt)).scalar() or 0
-    )
+    stale_heartbeat_count = int((await session.execute(stale_stmt)).scalar() or 0)
 
     fleet_snap = FleetSnapshot(
         active=active,

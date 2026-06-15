@@ -9300,3 +9300,72 @@ def test_stall_alert_functions_reachable_from_canonical_import_path():
         "release_qualifier.py (for check functions re-exported for callers).\n\n"
         "Unreachable functions:\n" + "\n".join(f"  {f}" for f in unreachable)
     )
+
+
+def test_summarize_release_artifacts_callers_always_pass_project():
+    """Every call to summarize_release_artifacts in backend/app/ passes project=.
+
+    Omitting project= silently enables the legacy scalar fallback that invents
+    a backend_revision contribution for external projects, causing a serving-status
+    divergence across UI / CLI / system-state surfaces. This invariant enforces
+    that all production call sites opt in to the project-aware path.
+
+    The definition file (release_artifacts.py) is excluded — the function's own
+    default parameter ``project=None`` is not a missing-keyword violation.
+    """
+    backend_dir = Path(__file__).resolve().parent.parent
+    app_dir = backend_dir / "app"
+
+    violations: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        # Exclude the definition file itself — `project=None` in the signature
+        # is intentional and is not a call-site violation.
+        if py_file.name == "release_artifacts.py":
+            continue
+        # Exclude routers sub-directory traversal already captured by rglob,
+        # but include them — they are production call sites too.
+
+        try:
+            source = py_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        if "summarize_release_artifacts" not in source:
+            continue
+
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                fname = func.id
+            elif isinstance(func, ast.Attribute):
+                fname = func.attr
+            else:
+                continue
+            if fname != "summarize_release_artifacts":
+                continue
+
+            has_project_kwarg = any(kw.arg == "project" for kw in node.keywords)
+            if not has_project_kwarg:
+                rel = py_file.relative_to(backend_dir.parent)
+                violations.append(
+                    f"  {rel}:{node.lineno} — "
+                    "call to summarize_release_artifacts() missing project= keyword"
+                )
+
+    assert not violations, (
+        "The following call sites omit project= from summarize_release_artifacts(). "
+        "Omitting project= enables a legacy scalar fallback that synthesises a "
+        "spurious backend_revision contribution for external projects and causes "
+        "serving-status divergence across surfaces. Pass project=<project_row> at "
+        "each site (or project=None if the call is known-safe and intentional — but "
+        "prefer the explicit keyword so the invariant stays informative).\n"
+        + "\n".join(violations)
+    )
