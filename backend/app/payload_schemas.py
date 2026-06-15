@@ -841,6 +841,22 @@ class RepoBootstrapOverview(BaseModel):
     source_revision: str | None = None
 
 
+class RepoDomainOverview(BaseModel):
+    """Product-domain summary extracted from README/docs during repo_bootstrap.
+
+    Persisted as a KnowledgeDocument with source_kind='repo_domain'.
+    All fields are bounded to keep the document lean (total ≤4000 chars).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    purpose: str = Field(..., max_length=2000)
+    key_concepts: dict[str, str] = Field(default_factory=dict)
+    critical_user_flows: list[str] = Field(default_factory=list)
+    architectural_gotchas: list[str] = Field(default_factory=list)
+    source: str = Field(default="none-found", max_length=500)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------

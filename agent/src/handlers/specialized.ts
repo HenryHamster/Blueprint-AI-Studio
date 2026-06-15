@@ -56,6 +56,18 @@ export function isRepoBootstrapOverview(value: unknown): value is {
     && typeof record.first_steps_summary === 'string';
 }
 
+export function isRepoDomainOverview(value: unknown): value is {
+  purpose: string;
+  key_concepts?: Record<string, string>;
+  critical_user_flows?: string[];
+  architectural_gotchas?: string[];
+  source?: string;
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.purpose === 'string' && record.purpose.trim().length >= 20;
+}
+
 /**
  * Agent-reported repo_bootstrap command write-back outcome, reported separately
  * from the repo overview. `status` is one of the backend-accepted values
@@ -1119,7 +1131,19 @@ Also read any detected build/CI manifests you find.
    \`\`\`
    Use \`success\` only if the write-back call actually succeeded with at least one confirmed command. Use \`missing_commands\` if you could not confirm any runnable command, and \`writeback_failed\` if the write-back call itself errored. The file must contain ONLY the JSON object, no markdown wrapping. This is reported independently of the overview — a good overview does NOT imply confirmed commands.
 
-4. **Status**: After completing the steps above, post COMPLETED status with \`${completionPayloadField}\` populated. If you cannot read the repo or run commands, still complete with whatever you found.
+4. **Domain overview**: Extract product-domain knowledge from the documentation you read and write the following JSON object to \`/tmp/bootstrap_domain_${taskId}.json\` (NOT inside the repository):
+   \`\`\`json
+   {
+     "purpose": "2-3 sentences: what the product does and who its primary users are",
+     "key_concepts": {"TermName": "1-sentence definition", "...": "..."},
+     "critical_user_flows": ["top user journey 1", "top user journey 2"],
+     "architectural_gotchas": ["non-obvious constraint or sharp edge", "..."],
+     "source": "primary file used, e.g. README.md"
+   }
+   \`\`\`
+   Read docs/**/*.md, ARCHITECTURE.md, DESIGN.md, OVERVIEW.md, openapi.yaml in addition to the files listed above. Cap the total at ~4000 characters. If README is absent or fewer than 200 characters, scan docs/ and top-level source docstrings. If nothing useful is found, produce a minimal stub: \`{"purpose": "No documentation found.", "key_concepts": {}, "critical_user_flows": [], "architectural_gotchas": [], "source": "none-found"}\`. The file must contain ONLY the JSON object, no markdown wrapping. Include the same object as \`domain_overview\` in the terminal COMPLETED status payload.
+
+5. **Status**: After completing the steps above, post COMPLETED status with \`${completionPayloadField}\` and \`domain_overview\` populated. If you cannot read the repo or run commands, still complete with whatever you found.
 
 ${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
 
@@ -1142,6 +1166,9 @@ ${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
   const commandMemory = isCommandMemoryOutcome(parsedCommandMemory)
     ? normalizeCommandMemoryOutcome(parsedCommandMemory)
     : null;
+  // Domain overview is best-effort: absent or malformed file is a clean no-op.
+  const parsedDomainOverview = exitCode === 0 ? readHandlerOutput(taskId, 'bootstrap_domain', ws) : null;
+  const domainOverview = isRepoDomainOverview(parsedDomainOverview) ? parsedDomainOverview : null;
   const logs = bootstrapOverview !== null
     ? sanitize(JSON.stringify(bootstrapOverview))
     : sanitize(allOutput ? allOutput.slice(-500) : 'Bootstrap complete');
@@ -1154,6 +1181,7 @@ ${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
       : {}),
     ...(bootstrapOverview !== null ? { repo_overview: bootstrapOverview } : {}),
     ...(commandMemory !== null ? { command_memory: commandMemory } : {}),
+    ...(domainOverview !== null ? { domain_overview: domainOverview } : {}),
     logs,
   });
 }

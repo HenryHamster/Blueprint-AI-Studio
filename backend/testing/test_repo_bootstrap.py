@@ -19,6 +19,7 @@ from app.models import (
     TaskStatus,
 )
 from app.auth import get_current_user, require_admin
+from app.models import KnowledgeDocument, SourceKind
 from app.payload_schemas import RepoBootstrapOverview
 
 TEST_USER_ID = "test-user-bootstrap-123"
@@ -3303,3 +3304,197 @@ class TestBootstrapRefresh:
         assert resp.status_code in (403, 404), (
             f"Non-owner must be denied, got {resp.status_code}"
         )
+
+
+class TestRepoDomainKnowledgeDocument:
+    """Tests for product-domain KnowledgeDocument upsert at bootstrap completion."""
+
+    _VALID_OVERVIEW = {
+        "tech_stack": "Python, FastAPI",
+        "directory_layout": "backend/ — FastAPI app",
+        "first_steps_summary": "pip install && pytest",
+    }
+
+    _VALID_DOMAIN = {
+        "purpose": "A platform that helps teams ship software faster by automating code review.",
+        "key_concepts": {"Task": "A unit of AI work", "Direction": "A strategic goal"},
+        "critical_user_flows": ["Create a task", "Review a PR"],
+        "architectural_gotchas": ["Never commit secrets", "Always use UTC timestamps"],
+        "source": "README.md",
+    }
+
+    async def _make_bootstrap_task(self, db_session, *, context):
+        project = Project(
+            name=f"acme/domain-{uuid.uuid4().hex[:8]}",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="domain-test",
+            build_config={"language": "python"},
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/domain-test",
+            description="First-cycle bootstrap",
+            payloads=[
+                {
+                    "type": "repo_bootstrap",
+                    "github_owner": "acme",
+                    "github_repo": "domain-test",
+                }
+            ],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context=context,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(task)
+        return project, task
+
+    @pytest.mark.asyncio
+    async def test_domain_summary_creates_knowledge_document(self, db_session):
+        """A bootstrap completion with domain_overview creates a KnowledgeDocument."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project, task = await self._make_bootstrap_task(
+            db_session,
+            context={
+                "repo_overview": dict(self._VALID_OVERVIEW),
+                "domain_overview": dict(self._VALID_DOMAIN),
+            },
+        )
+
+        await _handle_repo_bootstrap_completion(task, "", db_session)
+
+        result = await db_session.execute(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.project_id == project.id,
+                KnowledgeDocument.topic == "domain-knowledge",
+                KnowledgeDocument.source_kind == SourceKind.REPO_DOMAIN.value,
+            )
+        )
+        doc = result.scalar_one_or_none()
+        assert doc is not None, "A domain KnowledgeDocument must be created"
+        assert "acme/domain-test" in doc.title
+        assert "Product Domain Knowledge" in doc.title
+        assert "A platform" in doc.body
+        assert doc.source_citations == ["file:README.md"]
+        assert "bootstrap" in doc.tags
+
+    @pytest.mark.asyncio
+    async def test_domain_summary_upserts_on_refresh(self, db_session):
+        """Calling completion twice updates the existing document rather than inserting a duplicate."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project, task = await self._make_bootstrap_task(
+            db_session,
+            context={
+                "repo_overview": dict(self._VALID_OVERVIEW),
+                "domain_overview": dict(self._VALID_DOMAIN),
+            },
+        )
+
+        await _handle_repo_bootstrap_completion(task, "", db_session)
+
+        # Second run with an updated purpose
+        updated_domain = dict(self._VALID_DOMAIN)
+        updated_domain["purpose"] = (
+            "An updated platform description after a second bootstrap run."
+        )
+        task.context = {
+            "repo_overview": dict(self._VALID_OVERVIEW),
+            "domain_overview": updated_domain,
+        }
+        from sqlalchemy.orm.attributes import flag_modified as _fm
+
+        _fm(task, "context")
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_repo_bootstrap_completion(task, "", db_session)
+
+        result = await db_session.execute(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.project_id == project.id,
+                KnowledgeDocument.topic == "domain-knowledge",
+                KnowledgeDocument.source_kind == SourceKind.REPO_DOMAIN.value,
+            )
+        )
+        docs = result.scalars().all()
+        assert len(docs) == 1, (
+            "Upsert must update in place, not insert a second document"
+        )
+        assert "updated platform description" in docs[0].body
+
+    @pytest.mark.asyncio
+    async def test_domain_summary_absent_does_not_block_bootstrap(self, db_session):
+        """A bootstrap completion without domain_overview is a clean no-op for domain docs."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        project, task = await self._make_bootstrap_task(
+            db_session,
+            context={"repo_overview": dict(self._VALID_OVERVIEW)},
+        )
+
+        # Must not raise
+        await _handle_repo_bootstrap_completion(task, "", db_session)
+
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("bootstrap_completed_at") is not None, (
+            "Bootstrap must still succeed without domain_overview"
+        )
+
+        result = await db_session.execute(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.project_id == project.id,
+                KnowledgeDocument.source_kind == SourceKind.REPO_DOMAIN.value,
+            )
+        )
+        assert result.scalar_one_or_none() is None, (
+            "No domain KnowledgeDocument must be created when domain_overview is absent"
+        )
+
+    @pytest.mark.asyncio
+    async def test_domain_summary_stub_persists(self, db_session):
+        """A stub domain_overview (source=none-found) still creates a KnowledgeDocument."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        stub_domain = {
+            "purpose": "No documentation found — inferred from code structure.",
+            "key_concepts": {},
+            "critical_user_flows": [],
+            "architectural_gotchas": [],
+            "source": "none-found",
+        }
+
+        project, task = await self._make_bootstrap_task(
+            db_session,
+            context={
+                "repo_overview": dict(self._VALID_OVERVIEW),
+                "domain_overview": stub_domain,
+            },
+        )
+
+        await _handle_repo_bootstrap_completion(task, "", db_session)
+
+        result = await db_session.execute(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.project_id == project.id,
+                KnowledgeDocument.source_kind == SourceKind.REPO_DOMAIN.value,
+            )
+        )
+        doc = result.scalar_one_or_none()
+        assert doc is not None, (
+            "Stub domain_overview must still produce a KnowledgeDocument"
+        )
+        assert doc.source_citations == [], (
+            "none-found source must produce empty citations"
+        )
+        assert "No documentation found" in doc.body

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
-from app.payload_schemas import RepoBootstrapOverview
+from app.payload_schemas import RepoDomainOverview, RepoBootstrapOverview
 from app.task_blocked import (
     NEED_KINDS,
     NEED_LABEL_MAX_LEN,
@@ -288,6 +288,11 @@ class AgentStatusPayload(BaseModel):
     # today (older agents omit it, and completion degrades command memory to
     # "unknown" rather than claiming success).
     command_memory: CommandMemoryOutcome | None = None
+    # Optional product-domain overview extracted from README/docs during
+    # repo_bootstrap. Persisted into task.context["domain_overview"] by the
+    # status endpoint, then upserted as a KnowledgeDocument by the completion
+    # handler. Absent payloads are a clean no-op — domain capture is best-effort.
+    domain_overview: RepoDomainOverview | None = None
 
     @field_validator("blocked_need", mode="before")
     @classmethod

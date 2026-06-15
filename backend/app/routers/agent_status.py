@@ -1146,6 +1146,8 @@ async def update_agent_status(
         # which the completion handler degrades to "unknown".
         if payload.command_memory is not None:
             ctx["command_memory"] = payload.command_memory.model_dump()
+        if payload.domain_overview is not None:
+            ctx["domain_overview"] = payload.domain_overview.model_dump()
         task.context = ctx
         flag_modified(task, "context")
     if payload.file_change_details:
