@@ -14161,3 +14161,45 @@ async def test_sweep_unblock_per_row_commit_releases_lock_between_tasks(
         f"expected at least 2 per-row commits for 2 tasks, got {commit_count[0]}; "
         "the per-row lock is not being released between tasks"
     )
+
+
+# ── Acceptance: extracted sweeps re-exported from reaper_sweeps ──────────────
+
+
+def test_extracted_sweeps_reexported_from_reaper_sweeps():
+    """Symbols extracted to reaper_bug_message_sweeps must remain importable
+    from app.reaper_sweeps so no existing caller needs to change.
+
+    This is the acceptance gate for the reaper_sweeps extraction refactor:
+    it verifies both the symbol contract (importable) and the identity
+    contract (the re-exports resolve to the same objects defined in the
+    sub-module, not stale copies).
+    """
+    import app.reaper_bug_message_sweeps as _sub
+    import app.reaper_sweeps as _rs
+
+    exported_names = [
+        "WakeSweepResult",
+        "_WAKE_DELIVERY_STALL_CYCLE_THRESHOLD",
+        "get_wake_delivery_stall_cycles",
+        "reset_wake_delivery_stall_state",
+        "sweep_converge_linked_bug_messages",
+        "sweep_deliver_task_wakes",
+        "sweep_resolve_open_owned_bug_messages",
+        "sweep_resolve_stale_open_bug_messages",
+        "sweep_wake_delivery_stall_alerts",
+    ]
+    for name in exported_names:
+        assert hasattr(_rs, name), (
+            f"app.reaper_sweeps is missing re-export '{name}' — "
+            "callers that import it directly from reaper_sweeps will break"
+        )
+        # The re-export must resolve to the same object as the sub-module def,
+        # not a stale local copy left behind by a partial extraction.
+        rs_obj = getattr(_rs, name)
+        sub_obj = getattr(_sub, name)
+        assert rs_obj is sub_obj, (
+            f"app.reaper_sweeps.{name} is NOT the same object as "
+            f"app.reaper_bug_message_sweeps.{name} — the re-export is a "
+            "stale copy, not a live reference to the sub-module symbol"
+        )
