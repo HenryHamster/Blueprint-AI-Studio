@@ -1,7 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
-import { readFileSync } from 'fs';
+import { readFileSync, mkdtempSync, rmSync } from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 
 // Regression guard for the committed before/after screenshot tooling (Phase 0).
@@ -61,5 +62,48 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
     expect(src).toContain('select((.status == "changed" or .status == "new") and .width != null))[0:12]');
     // Publishes the manifest at the path pr-helper.ts reads.
     expect(src).toContain('/tmp/viewport_manifest_${TASK_ID}.json');
+  });
+});
+
+describe('writeViewportSnapshotHelper — generated ./viewport-snapshot wrapper', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'vs-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('generates a valid bash wrapper that delegates to viewport-snapshot.sh --upload', async () => {
+    // Dynamically import so the module resolves WORKSPACE from the real env;
+    // we override by passing tmpDir as the workspace arg directly.
+    const { writeViewportSnapshotHelper } = await import('./prompt.js');
+    writeViewportSnapshotHelper('test-task-id-1234', tmpDir);
+
+    const wrapperPath = path.join(tmpDir, 'viewport-snapshot');
+    const src = readFileSync(wrapperPath, 'utf-8');
+
+    // Must invoke viewport-snapshot.sh with --upload and baked-in task ID.
+    expect(src).toContain('viewport-snapshot.sh --upload --task-id');
+    expect(src).toContain('test-task-id-1234');
+    // Must be valid bash.
+    expect(() => execFileSync('bash', ['-n', wrapperPath])).not.toThrow();
+  });
+
+  it('bakes the task ID into the script so --task-id is not a runtime variable', async () => {
+    const { writeViewportSnapshotHelper } = await import('./prompt.js');
+    writeViewportSnapshotHelper('abc-task-xyz', tmpDir);
+
+    const src = readFileSync(path.join(tmpDir, 'viewport-snapshot'), 'utf-8');
+    // Task ID must appear as a literal assignment, not just forwarded from env.
+    expect(src).toMatch(/TASK_ID="abc-task-xyz"/);
+  });
+
+  it('VIEWPORT_SNAPSHOT_HINT references ./viewport-snapshot (not the raw bash invocation)', async () => {
+    const { VIEWPORT_SNAPSHOT_HINT } = await import('./prompt.js');
+    expect(VIEWPORT_SNAPSHOT_HINT).toContain('./viewport-snapshot');
+    expect(VIEWPORT_SNAPSHOT_HINT).not.toContain('bash scripts/viewport-snapshot.sh`');
   });
 });
