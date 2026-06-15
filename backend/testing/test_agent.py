@@ -19107,7 +19107,7 @@ async def test_viewport_shots_download_url_non_member_rejected(
 async def test_agent_viewport_failure_screenshot_download_url(
     client: AsyncClient, db_session, mocker
 ):
-    """Agent with matching project_id gets a signed download URL for a failure screenshot."""
+    """Agent can download its own failure screenshot when context URI matches."""
     project = Project(name="Agent VP Fail DL Test", user_id="user-agent-vpdl-001")
     db_session.add(project)
     await db_session.commit()
@@ -19118,6 +19118,9 @@ async def test_agent_viewport_failure_screenshot_download_url(
         status="EVALUATING",
         payloads=[{"type": "fix", "prompt": "fix vp"}],
         vm_instance_id="vm-agent-vpdl-001",
+        context={
+            "viewport_failure_screenshot_uri": f"gs://bucket/viewport-failures/{project.id}/ChatPanel-375.png"
+        },
     )
     db_session.add(task)
     await db_session.commit()
@@ -19143,6 +19146,55 @@ async def test_agent_viewport_failure_screenshot_download_url(
     )
     assert resp.status_code == 200
     assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_failure_screenshot_download_url_cross_task_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent cannot download a failure screenshot it did not upload (cross-task read denied)."""
+    project = Project(
+        name="Agent VP Fail DL Cross", user_id="user-agent-vpdl-cross-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # task_a uploaded a screenshot; task_b tries to download it
+    task_a = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-agent-vpdl-cross-001",
+        context={
+            "viewport_failure_screenshot_uri": f"gs://bucket/viewport-failures/{project.id}/ChatPanel-375.png"
+        },
+    )
+    task_b = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-agent-vpdl-cross-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # task_b's token — no matching context entry
+    token = create_agent_token(
+        str(task_b.id), "vm-agent-vpdl-cross-002", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/agent/viewport/failure-screenshot-download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "ChatPanel",
+            "width": 375,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
 
 
 @pytest.mark.asyncio

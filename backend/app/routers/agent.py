@@ -4104,15 +4104,25 @@ async def get_viewport_failure_screenshot_download_url_agent(
     component: str,
     width: int,
     token: dict = Depends(verify_agent_token),
+    session: AsyncSession = Depends(get_session),
 ):
     """Generate a signed download URL for a viewport failure screenshot (agent-token path).
 
-    Scoped to the agent's own project_id claim — cross-project reads are denied.
-    The GCS path mirrors the upload endpoint exactly so agents can read back what
-    they uploaded without a separate admin-auth round-trip.
+    Scoped to the agent's own task (sub claim) — cross-task reads are denied.
+    The calling task must have previously uploaded a screenshot at the requested
+    path (stamped in task.context['viewport_failure_screenshot_uri']).
     """
     if str(project_id) != token.get("project_id"):
         raise HTTPException(status_code=403, detail="Project ID mismatch")
+
+    task_id = token.get("sub")
+    if not task_id:
+        raise HTTPException(status_code=403, detail="Agent token has no task scope")
+
+    result = await session.execute(select(Task).where(Task.id == uuid.UUID(task_id)))
+    task = result.scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=403, detail="Task not found")
 
     from app.storage import (
         ARTIFACT_BUCKET_NAME,
@@ -4122,6 +4132,12 @@ async def get_viewport_failure_screenshot_download_url_agent(
     from app.viewport_evidence import viewport_object_name
 
     object_name = viewport_object_name(project_id, component, width)
+    stamped_uri = (task.context or {}).get("viewport_failure_screenshot_uri", "")
+    if not stamped_uri or not stamped_uri.endswith(object_name):
+        raise HTTPException(
+            status_code=403,
+            detail="Agent may only download its own uploaded screenshot",
+        )
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
 
     try:
