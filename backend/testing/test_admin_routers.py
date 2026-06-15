@@ -2123,6 +2123,59 @@ class TestDeleteProject:
         assert remaining == []
 
     @pytest.mark.asyncio
+    async def test_delete_project_with_knowledge_document_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """A project that produced a KnowledgeDocument can be force-deleted.
+
+        Regression for the latent FK violation: knowledgedocument.source_task_id
+        had no ON DELETE action, so deleting the project cascaded to tasks but
+        then blocked on the KnowledgeDocument → task FK (constraint
+        knowledgedocument_source_task_id_fkey).  Migration 0289 adds CASCADE;
+        this test proves the end-to-end delete succeeds and both the task and
+        the knowledge document row are gone.
+        """
+        from app.models import KnowledgeDocument
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "web_research", "topic": "auth", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            title="Auth design",
+            summary="Summary of auth design.",
+            body="# Auth\n\nBody text.",
+            source_kind="web_research",
+        )
+        db_session.add(doc)
+        await db_session.commit()
+        doc_id = doc.id
+
+        resp = await client.delete(f"/api/admin/projects/{project.id}?force=true")
+        assert resp.status_code == 200, (
+            f"project delete must cascade knowledgedocument rows, not FK-violate; "
+            f"got {resp.status_code}: {resp.text}"
+        )
+
+        db_session.expire_all()
+        remaining_doc = (
+            await db_session.execute(
+                select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+            )
+        ).scalar_one_or_none()
+        assert remaining_doc is None, (
+            "KnowledgeDocument must be removed with its source task"
+        )
+
+    @pytest.mark.asyncio
     async def test_delete_project_force_populates_deny_list(
         self, client: AsyncClient, db_session, mocker
     ):

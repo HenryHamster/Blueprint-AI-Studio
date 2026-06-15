@@ -3204,7 +3204,14 @@ class KnowledgeDocument(SQLModel, table=True):
     project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
 
     # Provenance: the task whose terminal output produced this document.
-    source_task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
+    # ON DELETE CASCADE: removing the source task also removes the derived doc.
+    source_task_id: uuid.UUID = Field(
+        sa_column=Column(
+            ForeignKey("task.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
 
     # Which task kind produced this document (``design`` vs ``web_research``).
     # Stored as the enum value in a plain String column so it is index-friendly
