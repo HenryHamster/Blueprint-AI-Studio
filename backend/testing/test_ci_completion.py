@@ -4088,3 +4088,135 @@ async def test_no_precomputed_guard_calls_enforce_inline(db_session, mocker):
     )
 
     guard_mock.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Onboarding-proof: first merge-gate terminal verdict stamp
+#
+# Verifies the truthfulness invariant wired at the merge-success site:
+#   * a verified merge (no unverified_merge_reason) stamps
+#     first_merge_gate_executed_tests = True and no fall-open reason;
+#   * an unverified merge (gate fell open) stamps
+#     first_merge_gate_executed_tests = False AND the honest reason;
+#   * the stamp is idempotent — a later verdict never overwrites the first.
+# ---------------------------------------------------------------------------
+
+
+def _patch_merge_success(mocker):
+    """Patch the merge hot path so a single merge call lands successfully."""
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_unverified_merge_alert",
+        AsyncMock(return_value=None),
+    )
+    return mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True, "sha": "deadbeef"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_merge_gate_verdict_stamped_when_real_tests_executed(
+    db_session, mocker
+):
+    """A verified merge (no unverified reason) stamps executed_tests=True."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    _patch_merge_success(mocker)
+
+    project = Project(name="gate verdict verified", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    bc = project.build_config or {}
+    assert bc.get("first_merge_gate_verdict_at") is not None
+    assert bc.get("first_merge_gate_executed_tests") is True
+    # No fall-open reason recorded when the gate ran real tests.
+    assert bc.get("first_merge_gate_unverified_reason") is None
+
+
+@pytest.mark.asyncio
+async def test_first_merge_gate_verdict_stamped_false_when_gate_fell_open(
+    db_session, mocker
+):
+    """An unverified merge stamps executed_tests=False AND the honest reason."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    _patch_merge_success(mocker)
+
+    project = Project(name="gate verdict unverified", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"unverified_merge_reason": "no_test_command"},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    bc = project.build_config or {}
+    assert bc.get("first_merge_gate_verdict_at") is not None
+    # Truthfulness invariant: gate fell open ⇒ executed_tests must be False.
+    assert bc.get("first_merge_gate_executed_tests") is False
+    assert bc.get("first_merge_gate_unverified_reason") == "no_test_command"
+
+
+@pytest.mark.asyncio
+async def test_first_merge_gate_verdict_is_idempotent(db_session, mocker):
+    """A later verdict never overwrites the first stamp's truthful values."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    _patch_merge_success(mocker)
+
+    # Pre-stamp a prior VERIFIED verdict; the merge below carries an unverified
+    # reason. Idempotency must preserve the original True verdict and timestamp.
+    project = Project(
+        name="gate verdict idempotent",
+        user_id="test-user",
+        build_config={
+            "first_merge_gate_verdict_at": "2020-01-01T00:00:00",
+            "first_merge_gate_executed_tests": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"unverified_merge_reason": "no_test_command"},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    bc = project.build_config or {}
+    assert bc.get("first_merge_gate_verdict_at") == "2020-01-01T00:00:00"
+    assert bc.get("first_merge_gate_executed_tests") is True
+    # The fall-open reason from the second (skipped) verdict was NOT recorded.
+    assert bc.get("first_merge_gate_unverified_reason") is None

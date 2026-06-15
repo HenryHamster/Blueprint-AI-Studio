@@ -41,6 +41,7 @@ from app.ci_resolution import (
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
+from app.onboarding_proof import build_onboarding_proof_block
 
 router = APIRouter(
     prefix="/api/admin",
@@ -228,6 +229,7 @@ async def get_all_projects(
                 "task_status_counts": task_status_counts.get(
                     str(row.id), _empty_counts
                 ),
+                "onboarding_proof": build_onboarding_proof_block(row),
             }
             for row in page_rows
         ],
@@ -302,6 +304,7 @@ async def get_project(
         ),
         "capability_adoption_verdicts": get_trial_verdicts(project),
         "my_role": role,
+        "onboarding_proof": build_onboarding_proof_block(project),
     }
 
 

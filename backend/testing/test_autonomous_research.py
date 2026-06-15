@@ -16012,3 +16012,37 @@ async def test_filter_breakdown_type_filtered_is_per_direction(db_session):
     assert tf_a == 2, f"Direction A type_filtered must be 2 (its own count), got {tf_a}"
     assert tf_b == 1, f"Direction B type_filtered must be 1 (its own count), got {tf_b}"
     assert tf_a != tf_b, "Directions must not share the same type_filtered count"
+
+
+@pytest.mark.asyncio
+async def test_first_task_spawned_stamped_on_research_spawn(db_session):
+    """_spawn_research_task stamps first_task_spawned_at in project.build_config
+    on the first successful autonomous research spawn.
+
+    Follows the same project setup as
+    test_research_spawn_proceeds_when_external_repo_bootstrap_completed and adds
+    a post-spawn assertion that the onboarding milestone was recorded.
+    """
+    direction = _active_direction_with_cooldown_elapsed(
+        "d-stamp-spawn", "First spawn stamp direction"
+    )
+    project = Project(
+        name="First Task Spawned Stamp",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_strategic_failures": 3},
+        build_config={"bootstrap_completed_at": "2026-01-01T00:00:00"},
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("first_task_spawned_at") is not None, (
+        "first_task_spawned_at must be stamped in build_config after the first "
+        "successful autonomous research spawn"
+    )

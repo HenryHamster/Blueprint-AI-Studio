@@ -2594,6 +2594,20 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             continue
         spawned_tasks.append(new_task)
 
+    # Onboarding-proof: record the first non-bootstrap autonomous task spawn for
+    # this project. Best-effort and idempotent — only the first spawn stamps —
+    # and it must never gate the spawn commit, so it is wrapped defensively.
+    if spawned_tasks:
+        try:
+            from app.onboarding_proof import stamp_first_task_spawned
+
+            stamp_first_task_spawned(project, session, when=_utcnow())
+        except Exception:  # noqa: BLE001 — observability stamp never blocks spawn
+            logger.warning(
+                "[AUTONOMOUS] onboarding first-task-spawned stamp failed",
+                exc_info=True,
+            )
+
     await session.commit()
 
     # Track first task for HALF_OPEN → CLOSED transition

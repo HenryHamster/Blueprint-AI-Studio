@@ -664,6 +664,27 @@ async def _attempt_merge_with_retry_and_escalation(
         # ONCE to the operator now that the merge actually landed. Deduped per
         # PR inside the helper; isolated so an alert error never undoes the merge.
         _unverified_reason = ci_loop.get("unverified_merge_reason")
+        # Onboarding-proof: stamp the first merge-gate terminal verdict for this
+        # project. Truthfulness invariant — the gate genuinely executed the
+        # repo's own tests ONLY when no unverified-merge reason was recorded;
+        # any reason means the gate fell open, so executed_real_tests is False
+        # and the fall-open reason is recorded honestly. Best-effort and
+        # idempotent; never gates the merge.
+        try:
+            from app.onboarding_proof import stamp_first_merge_gate_verdict
+
+            stamp_first_merge_gate_verdict(
+                _merge_project,
+                session,
+                executed_real_tests=_unverified_reason is None,
+                unverified_reason=_unverified_reason,
+                when=_utcnow(),
+            )
+        except Exception:  # observability stamp never blocks the merge
+            logger.warning(
+                "[CI] onboarding first-merge-gate-verdict stamp failed",
+                exc_info=True,
+            )
         if _unverified_reason:
             try:
                 from app.alert_dispatch import _severity_for_unverified_reason

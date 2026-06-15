@@ -1876,6 +1876,21 @@ async def _process_post_commit(
             ):
                 pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
                 _project = await session.get(Project, task.project_id)
+                # Onboarding-proof: record the first PR opened for this project.
+                # This is the caller that records the freshly-opened PR and has
+                # both the Project ORM object and the async session in scope (the
+                # low-level create_pull_request helper has neither). Best-effort
+                # and idempotent; the staged mutation persists via the routing
+                # commits below. Never gates the PR-routing path.
+                try:
+                    from app.onboarding_proof import stamp_first_pr_opened
+
+                    stamp_first_pr_opened(_project, session, when=_utcnow())
+                except Exception:  # observability stamp never blocks PR routing
+                    logger.warning(
+                        "[POST_COMMIT] onboarding first-pr-opened stamp failed",
+                        exc_info=True,
+                    )
                 branch = _derive_task_branch(
                     task.id,
                     task_type,
