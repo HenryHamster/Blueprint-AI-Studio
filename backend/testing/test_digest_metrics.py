@@ -32,7 +32,6 @@ from app.digest_metrics import (
     compute_release_qualifier_infra_metrics,
     compute_retry_analytics,
     compute_research_output_quality,
-    compute_safeguard_shadow_metrics,
     compute_scope_mismatch_summary,
     compute_task_type_cost_adherence,
     compute_trial_arm_accumulation,
@@ -5968,84 +5967,6 @@ async def test_park_wake_health_timeout_by_cause_breakdown(db_session):
     # The non-park_wake_timeout task must not contribute to any cause bucket.
     total = sum(by_cause.values())
     assert total == 3, f"expected 3 total timeout tasks; got {total} in {by_cause}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# compute_safeguard_shadow_metrics
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _make_shadow_task(outcome: str | None) -> object:
-    """Return a minimal Task-like object with the given safeguard_observe_verdict."""
-    from app.task_evaluators import SAFEGUARD_OBSERVE_VERDICT_KEY
-
-    ctx: dict = {}
-    if outcome is not None:
-        ctx[SAFEGUARD_OBSERVE_VERDICT_KEY] = {"outcome": outcome, "reasoning": "test"}
-
-    task = make_task(
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "security_audit", "base_branch": "main"}],
-        context=ctx,
-    )
-    return task
-
-
-def test_compute_safeguard_shadow_metrics_empty():
-    """No tasks → all zero counts and None rate."""
-    result = compute_safeguard_shadow_metrics([])
-    assert result["observed_blocks"] == 0
-    assert result["would_release"] == 0
-    assert result["confirmed"] == 0
-    assert result["unavailable"] == 0
-    assert result["false_positive_rate"] is None
-    assert result["cap_reached"] is False
-
-
-def test_compute_safeguard_shadow_metrics_no_shadow_verdicts():
-    """Tasks without a shadow verdict are ignored."""
-    tasks = [
-        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "security_audit"}]),
-        make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "security_audit"}]),
-    ]
-    result = compute_safeguard_shadow_metrics(tasks)
-    assert result["observed_blocks"] == 0
-    assert result["false_positive_rate"] is None
-
-
-def test_compute_safeguard_shadow_metrics_counts_outcomes():
-    """Correctly tallies rejected/confirmed/unavailable shadow verdicts."""
-    tasks = [
-        _make_shadow_task("rejected"),
-        _make_shadow_task("downgraded"),
-        _make_shadow_task("confirmed"),
-        _make_shadow_task("unavailable"),
-        _make_shadow_task("rejected"),
-    ]
-    result = compute_safeguard_shadow_metrics(tasks)
-    assert result["observed_blocks"] == 5
-    assert result["would_release"] == 3, "rejected + downgraded + rejected"
-    assert result["confirmed"] == 1
-    assert result["unavailable"] == 1
-    assert result["false_positive_rate"] == round(3 / 5, 3)
-    assert result["cap_reached"] is False
-
-
-def test_compute_safeguard_shadow_metrics_false_positive_rate():
-    """false_positive_rate is would_release / observed_blocks."""
-    tasks = [_make_shadow_task("rejected"), _make_shadow_task("confirmed")]
-    result = compute_safeguard_shadow_metrics(tasks)
-    assert result["false_positive_rate"] == 0.5
-
-
-def test_compute_safeguard_shadow_metrics_cap_reached():
-    """When task count exceeds _SAFEGUARD_SHADOW_CAP the cap_reached flag is set."""
-    from app.digest_metrics import _SAFEGUARD_SHADOW_CAP
-
-    tasks = [_make_shadow_task("confirmed") for _ in range(_SAFEGUARD_SHADOW_CAP + 5)]
-    result = compute_safeguard_shadow_metrics(tasks)
-    assert result["cap_reached"] is True
-    assert result["observed_blocks"] == _SAFEGUARD_SHADOW_CAP
 
 
 # ---------------------------------------------------------------------------

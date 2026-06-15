@@ -1,32 +1,31 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useCallback, useRef, useMemo } from 'react';
 import { AlertTriangle } from 'lucide-react';
-import { apiFetch, fetchTask, fetchFleetUtilization, fetchAgentServingShas, type AgentServingShasResponse, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse, type SrReviewerDisagreementsEnvelope } from '../api';
+import { fetchTask } from '../api';
 import { timeAgo } from '../utils/time';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
-import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
 import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
 import { PRMonitorSection, type OpenPR } from './PRMonitorSection';
-import { MediumScopeWidget, type MediumScopeMeasurement } from './MediumScopeWidget';
+import { MediumScopeWidget } from './MediumScopeWidget';
 import { RemediationFunnelSection } from './RemediationFunnelSection';
 import { FailureStageWidget } from './FailureStageWidget';
-import { TaskDurationWidget, type TaskDurationStats } from './TaskDurationWidget';
+import { TaskDurationWidget } from './TaskDurationWidget';
 import { FixLoopConvergenceWidget } from './FixLoopConvergenceWidget';
 import { OuterReviewLoopConvergenceWidget } from './OuterReviewLoopConvergenceWidget';
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
-import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
+import { ScopeTrendsSection } from './ScopeTrendsSection';
 import { ProviderCostPanel } from './ProviderCostPanel';
 import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 import { LlmCostBreakdownPanel } from './LlmCostBreakdownPanel';
 import { CapabilityTrialsPanel } from './CapabilityTrialsPanel';
 import { EffortEfficiencyPanel } from './EffortEfficiencyPanel';
 import { DriftSignalsCard } from './DriftSignalsCard';
-import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
-import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
+import { PoolAccountHealthPanel } from './PoolAccountHealthPanel';
+import { SystemMaturityCard } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { type SrMissedTask, type DirectionSrEntry } from './SrTrendBreakdown';
+import { type DirectionSrEntry } from './SrTrendBreakdown';
 import { ReviewQualitySection, type SrFixIterationBucket, type SrTrendWithFixIterations } from './ReviewQualitySection';
-import { SrDiagnosticsStack, type BlindSpotsData, type DirectionSrBreakdownData } from './SrDiagnosticsStack';
+import { SrDiagnosticsStack } from './SrDiagnosticsStack';
 import {
   MetricCard,
   FailedCard,
@@ -43,8 +42,8 @@ import { SystemStatusCard } from './SystemStatusCard';
 import { PipelineEfficiencyPanel } from './PipelineEfficiencyPanel';
 import { WarmReuseVsCostTrend } from './WarmReuseVsCostTrend';
 import { FailureClassPill } from './FailureClassPill';
-import { SystemHealthCard, type HealthOverviewResponse } from './SystemHealthCard';
-import { FleetCapacityCard, type FleetUtilizationResponse } from './FleetCapacityCard';
+import { SystemHealthCard } from './SystemHealthCard';
+import { FleetCapacityCard } from './FleetCapacityCard';
 import { AnomalyThrottleBanner } from './AnomalyThrottleBanner';
 import { FailureTaxonomyBreakdown } from './FailureTaxonomyBreakdown';
 import { ReviewRejectionBreakdown } from './ReviewRejectionBreakdown';
@@ -59,7 +58,11 @@ import { DependencyHealthCard } from './DependencyHealthCard';
 import { ImprovementLanesPanel } from './ImprovementLanesPanel';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
-import { assertDigestContract, type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
+import { type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
+import { useDashboardDigest, type SparkPoint } from '../hooks/useDashboardDigest';
+import { useOpenPRs } from '../hooks/useOpenPRs';
+import { useVersionLifecycle } from '../hooks/useVersionLifecycle';
+import { useProjectMetrics } from '../hooks/useProjectMetrics';
 
 // Dashboard reads DirectionPortfolioSection's `DirectionProgress` shape off
 // `direction_progress`, so it instantiates the generic canonical type with it.
@@ -76,11 +79,8 @@ export type { SrFixIterationBucket, SrTrendWithFixIterations };
 // DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
 export type { DirectionSrEntry };
 
-export interface SparkPoint {
-  active: number;
-  queued: number;
-  failed: number;
-}
+// SparkPoint is defined in useDashboardDigest and re-exported here for dependents
+export type { SparkPoint };
 
 // ---------- props ----------
 
@@ -107,14 +107,6 @@ export interface DashboardHomeProps {
   userRole?: 'admin' | 'user' | null;
 }
 
-interface OpenPrsResponse {
-  open_prs?: OpenPR[];
-  project_integration_branch?: string | null;
-  project_promotion_target?: string | null;
-  degraded?: boolean;
-  degraded_reason?: string | null;
-}
-
 // ---------- component ----------
 
 const WINDOW_OPTIONS = [
@@ -126,135 +118,65 @@ const WINDOW_OPTIONS = [
 ];
 
 export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, userRole }: DashboardHomeProps) {
-  const [digest, setDigest] = useState<DigestData | null>(null);
-  const [digestStale, setDigestStale] = useState(false);
-  const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
-  const [openPRsStale, setOpenPRsStale] = useState(false);
-  const [openPRsDegraded, setOpenPRsDegraded] = useState(false);
-  const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
-  const [openPRsPromotionTarget, setOpenPRsPromotionTarget] = useState<string | null>(null);
-  const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
-  const [scopeBaselines, setScopeBaselines] = useState<ScopeBaselinesResponse | null>(null);
-  const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
-  const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
-  const [accountHealthServedStale, setAccountHealthServedStale] = useState(false);
-  const [accountHealthGeneratedAt, setAccountHealthGeneratedAt] = useState<string | null>(null);
-  const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
-  const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
-  const [versionLifecycle, setVersionLifecycle] = useState<VersionLifecycleResponse | null>(null);
-  const [versionLifecycleError, setVersionLifecycleError] = useState<string | null>(null);
-  const [versionLifecycleLastSuccessAt, setVersionLifecycleLastSuccessAt] = useState<string | null>(null);
-  const [versionLifecycleRefreshing, setVersionLifecycleRefreshing] = useState(false);
-  const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
-  const [expandedBlindSpotThemes, setExpandedBlindSpotThemes] = useState<Set<string>>(new Set());
-  const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
-  const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
-  const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsEnvelope | null>(null);
-  const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
-  const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [healthOverview, setHealthOverview] = useState<HealthOverviewResponse | null>(null);
-  const [fleetUtilization, setFleetUtilization] = useState<FleetUtilizationResponse | null>(null);
-  const [agentServingShas, setAgentServingShas] = useState<AgentServingShasResponse | null>(null);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
-  const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
-  const [lastFetchError, setLastFetchError] = useState(false);
   const [windowHours, setWindowHours] = useState(24);
   const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
   const [srDrillThroughError, setSrDrillThroughError] = useState<{ taskId: string; message: string } | null>(null);
-  const sparkRef = useRef<SparkPoint[]>([]);
-  const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
-  // Tracks whether any successful digest fetch has run in the current project
-  // context. Used in the allFailed check to avoid reading stale `digest` state
-  // inside the fetchData useCallback closure.
-  const digestHasDataRef = useRef(false);
+  const [expandedBlindSpotThemes, setExpandedBlindSpotThemes] = useState<Set<string>>(new Set());
+  const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
   const reviewQualitySectionRef = useRef<HTMLElement>(null);
-  const dashboardRequestIdRef = useRef(0);
-  const openPRsRequestIdRef = useRef(0);
-  const versionLifecycleRequestIdRef = useRef(0);
+
+  // Reset project-scoped UI state synchronously during render on project switch
+  // (React "adjust state during rendering" pattern).
+  const [lastProjectIdForUi, setLastProjectIdForUi] = useState(selectedProjectId);
+  if (lastProjectIdForUi !== selectedProjectId) {
+    setLastProjectIdForUi(selectedProjectId);
+    setExpandedBlindSpotThemes(new Set());
+  }
+
+  // Compute task counts from props before hook calls — used by useDashboardDigest for sparkline
+  const pageActiveCount = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
+  const pageQueuedCount = tasks.filter(t => t.status === 'QUEUED').length;
+  const activeCount = selectedProjectId && scopedActiveCount != null
+    ? scopedActiveCount
+    : (globalActiveCount ?? pageActiveCount);
+  const queuedCount = selectedProjectId && scopedQueuedCount != null
+    ? scopedQueuedCount
+    : (globalQueuedCount ?? pageQueuedCount);
+
+  const { digest, digestStale, loading, lastFetchError, sparkData, refetchDigest } = useDashboardDigest(selectedProjectId, windowHours, activeCount, queuedCount);
+  const { openPRs, openPRsStale, openPRsDegraded, openPRsIntegrationBranch, openPRsPromotionTarget, openPRsRefreshing, fetchOpenPRs } = useOpenPRs(selectedProjectId);
+  const { versionLifecycle, versionLifecycleError, versionLifecycleLastSuccessAt, versionLifecycleRefreshing, refreshVersionLifecycle } = useVersionLifecycle(selectedProjectId);
+  const {
+    measurementData,
+    scopeBaselines,
+    accountHealth,
+    accountHealthServedStale,
+    accountHealthGeneratedAt,
+    systemMaturity,
+    blindSpots,
+    srRecentMisses,
+    srRecentMissesTotal,
+    srReviewerDisagreements,
+    directionSrBreakdown,
+    fingerprintAnalytics,
+    taskDurationStats,
+    healthOverview,
+    fleetUtilization,
+    agentServingShas,
+  } = useProjectMetrics(selectedProjectId, windowHours, selectedSrCategory);
 
   const selectedProject = projects?.find(p => p.id === selectedProjectId);
   const srCatchRateTargets = selectedProject?.sr_catch_rate_targets;
-
-  const resetProjectScopedState = useCallback(() => {
-    setDigest(null);
-    setDigestStale(false);
-    setOpenPRs([]);
-    setOpenPRsStale(false);
-    setOpenPRsDegraded(false);
-    setOpenPRsIntegrationBranch(null);
-    setOpenPRsPromotionTarget(null);
-    setMeasurementData(null);
-    setScopeBaselines(null);
-    setAccountHealth(null);
-    setAccountHealthServedStale(false);
-    setAccountHealthGeneratedAt(null);
-    setSystemMaturity(null);
-    setTaskDurationStats(null);
-    setVersionLifecycle(null);
-    setVersionLifecycleError(null);
-    setVersionLifecycleLastSuccessAt(null);
-    setVersionLifecycleRefreshing(false);
-    setBlindSpots(null);
-    setExpandedBlindSpotThemes(new Set());
-    setSrRecentMisses(null);
-    setSrRecentMissesTotal(0);
-    setSrReviewerDisagreements(null);
-    setDirectionSrBreakdown(null);
-    setFingerprintAnalytics(null);
-    setHealthOverview(null);
-    setFleetUtilization(null);
-    setAgentServingShas(null);
-    setSparkData([]);
-    sparkRef.current = [];
-    digestHasDataRef.current = false;
-    setOpenPRsRefreshing(false);
-    setLoading(true);
-    setLastFetchError(false);
-  }, []);
-
-  // Fetch open PRs only — used by manual refresh button
-  const fetchOpenPRs = useCallback(async () => {
-    if (!selectedProjectId) return;
-    const requestId = ++openPRsRequestIdRef.current;
-    setOpenPRsRefreshing(true);
-    try {
-      const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
-      if (res.ok && requestId === openPRsRequestIdRef.current) {
-        const data = await res.json() as OpenPrsResponse;
-        setOpenPRs(data.open_prs ?? []);
-        setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
-        setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
-        setOpenPRsDegraded(Boolean(data.degraded));
-        setOpenPRsStale(false);
-      } else if (requestId === openPRsRequestIdRef.current) {
-        setOpenPRsStale(true);
-        setOpenPRsDegraded(false);
-      }
-    } catch { /* silent */ }
-    finally {
-      if (requestId === openPRsRequestIdRef.current) {
-        setOpenPRsRefreshing(false);
-      }
-    }
-  }, [selectedProjectId]);
 
   const handleCategoryClick = useCallback((category: string) => {
     setSelectedSrCategory(category);
     onCategoryClick?.(category);
   }, [onCategoryClick]);
 
-  const handleScopeClick = useCallback((scope: string) => {
-    onScopeClick?.(scope);
-  }, [onScopeClick]);
-
   const handleScrollToReviewQuality = useCallback(() => {
     reviewQualitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, []);
-
-  const handleConfigureTargets = useCallback(() => {
-    onConfigureTargets?.();
-  }, [onConfigureTargets]);
 
   const handleOpenDirections = selectedProjectId && onDirectionClick
     ? () => onDirectionClick('')
@@ -284,303 +206,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     });
   }, [tasks, onViewTask]);
 
-  // Fetch data
-  const fetchData = useCallback(async (requestId: number) => {
-    let digestOk = false;
-    const fetches: Promise<void>[] = [];
-
-    // Digest
-    fetches.push(
-      (async () => {
-        try {
-          const url = selectedProjectId
-            ? `/api/admin/digest?hours=${windowHours}&project_id=${encodeURIComponent(selectedProjectId)}`
-            : `/api/admin/digest?hours=${windowHours}`;
-          const res = await apiFetch(url);
-          if (res.ok && requestId === dashboardRequestIdRef.current) {
-            const data = await res.json();
-            if (requestId === dashboardRequestIdRef.current && assertDigestContract<DirectionProgress>(data)) {
-              setDigest(data);
-              setDigestStale(false);
-              digestHasDataRef.current = true;
-              digestOk = true;
-            } else if (requestId === dashboardRequestIdRef.current) {
-              // Contract failed — preserve previous digest, mark stale
-              setDigestStale(true);
-            }
-          } else if (requestId === dashboardRequestIdRef.current) {
-            // HTTP error — preserve previous digest, mark stale
-            setDigestStale(true);
-          }
-        } catch {
-          if (requestId === dashboardRequestIdRef.current) {
-            setDigestStale(true);
-          }
-          /* silent */
-        }
-      })(),
-    );
-
-    // Diagnostics + open PRs — only when a project is selected
-    let diagnosticsOk = false;
-    let openPRsOk = false;
-    if (selectedProjectId) {
-      fetches.push(
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) { diagnosticsOk = true; }
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) {
-              const data = await res.json() as OpenPrsResponse;
-              setOpenPRs(data.open_prs ?? []);
-              setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
-              setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
-              setOpenPRsDegraded(Boolean(data.degraded));
-              setOpenPRsStale(false);
-              openPRsOk = true;
-            } else if (requestId === dashboardRequestIdRef.current) {
-              setOpenPRsStale(true);
-              setOpenPRsDegraded(false);
-            }
-          } catch {
-            if (requestId === dashboardRequestIdRef.current) {
-              setOpenPRsStale(true);
-              setOpenPRsDegraded(false);
-            }
-          }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/medium-scope-measurement?project_id=${encodeURIComponent(selectedProjectId)}&lookback_days=90`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) setMeasurementData(await res.json());
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/scope-baselines?project_id=${encodeURIComponent(selectedProjectId)}&lookback_days=30`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) setScopeBaselines(await res.json());
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/max-plan-accounts/health`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) {
-              const data = await res.json();
-              setAccountHealth(data.accounts ?? []);
-              setAccountHealthServedStale(data.served_stale === true);
-              setAccountHealthGeneratedAt(
-                typeof data.generated_at === 'string' ? data.generated_at : null,
-              );
-            }
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/system-maturity`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) {
-              const data = await res.json();
-              setSystemMaturity(Array.isArray(data) ? data : []);
-            }
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-blind-spots`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) setBlindSpots(await res.json());
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-reviewer-disagreements`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) setSrReviewerDisagreements(await res.json());
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const params = new URLSearchParams();
-            if (selectedSrCategory) params.set('category', selectedSrCategory);
-            const query = params.toString();
-            const url = `/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-recent-misses${query ? `?${query}` : ''}`;
-            const res = await apiFetch(url);
-            if (res.ok && requestId === dashboardRequestIdRef.current) {
-              const data = await res.json();
-              setSrRecentMisses(data.misses ?? []);
-              setSrRecentMissesTotal(data.total ?? (data.misses ?? []).length);
-            }
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/direction-sr-breakdown`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) setDirectionSrBreakdown(await res.json());
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/prompt-fingerprint-analytics`);
-            if (res.ok && requestId === dashboardRequestIdRef.current) setFingerprintAnalytics(await res.json());
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
-            if (requestId !== dashboardRequestIdRef.current) return;
-            if (res.ok) {
-              setVersionLifecycle(await res.json());
-              setVersionLifecycleError(null);
-              setVersionLifecycleLastSuccessAt(new Date().toISOString());
-            } else {
-              setVersionLifecycleError(`Version lifecycle unavailable (${res.status})`);
-            }
-          } catch {
-            if (requestId === dashboardRequestIdRef.current) {
-              setVersionLifecycleError('Version lifecycle refresh failed');
-            }
-          }
-        })(),
-        (async () => {
-          try {
-            const data = await fetchAgentServingShas(selectedProjectId);
-            if (requestId === dashboardRequestIdRef.current) setAgentServingShas(data);
-          } catch {
-            if (requestId === dashboardRequestIdRef.current) setAgentServingShas(null);
-          }
-        })(),
-      );
-    }
-
-    fetches.push(
-      (async () => {
-        try {
-          const url = selectedProjectId
-            ? `/api/admin/task-duration-stats?project_id=${encodeURIComponent(selectedProjectId)}`
-            : `/api/admin/task-duration-stats`;
-          const res = await apiFetch(url);
-          if (res.ok && requestId === dashboardRequestIdRef.current) setTaskDurationStats(await res.json());
-        } catch { /* silent */ }
-      })(),
-      (async () => {
-        try {
-          const url = selectedProjectId
-            ? `/api/admin/health-overview?project_id=${encodeURIComponent(selectedProjectId)}&lookback_hours=${windowHours}`
-            : `/api/admin/health-overview?lookback_hours=${windowHours}`;
-          const res = await apiFetch(url);
-          if (requestId === dashboardRequestIdRef.current) {
-            if (res.ok) setHealthOverview(await res.json());
-            else setHealthOverview(null);
-          }
-        } catch {
-          if (requestId === dashboardRequestIdRef.current) setHealthOverview(null);
-        }
-      })(),
-      (async () => {
-        try {
-          const data = await fetchFleetUtilization();
-          if (requestId === dashboardRequestIdRef.current) setFleetUtilization(data);
-        } catch {
-          if (requestId === dashboardRequestIdRef.current) setFleetUtilization(null);
-        }
-      })(),
-    );
-
-    await Promise.allSettled(fetches);
-    if (requestId !== dashboardRequestIdRef.current) return;
-    setLoading(false);
-
-    // Show error banner only when all primary fetches fail AND we have no
-    // previously-loaded digest to show. digestHasDataRef tracks whether any
-    // successful digest fetch has run (avoids the stale-closure problem with
-    // reading `digest` state directly inside this callback).
-    const allFailed = selectedProjectId
-      ? !digestOk && !diagnosticsOk && !openPRsOk && !digestHasDataRef.current
-      : !digestOk && !digestHasDataRef.current;
-    setLastFetchError(allFailed);
-  }, [selectedProjectId, windowHours, selectedSrCategory]);
-
-  const refreshVersionLifecycle = useCallback(async () => {
-    if (!selectedProjectId) return;
-    const requestId = ++versionLifecycleRequestIdRef.current;
-    setVersionLifecycleRefreshing(true);
-    try {
-      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
-      if (requestId !== versionLifecycleRequestIdRef.current) return;
-      if (res.ok) {
-        setVersionLifecycle(await res.json());
-        setVersionLifecycleError(null);
-        setVersionLifecycleLastSuccessAt(new Date().toISOString());
-      } else {
-        setVersionLifecycleError(`Version lifecycle unavailable (${res.status})`);
-      }
-    } catch {
-      if (requestId === versionLifecycleRequestIdRef.current) {
-        setVersionLifecycleError('Version lifecycle refresh failed');
-      }
-    } finally {
-      if (requestId === versionLifecycleRequestIdRef.current) {
-        setVersionLifecycleRefreshing(false);
-      }
-    }
-  }, [selectedProjectId]);
-
-  // Reset project-scoped state synchronously on a project/window/category
-  // switch, BEFORE the poller below fires its leading fetch. Declared ahead of
-  // usePoller and sharing the same trigger (`fetchData` changes iff those
-  // inputs change) so React runs this reset first, then the leading poll.
-  useEffect(() => {
-    openPRsRequestIdRef.current += 1;
-    versionLifecycleRequestIdRef.current += 1;
-    resetProjectScopedState();
-    // fetchData is the canonical "inputs changed" signal; resetProjectScopedState
-    // is stable. Both are listed so the reset runs before the poller's leading
-    // fetch on any project/window/category switch.
-  }, [fetchData, resetProjectScopedState]);
-
-  // Coordinated polling on the shared 30s clock. Pauses when the tab is hidden
-  // and catches up on return; ticks align with every other 30s poller so
-  // apiFetch's in-flight de-dup can collapse overlapping identical GETs.
-  //
-  // Each tick starts a fresh "latest" request by reading the CURRENT id from
-  // the ref (via increment) rather than a stale id captured at setup time.
-  // Capturing the id in the closure froze polling after any manual refetch
-  // (which bumps the ref): fetchData's `requestId === ref.current` guards then
-  // permanently failed and the dashboard silently stopped applying responses.
-  usePoller(
-    () => fetchData(++dashboardRequestIdRef.current),
-    { intervalMs: DEFAULT_POLL_MS, deps: [fetchData] },
-  );
-
-  const refetchDashboard = useCallback(() => {
-    void fetchData(++dashboardRequestIdRef.current);
-  }, [fetchData]);
-
-  // Active/Queued headline cards read the membership-scoped aggregate counts
-  // (project-scoped when a project is selected, else fleet-wide) so a paginated
-  // task page can never hide active/queued work from other projects. Fall back
-  // to deriving from the current `tasks` page only when the aggregate props are
-  // absent (e.g. legacy callers / tests that don't thread them through).
-  const { pageActiveCount, pageQueuedCount } = useMemo(() => ({
-    pageActiveCount: tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
-    pageQueuedCount: tasks.filter(t => t.status === 'QUEUED').length,
-  }), [tasks]);
-  const activeCount = selectedProjectId && scopedActiveCount != null
-    ? scopedActiveCount
-    : (globalActiveCount ?? pageActiveCount);
-  const queuedCount = selectedProjectId && scopedQueuedCount != null
-    ? scopedQueuedCount
-    : (globalQueuedCount ?? pageQueuedCount);
-
-  // Sparkline sampling
-  useEffect(() => {
-    const failed = digest?.failed_count ?? 0;
-    const next = [...sparkRef.current, { active: activeCount, queued: queuedCount, failed }].slice(-60);
-    sparkRef.current = next;
-    setSparkData(next);
-  }, [activeCount, queuedCount, digest?.failed_count]);
   const digestIsStale = digestStale || Boolean(digest?.served_stale);
   const failedCount = digest?.failed_count ?? 0;
   const successRate = digest?.success_rate;
@@ -665,7 +290,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
       </div>
 
       {/* Anomaly Throttle Banner */}
-      <AnomalyThrottleBanner digest={digest} onRestored={refetchDashboard} />
+      <AnomalyThrottleBanner digest={digest} onRestored={refetchDigest} />
 
       {/* System Health — actionable issues with remediation hints */}
       <SystemHealthCard
@@ -800,8 +425,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
             onViewTaskById={handleViewTaskById}
             srCatchRateTargets={srCatchRateTargets}
             onCategoryClick={handleCategoryClick}
-            onScopeClick={handleScopeClick}
-            onConfigureTargets={handleConfigureTargets}
+            onScopeClick={onScopeClick}
+            onConfigureTargets={onConfigureTargets ?? (() => {})}
             sectionRef={reviewQualitySectionRef}
           />
 
