@@ -73,6 +73,23 @@ _SAMPLE_TASK_LIMIT = 10
 _BLOCKED_FETCH_LIMIT = 2000
 _CANCELLED_FETCH_LIMIT = 1000
 
+# The COMPLETED / terminal candidate scans (foundations that may satisfy a live
+# blocker) grow without bound as a project accumulates history — and unlike the
+# fetches above they were left un-capped. A long-lived project's full COMPLETED +
+# FAILED/CANCELLED backlog loaded in one ``select(Task)`` of fat JSONB rows
+# (context / payloads / plan_output) is what wedged the digest path on
+# 2026-06-15: the scan blew the server statement_timeout (QueryCanceledError) and
+# stalled the event loop materializing the result, starving every other request
+# (heartbeats included) into the Cloud Run 300s ceiling. Bound them the same way
+# as the fetches above: a generous recency window — a foundation a CURRENTLY
+# blocked dependent waits on shipped recently relative to that dependent — plus a
+# hard newest-first LIMIT backstop. Both are served by
+# ``ix_task_project_status_updated`` (project_id, status, updated_at). The signal
+# is advisory (digest metric + fail-open spawn hint), so the rare beyond-window
+# foundation miss only over-reports demand and never gates control flow.
+_CANDIDATE_FETCH_LOOKBACK = timedelta(days=30)
+_CANDIDATE_FETCH_LIMIT = 2000
+
 
 def _demand_identity(need: Dict[str, Any]) -> Optional[tuple]:
     """Return a ``(kind, identity_ref)`` grouping key for a foundation need, or None.
@@ -154,21 +171,28 @@ def unresolved_capability_needs(
     return unresolved
 
 
-async def _fetch_candidates(session, project_id, statuses) -> List[Task]:
-    """Same-project tasks in the given lifecycle statuses (a candidate set)."""
+async def _fetch_candidates(
+    session, project_id, statuses, *, since: Optional[datetime] = None, limit: Optional[int] = None
+) -> List[Task]:
+    """Same-project tasks in the given lifecycle statuses (a candidate set).
+
+    ``since`` recency-bounds the scan (``updated_at >= since``) and ``limit`` caps
+    it newest-first, so a long-lived project's unbounded COMPLETED / terminal
+    backlog can't be loaded as one fat-row ``select(Task)`` (the digest-path wedge
+    of 2026-06-15). In-flight (ACTIVE) candidates pass ``since=None``: an unshipped
+    foundation still in flight matters regardless of age, and the active set is
+    naturally bounded by fleet concurrency.
+    """
     enum_statuses = [TaskStatus(s) for s in statuses]
-    return (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id,
-                    Task.status.in_(enum_statuses),
-                )
-            )
-        )
-        .scalars()
-        .all()
+    stmt = select(Task).where(
+        Task.project_id == project_id,
+        Task.status.in_(enum_statuses),
     )
+    if since is not None:
+        stmt = stmt.where(Task.updated_at >= since)
+    if limit is not None:
+        stmt = stmt.order_by(Task.updated_at.desc()).limit(limit)
+    return (await session.execute(stmt)).scalars().all()
 
 
 async def _fetch_recent_giveup_cancelled(
@@ -285,11 +309,30 @@ async def collect_missing_capability_demand(
     window_start = now - lookback
     window_iso = window_start.isoformat()
 
-    active = await _fetch_candidates(session, project_id, ACTIVE_CANDIDATE_STATUSES)
-    completed = await _fetch_candidates(
-        session, project_id, COMPLETED_CANDIDATE_STATUSES
+    candidate_since = now - _CANDIDATE_FETCH_LOOKBACK
+    # ACTIVE: in-flight foundations matter regardless of age — LIMIT-only backstop.
+    active = await _fetch_candidates(
+        session,
+        project_id,
+        ACTIVE_CANDIDATE_STATUSES,
+        limit=_CANDIDATE_FETCH_LIMIT,
     )
-    dead = await _fetch_candidates(session, project_id, TERMINAL_CANDIDATE_STATUSES)
+    # COMPLETED / terminal: recency + LIMIT bounded so the project's full history
+    # is never loaded as one fat-row scan (see _CANDIDATE_FETCH_LOOKBACK).
+    completed = await _fetch_candidates(
+        session,
+        project_id,
+        COMPLETED_CANDIDATE_STATUSES,
+        since=candidate_since,
+        limit=_CANDIDATE_FETCH_LIMIT,
+    )
+    dead = await _fetch_candidates(
+        session,
+        project_id,
+        TERMINAL_CANDIDATE_STATUSES,
+        since=candidate_since,
+        limit=_CANDIDATE_FETCH_LIMIT,
+    )
 
     # Stranded-parent set so a ghost-merge / unshipped completed foundation does NOT
     # count as satisfying a need — mirrors ``reaper_sweeps._classify_blocker_needs``.
