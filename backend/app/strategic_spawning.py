@@ -37,8 +37,8 @@ from app.models import (
 from app.deploy_identity import project_matches_deploy_identity
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.release_artifacts import (
-    summarize_release_artifacts,
     summarize_required_artifact_gap,
+    version_serving_summary as _version_serving_summary,
 )
 from app.capability_demand import (
     fetch_missing_demand_for_spawn,
@@ -132,17 +132,6 @@ def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> Non
             )
 
 
-def _version_serving_summary(
-    version, project=None
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    aggregate, artifacts = summarize_release_artifacts(
-        version,
-        getattr(version, "deploy_artifacts", None),
-        project=project,
-    )
-    return aggregate, artifacts
-
-
 def _strategic_recent_version_entry(version, project=None) -> dict[str, Any]:
     from app.release_version import summarize_qualification_state as _summarize
 
@@ -154,8 +143,6 @@ def _strategic_recent_version_entry(version, project=None) -> dict[str, Any]:
         "last_qualification": version.last_qualification,
         "qualification_state": _summarize(
             version.last_qualification,
-            version.serving_status,
-            version.deploy_failure_reason,
             aggregate_serving_status=aggregate["serving_status"],
             aggregate_deploy_failure_reason=aggregate["reason_code"],
             artifact_evidence=artifacts,

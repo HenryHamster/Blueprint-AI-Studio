@@ -996,3 +996,22 @@ if PROMOTION_MERGE_ARTIFACT_KIND not in _ARTIFACT_PROVIDERS:
         required=True,
         observable=_observable_for_any_github_project,
     )
+
+
+def version_serving_summary(
+    version: ReleaseVersion,
+    project: Project | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Canonical single-call serving resolver for read paths.
+
+    Wraps ``summarize_release_artifacts`` with the standard ``deploy_artifacts``
+    eager-load accessor so callers never inline the accessor or duplicate the
+    call.  All read paths (system state, version lifecycle, strategist) must go
+    through this wrapper rather than calling ``summarize_release_artifacts``
+    directly or maintaining their own private copies.
+    """
+    return summarize_release_artifacts(
+        version,
+        getattr(version, "deploy_artifacts", None),
+        project=project,
+    )

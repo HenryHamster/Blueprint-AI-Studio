@@ -1525,6 +1525,18 @@ export interface VersionQualification {
   promotion_error_detail?: string | null;
 }
 
+/** Single resolved serving block — the canonical answer to "is this version live?"
+ *  Derived by the backend from the aggregate artifact evidence so every read site
+ *  (UI panel, CLI) reads one field instead of re-implementing the three-field
+ *  precedence chain (aggregate_serving_status ?? serving_status ?? qual_state.serving_status). */
+export interface ResolvedServing {
+  status?: string | null;
+  sha?: string | null;
+  confirmed_at?: string | null;
+  failure_reason?: string | null;
+  artifacts?: ReleaseArtifactEvidence[];
+}
+
 /** Per-artifact serving evidence for a release version. One entry per registered
  *  deploy artifact (e.g. the backend Cloud Run revision, plus any other required
  *  artifact). serving_status is one of 'unconfirmed' | 'serving_confirmed' |
@@ -1655,6 +1667,9 @@ export interface CurrentVersion {
   aggregate_serving_status?: string | null;
   aggregate_deploy_failure_reason?: string | null;
   artifacts?: ReleaseArtifactEvidence[];
+  /** Single resolved serving block — prefer this over the three peer fields.
+   *  Absent on older backends (optional for zero-downtime mixed deploys). */
+  serving?: ResolvedServing | null;
   // Post-promotion deploy-confirmation window deadline (ISO string). The sweep
   // resolves serving_status to confirmed/failed when this elapses; the panel
   // computes remaining/overdue at render time.
@@ -1689,6 +1704,9 @@ export interface RecentVersion {
   aggregate_serving_status?: string | null;
   aggregate_deploy_failure_reason?: string | null;
   artifacts?: ReleaseArtifactEvidence[];
+  /** Single resolved serving block — prefer this over the three peer fields.
+   *  Absent on older backends (optional for zero-downtime mixed deploys). */
+  serving?: ResolvedServing | null;
   // Post-promotion deploy-confirmation window deadline (ISO string) — see
   // CurrentVersion. Present on the recently-promoted history row whose
   // serving_status is still 'unconfirmed'.

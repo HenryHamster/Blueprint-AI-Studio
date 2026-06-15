@@ -9369,3 +9369,56 @@ def test_summarize_release_artifacts_callers_always_pass_project():
         "prefer the explicit keyword so the invariant stays informative).\n"
         + "\n".join(violations)
     )
+
+
+def test_serving_status_reads_route_through_aggregate():
+    """All read-path files must use version_serving_summary, not private copies.
+
+    The canonical serving resolver is ``release_artifacts.version_serving_summary``.
+    Private copies of ``_version_serving_summary`` in other modules diverge silently:
+    they bypass project= threading, fall back to legacy scalars, or drift from the
+    aggregate-first algorithm over time.  This guard asserts that no file outside
+    ``release_artifacts.py`` defines a ``FunctionDef`` named ``_version_serving_summary``
+    or ``version_serving_summary`` — new read sites must import the canonical one.
+    """
+    backend_dir = Path(__file__).resolve().parent.parent
+    app_dir = backend_dir / "app"
+
+    duplicates: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        if py_file.name == "release_artifacts.py":
+            continue
+
+        try:
+            source = py_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        # Quick text filter before expensive parse.
+        if "_version_serving_summary" not in source and "version_serving_summary" not in source:
+            continue
+
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                "_version_serving_summary",
+                "version_serving_summary",
+            ):
+                rel = py_file.relative_to(backend_dir.parent)
+                duplicates.append(
+                    f"  {rel}:{node.lineno} — "
+                    f"defines {node.name!r} (should import from release_artifacts)"
+                )
+
+    assert not duplicates, (
+        "The following files define a private serving-summary resolver instead of "
+        "importing ``version_serving_summary`` from ``release_artifacts``.  "
+        "Duplicate definitions diverge from the aggregate-first algorithm and "
+        "cause serving-status inconsistency across UI/CLI/strategist surfaces.\n"
+        + "\n".join(duplicates)
+    )

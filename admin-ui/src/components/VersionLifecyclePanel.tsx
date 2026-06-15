@@ -1182,8 +1182,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // Keep this predicate on that same backend-owned latch; aggregate-only
   // required-artifact failures still surface in the badges/breakdown, but the
   // clear endpoint cannot currently recover them directly.
-  const hasDeployFailed = cv?.serving_status === 'deploy_failed'
-    || recent.some(v => v.serving_status === 'deploy_failed');
+  const hasDeployFailed = (cv?.serving?.status ?? cv?.serving_status) === 'deploy_failed'
+    || recent.some(v => (v.serving?.status ?? v.serving_status) === 'deploy_failed');
 
   const handleSetPhase = async (phase: 'build' | 'stabilize') => {
     if (!projectId) return;
@@ -1561,10 +1561,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
                   <ServingStatusBadge
-                    servingStatus={cv.aggregate_serving_status ?? cv.serving_status ?? cv.qualification_state.serving_status}
-                    servedSha={cv.served_sha}
-                    servedAt={cv.served_at}
-                    deployFailureReason={cv.aggregate_deploy_failure_reason ?? cv.deploy_failure_reason ?? cv.qualification_state.deploy_failure_reason}
+                    servingStatus={cv.serving?.status ?? cv.qualification_state?.serving_status}
+                    servedSha={cv.serving?.sha ?? cv.served_sha}
+                    servedAt={cv.serving?.confirmed_at ?? cv.served_at}
+                    deployFailureReason={cv.serving?.failure_reason ?? cv.qualification_state?.deploy_failure_reason}
                     deployConfirmDeadline={cv.deploy_confirm_deadline}
                   />
                 </div>
@@ -1596,7 +1596,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </p>
                 )}
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
-                <ArtifactEvidenceList artifacts={cv.artifacts} />
+                <ArtifactEvidenceList artifacts={cv.serving?.artifacts ?? cv.artifacts} />
               </div>
             )}
             {cv.last_qualification && (
@@ -1834,10 +1834,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
                       <span className="text-neutral-500">{v.status}</span>
                       <ServingStatusBadge
-                        servingStatus={v.aggregate_serving_status ?? v.serving_status ?? v.qualification_state?.serving_status}
-                        servedSha={v.served_sha}
-                        servedAt={v.served_at}
-                        deployFailureReason={v.aggregate_deploy_failure_reason ?? v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
+                        servingStatus={v.serving?.status ?? v.qualification_state?.serving_status}
+                        servedSha={v.serving?.sha ?? v.served_sha}
+                        servedAt={v.serving?.confirmed_at ?? v.served_at}
+                        deployFailureReason={v.serving?.failure_reason ?? v.qualification_state?.deploy_failure_reason}
                         deployConfirmDeadline={v.deploy_confirm_deadline}
                       />
                       <QualSummary q={v.last_qualification} />

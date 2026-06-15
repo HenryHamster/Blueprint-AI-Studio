@@ -624,21 +624,30 @@ async def test_serving_sha_falls_back_when_no_evidence(db_session):
 
 @pytest.mark.asyncio
 async def test_all_surfaces_agree_serving_status(db_session):
-    """All three surfaces agree on serving_confirmed for an external-project version.
+    """All four surfaces agree on serving_confirmed for an external-project version.
 
     External-project shape: one promotion_merge artifact (serving_confirmed),
     no backend_revision artifact.  Without project= threading, the legacy scalar
     fallback would synthesize an "unconfirmed" backend_revision contribution and
     hold the aggregate back.  With project= threaded, backend_revision is
     non-observable and vacuous, so only the promotion_merge artifact contributes,
-    yielding "serving_confirmed" across all three read surfaces.
+    yielding "serving_confirmed" across all four read surfaces.
+
+    The four surfaces are:
+    1. compute_system_state() canonical snapshot
+    2. admin release-version serialization
+    3. strategic-spawning version entry
+    4. deployment_state block promoted_serving_status (via _version_serving_summary)
     """
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
 
     from app.models import ReleaseVersion
     from app.routers.admin_release_version import _serialize_version_history_entry
-    from app.strategic_spawning import _strategic_recent_version_entry
+    from app.strategic_spawning import (
+        _strategic_recent_version_entry,
+        _version_serving_summary,
+    )
 
     await _make_deploy_state(db_session)
     project = await _make_project(db_session)
@@ -679,7 +688,14 @@ async def test_all_surfaces_agree_serving_status(db_session):
     surface3_entry = _strategic_recent_version_entry(version_row, project)
     surface3_status = surface3_entry["serving_status"]
 
-    # All three must agree and all must be "serving_confirmed".
+    # Surface 4: deployment_state block promoted_serving_status
+    # (computed the same way for the promoted version).
+    surface4_aggregate, surface4_artifacts = _version_serving_summary(
+        version_row, project
+    )
+    surface4_status = surface4_aggregate["serving_status"]
+
+    # All four must agree and all must be "serving_confirmed".
     assert surface1_status == "serving_confirmed", (
         f"compute_system_state returned {surface1_status!r}"
     )
@@ -689,4 +705,7 @@ async def test_all_surfaces_agree_serving_status(db_session):
     assert surface3_status == "serving_confirmed", (
         f"_strategic_recent_version_entry returned {surface3_status!r}"
     )
-    assert surface1_status == surface2_status == surface3_status
+    assert surface4_status == "serving_confirmed", (
+        f"_version_serving_summary returned {surface4_status!r}"
+    )
+    assert surface1_status == surface2_status == surface3_status == surface4_status

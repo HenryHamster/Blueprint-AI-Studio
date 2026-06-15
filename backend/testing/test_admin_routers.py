@@ -9839,6 +9839,116 @@ class TestVersionLifecycleArtifactServingState:
         assert recent[1]["aggregate_serving_status"] == "serving_confirmed"
         assert recent[1]["qualification_state"]["state"] == "promoted"
 
+    @pytest.mark.asyncio
+    async def test_serving_block_present_on_current_and_recent_versions(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """The resolved 'serving' block is present on both current_version and
+        recent_versions, exposing status/sha/failure_reason/artifacts so the UI
+        can read one field instead of the three-field precedence chain."""
+        from app import release_artifacts as artifact_registry
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import (
+            BACKEND_REVISION_ARTIFACT_KIND,
+            ReleaseArtifactProvider,
+        )
+
+        backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+            BACKEND_REVISION_ARTIFACT_KIND
+        ]
+
+        async def _check_synthetic(_session, _version, _artifact, _now):
+            return None
+
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+                "synthetic_required": ReleaseArtifactProvider(
+                    artifact_kind="synthetic_required",
+                    check=_check_synthetic,
+                    required=True,
+                ),
+            },
+            clear=True,
+        )
+
+        project = await _make_project(db_session)
+        promoted = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=datetime(2026, 5, 1, 0, 0, 0),
+            promoted_at=datetime(2026, 5, 2, 0, 0, 0),
+            last_qualification={"status": "promoted", "confidence": 0.95},
+            serving_status="serving_confirmed",
+            served_sha="deadbeef1234",
+        )
+        open_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=datetime(2026, 5, 3, 0, 0, 0),
+        )
+        db_session.add_all([promoted, open_version])
+        await db_session.commit()
+        await db_session.refresh(promoted)
+
+        db_session.add_all(
+            [
+                ReleaseDeployArtifact(
+                    version_id=promoted.id,
+                    artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                    serving_status="serving_confirmed",
+                    served_identifier="deadbeef1234",
+                    served_at=datetime(2026, 5, 2, 0, 5, 0),
+                ),
+                ReleaseDeployArtifact(
+                    version_id=promoted.id,
+                    artifact_kind="synthetic_required",
+                    serving_status="serving_confirmed",
+                    served_identifier="synth-id-abc",
+                    served_at=datetime(2026, 5, 2, 0, 6, 0),
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        readiness, audit, merged = self._lifecycle_patches()
+        with readiness, audit, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        # current_version (open, no artifacts) exposes the serving block.
+        cv_serving = body["current_version"]["serving"]
+        assert isinstance(cv_serving, dict)
+        assert "status" in cv_serving
+        assert "sha" in cv_serving
+        assert "failure_reason" in cv_serving
+        assert "artifacts" in cv_serving
+
+        # recent_version (promoted, serving_confirmed) exposes the resolved block.
+        recent = body["recent_versions"][0]
+        rv_serving = recent["serving"]
+        assert isinstance(rv_serving, dict)
+        assert rv_serving["status"] == "serving_confirmed"
+        # sha derives from confirmed artifact evidence (not the legacy scalar).
+        assert rv_serving["sha"] == "deadbeef1234"
+        # failure_reason is None when not deploy_failed.
+        assert rv_serving["failure_reason"] is None
+        # artifacts is the full per-artifact list.
+        assert isinstance(rv_serving["artifacts"], list)
+        assert len(rv_serving["artifacts"]) == 2
+        artifact_kinds = {a["artifact_kind"] for a in rv_serving["artifacts"]}
+        assert BACKEND_REVISION_ARTIFACT_KIND in artifact_kinds
+        assert "synthetic_required" in artifact_kinds
+
 
 class TestVersionLifecycleAuditEvidence:
     """GET /version-lifecycle scopes audit evidence to the open candidate SHA."""
@@ -16694,3 +16804,57 @@ class TestGetReleaseVersionSummary:
         assert tasks[0]["title"] == "feat: add changelog surface"
         assert tasks[0]["task_type"] == "feat"
         assert tasks[0]["pr_number"] == 42
+
+    @pytest.mark.asyncio
+    async def test_release_version_summary_headline_uses_aggregate_serving(
+        self, client: AsyncClient, db_session
+    ):
+        """Headline should use aggregate serving status, not the scalar."""
+        from app.models import ReleaseDeployArtifact
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        now = _utcnow()
+        # Create a promoted version with scalar serving_status="unconfirmed"
+        # (not "serving_confirmed")
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=now,
+            promoted_sha="abc1234",
+            serving_status="unconfirmed",  # Scalar is NOT serving_confirmed
+            served_sha=None,
+            served_at=None,
+            last_qualification={"status": "promoted", "confidence": 0.9},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Create a backend_revision artifact with serving_status="serving_confirmed"
+        # to make the aggregate say "serving_confirmed"
+        artifact = ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind="backend_revision",
+            serving_status="serving_confirmed",
+            served_identifier="abc1234",
+            served_at=now,
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=5),
+        ):
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "promoted"
+        assert data["serving_status"] == "unconfirmed"  # The scalar remains unconfirmed
+        # But the headline should be "promoted & serving" because the aggregate is
+        # serving_confirmed
+        assert data["highlights"]["headline"] == "promoted & serving"

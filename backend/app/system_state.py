@@ -112,7 +112,8 @@ async def compute_system_state(
     Contains NO new business logic — only reads and assembles existing data.
     """
     from app.time_utils import _utcnow
-    from app import release_artifacts, release_version as rv
+    from app import release_version as rv
+    from app.release_artifacts import version_serving_summary as _version_serving_summary
 
     now = _utcnow()
 
@@ -151,10 +152,7 @@ async def compute_system_state(
             session, project_id, include_artifacts=include_artifacts
         )
         if version is not None:
-            artifact_list = version.deploy_artifacts if include_artifacts else None
-            agg_dict, evidence_list = release_artifacts.summarize_release_artifacts(
-                version, artifact_list, project=project
-            )
+            agg_dict, evidence_list = _version_serving_summary(version, project)
             aggregate_serving_status: str | None = agg_dict.get("serving_status")
             aggregate_reason: str | None = agg_dict.get("reason_code")
 

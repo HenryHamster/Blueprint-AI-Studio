@@ -25,7 +25,7 @@ from app.shared_state import (
     resolve_project_promotion_enabled,
     runtime_config as _runtime_config,
 )
-from app.release_artifacts import summarize_release_artifacts
+from app.release_artifacts import version_serving_summary as _version_serving_summary
 from app import release_version as _release_version
 from app import compute as _compute
 from app.digest_cache import DigestCache
@@ -44,6 +44,45 @@ _agent_serving_shas_cache = DigestCache(default_ttl=300.0, stale_retry_ttl=60.0)
 _version_lifecycle_cache = DigestCache(default_ttl=30.0, stale_retry_ttl=15.0)
 
 _MAX_RETIREMENT_CRITIQUES = 100
+
+
+def _compose_serving_block(
+    aggregate: dict,
+    artifacts: list,
+    version: "ReleaseVersion",
+) -> dict:
+    """Build the resolved serving block from aggregate + artifact evidence.
+
+    Mirrors system_state.compute_system_state so every read site resolves
+    serving state identically: sha from the first confirmed artifact
+    (fallback to the legacy scalar), confirmed_at from that same artifact,
+    failure_reason only when the aggregate status is deploy_failed.
+    """
+    aggregate_status = aggregate.get("serving_status")
+    serving_sha = next(
+        (
+            e["served_identifier"]
+            for e in artifacts
+            if e.get("serving_status") == "serving_confirmed"
+            and e.get("served_identifier") is not None
+        ),
+        getattr(version, "served_sha", None),
+    )
+    confirmed_at = next(
+        (
+            e["served_at"]
+            for e in artifacts
+            if e.get("serving_status") == "serving_confirmed" and e.get("served_at")
+        ),
+        version.served_at.isoformat() if version.served_at else None,
+    )
+    return {
+        "status": aggregate_status,
+        "sha": serving_sha,
+        "confirmed_at": confirmed_at,
+        "failure_reason": aggregate.get("reason_code") if aggregate_status == "deploy_failed" else None,
+        "artifacts": artifacts,
+    }
 
 
 @router.get("/projects/{project_id}/retirement-critiques")
@@ -141,17 +180,6 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _version_serving_summary(
-    version: ReleaseVersion, project: Optional[Any] = None
-) -> tuple[dict[str, Any], list[dict]]:
-    aggregate, artifacts = summarize_release_artifacts(
-        version,
-        getattr(version, "deploy_artifacts", None),
-        project=project,
-    )
-    return aggregate, artifacts
-
-
 def _serialize_version_history_entry(
     version: ReleaseVersion, project: Optional[Any] = None
 ) -> dict[str, Any]:
@@ -178,6 +206,7 @@ def _serialize_version_history_entry(
         "aggregate_serving_status": aggregate["serving_status"],
         "aggregate_deploy_failure_reason": aggregate["reason_code"],
         "artifacts": artifacts,
+        "serving": _compose_serving_block(aggregate, artifacts, version),
         "qualification_state": _release_version.summarize_qualification_state(
             version.last_qualification,
             version.serving_status,
@@ -560,6 +589,9 @@ async def get_version_lifecycle(
                 "aggregate_serving_status": aggregate_serving["serving_status"],
                 "aggregate_deploy_failure_reason": aggregate_serving["reason_code"],
                 "artifacts": artifact_evidence,
+                "serving": _compose_serving_block(
+                    aggregate_serving, artifact_evidence, open_row
+                ),
                 "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
                 if open_row.deploy_confirm_deadline
                 else None,
@@ -1503,7 +1535,7 @@ async def get_release_version_summary(
     confidence = qual.get("confidence")
     threshold = qual.get("threshold")
 
-    if version.status == "promoted" and version.serving_status == "serving_confirmed":
+    if version.status == "promoted" and aggregate_serving["serving_status"] == "serving_confirmed":
         headline = "promoted & serving"
     elif version.status == "promoted":
         headline = "promoted"
