@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import desc, func, or_, text
+from sqlalchemy import desc, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -283,41 +283,57 @@ async def _compute_digest(
     hours: int,
     project_id: uuid.UUID | None,
     session: AsyncSession,
+    _statement_timeout_secs: int = 30,
 ) -> Dict[str, Any]:
     """Extracted body of `get_digest` so the cache layer can call it without
     FastAPI-dependency plumbing."""
     window_start = _utcnow() - timedelta(hours=hours)
     prev_window_start = window_start - timedelta(hours=hours)
-    # Extend lookback to capture long-running tasks and 7 periods for trend history
-    raw_lookback = _utcnow() - timedelta(hours=min(hours * 7, 24 * 14))
-    lookback_start = min(raw_lookback, prev_window_start)
+    # Narrow main scan to current + previous window only (2xhours).
+    # Trend history (7 periods) is computed from a separate lean query below.
+    lookback_start = prev_window_start
 
     # Fast-fail guard: cap this analytics scan well under the 120s global
     # statement_timeout so a slow query releases its pooled connection quickly
     # instead of starving the shared pool (which stalls the orchestrator main
     # cycle → "no progress heartbeat" hang). On timeout the cache layer serves
     # the last good result (see digest_cache.DigestCache). Postgres-only.
+    # Background precompute passes a lower budget (e.g. 5s) so a stalled key
+    # doesn't pin a background connection for the full 30s.
     if resolve_dialect_name(session) == "postgresql":
-        await session.execute(text("SET LOCAL statement_timeout = '30s'"))
+        await session.execute(
+            text(f"SET LOCAL statement_timeout = '{_statement_timeout_secs}s'")
+        )
 
-    # --- Query tasks from extended lookback window ---
-    # Load terminal tasks (COMPLETED/FAILED/CANCELLED) for digest stats, plus any task
-    # with requires_approval=True so we can surface pending-approval items in
-    # needs_attention even while they are still IN_PROGRESS/QUEUED/etc.
-    # QUEUED/PROVISIONING/IN_PROGRESS without approval flags are excluded here
-    # to keep JSONB payload memory bounded; active counts come from a separate
-    # lean query below.
-    task_filters = [
+    # --- Query tasks from narrowed main window (current + previous window) ---
+    # The OR clause (status IN terminal OR requires_approval IS TRUE) defeated
+    # any composite index, forcing a BitmapOr / seq-scan over the full slice.
+    # Split into two index-served queries merged in Python so each half can use
+    # its own index (migration 0275 adds ix_task_requires_approval partial index).
+    #
+    # Query A: terminal tasks (COMPLETED/FAILED/CANCELLED)
+    terminal_filters = [
         Task.created_at >= lookback_start,
-        or_(
-            Task.status.in_(
-                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
-            ),
-            Task.requires_approval.is_(True),
+        Task.status.in_(
+            [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
         ),
     ]
     if project_id:
-        task_filters.append(Task.project_id == project_id)
+        terminal_filters.append(Task.project_id == project_id)
+
+    # Query B: non-terminal approval tasks (requires_approval=True, not yet terminal).
+    # Uses the ix_task_requires_approval partial index (migration 0275).
+    # Only current window is needed — approval tasks are surfaced for operator
+    # action and are never older than the current window in practice.
+    approval_filters = [
+        Task.created_at >= window_start,
+        Task.requires_approval.is_(True),
+        Task.status.not_in(
+            [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+        ),
+    ]
+    if project_id:
+        approval_filters.append(Task.project_id == project_id)
 
     _DIGEST_TASK_ROW_CAP = 5000
     _ACTIVE_TASKS_DISPLAY_LIMIT = 5
@@ -330,62 +346,60 @@ async def _compute_digest(
     # returns json_extract results as text rather than parsed dicts, so we
     # fall back to the heavy load path there.
     _use_projection = resolve_dialect_name(session) == "postgresql"
+
+    def _fat_load_options(*, include_status_log: bool = False):
+        """Load-only options for the main terminal+approval task queries."""
+        cols = [
+            Task.id,
+            Task.status,
+            Task.project_id,
+            Task.title,
+            Task.created_at,
+            Task.started_at,
+            Task.last_heartbeat,
+            Task.context,
+            Task.latest_status_message,
+            Task.attempt_count,
+            Task.requires_approval,
+            Task.vm_provisioned_at,
+            Task.vm_started_at,
+            Task.vm_stopped_at,
+            Task.vm_spot,
+            Task.previous_error_fingerprint,
+            Task.auto_remediation,
+            Task.provider,
+            Task.model,
+            Task.attempt_history_db,
+            Task.api_call_summary,
+            Task.llm_input_tokens_banked_db,
+            Task.llm_output_tokens_banked_db,
+            Task.llm_call_count_banked_db,
+            Task.format_compliance_summary,
+        ]
+        if include_status_log:
+            # SQLite path: no SQL-side projection, so load both columns directly.
+            cols.append(Task.status_log)
+            cols.append(Task.payloads)
+        # PG path: payloads[0] and status_log[-1]["t"] are projected as separate
+        # SELECT columns (see _stash_projected_task_fields); including them in
+        # load_only would duplicate them in the result row and shift column indices.
+        return load_only(*cols, raiseload=True)
+
+    all_tasks: List[Task] = []
+
     if _use_projection:
-        tasks_query = (
+        # --- Query A: terminal tasks (PG, with SQL-side projections) ---
+        terminal_result = await session.execute(
             select(
                 Task,
                 Task.payloads[0].label("_projected_first_payload"),
                 Task.status_log[-1]["t"].astext.label("_projected_completed_at_ts"),
             )
-            .where(*task_filters)
-            .options(
-                load_only(
-                    Task.id,
-                    Task.status,
-                    Task.project_id,
-                    Task.title,
-                    Task.created_at,
-                    Task.started_at,
-                    # at_time correlation in compute_failure_grouping /
-                    # compute_digest_trend_history reads last_heartbeat; load it
-                    # here so the access doesn't trigger an async lazy-load.
-                    Task.last_heartbeat,
-                    Task.context,
-                    Task.latest_status_message,
-                    Task.attempt_count,
-                    Task.requires_approval,
-                    Task.vm_provisioned_at,
-                    Task.vm_started_at,
-                    Task.vm_stopped_at,
-                    Task.vm_spot,
-                    # Audit W1: promoted columns read in the digest funnel.
-                    Task.previous_error_fingerprint,
-                    Task.auto_remediation,
-                    # Per-(provider, model) cost attribution on direction CPM.
-                    Task.provider,
-                    Task.model,
-                    # Per-attempt banked costs for pair-atomic cost_by_provider_model.
-                    Task.attempt_history_db,
-                    # Token telemetry for the per-effort/per-model LLM efficiency
-                    # rollup (compute_effort_model_efficiency). api_call_summary is
-                    # accessed directly (not via __dict__), so it MUST be loaded
-                    # here or the async access would trigger a lazy-load error; the
-                    # banked *_db columns back the property fallbacks.
-                    Task.api_call_summary,
-                    Task.llm_input_tokens_banked_db,
-                    Task.llm_output_tokens_banked_db,
-                    Task.llm_call_count_banked_db,
-                    # Structured-output format-compliance telemetry for the
-                    # windowed compute_format_compliance_metrics measure; loaded
-                    # here so the direct access doesn't trigger a lazy-load.
-                    Task.format_compliance_summary,
-                raiseload=True,)
-            )
+            .where(*terminal_filters)
+            .options(_fat_load_options())
             .limit(_DIGEST_TASK_ROW_CAP)
         )
-        tasks_result = await session.execute(tasks_query)
-        all_tasks: List[Task] = []
-        for row in tasks_result.all():
+        for row in terminal_result.all():
             task = row[0]
             _stash_projected_task_fields(
                 task,
@@ -393,55 +407,126 @@ async def _compute_digest(
                 completed_at_ts=row[2],
             )
             all_tasks.append(task)
-    else:
-        tasks_result = await session.execute(
-            select(Task)
-            .where(*task_filters)
+
+        # --- Query B: non-terminal approval tasks (PG) ---
+        approval_result = await session.execute(
+            select(
+                Task,
+                Task.payloads[0].label("_projected_first_payload"),
+                Task.status_log[-1]["t"].astext.label("_projected_completed_at_ts"),
+            )
+            .where(*approval_filters)
+            .options(_fat_load_options())
+            .limit(_DIGEST_TASK_ROW_CAP)
+        )
+        for row in approval_result.all():
+            task = row[0]
+            _stash_projected_task_fields(
+                task,
+                first_payload=row[1] or {},
+                completed_at_ts=row[2],
+            )
+            all_tasks.append(task)
+
+        # --- Lean trend history query (PG): 7xhours lookback, narrow columns only ---
+        # The main scan covers only 2xhours; trend history needs 7 periods.
+        # This separate query loads only the columns required by
+        # compute_digest_trend_history (no payloads/api_call_summary/etc.).
+        trend_lookback_start = _utcnow() - timedelta(hours=hours * 7)
+        trend_filters = [
+            Task.created_at >= trend_lookback_start,
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
+        ]
+        if project_id:
+            trend_filters.append(Task.project_id == project_id)
+        trend_result = await session.execute(
+            select(
+                Task,
+                Task.status_log[-1]["t"].astext.label("_projected_completed_at_ts"),
+            )
+            .where(*trend_filters)
             .options(
                 load_only(
                     Task.id,
                     Task.status,
-                    Task.project_id,
-                    Task.title,
                     Task.created_at,
-                    Task.started_at,
-                    # at_time correlation in compute_failure_grouping /
-                    # compute_digest_trend_history reads last_heartbeat; load it
-                    # here so the access doesn't trigger an async lazy-load.
                     Task.last_heartbeat,
-                    Task.payloads,
-                    Task.context,
-                    Task.status_log,
-                    Task.latest_status_message,
-                    Task.attempt_count,
-                    Task.requires_approval,
+                    Task.started_at,
                     Task.vm_provisioned_at,
-                    Task.vm_started_at,
                     Task.vm_stopped_at,
                     Task.vm_spot,
-                    # Audit W1: promoted columns read in the digest funnel.
-                    Task.previous_error_fingerprint,
-                    Task.auto_remediation,
-                    # Per-(provider, model) cost attribution on direction CPM.
-                    Task.provider,
-                    Task.model,
-                    # Per-attempt banked costs for pair-atomic cost_by_provider_model.
-                    Task.attempt_history_db,
-                    # Token telemetry for the per-effort/per-model LLM efficiency
-                    # rollup (compute_effort_model_efficiency).
-                    Task.api_call_summary,
-                    Task.llm_input_tokens_banked_db,
-                    Task.llm_output_tokens_banked_db,
-                    Task.llm_call_count_banked_db,
-                    # Structured-output format-compliance telemetry for the
-                    # windowed compute_format_compliance_metrics measure; loaded
-                    # here so the direct access doesn't trigger a lazy-load.
-                    Task.format_compliance_summary,
-                raiseload=True,)
+                    Task.context,
+                    Task.latest_status_message,
+                    raiseload=True,
+                )
             )
             .limit(_DIGEST_TASK_ROW_CAP)
         )
-        all_tasks = list(tasks_result.scalars().all())
+        trend_tasks: List[Task] = []
+        for row in trend_result.all():
+            task = row[0]
+            # Set ONLY the completion-timestamp projection; do NOT call
+            # _stash_projected_task_fields here because that would also set
+            # _projected_first_payload={} — overwriting the correct value
+            # already stashed by the terminal/approval queries above for
+            # tasks that appear in both result sets (SQLAlchemy identity map
+            # returns the same Python object for the same PK). Trend history
+            # never reads first_payload, so leaving it as-is is safe.
+            object.__setattr__(task, "_projected_completed_at_ts", row[1])
+            trend_tasks.append(task)
+    else:
+        # SQLite path (tests): no negative-index JSON, load status_log directly.
+        terminal_result = await session.execute(
+            select(Task)
+            .where(*terminal_filters)
+            .options(_fat_load_options(include_status_log=True))
+            .limit(_DIGEST_TASK_ROW_CAP)
+        )
+        all_tasks.extend(terminal_result.scalars().all())
+
+        approval_result = await session.execute(
+            select(Task)
+            .where(*approval_filters)
+            .options(_fat_load_options(include_status_log=True))
+            .limit(_DIGEST_TASK_ROW_CAP)
+        )
+        all_tasks.extend(approval_result.scalars().all())
+
+        # Lean trend history query (SQLite).
+        trend_lookback_start = _utcnow() - timedelta(hours=hours * 7)
+        trend_filters = [
+            Task.created_at >= trend_lookback_start,
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
+        ]
+        if project_id:
+            trend_filters.append(Task.project_id == project_id)
+        trend_result = await session.execute(
+            select(Task)
+            .where(*trend_filters)
+            .options(
+                load_only(
+                    Task.id,
+                    Task.status,
+                    Task.created_at,
+                    Task.last_heartbeat,
+                    Task.started_at,
+                    Task.vm_provisioned_at,
+                    Task.vm_stopped_at,
+                    Task.vm_spot,
+                    Task.context,
+                    Task.latest_status_message,
+                    Task.status_log,
+                    raiseload=True,
+                )
+            )
+            .limit(_DIGEST_TASK_ROW_CAP)
+        )
+        trend_tasks = list(trend_result.scalars().all())
+
     tasks_capped = len(all_tasks) == _DIGEST_TASK_ROW_CAP
     if tasks_capped:
         logger.warning(
@@ -534,7 +619,8 @@ async def _compute_digest(
                     Task.vm_spot,
                     Task.previous_error_fingerprint,
                     Task.auto_remediation,
-                raiseload=True,)
+                    raiseload=True,
+                )
             )
         )
         active_tasks_all: List[Task] = []
@@ -564,7 +650,8 @@ async def _compute_digest(
                     Task.vm_spot,
                     Task.previous_error_fingerprint,
                     Task.auto_remediation,
-                raiseload=True,)
+                    raiseload=True,
+                )
             )
         )
         active_tasks_all = list(active_result.scalars().all())
@@ -984,9 +1071,11 @@ async def _compute_digest(
     else:
         trend = None
 
-    # Compute trend history: 7 periods (6 previous + current), oldest first
+    # Compute trend history: 7 periods (6 previous + current), oldest first.
+    # Uses the separate lean trend_tasks query (7xhours lookback, narrow columns)
+    # so the main all_tasks scan stays at the narrower 2xhours window.
     trend_history = compute_digest_trend_history(
-        all_tasks=all_tasks,
+        all_tasks=trend_tasks,
         hours=hours,
         now=_now,
     )

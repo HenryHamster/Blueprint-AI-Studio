@@ -88,6 +88,27 @@ PRECOMPUTE_STALE_FALLBACK_SECONDS: float = 300.0
 # project count can't unbound the tick duration.
 _MAX_PROJECTS_PER_TICK: int = 25
 
+# Number of projects processed in one tick (round-robin slice). Rather than
+# priming all 25 projects every tick, each tick advances a rotating offset so
+# every project gets refreshed across multiple ticks. This spreads per-project
+# work over multiple 45s cycles, staying well within the 35s budget.
+_PROJECTS_PER_TICK_SLICE: int = 5
+
+# Lower statement_timeout for background precompute keys vs the on-demand
+# request path. A stalled background tick should not pin a DB connection for
+# 30s; skip-on-timeout is safe because the previous L1/L2 cached value remains
+# servable until the next tick succeeds.
+_BACKGROUND_STATEMENT_TIMEOUT_SECS: int = 5
+
+# Round-robin offset: tracks the starting index in the active project list for
+# the next tick. Advanced by _PROJECTS_PER_TICK_SLICE each tick.
+_project_tick_offset: int = 0
+
+# Overlap guard: set to True while a tick is executing. If a tick hasn't
+# finished when the next interval fires (e.g. a DB hiccup delays the timeout),
+# skip rather than stack a second tick on top.
+_tick_in_progress: bool = False
+
 
 # Provenance of a cache entry. Only entries written by the leader's background
 # WORKER tick may be served as fresh-for-PRECOMPUTE_STALE_FALLBACK_SECONDS,
@@ -412,7 +433,12 @@ async def _precompute_one(
     from app.routers.admin_digest import _compute_digest
     from app.time_utils import _utcnow
 
-    result = await _compute_digest(hours=hours, project_id=project_id, session=session)
+    result = await _compute_digest(
+        hours=hours,
+        project_id=project_id,
+        session=session,
+        _statement_timeout_secs=_BACKGROUND_STATEMENT_TIMEOUT_SECS,
+    )
     _PRECOMPUTE_CACHE.put(
         hours,
         project_id,
@@ -472,16 +498,15 @@ async def run_precompute_tick(session_factory) -> int:
     Pure orchestration over ``_precompute_one`` / ``_precompute_health_one`` —
     directly unit-testable with a session-factory stub.
 
-    Priming order is budget-aware (the tick is wrapped in
-    ``PRECOMPUTE_TICK_BUDGET_SECONDS`` by the caller, and doubling the work to
-    cover health-overview risks exhausting it under load): the two GLOBAL views
-    (both kinds) go first because the no-project dashboard polls are the most-hit
-    keys, then per-project digest, then per-project health. Whatever the budget
-    truncates degrades to the bounded on-demand path (the prior behavior), never
-    an error. Each successfully-primed key also publishes to the shared L2 table
-    (best-effort) so non-leader / cold-cache instances can serve it without
-    re-running the heavy scan.
+    Priming order is budget-aware: global views go first (most-hit keys), then
+    a round-robin SLICE of per-project digest keys, then the matching slice of
+    health keys. Only ``_PROJECTS_PER_TICK_SLICE`` projects are primed per tick;
+    the global ``_project_tick_offset`` advances each tick so every active project
+    is refreshed across multiple ticks rather than all 25 being hit every 45s.
+    Whatever the budget truncates degrades to the bounded on-demand path (the
+    prior behavior), never an error.
     """
+    global _project_tick_offset
     refreshed = 0
 
     async def _prime(label: str, coro_factory) -> None:
@@ -517,19 +542,27 @@ async def run_precompute_tick(session_factory) -> int:
         ),
     )
 
-    # --- Per-project views: digest first (the established hot path), then
-    #     health. If the tick hits PRECOMPUTE_TICK_BUDGET_SECONDS the remaining
-    #     per-project health priming is abandoned and the next tick retries;
-    #     un-primed keys degrade to the bounded on-demand path (the old
-    #     behavior), never an error. ---
-    for project_id in project_ids:
+    # --- Per-project views: round-robin slice of projects per tick. ---
+    # Rotate the full list by the current offset, then take the first slice.
+    # This spreads the work evenly: with 25 projects and a slice of 5, each
+    # project is hit once every 5 ticks (~225s) rather than every tick.
+    if project_ids:
+        n = len(project_ids)
+        offset = _project_tick_offset % n
+        rotated = project_ids[offset:] + project_ids[:offset]
+        tick_slice = rotated[:_PROJECTS_PER_TICK_SLICE]
+        _project_tick_offset = (offset + _PROJECTS_PER_TICK_SLICE) % n
+    else:
+        tick_slice = []
+
+    for project_id in tick_slice:
         await _prime(
             f"project={project_id} digest",
             lambda s, pid=project_id: _precompute_one(
                 s, hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=pid
             ),
         )
-    for project_id in project_ids:
+    for project_id in tick_slice:
         await _prime(
             f"project={project_id} health",
             lambda s, pid=project_id: _precompute_health_one(
@@ -562,7 +595,13 @@ async def digest_precompute_service() -> None:
     by ``PRECOMPUTE_TICK_BUDGET_SECONDS`` so a wedged tick can never pin the
     task; the lifecycle monitor restarts it on crash/timeout. Cancellation
     (shutdown) propagates cleanly.
+
+    The ``_tick_in_progress`` flag prevents tick overlap: if a previous tick
+    hasn't finished when the next interval fires (e.g. a DB hiccup held the
+    asyncio.timeout beyond its deadline), the new interval is skipped rather
+    than stacking a second concurrent tick.
     """
+    global _tick_in_progress
     from app.database import AsyncSessionLocal
 
     logger.info(
@@ -572,6 +611,12 @@ async def digest_precompute_service() -> None:
     )
     while True:
         await asyncio.sleep(_resolve_interval())
+        if _tick_in_progress:
+            logger.warning(
+                "[DIGEST_PRECOMPUTE] previous tick still running — skipping this interval"
+            )
+            continue
+        _tick_in_progress = True
         try:
             async with asyncio.timeout(PRECOMPUTE_TICK_BUDGET_SECONDS):
                 refreshed = await run_precompute_tick(AsyncSessionLocal)
@@ -590,6 +635,6 @@ async def digest_precompute_service() -> None:
                 PRECOMPUTE_TICK_BUDGET_SECONDS,
             )
         except Exception as tick_exc:
-            logger.error(
-                "[DIGEST_PRECOMPUTE] tick error: %s", tick_exc, exc_info=True
-            )
+            logger.error("[DIGEST_PRECOMPUTE] tick error: %s", tick_exc, exc_info=True)
+        finally:
+            _tick_in_progress = False
