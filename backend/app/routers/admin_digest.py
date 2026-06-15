@@ -62,15 +62,12 @@ from app.digest_metrics import (
     compute_dependency_health_signals,
     compute_trial_arm_accumulation,
     compute_trial_arm_accrual,
-    compute_wake_post_commit_health_signals,
     compute_park_wake_health,
     compute_merge_gate_fleet_health,
     compute_digest_cost_economics,
     compute_digest_trend_history,  # noqa: F401  re-exported for external importers
     compute_direction_progress,
     compute_failure_grouping,  # noqa: F401  re-exported for external importers
-    compute_format_compliance_metrics,
-    compute_research_output_quality_for_digest,
     _CPM_RETIREMENT_MULTIPLIER,  # noqa: F401  re-exported for external importers
     compute_migration_health,  # noqa: F401  re-exported for external importers
     compute_migration_slot_contention,
@@ -81,14 +78,12 @@ from app.digest_metrics import (
     compute_remediation_and_patterns,  # noqa: F401  re-exported for external importers
     compute_remediation_funnel,  # noqa: F401  re-exported for external importers
     compute_resurrection_outcome_summary,  # noqa: F401  re-exported for external importers
-    compute_llm_rework_cost,
     compute_retry_analytics,  # noqa: F401  re-exported for external importers
     compute_retry_pattern_summary,  # noqa: F401  re-exported for external importers
     compute_review_cap_exhaustion_summary,  # noqa: F401  re-exported for external importers
     compute_release_qualifier_infra_metrics,  # noqa: F401  re-exported for external importers
     compute_review_quality_metrics,
     compute_scope_mismatch_summary,
-    compute_problem_model_gc_health,
 )
 
 logger = logging.getLogger(__name__)
@@ -276,6 +271,142 @@ async def get_digest(
     )
     annotated["served_stale"] = served_stale
     return annotated
+
+
+# Durable keep-list for every top-level key emitted by `_compute_digest`.
+#
+# Each entry must declare EXACTLY ONE of:
+#   {"consumer": "<ComponentName or code path>"}  — a named reader currently renders this key
+#   {"status": "retired"|"pending", "reason": "...", "date": "YYYY-MM-DD"}
+#       — a retired key (computation removed) or a pending key (emitted but no
+#         reader yet).
+#
+# The invariant tests in test_digest_payload_metric_manifest.py enforce that:
+#   1. every emitted top-level key appears here, and
+#   2. every active-consumer entry still corresponds to an emitted key.
+#
+# Precompute-metadata keys added by `annotate_precompute_metadata`
+# (precomputed, precomputed_at, precompute_age_seconds, served_stale) are
+# governed separately and excluded from this manifest's scope.
+DIGEST_PAYLOAD_METRIC_MANIFEST: dict[str, dict] = {
+    "window_hours": {"consumer": "CatchUpPanel, CatchUpNarrativeSummary"},
+    "tasks_truncated": {"consumer": "DashboardHome"},
+    "total_merge_retries_saved": {"consumer": "CatchUpOperationalMetricsSection"},
+    "first_attempt_success_rate": {"consumer": "CatchUpReviewQualitySection"},
+    "first_review_approval_rate": {"consumer": "CatchUpReviewQualitySection"},
+    "self_review_effectiveness": {"consumer": "CatchUpReviewQualitySection"},
+    "self_review_prediction_accuracy": {"consumer": "CatchUpReviewQualitySection"},
+    "self_review_prediction_accuracy_trends": {
+        "consumer": "CatchUpReviewQualitySection"
+    },
+    "sr_regression_risk_test_signal_trends": {
+        "consumer": "CatchUpReviewQualitySection"
+    },
+    "sr_false_attestation_trends": {"consumer": "CatchUpReviewQualitySection"},
+    "self_review_skip_rate": {"consumer": "CatchUpReviewQualitySection"},
+    "sr_disallowed_blind_spot_rate": {"consumer": "CatchUpReviewQualitySection"},
+    "review_accuracy": {"consumer": "CatchUpReviewQualitySection"},
+    "fresh_reviewer_effectiveness": {"consumer": "CatchUpReviewQualitySection"},
+    "edges_trend": {"consumer": "ReviewQualitySection"},
+    "rejection_pattern_summary": {"consumer": "CatchUpReviewQualitySection"},
+    "merge_early_exit_count": {"consumer": "CatchUpOperationalMetricsSection"},
+    "generated_at": {"consumer": "DashboardHome"},
+    "completed_count": {"consumer": "CatchUpStatsRow, DashboardHome"},
+    "failed_count": {"consumer": "CatchUpStatsRow, DashboardHome"},
+    "pending_approval_count": {"consumer": "CatchUpStatsRow"},
+    "research_cycles": {"consumer": "CatchUpStatsRow, CatchUpResearchYieldSection"},
+    "prs_opened": {"consumer": "CatchUpStatsRow, CatchUpPanel"},
+    "active_count": {"consumer": "DashboardHome, CatchUpStatsRow"},
+    "running_count": {"consumer": "DashboardHome"},
+    "queued_count": {"consumer": "DashboardHome"},
+    "stale_heartbeat_count": {"consumer": "OrchestratorHealthBar"},
+    "active_tasks": {"consumer": "CatchUpInProgressSection"},
+    "success_rate": {"consumer": "CatchUpStatsRow, DashboardHome"},
+    "needs_attention": {"consumer": "CatchUpNeedsAttentionSection"},
+    "recent_failures": {"consumer": "CatchUpFailureSignalsSection"},
+    "failure_groups": {"consumer": "DashboardHome, CatchUpFailureSignalsSection"},
+    "failure_taxonomy_distribution": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "failure_stage_distribution": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "recent_completions": {"consumer": "CatchUpRecentCompletionsSection"},
+    "direction_progress": {"consumer": "CatchUpPanel, DirectionPortfolioSection"},
+    "direction_portfolio": {"consumer": "DirectionPortfolioSection"},
+    "overall_product_ratio": {"consumer": "DashboardHome"},
+    "median_cost_per_merged_pr": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "cost_per_merge_by_type": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "median_cost_per_merge_by_type": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "effort_model_efficiency": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "overall_type_distribution": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "total_estimated_cost_usd": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "spot_cost_usd": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "on_demand_cost_usd": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "provisioning_overhead_usd": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "provisioning_overhead_pct": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "cost_by_failure_class": {
+        "consumer": "DashboardHome, CatchUpCostDiagnosticsSection"
+    },
+    "total_failed_cost_usd": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "provision_waste_cost_usd": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "provision_waste_by_direction": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "analysis_overflow_summary": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "retry_overhead_cost_usd": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "retry_recovery_cost_usd": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "retry_waste_by_direction": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "retry_task_count": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "avg_retries_before_failure": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "retry_success_count": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "retry_success_rate_by_class": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "retry_wasted_rate": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "daily_cost_usd": {"consumer": "DashboardHome, OrchestratorHealthBar"},
+    "daily_cost_ceiling_usd": {"consumer": "DashboardHome, OrchestratorHealthBar"},
+    "narrative_summary": {"consumer": "CatchUpNarrativeSummary"},
+    "prev_completed_count": {"consumer": "CatchUpStatsRow"},
+    "prev_failed_count": {"consumer": "CatchUpStatsRow"},
+    "prev_success_rate": {"consumer": "CatchUpStatsRow"},
+    "completed_delta": {"consumer": "CatchUpStatsRow"},
+    "failed_delta": {"consumer": "CatchUpStatsRow"},
+    "success_rate_delta": {"consumer": "CatchUpStatsRow"},
+    "trend": {"consumer": "CatchUpStatsRow, DashboardHome"},
+    "trend_history": {"consumer": "CatchUpPanel"},
+    "latest_cycle": {"consumer": "CatchUpLatestCycleSection, DashboardHome"},
+    "memo_pathway_exits": {"consumer": "CatchUpMemoPathwaySection"},
+    "memo_ever_cited": {"consumer": "CatchUpMemoPathwaySection"},
+    "recent_cycle_memo_stats": {"consumer": "CatchUpMemoPathwaySection"},
+    "scope_conversion_rates": {
+        "consumer": "CatchUpResearchYieldSection, DashboardHome"
+    },
+    "prev_scope_conversion_rates": {
+        "consumer": "CatchUpResearchYieldSection, DashboardHome"
+    },
+    "pipeline_acceptance_rate": {
+        "consumer": "DashboardHome, CatchUpCostDiagnosticsSection"
+    },
+    "pipeline_conversion_rate": {
+        "consumer": "DashboardHome, CatchUpCostDiagnosticsSection"
+    },
+    "pipeline_filter_funnel": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "scope_mismatch_summary": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "escalation_outcome_summary": {"consumer": "CatchUpResearchYieldSection"},
+    "prevention_efficacy": {"consumer": "CatchUpResearchYieldSection"},
+    "retry_pattern_summary": {"consumer": "CatchUpFailureSignalsSection"},
+    "review_cap_exhaustion_summary": {"consumer": "CatchUpCostDiagnosticsSection"},
+    "resurrection_outcome_summary": {"consumer": "CatchUpOperationalMetricsSection"},
+    "recurring_error_clusters": {"consumer": "CatchUpFailureSignalsSection"},
+    "recurring_patterns": {"consumer": "CatchUpFailureSignalsSection"},
+    "early_warnings": {"consumer": "CatchUpFailureSignalsSection"},
+    "remediation_funnel": {"consumer": "CatchUpRemediationPipelineSection"},
+    "investigation_conversion": {"consumer": "CatchUpRemediationPipelineSection"},
+    "anomaly_adjustment": {"consumer": "AnomalyThrottleBanner"},
+    "dependency_health_signals": {"consumer": "DependencyHealthCard"},
+    "park_wake_health": {"consumer": "CatchUpOperationalMetricsSection"},
+    "merge_gate_fleet_health": {"consumer": "CatchUpOperationalMetricsSection"},
+    "migration_health": {"consumer": "CatchUpOperationalMetricsSection"},
+    "migration_slot_contention": {"consumer": "CatchUpOperationalMetricsSection"},
+    "prediction_calibration_factor": {"consumer": "DashboardHome"},
+    "prediction_calibration_note": {"consumer": "DashboardHome"},
+    "prediction_calibration_sample_count": {"consumer": "DashboardHome"},
+    "release_qualifier_infra_metrics": {"consumer": "CatchUpOperationalMetricsSection"},
+    "capability_adoption_verdicts": {"consumer": "CapabilityTrialsPanel"},
+}
 
 
 async def _compute_digest(
@@ -894,13 +1025,6 @@ async def _compute_digest(
     retry_success_rate_by_class = _retry_analytics["retry_success_rate_by_class"]
     retry_wasted_rate = _retry_analytics["retry_wasted_rate"]
 
-    _llm_rework = compute_llm_rework_cost(
-        failed_tasks=failed_tasks,
-        cancelled_tasks=cancelled_tasks,
-        completed_tasks=completed_tasks,
-        window_start=window_start,
-    )
-
     # Taxonomy distribution (4-category: scope/review/infra/code_defect)
     _tax_keys = (
         TAXONOMY_SCOPE_RELATED,
@@ -1169,10 +1293,6 @@ async def _compute_digest(
     # operator_action_count fields (already surfaced in DirectionCard).
     overall_type_distribution = _cost_econ["overall_type_distribution"]
     pipeline_filter_funnel = _cost_econ["pipeline_filter_funnel"]
-    total_llm_cost_usd = _cost_econ["total_llm_cost_usd"]
-    llm_share_of_combined_cost = _cost_econ["llm_share_of_combined_cost"]
-    median_llm_cost_per_merged_pr = _cost_econ["median_llm_cost_per_merged_pr"]
-
     # Per-effort-tier / per-actual-model LLM efficiency rollup over the window's
     # finished (terminal) tasks. Additive — answers whether effort-tier scaling
     # earns its money in landed PRs. Reuses the shared LLM pricing so its totals
@@ -1493,14 +1613,6 @@ async def _compute_digest(
         session, project_id
     )
 
-    # --- Compute-wake post-commit stuck-marker count (read-only) — surfaces
-    # DELIVERED compute_job_terminal registrations still carrying the durable
-    # post-commit marker, i.e., rows whose knowledge-persistence side effects
-    # have not yet completed. A non-zero count is actionable for operators. ---
-    compute_wake_post_commit_health = await compute_wake_post_commit_health_signals(
-        session, project_id
-    )
-
     # --- Park/wake operational health (read-only) — PARKED population + wake
     # delivery backlog for the park-and-wake primitive. Distinct from the
     # parked_blockers block above (escalated BLOCKED tasks); this grounds
@@ -1783,13 +1895,6 @@ async def _compute_digest(
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(
         completed_tasks + failed_tasks
     )
-    _format_compliance = compute_format_compliance_metrics(
-        completed_tasks + failed_tasks,
-        prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
-    )
-    _research_output_quality = await compute_research_output_quality_for_digest(
-        session, all_tasks
-    )
 
     # Migration-serialization-slot contention (read-only) — surfaces whether a
     # migration task currently holds the per-project slot and for how long, how
@@ -1809,19 +1914,12 @@ async def _compute_digest(
         migration_slot_contention=migration_slot_contention,
     )
 
-    problem_model_gc_health = None
-    if project_id:
-        problem_model_gc_health = await compute_problem_model_gc_health(
-            session, project_id
-        )
-
     return {
         "window_hours": hours,
         "tasks_truncated": tasks_capped,
         "total_merge_retries_saved": total_merge_retries_saved,
         "first_attempt_success_rate": _first_attempt_success_rate,
         "first_review_approval_rate": _first_review_approval_rate,
-        "format_compliance": _format_compliance,
         "self_review_effectiveness": _review_quality["self_review_effectiveness"],
         "self_review_prediction_accuracy": _review_quality[
             "self_review_prediction_accuracy"
@@ -1884,12 +1982,7 @@ async def _compute_digest(
         "retry_success_rate_by_class": retry_success_rate_by_class,
         "retry_wasted_rate": retry_wasted_rate,
         "daily_cost_usd": daily_cost_usd,
-        "daily_vm_cost_usd": _cost_econ["daily_vm_cost_usd"],
-        "daily_compute_cost_usd": _cost_econ["daily_compute_cost_usd"],
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
-        "total_llm_cost_usd": total_llm_cost_usd,
-        "llm_share_of_combined_cost": llm_share_of_combined_cost,
-        "median_llm_cost_per_merged_pr": median_llm_cost_per_merged_pr,
         "narrative_summary": narrative_summary,
         "prev_completed_count": prev_completed_count,
         "prev_failed_count": prev_failed_count,
@@ -1925,7 +2018,6 @@ async def _compute_digest(
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
         "dependency_health_signals": dependency_health_signals,
-        "compute_wake_post_commit_health": compute_wake_post_commit_health,
         "park_wake_health": park_wake_health,
         "merge_gate_fleet_health": merge_gate_fleet_health,
         "migration_health": migration_health,
@@ -1943,8 +2035,5 @@ async def _compute_digest(
         "capability_adoption_verdicts": _augmented_verdicts
         if _digest_project is not None
         else {},
-        "research_output_quality": _research_output_quality,
-        "problem_model_gc_health": problem_model_gc_health,
         "stale_heartbeat_count": stale_heartbeat_count,
-        "llm_rework_cost": _llm_rework,
     }
