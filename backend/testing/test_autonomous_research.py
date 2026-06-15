@@ -14290,7 +14290,7 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
 
     mock_spend = mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value=1.5),
+        new=AsyncMock(return_value={"total": 1.5, "compute": 1.5, "agent_vm": 0.0, "idle": 0.0}),
     )
 
     await _spawn_research_task(project, db_session)
@@ -14340,7 +14340,7 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
 
     mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value=2.0),
+        new=AsyncMock(return_value={"total": 2.0, "compute": 2.0, "agent_vm": 0.0, "idle": 0.0}),
     )
 
     await _spawn_research_task(project2, db_session)
@@ -14369,7 +14369,7 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
     # Re-patch to count calls cleanly for the no-ceiling assertion
     no_ceiling_mock = mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value=999.0),
+        new=AsyncMock(return_value={"total": 999.0, "compute": 999.0, "agent_vm": 0.0, "idle": 0.0}),
     )
     await _spawn_research_task(project3, db_session)
 

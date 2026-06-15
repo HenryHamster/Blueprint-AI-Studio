@@ -768,6 +768,9 @@ class ResourceEnvelope(BaseModel):
     spend_window_days: int = Field(30, ge=1)
     # Maximum concurrent compute jobs allowed for this project (stored in runtime_config).
     max_concurrent_compute_jobs: int | None = Field(None, ge=1)
+    # Fraction of spend_ceiling_usd at which to fire a proactive approaching-ceiling alert.
+    # e.g. 0.8 fires when rolling spend reaches 80% of the ceiling. Default 0.8 when absent.
+    spend_warning_fraction: float | None = Field(None, gt=0, le=1)
 
 
 class BuildConfig(BaseModel):

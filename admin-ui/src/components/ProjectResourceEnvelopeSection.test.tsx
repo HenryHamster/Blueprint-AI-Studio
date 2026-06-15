@@ -15,6 +15,10 @@ describe('ProjectResourceEnvelopeSection', () => {
           spend_window_days: 14,
           active_vm_count: 2,
           recent_spend_usd: 7.25,
+          recent_spend_compute_usd: 4.0,
+          recent_spend_agent_vm_usd: 2.25,
+          recent_spend_idle_usd: 1.0,
+          is_throttled: false,
         }}
         loading={false}
         error={null}
@@ -75,6 +79,10 @@ describe('ProjectResourceEnvelopeSection', () => {
           spend_window_days: 14,
           active_vm_count: 2,
           recent_spend_usd: 7.25,
+          recent_spend_compute_usd: 4.0,
+          recent_spend_agent_vm_usd: 2.25,
+          recent_spend_idle_usd: 1.0,
+          is_throttled: false,
         }}
         loading={false}
         error="Transient fetch error"
@@ -86,6 +94,67 @@ describe('ProjectResourceEnvelopeSection', () => {
     expect(screen.queryByText('Unavailable')).not.toBeInTheDocument();
     expect(screen.getByText('4')).toBeInTheDocument();
     expect(screen.getByText('$50.00')).toBeInTheDocument();
+  });
+
+  it('renders the spend breakdown and a throttle banner when throttled', () => {
+    render(
+      <ProjectResourceEnvelopeSection
+        githubOwner="myorg"
+        githubRepo="myrepo"
+        data={{
+          project_id: 'project-1',
+          max_concurrent_vms: 4,
+          spend_ceiling_usd: 6,
+          spend_window_days: 14,
+          active_vm_count: 2,
+          recent_spend_usd: 7.25,
+          recent_spend_compute_usd: 4,
+          recent_spend_agent_vm_usd: 2.25,
+          recent_spend_idle_usd: 1,
+          is_throttled: true,
+        }}
+        loading={false}
+        error={null}
+        canSave={false}
+        onSave={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Compute jobs')).toBeInTheDocument();
+    expect(screen.getByText('Agent VMs')).toBeInTheDocument();
+    expect(screen.getByText('Warm-pool idle')).toBeInTheDocument();
+    expect(screen.getByText('$4.00')).toBeInTheDocument();
+    expect(screen.getByText('$2.25')).toBeInTheDocument();
+    expect(screen.getByText('$1.00')).toBeInTheDocument();
+    expect(screen.getByText('$7.25 / $6.00')).toBeInTheDocument();
+    expect(screen.getByText('Compute throttled — spend ceiling reached')).toBeInTheDocument();
+  });
+
+  it('does not render the throttle banner when not throttled', () => {
+    render(
+      <ProjectResourceEnvelopeSection
+        githubOwner="myorg"
+        githubRepo="myrepo"
+        data={{
+          project_id: 'project-1',
+          max_concurrent_vms: 4,
+          spend_ceiling_usd: 50,
+          spend_window_days: 14,
+          active_vm_count: 2,
+          recent_spend_usd: 7.25,
+          recent_spend_compute_usd: 4,
+          recent_spend_agent_vm_usd: 2.25,
+          recent_spend_idle_usd: 1,
+          is_throttled: false,
+        }}
+        loading={false}
+        error={null}
+        canSave={false}
+        onSave={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText('Compute throttled — spend ceiling reached')).not.toBeInTheDocument();
   });
 
   it('sends the edited resource-envelope fields on save', async () => {
@@ -101,6 +170,10 @@ describe('ProjectResourceEnvelopeSection', () => {
           spend_window_days: 14,
           active_vm_count: 2,
           recent_spend_usd: 7.25,
+          recent_spend_compute_usd: 4.0,
+          recent_spend_agent_vm_usd: 2.25,
+          recent_spend_idle_usd: 1.0,
+          is_throttled: false,
         }}
         loading={false}
         error={null}

@@ -330,7 +330,10 @@ async def test_get_project_recent_spend_usd_empty(db_session):
     result = await get_project_recent_spend_usd(
         db_session, project_id=project.id, window_days=30
     )
-    assert result == 0.0
+    assert result["total"] == 0.0
+    assert result["compute"] == 0.0
+    assert result["agent_vm"] == 0.0
+    assert result["idle"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -356,7 +359,10 @@ async def test_get_project_recent_spend_usd_sums_task_vm_cost(db_session):
     result = await get_project_recent_spend_usd(
         db_session, project_id=project.id, window_days=30
     )
-    assert result == pytest.approx(1.5, abs=1e-6)
+    assert result["total"] == pytest.approx(1.5, abs=1e-6)
+    assert result["agent_vm"] == pytest.approx(1.5, abs=1e-6)
+    assert result["compute"] == pytest.approx(0.0, abs=1e-6)
+    assert result["idle"] == pytest.approx(0.0, abs=1e-6)
 
 
 @pytest.mark.asyncio
@@ -383,7 +389,10 @@ async def test_get_project_recent_spend_usd_excludes_old_tasks(db_session):
     result = await get_project_recent_spend_usd(
         db_session, project_id=project.id, window_days=30
     )
-    assert result == 0.0
+    assert result["total"] == 0.0
+    assert result["compute"] == 0.0
+    assert result["agent_vm"] == 0.0
+    assert result["idle"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -418,7 +427,10 @@ async def test_get_project_recent_spend_usd_sums_compute_job_cost(db_session):
     result = await get_project_recent_spend_usd(
         db_session, project_id=project.id, window_days=30
     )
-    assert result == pytest.approx(2.5, abs=1e-6)
+    assert result["total"] == pytest.approx(2.5, abs=1e-6)
+    assert result["compute"] == pytest.approx(2.5, abs=1e-6)
+    assert result["agent_vm"] == pytest.approx(0.0, abs=1e-6)
+    assert result["idle"] == pytest.approx(0.0, abs=1e-6)
 
 
 @pytest.mark.asyncio
@@ -459,7 +471,10 @@ async def test_get_project_recent_spend_usd_combines_both_sources(db_session):
     result = await get_project_recent_spend_usd(
         db_session, project_id=project.id, window_days=30
     )
-    assert result == pytest.approx(5.0, abs=1e-6)
+    assert result["total"] == pytest.approx(5.0, abs=1e-6)
+    assert result["compute"] == pytest.approx(3.75, abs=1e-6)
+    assert result["agent_vm"] == pytest.approx(1.25, abs=1e-6)
+    assert result["idle"] == pytest.approx(0.0, abs=1e-6)
 
 
 @pytest.mark.asyncio
@@ -502,7 +517,10 @@ async def test_get_project_recent_spend_usd_scoped_to_project(db_session):
     result = await get_project_recent_spend_usd(
         db_session, project_id=project_a.id, window_days=30
     )
-    assert result == 0.0
+    assert result["total"] == 0.0
+    assert result["compute"] == 0.0
+    assert result["agent_vm"] == 0.0
+    assert result["idle"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -529,7 +547,10 @@ async def test_get_project_recent_spend_usd_includes_pool_idle_cost(db_session):
     result = await get_project_recent_spend_usd(
         db_session, project_id=project.id, window_days=30
     )
-    assert result == pytest.approx(3.0, abs=1e-6)
+    assert result["total"] == pytest.approx(3.0, abs=1e-6)
+    assert result["idle"] == pytest.approx(3.0, abs=1e-6)
+    assert result["compute"] == pytest.approx(0.0, abs=1e-6)
+    assert result["agent_vm"] == pytest.approx(0.0, abs=1e-6)
 
 
 @pytest.mark.asyncio
@@ -556,7 +577,10 @@ async def test_get_project_recent_spend_usd_excludes_old_pool_idle_cost(db_sessi
     result = await get_project_recent_spend_usd(
         db_session, project_id=project.id, window_days=30
     )
-    assert result == 0.0
+    assert result["total"] == 0.0
+    assert result["compute"] == 0.0
+    assert result["agent_vm"] == 0.0
+    assert result["idle"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -613,4 +637,7 @@ async def test_get_project_recent_spend_usd_combines_all_three_sources(db_sessio
         db_session, project_id=project.id, window_days=30
     )
     # task VM (1.0) + compute job (2.0) + pool idle (4.0) = 7.0
-    assert result == pytest.approx(7.0, abs=1e-6)
+    assert result["total"] == pytest.approx(7.0, abs=1e-6)
+    assert result["compute"] == pytest.approx(2.0, abs=1e-6)
+    assert result["agent_vm"] == pytest.approx(1.0, abs=1e-6)
+    assert result["idle"] == pytest.approx(4.0, abs=1e-6)

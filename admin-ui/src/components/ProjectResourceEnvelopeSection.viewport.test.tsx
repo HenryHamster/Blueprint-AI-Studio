@@ -32,6 +32,10 @@ describe('ProjectResourceEnvelopeSection — viewport regression', () => {
               spend_window_days: 14,
               active_vm_count: 2,
               recent_spend_usd: 7.25,
+              recent_spend_compute_usd: 4.0,
+              recent_spend_agent_vm_usd: 2.25,
+              recent_spend_idle_usd: 1.0,
+              is_throttled: false,
             }}
             loading={false}
             error={null}

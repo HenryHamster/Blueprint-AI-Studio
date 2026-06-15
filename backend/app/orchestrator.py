@@ -868,11 +868,12 @@ async def _project_resource_dispatch_defer_message(
     if spend_cache is not None and task.project_id in spend_cache:
         recent_spend, spend_ceiling, spend_window_days = spend_cache[task.project_id]
     else:
-        recent_spend = await get_project_recent_spend_usd(
+        spend_breakdown = await get_project_recent_spend_usd(
             session,
             project_id=task.project_id,
             window_days=spend_window_days,
         )
+        recent_spend = spend_breakdown["total"]
         if spend_cache is not None:
             spend_cache[task.project_id] = (
                 recent_spend,

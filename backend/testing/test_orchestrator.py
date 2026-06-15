@@ -5311,7 +5311,7 @@ class TestWarmVMSkipProvision:
         spend_mock = mocker.patch(
             "app.orchestrator.get_project_recent_spend_usd",
             new_callable=AsyncMock,
-            return_value=12.0,
+            return_value={"total": 12.0, "compute": 12.0, "agent_vm": 0.0, "idle": 0.0},
         )
 
         previous_max = _orch_module._runtime_config["max_concurrent_vms"]

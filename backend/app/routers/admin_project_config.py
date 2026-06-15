@@ -803,18 +803,26 @@ def _resource_envelope_response(
     project,
     *,
     active_vm_count: int,
-    recent_spend_usd: float,
+    spend_breakdown: dict,
 ) -> Dict[str, Any]:
+    spend_ceiling_usd = resolve_project_spend_ceiling(project)
+    recent_spend_usd = spend_breakdown["total"]
     return {
         "project_id": str(project.id),
         "max_concurrent_vms": resolve_project_vm_cap(project),
-        "spend_ceiling_usd": resolve_project_spend_ceiling(project),
+        "spend_ceiling_usd": spend_ceiling_usd,
         "spend_window_days": resolve_project_spend_window_days(project),
         "max_concurrent_compute_jobs": resolve_project_compute_job_concurrency_cap(
             project.id
         ),
         "active_vm_count": active_vm_count,
         "recent_spend_usd": float(recent_spend_usd),
+        "recent_spend_compute_usd": float(spend_breakdown["compute"]),
+        "recent_spend_agent_vm_usd": float(spend_breakdown["agent_vm"]),
+        "recent_spend_idle_usd": float(spend_breakdown["idle"]),
+        "is_throttled": (
+            spend_ceiling_usd is not None and recent_spend_usd >= spend_ceiling_usd
+        ),
     }
 
 
@@ -1074,7 +1082,7 @@ async def get_resource_envelope_config(
         project_id, current_user["user_id"], session, "member"
     )
     active_vm_count = await _get_project_active_vm_count(session, project_id)
-    recent_spend_usd = await get_project_recent_spend_usd(
+    spend_breakdown = await get_project_recent_spend_usd(
         session,
         project_id=project_id,
         window_days=resolve_project_spend_window_days(project),
@@ -1082,7 +1090,7 @@ async def get_resource_envelope_config(
     return _resource_envelope_response(
         project,
         active_vm_count=active_vm_count,
-        recent_spend_usd=recent_spend_usd,
+        spend_breakdown=spend_breakdown,
     )
 
 
@@ -1173,7 +1181,7 @@ async def update_resource_envelope_config(
     await session.refresh(project)
 
     active_vm_count = await _get_project_active_vm_count(session, project_id)
-    recent_spend_usd = await get_project_recent_spend_usd(
+    spend_breakdown = await get_project_recent_spend_usd(
         session,
         project_id=project_id,
         window_days=resolve_project_spend_window_days(project),
@@ -1181,7 +1189,7 @@ async def update_resource_envelope_config(
     return _resource_envelope_response(
         project,
         active_vm_count=active_vm_count,
-        recent_spend_usd=recent_spend_usd,
+        spend_breakdown=spend_breakdown,
     )
 
 

@@ -73,6 +73,10 @@ export function ProjectResourceEnvelopeSection({
     max_concurrent_compute_jobs: null,
     active_vm_count: 0,
     recent_spend_usd: 0,
+    recent_spend_compute_usd: 0,
+    recent_spend_agent_vm_usd: 0,
+    recent_spend_idle_usd: 0,
+    is_throttled: false,
   };
 
   const displayLoading = data == null && loading;
@@ -175,14 +179,41 @@ export function ProjectResourceEnvelopeSection({
             </div>
             <p className="text-[11px] text-neutral-600 mt-1">Counts PROVISIONING and IN_PROGRESS tasks.</p>
           </div>
-          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3">
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-xs text-neutral-300">Recent spend</span>
-              <span className={`text-xs font-mono ${!noDataLabel && spendOverCeiling ? 'text-red-400' : 'text-neutral-100'}`}>
-                {noDataLabel ?? `${formatUsd(current.recent_spend_usd)} / ${currentCeilingLabel}`}
+          {!noDataLabel && current.is_throttled && (
+            <div className="bg-amber-950/50 border border-amber-600 rounded-lg px-4 py-2 flex items-center gap-2">
+              <span className="text-amber-400" aria-hidden="true">⚠</span>
+              <span className="text-xs font-semibold text-amber-300">
+                Compute throttled — spend ceiling reached
               </span>
             </div>
-            <p className="text-[11px] text-neutral-600 mt-1">{current.spend_window_days}-day rolling window.</p>
+          )}
+          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3">
+            <div className="text-xs text-neutral-300 mb-2">Recent spend</div>
+            {noDataLabel ? (
+              <div className="text-xs font-mono text-neutral-100">{noDataLabel}</div>
+            ) : (
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[11px] text-neutral-400">Compute jobs</span>
+                  <span className="text-xs font-mono text-neutral-100">{formatUsd(current.recent_spend_compute_usd)}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[11px] text-neutral-400">Agent VMs</span>
+                  <span className="text-xs font-mono text-neutral-100">{formatUsd(current.recent_spend_agent_vm_usd)}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[11px] text-neutral-400">Warm-pool idle</span>
+                  <span className="text-xs font-mono text-neutral-100">{formatUsd(current.recent_spend_idle_usd)}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 border-t border-neutral-800 pt-1 mt-1">
+                  <span className="text-[11px] font-semibold text-neutral-300">Total</span>
+                  <span className={`text-xs font-mono ${spendOverCeiling ? 'text-red-400' : 'text-neutral-100'}`}>
+                    {`${formatUsd(current.recent_spend_usd)} / ${currentCeilingLabel}`}
+                  </span>
+                </div>
+              </div>
+            )}
+            <p className="text-[11px] text-neutral-600 mt-2">{current.spend_window_days}-day rolling window.</p>
           </div>
         </div>
       </div>

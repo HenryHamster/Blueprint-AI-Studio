@@ -224,6 +224,10 @@ export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig 
   project_id: string;
   active_vm_count: number;
   recent_spend_usd: number;
+  recent_spend_compute_usd: number;
+  recent_spend_agent_vm_usd: number;
+  recent_spend_idle_usd: number;
+  is_throttled: boolean;
 }
 
 /**

@@ -6,9 +6,14 @@ import pytest
 from sqlalchemy import select
 
 import app.shared_state as _shared_state
+from app.alert_dispatch import (
+    _SPEND_APPROACHING_ALERT_TITLE,
+    _SPEND_CEILING_ALERT_TITLE,
+)
 from app.autonomous_research import _spawn_periodic_task, _spawn_research_task
+from app.autonomous_research import _project_spend_ceiling_spawn_defer_reason
 from app.max_plan_pool import _account_by_id, _max_plan_pools
-from app.models import Task
+from app.models import Alert, Task
 from app.orchestrator import (
     _filter_project_resource_dispatch_eligible,
     _project_resource_dispatch_defer_message,
@@ -58,7 +63,7 @@ async def test_spend_ceiling_blocks_autonomous_research_spawn(db_session, mocker
 
     spend_mock = mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value=10.0),
+        new=AsyncMock(return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}),
     )
 
     await _spawn_research_task(project, db_session)
@@ -100,7 +105,7 @@ async def test_spend_ceiling_blocks_autonomous_periodic_spawn(db_session, mocker
 
     spend_mock = mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value=7.5),
+        new=AsyncMock(return_value={"total": 7.5, "compute": 7.5, "agent_vm": 0.0, "idle": 0.0}),
     )
     previous_periodic = _shared_state.runtime_config.get("autonomous_periodic_tasks")
     _shared_state.runtime_config["autonomous_periodic_tasks"] = {
@@ -172,7 +177,7 @@ async def test_spend_ceiling_blocks_residual_remediation_spawn(db_session, mocke
     # Simulate over-budget spend
     mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value=15.0),
+        new=AsyncMock(return_value={"total": 15.0, "compute": 15.0, "agent_vm": 0.0, "idle": 0.0}),
     )
     # Stub other spawn functions to avoid side-effects
     mocker.patch("app.autonomous_research._spawn_research_task", new_callable=AsyncMock)
@@ -295,7 +300,7 @@ async def test_dispatch_defers_task_at_spend_ceiling(db_session, mocker):
 
     mocker.patch(
         "app.orchestrator.get_project_recent_spend_usd",
-        new=AsyncMock(return_value=10.0),
+        new=AsyncMock(return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}),
     )
 
     msg = await _project_resource_dispatch_defer_message(db_session, task, {})
@@ -326,7 +331,7 @@ async def test_dispatch_passes_task_under_spend_ceiling(db_session, mocker):
 
     mocker.patch(
         "app.orchestrator.get_project_recent_spend_usd",
-        new=AsyncMock(return_value=9.99),
+        new=AsyncMock(return_value={"total": 9.99, "compute": 9.99, "agent_vm": 0.0, "idle": 0.0}),
     )
 
     msg = await _project_resource_dispatch_defer_message(db_session, task, {})
@@ -481,3 +486,156 @@ async def test_dispatch_defers_when_idle_cost_pushes_over_ceiling(db_session):
 
     assert msg is not None
     assert "spend budget" in msg
+
+
+# ---------------------------------------------------------------------------
+# Approaching-ceiling proactive warning alert tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approaching_ceiling_warning_fires_in_configured_band(db_session, mocker):
+    """Approaching-ceiling alert fires when spend >= ceiling * warning_fraction but < ceiling."""
+    project = make_project(
+        autonomous_enabled=True,
+        directions=[{"id": "d1", "status": "active", "text": "reduce cost"}],
+        vision={"purpose": "test"},
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 7,
+                "spend_warning_fraction": 0.8,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Spend at 85% of ceiling — above the 0.8 threshold but below the ceiling
+    mocker.patch(
+        "app.autonomous_research.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 8.5, "compute": 8.5, "agent_vm": 0.0, "idle": 0.0}),
+    )
+
+    result = await _project_spend_ceiling_spawn_defer_reason(project, db_session)
+
+    # Should NOT block spawning
+    assert result is None
+
+    # Approaching-ceiling alert must have been created
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _SPEND_APPROACHING_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "80%" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_approaching_ceiling_warning_not_fired_below_threshold(
+    db_session, mocker
+):
+    """No approaching-ceiling alert when spend is below the warning threshold."""
+    project = make_project(
+        autonomous_enabled=True,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 7,
+                "spend_warning_fraction": 0.8,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Spend at 70% of ceiling — below the 0.8 threshold
+    mocker.patch(
+        "app.autonomous_research.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 7.0, "compute": 7.0, "agent_vm": 0.0, "idle": 0.0}),
+    )
+
+    result = await _project_spend_ceiling_spawn_defer_reason(project, db_session)
+
+    assert result is None
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _SPEND_APPROACHING_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_at_ceiling_creates_ceiling_alert_not_approaching(db_session, mocker):
+    """When spend is at/above the ceiling, the AT-CEILING alert fires, not the approaching alert."""
+    project = make_project(
+        autonomous_enabled=True,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 7,
+                "spend_warning_fraction": 0.8,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Spend exactly at the ceiling
+    mocker.patch(
+        "app.autonomous_research.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}),
+    )
+
+    result = await _project_spend_ceiling_spawn_defer_reason(project, db_session)
+
+    # Spawning must be blocked
+    assert result is not None
+    assert "spend ceiling reached" in result
+
+    ceiling_alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _SPEND_CEILING_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    approaching_alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _SPEND_APPROACHING_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(ceiling_alerts) == 1
+    assert approaching_alerts == []

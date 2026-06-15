@@ -70,6 +70,7 @@ from app.direction_refractory import get_direction_refractory_info
 from app.resource_envelope import (
     get_project_recent_spend_usd,
     resolve_project_spend_ceiling,
+    resolve_project_spend_warning_fraction,
     resolve_project_spend_window_days,
 )
 
@@ -126,11 +127,12 @@ async def _project_spend_ceiling_spawn_defer_reason(
     if spend_ceiling is None:
         return None
     spend_window_days = resolve_project_spend_window_days(project)
-    recent_spend = await get_project_recent_spend_usd(
+    spend_breakdown = await get_project_recent_spend_usd(
         session,
         project_id=project.id,
         window_days=spend_window_days,
     )
+    recent_spend = spend_breakdown["total"]
     if recent_spend >= spend_ceiling:
         from app.alert_dispatch import _maybe_create_spend_ceiling_alert
 
@@ -143,6 +145,17 @@ async def _project_spend_ceiling_spawn_defer_reason(
         return (
             f"project spend ceiling reached: ${recent_spend:.2f}/${spend_ceiling:.2f} "
             f"in the last {spend_window_days} day(s)"
+        )
+    warning_fraction = resolve_project_spend_warning_fraction(project)
+    if recent_spend >= spend_ceiling * warning_fraction:
+        from app.alert_dispatch import _maybe_create_approaching_ceiling_alert
+
+        await _maybe_create_approaching_ceiling_alert(
+            project.id,
+            session,
+            window_spend_usd=recent_spend,
+            ceiling_usd=spend_ceiling,
+            warning_fraction=warning_fraction,
         )
     return None
 
@@ -2687,7 +2700,6 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
                     f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
                 )
                 return
-
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(
         task_type, {}

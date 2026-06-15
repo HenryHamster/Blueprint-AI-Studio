@@ -183,11 +183,12 @@ async def _spawn_residual_fingerprint_remediation(
     spend_ceiling = resolve_project_spend_ceiling(project)
     if spend_ceiling is not None:
         spend_window_days = resolve_project_spend_window_days(project)
-        window_spend = await get_project_recent_spend_usd(
+        spend_breakdown = await get_project_recent_spend_usd(
             session,
             project_id=project.id,
             window_days=spend_window_days,
         )
+        window_spend = spend_breakdown["total"]
         if window_spend >= spend_ceiling:
             from app.alert_dispatch import _maybe_create_spend_ceiling_alert
 
