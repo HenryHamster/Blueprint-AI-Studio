@@ -23,6 +23,7 @@ from app.size_limit_policy import (
     BumpRecord,
     _is_chronic_offender,
     _parse_git_diff_output,
+    classify_breach,
 )
 
 
@@ -328,3 +329,67 @@ async def test_parse_bump_history_error_does_not_block_alert(db_session, mocker)
     alerts = await _alerts_for(db_session, project.id)
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
+
+
+# ---------------------------------------------------------------------------
+# classify_breach — unit tests (no DB, no subprocess)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_breach_chronic_returns_no_new_limit(mocker):
+    """classify_breach for a chronic offender must return is_chronic=True, suggested_new_limit=None."""
+    chronic_history = [
+        _record(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
+        _record(1200, 1400, CHRONIC_WINDOW_DAYS - 60),
+        _record(1400, 1600, 30),
+    ]
+    with patch(
+        "app.size_limit_policy.parse_bump_history", return_value=chronic_history
+    ):
+        verdict = classify_breach("big_module.py", 1720)
+
+    assert verdict["is_chronic"] is True
+    assert verdict["suggested_new_limit"] is None
+    assert verdict["bump_count"] == 3
+    assert "decomposition" in verdict["reason"].lower()
+
+
+def test_classify_breach_routine_returns_new_limit(mocker):
+    """classify_breach for a routine breach (no/few prior bumps) must return a new limit."""
+    with patch("app.size_limit_policy.parse_bump_history", return_value=[]):
+        verdict = classify_breach("new_module.py", 1720)
+
+    assert verdict["is_chronic"] is False
+    assert verdict["suggested_new_limit"] is not None
+    assert verdict["suggested_new_limit"] > 1720
+    assert verdict["bump_count"] == 0
+
+
+def test_classify_breach_chronic_override_grants_new_limit(mocker):
+    """With override_chronic=True, chronic offender still gets a suggested_new_limit."""
+    chronic_history = [
+        _record(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
+        _record(1200, 1400, CHRONIC_WINDOW_DAYS - 60),
+        _record(1400, 1600, 30),
+    ]
+    with patch(
+        "app.size_limit_policy.parse_bump_history", return_value=chronic_history
+    ):
+        verdict = classify_breach("big_module.py", 1720, override_chronic=True)
+
+    assert verdict["is_chronic"] is True
+    assert verdict["suggested_new_limit"] is not None
+    assert verdict["suggested_new_limit"] > 1720
+
+
+def test_classify_breach_git_unavailable_degrades_to_routine():
+    """When git errors, classify_breach must degrade to routine (not raise)."""
+    with patch(
+        "app.size_limit_policy.subprocess.run",
+        side_effect=FileNotFoundError("git not found"),
+    ):
+        verdict = classify_breach("any_module.py", 1720)
+
+    assert verdict["is_chronic"] is False
+    assert verdict["suggested_new_limit"] is not None
+    assert verdict["suggested_new_limit"] > 1720

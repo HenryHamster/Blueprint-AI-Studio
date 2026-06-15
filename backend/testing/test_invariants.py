@@ -4499,6 +4499,22 @@ class TestBackendModuleSizeGuardrails:
         section has no environment skip, so it always enforces."""
         self._check_module(relative_path)
 
+    def test_recovery_sweeps_cap_reflects_decomposed_size(self):
+        """recovery_sweeps.py is a thin re-export hub (~63 lines) after its
+        sweeps were split into recovery_evaluating.py and recovery_post_commit.py.
+        Its cap must stay well below 200 so the guardrail catches any regression
+        where substantial logic is re-added to this file instead of the proper
+        submodule. A cap above 200 indicates stale pre-decomposition headroom
+        crept back in."""
+        cap = MODULE_SIZE_LIMITS["recovery_sweeps.py"]
+        assert cap <= 200, (
+            f"recovery_sweeps.py cap is {cap}, which exceeds 200. "
+            "This file is a thin re-export hub after decomposition; its cap "
+            "should stay well below 200. If the file has genuinely grown, "
+            "consider whether new logic belongs in recovery_evaluating.py or "
+            "recovery_post_commit.py instead."
+        )
+
 
 _AGENT_SRC_ROOT = (
     os.path.normpath(

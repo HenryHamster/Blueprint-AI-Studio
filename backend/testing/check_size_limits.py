@@ -56,6 +56,23 @@ def _bump_size_limit(current_size: int) -> int:
     return bump_size_limit(current_size)
 
 
+def _classify_breach(
+    module_key: str,
+    current_size: int,
+    section: str = "backend",
+    *,
+    override_chronic: bool = False,
+):
+    """Chronic-offender-aware breach verdict, shared with the server endpoint.
+
+    Imported lazily for the same reason as ``_bump_size_limit`` above."""
+    from app.size_limit_policy import classify_breach
+
+    return classify_breach(
+        module_key, current_size, section, override_chronic=override_chronic
+    )
+
+
 # Repo root is two levels up from this file (backend/testing -> repo root).
 _DEFAULT_REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..")
@@ -281,6 +298,16 @@ def main(argv: list[str] | None = None) -> int:
         help="bump the cap of each breached file to the canonical policy value",
     )
     parser.add_argument(
+        "--force-chronic",
+        action="store_true",
+        dest="force_chronic",
+        help=(
+            "operator-approval override: allow --fix to bump a chronic offender's cap. "
+            "Attribution is recorded in the output. Without this flag, chronic offenders "
+            "are skipped and exit 1 is returned."
+        ),
+    )
+    parser.add_argument(
         "--json",
         dest="json_path",
         default=_DEFAULT_JSON_PATH,
@@ -332,27 +359,63 @@ def main(argv: list[str] | None = None) -> int:
         if not breaches and not uncapped:
             print("No breaches to fix — all scoped files within cap.")
             return 0
+        chronic_skipped: list[tuple[str, dict, str]] = []
+        bumped: list[tuple[str, dict, int]] = []
+        added: list[tuple[str, dict, int]] = []
         for section, rec in breaches:
-            new_cap = _bump_size_limit(rec["count"])
-            data[section][rec["rel"]] = new_cap
-            print(
-                f"[fix]  {section}/{rec['rel']}: {rec['count']} lines — "
-                f"cap {rec['cap']} -> {new_cap}"
+            verdict = _classify_breach(
+                rec["rel"],
+                rec["count"],
+                section,
+                override_chronic=args.force_chronic,
             )
+            if verdict["is_chronic"] and not args.force_chronic:
+                print(
+                    f"[chronic] {section}/{rec['rel']}: {rec['count']} lines — "
+                    f"{verdict['reason']} Skipping cap bump; use --force-chronic "
+                    f"to override with operator approval."
+                )
+                chronic_skipped.append((section, rec, verdict["reason"]))
+            else:
+                new_cap = verdict["suggested_new_limit"]
+                assert new_cap is not None
+                data[section][rec["rel"]] = new_cap
+                label = "[fix-chronic]" if verdict["is_chronic"] else "[fix]"
+                print(
+                    f"{label}  {section}/{rec['rel']}: {rec['count']} lines — "
+                    f"cap {rec['cap']} -> {new_cap}"
+                    + (
+                        f" (operator-approved; {verdict['bump_count']} prior bumps)"
+                        if verdict["is_chronic"]
+                        else ""
+                    )
+                )
+                bumped.append((section, rec, new_cap))
         for section, rec in uncapped:
+            # Uncapped files have no bump history to check — they are new to the
+            # tracking system, so they cannot be chronic offenders yet.
             new_cap = _bump_size_limit(rec["count"])
             data.setdefault(section, {})[rec["rel"]] = new_cap
             print(
                 f"[add]  {section}/{rec['rel']}: {rec['count']} lines — "
                 f"added cap {new_cap}"
             )
-        write_limits(args.json_path, data)
-        actions = []
-        if breaches:
-            actions.append(f"Bumped {len(breaches)} cap(s)")
-        if uncapped:
-            actions.append(f"Added {len(uncapped)} cap(s)")
-        print(f"{'; '.join(actions)} in {args.json_path}.")
+            added.append((section, rec, new_cap))
+        if bumped or added:
+            write_limits(args.json_path, data)
+            actions = []
+            if bumped:
+                actions.append(f"Bumped {len(bumped)} cap(s)")
+            if added:
+                actions.append(f"Added {len(added)} cap(s)")
+            print(f"{'; '.join(actions)} in {args.json_path}.")
+        if chronic_skipped:
+            print(
+                f"\n{len(chronic_skipped)} chronic offender(s) skipped — "
+                "decomposition required before bumping cap. "
+                "Use --force-chronic with operator approval to override."
+            )
+            return 1
         return 0
 
     exit_code = 0

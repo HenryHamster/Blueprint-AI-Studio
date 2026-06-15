@@ -266,6 +266,133 @@ def test_uncapped_scan_skips_already_capped_files(tmp_path):
     assert [rec["rel"] for rec in offenders] == ["uncapped.py"]
 
 
+# ── Chronic-offender gate in --fix mode ─────────────────────────────────────
+
+
+def test_chronic_offender_not_silently_fixed(tmp_path, capsys, mocker):
+    """Primary acceptance criterion: --fix must NOT silently bump a chronic offender's cap.
+
+    Selector: test_size_limits_checker.py::test_chronic_offender_not_silently_fixed
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
+
+    repo, jp = _build_repo(
+        tmp_path,
+        backend={"chronic.py": (1720, 1600), "clean.py": (50, 100)},
+    )
+
+    # Simulate 3 recent bumps — enough to trigger chronic classification.
+    def _rec(old, new, days_ago):
+        date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        return BumpRecord(
+            commit_sha=f"sha{days_ago}", commit_date=date, old_cap=old, new_cap=new
+        )
+
+    chronic_history = [
+        _rec(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
+        _rec(1200, 1400, CHRONIC_WINDOW_DAYS - 60),
+        _rec(1400, 1600, 30),
+    ]
+
+    with mocker.patch(
+        "app.size_limit_policy.parse_bump_history", return_value=chronic_history
+    ):
+        rc = _run(jp, repo, "--fix", "--sections", "backend")
+
+    out = capsys.readouterr().out
+
+    # Must exit 1 to signal that a chronic offender was skipped.
+    assert rc == 1, f"Expected exit 1 for chronic offender but got {rc}"
+
+    # Must print [chronic] tag identifying the skipped file.
+    assert "[chronic]" in out, f"Expected '[chronic]' in output but got:\n{out}"
+    assert "chronic.py" in out
+
+    # The JSON cap must NOT have been bumped — the file stays at 1600.
+    import json
+
+    data = json.loads(open(jp).read())
+    assert data["backend"]["chronic.py"] == 1600, (
+        f"Chronic offender cap should not be bumped; got {data['backend']['chronic.py']}"
+    )
+
+    # The clean (non-breaching) file must be untouched.
+    assert data["backend"]["clean.py"] == 100
+
+
+def test_first_time_breach_still_bumped_normally(tmp_path, mocker):
+    """A first-time breach (empty history) must still be bumped as usual."""
+    repo, jp = _build_repo(tmp_path, backend={"new.py": (1720, 1600)})
+
+    with mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[]):
+        rc = _run(jp, repo, "--fix", "--sections", "backend")
+
+    assert rc == 0
+
+    import json
+
+    data = json.loads(open(jp).read())
+    assert data["backend"]["new.py"] == bump_size_limit(1720)
+
+
+def test_fix_chronic_git_unavailable_degrades_to_routine(tmp_path, mocker):
+    """If git is unavailable (subprocess error), --fix must degrade to routine bump."""
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (1720, 1600)})
+
+    # Simulate git subprocess failing entirely (e.g., non-repo CI shard).
+    with mocker.patch(
+        "app.size_limit_policy.subprocess.run",
+        side_effect=FileNotFoundError("git not found"),
+    ):
+        rc = _run(jp, repo, "--fix", "--sections", "backend")
+
+    # Must succeed (degrade to routine bump, not hard-fail).
+    assert rc == 0
+
+    import json
+
+    data = json.loads(open(jp).read())
+    assert data["backend"]["big.py"] == bump_size_limit(1720)
+
+
+def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker):
+    """--force-chronic grants operator-approved bump even for chronic offenders."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
+
+    repo, jp = _build_repo(tmp_path, backend={"chronic.py": (1720, 1600)})
+
+    def _rec(old, new, days_ago):
+        date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        return BumpRecord(
+            commit_sha=f"sha{days_ago}", commit_date=date, old_cap=old, new_cap=new
+        )
+
+    chronic_history = [
+        _rec(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
+        _rec(1200, 1400, CHRONIC_WINDOW_DAYS - 60),
+        _rec(1400, 1600, 30),
+    ]
+
+    with mocker.patch(
+        "app.size_limit_policy.parse_bump_history", return_value=chronic_history
+    ):
+        rc = _run(jp, repo, "--fix", "--force-chronic", "--sections", "backend")
+
+    assert rc == 0
+
+    import json
+
+    out = capsys.readouterr().out
+    data = json.loads(open(jp).read())
+    assert data["backend"]["chronic.py"] == bump_size_limit(1720)
+    # Should label it as operator-approved, not a silent bump.
+    assert "chronic" in out.lower()
+
+
 def test_coverage_threshold_in_sync_with_test_invariants():
     # The checker mirrors (not imports) the meta-test threshold; guard the drift.
     from testing import test_invariants

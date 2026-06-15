@@ -56,6 +56,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.size_limit_policy import bump_size_limit as _bump_size_limit_policy
+from app.size_limit_policy import classify_breach as _classify_breach_policy
 from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
@@ -452,9 +453,16 @@ class AgentAnnotation(BaseModel):
     # size_breach fields — programmatic signal from a test-invariant failure.
     # Server bumps the limit (policy-driven, not agent-judgment) and returns
     # new_limit; the agent applies it to module_size_limits.json and commits.
+    # For chronic offenders the server refuses the silent bump and returns
+    # is_chronic=True without new_limit; pass force_chronic_override=True with
+    # explicit operator approval to grant the bump anyway.
     file_path: str | None = None
     current_size: int | None = None
     change_summary: str | None = None
+    section: str = "backend"  # which module_size_limits.json section the file lives in
+    force_chronic_override: bool = (
+        False  # operator-approval bypass for chronic offenders
+    )
 
 
 _ANNOTATION_TYPE_MAP = {
@@ -547,19 +555,41 @@ async def agent_annotate(
         assert file_path is not None
         assert change_summary is not None
 
-        new_limit = _bump_size_limit(current_size)
-        content = (
-            f"Size breach: {file_path} grew to {current_size} lines. "
-            f"Suggested new limit: {new_limit}. Change: {change_summary.strip()}"
+        verdict = _classify_breach_policy(
+            file_path.strip(),
+            current_size,
+            payload.section,
+            override_chronic=payload.force_chronic_override,
         )
-        ctx = {
-            "annotation_type": "size_breach",
-            "task_type": token.get("task_type", ""),
-            "file_path": file_path.strip(),
-            "current_size": current_size,
-            "new_limit": new_limit,
-            "change_summary": change_summary.strip(),
-        }
+        if verdict["is_chronic"] and not payload.force_chronic_override:
+            content = (
+                f"Size breach (chronic offender): {file_path} grew to {current_size} lines. "
+                f"{verdict['reason']} Change: {change_summary.strip()}"
+            )
+            ctx = {
+                "annotation_type": "size_breach",
+                "task_type": token.get("task_type", ""),
+                "file_path": file_path.strip(),
+                "current_size": current_size,
+                "is_chronic": True,
+                "bump_count": verdict["bump_count"],
+                "change_summary": change_summary.strip(),
+            }
+        else:
+            new_limit = verdict["suggested_new_limit"]
+            assert new_limit is not None
+            content = (
+                f"Size breach: {file_path} grew to {current_size} lines. "
+                f"Suggested new limit: {new_limit}. Change: {change_summary.strip()}"
+            )
+            ctx = {
+                "annotation_type": "size_breach",
+                "task_type": token.get("task_type", ""),
+                "file_path": file_path.strip(),
+                "current_size": current_size,
+                "new_limit": new_limit,
+                "change_summary": change_summary.strip(),
+            }
     else:
         content = payload.content.strip()
         ctx = {
@@ -606,7 +636,11 @@ async def agent_annotate(
     )
     response: dict[str, Any] = {"status": "ok", "annotation_id": str(msg.id)}
     if is_size_breach:
-        response["new_limit"] = ctx["new_limit"]
+        if "new_limit" in ctx:
+            response["new_limit"] = ctx["new_limit"]
+        if ctx.get("is_chronic"):
+            response["is_chronic"] = True
+            response["bump_count"] = ctx["bump_count"]
     return response
 
 

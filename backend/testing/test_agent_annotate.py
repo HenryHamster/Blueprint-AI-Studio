@@ -203,6 +203,154 @@ async def test_existing_annotation_types_still_work(
     assert by_type["vision"].message_type == MessageType.FEEDBACK
 
 
+@pytest.mark.asyncio
+async def test_size_breach_chronic_offender_no_new_limit(
+    client: AsyncClient,
+    db_session,
+    mocker,
+):
+    """Chronic offender size_breach: response must include is_chronic=True and
+    omit new_limit so the agent knows decomposition is required."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
+
+    project = Project(name="Chronic Offender Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-chronic",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-chronic", task_type="create")
+
+    def _rec(old, new, days_ago):
+        date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        return BumpRecord(
+            commit_sha=f"sha{days_ago}", commit_date=date, old_cap=old, new_cap=new
+        )
+
+    chronic_history = [
+        _rec(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
+        _rec(1200, 1400, CHRONIC_WINDOW_DAYS - 60),
+        _rec(1400, 1600, 30),
+    ]
+
+    with mocker.patch(
+        "app.size_limit_policy.parse_bump_history", return_value=chronic_history
+    ):
+        resp = await client.post(
+            "/api/agent/annotate",
+            json={
+                "task_id": str(task.id),
+                "annotation_type": "size_breach",
+                "file_path": "orchestrator.py",
+                "current_size": 1720,
+                "change_summary": "Added monitoring hooks",
+                "section": "backend",
+            },
+            headers={"x-agent-token": token},
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    # Chronic offender: must flag is_chronic, must NOT return new_limit.
+    assert body.get("is_chronic") is True, f"Expected is_chronic=True, got: {body}"
+    assert "new_limit" not in body, (
+        f"Chronic offender must not return new_limit: {body}"
+    )
+    assert "bump_count" in body
+
+    # Persisted message must describe decomposition, not offer a cap bump.
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.from_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert msg.context["is_chronic"] is True
+    assert "new_limit" not in msg.context
+    assert "chronic" in msg.content.lower()
+
+
+@pytest.mark.asyncio
+async def test_size_breach_force_chronic_override_grants_bump(
+    client: AsyncClient,
+    db_session,
+    mocker,
+):
+    """force_chronic_override=True on a chronic offender must still grant new_limit."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
+
+    project = Project(name="Force Chronic Override", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-force",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-force", task_type="create")
+
+    def _rec(old, new, days_ago):
+        date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        return BumpRecord(
+            commit_sha=f"sha{days_ago}", commit_date=date, old_cap=old, new_cap=new
+        )
+
+    chronic_history = [
+        _rec(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
+        _rec(1200, 1400, CHRONIC_WINDOW_DAYS - 60),
+        _rec(1400, 1600, 30),
+    ]
+
+    with mocker.patch(
+        "app.size_limit_policy.parse_bump_history", return_value=chronic_history
+    ):
+        resp = await client.post(
+            "/api/agent/annotate",
+            json={
+                "task_id": str(task.id),
+                "annotation_type": "size_breach",
+                "file_path": "orchestrator.py",
+                "current_size": 1720,
+                "change_summary": "Operator-approved bump",
+                "section": "backend",
+                "force_chronic_override": True,
+            },
+            headers={"x-agent-token": token},
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "new_limit" in body, f"Override must grant new_limit: {body}"
+    assert body["new_limit"] == _bump_size_limit(1720)
+
+
 def test_bump_size_limit_policy():
     """The policy is max(current+200, current*1.15) rounded up to nearest 50."""
     # current=1720: floor=1920, proportional=1978, max=1978 → 2000

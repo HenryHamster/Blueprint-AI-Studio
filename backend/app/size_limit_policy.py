@@ -191,6 +191,63 @@ def _is_chronic_offender(history: list[BumpRecord]) -> bool:
     return first_cap > 0 and (current_cap - first_cap) / first_cap >= CHRONIC_GROWTH_PCT
 
 
+class BreachVerdict(TypedDict):
+    is_chronic: bool
+    suggested_new_limit: int | None  # None when chronic and no operator override
+    bump_count: int
+    reason: str
+
+
+def classify_breach(
+    module_key: str,
+    current_size: int,
+    section: str = "backend",
+    *,
+    override_chronic: bool = False,
+) -> BreachVerdict:
+    """Classify a size breach as routine or chronic-offender escalation.
+
+    Returns a ``BreachVerdict`` with ``is_chronic=True`` and
+    ``suggested_new_limit=None`` for chronic offenders (unless
+    ``override_chronic=True``, the explicit operator-approval path, which
+    grants the bump but records attribution).
+
+    Degrades gracefully when git is unavailable — any error from
+    ``parse_bump_history`` is caught and treated as empty history, falling
+    back to a routine bump rather than hard-failing every agent's gate.
+    This matches the advisory-only contract ``parse_bump_history`` documents.
+    """
+    try:
+        history = parse_bump_history(module_key, section)
+    except Exception:  # noqa: BLE001 — advisory degradation, never propagate
+        history = []
+
+    chronic = _is_chronic_offender(history)
+    bump_count = len(history)
+
+    if chronic and not override_chronic:
+        return BreachVerdict(
+            is_chronic=True,
+            suggested_new_limit=None,
+            bump_count=bump_count,
+            reason=(
+                f"Chronic offender: {bump_count} cap bumps on record. "
+                "Decomposition required — do not bump without operator approval."
+            ),
+        )
+
+    return BreachVerdict(
+        is_chronic=chronic,
+        suggested_new_limit=bump_size_limit(current_size),
+        bump_count=bump_count,
+        reason=(
+            "Chronic offender — operator-approved bump."
+            if chronic
+            else f"Routine breach ({bump_count} prior bumps)."
+        ),
+    )
+
+
 def _parse_iso(date_str: str) -> datetime:
     """Parse an ISO-8601 datetime string to a tz-aware datetime.
 

@@ -32,7 +32,7 @@
     "anomaly_detection.py": 2100,
     "routers/agent.py": 5550,
     "services.py": 3250,
-    "recovery_sweeps.py": 4700,
+    "recovery_sweeps.py": 100,
     "routers/agent_status.py": 3850,
     "autonomous_research.py": 3350,
     "autonomous_research_residual.py": 600,
