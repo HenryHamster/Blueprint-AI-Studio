@@ -13744,6 +13744,235 @@ async def test_wake_delivery_stall_raises_operator_alert(reaper_db, mocker):
     reset_wake_delivery_stall_state()
 
 
+# ── Infra-recovery guard: reaper PR-close loop ────────────────────────────────
+# These tests verify that the reaper skips closing PRs owned by infra-reaped
+# fix tasks when the review-loop still has iteration budget, and correctly
+# closes PRs for genuine merit failures or budget-exhausted infra failures.
+
+
+def _make_review_loop_fix_task(
+    project,
+    *,
+    pr_number: int,
+    iteration: int,
+    max_iterations: int,
+    attempt_count: int = 3,
+    failure_class_history: list | None = None,
+) -> Task:
+    """Return an IN_PROGRESS fix task with a stale heartbeat and review_loop
+    context, but NO PULL_REQUEST artifact (so the reaper doesn't redirect it
+    to the EVALUATING open-PR handoff path)."""
+    ctx = {
+        "review_loop": {
+            "pr_number": pr_number,
+            "iteration": iteration,
+            "max_iterations": max_iterations,
+            "branch": f"blueprint/fix-{pr_number}",
+            "base_branch": "main",
+        },
+    }
+    if failure_class_history is not None:
+        ctx["_failure_class_history"] = failure_class_history
+    return Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id=f"vm-fix-{pr_number}",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=attempt_count,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context=ctx,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_preserves_pr_for_infra_reaped_fix_with_budget_remaining(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """(a) Infra-reaped fix task + open PR + iterations remaining → PR NOT closed.
+
+    The real incident: fix task 33cdac3e was reaped 3x on AGENT_TIMEOUT (the
+    agent never ran), yet the reaper closed the PR, discarding valid work.
+    The infra-recovery guard must skip close_pull_request and let the
+    eval-sweep reaped-owner reconcile re-drive the chain.
+    """
+    import app.failure_classification as fc
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="AGENT_TIMEOUT", confidence=0.9
+        ),
+    )
+    mock_close = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    t = _make_review_loop_fix_task(
+        project,
+        pr_number=10152,
+        iteration=2,
+        max_iterations=12,
+        attempt_count=3,
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED, "task must reach terminal-fail path"
+    assert (t.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+    mock_close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reaper_closes_pr_for_merit_failure(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """(b) Genuine merit failure (CODE_ERROR) → PR IS closed as before.
+
+    The infra-recovery guard must not interfere with the existing close path
+    for code-quality failures.
+    """
+    import app.failure_classification as fc
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="CODE_ERROR", confidence=0.9
+        ),
+    )
+    mock_close = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    t = _make_review_loop_fix_task(
+        project,
+        pr_number=20001,
+        iteration=3,
+        max_iterations=12,
+        attempt_count=3,
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    assert (t.context or {}).get("failure_category") == "CODE_ERROR"
+    mock_close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reaper_closes_pr_when_iteration_cap_exhausted(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """(b) Even an AGENT_TIMEOUT failure closes the PR when the iteration cap
+    is exhausted (iteration == max_iterations). No unbounded re-drive loop."""
+    import app.failure_classification as fc
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="AGENT_TIMEOUT", confidence=0.9
+        ),
+    )
+    mock_close = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    t = _make_review_loop_fix_task(
+        project,
+        pr_number=20002,
+        iteration=12,
+        max_iterations=12,
+        attempt_count=3,
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    mock_close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reaper_closes_pr_when_infra_retry_budget_exhausted(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """(c) AGENT_TIMEOUT with 3 prior infra entries in _failure_class_history
+    → budget exhausted → PR IS still closed (no infinite re-drive)."""
+    import app.failure_classification as fc
+    from datetime import timedelta
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="AGENT_TIMEOUT", confidence=0.9
+        ),
+    )
+    mock_close = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    project = await _make_project(reaper_db)
+    t = _make_review_loop_fix_task(
+        project,
+        pr_number=20003,
+        iteration=2,
+        max_iterations=12,
+        attempt_count=3,
+        failure_class_history=[
+            {"class": "AGENT_TIMEOUT", "at": recent},
+            {"class": "AGENT_TIMEOUT", "at": recent},
+            {"class": "AGENT_TIMEOUT", "at": recent},
+        ],
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    mock_close.assert_called_once()
+
+
 # ── Fleet-scan cadence gates and limits (Part A) ────────────────────────────
 
 

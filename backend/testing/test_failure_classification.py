@@ -3439,3 +3439,132 @@ class TestSanitizeReportAppliesRedaction:
         t.api_call_summary = None
         t.context = {**t.context, AGENT_ERROR_REPORT_CONTEXT_KEY: out}
         assert classify_failure(t) == RATE_LIMIT
+
+
+class TestIsRecoverableInfraTerminal:
+    """Unit tests for is_recoverable_infra_terminal — the guard that decides
+    whether the reaper should preserve or close a PR when its fix task hits a
+    terminal infrastructure failure."""
+
+    def _fix_task(self, ctx: dict) -> "Task":
+        t = MagicMock(spec=Task)
+        t.context = ctx
+        return t
+
+    def test_returns_true_for_agent_timeout_with_budget_remaining(self):
+        """An AGENT_TIMEOUT fix task with iterations remaining is recoverable."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 101},
+        })
+        assert is_recoverable_infra_terminal(t) is True
+
+    def test_returns_false_for_code_error(self):
+        """A CODE_ERROR (merit failure) is NOT recoverable — PR should close."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "CODE_ERROR",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 102},
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_returns_false_when_iteration_cap_exhausted(self):
+        """When iteration == max_iterations the review loop has no budget left."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 12, "max_iterations": 12, "pr_number": 103},
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_returns_false_when_iteration_exceeds_cap(self):
+        """iteration > max_iterations is also treated as exhausted."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 13, "max_iterations": 12, "pr_number": 104},
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_returns_true_when_no_review_loop_context(self):
+        """No review_loop in context → iteration budget unknown → preserve PR."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({"failure_category": "AGENT_TIMEOUT"})
+        assert is_recoverable_infra_terminal(t) is True
+
+    def test_returns_false_when_infra_history_at_threshold(self):
+        """Three infra failures in _failure_class_history → budget exhausted."""
+        from datetime import datetime, timedelta
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 105},
+            "_failure_class_history": [
+                {"class": "AGENT_TIMEOUT", "at": recent},
+                {"class": "AGENT_TIMEOUT", "at": recent},
+                {"class": "AGENT_TIMEOUT", "at": recent},
+            ],
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_returns_true_when_infra_history_below_threshold(self):
+        """Two infra entries is below the threshold of 3 — still recoverable."""
+        from datetime import datetime, timedelta
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 106},
+            "_failure_class_history": [
+                {"class": "AGENT_TIMEOUT", "at": recent},
+                {"class": "AGENT_TIMEOUT", "at": recent},
+            ],
+        })
+        assert is_recoverable_infra_terminal(t) is True
+
+    def test_provision_failure_also_recoverable(self):
+        """PROVISION_FAILURE is in INFRA_CLASSES and is also recoverable."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "failure_category": "PROVISION_FAILURE",
+            "review_loop": {"iteration": 1, "max_iterations": 10, "pr_number": 107},
+        })
+        assert is_recoverable_infra_terminal(t) is True
+
+    def test_missing_failure_category_returns_false(self):
+        """No failure_category → not an infra class → False."""
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        t = self._fix_task({
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 108},
+        })
+        assert is_recoverable_infra_terminal(t) is False
+
+    def test_stale_history_entries_ignored_by_ttl(self):
+        """Entries older than 48h are dropped by normalize_failure_class_history —
+        stale repeated failures don't count toward the budget threshold."""
+        from datetime import datetime, timedelta
+        from app.failure_classification import is_recoverable_infra_terminal
+
+        old = (datetime.utcnow() - timedelta(hours=72)).isoformat()
+        t = self._fix_task({
+            "failure_category": "AGENT_TIMEOUT",
+            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 109},
+            "_failure_class_history": [
+                {"class": "AGENT_TIMEOUT", "at": old},
+                {"class": "AGENT_TIMEOUT", "at": old},
+                {"class": "AGENT_TIMEOUT", "at": old},
+            ],
+        })
+        # All three are expired → infra_count = 0 < 3 → still recoverable.
+        assert is_recoverable_infra_terminal(t) is True

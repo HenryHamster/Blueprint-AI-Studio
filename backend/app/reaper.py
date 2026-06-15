@@ -3588,6 +3588,28 @@ async def reaper_service():
                                 f"closing would discard the rollup body"
                             )
                             continue
+                        # Infra-recovery guard: do NOT close PRs for fix tasks that
+                        # failed due to transient infrastructure (AGENT_TIMEOUT, VM
+                        # preemption, etc.) while the review-loop still has iteration
+                        # budget.  The code on the PR is valid — the agent may never
+                        # have run.  Leave the PR open so the eval-sweep reaped-owner
+                        # reconcile (recovery_evaluating.py) or the resurrection sweep
+                        # can re-drive the chain.  Only close for genuine merit/code
+                        # failures or when iteration budget is truly exhausted.
+                        # Sibling chokepoints that are failure-class-blind (rollup-wait
+                        # gate in rollup_management.py ~2031, _resolve_terminal_parent_
+                        # verdict in task_lifecycle_requeue.py, review cap handler) are
+                        # tracked as follow-up work — they require broader DB queries
+                        # and separate review to fix safely.
+                        from app.failure_classification import is_recoverable_infra_terminal
+
+                        if is_recoverable_infra_terminal(task):
+                            logger.info(
+                                f"[PIPELINE] Preserving PR #{pr_number} for infra-reaped "
+                                f"fix task {task.id} — review-loop budget remains, "
+                                f"skipping close so eval-sweep can re-drive the chain"
+                            )
+                            continue
                         try:
                             from app.routers.agent import get_github_token_for_task
                             from app.github import close_pull_request, create_pr_comment

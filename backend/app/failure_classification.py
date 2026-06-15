@@ -2918,3 +2918,66 @@ def append_grader_diagnostic_trail(
     trail = [*trail, entry][-_GRADER_DIAGNOSTIC_TRAIL_MAX:]
     ctx[GRADER_DIAGNOSTIC_TRAIL_KEY] = trail
     return entry
+
+
+# ── Infra-recovery policy primitive ─────────────────────────────────────────
+# How many infra-class entries in the per-task _failure_class_history constitute
+# "budget exhausted" for a single fix task.  Mirrors the AGENT_TIMEOUT repeat-
+# count rule in compute_effective_max_requeues: two occurrences reduce the parent
+# requeue budget; three signals structural breakage rather than transient infra.
+_INFRA_BUDGET_THRESHOLD = 3
+
+
+def is_recoverable_infra_terminal(task: "Task") -> bool:
+    """True when a terminally-FAILED fix task's PR should be preserved, not closed.
+
+    A terminal infrastructure failure (AGENT_TIMEOUT, VM preemption, provisioning
+    failure, etc.) does not indicate a code defect — the PR code may be entirely
+    valid and the agent may never have touched it.  The reaper should NOT close
+    the PR in this case; the review pipeline can re-drive the next fix iteration.
+
+    Returns False (PR should be closed / abandoned) when any of:
+    - The failure class is not infrastructure (genuine merit / code failure).
+    - The review-loop per-chain iteration budget is exhausted
+      (``iteration >= max_iterations`` — _spawn_pipeline_task enforces the same
+      guard; this prevents the close-skip from creating an unbounded re-drive loop
+      after the chain cap fires).
+    - The per-task infra-repeat count has reached or exceeded _INFRA_BUDGET_THRESHOLD,
+      mirroring the retry-budget repeat-count rule in
+      ``compute_effective_max_requeues`` (AGENT_TIMEOUT × 3+ on the SAME task
+      signals a structurally broken task, not a transient infrastructure condition).
+
+    Returns True (keep the PR open, allow the review loop to re-drive) otherwise.
+    """
+    ctx = task.context or {}
+    failure_category = ctx.get("failure_category")
+    if failure_category not in INFRA_CLASSES:
+        return False
+
+    # Review-loop iteration budget: the fix task's review_loop carries the current
+    # iteration number and the per-chain cap set at spawn time.  When both are
+    # present and the cap is reached, further re-drives cannot spawn a new
+    # iteration, so the PR should be closed to unblock sibling rollups.
+    review_loop = ctx.get("review_loop") or {}
+    iteration = review_loop.get("iteration")
+    max_iterations = review_loop.get("max_iterations")
+    if iteration is not None and max_iterations is not None:
+        if iteration >= max_iterations:
+            return False
+
+    # Compose with the retry-budget repeat-count rule: inspect the per-task
+    # _failure_class_history (accumulated across prior RETRY cycles for this
+    # task ID).  Three or more infra-class entries indicate the task itself is
+    # structurally broken — the resurrection sweep already capped its own
+    # budget at _resurrection_count=1, so a high repeat count here means the
+    # task kept failing even after being resurrected.  At that point the review
+    # loop should spawn a FRESH fix task rather than continuously re-driving
+    # this broken one, so we return False and let the caller close the PR.
+    from app.retry_budget import failure_class_history_classes
+
+    history = failure_class_history_classes(ctx.get("_failure_class_history"))
+    infra_count = sum(1 for c in history if c in INFRA_CLASSES)
+    if infra_count >= _INFRA_BUDGET_THRESHOLD:
+        return False
+
+    return True
