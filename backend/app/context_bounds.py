@@ -32,20 +32,16 @@ Adopting elsewhere
 * **Count-capped + text-truncated** (``max_entries`` set) — for append-only
   *history* where old entries are disposable. ``bound_review_history`` is the
   review_history wrapper.
-* **Truncate-only** (``max_entries=None``) — for accumulations whose entries are
+* **Truncate-only with count backstop** — for accumulations whose entries are
   *work items* that must NOT be dropped (dropping would silently lose queued
   work), where only oversized freeform text needs bounding. The research
-  ``deferred_findings`` accumulation is the canonical next adopter: its entries
-  have ``finding_hash`` stamped before the write site
-  (``research_completion._stamp_deferral``), so truncating ``description`` /
-  ``title`` there does not change dedup. Adopt with::
+  ``deferred_findings`` accumulation uses :func:`bound_deferred_findings`, a
+  convenience wrapper that truncates ``title``, ``description``, and ``body``
+  to ``DEFERRED_FINDING_MAX_CHARS`` and applies a generous count backstop
+  (``DEFERRED_FINDINGS_MAX_ENTRIES``) that only fires for pathologically stalled
+  directions::
 
-      ctx["deferred_findings"] = bound_history_entries(
-          all_deferred,
-          text_fields=("description", "title"),
-          max_field_chars=DEFERRED_FINDING_MAX_CHARS,
-          max_entries=None,
-      )
+      ctx["deferred_findings"] = bound_deferred_findings(all_deferred)
 """
 
 import json
@@ -78,6 +74,17 @@ REVIEW_FEEDBACK_MAX_CHARS = 8192
 # module docstring). Defined here so the bound lives with its siblings; wiring is
 # a one-line change at the research write site.
 DEFERRED_FINDING_MAX_CHARS = 8192
+
+# Generous count-cap backstop for deferred_findings. Findings are work items
+# (dropping silently would lose queued work), so the primary bound is text-only.
+# This backstop prevents pathological count growth (stalled directions that
+# accumulate hundreds of perpetually-unresolvable entries) from itself becoming a
+# fat row: 200 entries * 8 KB = ~1.6 MB freeform text worst-case. Set well above
+# any realistic single-cycle maximum (~10–30 per cycle) so the cap is never
+# reached under normal operation. When it fires, the oldest entries are dropped
+# (they have been deferred the most times and are most stale) and the eviction is
+# logged explicitly — never silent.
+DEFERRED_FINDINGS_MAX_ENTRIES = 200
 
 # Soft telemetry threshold: a persisted ``context`` larger than this is logged as
 # a possible fat-row regression. Set above the bound's own worst case
@@ -165,6 +172,38 @@ def bound_review_history(entries: "list | None") -> list:
         text_fields=("feedback",),
         max_field_chars=REVIEW_FEEDBACK_MAX_CHARS,
         max_entries=REVIEW_HISTORY_MAX_ENTRIES,
+    )
+
+
+def bound_deferred_findings(entries: "list | None") -> list:
+    """Bound ``task.context['deferred_findings']`` for context persistence.
+
+    Truncates freeform text fields (title, description, body) to
+    DEFERRED_FINDING_MAX_CHARS with an elision marker. Structured routing fields
+    (finding_hash, type, depends_on, prerequisite, deferred_reason, deferred_count,
+    etc.) are preserved verbatim, so dedup and routing consumers are unaffected.
+
+    Findings are work items — dropping silently would lose queued work — so the
+    primary guard is text-only (max_entries=None by default). A generous count
+    backstop (DEFERRED_FINDINGS_MAX_ENTRIES) evicts the OLDEST entries when the
+    list grows pathologically; the eviction is logged explicitly, never silent.
+    """
+    if not entries:
+        return []
+    if len(entries) > DEFERRED_FINDINGS_MAX_ENTRIES:
+        n_dropped = len(entries) - DEFERRED_FINDINGS_MAX_ENTRIES
+        logger.warning(
+            "[CONTEXT-BOUNDS] deferred_findings count cap: %d entries dropped "
+            "(kept %d most-recent, cap=%d) — possible stalled direction",
+            n_dropped,
+            DEFERRED_FINDINGS_MAX_ENTRIES,
+            DEFERRED_FINDINGS_MAX_ENTRIES,
+        )
+    return bound_history_entries(
+        entries,
+        text_fields=("title", "description", "body"),
+        max_field_chars=DEFERRED_FINDING_MAX_CHARS,
+        max_entries=DEFERRED_FINDINGS_MAX_ENTRIES,
     )
 
 

@@ -11,6 +11,7 @@ from app.failure_classification import (
     AGENT_TIMEOUT,
     ALL_FAILURE_CLASSES,
     APPROVED_CAP_PR_CLOSED,
+    CO_DEFERRED_SHELVED,
     CODE_ERROR,
     EXTERNAL_API,
     VIEWPORT_REGRESSION,
@@ -3455,40 +3456,56 @@ class TestIsRecoverableInfraTerminal:
         """An AGENT_TIMEOUT fix task with iterations remaining is recoverable."""
         from app.failure_classification import is_recoverable_infra_terminal
 
-        t = self._fix_task({
-            "failure_category": "AGENT_TIMEOUT",
-            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 101},
-        })
+        t = self._fix_task(
+            {
+                "failure_category": "AGENT_TIMEOUT",
+                "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 101},
+            }
+        )
         assert is_recoverable_infra_terminal(t) is True
 
     def test_returns_false_for_code_error(self):
         """A CODE_ERROR (merit failure) is NOT recoverable — PR should close."""
         from app.failure_classification import is_recoverable_infra_terminal
 
-        t = self._fix_task({
-            "failure_category": "CODE_ERROR",
-            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 102},
-        })
+        t = self._fix_task(
+            {
+                "failure_category": "CODE_ERROR",
+                "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 102},
+            }
+        )
         assert is_recoverable_infra_terminal(t) is False
 
     def test_returns_false_when_iteration_cap_exhausted(self):
         """When iteration == max_iterations the review loop has no budget left."""
         from app.failure_classification import is_recoverable_infra_terminal
 
-        t = self._fix_task({
-            "failure_category": "AGENT_TIMEOUT",
-            "review_loop": {"iteration": 12, "max_iterations": 12, "pr_number": 103},
-        })
+        t = self._fix_task(
+            {
+                "failure_category": "AGENT_TIMEOUT",
+                "review_loop": {
+                    "iteration": 12,
+                    "max_iterations": 12,
+                    "pr_number": 103,
+                },
+            }
+        )
         assert is_recoverable_infra_terminal(t) is False
 
     def test_returns_false_when_iteration_exceeds_cap(self):
         """iteration > max_iterations is also treated as exhausted."""
         from app.failure_classification import is_recoverable_infra_terminal
 
-        t = self._fix_task({
-            "failure_category": "AGENT_TIMEOUT",
-            "review_loop": {"iteration": 13, "max_iterations": 12, "pr_number": 104},
-        })
+        t = self._fix_task(
+            {
+                "failure_category": "AGENT_TIMEOUT",
+                "review_loop": {
+                    "iteration": 13,
+                    "max_iterations": 12,
+                    "pr_number": 104,
+                },
+            }
+        )
         assert is_recoverable_infra_terminal(t) is False
 
     def test_returns_true_when_no_review_loop_context(self):
@@ -3504,15 +3521,17 @@ class TestIsRecoverableInfraTerminal:
         from app.failure_classification import is_recoverable_infra_terminal
 
         recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
-        t = self._fix_task({
-            "failure_category": "AGENT_TIMEOUT",
-            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 105},
-            "_failure_class_history": [
-                {"class": "AGENT_TIMEOUT", "at": recent},
-                {"class": "AGENT_TIMEOUT", "at": recent},
-                {"class": "AGENT_TIMEOUT", "at": recent},
-            ],
-        })
+        t = self._fix_task(
+            {
+                "failure_category": "AGENT_TIMEOUT",
+                "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 105},
+                "_failure_class_history": [
+                    {"class": "AGENT_TIMEOUT", "at": recent},
+                    {"class": "AGENT_TIMEOUT", "at": recent},
+                    {"class": "AGENT_TIMEOUT", "at": recent},
+                ],
+            }
+        )
         assert is_recoverable_infra_terminal(t) is False
 
     def test_returns_true_when_infra_history_below_threshold(self):
@@ -3521,33 +3540,39 @@ class TestIsRecoverableInfraTerminal:
         from app.failure_classification import is_recoverable_infra_terminal
 
         recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
-        t = self._fix_task({
-            "failure_category": "AGENT_TIMEOUT",
-            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 106},
-            "_failure_class_history": [
-                {"class": "AGENT_TIMEOUT", "at": recent},
-                {"class": "AGENT_TIMEOUT", "at": recent},
-            ],
-        })
+        t = self._fix_task(
+            {
+                "failure_category": "AGENT_TIMEOUT",
+                "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 106},
+                "_failure_class_history": [
+                    {"class": "AGENT_TIMEOUT", "at": recent},
+                    {"class": "AGENT_TIMEOUT", "at": recent},
+                ],
+            }
+        )
         assert is_recoverable_infra_terminal(t) is True
 
     def test_provision_failure_also_recoverable(self):
         """PROVISION_FAILURE is in INFRA_CLASSES and is also recoverable."""
         from app.failure_classification import is_recoverable_infra_terminal
 
-        t = self._fix_task({
-            "failure_category": "PROVISION_FAILURE",
-            "review_loop": {"iteration": 1, "max_iterations": 10, "pr_number": 107},
-        })
+        t = self._fix_task(
+            {
+                "failure_category": "PROVISION_FAILURE",
+                "review_loop": {"iteration": 1, "max_iterations": 10, "pr_number": 107},
+            }
+        )
         assert is_recoverable_infra_terminal(t) is True
 
     def test_missing_failure_category_returns_false(self):
         """No failure_category → not an infra class → False."""
         from app.failure_classification import is_recoverable_infra_terminal
 
-        t = self._fix_task({
-            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 108},
-        })
+        t = self._fix_task(
+            {
+                "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 108},
+            }
+        )
         assert is_recoverable_infra_terminal(t) is False
 
     def test_stale_history_entries_ignored_by_ttl(self):
@@ -3557,14 +3582,103 @@ class TestIsRecoverableInfraTerminal:
         from app.failure_classification import is_recoverable_infra_terminal
 
         old = (datetime.utcnow() - timedelta(hours=72)).isoformat()
-        t = self._fix_task({
-            "failure_category": "AGENT_TIMEOUT",
-            "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 109},
-            "_failure_class_history": [
-                {"class": "AGENT_TIMEOUT", "at": old},
-                {"class": "AGENT_TIMEOUT", "at": old},
-                {"class": "AGENT_TIMEOUT", "at": old},
-            ],
-        })
+        t = self._fix_task(
+            {
+                "failure_category": "AGENT_TIMEOUT",
+                "review_loop": {"iteration": 2, "max_iterations": 12, "pr_number": 109},
+                "_failure_class_history": [
+                    {"class": "AGENT_TIMEOUT", "at": old},
+                    {"class": "AGENT_TIMEOUT", "at": old},
+                    {"class": "AGENT_TIMEOUT", "at": old},
+                ],
+            }
+        )
         # All three are expired → infra_count = 0 < 3 → still recoverable.
         assert is_recoverable_infra_terminal(t) is True
+
+
+class TestPrereqEscalationClassification:
+    """Prerequisite-escalation / co-deferred CANCELLED tasks must NOT be CODE_ERROR.
+
+    When research_completion cancels a child task because its declared prerequisite
+    has no live/deferred provider this cycle (prerequisite_escalated_to_parent=True)
+    or because it is co-deferred alongside its same-cycle-deferred foundation
+    (CO_DEFERRED_SHELVED), the failure classifier must return BLOCKED_PRECONDITION
+    (a budget-exempt INFRA class) rather than falling through to CODE_ERROR.
+
+    Acceptance proof for: test_prereq_escalation_not_code_error
+    """
+
+    def test_no_live_provider_routes_to_blocked_precondition(self):
+        """prerequisite_escalated_to_parent=True + no_live_or_deferred_provider reason."""
+        t = _task(
+            "Escalated to parent: finding 'fix: foo' declared task prerequisite(s) "
+            "with no spawned, deferred, or in-flight provider.",
+            {
+                "prerequisite_escalated_to_parent": True,
+                "prerequisite_escalation_reason": "no_live_or_deferred_provider",
+            },
+        )
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_structurally_unresolvable_routes_to_blocked_precondition(self):
+        """prerequisite_escalated_to_parent=True + structurally_unresolvable reason."""
+        t = _task(
+            "Escalated to parent: finding 'fix: bar' declared only "
+            "structurally unresolvable prerequisite(s).",
+            {
+                "prerequisite_escalated_to_parent": True,
+                "prerequisite_escalation_reason": "structurally_unresolvable",
+            },
+        )
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_co_deferred_shelved_routes_to_blocked_precondition(self):
+        """CO_DEFERRED_SHELVED marker routes to BLOCKED_PRECONDITION."""
+        t = _task(
+            "",
+            {CO_DEFERRED_SHELVED: True},
+        )
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_prereq_escalation_not_code_error(self):
+        """Selector asserted in task acceptance evidence."""
+        t = _task(
+            "Escalated to parent: finding 'feat: inject domain knowledge' declared "
+            "task prerequisite(s) with no spawned, deferred, or in-flight provider.",
+            {
+                "prerequisite_escalated_to_parent": True,
+                "prerequisite_escalation_reason": "no_live_or_deferred_provider",
+            },
+        )
+        result = classify_failure(t)
+        assert result != CODE_ERROR
+        assert result == BLOCKED_PRECONDITION
+
+    def test_prereq_escalation_overrides_persisted_code_error(self):
+        """Context marker overrides a previously-persisted failure_class=CODE_ERROR."""
+        t = _task(
+            "Escalated to parent: finding 'fix: baz' declared only "
+            "structurally unresolvable prerequisite(s).",
+            {
+                "prerequisite_escalated_to_parent": True,
+                "failure_class": CODE_ERROR,
+            },
+        )
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_prereq_escalation_is_in_infra_classes(self):
+        from app.failure_classification import INFRA_CLASSES
+
+        assert BLOCKED_PRECONDITION in INFRA_CLASSES
+
+    def test_co_deferred_overrides_persisted_code_error(self):
+        """CO_DEFERRED_SHELVED overrides a stale persisted CODE_ERROR verdict."""
+        t = _task(
+            "",
+            {
+                CO_DEFERRED_SHELVED: True,
+                "failure_class": CODE_ERROR,
+            },
+        )
+        assert classify_failure(t) == BLOCKED_PRECONDITION

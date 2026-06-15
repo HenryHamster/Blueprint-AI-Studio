@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.context_bounds import bound_deferred_findings
 from app.depends_on_provenance import remember_structural_depends_on
 from app.findings_index import (  # noqa: F401 — re-exported for callers/tests
     lookup_findings_by_source_ref,
@@ -4896,7 +4897,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     ):
         ctx = dict(task.context or {})
         if _all_deferred:
-            ctx["deferred_findings"] = _all_deferred
+            ctx["deferred_findings"] = bound_deferred_findings(_all_deferred)
         if _finding_give_up:
             ctx["finding_structural_give_up"] = _finding_give_up
         if _scope_skip_counts:
@@ -5531,7 +5532,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # prerequisites so autonomous_research re-injects the coupled set next cycle.
     if _codeferred_findings:
         _cd_ctx = dict(task.context or {})
-        _cd_ctx["deferred_findings"] = (
+        _cd_ctx["deferred_findings"] = bound_deferred_findings(
             list(_cd_ctx.get("deferred_findings") or []) + _codeferred_findings
         )
         task.context = _cd_ctx

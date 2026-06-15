@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.context_bounds import bound_deferred_findings
 from app.database import closing_session
 from app.models import (
     Task,
@@ -250,7 +251,7 @@ async def _shelve_findings_for_next_cycle(
                 return
             ctx = dict(t.context or {})
             existing = list(ctx.get("deferred_findings") or [])
-            ctx["deferred_findings"] = existing + stamped
+            ctx["deferred_findings"] = bound_deferred_findings(existing + stamped)
             t.context = ctx
             flag_modified(t, "context")
             t.latest_status_message = (
