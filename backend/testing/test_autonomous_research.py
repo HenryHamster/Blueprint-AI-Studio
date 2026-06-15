@@ -14282,14 +14282,14 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-spend01")],
-        build_config={"daily_spend_ceiling_usd": 1.0},
+        build_config={"resource_envelope": {"spend_ceiling_usd": 1.0}},
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     mock_spend = mocker.patch(
-        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        "app.autonomous_research.get_project_recent_spend_usd",
         new=AsyncMock(return_value=1.5),
     )
 
@@ -14331,7 +14331,7 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-spend02")],
-        build_config={"daily_spend_ceiling_usd": 10.0},
+        build_config={"resource_envelope": {"spend_ceiling_usd": 10.0}},
         vision={"purpose": "test"},
     )
     db_session.add(project2)
@@ -14339,7 +14339,7 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
     await db_session.refresh(project2)
 
     mocker.patch(
-        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        "app.autonomous_research.get_project_recent_spend_usd",
         new=AsyncMock(return_value=2.0),
     )
 
@@ -14359,7 +14359,7 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-spend03")],
-        build_config={},  # no daily_spend_ceiling_usd
+        build_config={},  # no resource_envelope.spend_ceiling_usd
         vision={"purpose": "test"},
     )
     db_session.add(project3)
@@ -14368,13 +14368,13 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
 
     # Re-patch to count calls cleanly for the no-ceiling assertion
     no_ceiling_mock = mocker.patch(
-        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        "app.autonomous_research.get_project_recent_spend_usd",
         new=AsyncMock(return_value=999.0),
     )
     await _spawn_research_task(project3, db_session)
 
     assert no_ceiling_mock.call_count == 0, (
-        "compute_project_window_spend_usd must NOT be called when no ceiling is set"
+        "get_project_recent_spend_usd must NOT be called when no ceiling is set"
     )
     # Also assert no spend-ceiling alerts for project3
     alerts3 = (

@@ -117,7 +117,11 @@ def _direction_in_refractory(d: dict, now: datetime) -> bool:
 async def _project_spend_ceiling_spawn_defer_reason(
     project: Project, session: AsyncSession
 ) -> str | None:
-    """Return a spawn deferral reason when the project spend ceiling is reached."""
+    """Return a spawn deferral reason when the project spend ceiling is reached.
+
+    Also emits a spend-ceiling alert when the ceiling is hit so operators are
+    notified regardless of which spawn gate triggers the check.
+    """
     spend_ceiling = resolve_project_spend_ceiling(project)
     if spend_ceiling is None:
         return None
@@ -128,6 +132,14 @@ async def _project_spend_ceiling_spawn_defer_reason(
         window_days=spend_window_days,
     )
     if recent_spend >= spend_ceiling:
+        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+
+        await _maybe_create_spend_ceiling_alert(
+            project.id,
+            session,
+            window_spend_usd=recent_spend,
+            ceiling_usd=spend_ceiling,
+        )
         return (
             f"project spend ceiling reached: ${recent_spend:.2f}/${spend_ceiling:.2f} "
             f"in the last {spend_window_days} day(s)"
@@ -518,26 +530,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # re-enabled.
     if not project.autonomous_enabled or project.archived:
         return
-
-    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
-    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
-    if spend_ceiling_usd:
-        from app.efficiency_snapshot import compute_project_window_spend_usd
-        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
-
-        window_spend = await compute_project_window_spend_usd(session, project.id)
-        if window_spend >= spend_ceiling_usd:
-            logger.info(
-                f"[AUTONOMOUS] Spend ceiling reached for project {project.id}: "
-                f"${window_spend:.4f} >= ${spend_ceiling_usd:.4f} — pausing spawning"
-            )
-            await _maybe_create_spend_ceiling_alert(
-                project.id,
-                session,
-                window_spend_usd=window_spend,
-                ceiling_usd=spend_ceiling_usd,
-            )
-            return
 
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
     # Blueprint pipeline repo and polluted new projects with wrong build/test
@@ -2682,25 +2674,6 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
                 )
                 return
 
-    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
-    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
-    if spend_ceiling_usd:
-        from app.efficiency_snapshot import compute_project_window_spend_usd
-        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
-
-        window_spend = await compute_project_window_spend_usd(session, project.id)
-        if window_spend >= spend_ceiling_usd:
-            logger.info(
-                f"[AUTONOMOUS] Spend ceiling reached for project {project.id}: "
-                f"${window_spend:.4f} >= ${spend_ceiling_usd:.4f} — skipping periodic spawn (type={task_type})"
-            )
-            await _maybe_create_spend_ceiling_alert(
-                project.id,
-                session,
-                window_spend_usd=window_spend,
-                ceiling_usd=spend_ceiling_usd,
-            )
-            return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(
         task_type, {}

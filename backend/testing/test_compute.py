@@ -8185,7 +8185,7 @@ def _make_project_with_ceiling(ceiling_usd: float) -> Project:
     return Project(
         name=f"Ceiling Project {ceiling_usd}",
         user_id="test-user",
-        build_config={"daily_spend_ceiling_usd": ceiling_usd},
+        build_config={"resource_envelope": {"spend_ceiling_usd": ceiling_usd}},
     )
 
 
@@ -8262,6 +8262,71 @@ async def test_create_compute_job_respects_project_daily_spend_ceiling(db_sessio
         .all()
     )
     assert jobs == [], "no compute job should be created when ceiling is exceeded"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_respects_resource_envelope_spend_ceiling(db_session):
+    """Ceiling set via resource_envelope key blocks launch when rolling spend >= ceiling."""
+    project = Project(
+        name="Resource Envelope Ceiling Project",
+        user_id="test-user",
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 5.0,
+                "spend_window_days": 30,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Settled spend: $4.50 within the 30-day window.
+    await _make_terminal_job(db_session, project_id=project.id, final_cost_usd=4.50)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Requesting $1.00 cap: 4.50 + 1.00 = 5.50 >= 5.00 → should raise.
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo ceiling via resource_envelope",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_spend_ceiling_exceeded"
+    assert detail["ceiling_usd"] == pytest.approx(5.0)
+    assert detail["rolling_spend_usd"] == pytest.approx(4.50)
+    assert detail["requested_cap_usd"] == pytest.approx(1.0)
+
+    # No active job row should have been created.
+    jobs = (
+        (
+            await db_session.execute(
+                select(ComputeJob).where(
+                    ComputeJob.project_id == project.id,
+                    ComputeJob.status.in_(
+                        [
+                            ComputeJobStatus.QUEUED,
+                            ComputeJobStatus.STARTING,
+                            ComputeJobStatus.RUNNING,
+                            ComputeJobStatus.POLLING,
+                        ]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert jobs == [], "no compute job should be created when resource_envelope ceiling is exceeded"
 
 
 @pytest.mark.asyncio
@@ -8471,6 +8536,58 @@ async def test_create_compute_job_ceiling_counts_agent_vm_spend(db_session):
     )
     assert jobs == [], (
         "no compute job should be created when agent-VM spend exceeds ceiling"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_ceiling_task_spend_uses_correct_window(db_session):
+    """compute_project_window_spend_usd is called with window_hours=window_days*24.
+
+    When resource_envelope.spend_window_days=30, the agent-VM/LLM spend helper
+    must be queried with window_hours=720 (not the default 24), so both compute
+    and task spend are measured over the same rolling window.
+    """
+    project = Project(
+        name="Window Match Project",
+        user_id="test-user",
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    captured_kwargs: dict = {}
+
+    async def capture_call(session, pid, *, window_hours=24):
+        captured_kwargs["window_hours"] = window_hours
+        return 0.0  # well below ceiling — we only care about the kwarg
+
+    with patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=capture_call,
+    ):
+        # Should succeed (0.0 spend + 1.0 cap = 1.0 < 100.0 ceiling).
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo window match",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+
+    assert captured_kwargs.get("window_hours") == 30 * 24, (
+        f"expected window_hours=720 (30-day window), got {captured_kwargs.get('window_hours')}"
     )
 
 

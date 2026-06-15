@@ -173,26 +173,36 @@ async def _spawn_residual_fingerprint_remediation(
     if not fingerprints:
         return 0
 
-    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
-    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
-    if spend_ceiling_usd:
-        from app.efficiency_snapshot import compute_project_window_spend_usd
-        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+    # Guard: per-project spend ceiling via canonical resource_envelope resolver
+    from app.resource_envelope import (
+        get_project_recent_spend_usd,
+        resolve_project_spend_ceiling,
+        resolve_project_spend_window_days,
+    )
 
-        window_spend = await compute_project_window_spend_usd(session, project.id)
-        if window_spend >= spend_ceiling_usd:
+    spend_ceiling = resolve_project_spend_ceiling(project)
+    if spend_ceiling is not None:
+        spend_window_days = resolve_project_spend_window_days(project)
+        window_spend = await get_project_recent_spend_usd(
+            session,
+            project_id=project.id,
+            window_days=spend_window_days,
+        )
+        if window_spend >= spend_ceiling:
+            from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+
             logger.info(
                 "[AUTO REMEDIATION] Spend ceiling reached for project %s: "
                 "$%.4f >= $%.4f — skipping remediation spawn",
                 project.id,
                 window_spend,
-                spend_ceiling_usd,
+                spend_ceiling,
             )
             await _maybe_create_spend_ceiling_alert(
                 project.id,
                 session,
                 window_spend_usd=window_spend,
-                ceiling_usd=spend_ceiling_usd,
+                ceiling_usd=spend_ceiling,
             )
             return 0
 

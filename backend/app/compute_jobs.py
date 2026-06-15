@@ -32,6 +32,10 @@ from app.compute_backends import (
     get_compute_backend,
     validate_backend_name,
 )
+from app.resource_envelope import (
+    resolve_project_spend_ceiling,
+    resolve_project_spend_window_days,
+)
 from app.release_artifacts import (
     summarize_release_artifacts,
     summarize_required_artifact_gap,
@@ -501,20 +505,18 @@ async def _check_project_spend_ceiling(
 ) -> None:
     """Raise ComputeLaunchPreconditionFailed when launching would breach the project ceiling.
 
-    Computes total 24h spend as: settled terminal-job costs + in-flight accrued
+    Computes total rolling spend as: settled terminal-job costs + in-flight accrued
     compute costs + agent-VM/LLM task spend (via compute_project_window_spend_usd).
-    If that total plus the requested cap would exceed the configured
-    ``daily_spend_ceiling_usd``, the launch is rejected before any row is written.
-    The check is skipped when no ceiling is configured.
+    If that total plus the requested cap would meet or exceed the configured
+    ``resource_envelope.spend_ceiling_usd``, the launch is rejected before any row
+    is written. The check is skipped when no ceiling is configured.
     """
     project = await session.get(Project, project_id)
-    ceiling_usd = (
-        (project.build_config or {}).get("daily_spend_ceiling_usd") if project else None
-    )
+    ceiling_usd = resolve_project_spend_ceiling(project) if project else None
     if not ceiling_usd:
         return
-    ceiling_usd = float(ceiling_usd)
-    since = _utcnow() - timedelta(hours=24)
+    window_days = resolve_project_spend_window_days(project)
+    since = _utcnow() - timedelta(days=window_days)
     settled = await get_recent_terminal_compute_spend_usd(
         session, project_id=project_id, since=since
     )
@@ -531,16 +533,16 @@ async def _check_project_spend_ceiling(
     # is no double-counting with compute_rolling above.
     from app.efficiency_snapshot import compute_project_window_spend_usd
 
-    task_spend = await compute_project_window_spend_usd(session, project_id)
+    task_spend = await compute_project_window_spend_usd(session, project_id, window_hours=window_days * 24)
     rolling = compute_rolling + task_spend
-    if rolling + requested_cap_usd > ceiling_usd:
+    if rolling + requested_cap_usd >= ceiling_usd:
         raise ComputeLaunchPreconditionFailed(
             {
                 "error": "project_spend_ceiling_exceeded",
                 "message": (
-                    f"project rolling 24h total spend ${rolling:.4f} (compute: "
+                    f"project rolling {window_days}-day total spend ${rolling:.4f} (compute: "
                     f"${compute_rolling:.4f}, agent VM+LLM: ${task_spend:.4f}) plus "
-                    f"requested cap ${requested_cap_usd:.4f} would exceed configured "
+                    f"requested cap ${requested_cap_usd:.4f} would meet or exceed configured "
                     f"ceiling ${ceiling_usd:.4f}"
                 ),
                 "rolling_spend_usd": rolling,
