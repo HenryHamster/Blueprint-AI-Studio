@@ -858,14 +858,26 @@ async def _recover_orphaned_tasks():
                                 Task.description,
                                 Task.payloads,
                                 Task.context,
-                            raiseload=True,)
+                                raiseload=True,
+                            )
                         )
                         .where(
                             Task.status == TaskStatus.COMPLETED,
                             Task.created_by == "ORCHESTRATOR",
                             Task.created_at <= five_min_ago,
-                            Task.created_at
-                            >= one_hour_ago,  # Only check recent tasks, not entire history
+                            # Normal window: tasks created in the last hour.
+                            # Extended: also include post_commit_failed=True tasks
+                            # regardless of age — the post-commit sweep may abandon
+                            # a task hours after creation (agent runtime +
+                            # lock-starvation + 90-min backstop ≈ 3.5h observed),
+                            # which puts it permanently outside the 1-hour window.
+                            # post_commit_failed is write-only without this OR arm;
+                            # coupling it here makes the abandon→recovery path
+                            # event-driven on the flag rather than on creation age.
+                            or_(
+                                Task.created_at >= one_hour_ago,
+                                Task.post_commit_failed.is_(True),
+                            ),
                         )
                         # C3: per-cycle row cap. Each candidate costs a serial
                         # get_github_token_for_task + list-pulls GitHub round-trip;
@@ -1366,7 +1378,8 @@ async def _sweep_stranded_sidecar_sources() -> None:
                         Task.archived,
                         Task.project_id,
                         Task.context,
-                    raiseload=True,)
+                        raiseload=True,
+                    )
                 )
                 .where(
                     Task.status == TaskStatus.COMPLETED,

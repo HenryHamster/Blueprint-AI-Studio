@@ -323,6 +323,104 @@ async def test_orphan_recovery_skips_too_recent_tasks(svc_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_orphan_recovery_recovers_post_commit_failed_outside_time_window(
+    svc_db, mocker
+):
+    """post_commit_failed=True tasks are recovered even when created_at is outside
+    the normal 1-hour window.
+
+    Regression test for the late-abandon strand: agent runtime + lock-starvation
+    + 90-min post-commit backstop ≈ 3.5h, which places created_at permanently
+    outside the 1-hour window by the time the task is abandoned. The
+    post_commit_failed flag must trigger recovery independently of creation age.
+    """
+    project = await _make_project(svc_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do create"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=_naive_utc_ago(hours=3, minutes=30),
+        post_commit_failed=True,
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+    await svc_db.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh_token", "owner", "repo"),
+    )
+
+    pr_url = "https://github.com/owner/repo/pull/123"
+    mock_gh_resp = MagicMock()
+    mock_gh_resp.status_code = 200
+    mock_gh_resp.json.return_value = [{"html_url": pr_url, "number": 123}]
+    mocker.patch("app.github._github_request", AsyncMock(return_value=mock_gh_resp))
+
+    mock_review_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 123}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    mock_spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(mock_review_task, True),
+    )
+
+    await _recover_orphaned_tasks()
+
+    mock_spawn.assert_called_once()
+
+    artifact = (
+        (
+            await svc_db.execute(
+                select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert artifact is not None, "PR artifact must be created for late-abandoned task"
+    assert artifact.pr_url == pr_url
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_still_skips_old_task_without_post_commit_failed(
+    svc_db, mocker
+):
+    """Tasks outside the 1-hour window without post_commit_failed=True are still skipped.
+
+    Ensures the post_commit_failed OR-extension doesn't widen the window for
+    normal old tasks (would waste GitHub API quota on entire task history).
+    """
+    project = await _make_project(svc_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do create"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=_naive_utc_ago(hours=3, minutes=30),
+        post_commit_failed=False,
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    mock_get_token = AsyncMock(return_value=("gh_token", "owner", "repo"))
+    mocker.patch("app.routers.agent.get_github_token_for_task", mock_get_token)
+
+    await _recover_orphaned_tasks()
+
+    mock_get_token.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_orphan_recovery_uses_project_namespace(svc_db, mocker):
     """review-respawn derives branches under the project's task_branch_namespace, not hardcoded 'blueprint'."""
     project = Project(
@@ -2824,7 +2922,9 @@ async def test_post_commit_sweep_abandons_lock_starved_marker_by_age(svc_db, moc
     assert stuck.post_commit_pending is False
     assert stuck.post_commit_failed is True
     ctx = stuck.context or {}
-    assert "_post_commit_pending_meta" not in ctx, "stale pending marker must be cleared"
+    assert "_post_commit_pending_meta" not in ctx, (
+        "stale pending marker must be cleared"
+    )
     abandoned = ctx.get("_post_commit_abandoned") or {}
     assert abandoned.get("reason") == "max_pending_age_exceeded"
     assert abandoned.get("after_pending_age_s", 0) >= POST_COMMIT_MAX_PENDING_AGE_S
