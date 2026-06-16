@@ -125,6 +125,37 @@ describe('VersionSummaryPanel — viewport regression', () => {
     expect(anchors[0].getAttribute('target')).toBe('_blank');
   });
 
+  test('heading prop overrides default label', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} heading="What merged" />);
+    });
+    const panel = host.querySelector('[data-testid="version-summary-panel"]');
+    if (!panel?.textContent?.includes('What merged')) {
+      throw new Error('Expected heading "What merged" when heading prop is passed');
+    }
+    if (panel?.textContent?.includes('What shipped')) {
+      throw new Error('Expected default heading "What shipped" to be absent when heading prop overrides it');
+    }
+  });
+
+  test('omitting heading prop renders default "What shipped" label', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const panel = host.querySelector('[data-testid="version-summary-panel"]');
+    if (!panel?.textContent?.includes('What shipped')) {
+      throw new Error('Expected default heading "What shipped" when heading prop is omitted');
+    }
+  });
+
   test('changelog entry with null pr_url renders plain text PR number', async () => {
     host = document.createElement('div');
     document.body.appendChild(host);

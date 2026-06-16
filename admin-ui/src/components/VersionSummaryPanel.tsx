@@ -66,8 +66,10 @@ function TypeSection({
 
 export function VersionSummaryPanel({
   tasksMerged,
+  heading,
 }: {
   tasksMerged: ChangelogEntry[] | undefined;
+  heading?: string;
 }): JSX.Element | null {
   if (tasksMerged === undefined) return null;
 
@@ -90,7 +92,7 @@ export function VersionSummaryPanel({
       className="mt-3 rounded border border-slate-700/60 bg-slate-800/40 px-3 py-2"
     >
       <div className="text-[11px] font-semibold text-slate-400 mb-2">
-        What shipped ({tasksMerged.length} task{tasksMerged.length !== 1 ? 's' : ''})
+        {heading ?? 'What shipped'} ({tasksMerged.length} task{tasksMerged.length !== 1 ? 's' : ''})
       </div>
       <div className="max-h-48 overflow-y-auto pr-1">
         {Array.from(groups.entries()).map(([type, entries]) => (
