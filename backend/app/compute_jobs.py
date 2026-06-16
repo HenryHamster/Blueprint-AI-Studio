@@ -533,7 +533,9 @@ async def _check_project_spend_ceiling(
     # is no double-counting with compute_rolling above.
     from app.efficiency_snapshot import compute_project_window_spend_usd
 
-    task_spend = await compute_project_window_spend_usd(session, project_id, window_hours=window_days * 24)
+    task_spend = await compute_project_window_spend_usd(
+        session, project_id, window_hours=window_days * 24
+    )
     rolling = compute_rolling + task_spend
     if rolling + requested_cap_usd >= ceiling_usd:
         raise ComputeLaunchPreconditionFailed(
@@ -1700,7 +1702,11 @@ async def _attach_repo_clone(
             if job.task_id:
                 task = await session.get(Task, job.task_id)
                 if task is not None:
-                    payload = task.first_payload if isinstance(task.first_payload, dict) else {}
+                    payload = (
+                        task.first_payload
+                        if isinstance(task.first_payload, dict)
+                        else {}
+                    )
                     ctx = task.context if isinstance(task.context, dict) else {}
                     ref = payload.get("base_branch") or ctx.get("original_base")
             ref = ref or getattr(project, "promotion_target", None) or "main"
@@ -2011,6 +2017,17 @@ def build_compute_result_logs(job: ComputeJob) -> str:
             num = _coerce_metric_number(value)
             if num is not None:
                 result[name] = num
+    # Embed the bounded command log text so downstream analysis (knowledge doc,
+    # LLM analysis prompt) can find results that live in stdout/stderr rather
+    # than in $BLUEPRINT_RESULT_FILE. Capped at _COMMAND_LOG_EMBED_CHARS so a
+    # noisy command log can never bloat the artifact JSON unreasonably.
+    _COMMAND_LOG_EMBED_CHARS = 8000
+    command_log = meta.get("command_log")
+    if isinstance(command_log, dict):
+        cl_text = str(command_log.get("text") or "").strip()
+        if cl_text:
+            result["command_log_text"] = cl_text[:_COMMAND_LOG_EMBED_CHARS]
+            result["command_log_truncated"] = bool(command_log.get("truncated"))
     return json.dumps(result)
 
 

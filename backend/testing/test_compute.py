@@ -6352,6 +6352,67 @@ def test_build_compute_result_logs_shape_metrics_and_disposition():
     assert "ignored" not in result
 
 
+def test_build_compute_result_logs_embeds_command_log_text():
+    """The builder embeds the bounded command-output log so downstream analysis can
+    find results that live in stdout/stderr rather than in $BLUEPRINT_RESULT_FILE."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={
+            "command_log": {
+                "text": "act-1-clear improvement: +0.16\n",
+                "truncated": True,
+            },
+        },
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert "act-1-clear improvement: +0.16" in result["command_log_text"]
+    assert result["command_log_truncated"] is True
+
+
+def test_build_compute_result_logs_caps_command_log_text():
+    """A noisy command log is truncated to the embed cap so it cannot bloat the JSON."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={"command_log": {"text": "x" * 20000, "truncated": False}},
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert len(result["command_log_text"]) == 8000
+
+
+def test_build_compute_result_logs_omits_command_log_when_absent():
+    """No command_log in polling_metadata ⇒ no command_log_text key (backward-compat)."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="local",
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.1,
+        final_cost_usd=0.1,
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert "command_log_text" not in result
+    assert "command_log_truncated" not in result
+
+
 def test_build_compute_result_logs_falls_back_to_accrued_cost():
     """When final_cost_usd is unset, the builder falls back to accrued cost."""
     job = ComputeJob(

@@ -15095,10 +15095,16 @@ class TestComputeExperimentTaskLaunch:
         assert payload["benchmark"] == "tokens-per-second"
         assert payload["hypothesis"] == "L4 throughput exceeds the acceptance floor."
         assert payload["metric"] == "tokens_per_second"
+        # The criterion now carries an explicit kind discriminator (defaulting to
+        # "metric" for backward compatibility) plus the min_file_count field used
+        # by the artifact_produced kind; the metric/operator/threshold trio is
+        # unchanged for a metric criterion.
         assert payload["success_criterion"] == {
+            "kind": "metric",
             "metric": "tokens_per_second",
             "operator": ">=",
             "threshold": 100.0,
+            "min_file_count": 1,
         }
 
     @pytest.mark.asyncio

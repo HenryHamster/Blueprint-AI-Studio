@@ -244,6 +244,48 @@ def test_compute_experiment_payload_accepts_success_criterion():
     assert result["success_criterion"]["threshold"] == 0.9
 
 
+def test_compute_experiment_metric_criterion_requires_metric_operator_threshold():
+    # kind defaults to "metric"; the metric/operator/threshold trio stays required
+    # so a metric criterion missing any of them fails closed at validation.
+    for missing in ("metric", "operator", "threshold"):
+        criterion = {"metric": "accuracy", "operator": ">=", "threshold": 0.9}
+        criterion.pop(missing)
+        raw = {
+            "type": "compute_experiment",
+            "command": "run-eval",
+            "success_criterion": criterion,
+        }
+        _invalid(raw)
+
+
+def test_compute_experiment_artifact_produced_criterion_no_numeric_fields():
+    # kind="artifact_produced" does NOT require metric/operator/threshold; the
+    # value of the experiment is its durable output, not a scalar. min_file_count
+    # defaults to 1 when unspecified.
+    raw = {
+        "type": "compute_experiment",
+        "command": "train-model",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 600,
+        "success_criterion": {"kind": "artifact_produced"},
+    }
+    result = _valid(raw)
+    sc = result["success_criterion"]
+    assert sc["kind"] == "artifact_produced"
+    assert sc["min_file_count"] == 1
+    assert sc.get("metric") is None
+
+
+def test_compute_experiment_artifact_produced_criterion_custom_min_file_count():
+    raw = {
+        "type": "compute_experiment",
+        "command": "train-model",
+        "success_criterion": {"kind": "artifact_produced", "min_file_count": 3},
+    }
+    result = _valid(raw)
+    assert result["success_criterion"]["min_file_count"] == 3
+
+
 def test_compute_experiment_payload_rejects_unknown_criterion_operator():
     # The operator is a closed Literal set — an unrecognized operator is rejected.
     raw = {

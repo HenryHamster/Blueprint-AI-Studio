@@ -3200,6 +3200,130 @@ async def test_real_evidence_rejects_http_artifact_location(
     )
 
 
+@pytest.mark.asyncio
+async def test_gather_compute_evidence_surfaces_command_log_text(
+    db_session, _quiet_compute_io
+):
+    """When the COMPUTE_RESULT artifact text embeds command_log_text (a result that
+    lives in stdout/stderr rather than a scalar), _gather_compute_evidence surfaces
+    it so the analysis prompt can preserve it rather than discarding it."""
+    from app.knowledge_completion import _gather_compute_evidence
+
+    project = Project(name="CmdLogEvidence", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: command-log result",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {"type": "compute_experiment", "experiment": "eval", "base_branch": "main"}
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri="gs://bucket/jobs/result/bundle.tar.gz",
+        logs=json.dumps(
+            {"artifact_uri": "gs://bucket/jobs/result/bundle.tar.gz", "file_count": 3}
+        ),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=artifact.id,
+        result_reference="gs://bucket/jobs/result/bundle.tar.gz",
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs_json = json.dumps(
+        {
+            "job_id": str(job.id),
+            "command_log_text": "act-1-clear improvement: +0.16 over baseline\n",
+        }
+    )
+
+    evidence = await _gather_compute_evidence(
+        task,
+        logs=logs_json,
+        result_reference=None,
+        criterion=None,
+        session=db_session,
+    )
+
+    assert evidence is not None
+    assert evidence["command_log_text"] is not None
+    assert "act-1-clear improvement: +0.16" in evidence["command_log_text"]
+
+
+@pytest.mark.asyncio
+async def test_gather_compute_evidence_no_artifact_no_command_log_is_safe(
+    db_session, _quiet_compute_io
+):
+    """Backward-compat: a metrics-only job with a durable result_reference + metrics
+    but NO linked artifact_id and no embedded command log must not raise (regression
+    guard for the art_logs UnboundLocalError) and yields command_log_text=None."""
+    from app.knowledge_completion import _gather_compute_evidence
+
+    project = Project(name="MetricsOnlyEvidence", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: metrics only",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {"type": "compute_experiment", "experiment": "eval", "base_branch": "main"}
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=None,  # no linked COMPUTE_RESULT artifact row
+        result_reference="gs://bucket/jobs/result/bundle.tar.gz",
+        polling_metadata={"result_metrics": {"accuracy": 0.93}},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs_json = json.dumps({"job_id": str(job.id)})  # no command_log_text key
+
+    evidence = await _gather_compute_evidence(
+        task,
+        logs=logs_json,
+        result_reference=None,
+        criterion=None,
+        session=db_session,
+    )
+
+    assert evidence is not None
+    assert evidence["command_log_text"] is None
+    assert evidence["metrics"] == {"accuracy": 0.93}
+
+
 # ── artifact_delivery record stamping ──────────────────────────────────────
 
 
