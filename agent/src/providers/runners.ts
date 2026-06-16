@@ -828,7 +828,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       ...(classified ? { classified } : {}),
     };
   };
-  const flags: { timedOut: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean; llmNoProgressHang: boolean } = { timedOut: false, providerKilledByOOM: false, stalledMidStream: false, llmNoProgressHang: false };
+  const flags: { timedOut: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean; llmNoProgressHang: boolean; agentKillIssued: boolean } = { timedOut: false, providerKilledByOOM: false, stalledMidStream: false, llmNoProgressHang: false, agentKillIssued: false };
   let lastToolUseAt: number | null = null;
   let toolInFlight = false;
   // True while the in-flight top-level tool is a workflow / sub-agent fan-out
@@ -931,7 +931,12 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       && child.signalCode === null;
     const setForceKillTimer = (callback: () => void): void => {
       if (forceKillTimer) clearTimeout(forceKillTimer);
-      forceKillTimer = setTimeout(callback, PROCESS_KILL_GRACE_MS);
+      forceKillTimer = setTimeout(() => {
+        // Mark that the agent itself is issuing this SIGKILL so the close
+        // handler does not misclassify it as a cgroup/external OOM.
+        flags.agentKillIssued = true;
+        callback();
+      }, PROCESS_KILL_GRACE_MS);
     };
     const resetStallWatchdog = () => {
       if (stallWatchdog) clearTimeout(stallWatchdog);
@@ -1567,7 +1572,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       if (typeof originalPid === 'number') {
         unregisterChildPid(originalPid);
       }
-      if (closeSignal === 'SIGKILL' && !flags.timedOut) {
+      if (closeSignal === 'SIGKILL' && !flags.timedOut && !flags.agentKillIssued) {
         flags.providerKilledByOOM = true;
         const oomLine = `EOOM: ${runCommand.displayName} process received external SIGKILL before agent timeout; likely cgroup OOM\n`;
         stderrBuffer = appendBoundedTail(stderrBuffer, oomLine, STDERR_TAIL_BYTES);

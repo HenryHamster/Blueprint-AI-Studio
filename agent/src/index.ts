@@ -1914,7 +1914,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     try {
       await apiPost('/api/agent/heartbeat', {
         task_id: taskId,
-        status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
+        status_message: `[${metrics.heap_used_mb}MB] ${sanitize(statusMessage)}`,
         metrics,
         tool_trace,
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
@@ -1986,7 +1986,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       // Tighter values keep the mutex turning over.
       await apiPost('/api/agent/heartbeat', {
         task_id: taskId,
-        status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
+        status_message: `[${metrics.heap_used_mb}MB] ${sanitize(statusMessage)}`,
         metrics,
         tool_trace,
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
@@ -2020,7 +2020,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
             const retryToolTrace = snapshotToolTrace({ refreshLastEntry: retryStatusMessage.startsWith('Using tool:') });
             await apiPost('/api/agent/heartbeat', {
               task_id: taskId,
-              status_message: `[${retryMetrics.heap_used_mb}MB] ${retryStatusMessage}`,
+              status_message: `[${retryMetrics.heap_used_mb}MB] ${sanitize(retryStatusMessage)}`,
               metrics: retryMetrics,
               tool_trace: retryToolTrace,
               ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
@@ -2118,7 +2118,7 @@ export function sendHeartbeatSync(
     const metrics = collectMetrics();
     const payload = JSON.stringify({
       task_id: taskId,
-      status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
+      status_message: `[${metrics.heap_used_mb}MB] ${sanitize(statusMessage)}`,
       metrics,
       ...getLlmTelemetry(),
       ...getFormatComplianceTelemetry(),
@@ -3049,7 +3049,7 @@ export async function main() {
   // flushes before the process exits.
   const reportPreClaimFailure = (reason: string) => {
     const reportTaskId = PRE_CLAIM_TASK_ID || process.env.TASK_ID || '';
-    const truncated = reason.slice(0, 500);
+    const truncated = sanitize(reason).slice(0, 500);
     if (!reportTaskId) {
       // Taskless pool boot: there is no task to attribute the failure to, but a
       // VM-scoped token can carry the reason via /vm-heartbeat so the orchestrator
