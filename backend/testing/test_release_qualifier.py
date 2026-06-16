@@ -12807,6 +12807,84 @@ async def test_sweep_skips_version_with_running_child(db_session):
 
 
 @pytest.mark.asyncio
+async def test_sweep_redrives_deferred_unsynced_when_now_synced(db_session, mocker):
+    """A version stranded in ``deferred_unsynced`` whose integration branch has
+    SINCE absorbed the promotion target is re-driven by the sweep: it re-enters
+    ``run_qualification``, the now-synced candidate clears the gate, and the real
+    audit spawns.  Regression for the wedge where a deferred qualification has no
+    scheduled re-driver — ``run_qualification`` only re-enters via a fresh
+    strategic ``qualify_request`` / admin ``/qualify`` — so once the strategist
+    stops re-emitting it strands forever even after the back-merge lands."""
+    from datetime import datetime, timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Stranded deferral, recorded a few minutes ago (well within the 30-min
+    # fall-through window, so the ONLY thing that can clear it is now being
+    # synced — not the fall-through).
+    version.last_qualification = {
+        "status": "deferred_unsynced",
+        "candidate_sha": "stale00" * 5 + "00000",
+        "first_deferred_at": (datetime.utcnow() - timedelta(minutes=3)).isoformat(),
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    # main is NOW absorbed into the (fresh) candidate — the back-merge landed.
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+    await db_session.refresh(version)
+    # Deferral cleared → qualification actually started.
+    assert version.last_qualification["status"] == "pending"
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_deferred_unsynced_when_still_behind(db_session, mocker):
+    """A version still genuinely behind the promotion target (back-merge not yet
+    landed, within the fall-through window) is NOT scored by the sweep: the
+    re-drive re-defers, spawns no audit, and preserves ``first_deferred_at`` so
+    the bounded fall-through clock keeps accumulating across sweeps."""
+    from datetime import datetime, timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    first_deferred = (datetime.utcnow() - timedelta(minutes=3)).isoformat()
+    version.last_qualification = {
+        "status": "deferred_unsynced",
+        "candidate_sha": "stale00" * 5 + "00000",
+        "first_deferred_at": first_deferred,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    # Still NOT absorbed — the back-merge has not landed yet.
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=False)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    await db_session.refresh(version)
+    # Still deferred, nothing spawned, and the accrued-wait clock is preserved.
+    assert version.last_qualification["status"] == "deferred_unsynced"
+    assert version.last_qualification["first_deferred_at"] == first_deferred
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
 async def test_sweep_skips_already_finalized_version(db_session):
     """A version whose last_qualification is not 'pending' is skipped — the
     sweep only acts on stuck pending records."""

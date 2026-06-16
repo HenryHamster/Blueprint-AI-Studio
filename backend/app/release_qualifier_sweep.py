@@ -243,6 +243,67 @@ async def _force_finalize_sweep_crash_loop(
     )
 
 
+async def _redrive_deferred_unsynced_qualification(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-enter the qualifier for a version stranded in ``deferred_unsynced``.
+
+    The qualify-on-synced gate (``release_qualifier._check_lts_sync_gate``)
+    DEFERS a candidate the promotion target is not yet absorbed into — a
+    ``main -> integration`` back-merge is still pending — and records
+    ``last_qualification.status == "deferred_unsynced"``.  The deferral is meant
+    to be retryable, but ``run_qualification`` only ever re-enters via a fresh
+    strategic ``qualify_request`` or the admin ``POST /qualify`` endpoint; there
+    is no scheduled re-driver.  So once the strategist stops re-emitting (its own
+    status reads a standing ``deferred_unsynced`` as "qualification in
+    progress"), the version strands there indefinitely — even after the
+    back-merge has made it synced — and the gate's OWN bounded fall-through never
+    fires, because that fall-through is evaluated only ON RE-ENTRY.
+
+    This is that missing scheduled re-driver.  For an open, stabilize-phase
+    version whose ``last_qualification.status == "deferred_unsynced"`` it
+    re-invokes ``run_qualification`` in a dedicated session.
+    ``run_qualification`` re-snapshots the integration-branch HEAD and either
+    PROCEEDS — now synced, or the bounded fall-through window has elapsed —
+    spawning the real audit, or RE-DEFERS (still behind) while preserving
+    ``first_deferred_at`` so the fall-through clock keeps accumulating across
+    sweeps.  ``run_qualification`` is fully self-defending (it re-checks phase /
+    in-flight / promotion / cached-verdict under its own ``FOR UPDATE`` row
+    lock), so a version that changed state since the scan is a safe no-op, and a
+    still-unsynced candidate spawns nothing (the gate returns before the spawn).
+
+    Returns True only when the re-entry actually STARTED a qualification
+    (``status == "spawned"``) — i.e. the deferral cleared — so the sweep can
+    count and log it.  A continued deferral or any guard no-op returns False.
+    """
+    # ``run_qualification`` lives in release_qualifier (the core coordinator);
+    # import it lazily to avoid the load-time import cycle (release_qualifier
+    # imports this module at top for its re-exports).
+    from app import release_qualifier
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = await redrive_session.get(
+            release_version.ReleaseVersion, version_id
+        )
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "deferred_unsynced"
+            or version.phase != "stabilize"
+        ):
+            return False
+        result = await release_qualifier.run_qualification(
+            redrive_session, version.project_id, version
+        )
+        await redrive_session.commit()
+        return bool(result) and result.get("status") == "spawned"
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -384,6 +445,41 @@ async def sweep_stuck_qualifications(
             "[RELEASE_QUALIFIER] sweep finalized %d stuck qualification(s)",
             finalized,
         )
+
+    # Re-drive qualifications stranded in ``deferred_unsynced``.  The
+    # qualify-on-synced gate defers a candidate the promotion target is not yet
+    # absorbed into (a ``main -> integration`` back-merge is pending), but
+    # ``run_qualification`` only re-enters via a fresh strategic
+    # ``qualify_request`` or the admin ``/qualify`` endpoint — nothing
+    # re-evaluates a STANDING deferral.  So once the back-merge lands (making the
+    # candidate synced) the version can sit in ``deferred_unsynced`` forever, and
+    # the gate's bounded fall-through never fires because it is checked only on
+    # re-entry.  This loop is the scheduled re-driver: each sweep it re-invokes
+    # ``run_qualification`` for any open ``deferred_unsynced`` version, which
+    # re-snapshots the integration HEAD and either proceeds (now synced /
+    # fall-through elapsed) or re-defers while preserving ``first_deferred_at`` so
+    # the fall-through accumulates.  ``run_qualification`` is self-defending, so a
+    # version that changed state since the scan is a safe no-op.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_deferred_unsynced_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: deferred_unsynced re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove deferred_unsynced version %s "
+                "(now synced — qualification spawned)",
+                version_id,
+            )
 
     # Reconcile open versions whose promotion-failure candidate is already on
     # main.  A promotion_failed version is kept open so the next strategic cycle
