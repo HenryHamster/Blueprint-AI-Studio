@@ -4163,8 +4163,7 @@ async def test_sweep_idle_pool_vms_candidate_scan_carries_limit(db_session, mock
     pool_vm_scans = [
         str(q.compile(dialect=dialect)).upper()
         for q in captured_queries
-        if hasattr(q, "compile")
-        and "POOLVM" in str(q.compile(dialect=dialect)).upper()
+        if hasattr(q, "compile") and "POOLVM" in str(q.compile(dialect=dialect)).upper()
     ]
     assert pool_vm_scans, "expected at least one pool_vm scan"
     assert any("LIMIT" in s for s in pool_vm_scans), (
@@ -4272,3 +4271,143 @@ async def test_transient_is_ancestor_of_does_not_burn_phase_requeues(
     assert (lane.phase_requeues or 0) == initial_requeues, (
         "transient is_ancestor_of failure must NOT increment phase_requeues"
     )
+
+
+# ---------------------------------------------------------------------------
+# sweep_lane_pilot_kill_verdict — reaper-owned KILL sweep
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pilot_on(lanes_on):
+    """Enable both improvement_lanes_enabled and review_fix_lane_pilot_enabled."""
+    prior = _runtime_config.get("review_fix_lane_pilot_enabled")
+    _runtime_config["review_fix_lane_pilot_enabled"] = True
+    try:
+        yield
+    finally:
+        if prior is None:
+            _runtime_config.pop("review_fix_lane_pilot_enabled", None)
+        else:
+            _runtime_config["review_fix_lane_pilot_enabled"] = prior
+
+
+@pytest.mark.asyncio
+async def test_sweep_lane_pilot_kill_verdict_noop_when_pilot_disabled(db_session):
+    """sweep_lane_pilot_kill_verdict returns 0 immediately when the pilot is off,
+    without querying ImprovementLane at all."""
+    prior = _runtime_config.get("review_fix_lane_pilot_enabled")
+    _runtime_config["review_fix_lane_pilot_enabled"] = False
+    try:
+        from app.review_fix_lane_pilot import sweep_lane_pilot_kill_verdict
+
+        result = await sweep_lane_pilot_kill_verdict(db_session)
+        assert result == 0
+    finally:
+        if prior is None:
+            _runtime_config.pop("review_fix_lane_pilot_enabled", None)
+        else:
+            _runtime_config["review_fix_lane_pilot_enabled"] = prior
+
+
+@pytest.mark.asyncio
+async def test_sweep_lane_pilot_kill_verdict_skips_already_killed(
+    db_session, pilot_on, mocker
+):
+    """When a project already has a durable KILL verdict recorded in
+    capability_adoption_verdicts, the sweep is a no-op for that project."""
+    from app.capability_trial_verdict import LANE_PILOT_CAP_NAME
+    from app.review_fix_lane_pilot import sweep_lane_pilot_kill_verdict
+
+    project = await _make_project(db_session, name="Already Killed")
+    project.capability_adoption_verdicts = {
+        LANE_PILOT_CAP_NAME: {"verdict": "KILL", "verdict_reason": "prior_kill"}
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _make_lane(
+        db_session, project, status=ImprovementLaneStatus.ACTIVE, name="killed-lane"
+    )
+
+    kill_fn = mocker.patch(
+        "app.review_fix_lane_pilot.apply_lane_pilot_kill_in_transaction",
+        new_callable=AsyncMock,
+    )
+
+    result = await sweep_lane_pilot_kill_verdict(db_session)
+    assert result == 0
+    kill_fn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sweep_lane_pilot_kill_verdict_applies_kill(db_session, pilot_on, mocker):
+    """Acceptance seam: sweep_lane_pilot_kill_verdict applies a KILL when
+    evaluate_lane_pilot_verdict returns KILL (gate-integrity violations >= 3).
+
+    Verifies:
+    - return value >= 1
+    - apply_lane_pilot_kill_in_transaction is called with reason='reaper_sweep'
+    - alert_detail is set because immediate_alert=True from gate violations
+    """
+    from app.review_fix_lane_pilot import sweep_lane_pilot_kill_verdict
+
+    project = await _make_project(db_session, name="Kill Candidate")
+    project.is_self_repo = True
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _make_lane(
+        db_session, project, status=ImprovementLaneStatus.ACTIVE, name="kill-lane"
+    )
+
+    # Aggregates with 3 gate-integrity violations trigger an immediate-alert KILL.
+    kill_aggregates = {
+        "n_lane": 0,
+        "n_control": 0,
+        "n_shadow": 0,
+        "lane_merge_rate": None,
+        "control_merge_rate": None,
+        "lane_cost_per_merged": None,
+        "control_cost_per_merged": None,
+        "lane_runtime_cost_per_merged": None,
+        "control_runtime_cost_per_merged": None,
+        "lane_reserved_idle_cost_per_merged": None,
+        "control_reserved_idle_cost_per_merged": None,
+        "gate_integrity_violations": 3,
+        "control_warm_resume_count": 0,
+        "checkpoint_loss_rate": None,
+        "checkpoint_attempts_total": 0,
+        "checkpoint_requeues_total": 0,
+        "warm_resume_fraction": None,
+        "checkpoint_fraction": None,
+        "lane_fix_tasks_sampled": 0,
+        "lane_visual": {},
+        "control_visual": {},
+    }
+
+    mocker.patch(
+        "app.review_fix_lane_pilot.compute_lane_pilot_aggregates",
+        new_callable=AsyncMock,
+        return_value=kill_aggregates,
+    )
+    kill_fn = mocker.patch(
+        "app.review_fix_lane_pilot.apply_lane_pilot_kill_in_transaction",
+        new_callable=AsyncMock,
+        return_value={
+            "flag_disabled": True,
+            "reservations_cleared": 0,
+            "lanes_killed": 1,
+        },
+    )
+
+    result = await sweep_lane_pilot_kill_verdict(db_session)
+
+    assert result >= 1, "sweep must return >= 1 when KILL is applied"
+    kill_fn.assert_awaited_once()
+    call_kwargs = kill_fn.await_args
+    assert call_kwargs.kwargs["reason"] == "reaper_sweep"
+    # Gate violations set immediate_alert=True → alert_detail must be non-None.
+    assert call_kwargs.kwargs["alert_detail"] is not None

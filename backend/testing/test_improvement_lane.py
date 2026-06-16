@@ -2140,6 +2140,73 @@ async def test_activate_lane_for_fix_no_restamp_when_hard_ceiling_elapsed(
 
 
 # ---------------------------------------------------------------------------
+# activate_lane_for_fix — workspace_state branch contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_activate_lane_for_fix_full_pilot_sets_workspace_state_leased(
+    db: AsyncSession,
+):
+    """Full-pilot path (lease_workspace=True) must flip workspace_state to LEASED
+    after PARKED->ACTIVE transition.  A stale COLD value here means the fix task
+    cannot claim a warm workspace, so this is a correctness invariant."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/ws-leased-contract",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    await db.commit()
+
+    task_id = uuid.uuid4()
+    await activate_lane_for_fix(db, lane, task_id=task_id, lease_workspace=True)
+    await db.commit()
+
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
+    assert refreshed.workspace_state == "LEASED", (
+        "full-pilot activate_lane_for_fix must set workspace_state=LEASED"
+    )
+
+
+@pytest.mark.asyncio
+async def test_activate_lane_for_fix_shadow_mode_does_not_set_workspace_leased(
+    db: AsyncSession,
+):
+    """Shadow path (lease_workspace=False) must NOT flip workspace_state to LEASED.
+    A stray LEASED value in the shadow arm contaminates the control arm — itself a
+    pilot KILL condition — so the cold state must be preserved."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/ws-shadow-contract",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    await db.commit()
+
+    task_id = uuid.uuid4()
+    await activate_lane_for_fix(db, lane, task_id=task_id, lease_workspace=False)
+    await db.commit()
+
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
+    assert refreshed.workspace_state == "COLD", (
+        "shadow activate_lane_for_fix must NOT set workspace_state=LEASED"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Reservation-expiry while lane is in LEASED state (end-to-end seam)
 # ---------------------------------------------------------------------------
 

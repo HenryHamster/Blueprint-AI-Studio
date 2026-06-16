@@ -2024,3 +2024,77 @@ async def compute_lane_pilot_aggregates(
         "lane_visual": lane_visual,
         "control_visual": control_visual,
     }
+
+
+async def sweep_lane_pilot_kill_verdict(session: AsyncSession) -> int:
+    """Evaluate KILL conditions for all projects with active lane work.
+
+    Runs on every reaper cycle, independently of digest computation, so the
+    safety KILL (flag flip + force-expire reservations + kill lanes + alert)
+    is not gated on a leader-only precompute timer or an operator GET.
+
+    Returns the count of projects where KILL was applied this cycle.
+    """
+    if not is_review_fix_lane_pilot_enabled():
+        return 0
+
+    from app.capability_trial_verdict import evaluate_lane_pilot_verdict
+    from app.improvement_lane_ops import _TERMINAL_STATUSES
+    from app.models import ImprovementLane, Project
+
+    # Enumerate distinct project IDs that have non-terminal lane rows.
+    rows = (
+        await session.execute(
+            select(ImprovementLane.project_id).where(
+                ImprovementLane.status.not_in(list(_TERMINAL_STATUSES))
+            )
+        )
+    ).all()
+    project_ids = list({row[0] for row in rows})
+
+    kills_applied = 0
+    for project_id in project_ids:
+        try:
+            # Skip projects that already have a durable KILL recorded.
+            project = await session.get(Project, project_id)
+            if project is None:
+                continue
+            verdicts = getattr(project, "capability_adoption_verdicts", None)
+            if isinstance(verdicts, dict):
+                entry = verdicts.get(LANE_PILOT_CAP_NAME)
+                if isinstance(entry, dict) and entry.get("verdict") == "KILL":
+                    continue
+
+            aggregates = await compute_lane_pilot_aggregates(session, project_id)
+            verdict = evaluate_lane_pilot_verdict(aggregates)
+            if verdict.get("verdict") != "KILL":
+                continue
+
+            alert_detail: str | None = None
+            if verdict.get("immediate_alert"):
+                alert_detail = (
+                    verdict.get("verdict_reason") or "gate_integrity_violation"
+                )
+
+            await apply_lane_pilot_kill_in_transaction(
+                session,
+                project_id,
+                verdict_entry=verdict,
+                reason="reaper_sweep",
+                alert_detail=alert_detail,
+            )
+            kills_applied += 1
+            logger.info(
+                "[LANE-PILOT] reaper sweep applied KILL to project %s reason=%s",
+                project_id,
+                verdict.get("verdict_reason"),
+            )
+        except Exception as exc:
+            logger.error(
+                "[LANE-PILOT] reaper sweep error for project %s: %s",
+                project_id,
+                exc,
+                exc_info=True,
+            )
+
+    return kills_applied

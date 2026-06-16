@@ -1194,7 +1194,8 @@ async def reaper_service():
                             Task.previous_error_fingerprint,
                             Task.requeue_in_flight,
                             Task.description,
-                        raiseload=True,)
+                            raiseload=True,
+                        )
                     )
                     .where(
                         Task.status.in_(
@@ -3601,7 +3602,9 @@ async def reaper_service():
                         # verdict in task_lifecycle_requeue.py, review cap handler) are
                         # tracked as follow-up work — they require broader DB queries
                         # and separate review to fix safely.
-                        from app.failure_classification import is_recoverable_infra_terminal
+                        from app.failure_classification import (
+                            is_recoverable_infra_terminal,
+                        )
 
                         if is_recoverable_infra_terminal(task):
                             logger.info(
@@ -3705,7 +3708,8 @@ async def reaper_service():
                                         Task.status_log,
                                         Task.attempt_count,
                                         Task.created_at,
-                                    raiseload=True,)
+                                        raiseload=True,
+                                    )
                                 )
                                 .where(
                                     Task.status == TaskStatus.EVALUATING,
@@ -3749,7 +3753,8 @@ async def reaper_service():
                                             Task.status_log,
                                             Task.latest_status_message,
                                             Task.payloads,
-                                        raiseload=True,)
+                                            raiseload=True,
+                                        )
                                     )
                                     .where(Task.parent_task_id.in_(_parent_ids))
                                 )
@@ -4321,6 +4326,26 @@ async def reaper_service():
                     logger.error(
                         f"[REAPER] Stale-bug-message resolve sweep error: {e}",
                         exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 19: Lane-pilot KILL verdict sweep — evaluate pilot safety
+                # conditions for all projects with active lane work; apply KILL
+                # (flag flip + force-expire reservations + kill lanes + alert) when
+                # warranted. Owns the KILL safety guarantee independently of digest.
+                _mark_reaper_progress()
+                try:
+                    from app.review_fix_lane_pilot import sweep_lane_pilot_kill_verdict
+
+                    _pilot_kills = await sweep_lane_pilot_kill_verdict(session)
+                    if _pilot_kills:
+                        logger.info(
+                            f"[REAPER] Step 19: applied lane-pilot KILL to {_pilot_kills} project(s)"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Lane-pilot kill sweep error: {e}", exc_info=True
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()
