@@ -49,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
+from app.json_extract import _extract_json_object
 from app.schemas import sanitize_rpc_diagnostic
 from app.knowledge_query import (
     KnowledgeSubstance,
@@ -602,43 +603,15 @@ def _parse_web_research_document(text: str | None) -> dict[str, Any] | None:
         return parsed
 
     # Fallback: scan for a balanced JSON object carrying the required keys.
-    if not all(f'"{k}"' in snippet for k in _DOCUMENT_REQUIRED_KEYS):
+    candidate = _extract_json_object(snippet, *_DOCUMENT_REQUIRED_KEYS)
+    if candidate is None:
         return None
-    start = snippet.find("{")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escape_next = False
-        for i in range(start, len(snippet)):
-            c = snippet[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if c == "\\" and in_string:
-                escape_next = True
-                continue
-            if c == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = snippet[start : i + 1]
-                    if all(f'"{k}"' in candidate for k in _DOCUMENT_REQUIRED_KEYS):
-                        try:
-                            obj = json.loads(candidate)
-                        except (json.JSONDecodeError, ValueError):
-                            obj = None
-                        if isinstance(obj, dict) and all(
-                            k in obj for k in _DOCUMENT_REQUIRED_KEYS
-                        ):
-                            return obj
-                    break
-        start = snippet.find("{", start + 1)
+    try:
+        obj = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(obj, dict) and all(k in obj for k in _DOCUMENT_REQUIRED_KEYS):
+        return obj
     return None
 
 

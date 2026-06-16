@@ -48,6 +48,7 @@ from app.task_capabilities import (
     get_task_capability,
     strategic_phase_for,
 )
+from app.json_extract import scan_balanced_json_objects
 from app.task_blocked import strip_fresh_attempt_context
 from app.time_utils import clear_retry_after
 import app.shared_state as _shared_state
@@ -2108,7 +2109,8 @@ async def _process_post_commit(
                                         "scan_transient_failure": True,
                                     }
                                     task.latest_status_message = _safe_exception_message(
-                                        retry_exc, "Security scan unavailable (infrastructure error) — requires manual approval"
+                                        retry_exc,
+                                        "Security scan unavailable (infrastructure error) — requires manual approval",
                                     )
                                     session.add(task)
                                     if task.auto_remediation:
@@ -2661,7 +2663,8 @@ async def _process_post_commit(
                                     "scan_transient_failure": True,
                                 }
                                 task.latest_status_message = _safe_exception_message(
-                                    retry_exc, "Security scan unavailable (infrastructure error) — review will proceed but merge requires manual approval"
+                                    retry_exc,
+                                    "Security scan unavailable (infrastructure error) — review will proceed but merge requires manual approval",
                                 )
                                 session.add(task)
                                 await session.commit()
@@ -2832,8 +2835,6 @@ async def _process_post_commit(
                 investigated_files: list[str] = []
 
                 # Parse verdict: prefer structured verdict_json field, fall back to log parsing
-                import re
-
                 verdict_parsed = False
                 verdict_unparseable = False
                 review_was_parallelized = False
@@ -2871,52 +2872,21 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}"
                         )
 
-                # Method 2: Parse JSON from log output (string-aware bracket counting)
+                # Method 2: Parse JSON from log output
                 if not verdict_parsed:
                     try:
-                        for m in re.finditer(r'\{[^{}]*"verdict"', verdict_text):
-                            start = m.start()
-                            depth = 0
-                            in_string = False
-                            escape_next = False
-                            for i in range(start, len(verdict_text)):
-                                c = verdict_text[i]
-                                if escape_next:
-                                    escape_next = False
-                                    continue
-                                if c == "\\" and in_string:
-                                    escape_next = True
-                                    continue
-                                if c == '"' and not escape_next:
-                                    in_string = not in_string
-                                    continue
-                                if in_string:
-                                    continue
-                                if c == "{":
-                                    depth += 1
-                                elif c == "}":
-                                    depth -= 1
-                                    if depth == 0:
-                                        try:
-                                            candidate = json.loads(
-                                                verdict_text[start : i + 1]
-                                            )
-                                            if "verdict" in candidate:
-                                                verdict = candidate["verdict"]
-                                                feedback = candidate.get(
-                                                    "feedback", verdict_text
-                                                )
-                                                issues = (
-                                                    candidate.get("issues", [])
-                                                    if isinstance(
-                                                        candidate.get("issues"), list
-                                                    )
-                                                    else []
-                                                )
-                                                verdict_parsed = True
-                                        except json.JSONDecodeError:
-                                            pass
-                                        break
+                        candidate = scan_balanced_json_objects(
+                            verdict_text, required_key="verdict", last=True
+                        )
+                        if candidate is not None:
+                            verdict = candidate["verdict"]
+                            feedback = candidate.get("feedback", verdict_text)
+                            issues = (
+                                candidate.get("issues", [])
+                                if isinstance(candidate.get("issues"), list)
+                                else []
+                            )
+                            verdict_parsed = True
                     except Exception as e:
                         logger.error(
                             f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}",
