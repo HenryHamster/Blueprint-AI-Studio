@@ -143,6 +143,13 @@ from app.release_qualifier_audit import (
     get_latest_release_audit_report,  # noqa: F401 — re-exported for callers/tests
     resolve_lifecycle_audit_evidence,  # noqa: F401 — re-exported for callers/tests
 )
+from app.ci_resolution import (
+    _CI_GREEN,
+    _CI_NO_CHECKS,  # noqa: F401
+    _CI_PENDING,
+    _CI_RED,
+    _classify_check_runs,
+)
 from app.release_scoring import (
     # Re-exports — release_qualifier is the canonical import + test-patch
     # surface for the scoring layer (tests mock via ``app.release_qualifier.<name>``
@@ -151,10 +158,6 @@ from app.release_scoring import (
     # as "unused" and silently break downstream importers / patch points.
     _AUDIT_DEDUCTION_UNKNOWN,  # noqa: F401
     _AUDIT_DEDUCTIONS,  # noqa: F401
-    _CI_GREEN,
-    _CI_NO_CHECKS,  # noqa: F401
-    _CI_PENDING,
-    _CI_RED,
     _DEFAULT_POLICY,
     _FINDING_SUMMARY_MAX,
     _MAX_CARRIED_FINDINGS,  # noqa: F401
@@ -167,7 +170,6 @@ from app.release_scoring import (
     _audit_findings_carry_meta,
     _audit_missing_reason,
     _clamp01,  # noqa: F401
-    _classify_check_runs,
     _compute_audit_reconciliation,
     _compute_audit_challenge_synthesis,  # noqa: F401 — re-exported for callers/tests
     _compute_challenge_synthesis_from_binding_verdicts,
@@ -3709,7 +3711,10 @@ async def _finalize_locked_version(
         ) = await _resolve_migration_identity_at_finalize(
             session, peek, peek_candidate_sha
         )
-        pre_apply_verdict, pre_apply_detail = await _resolve_migration_apply_at_finalize(
+        (
+            pre_apply_verdict,
+            pre_apply_detail,
+        ) = await _resolve_migration_apply_at_finalize(
             session, peek, peek_candidate_sha
         )
         _pre_gates = {

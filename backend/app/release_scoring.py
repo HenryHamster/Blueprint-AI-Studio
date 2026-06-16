@@ -19,11 +19,7 @@ import re
 from typing import Any
 
 from app.ci_resolution import (
-    _CI_GREEN,  # noqa: F401
-    _CI_NO_CHECKS,  # noqa: F401
-    _CI_PENDING,  # noqa: F401
     _CI_RED,
-    _classify_check_runs,  # noqa: F401
 )
 from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
 

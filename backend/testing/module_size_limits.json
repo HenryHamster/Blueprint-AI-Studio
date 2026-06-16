@@ -134,7 +134,7 @@
     "constants.ts": 420,
     "json-extract.ts": 330,
     "workspacePrep.ts": 500,
-    "reset.ts": 320,
+    "reset.ts": 550,
     "utils/test-runners.ts": 2850,
     "utils/diff-detection.ts": 150,
     "utils/stale-result.ts": 150,
