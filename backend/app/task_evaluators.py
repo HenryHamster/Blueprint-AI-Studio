@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.acceptance_gate import CRITERION_OPS, coerce_number, criterion_met
+from app.json_extract import _extract_json_array, _extract_last_json_array
 from app.models import Task, TaskStatus
 from app.task_capabilities import get_task_capability
 
@@ -735,8 +736,6 @@ def _extract_measurement(artifact_text: str | None) -> list | None:
     text = (artifact_text or "").strip()
     if not text:
         return None
-    from app.task_completion import _extract_json_array
-
     json_str = _extract_json_array(text, "severity")
     if not json_str:
         return None
@@ -1158,8 +1157,6 @@ def parse_adversarial_finding_verdicts(
         return {
             h: _default_entry(ADVERSARIAL_PARSE_EMPTY_LOGS) for h in finding_hashes
         }, ADVERSARIAL_PARSE_EMPTY_LOGS
-
-    from app.task_completion import _extract_last_json_array
 
     text = logs.strip()
     # Try extraction with different required-key combinations to support:

@@ -93,7 +93,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0289"
+EXPECTED_SCHEMA_REVISION = "0300"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -677,7 +677,6 @@ async def _init_deployment_state():
         # deploy's sha + timestamp first so investigation payloads can compute
         # the prior_deploy_sha..current_sha commit range without a live checkout.
         state.prior_deploy_sha = state.current_sha
-        state.prior_deployed_at = state.deployed_at
         state.current_revision = _current_revision
         state.current_sha = _current_sha
         state.deployed_at = _utcnow()

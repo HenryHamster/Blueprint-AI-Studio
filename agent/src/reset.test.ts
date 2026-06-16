@@ -269,7 +269,9 @@ describe('resetForNextRole', () => {
         expect.stringContaining('.claude'),
         expect.objectContaining({ recursive: true, force: true }),
       );
-      const rmPath = fsPromisesMocks.rm.mock.calls[0]?.[0] as string;
+      const rmPath = fsPromisesMocks.rm.mock.calls
+        .map((c) => c[0] as string)
+        .find((p) => p.includes('.claude'));
       expect(rmPath).toMatch(/[\\/]home[\\/]agent[\\/]\.claude$/);
     } finally {
       if (priorHome === undefined) delete process.env.HOME;
@@ -320,7 +322,9 @@ describe('resetForNextRole', () => {
     process.env.HOME = '/var/agent-home';
     try {
       await resetForNextRole({ workspace: '/ws', priorTaskId: 'X' });
-      const rmPath = fsPromisesMocks.rm.mock.calls[0]?.[0] as string;
+      const rmPath = fsPromisesMocks.rm.mock.calls
+        .map((c) => c[0] as string)
+        .find((p) => p.includes('.claude'));
       // Must match the env var, NOT the mocked os.homedir of /home/agent.
       expect(rmPath).toMatch(/[\\/]var[\\/]agent-home[\\/]\.claude$/);
       expect(rmPath).not.toMatch(/[\\/]home[\\/]agent[\\/]/);
@@ -335,7 +339,9 @@ describe('resetForNextRole', () => {
     delete process.env.HOME;
     try {
       await resetForNextRole({ workspace: '/ws', priorTaskId: 'X' });
-      const rmPath = fsPromisesMocks.rm.mock.calls[0]?.[0] as string;
+      const rmPath = fsPromisesMocks.rm.mock.calls
+        .map((c) => c[0] as string)
+        .find((p) => p.includes('.claude'));
       // os.homedir() is mocked to /home/agent in this test file.
       expect(rmPath).toMatch(/[\\/]home[\\/]agent[\\/]\.claude$/);
     } finally {
@@ -564,6 +570,23 @@ describe('resetForNextRole — integration: full /tmp artifact surface', () => {
     // Total unlink count: one per TMP_OUTPUT_NAMES entry + the agent_prompt file.
     // Verifies no extra stale or unexpected paths are touched.
     expect(unlinkPaths).toHaveLength(TMP_OUTPUT_NAMES.length + 1);
+  });
+
+  it('unlinks every path derived from TMP_OUTPUT_NAMES for the prior task — rm covers viewport_review dir', async () => {
+    const taskId = 'integration-test-task-abc123';
+
+    await resetForNextRole({ workspace: '/ws', priorTaskId: taskId });
+
+    // The viewport_review dir is cleaned via fs.promises.rm (recursive),
+    // not unlink, because it is a directory containing screenshot files.
+    const rmPaths = fsPromisesMocks.rm.mock.calls.map((c) => c[0] as string);
+    expect(rmPaths).toContain(`/tmp/viewport_review_${taskId}`);
+    // Must use { recursive: true, force: true } so non-empty dirs are removed
+    // and missing dirs are silently skipped.
+    const viewportRmCall = fsPromisesMocks.rm.mock.calls.find(
+      (c) => c[0] === `/tmp/viewport_review_${taskId}`,
+    );
+    expect(viewportRmCall?.[1]).toEqual(expect.objectContaining({ recursive: true, force: true }));
   });
 
   it('includes "symbols" to prevent ctags file leak on warm VMs between roles', () => {
